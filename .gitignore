@@ -6,3 +6,5 @@ __pycache__/
 ralph.yml
 /thirdparty/**
 !/thirdparty/*.md
+*.zip
+*.tar.gz

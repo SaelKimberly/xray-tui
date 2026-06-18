@@ -120,3 +120,8 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - `cargo clippy` — lint
 - `cargo build --release` — release build
 - Manual: run xray-tui against real xray-core and sing-box binaries, verify connect/speedtest/disconnect flow for both backends
+### Tool Restrictions
+
+- **DO NOT use `ast_edit`** — this tool is forbidden. Use `edit` for all code changes. `ast_edit` previews corrupt session state.
+- Use `search` for content search, NOT `grep`/`rg`/`awk` in bash.
+- Use `read` for file display, NOT `cat`/`head`/`tail`/`ls` in bash.

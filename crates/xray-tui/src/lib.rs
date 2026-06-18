@@ -1,11 +1,13 @@
 pub mod ui;
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::str::FromStr;
+use tokio::sync::mpsc;
 use xray_tui_config::AppConfig;
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{resolve_core, CoreType};
-use xray_tui_db::models::{Group, Profile, ProfileExtension, ServerStat};
+use xray_tui_core::{find_binary, resolve_core, BuildParams, CoreManager, ConfigBuilder, CoreType};
+use xray_tui_db::models::{DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat};
 use xray_tui_db::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,14 @@ pub enum AppMode {
 }
 
 
+/// Events from the core process manager to the UI event loop.
+#[derive(Debug, Clone)]
+pub enum CoreEvent {
+    Connected(CoreType),
+    Disconnected,
+    Error(String),
+}
+
 pub struct AppState {
     pub db: Database,
     pub config: AppConfig,
@@ -93,6 +103,11 @@ pub struct AppState {
     pub search_focused: bool,
     pub log_buffer: Vec<LogLine>,
     pub connected_core: Option<CoreType>,
+    pub connecting: bool,
+    pub connection_error: Option<String>,
+    pub core_event_rx: Option<mpsc::UnboundedReceiver<CoreEvent>>,
+    pub core_event_tx: Option<mpsc::UnboundedSender<CoreEvent>>,
+    pub disconnect_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub should_quit: bool,
     pub mode: AppMode,
     pub multi_select: HashSet<String>,
@@ -116,6 +131,11 @@ impl AppState {
             search_focused: false,
             log_buffer: Vec::new(),
             connected_core: None,
+            connecting: false,
+            connection_error: None,
+            core_event_rx: None,
+            core_event_tx: None,
+            disconnect_tx: None,
             should_quit: false,
             mode: AppMode::List,
             multi_select: HashSet::new(),
@@ -504,6 +524,169 @@ impl AppState {
         }
         self.reload_profiles();
     }
+
+    // ── Core connection management ──────────────────────────────────────
+
+    /// Connect to the selected profile by id.
+    pub fn connect_to_profile(&mut self, profile_id: &str) {
+        if self.connecting {
+            return;
+        }
+
+        let profile = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
+            Some(r) => r.profile.clone(),
+            None => {
+                self.add_log("error", "Profile not found for connection");
+                return;
+            }
+        };
+
+        let protocol = match Protocol::try_from_i32(profile.config_type) {
+            Some(p) => p,
+            None => {
+                self.add_log("error", &format!("Unknown protocol: {}", profile.config_type));
+                return;
+            }
+        };
+
+        let profile_override = profile.core_type.parse::<CoreType>().ok();
+        let core_type = resolve_core(protocol, profile_override);
+
+        // If already connected/disconnecting, send stop signal first
+        if let Some(tx) = self.disconnect_tx.take() {
+            let _ = tx.send(());
+        }
+
+        // Create disconnect signal channel
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        self.disconnect_tx = Some(stop_tx);
+        self.connecting = true;
+        self.connection_error = None;
+
+        let tx = match &self.core_event_tx {
+            Some(tx) => tx.clone(),
+            None => {
+                self.connecting = false;
+                self.add_log("error", "Core event channel not initialized");
+                return;
+            }
+        };
+
+        let params = BuildParams {
+            log_level: self.config.core.log_level.clone(),
+            socks_port: self.config.inbound.socks_port,
+            http_port: self.config.inbound.http_port,
+            listen: self.config.inbound.listen.clone(),
+            sniffing: self.config.inbound.sniffing,
+        };
+
+        // Default DNS and routing for first pass
+        let dns = DnsSetting {
+            id: "default".to_string(),
+            name: None,
+            servers: None,
+            hosts: None,
+            query_strategy: None,
+            disable_cache: None,
+            disable_fallback: None,
+            client_ip: None,
+        };
+        let routing: Vec<RoutingRule> = vec![];
+
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+            .join("xray-tui");
+        let bin_dir = config_dir.join("bin").join(core_type.to_string());
+        let bin_configs_dir = config_dir.join("binConfigs");
+
+        // Need to move params into the async block
+
+        tokio::spawn(async move {
+            // 1. Build config
+            let backend_config = match ConfigBuilder::build(
+                &profile, core_type, &params, &routing, &dns,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(CoreEvent::Error(format!("Config build failed: {e}")));
+                    return;
+                }
+            };
+
+            // 2. Find binary
+            let bin_path = match find_binary(core_type, &bin_dir) {
+                Some(p) => p,
+                None => {
+                    let _ = tx.send(CoreEvent::Error(
+                        "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
+                            .to_string(),
+                    ));
+                    return;
+                }
+            };
+
+            // 3. Start core
+            let mut manager = CoreManager::new(bin_configs_dir);
+            if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
+                let _ = tx.send(CoreEvent::Error(format!("Failed to start core: {e}")));
+                return;
+            }
+
+            // 4. Signal connected
+            let _ = tx.send(CoreEvent::Connected(core_type));
+
+            // 5. Wait for stop signal
+            let _ = stop_rx.await;
+
+            // 6. Stop core
+            let _ = manager.stop().await;
+
+            // 7. Signal disconnected
+            let _ = tx.send(CoreEvent::Disconnected);
+        });
+    }
+
+    /// Disconnect the currently running core.
+    pub fn disconnect(&mut self) {
+        if let Some(tx) = self.disconnect_tx.take() {
+            let _ = tx.send(());
+        }
+        self.connected_core = None;
+        self.connecting = false;
+        self.add_log("info", "Disconnected");
+    }
+
+    /// Poll core event channel and update state accordingly.
+    pub fn poll_core_events(&mut self) {
+        while let Some(rx) = self.core_event_rx.as_mut() {
+            let event = match rx.try_recv() {
+                Ok(event) => event,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            };
+            match event {
+                CoreEvent::Connected(core_type) => {
+                    self.connected_core = Some(core_type);
+                    self.connecting = false;
+                    self.connection_error = None;
+                    self.add_log("info", &format!("Connected [{core_type}]"));
+                }
+                CoreEvent::Disconnected => {
+                    // Ignore stale Disconnected if already reconnecting
+                    if !self.connecting {
+                        self.connected_core = None;
+                        self.add_log("info", "Core process stopped");
+                    }
+                }
+                CoreEvent::Error(err) => {
+                    self.connection_error = Some(err.clone());
+                    self.connecting = false;
+                    self.connected_core = None;
+                    self.add_log("error", &format!("Connection error: {err}"));
+                }
+            }
+        }
+    }
 }
 
 fn common_field_defaults() -> Vec<(String, String)> {
@@ -538,8 +721,8 @@ fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
     }
 
     // Flatten stream_settings into dotted keys
-    if let Some(ss) = &profile.stream_settings {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ss) {
+    if let Some(ss) = &profile.stream_settings
+        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ss) {
             for (k, v) in obj {
                 let val = match &v {
                     serde_json::Value::String(s) => s.clone(),
@@ -550,11 +733,10 @@ fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
                 fields.push((k, val));
             }
         }
-    }
 
     // Flatten protocol_settings
-    if let Some(ps) = &profile.protocol_settings {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ps) {
+    if let Some(ps) = &profile.protocol_settings
+        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ps) {
             for (k, v) in obj {
                 let val = match &v {
                     serde_json::Value::String(s) => s.clone(),
@@ -568,7 +750,6 @@ fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
                 }
             }
         }
-    }
 
     fields
 }

@@ -352,11 +352,10 @@ fn handle_import_key(state: &mut AppState, key: &KeyEvent) {
         _ => (None, false),
     };
 
-    if should_import {
-        if let Some(url) = url_to_import {
+    if should_import
+        && let Some(url) = url_to_import {
             state.import_url(&url);
         }
-    }
 }
 
 fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
@@ -478,8 +477,8 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Esc => state.cancel_form(),
-        KeyCode::Left | KeyCode::Right => {
-            if *focus_index < form_fields.len() {
+        KeyCode::Left | KeyCode::Right
+            if *focus_index < form_fields.len() => {
                 let ff = &form_fields[*focus_index];
                 if let FormFieldType::Select(options) = ff.field_type {
                     let (_, ref mut val) = fields[*focus_index];
@@ -496,7 +495,6 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                     val.push_str(options[new_idx]);
                 }
             }
-        }
         _ => {}
     }
 }

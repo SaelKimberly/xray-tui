@@ -42,9 +42,27 @@ pub struct AppState {
     pub search_focused: bool,
     pub log_buffer: Vec<LogLine>,
     pub connected_core: Option<CoreType>,
+    pub connecting: bool,
+    pub connection_error: Option<String>,
+    pub core_event_rx: Option<UnboundedReceiver<CoreEvent>>,
+    pub core_event_tx: Option<UnboundedSender<CoreEvent>>,
+    pub disconnect_tx: Option<oneshot::Sender<()>>,
     pub should_quit: bool,
 }
+
+### CoreEvent Channel
+
+```rust
+pub enum CoreEvent {
+    Connected(CoreType),
+    Disconnected,
+    Error(String),
+}
 ```
+The `CoreEvent` channel uses `tokio::sync::mpsc::unbounded` for async communication between the
+spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
+draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
+The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
 
 AppState provides:
 - `filtered_profiles()` — group filter + search filter + sort by column
@@ -56,6 +74,9 @@ AppState provides:
 - `toggle_multi_select()` / `move_profile_up()` / `move_profile_down()` — multi-select + reorder
 - `set_active()` — set default server
 - `import_url()` — parse share URL and add profile
+- `connect_to_profile(&mut self, profile_id: &str)` — spawn async CoreManager task, send CoreEvents
+- `disconnect(&mut self)` — send stop signal via disconnect_tx oneshot
+- `poll_core_events(&mut self)` — drain core event channel each frame, update state
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
@@ -92,12 +113,13 @@ pub enum CoreType {
 pub struct CoreProcess {
     child: Option<Child>,
     config_path: PathBuf,
-    core_type: CoreType,
+    pub core_type: CoreType,
+    log_tx: UnboundedSender<String>,  // stderr forwarded to TUI
 }
 
 pub enum RunningCore {
     Xray(CoreProcess),
-    SingBox(SingBoxProcess),
+    SingBox(CoreProcess),
 }
 
 pub struct CoreManager {
@@ -106,20 +128,48 @@ pub struct CoreManager {
 }
 
 impl CoreManager {
-    pub async fn start(core_type: CoreType, config: &BackendConfig) -> Result<()>;
-    pub async fn stop(&mut self) -> Result<()>;
-    pub async fn restart(&mut self, core_type: CoreType, config: &BackendConfig) -> Result<()>;
+    pub async fn start(
+        core_type: CoreType,
+        profile: &Profile,
+        params: &BuildParams,
+        routing: &[RoutingRule],
+        dns: &DnsSetting,
+        tx: UnboundedSender<CoreEvent>,
+        stop_rx: oneshot::Receiver<()>,
+    );
+    pub async fn stop(&mut self);
     pub fn is_running(&self) -> bool;
     pub fn running_core_type(&self) -> Option<CoreType>;
 }
 ```
 
 `CoreManager::start` flow:
-1. If a core is running and of different type → stop it
-2. Write the appropriate JSON config to temp file
-3. Spawn `xray run -c <path>` or `sing-box run -c <path>`
-4. Wait for process ready (poll every 500ms, max 10s)
-5. Connect to the backend's gRPC API
+1. Resolve core binary path via `find_binary()`
+2. Build config via `ConfigBuilder::build()`
+3. Write JSON config to temp file in config_dir
+4. Spawn `xray run -c <path>` or `sing-box run -c <path>`
+5. Spawn stderr reader task forwarding lines via log_tx
+6. Poll process readiness (check stderr for "start" message, max 10s)
+7. Send `CoreEvent::Connected` / `CoreEvent::Error` on the event channel
+8. Wait for `stop_rx` signal, then kill child + remove config file
+
+
+**`bin_manager.rs`** — Binary discovery and archive extraction
+```rust
+pub struct CoreBinInfo {
+    pub name: &'static str,
+    pub bin_names: &'static [&'static str],
+    pub args_template: &'static str,
+    pub archive_patterns: &'static [&'static str],
+}
+
+pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf>;
+pub fn get_core_info(core_type: CoreType) -> CoreBinInfo;
+pub fn find_and_extract_archives(core_type: CoreType, bin_dir: &Path) -> Result<(), BinError>;
+```
+`find_binary` checks `bin_dir`/`core_type` first (managed install), then falls back to `which`.
+`get_core_info` returns binary names (xray: `["xray"]`; sing-box: `["sing-box-client", "sing-box"]`)
+and archive patterns for automatic extraction in dev environments.
 
 ---
 
@@ -128,26 +178,30 @@ impl CoreManager {
 - `xray.rs` — Builds xray-core format JSON
 - `singbox.rs` — Builds sing-box format JSON
 
-```rust
+
 pub enum BackendConfig {
     Xray(XrayConfig),
     SingBox(SingBoxConfig),
 }
 
+pub struct BuildParams {
+    log_level: String,
+    socks_port: u16,
+    http_port: Option<u16>,
+    listen: String,
+    sniffing: bool,
+}
+
 pub struct ConfigBuilder;
 impl ConfigBuilder {
     pub fn build(
-        profile: &Profile, settings: &Settings,
-        routing: &[RoutingRule], dns: &DnsConfig
-    ) -> Result<BackendConfig>;
+        profile: &Profile,
+        core_type: CoreType,
+        params: &BuildParams,
+        routing: &[RoutingRule],
+        dns: &DnsSetting,
+    ) -> Result<BackendConfig, BuildError>;
 }
-```
-
-**Config builder — xray.rs** ports v2rayN's `CoreConfigContextBuilder` (C#) to Rust. Produces the xray-core JSON format:
-```json
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [{ "tag": "socks-in", "protocol": "socks", ... }],
   "outbounds": [
     { "tag": "proxy", "protocol": "vmess", "settings": { ... },
       "streamSettings": { ... }, "mux": { ... } },

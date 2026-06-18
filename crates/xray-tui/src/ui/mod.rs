@@ -42,6 +42,11 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     let refresh_interval = Duration::from_secs(state.config.gui.refresh_interval_secs);
     let mut last_tick = std::time::Instant::now();
 
+    // Create core event channel for async core process communication
+    let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.core_event_tx = Some(core_tx);
+    state.core_event_rx = Some(core_rx);
+
     while !state.should_quit {
         loop {
             match rx.try_recv() {
@@ -53,6 +58,9 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
                 }
             }
         }
+
+        // Process core process events (connect/disconnect/error)
+        state.poll_core_events();
 
         if last_tick.elapsed() >= refresh_interval {
             last_tick = std::time::Instant::now();
@@ -127,6 +135,10 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('q' | 'Q') => {
             state.should_quit = true;
         }
+        KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected_core.is_some() => {
+            state.disconnect();
+        }
+
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.should_quit = true;
         }
@@ -163,6 +175,12 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
             state.move_profile_down();
         }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+            if let Some(id) = state.selected_profile_id() {
+                state.connect_to_profile(&id);
+            }
+        }
+
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
                 state.set_active(&id);
@@ -209,14 +227,12 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             };
         }
         KeyCode::Char('S') if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) && state.current_tab == Tab::Profiles => {
-            if let Some(id) = state.selected_profile_id() {
-                if let Some(profile) = state.filtered_profiles().iter().find(|r| r.profile.id == id) {
-                    if let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile) {
+            if let Some(id) = state.selected_profile_id()
+                && let Some(profile) = state.filtered_profiles().iter().find(|r| r.profile.id == id)
+                    && let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile) {
                         state.clipboard = Some(url);
                         state.add_log("info", "Share URL copied to clipboard");
                     }
-                }
-            }
         }
         KeyCode::Esc => {
             if state.confirm_delete.is_some() {

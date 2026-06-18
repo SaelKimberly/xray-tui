@@ -34,16 +34,16 @@
 - ✅ Set default server, move/reorder servers
 ## Phase 3 — Core Integration
 
-- **Dual-backend CoreManager** — common trait with xray and sing-box implementations
-- `CoreProcess` for xray-core (spawn `xray run -c <path>`)
-- `SingBoxProcess` for sing-box (spawn `sing-box run -c <path>`)
-- Config builder split: `config_builder_xray.rs` (xray-core JSON) + `config_builder_singbox.rs` (sing-box JSON)
-- Protocol → Core auto-resolution: TUIC/Hysteria/Naïve/AnyTLS/ShadowTLS/Tor/SSH → sing-box; all others → xray-core
-- gRPC API abstraction: `StatsProvider` trait for stats + logs; xray uses native gRPC, sing-box uses experimental v2ray_api
-- One-core-at-a-time: switching profiles between backends stops current core, starts the other
-- Connect/disconnect flow
-- Auto-detect xray and sing-box binary paths (PATH, configured paths)
-- Process spawn/kill/restart lifecycle with health polling
+- ✅ **Dual-backend CoreManager** — common trait with xray and sing-box implementations
+- ✅ `CoreProcess` for xray-core (spawn `xray run -c <path>`)
+- ✅ `SingBoxProcess` for sing-box (spawn `sing-box run -c <path>`)
+- ✅ Config builder split: `config_builder_xray.rs` (xray-core JSON) + `config_builder_singbox.rs` (sing-box JSON)
+- ✅ Protocol → Core auto-resolution: TUIC/Hysteria/Naïve/AnyTLS/ShadowTLS/Tor/SSH → sing-box; all others → xray-core
+- 🔲 gRPC API abstraction: `StatsProvider` trait for stats + logs; xray uses native gRPC, sing-box uses experimental v2ray_api
+- ✅ One-core-at-a-time: switching profiles between backends stops current core, starts the other
+- ✅ Connect/disconnect flow
+- ✅ Auto-detect xray and sing-box binary paths (PATH, configured paths)
+- ✅ Process spawn/kill/restart lifecycle with health polling
 
 ## Phase 4 — Subscription Management
 
