@@ -2,4 +2,5 @@
 .memelord/
 .codegraph/
 .omp/
+__pycache__/
 ralph.yml
