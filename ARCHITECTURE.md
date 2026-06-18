@@ -20,6 +20,7 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 ```rust
 pub enum Tab { Profiles, Settings, Routing, Dns, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
+pub enum AppMode { List, AddServer{..}, EditServer{..}, ImportUrl{..} }
 pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
 pub struct LogLine { level: String, message: String }
 
@@ -27,10 +28,14 @@ pub struct AppState {
     pub db: Database,
     pub config: AppConfig,
     pub current_tab: Tab,
+    pub mode: AppMode,
     pub profiles: Vec<ProfileRow>,
     pub groups: Vec<Group>,
     pub selected_group_id: Option<String>,
     pub selected_index: usize,
+    pub multi_select: HashSet<String>,
+    pub confirm_delete: Option<String>,
+    pub clipboard: Option<String>,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub search_query: String,
@@ -45,11 +50,18 @@ AppState provides:
 - `filtered_profiles()` — group filter + search filter + sort by column
 - `reload_profiles()` / `reload_groups()` — DB reload
 - `add_log()` — capped circular log buffer (1000 entries)
+- `start_add_server()` / `start_edit_profile()` — enter form mode
+- `confirm_add_server()` / `confirm_edit_server()` / `cancel_form()` — form lifecycle
+- `delete_profile()` / `clone_profile()` — CRUD operations
+- `toggle_multi_select()` / `move_profile_up()` / `move_profile_down()` — multi-select + reorder
+- `set_active()` — set default server
+- `import_url()` — parse share URL and add profile
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
-- `mod.rs` — Main event loop, tab rendering, keyboard handler, placeholder renderer
-- `profiles.rs` — Profile list DataGrid with sortable columns, group filter, search bar
+- `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, placeholder renderer
+- `profiles.rs` — Profile list DataGrid with sortable columns, group filter, search bar, multi-select indicator, delete confirmation overlay
+- `add_server.rs` — Form screen for add/edit, protocol picker, field editing, import URL screen
 - `status_bar.rs` — Bottom strip: connection indicator + key hints
 - `settings.rs` — **Placeholder** (Phase 1: "Coming Soon")
 - `routing.rs` — **Placeholder** (Phase 1: "Coming Soon")
@@ -57,7 +69,7 @@ AppState provides:
 - `logs.rs` — **Placeholder** (Phase 1: "Coming Soon")
 - `statistics.rs` — **Placeholder** (Phase 1: "Coming Soon")
 
-Future screens (Phase 2+): `add_server.rs`, `subscription.rs`, settings panels, routing editor, log viewer, statistics panels.
+Future screens (Phase 3+): `subscription.rs`, settings panels, routing editor, log viewer, statistics panels.
 
 ### xray-tui-core (library crate)
 
@@ -333,7 +345,11 @@ CREATE TABLE IF NOT EXISTS server_stats (
 
 ### xray-tui-config (library crate)
 
-`crates/xray-tui-config/src/lib.rs` — App config management.
+`crates/xray-tui-config/src/lib.rs` — App config management, protocol form fields, share URL parsing.
+
+**Modules added in Phase 2:**
+- `forms.rs` — `FormFieldType`, `FormField`, `FieldSection`, `form_fields_for()` (27 protocols)
+- `import_export.rs` — `parse_share_url()`, `format_share_url()` (12 protocol formats)
 
 **App config** (JSON at `~/.config/xray-tui/config.json`): mirrors v2rayN's `Config.cs` fields plus dual-core settings (xray binary path, sing-box binary path, default core type).
 

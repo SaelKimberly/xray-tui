@@ -1,3 +1,4 @@
+pub mod add_server;
 pub mod dns;
 pub mod logs;
 pub mod profiles;
@@ -77,6 +78,17 @@ fn handle_event(ev: &Event, state: &mut AppState) {
 }
 
 fn handle_key(key: &KeyEvent, state: &mut AppState) {
+    // Form mode: route all keys to add_server handler (except Ctrl+C quit)
+    if !matches!(state.mode, crate::AppMode::List) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.should_quit = true;
+            }
+            _ => add_server::handle_key(state, key),
+        }
+        return;
+    }
+
     // Search mode captures all alphanumeric input
     if state.search_focused {
         match key.code {
@@ -89,6 +101,22 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Esc => {
                 state.search_focused = false;
                 state.search_query.clear();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Delete confirmation: only y/n/esc
+    if state.confirm_delete.is_some() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                if let Some(id) = state.confirm_delete.take() {
+                    state.delete_profile(&id);
+                }
+            }
+            KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
+                state.confirm_delete = None;
             }
             _ => {}
         }
@@ -129,18 +157,73 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::End if state.current_tab == Tab::Profiles => {
             state.selected_index = state.filtered_profiles().len().saturating_sub(1);
         }
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+            state.move_profile_up();
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+            state.move_profile_down();
+        }
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
-            state.add_log(
-                "info",
-                &format!("Enter pressed on profile {}", state.selected_index + 1),
-            );
+            if let Some(id) = state.selected_profile_id() {
+                state.set_active(&id);
+            }
+        }
+        KeyCode::Char(' ') if state.current_tab == Tab::Profiles => {
+            if let Some(id) = state.selected_profile_id() {
+                state.toggle_multi_select(&id);
+            }
         }
         KeyCode::Char('/') if state.current_tab == Tab::Profiles => {
             state.search_focused = true;
             state.search_query.clear();
         }
+        // CRUD shortcuts (profiles tab)
+        KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {
+            state.start_add_server();
+        }
+        KeyCode::Char('e' | 'E') if state.current_tab == Tab::Profiles => {
+            if let Some(id) = state.selected_profile_id() {
+                state.start_edit_profile(&id);
+            }
+        }
+        KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
+            if state.multi_select.len() >= 2 {
+                let ids: Vec<String> = state.multi_select.iter().cloned().collect();
+                for id in &ids {
+                    state.delete_profile(id);
+                }
+                state.multi_select.clear();
+            } else if let Some(id) = state.selected_profile_id() {
+                state.confirm_delete = Some(id);
+            }
+        }
+        KeyCode::Char('c' | 'C') if !key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+            if let Some(id) = state.selected_profile_id() {
+                state.clone_profile(&id);
+            }
+        }
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+            state.mode = crate::AppMode::ImportUrl {
+                input: String::new(),
+                error: None,
+            };
+        }
+        KeyCode::Char('S') if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) && state.current_tab == Tab::Profiles => {
+            if let Some(id) = state.selected_profile_id() {
+                if let Some(profile) = state.filtered_profiles().iter().find(|r| r.profile.id == id) {
+                    if let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile) {
+                        state.clipboard = Some(url);
+                        state.add_log("info", "Share URL copied to clipboard");
+                    }
+                }
+            }
+        }
         KeyCode::Esc => {
-            state.selected_group_id = None;
+            if state.confirm_delete.is_some() {
+                state.confirm_delete = None;
+            } else {
+                state.selected_group_id = None;
+            }
         }
         _ => {}
     }
@@ -157,6 +240,21 @@ fn render(frame: &mut Frame, state: &AppState) {
             Constraint::Length(1), // Status bar
         ])
         .split(frame.area());
+
+    // In form/import mode, render form instead of tabs
+    if !matches!(state.mode, crate::AppMode::List) {
+        match &state.mode {
+            crate::AppMode::AddServer { .. } | crate::AppMode::EditServer { .. } => {
+                add_server::render(frame, chunks[1], state);
+            }
+            crate::AppMode::ImportUrl { .. } => {
+                add_server::render_import_url(frame, chunks[1], state);
+            }
+            _ => {}
+        }
+        status_bar::render(frame, chunks[2], state);
+        return;
+    }
 
     render_tabs(frame, chunks[0], state);
 
@@ -203,10 +301,9 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 pub fn render_placeholder_screen(frame: &mut Frame, area: Rect, name: &str) {
-    let text = format!(" {} — Coming Soon ", name);
-    let block = Block::default()
-        .title(text)
-        .borders(Borders::ALL)
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(block, area);
+    let text = format!("{name} — Coming Soon");
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(Color::Gray))
+        .block(Block::default().title(name).borders(Borders::ALL));
+    frame.render_widget(paragraph, area);
 }

@@ -15,23 +15,40 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Filter strip
-            Constraint::Min(1),    // Data grid
+            Constraint::Length(1),
+            Constraint::Min(0),
         ])
         .split(area);
 
     render_filter_strip(frame, chunks[0], state);
-    render_data_grid(frame, chunks[1], &rows, selected);
+    render_data_grid(frame, chunks[1], &rows, selected, state);
+
+    // Delete confirmation overlay
+    if let Some(ref delete_id) = state.confirm_delete {
+        let profile_name = rows
+            .iter()
+            .find(|r| r.profile.id == *delete_id)
+            .and_then(|r| r.profile.remarks.as_deref())
+            .unwrap_or("unknown");
+        let overlay_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD);
+        let overlay_text = format!(" Delete \"{profile_name}\"? (y/N) ");
+        let overlay_para = Paragraph::new(overlay_text.clone()).style(overlay_style);
+        let overlay_area = Rect::new(
+            area.width.saturating_sub(overlay_text.len() as u16 + 4).min(area.width),
+            area.height.saturating_sub(2),
+            overlay_text.len() as u16 + 4,
+            1,
+        );
+        frame.render_widget(overlay_para, overlay_area);
+    }
 }
 
 fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
     let group_name = match &state.selected_group_id {
-        Some(gid) => state
-            .groups
-            .iter()
-            .find(|g| g.id == *gid)
-            .and_then(|g| g.name.as_deref())
-            .unwrap_or("Selected"),
+        Some(gid) => state.groups.iter().find(|g| g.id == *gid).and_then(|g| g.name.as_deref()).unwrap_or("All"),
         None => "All",
     };
 
@@ -60,6 +77,7 @@ fn render_data_grid(
     area: Rect,
     rows: &[&crate::ProfileRow],
     selected_index: usize,
+    state: &AppState,
 ) {
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(area);
@@ -72,7 +90,6 @@ fn render_data_grid(
 
     let mut text_lines: Vec<Line> = Vec::new();
 
-    // Header
     let header_line = Line::from(
         vec![
             cell_span("  #", 5),
@@ -115,7 +132,9 @@ fn render_data_grid(
             Style::default().fg(core_color)
         };
 
-        let idx_str = format!("{:>3}", i + 1);
+        let is_multi = state.multi_select.contains(&row.profile.id);
+        let idx_str = if is_multi { "  *".to_string() } else { format!("{:>3}", i + 1) };
+
         let type_str = format!("{:.8}", protocol.to_string());
         let remarks = row.profile.remarks.as_deref().unwrap_or("");
         let remarks_str = truncate_pad(remarks, 24);
@@ -168,7 +187,7 @@ fn render_data_grid(
     frame.render_widget(paragraph, inner);
 }
 
-fn cell_span(label: &str, width: usize) -> Span<'_> {
+fn cell_span(label: &str, width: usize) -> Span<'static> {
     let padded = format!("{:width$}", label, width = width);
     Span::raw(padded)
 }

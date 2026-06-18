@@ -7,12 +7,12 @@ Feature target: feature parity with v2rayN (C# desktop GUI) for all protocols su
 
 ```
 xray-tui/
-├── crates/
-│   ├── xray-tui/          # Binary: ratatui event loop + all screens
-│   │   └── src/ui/         # TUI screen modules (profiles, status_bar, 5 placeholders)
-│   ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
-│   ├── xray-tui-db/       # Library: SQLite persistence layer + query methods
-│   └── xray-tui-config/   # Library: import/export format parsers, JSON config management
+├── xray-tui/          # Binary: ratatui event loop + all screens
+│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, 5 placeholders)
+├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
+├── xray-tui-db/       # Library: SQLite persistence layer + query methods
+├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management
+├── thirdparty/
 │   ├── Xray-core/         # Source of truth for protocols and behavior
 │   ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
 │   ├── v2rayN/            # Source of truth for UI/UX feature set
@@ -42,9 +42,7 @@ xray-tui/
 | **Outbound** | Remote proxy server connection (VMess, VLESS, Shadowsocks, etc.) |
 | **Profile/Server** | A single outbound proxy configuration (address, port, protocol, credentials, transport, core type) |
 | **Core Type** | The proxy backend binary assigned to a profile — xray or sing-box |
-| **Group** | A named collection of servers, optionally tied to a subscription URL |
-| **Subscription** | A URL that returns a list of server configurations (base64-encoded share links) |
-| **Share URL** | Protocol-specific URI format for sharing a proxy configuration (e.g., vmess://...) |
+| **AppMode** | Application mode enum (List / AddServer / EditServer / ImportUrl) — controls which screen renders
 | **Transport** | The network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around the transport |
 | **Config Type** | The proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |

@@ -19,10 +19,13 @@ cargo run
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management
+- `crates/xray-tui-config/src/forms.rs` — per-protocol form field definitions (27 protocols)
+- `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (12 protocols)
 
 ### TUI screens (crates/xray-tui/src/ui/)
-- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing
-- `profiles.rs` — profile list DataGrid with group filter + search
+- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch
+- `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
+- `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `status_bar.rs` — bottom connection indicator + key hints
 - `settings.rs`, `routing.rs`, `dns.rs`, `logs.rs`, `statistics.rs` — placeholder screens
 
@@ -74,16 +77,10 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
-2. Create form fields in `add_server.rs` matching that protocol's parameters
-3. Create `XxxFmt::parse_share_url` and `XxxFmt::format_share_url` in `xray-tui-config`
+2. Create form fields in `crates/xray-tui-config/src/forms.rs` matching that protocol's parameters
+3. Create `XxxFmt::parse_share_url` and `XxxFmt::format_share_url` in `crates/xray-tui-config/src/import_export.rs`
 4. Add profile validation in the appropriate config builder (`xray.rs` or `singbox.rs`)
 5. Reference: v2rayN's individual `*Fmt.cs` files for format specs; sing-box's `option/*.go` for JSON config structs
-
-### Making a UI screen
-1. Create file in `crates/xray-tui/src/ui/`
-2. Implement ratatui `Widget` or render function
-3. Register in `crates/xray-tui/src/ui/mod.rs` tab routing
-4. Wire keyboard handling in the main event loop
 
 ### Adding a database migration
 1. Add versioned SQL migration to `xray-tui-db/src/migrations/`

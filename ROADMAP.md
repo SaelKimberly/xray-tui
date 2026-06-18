@@ -24,15 +24,14 @@
 - ✅ AppState with filtered/sorted profile list
 - ✅ Keyboard shortcuts: q/Ctrl+C quit, / search, Esc clear filter, Tab cycle tabs
 
-## Phase 2 — Profile CRUD
+## Phase 2 — Profile CRUD ✅
 
-- Add server forms per protocol (VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, WireGuard, Hysteria2, Hysteria v1, TUIC, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, Dokodemo-door, Custom)
-- Core type selector per profile: auto-detect (default), force xray, force sing-box
-- Edit/delete/clone/copy servers
-- Share URL import (vmess://, vless://, ss://, trojan://, socks://, hysteria://, hysteria2://, tuic://, naive://, anytls://, shadowtls://, wireguard://)
-- Multi-server selection operations
-- Set default server, move/reorder servers
-
+- ✅ Add server forms per protocol (VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, WireGuard, Hysteria2, Hysteria v1, TUIC, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, Dokodemo-door, Custom)
+- ✅ Core type selector per profile: auto-detect (default), force xray, force sing-box
+- ✅ Edit/delete/clone/copy servers
+- ✅ Share URL import (vmess://, vless://, ss://, trojan://, socks://, hysteria://, hysteria2://, tuic://, naive://, anytls://, shadowtls://, wireguard://)
+- ✅ Multi-server selection operations
+- ✅ Set default server, move/reorder servers
 ## Phase 3 — Core Integration
 
 - **Dual-backend CoreManager** — common trait with xray and sing-box implementations

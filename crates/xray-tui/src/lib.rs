@@ -1,5 +1,6 @@
 pub mod ui;
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use xray_tui_config::AppConfig;
 use xray_tui_core::protocol::Protocol;
@@ -50,6 +51,33 @@ pub struct LogLine {
     pub level: String,
     pub message: String,
 }
+/// Tracks what the UI is currently showing.
+#[derive(Debug, Clone)]
+pub enum AppMode {
+    /// The main profile list
+    List,
+    /// Adding a new server
+    AddServer {
+        /// Selected protocol (None while protocol picker shown)
+        protocol: Option<Protocol>,
+        /// Raw form field values: map of field key -> current input
+        fields: Vec<(String, String)>,
+        /// Index of the focused field
+        focus_index: usize,
+    },
+    /// Editing an existing server
+    EditServer {
+        profile_id: String,
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    /// Import URL from paste
+    ImportUrl {
+        input: String,
+        error: Option<String>,
+    },
+}
+
 
 pub struct AppState {
     pub db: Database,
@@ -66,6 +94,10 @@ pub struct AppState {
     pub log_buffer: Vec<LogLine>,
     pub connected_core: Option<CoreType>,
     pub should_quit: bool,
+    pub mode: AppMode,
+    pub multi_select: HashSet<String>,
+    pub confirm_delete: Option<String>,
+    pub clipboard: Option<String>,
 }
 
 impl AppState {
@@ -85,6 +117,10 @@ impl AppState {
             log_buffer: Vec::new(),
             connected_core: None,
             should_quit: false,
+            mode: AppMode::List,
+            multi_select: HashSet::new(),
+            clipboard: None,
+            confirm_delete: None,
         };
         state.reload_profiles();
         state.reload_groups();
@@ -200,4 +236,388 @@ impl AppState {
             self.log_buffer.remove(0);
         }
     }
+    // ── CRUD operations ──────────────────────────────────────────────────
+
+    pub fn start_add_server(&mut self) {
+        let fields = common_field_defaults();
+        self.mode = AppMode::AddServer {
+            protocol: None,
+            fields,
+            focus_index: 0,
+        };
+    }
+
+    pub fn start_edit_profile(&mut self, id: &str) {
+        match self.db.get_profile(id) {
+            Ok(Some(profile)) => {
+                let fields = profile_to_fields(&profile);
+                self.mode = AppMode::EditServer {
+                    profile_id: id.to_string(),
+                    fields,
+                    focus_index: 0,
+                };
+            }
+            Ok(None) => self.add_log("error", &format!("Profile {id} not found")),
+            Err(e) => self.add_log("error", &format!("Failed to load profile: {e}")),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn selected_profile(&self) -> Option<&Profile> {
+        let filtered = self.filtered_profiles();
+        filtered.get(self.selected_index).map(|r| &r.profile)
+    }
+
+    fn selected_profile_id(&self) -> Option<String> {
+        let filtered = self.filtered_profiles();
+        filtered.get(self.selected_index).map(|r| r.profile.id.clone())
+    }
+
+    fn fields_to_profile(&self, protocol: Protocol, fields: &[(String, String)]) -> Profile {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = iso_now();
+        let mut profile = Profile {
+            id,
+            config_type: protocol.to_i32(),
+            core_type: "auto".into(),
+            remarks: None,
+            address: None,
+            port: None,
+            user_id: None,
+            security: None,
+            network: None,
+            stream_settings: None,
+            protocol_settings: None,
+            is_sub: Some(0),
+            sub_id: None,
+            group_id: None,
+            sort_order: None,
+            is_active: None,
+            created_at: Some(now.clone()),
+            updated_at: Some(now),
+        };
+        let mut stream_map = serde_json::Map::new();
+        let mut proto_map = serde_json::Map::new();
+
+        for (key, value) in fields {
+            if value.is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "remarks" => profile.remarks = Some(value.clone()),
+                "address" => profile.address = Some(value.clone()),
+                "port" => profile.port = value.parse::<i32>().ok(),
+                "core_type" => profile.core_type = value.clone(),
+                "user_id" | "password" | "uuid" => profile.user_id = Some(value.clone()),
+                "security" => profile.security = Some(value.clone()),
+                "network" => profile.network = Some(value.clone()),
+                // Stream settings (dot-separated keys)
+                _ if key.starts_with("tls.") || key.starts_with("ws.") || key.starts_with("grpc.")
+                    || key.starts_with("reality.") || key.starts_with("tcp.")
+                    || *key == "sni" || *key == "alpn" || *key == "fingerprint"
+                    || *key == "allow_insecure" => {
+                    let json_val = if value == "true" {
+                        serde_json::Value::Bool(true)
+                    } else if value == "false" {
+                        serde_json::Value::Bool(false)
+                    } else if let Ok(n) = value.parse::<i64>() {
+                        serde_json::Value::Number(n.into())
+                    } else {
+                        serde_json::Value::String(value.clone())
+                    };
+                    stream_map.insert(key.clone(), json_val);
+                }
+                // Protocol settings fallback
+                _ => {
+                    let json_val = if value == "true" {
+                        serde_json::Value::Bool(true)
+                    } else if value == "false" {
+                        serde_json::Value::Bool(false)
+                    } else if let Ok(n) = value.parse::<i64>() {
+                        serde_json::Value::Number(n.into())
+                    } else {
+                        serde_json::Value::String(value.clone())
+                    };
+                    proto_map.insert(key.clone(), json_val);
+                }
+            }
+        }
+
+        if !stream_map.is_empty() {
+            profile.stream_settings = Some(serde_json::to_string(&stream_map).unwrap_or_default());
+        }
+        if !proto_map.is_empty() {
+            profile.protocol_settings = Some(serde_json::to_string(&proto_map).unwrap_or_default());
+        }
+        profile
+    }
+
+    pub fn confirm_add_server(&mut self) {
+        let (protocol, fields) = match &self.mode {
+            AppMode::AddServer { protocol: Some(p), fields, .. } => (*p, fields.clone()),
+            _ => {
+                self.add_log("error", "Cannot confirm: no protocol selected");
+                return;
+            }
+        };
+        let profile = self.fields_to_profile(protocol, &fields);
+        if let Err(e) = self.db.insert_profile(&profile) {
+            self.add_log("error", &format!("Failed to add server: {e}"));
+            return;
+        }
+        self.add_log("info", &format!("Added server: {}", profile.remarks.as_deref().unwrap_or("unnamed")));
+        self.mode = AppMode::List;
+        self.reload_profiles();
+    }
+
+    pub fn confirm_edit_server(&mut self) {
+        let (profile_id, fields) = match &self.mode {
+            AppMode::EditServer { profile_id, fields, .. } => (profile_id.clone(), fields.clone()),
+            _ => return,
+        };
+        let mut profile = match self.db.get_profile(&profile_id) {
+            Ok(Some(p)) => p,
+            _ => {
+                self.add_log("error", "Profile not found for edit");
+                return;
+            }
+        };
+        // Infer protocol from existing profile
+        let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
+        // Rebuild from form fields
+        let new_profile = self.fields_to_profile(protocol, &fields);
+        profile.remarks = new_profile.remarks;
+        profile.address = new_profile.address;
+        profile.port = new_profile.port;
+        profile.core_type = new_profile.core_type;
+        profile.user_id = new_profile.user_id;
+        profile.security = new_profile.security;
+        profile.network = new_profile.network;
+        profile.stream_settings = new_profile.stream_settings;
+        profile.protocol_settings = new_profile.protocol_settings;
+        profile.updated_at = Some(iso_now());
+
+        if let Err(e) = self.db.update_profile(&profile) {
+            self.add_log("error", &format!("Failed to update server: {e}"));
+            return;
+        }
+        self.add_log("info", "Server updated");
+        self.mode = AppMode::List;
+        self.reload_profiles();
+    }
+
+    pub fn cancel_form(&mut self) {
+        self.mode = AppMode::List;
+    }
+
+    pub fn delete_profile(&mut self, id: &str) {
+        if let Err(e) = self.db.delete_profile(id) {
+            self.add_log("error", &format!("Failed to delete profile: {e}"));
+            return;
+        }
+        self.add_log("info", "Profile deleted");
+        self.confirm_delete = None;
+        self.multi_select.remove(id);
+        self.reload_profiles();
+    }
+
+    pub fn clone_profile(&mut self, id: &str) {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = self.db.clone_profile(id, &new_id) {
+            self.add_log("error", &format!("Failed to clone profile: {e}"));
+            return;
+        }
+        self.add_log("info", "Profile cloned");
+        self.reload_profiles();
+    }
+
+    pub fn toggle_multi_select(&mut self, id: &str) {
+        if !self.multi_select.insert(id.to_string()) {
+            self.multi_select.remove(id);
+        }
+    }
+
+    pub fn import_url(&mut self, url: &str) {
+        match xray_tui_config::import_export::parse_share_url(url) {
+            Ok(profile) => {
+                let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
+                let fields = profile_to_fields(&profile);
+                self.mode = AppMode::AddServer {
+                    protocol: Some(protocol),
+                    fields,
+                    focus_index: 0,
+                };
+                self.add_log("info", "URL imported successfully");
+            }
+            Err(e) => {
+                self.mode = AppMode::ImportUrl {
+                    input: url.to_string(),
+                    error: Some(e.to_string()),
+                };
+            }
+        }
+    }
+
+    pub fn move_profile_up(&mut self) {
+        let id = match self.selected_profile_id() {
+            Some(id) => id,
+            None => return,
+        };
+        let filtered = self.filtered_profiles();
+        let idx = filtered.iter().position(|r| r.profile.id == id);
+        let idx = match idx {
+            Some(i) if i > 0 => i,
+            _ => return,
+        };
+        let prev_id = &filtered[idx - 1].profile.id;
+        let a_order = filtered[idx].profile.sort_order.unwrap_or(0);
+        let b_order = filtered[idx - 1].profile.sort_order.unwrap_or(0);
+        if let Err(e) = self.db.reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)]) {
+            self.add_log("error", &format!("Failed to reorder: {e}"));
+        }
+        self.reload_profiles();
+    }
+
+    pub fn move_profile_down(&mut self) {
+        let id = match self.selected_profile_id() {
+            Some(id) => id,
+            None => return,
+        };
+        let filtered = self.filtered_profiles();
+        let idx = match filtered.iter().position(|r| r.profile.id == id) {
+            Some(i) if i < filtered.len() - 1 => i,
+            _ => return,
+        };
+        let next_id = &filtered[idx + 1].profile.id;
+        let a_order = filtered[idx].profile.sort_order.unwrap_or(0);
+        let b_order = filtered[idx + 1].profile.sort_order.unwrap_or(0);
+        if let Err(e) = self.db.reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)]) {
+            self.add_log("error", &format!("Failed to reorder: {e}"));
+        }
+        self.reload_profiles();
+    }
+
+    pub fn set_active(&mut self, id: &str) {
+        if let Err(e) = self.db.update_profile_active(id) {
+            self.add_log("error", &format!("Failed to set active: {e}"));
+            return;
+        }
+        self.reload_profiles();
+    }
+}
+
+fn common_field_defaults() -> Vec<(String, String)> {
+    vec![
+        ("remarks".to_string(), String::new()),
+        ("address".to_string(), String::new()),
+        ("port".to_string(), "443".to_string()),
+        ("core_type".to_string(), "auto".to_string()),
+    ]
+}
+
+fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
+    let mut fields = common_field_defaults();
+    if let Some(v) = &profile.remarks {
+        set_field(&mut fields, "remarks", v);
+    }
+    if let Some(v) = &profile.address {
+        set_field(&mut fields, "address", v);
+    }
+    if let Some(v) = profile.port {
+        set_field(&mut fields, "port", &v.to_string());
+    }
+    set_field(&mut fields, "core_type", &profile.core_type);
+    if let Some(v) = &profile.user_id {
+        set_field(&mut fields, "user_id", v);
+    }
+    if let Some(v) = &profile.security {
+        set_field(&mut fields, "security", v);
+    }
+    if let Some(v) = &profile.network {
+        set_field(&mut fields, "network", v);
+    }
+
+    // Flatten stream_settings into dotted keys
+    if let Some(ss) = &profile.stream_settings {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ss) {
+            for (k, v) in obj {
+                let val = match &v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                fields.push((k, val));
+            }
+        }
+    }
+
+    // Flatten protocol_settings
+    if let Some(ps) = &profile.protocol_settings {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ps) {
+            for (k, v) in obj {
+                let val = match &v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                // Skip duplicates already set explicitly
+                if !fields.iter().any(|(fk, _)| fk == &k) {
+                    fields.push((k, val));
+                }
+            }
+        }
+    }
+
+    fields
+}
+
+fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = fields.iter_mut().find(|(k, _)| k == key) {
+        *existing = value.to_string();
+    } else {
+        fields.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn iso_now() -> String {
+    // Simple ISO 8601 without chrono dependency
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    // Format as YYYY-MM-DDTHH:MM:SSZ
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+
+    // Simple date calculation from Unix epoch (1970-01-01)
+    let mut y = 1970i64;
+    let mut remaining = days as i64;
+    loop {
+        let days_in_year = if is_leap(y) { 366 } else { 365 };
+        if remaining < days_in_year { break; }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let month_days = if is_leap(y) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m = 1;
+    for &md in &month_days {
+        if remaining < md { break; }
+        remaining -= md;
+        m += 1;
+    }
+    let d = remaining + 1;
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
