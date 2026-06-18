@@ -1,10 +1,10 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{resolve_core, CoreType};
+use xray_tui_core::{CoreType, resolve_core};
 
 use crate::{AppState, ConfirmAction};
 
@@ -14,10 +14,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
 
     render_filter_strip(frame, chunks[0], state);
@@ -37,7 +34,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         let overlay_text = format!(" Delete \"{profile_name}\"? (y/N) ");
         let overlay_para = Paragraph::new(overlay_text.clone()).style(overlay_style);
         let overlay_area = Rect::new(
-            area.width.saturating_sub(overlay_text.len() as u16 + 4).min(area.width),
+            area.width
+                .saturating_sub(overlay_text.len() as u16 + 4)
+                .min(area.width),
             area.height.saturating_sub(2),
             overlay_text.len() as u16 + 4,
             1,
@@ -48,14 +47,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
     let group_name = match &state.selected_group_id {
-        Some(gid) => state.groups.iter().find(|g| g.id == *gid).and_then(|g| g.name.as_deref()).unwrap_or("All"),
+        Some(gid) => state
+            .groups
+            .iter()
+            .find(|g| g.id == *gid)
+            .and_then(|g| g.name.as_deref())
+            .unwrap_or("All"),
         None => "All",
     };
 
     let group_text = format!(" Group: {}", group_name);
     let group_span = Span::styled(
         group_text,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     );
 
     let search_text = if state.search_focused {
@@ -114,7 +120,12 @@ fn render_data_grid(
         let protocol = Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
         let core = resolve_core(
             protocol,
-            Some(row.profile.core_type.parse::<CoreType>().unwrap_or(CoreType::Auto)),
+            Some(
+                row.profile
+                    .core_type
+                    .parse::<CoreType>()
+                    .unwrap_or(CoreType::Auto),
+            ),
         );
 
         let core_color = match core {
@@ -133,7 +144,11 @@ fn render_data_grid(
         };
 
         let is_multi = state.multi_select.contains(&row.profile.id);
-        let idx_str = if is_multi { "  *".to_string() } else { format!("{:>3}", i + 1) };
+        let idx_str = if is_multi {
+            "  *".to_string()
+        } else {
+            format!("{:>3}", i + 1)
+        };
 
         let type_str = format!("{:.8}", protocol.to_string());
         let remarks = row.profile.remarks.as_deref().unwrap_or("");

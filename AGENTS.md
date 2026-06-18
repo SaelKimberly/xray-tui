@@ -26,9 +26,10 @@ cargo run
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 - `crates/xray-tui-db/src/models.rs` — Profile (compute_sub_uid), Group, Subscription, GRAVEYARD_GROUP_ID
+- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping, speed test, UDP test, batch ping) using tokio + reqwest SOCKS5 proxy
 
 ### TUI screens (crates/xray-tui/src/ui/)
-- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch
+:- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 - `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `status_bar.rs` — bottom connection indicator + key hints
@@ -93,6 +94,14 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 4. `move_orphans_to_graveyard()` / `purge_graveyard()` handle stale profile cleanup
 5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
 6. Refer to `groups.rs` for group management overlay UI patterns (matching `add_server.rs` form conventions)
+
+### Adding a new speed test type
+1. Add variant to `TestType` enum in `crates/xray-tui-core/src/speed_test.rs`
+2. Implement the async function in `speed_test.rs` using tokio timeouts
+3. Add a `start_xxx_test()` method in `crates/xray-tui/src/lib.rs` AppState that spawns a tokio task calling the function
+4. Wire the result into `CoreEvent::SpeedTestResult` handler in `poll_core_events()`
+5. Add menu item in `render_speed_test_menu()` in `crates/xray-tui/src/ui/mod.rs`
+6. Add key handler entry in `handle_key()` menu navigation
 
 ### Determining which core a protocol belongs to
 2. Register version in the migration runner

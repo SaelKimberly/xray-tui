@@ -1,4 +1,4 @@
-use rapidhash::v3::{RapidStreamHasherV3, DEFAULT_RAPID_SECRETS};
+use rapidhash::v3::{DEFAULT_RAPID_SECRETS, RapidStreamHasherV3};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

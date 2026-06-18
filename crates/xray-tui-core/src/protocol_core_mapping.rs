@@ -39,11 +39,21 @@ mod tests {
     #[test]
     fn xray_protocols_resolve_to_xray() {
         for protocol in [
-            Protocol::Vmess, Protocol::Vless, Protocol::Shadowsocks,
-            Protocol::Shadowsocks2022, Protocol::Socks, Protocol::Http,
-            Protocol::Trojan, Protocol::WireGuard, Protocol::Hysteria2,
-            Protocol::DokodemoDoor, Protocol::Freedom, Protocol::Blackhole,
-            Protocol::Dns, Protocol::Loopback, Protocol::Custom,
+            Protocol::Vmess,
+            Protocol::Vless,
+            Protocol::Shadowsocks,
+            Protocol::Shadowsocks2022,
+            Protocol::Socks,
+            Protocol::Http,
+            Protocol::Trojan,
+            Protocol::WireGuard,
+            Protocol::Hysteria2,
+            Protocol::DokodemoDoor,
+            Protocol::Freedom,
+            Protocol::Blackhole,
+            Protocol::Dns,
+            Protocol::Loopback,
+            Protocol::Custom,
         ] {
             assert_eq!(
                 resolve_core(protocol, None),

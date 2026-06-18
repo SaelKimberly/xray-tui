@@ -95,7 +95,8 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     )?;
 
     // Migration v2: add sub_uid column (ignore error if already exists)
-    let _ = conn.execute_batch("ALTER TABLE profiles ADD COLUMN sub_uid INTEGER NOT NULL DEFAULT 0;");
+    let _ =
+        conn.execute_batch("ALTER TABLE profiles ADD COLUMN sub_uid INTEGER NOT NULL DEFAULT 0;");
     let _ = conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_profiles_group_sub_uid ON profiles(group_id, sub_uid) WHERE sub_uid != 0;",
     );

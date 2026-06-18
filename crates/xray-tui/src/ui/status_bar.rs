@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::AppState;
 
@@ -14,12 +14,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
+    } else if let Some((done, total)) = state.test_progress {
+        (
+            format!(" Testing: {done}/{total} profiles..."),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if !state.testing_profiles.is_empty() {
+        (
+            " Testing...".to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if let Some(err) = &state.connection_error {
         (
             format!(" Error: {err}"),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else {
         match &state.connected_core {
@@ -31,9 +43,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             ),
             None => (
                 " Disconnected".to_string(),
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         }
     };
@@ -51,7 +61,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let width = area.width as usize;
     let left_len = left_text.len();
     let padding = width.saturating_sub(left_len + right_text.len());
-
 
     let line = Line::from(vec![
         Span::styled(left_text.clone(), left_style),

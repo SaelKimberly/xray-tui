@@ -1,11 +1,10 @@
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
 
 use crate::protocol::Protocol;
 
 use super::{BuildError, BuildParams};
-
 
 // ── Xray JSON config structs ────────────────────────────────────────
 
@@ -331,9 +330,11 @@ fn add_user_if_present(server: &mut Value, p_settings: &Value) {
         .or_else(|| p_settings.get("pass"))
         .and_then(|v| v.as_str());
     if let (Some(u), Some(p)) = (username, password)
-        && !u.is_empty() && !p.is_empty() {
-            server["users"] = json!([{ "user": u, "pass": p }]);
-        }
+        && !u.is_empty()
+        && !p.is_empty()
+    {
+        server["users"] = json!([{ "user": u, "pass": p }]);
+    }
 }
 
 fn build_dns_outbound() -> Outbound {
@@ -518,10 +519,7 @@ mod tests {
 
     fn assert_has_standard_outbounds(json: &Value) {
         let outbounds = json["outbounds"].as_array().expect("outbounds array");
-        let tags: Vec<&str> = outbounds
-            .iter()
-            .filter_map(|o| o["tag"].as_str())
-            .collect();
+        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
         assert!(tags.contains(&"dns-out"), "missing dns-out");
         assert!(tags.contains(&"direct"), "missing direct");
         assert!(tags.contains(&"block"), "missing block");
@@ -531,8 +529,7 @@ mod tests {
     fn xray_vmess_config() {
         let profile = test_profile(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "vmess");
@@ -543,8 +540,7 @@ mod tests {
     fn xray_vless_config() {
         let profile = test_profile(Protocol::Vless.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "vless");
@@ -554,8 +550,7 @@ mod tests {
     fn xray_shadowsocks_config() {
         let profile = test_profile(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
@@ -565,8 +560,7 @@ mod tests {
     fn xray_trojan_config() {
         let profile = test_profile(Protocol::Trojan.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "trojan");
@@ -576,8 +570,7 @@ mod tests {
     fn xray_socks_config() {
         let profile = test_profile(Protocol::Socks.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "socks");
@@ -587,8 +580,7 @@ mod tests {
     fn xray_http_config() {
         let profile = test_profile(Protocol::Http.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "http");
@@ -598,8 +590,7 @@ mod tests {
     fn xray_hysteria2_config() {
         let profile = test_profile(Protocol::Hysteria2.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "hysteria2");
@@ -609,8 +600,7 @@ mod tests {
     fn xray_inbounds_default() {
         let profile = test_profile(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 2, "should have 2 inbounds (SOCKS + API)");
@@ -625,11 +615,14 @@ mod tests {
         let profile = test_profile(Protocol::Vmess.to_i32());
         let (mut params, rules, dns) = default_params();
         params.http_port = Some(10809);
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 3, "should have 3 inbounds (SOCKS + HTTP + API)");
+        assert_eq!(
+            inbounds.len(),
+            3,
+            "should have 3 inbounds (SOCKS + HTTP + API)"
+        );
         assert_eq!(inbounds[0]["protocol"], "socks");
         assert_eq!(inbounds[0]["port"], 10808);
         assert_eq!(inbounds[1]["protocol"], "http");
@@ -644,10 +637,7 @@ mod tests {
         let profile = test_profile(Protocol::WireGuard.to_i32());
         let (params, rules, dns) = default_params();
         let result = XrayConfigBuilder::build(&profile, &params, &rules, &dns);
-        assert!(
-            result.is_err(),
-            "unsupported protocol should return error"
-        );
+        assert!(result.is_err(), "unsupported protocol should return error");
         match result {
             Err(BuildError::InvalidProfile(_)) => {} // expected
             _ => panic!("expected InvalidProfile error"),
@@ -677,8 +667,7 @@ mod tests {
             rule_set_url: None,
             sort_order: Some(0),
         }];
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let routing_rules = json["routing"]["rules"].as_array().unwrap();
         assert_eq!(routing_rules.len(), 1);
@@ -694,8 +683,7 @@ mod tests {
             json!({"network": "ws", "security": "tls", "wsSettings": {"path": "/ws"}}).to_string(),
         );
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let outbounds = json["outbounds"].as_array().unwrap();
         let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();

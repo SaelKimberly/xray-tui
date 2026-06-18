@@ -4,7 +4,6 @@ use serde::Deserialize;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_db::models::Profile;
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
     #[error("unsupported URL scheme")]
@@ -225,7 +224,11 @@ fn format_vmess(profile: &Profile) -> Result<String> {
 
 fn parse_vless(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::Vless, &parsed.host, parsed.port.unwrap_or(0) as i32);
+    let mut profile = base_profile(
+        Protocol::Vless,
+        &parsed.host,
+        parsed.port.unwrap_or(0) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
     if !parsed.username.is_empty() {
         profile.user_id = Some(parsed.username.clone());
@@ -247,7 +250,10 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "fp" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("fingerprint".into(), serde_json::Value::String(v.to_string()));
+                ss.insert(
+                    "fingerprint".into(),
+                    serde_json::Value::String(v.to_string()),
+                );
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "alpn" => {
@@ -257,7 +263,10 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "allowInsecure" | "allow_insecure" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("allow_insecure".into(), serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")));
+                ss.insert(
+                    "allow_insecure".into(),
+                    serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
+                );
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "type" => {
@@ -277,7 +286,10 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "serviceName" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("grpc.serviceName".into(), serde_json::Value::String(v.to_string()));
+                ss.insert(
+                    "grpc.serviceName".into(),
+                    serde_json::Value::String(v.to_string()),
+                );
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "encryption" => { /* ignored */ }
@@ -295,22 +307,32 @@ fn format_vless(profile: &Profile) -> Result<String> {
 
     if let Some(ps) = &profile.protocol_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
-            && let Some(flow) = v.get("flow").and_then(|f| f.as_str()) {
-                query.push(("flow".into(), flow.to_string()));
-            }
+        && let Some(flow) = v.get("flow").and_then(|f| f.as_str())
+    {
+        query.push(("flow".into(), flow.to_string()));
+    }
     if let Some(ss) = &profile.stream_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss) {
-            if let Some(sni) = v.get("sni").and_then(|s| s.as_str()) {
-                query.push(("sni".into(), sni.to_string()));
-            }
-            if let Some(fp) = v.get("fingerprint").and_then(|f| f.as_str()) {
-                query.push(("fp".into(), fp.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
+    {
+        if let Some(sni) = v.get("sni").and_then(|s| s.as_str()) {
+            query.push(("sni".into(), sni.to_string()));
         }
+        if let Some(fp) = v.get("fingerprint").and_then(|f| f.as_str()) {
+            query.push(("fp".into(), fp.to_string()));
+        }
+    }
 
-    let qs = query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let qs = query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("vless://{userinfo}@{add}:{port}?{qs}{fragment}"))
 }
 
@@ -320,14 +342,17 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
     // SIP002: ss://base64(method:password)@host:port?plugin=...#tag
     let rest = url.strip_prefix("ss://").unwrap_or(url);
     // Split on '@' to separate userinfo from host
-    let (userinfo_b64, rest2) = rest.split_once('@')
+    let (userinfo_b64, rest2) = rest
+        .split_once('@')
         .ok_or_else(|| ImportError::Parse("missing @ in ss:// URL".into()))?;
 
-    let (host_part, fragment) = rest2.split_once('#')
+    let (host_part, fragment) = rest2
+        .split_once('#')
         .map(|(h, f)| (h, Some(f.to_string())))
         .unwrap_or((rest2, None));
 
-    let (address, port_str) = host_part.rsplit_once(':')
+    let (address, port_str) = host_part
+        .rsplit_once(':')
         .ok_or_else(|| ImportError::Parse("missing port in ss:// URL".into()))?;
     let trimmed = userinfo_b64.trim_end_matches('=');
     // Re-pad to correct length for STANDARD decoder
@@ -340,10 +365,13 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
         .decode_to_vec(padded.as_bytes())
         .map_err(|_| ImportError::Parse("invalid base64 in ss://".into()))?;
     let userinfo = String::from_utf8_lossy(&decoded);
-    let (method, password) = userinfo.split_once(':')
+    let (method, password) = userinfo
+        .split_once(':')
         .ok_or_else(|| ImportError::Parse("missing : in ss:// userinfo".into()))?;
 
-    let port: i32 = port_str.parse().map_err(|_| ImportError::Parse("invalid port".into()))?;
+    let port: i32 = port_str
+        .parse()
+        .map_err(|_| ImportError::Parse("invalid port".into()))?;
     let protocol = if method.starts_with("2022-blake3-") {
         Protocol::Shadowsocks2022
     } else {
@@ -353,23 +381,31 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
     profile.remarks = fragment;
     profile.user_id = Some(password.to_string());
     let mut ps = serde_json::Map::new();
-    ps.insert("method".into(), serde_json::Value::String(method.to_string()));
+    ps.insert(
+        "method".into(),
+        serde_json::Value::String(method.to_string()),
+    );
     profile.protocol_settings = Some(serde_json::to_string(&ps)?);
-
 
     Ok(profile)
 }
 
 fn format_shadowsocks(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
-    let method = profile.protocol_settings.as_deref()
+    let method = profile
+        .protocol_settings
+        .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("method").and_then(|m| m.as_str().map(String::from)))
         .unwrap_or_else(|| "aes-256-gcm".into());
     let password = profile.user_id.as_deref().unwrap_or("");
     let userinfo = base64_simd::STANDARD.encode_to_string(format!("{method}:{password}"));
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("ss://{userinfo}@{add}:{port}{fragment}"))
 }
 
@@ -377,7 +413,11 @@ fn format_shadowsocks(profile: &Profile) -> Result<String> {
 
 fn parse_trojan(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::Trojan, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::Trojan,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
 
     if !parsed.username.is_empty() {
@@ -393,7 +433,10 @@ fn parse_trojan(url: &str) -> Result<Profile> {
             }
             "allowInsecure" | "allow_insecure" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("allow_insecure".into(), serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")));
+                ps.insert(
+                    "allow_insecure".into(),
+                    serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "alpn" => {
@@ -418,12 +461,28 @@ fn format_trojan(profile: &Profile) -> Result<String> {
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
-            && let Some(sni) = v.get("sni").and_then(|s| s.as_str()) {
-                query.push(("sni".into(), sni.to_string()));
-            }
-    let qs = if query.is_empty() { String::new() } else { format!("?{}", query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")) };
+        && let Some(sni) = v.get("sni").and_then(|s| s.as_str())
+    {
+        query.push(("sni".into(), sni.to_string()));
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "?{}",
+            query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("trojan://{pw}@{add}:{port}{qs}{fragment}"))
 }
 
@@ -431,11 +490,18 @@ fn format_trojan(profile: &Profile) -> Result<String> {
 
 fn parse_socks(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::Socks, &parsed.host, parsed.port.unwrap_or(1080) as i32);
+    let mut profile = base_profile(
+        Protocol::Socks,
+        &parsed.host,
+        parsed.port.unwrap_or(1080) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
-        ps.insert("username".into(), serde_json::Value::String(parsed.username.clone()));
+        ps.insert(
+            "username".into(),
+            serde_json::Value::String(parsed.username.clone()),
+        );
         if let Some(pw) = &parsed.password {
             ps.insert("password".into(), serde_json::Value::String(pw.clone()));
         }
@@ -447,7 +513,11 @@ fn parse_socks(url: &str) -> Result<Profile> {
 fn format_socks(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("socks://@{add}:{port}{fragment}"))
 }
 
@@ -455,7 +525,11 @@ fn format_socks(profile: &Profile) -> Result<String> {
 
 fn parse_hysteria2(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::Hysteria2, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::Hysteria2,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
 
     for (k, v) in &parsed.query_pairs {
@@ -478,7 +552,10 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
             }
             "insecure" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("insecure".into(), serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")));
+                ps.insert(
+                    "insecure".into(),
+                    serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             _ => {}
@@ -494,17 +571,41 @@ fn format_hysteria2(profile: &Profile) -> Result<String> {
         query.push(("auth".into(), auth.clone()));
     }
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-            if let Some(obfs) = v.get("obfs").and_then(|o| o.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("obfs".into(), obfs.to_string()));
-            }
-            if let Some(sni) = v.get("sni").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("sni".into(), sni.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    {
+        if let Some(obfs) = v
+            .get("obfs")
+            .and_then(|o| o.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("obfs".into(), obfs.to_string()));
         }
-    let qs = if query.is_empty() { String::new() } else { format!("?{}", query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")) };
+        if let Some(sni) = v
+            .get("sni")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("sni".into(), sni.to_string()));
+        }
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "?{}",
+            query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("hysteria2://{add}:{port}{qs}{fragment}"))
 }
 
@@ -512,7 +613,11 @@ fn format_hysteria2(profile: &Profile) -> Result<String> {
 
 fn parse_hysteria(url: &str) -> Result<Profile> {
     let parsed = split_share_url(&url.replace("hy://", "hysteria://"))?;
-    let mut profile = base_profile(Protocol::Hysteria, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::Hysteria,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
 
     for (k, v) in &parsed.query_pairs {
@@ -534,12 +639,22 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
             }
             "upmbps" | "up_mbps" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("up_mbps".into(), serde_json::Value::Number(serde_json::Number::from(v.parse::<i64>().unwrap_or(100))));
+                ps.insert(
+                    "up_mbps".into(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        v.parse::<i64>().unwrap_or(100),
+                    )),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "downmbps" | "down_mbps" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("down_mbps".into(), serde_json::Value::Number(serde_json::Number::from(v.parse::<i64>().unwrap_or(100))));
+                ps.insert(
+                    "down_mbps".into(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        v.parse::<i64>().unwrap_or(100),
+                    )),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "sni" => {
@@ -549,7 +664,10 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
             }
             "insecure" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("insecure".into(), serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")));
+                ps.insert(
+                    "insecure".into(),
+                    serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             _ => {}
@@ -562,20 +680,40 @@ fn format_hysteria(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-            if let Some(auth) = v.get("auth").and_then(|a| a.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("auth".into(), auth.to_string()));
-            }
-            if let Some(up) = v.get("up_mbps").and_then(|u| u.as_i64()) {
-                query.push(("upmbps".into(), up.to_string()));
-            }
-            if let Some(down) = v.get("down_mbps").and_then(|d| d.as_i64()) {
-                query.push(("downmbps".into(), down.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    {
+        if let Some(auth) = v
+            .get("auth")
+            .and_then(|a| a.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("auth".into(), auth.to_string()));
         }
-    let qs = if query.is_empty() { String::new() } else { format!("?{}", query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")) };
+        if let Some(up) = v.get("up_mbps").and_then(|u| u.as_i64()) {
+            query.push(("upmbps".into(), up.to_string()));
+        }
+        if let Some(down) = v.get("down_mbps").and_then(|d| d.as_i64()) {
+            query.push(("downmbps".into(), down.to_string()));
+        }
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "?{}",
+            query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("hysteria://{add}:{port}{qs}{fragment}"))
 }
 
@@ -583,7 +721,11 @@ fn format_hysteria(profile: &Profile) -> Result<String> {
 
 fn parse_tuic(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::Tuic, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::Tuic,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
 
     for (k, v) in &parsed.query_pairs {
@@ -596,12 +738,18 @@ fn parse_tuic(url: &str) -> Result<Profile> {
             }
             "congestion_control" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("congestion_control".into(), serde_json::Value::String(v.clone()));
+                ps.insert(
+                    "congestion_control".into(),
+                    serde_json::Value::String(v.clone()),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "udp_relay_mode" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("udp_relay_mode".into(), serde_json::Value::String(v.clone()));
+                ps.insert(
+                    "udp_relay_mode".into(),
+                    serde_json::Value::String(v.clone()),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "sni" => {
@@ -616,7 +764,10 @@ fn parse_tuic(url: &str) -> Result<Profile> {
             }
             "allow_insecure" | "insecure" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("insecure".into(), serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")));
+                ps.insert(
+                    "insecure".into(),
+                    serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             _ => {}
@@ -631,20 +782,41 @@ fn format_tuic(profile: &Profile) -> Result<String> {
     let mut query: Vec<(String, String)> = Vec::new();
     query.push(("uuid".into(), uuid.to_string()));
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-            if let Some(pw) = v.get("password").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("password".into(), pw.to_string()));
-            }
-            if let Some(cc) = v.get("congestion_control").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("congestion_control".into(), cc.to_string()));
-            }
-            if let Some(urm) = v.get("udp_relay_mode").and_then(|u| u.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("udp_relay_mode".into(), urm.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    {
+        if let Some(pw) = v
+            .get("password")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("password".into(), pw.to_string()));
         }
-    let qs = query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+        if let Some(cc) = v
+            .get("congestion_control")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("congestion_control".into(), cc.to_string()));
+        }
+        if let Some(urm) = v
+            .get("udp_relay_mode")
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("udp_relay_mode".into(), urm.to_string()));
+        }
+    }
+    let qs = query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("tuic://{add}:{port}?{qs}{fragment}"))
 }
 
@@ -652,11 +824,18 @@ fn format_tuic(profile: &Profile) -> Result<String> {
 
 fn parse_naive(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::Naive, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::Naive,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
-        ps.insert("user".into(), serde_json::Value::String(parsed.username.clone()));
+        ps.insert(
+            "user".into(),
+            serde_json::Value::String(parsed.username.clone()),
+        );
         if let Some(pw) = &parsed.password {
             ps.insert("password".into(), serde_json::Value::String(pw.clone()));
         }
@@ -667,17 +846,29 @@ fn parse_naive(url: &str) -> Result<Profile> {
 
 fn format_naive(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
-    let user = profile.protocol_settings.as_deref()
+    let user = profile
+        .protocol_settings
+        .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("user").and_then(|u| u.as_str().map(String::from)))
         .unwrap_or_default();
-    let password = profile.protocol_settings.as_deref()
+    let password = profile
+        .protocol_settings
+        .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("password").and_then(|p| p.as_str().map(String::from)))
         .unwrap_or_default();
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
-    let userinfo = if user.is_empty() { String::new() } else { format!("{user}:{password}@") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
+    let userinfo = if user.is_empty() {
+        String::new()
+    } else {
+        format!("{user}:{password}@")
+    };
     Ok(format!("naive+https://{userinfo}{add}:{port}{fragment}"))
 }
 
@@ -685,7 +876,11 @@ fn format_naive(profile: &Profile) -> Result<String> {
 
 fn parse_anytls(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::AnyTls, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::AnyTls,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
 
     for (k, v) in &parsed.query_pairs {
@@ -707,7 +902,10 @@ fn parse_anytls(url: &str) -> Result<Profile> {
             }
             "insecure" | "allow_insecure" => {
                 let mut ps = protocol_settings(profile.protocol_settings.as_deref());
-                ps.insert("insecure".into(), serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")));
+                ps.insert(
+                    "insecure".into(),
+                    serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
+                );
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             _ => {}
@@ -720,17 +918,41 @@ fn format_anytls(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-            if let Some(pw) = v.get("password").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("password".into(), pw.to_string()));
-            }
-            if let Some(sni) = v.get("sni").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("sni".into(), sni.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    {
+        if let Some(pw) = v
+            .get("password")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("password".into(), pw.to_string()));
         }
-    let qs = if query.is_empty() { String::new() } else { format!("?{}", query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")) };
+        if let Some(sni) = v
+            .get("sni")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("sni".into(), sni.to_string()));
+        }
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "?{}",
+            query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("anytls://{add}:{port}{qs}{fragment}"))
 }
 
@@ -738,7 +960,11 @@ fn format_anytls(profile: &Profile) -> Result<String> {
 
 fn parse_shadowtls(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
-    let mut profile = base_profile(Protocol::ShadowTls, &parsed.host, parsed.port.unwrap_or(443) as i32);
+    let mut profile = base_profile(
+        Protocol::ShadowTls,
+        &parsed.host,
+        parsed.port.unwrap_or(443) as i32,
+    );
     profile.remarks = parsed.fragment.clone();
 
     for (k, v) in &parsed.query_pairs {
@@ -769,16 +995,40 @@ fn format_shadowtls(profile: &Profile) -> Result<String> {
     let remark = profile.remarks.as_deref().unwrap_or("");
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-            if let Some(pw) = v.get("password").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("password".into(), pw.to_string()));
-            }
-            if let Some(ver) = v.get("version").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("version".into(), ver.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    {
+        if let Some(pw) = v
+            .get("password")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("password".into(), pw.to_string()));
         }
-    let qs = if query.is_empty() { String::new() } else { format!("?{}", query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")) };
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+        if let Some(ver) = v
+            .get("version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("version".into(), ver.to_string()));
+        }
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "?{}",
+            query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("shadowtls://{add}:{port}{qs}{fragment}"))
 }
 
@@ -832,21 +1082,39 @@ fn parse_wireguard(url: &str) -> Result<Profile> {
 fn format_wireguard(profile: &Profile) -> Result<String> {
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-            if let Some(pk) = v.get("private_key").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("privateKey".into(), pk.to_string()));
-            }
-            if let Some(pubk) = v.get("public_key").and_then(|p| p.as_str()).filter(|s| !s.is_empty()) {
-                query.push(("publicKey".into(), pubk.to_string()));
-            }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    {
+        if let Some(pk) = v
+            .get("private_key")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("privateKey".into(), pk.to_string()));
         }
+        if let Some(pubk) = v
+            .get("public_key")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            query.push(("publicKey".into(), pubk.to_string()));
+        }
+    }
     if let Some(addr) = &profile.address
-        && let Some(port) = profile.port {
-            query.push(("endpoint".into(), format!("{addr}:{port}")));
-        }
-    let qs = query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+        && let Some(port) = profile.port
+    {
+        query.push(("endpoint".into(), format!("{addr}:{port}")));
+    }
+    let qs = query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("wireguard://?{qs}{fragment}"))
 }
 
@@ -869,7 +1137,8 @@ struct UrlComponents {
 /// Returns components without using `url::Url`.
 fn split_share_url(url: &str) -> Result<UrlComponents> {
     // 1. Extract scheme
-    let (scheme, rest) = url.split_once("://")
+    let (scheme, rest) = url
+        .split_once("://")
         .ok_or_else(|| ImportError::Parse("missing scheme in URL".into()))?;
     let scheme = scheme.to_string();
     let mut unparsed = rest;
@@ -938,7 +1207,8 @@ fn find_userinfo<'a>(s: &'a str, scheme: &str) -> (String, Option<String>, &'a s
                 if scheme.starts_with("trojan") && pos == 16 && s[..pos].is_ascii() {
                     // Validate that what follows @ is a host:port
                     let after_at = &s[pos + 1..];
-                    let host_end = after_at.find('/')
+                    let host_end = after_at
+                        .find('/')
                         .or_else(|| after_at.find('?'))
                         .or_else(|| after_at.find('#'))
                         .unwrap_or(after_at.len());
@@ -1043,7 +1313,11 @@ fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
         config_type: protocol.to_i32(),
         core_type: "auto".into(),
         remarks: None,
-        address: if address.is_empty() { None } else { Some(address.to_string()) },
+        address: if address.is_empty() {
+            None
+        } else {
+            Some(address.to_string())
+        },
         port: if port > 0 { Some(port) } else { None },
         user_id: None,
         security: None,
@@ -1085,7 +1359,6 @@ fn protocol_settings(existing: Option<&str>) -> serde_json::Map<String, serde_js
         .unwrap_or_default()
 }
 
-
 // ── ShadowsocksR ─────────────────────────────────────────────────────────
 
 /// Parse `ssr://` URL.
@@ -1100,7 +1373,9 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
 
     let parts: Vec<&str> = text.split(':').collect();
     if parts.len() < 6 {
-        return Err(ImportError::Parse("ssr: expected at least 6 colon-delimited fields".into()));
+        return Err(ImportError::Parse(
+            "ssr: expected at least 6 colon-delimited fields".into(),
+        ));
     }
 
     // Index from end for IPv6 support
@@ -1116,7 +1391,8 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
         .or_else(|| password_raw.split_once('?'))
         .unwrap_or((&password_raw, ""));
 
-    let port: i32 = raw_port.parse()
+    let port: i32 = raw_port
+        .parse()
         .map_err(|_| ImportError::Parse("ssr: invalid port".into()))?;
 
     let mut params = std::collections::HashMap::new();
@@ -1132,25 +1408,40 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
     profile.user_id = Some(password.to_string());
 
     let mut ps = serde_json::Map::new();
-    ps.insert("method".into(), serde_json::Value::String(raw_method.to_string()));
-    ps.insert("protocol".into(), serde_json::Value::String(raw_protocol.to_string()));
-    ps.insert("obfs".into(), serde_json::Value::String(raw_obfs.to_string()));
+    ps.insert(
+        "method".into(),
+        serde_json::Value::String(raw_method.to_string()),
+    );
+    ps.insert(
+        "protocol".into(),
+        serde_json::Value::String(raw_protocol.to_string()),
+    );
+    ps.insert(
+        "obfs".into(),
+        serde_json::Value::String(raw_obfs.to_string()),
+    );
 
     // Decode base64 query params
-    for (key, src_field) in [("obfsparam", "obfsparam"), ("protoparam", "protoparam"), ("group", "group")] {
+    for (key, src_field) in [
+        ("obfsparam", "obfsparam"),
+        ("protoparam", "protoparam"),
+        ("group", "group"),
+    ] {
         if let Some(val_b64) = params.get(src_field)
             && let Ok(bytes) = crate::base64_util::decode_base64(val_b64)
-                && let Ok(val_decoded) = String::from_utf8(bytes) {
-                    ps.insert((*key).into(), serde_json::Value::String(val_decoded));
-                }
+            && let Ok(val_decoded) = String::from_utf8(bytes)
+        {
+            ps.insert((*key).into(), serde_json::Value::String(val_decoded));
+        }
     }
     profile.protocol_settings = Some(serde_json::to_string(&ps)?);
 
     if let Some(remarks_b64) = params.get("remarks")
         && let Ok(bytes) = crate::base64_util::decode_base64(remarks_b64)
-            && let Ok(decoded) = String::from_utf8(bytes) {
-                profile.remarks = Some(decoded);
-            }
+        && let Ok(decoded) = String::from_utf8(bytes)
+    {
+        profile.remarks = Some(decoded);
+    }
 
     Ok(profile)
 }
@@ -1159,11 +1450,19 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
     let password = profile.user_id.as_deref().unwrap_or("");
 
-    let (method, protocol, obfs) = profile.protocol_settings.as_deref()
+    let (method, protocol, obfs) = profile
+        .protocol_settings
+        .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .map(|v| {
-            let m = v.get("method").and_then(|m| m.as_str()).unwrap_or("rc4-md5");
-            let p = v.get("protocol").and_then(|p| p.as_str()).unwrap_or("origin");
+            let m = v
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("rc4-md5");
+            let p = v
+                .get("protocol")
+                .and_then(|p| p.as_str())
+                .unwrap_or("origin");
             let o = v.get("obfs").and_then(|o| o.as_str()).unwrap_or("plain");
             (m.to_string(), p.to_string(), o.to_string())
         })
@@ -1172,10 +1471,14 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
     let mut query_str = String::new();
     if let Some(ps) = &profile.protocol_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
-            && let Some(obfsparam) = v.get("obfsparam").and_then(|o| o.as_str()).filter(|s| !s.is_empty()) {
-                let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(obfsparam);
-                query_str.push_str(&format!("obfsparam={}&", encoded));
-            }
+        && let Some(obfsparam) = v
+            .get("obfsparam")
+            .and_then(|o| o.as_str())
+            .filter(|s| !s.is_empty())
+    {
+        let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(obfsparam);
+        query_str.push_str(&format!("obfsparam={}&", encoded));
+    }
     if let Some(remarks) = &profile.remarks {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(remarks);
         query_str.push_str(&format!("remarks={}", encoded));
@@ -1199,16 +1502,18 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
 fn parse_http(url: &str) -> Result<Profile> {
     let rest = url.strip_prefix("http://").unwrap_or(url);
     // Split @ for userinfo
-    let (userinfo, hostpart) = rest.split_once('@')
-        .unwrap_or(("", rest));
+    let (userinfo, hostpart) = rest.split_once('@').unwrap_or(("", rest));
     // Split # for fragment (remark)
-    let (hostport, fragment) = hostpart.split_once('#')
+    let (hostport, fragment) = hostpart
+        .split_once('#')
         .map(|(h, f)| (h, Some(f.to_string())))
         .unwrap_or((hostpart, None));
 
-    let (host, port_str) = hostport.rsplit_once(':')
+    let (host, port_str) = hostport
+        .rsplit_once(':')
         .ok_or_else(|| ImportError::Parse("http: missing port".into()))?;
-    let port: i32 = port_str.parse()
+    let port: i32 = port_str
+        .parse()
         .map_err(|_| ImportError::Parse("http: invalid port".into()))?;
 
     let mut profile = base_profile(Protocol::Http, host, port);
@@ -1217,10 +1522,19 @@ fn parse_http(url: &str) -> Result<Profile> {
     if !userinfo.is_empty() {
         let mut ps = serde_json::Map::new();
         if let Some((username, password)) = userinfo.split_once(':') {
-            ps.insert("username".into(), serde_json::Value::String(username.to_string()));
-            ps.insert("password".into(), serde_json::Value::String(password.to_string()));
+            ps.insert(
+                "username".into(),
+                serde_json::Value::String(username.to_string()),
+            );
+            ps.insert(
+                "password".into(),
+                serde_json::Value::String(password.to_string()),
+            );
         } else {
-            ps.insert("username".into(), serde_json::Value::String(userinfo.to_string()));
+            ps.insert(
+                "username".into(),
+                serde_json::Value::String(userinfo.to_string()),
+            );
         }
         profile.protocol_settings = Some(serde_json::to_string(&ps)?);
     }
@@ -1230,11 +1544,21 @@ fn parse_http(url: &str) -> Result<Profile> {
 
 fn format_http(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
-    let (user, pass) = profile.protocol_settings.as_deref()
+    let (user, pass) = profile
+        .protocol_settings
+        .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .map(|v| {
-            let u = v.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string();
-            let p = v.get("password").and_then(|p| p.as_str()).unwrap_or("").to_string();
+            let u = v
+                .get("username")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            let p = v
+                .get("password")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
             (u, p)
         })
         .unwrap_or_default();
@@ -1247,7 +1571,11 @@ fn format_http(profile: &Profile) -> Result<String> {
         format!("{user}:{pass}@")
     };
     let remark = profile.remarks.as_deref().unwrap_or("");
-    let fragment = if remark.is_empty() { String::new() } else { format!("#{remark}") };
+    let fragment = if remark.is_empty() {
+        String::new()
+    } else {
+        format!("#{remark}")
+    };
     Ok(format!("http://{userinfo}{add}:{port}{fragment}"))
 }
 #[cfg(test)]
@@ -1284,7 +1612,10 @@ mod tests {
         let mut p = base_profile(Protocol::Shadowsocks, "ss.example", 1080);
         p.user_id = Some("password123".into());
         let mut ps = serde_json::Map::new();
-        ps.insert("method".into(), serde_json::Value::String("aes-256-gcm".into()));
+        ps.insert(
+            "method".into(),
+            serde_json::Value::String("aes-256-gcm".into()),
+        );
         p.protocol_settings = Some(serde_json::to_string(&ps).unwrap());
         p.remarks = Some("myss".into());
         let url = format_share_url(&p).unwrap();
@@ -1322,6 +1653,9 @@ mod tests {
 
     #[test]
     fn unsupported_scheme() {
-        assert!(matches!(parse_share_url("unknown://x"), Err(ImportError::UnsupportedScheme)));
+        assert!(matches!(
+            parse_share_url("unknown://x"),
+            Err(ImportError::UnsupportedScheme)
+        ));
     }
 }

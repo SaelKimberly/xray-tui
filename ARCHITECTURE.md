@@ -20,7 +20,7 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 ```rust
 pub enum Tab { Profiles, Settings, Routing, Dns, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
-pub enum AppMode { List, AddServer{..}, EditServer{..}, ImportUrl{..} }
+pub enum AppMode { List, AddServer{..}, EditServer{..}, ImportUrl{..}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
 pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
 pub struct LogLine { level: String, message: String }
 
@@ -37,8 +37,8 @@ pub struct AppState {
     pub clipboard: Option<String>,
     pub confirmation: Option<ConfirmAction>,
     pub updating_groups: HashSet<String>,
-    pub sort_column: SortColumn,
-    pub search_query: String,
+    pub testing_profiles: HashSet<String>,
+    pub test_progress: Option<(usize, usize)>,
     pub search_focused: bool,
     pub log_buffer: Vec<LogLine>,
     pub connected_core: Option<CoreType>,
@@ -64,6 +64,8 @@ pub enum CoreEvent {
         total_down: i64,
     },
     SysStatsUpdate(SysStats),
+    SubscriptionsUpdated { group_id, count, error },
+    SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, error },
 }
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
@@ -91,6 +93,20 @@ AppState provides:
 - `settings.rs` — **Placeholder** (Phase 1: "Coming Soon")
 ...
 Future screens (Phase 5+): settings panels, routing editor, log viewer.
+
+**`speed_test.rs`** — Async speed test engine:
+```rust
+pub enum TestType { TcpPing, RealPing, SpeedTest, UdpTest }
+pub enum SpeedTestError { Io, Timeout, Proxy, Http, InvalidAddress }
+pub async fn tcp_ping(addr: &str, port: u16, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
+pub async fn real_ping(proxy: &str, port: u16, url: &str, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
+pub async fn speed_test(proxy: &str, port: u16, url: &str, min_duration: Duration, max_duration: Duration) -> Result<u64, SpeedTestError>;
+pub async fn udp_test(proxy: &str, port: u16, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
+```
+tcp_ping connects directly to the target address. real_ping, speed_test, and udp_test route through the active SOCKS5 proxy.
+Results are sent via CoreEvent::SpeedTestResult and handled in poll_core_events(), which updates the ProfileExtension
+(delay for ping/udp, speed for speed_test) in memory and persists via upsert_profile_extension().
+Batch ping mode deduplicates by (address, port) using the UniqueTarget helper struct.
 
 ### xray-tui-core (library crate)
 

@@ -1,11 +1,11 @@
+use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
-use ratatui::layout::Rect;
 
 use crate::AppState;
-use xray_tui_core::{format_bytes, format_uptime, API_ENDPOINT};
+use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let connected = state.connected_core.is_some();
@@ -80,10 +80,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             format_bytes(sys.alloc as i64),
             format_bytes(sys.sys as i64),
         )));
-        lines.push(Line::from(format!(
-            "  Routines:  {}",
-            sys.num_goroutine,
-        )));
+        lines.push(Line::from(format!("  Routines:  {}", sys.num_goroutine,)));
         lines.push(Line::from(format!(
             "  Uptime:    {}",
             format_uptime(sys.uptime),
@@ -110,17 +107,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("Connected", status_style),
     ]));
 
-    let block = Block::default()
-        .title(" Statistics ")
-        .borders(Borders::ALL);
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let block = Block::default().title(" Statistics ").borders(Borders::ALL);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn render_placeholder(frame: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .title(" Statistics ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Statistics ").borders(Borders::ALL);
     let paragraph = Paragraph::new("No data — connect to a server")
         .block(block)
         .style(Style::default().fg(Color::DarkGray))

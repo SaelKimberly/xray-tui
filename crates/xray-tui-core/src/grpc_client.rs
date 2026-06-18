@@ -33,10 +33,10 @@ pub enum GrpcError {
 #[derive(Debug, Clone, Default)]
 pub struct SysStats {
     pub num_goroutine: u32,
-    pub alloc: u64,        // bytes allocated
-    pub total_alloc: u64,  // cumulative bytes allocated
-    pub sys: u64,          // bytes obtained from OS
-    pub uptime: u32,       // seconds since core start
+    pub alloc: u64,       // bytes allocated
+    pub total_alloc: u64, // cumulative bytes allocated
+    pub sys: u64,         // bytes obtained from OS
+    pub uptime: u32,      // seconds since core start
 }
 
 // ── StatsProvider trait ─────────────────────────────────────────────
@@ -76,8 +76,7 @@ impl XrayGrpcClient {
 #[async_trait]
 impl StatsProvider for XrayGrpcClient {
     async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<proto::Stat>, GrpcError> {
-        let mut client =
-            proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
+        let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
         let response = client
             .query_stats(tonic::Request::new(proto::QueryStatsRequest {
                 pattern: pattern.to_string(),
@@ -90,8 +89,7 @@ impl StatsProvider for XrayGrpcClient {
     }
 
     async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
-        let mut client =
-            proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
+        let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
         let response = client
             .get_sys_stats(tonic::Request::new(proto::SysStatsRequest {}))
             .await?;
@@ -130,8 +128,7 @@ impl SingBoxGrpcClient {
 #[async_trait]
 impl StatsProvider for SingBoxGrpcClient {
     async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<proto::Stat>, GrpcError> {
-        let mut client =
-            proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
+        let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
         let response = client
             .query_stats(tonic::Request::new(proto::QueryStatsRequest {
                 pattern: pattern.to_string(),
@@ -144,8 +141,7 @@ impl StatsProvider for SingBoxGrpcClient {
     }
 
     async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
-        let mut client =
-            proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
+        let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
         let response = client
             .get_sys_stats(tonic::Request::new(proto::SysStatsRequest {}))
             .await?;

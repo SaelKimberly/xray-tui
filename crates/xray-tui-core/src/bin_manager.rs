@@ -34,9 +34,10 @@ pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
             {
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = managed.metadata()
-                    && meta.permissions().mode() & 0o111 != 0 {
-                        return Some(managed);
-                    }
+                    && meta.permissions().mode() & 0o111 != 0
+                {
+                    return Some(managed);
+                }
             }
             #[cfg(not(unix))]
             {
@@ -48,39 +49,40 @@ pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
     // 2. Check PATH via `which` command
     for exe in info.exe_names {
         if let Ok(path) = std::process::Command::new("which").arg(exe).output()
-            && path.status.success() {
-                let path_str = String::from_utf8_lossy(&path.stdout);
-                let trimmed = path_str.trim();
-                if !trimmed.is_empty() {
-                    let p = PathBuf::from(trimmed);
-                    if p.is_file() {
-                        return Some(p);
-                    }
+            && path.status.success()
+        {
+            let path_str = String::from_utf8_lossy(&path.stdout);
+            let trimmed = path_str.trim();
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                if p.is_file() {
+                    return Some(p);
                 }
             }
+        }
     }
 
     None
 }
 
 /// Extract a core binary archive (zip or tar.gz) into the target directory.
-pub fn extract_archive(archive: &Path, _core_type: CoreType, target_dir: &Path) -> Result<(), BinError> {
-    let ext = archive
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+pub fn extract_archive(
+    archive: &Path,
+    _core_type: CoreType,
+    target_dir: &Path,
+) -> Result<(), BinError> {
+    let ext = archive.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let stem = archive
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let stem = archive.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
     // Create target dir
     std::fs::create_dir_all(target_dir)?;
 
     match ext {
         "zip" => extract_zip(archive, target_dir)?,
-        "gz" | "tgz" if stem.ends_with(".tar") || ext == "tgz" => extract_tar_gz(archive, target_dir)?,
+        "gz" | "tgz" if stem.ends_with(".tar") || ext == "tgz" => {
+            extract_tar_gz(archive, target_dir)?
+        }
         _ => {
             return Err(BinError::ExtractionFailed(format!(
                 "Unsupported archive format: .{ext}"

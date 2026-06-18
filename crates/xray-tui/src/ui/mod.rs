@@ -1,16 +1,19 @@
 pub mod add_server;
 pub mod dns;
+pub mod groups;
 pub mod logs;
 pub mod profiles;
 pub mod routing;
 pub mod settings;
 pub mod statistics;
-pub mod groups;
 pub mod status_bar;
 
+use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -18,9 +21,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io;
-use std::time::Duration;
 use std::sync::mpsc;
-use crate::{AppMode, AppState, ConfirmAction, Tab};
+use std::time::Duration;
 
 // ── Entry point ───────────────────────────────────────────────────────
 
@@ -28,8 +30,7 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+:- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 
     let (tx, rx) = mpsc::channel::<Event>();
     std::thread::spawn(move || {
@@ -94,9 +95,14 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 
     // Group form mode: route to groups handler (with Ctrl+C quit)
-    if matches!(&state.mode, crate::AppMode::AddGroup { .. } | crate::AppMode::EditGroup { .. }) {
+    if matches!(
+        &state.mode,
+        crate::AppMode::AddGroup { .. } | crate::AppMode::EditGroup { .. }
+    ) {
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => state.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.should_quit = true
+            }
             _ => groups::handle_key(state, key),
         }
         return;
@@ -131,19 +137,89 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
+    // Speed test menu mode
+    if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
+        match key.code {
+            KeyCode::Up => {
+                if let crate::AppMode::SpeedTestMenu { ref mut selected } = state.mode {
+                    *selected = selected.saturating_sub(1);
+                    // Skip the separator
+                    if *selected == 4 {
+                        *selected = 3;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let crate::AppMode::SpeedTestMenu { ref mut selected } = state.mode {
+                    let max = 7usize;
+                    if *selected < max {
+                        *selected += 1;
+                    }
+                    // Skip the separator
+                    if *selected == 4 {
+                        *selected = 5;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let selected = match &state.mode {
+                    crate::AppMode::SpeedTestMenu { selected } => *selected,
+                    _ => 0,
+                };
+                state.mode = crate::AppMode::List;
+                match selected {
+                    0 => {
+                        if let Some(id) = state.selected_profile_id() {
+                            state.start_tcp_ping(&id);
+                        }
+                    }
+                    1 => {
+                        if let Some(id) = state.selected_profile_id() {
+                            state.start_real_ping(&id);
+                        }
+                    }
+                    2 => {
+                        if let Some(id) = state.selected_profile_id() {
+                            state.start_speed_test(&id);
+                        }
+                    }
+                    3 => {
+                        if let Some(id) = state.selected_profile_id() {
+                            state.start_udp_test(&id);
+                        }
+                    }
+                    5 => {
+                        state.start_batch_ping();
+                    }
+                    6 => {
+                        state.sort_column = SortColumn::Delay;
+                        state.sort_ascending = true;
+                    }
+                    7 => {
+                        state.remove_failed_servers();
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Esc => {
+                state.mode = crate::AppMode::List;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Delete confirmation: only y/n/esc
     if let Some(ref confirm) = state.confirmation {
         match confirm {
-            ConfirmAction::DeleteProfile(_) | ConfirmAction::DeleteGroup(_) => {},
+            ConfirmAction::DeleteProfile(_) | ConfirmAction::DeleteGroup(_) => {}
         }
         match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                match state.confirmation.take() {
-                    Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
-                    Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
-                    None => {}
-                }
-            }
+            KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
+                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
+                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
+                None => {}
+            },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
                 state.confirmation = None;
             }
@@ -156,7 +232,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('q' | 'Q') => {
             state.should_quit = true;
         }
-        KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected_core.is_some() => {
+        KeyCode::Char('C')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected_core.is_some() =>
+        {
             state.disconnect();
         }
 
@@ -164,11 +242,17 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.should_quit = true;
         }
         KeyCode::Tab => {
-            let idx = Tab::ALL.iter().position(|t| *t == state.current_tab).unwrap_or(0);
+            let idx = Tab::ALL
+                .iter()
+                .position(|t| *t == state.current_tab)
+                .unwrap_or(0);
             state.current_tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
         }
         KeyCode::BackTab => {
-            let idx = Tab::ALL.iter().position(|t| *t == state.current_tab).unwrap_or(0);
+            let idx = Tab::ALL
+                .iter()
+                .position(|t| *t == state.current_tab)
+                .unwrap_or(0);
             state.current_tab = if idx == 0 {
                 Tab::ALL[Tab::ALL.len() - 1]
             } else {
@@ -190,13 +274,22 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::End if state.current_tab == Tab::Profiles => {
             state.selected_index = state.filtered_profiles().len().saturating_sub(1);
         }
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
             state.move_profile_up();
         }
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+        KeyCode::Down
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
             state.move_profile_down();
         }
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+        KeyCode::Enter
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
             if let Some(id) = state.selected_profile_id() {
                 state.connect_to_profile(&id);
             }
@@ -215,6 +308,30 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('/') if state.current_tab == Tab::Profiles => {
             state.search_focused = true;
             state.search_query.clear();
+        }
+        // Speed test menu
+        KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
+            state.mode = crate::AppMode::SpeedTestMenu { selected: 0 };
+        }
+        // Cycle sort column
+        KeyCode::Char('o' | 'O') if state.current_tab == Tab::Profiles => {
+            let all = &[
+                SortColumn::Remarks,
+                SortColumn::Address,
+                SortColumn::Port,
+                SortColumn::Delay,
+                SortColumn::Speed,
+                SortColumn::Traffic,
+                SortColumn::ConfigType,
+                SortColumn::Core,
+            ];
+            let current_idx = all
+                .iter()
+                .position(|c| *c == state.sort_column)
+                .unwrap_or(0);
+            let next_idx = (current_idx + 1) % all.len();
+            state.sort_column = all[next_idx];
+            state.sort_ascending = true;
         }
         // CRUD shortcuts (profiles tab)
         KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {
@@ -239,24 +356,38 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.confirmation = Some(ConfirmAction::DeleteProfile(id));
             }
         }
-        KeyCode::Char('c' | 'C') if !key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+        KeyCode::Char('c' | 'C')
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
             if let Some(id) = state.selected_profile_id() {
                 state.clone_profile(&id);
             }
         }
-        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
+        KeyCode::Char('v')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
             state.mode = crate::AppMode::ImportUrl {
                 input: String::new(),
                 error: None,
             };
         }
-        KeyCode::Char('S') if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) && state.current_tab == Tab::Profiles => {
+        KeyCode::Char('S')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT)
+                && state.current_tab == Tab::Profiles =>
+        {
             if let Some(id) = state.selected_profile_id()
-                && let Some(profile) = state.filtered_profiles().iter().find(|r| r.profile.id == id)
-                    && let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile) {
-                        state.clipboard = Some(url);
-                        state.add_log("info", "Share URL copied to clipboard");
-                    }
+                && let Some(profile) = state
+                    .filtered_profiles()
+                    .iter()
+                    .find(|r| r.profile.id == id)
+                && let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile)
+            {
+                state.clipboard = Some(url);
+                state.add_log("info", "Share URL copied to clipboard");
+            }
         }
         KeyCode::Esc => {
             if state.confirmation.is_some() {
@@ -284,6 +415,14 @@ fn render(frame: &mut Frame, state: &AppState) {
     // In form/import mode, render form instead of tabs
     // In form/import/modal mode, render appropriate UI
     if !matches!(state.mode, crate::AppMode::List) {
+        // SpeedTestMenu renders the profiles underneath, then overlays the menu
+        if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
+            render_tabs(frame, chunks[0], state);
+            profiles::render(frame, chunks[1], state);
+            render_speed_test_menu(frame, chunks[1], state);
+            status_bar::render(frame, chunks[2], state);
+            return;
+        }
         match &state.mode {
             crate::AppMode::AddServer { .. } | crate::AppMode::EditServer { .. } => {
                 add_server::render(frame, chunks[1], state);
@@ -320,6 +459,80 @@ fn render(frame: &mut Frame, state: &AppState) {
     status_bar::render(frame, chunks[2], state);
 }
 
+/// Render the speed test menu as a centered overlay.
+fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
+    let menu_items = [
+        "TCP Ping (Selected)",
+        "Real Ping (Selected)",
+        "Speed Test (Selected)",
+        "UDP Test (Selected)",
+        "",
+        "Batch TCP Ping (All Visible)",
+        "Sort by Delay",
+        "Remove Bad Servers",
+    ];
+
+    let selected = match &state.mode {
+        crate::AppMode::SpeedTestMenu { selected } => *selected,
+        _ => return,
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in menu_items.iter().enumerate() {
+        if item.is_empty() {
+            lines.push(Line::from(Span::raw(" ─────")));
+            continue;
+        }
+        let prefix = if i == selected { "► " } else { "  " };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("{prefix}{item}"), style)));
+    }
+
+    // Calculate popup dimensions
+    let item_count = menu_items.len() as u16;
+    let popup_width = 34u16;
+    let popup_height = item_count + 2; // border top/bottom
+
+    let vert_pad = (area.height.saturating_sub(popup_height)) / 2;
+    let horiz_pad = (area.width.saturating_sub(popup_width)) / 2;
+
+    let popup_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(vert_pad),
+            Constraint::Length(popup_height),
+            Constraint::Min(0),
+        ])
+        .split(area)[1];
+
+    let popup_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(horiz_pad),
+            Constraint::Length(popup_width),
+            Constraint::Min(0),
+        ])
+        .split(popup_area)[1];
+
+    let block = Block::default()
+        .title(" Speed Test ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(paragraph, popup_area);
+}
 fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
     let spans: Vec<Span> = Tab::ALL
         .iter()

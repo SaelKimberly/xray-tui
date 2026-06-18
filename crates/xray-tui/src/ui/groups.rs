@@ -1,9 +1,9 @@
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
-use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::{AppMode, AppState, ConfirmAction};
 
@@ -30,59 +30,95 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
     // Table header
     let header = Line::from(vec![
-        Span::styled(" Name ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Name ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("│"),
-        Span::styled(" URL ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " URL ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("│"),
-        Span::styled(" Ena ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Ena ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("│"),
-        Span::styled(" Status ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Status ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("│"),
-        Span::styled(" Last Updated ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Last Updated ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
     frame.render_widget(header, chunks[0]);
 
     // Scrollable group list
     let list_area = chunks[0];
-    let rows: Vec<Line> = state.groups.iter().enumerate().map(|(i, g)| {
-        let name = g.name.as_deref().unwrap_or("unnamed");
-        let url = g.subscription_url.as_deref().unwrap_or("-");
-        let enabled = if g.subscription_enabled.unwrap_or(0) == 1 { "Y" } else { "N" };
-        let status = "idle"; // TODO: look up from subscriptions table
-        let last_up = "-";
+    let rows: Vec<Line> = state
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let name = g.name.as_deref().unwrap_or("unnamed");
+            let url = g.subscription_url.as_deref().unwrap_or("-");
+            let enabled = if g.subscription_enabled.unwrap_or(0) == 1 {
+                "Y"
+            } else {
+                "N"
+            };
+            let status = "idle"; // TODO: look up from subscriptions table
+            let last_up = "-";
 
-        let style = if i == selected {
-            Style::default().bg(Color::Blue).fg(Color::White)
-        } else {
-            Style::default()
-        };
+            let style = if i == selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
 
-        Line::from(vec![
-            Span::styled(format!(" {:<20} │ {:<30} │ {} │ {:<10} │ {}", name, url, enabled, status, last_up), style),
-        ])
-    }).collect();
+            Line::from(vec![Span::styled(
+                format!(
+                    " {:<20} │ {:<30} │ {} │ {:<10} │ {}",
+                    name, url, enabled, status, last_up
+                ),
+                style,
+            )])
+        })
+        .collect();
 
     for (i, row) in rows.iter().enumerate() {
         if i < list_area.height as usize {
-            frame.render_widget(row.clone(), Rect::new(list_area.x, list_area.y + i as u16, list_area.width, 1));
+            frame.render_widget(
+                row.clone(),
+                Rect::new(list_area.x, list_area.y + i as u16, list_area.width, 1),
+            );
         }
     }
 
     // Footer
-    let footer = Paragraph::new(
-        Line::from(Span::styled(
-            " [a] Add  [e] Edit  [d] Delete  [u] Update  [Shift+U] Update All  [Enter] Filter  [Esc] Close ",
-            Style::default().fg(Color::DarkGray),
-        ))
-    );
+    let footer = Paragraph::new(Line::from(Span::styled(
+        " [a] Add  [e] Edit  [d] Delete  [u] Update  [Shift+U] Update All  [Enter] Filter  [Esc] Close ",
+        Style::default().fg(Color::DarkGray),
+    )));
     frame.render_widget(footer, chunks[1]);
 }
 
@@ -95,21 +131,39 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
     frame.render_widget(block, area);
 
     let (fields, focus_index) = match &state.mode {
-        AppMode::AddGroup { fields, focus_index } | AppMode::EditGroup { fields, focus_index, .. } => {
-            (fields.clone(), *focus_index)
+        AppMode::AddGroup {
+            fields,
+            focus_index,
         }
+        | AppMode::EditGroup {
+            fields,
+            focus_index,
+            ..
+        } => (fields.clone(), *focus_index),
         _ => return,
     };
 
-    let keys = ["name", "subscription_url", "user_agent", "update_interval", "core_type"];
+    let keys = [
+        "name",
+        "subscription_url",
+        "user_agent",
+        "update_interval",
+        "core_type",
+    ];
     let max_label_len = keys.iter().map(|k| k.len()).max().unwrap_or(10);
 
     for (i, key) in keys.iter().enumerate() {
-        let value = fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()).unwrap_or("");
+        let value = fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
         let is_focused = i == focus_index;
 
         let label_style = if is_focused {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -129,12 +183,10 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
     }
 
     // Hint
-    let hint = Paragraph::new(
-        Line::from(Span::styled(
-            " Tab/S-Tab: navigate  Enter: save  Esc: cancel ",
-            Style::default().fg(Color::DarkGray),
-        ))
-    );
+    let hint = Paragraph::new(Line::from(Span::styled(
+        " Tab/S-Tab: navigate  Enter: save  Esc: cancel ",
+        Style::default().fg(Color::DarkGray),
+    )));
     frame.render_widget(
         hint,
         Rect::new(inner.x, inner.y + keys.len() as u16, inner.width, 1),
@@ -152,7 +204,9 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Down => {
                     let max = state.groups.len().saturating_sub(1);
-                    if sel < max { sel += 1; }
+                    if sel < max {
+                        sel += 1;
+                    }
                     state.mode = AppMode::ManageGroups { selected: sel };
                 }
                 KeyCode::Char('e' | 'E') => {
@@ -188,10 +242,24 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 _ => {}
             }
         }
-        AppMode::AddGroup { fields, focus_index } | AppMode::EditGroup { fields, focus_index, .. } => {
+        AppMode::AddGroup {
+            fields,
+            focus_index,
+        }
+        | AppMode::EditGroup {
+            fields,
+            focus_index,
+            ..
+        } => {
             let mut flds = fields.clone();
             let mut fi = *focus_index;
-            let keys = ["name", "subscription_url", "user_agent", "update_interval", "core_type"];
+            let keys = [
+                "name",
+                "subscription_url",
+                "user_agent",
+                "update_interval",
+                "core_type",
+            ];
 
             match key.code {
                 KeyCode::Tab => {
@@ -230,10 +298,17 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
             // Update focus index and fields in mode
             match &state.mode {
                 AppMode::AddGroup { .. } => {
-                    state.mode = AppMode::AddGroup { fields: flds, focus_index: fi };
+                    state.mode = AppMode::AddGroup {
+                        fields: flds,
+                        focus_index: fi,
+                    };
                 }
                 AppMode::EditGroup { group_id, .. } => {
-                    state.mode = AppMode::EditGroup { group_id: group_id.clone(), fields: flds, focus_index: fi };
+                    state.mode = AppMode::EditGroup {
+                        group_id: group_id.clone(),
+                        fields: flds,
+                        focus_index: fi,
+                    };
                 }
                 _ => {}
             }

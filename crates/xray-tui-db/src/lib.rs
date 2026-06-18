@@ -1,5 +1,5 @@
-pub mod schema;
 pub mod models;
+pub mod schema;
 
 use std::path::Path;
 
@@ -39,11 +39,14 @@ impl Database {
         schema::create_tables(&self.conn)?;
 
         // Ensure graveyard group exists
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM groups WHERE id = ?1",
-            rusqlite::params![models::GRAVEYARD_GROUP_ID],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM groups WHERE id = ?1",
+                rusqlite::params![models::GRAVEYARD_GROUP_ID],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         if count == 0 {
             self.conn.execute(
                 "INSERT INTO groups (id, name, subscription_enabled) VALUES (?1, ?2, 0)",
@@ -104,7 +107,6 @@ impl TryFrom<&Row<'_>> for Subscription {
     }
 }
 
-
 impl TryFrom<&Row<'_>> for Group {
     type Error = rusqlite::Error;
 
@@ -155,9 +157,9 @@ impl TryFrom<&Row<'_>> for ServerStat {
 
 impl Database {
     pub fn get_all_profiles(&self) -> Result<Vec<Profile>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM profiles ORDER BY sort_order"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM profiles ORDER BY sort_order")?;
         let rows = stmt.query_map([], |row| Profile::try_from(row))?;
         let mut profiles = Vec::new();
         for row in rows {
@@ -167,9 +169,9 @@ impl Database {
     }
 
     pub fn get_profiles_by_group(&self, group_id: &str) -> Result<Vec<Profile>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM profiles WHERE group_id = ?1 ORDER BY sort_order"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM profiles WHERE group_id = ?1 ORDER BY sort_order")?;
         let rows = stmt.query_map([group_id], |row| Profile::try_from(row))?;
         let mut profiles = Vec::new();
         for row in rows {
@@ -179,9 +181,9 @@ impl Database {
     }
 
     pub fn get_all_groups(&self) -> Result<Vec<Group>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM groups ORDER BY sort_order"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM groups ORDER BY sort_order")?;
         let rows = stmt.query_map([], |row| Group::try_from(row))?;
         let mut groups = Vec::new();
         for row in rows {
@@ -190,11 +192,10 @@ impl Database {
         Ok(groups)
     }
 
-
     pub fn get_profile_extension(&self, profile_id: &str) -> Result<Option<ProfileExtension>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM profile_extensions WHERE profile_id = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM profile_extensions WHERE profile_id = ?1")?;
         let mut rows = stmt.query_map([profile_id], |row| ProfileExtension::try_from(row))?;
         match rows.next() {
             Some(Ok(ext)) => Ok(Some(ext)),
@@ -204,9 +205,9 @@ impl Database {
     }
 
     pub fn get_server_stats(&self, profile_id: &str) -> Result<Option<ServerStat>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM server_stats WHERE profile_id = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM server_stats WHERE profile_id = ?1")?;
         let mut rows = stmt.query_map([profile_id], |row| ServerStat::try_from(row))?;
         match rows.next() {
             Some(Ok(stats)) => Ok(Some(stats)),
@@ -273,7 +274,7 @@ impl Database {
             results.push(row?);
         }
         Ok(results)
-}
+    }
     // ── Write methods ─────────────────────────────────────────────────────
 
     pub fn insert_profile(&self, p: &Profile) -> Result<()> {
@@ -302,11 +303,17 @@ impl Database {
         Ok(())
     }
 
-
     pub fn delete_profile(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", rusqlite::params![id])?;
-        self.conn.execute("DELETE FROM server_stats WHERE profile_id = ?1", rusqlite::params![id])?;
-        self.conn.execute("DELETE FROM profiles WHERE id = ?1", rusqlite::params![id])?;
+        self.conn.execute(
+            "DELETE FROM profile_extensions WHERE profile_id = ?1",
+            rusqlite::params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM server_stats WHERE profile_id = ?1",
+            rusqlite::params![id],
+        )?;
+        self.conn
+            .execute("DELETE FROM profiles WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
 
@@ -380,12 +387,14 @@ impl Database {
         Ok(())
     }
 
-
     pub fn update_profile_active(&self, id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
             tx.execute("UPDATE profiles SET is_active = 0 WHERE is_active = 1", [])?;
-            tx.execute("UPDATE profiles SET is_active = 1 WHERE id = ?1", rusqlite::params![id])?;
+            tx.execute(
+                "UPDATE profiles SET is_active = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -396,11 +405,14 @@ impl Database {
         for p in &profiles {
             self.delete_profile(&p.id)?;
         }
-        self.conn.execute("DELETE FROM groups WHERE id = ?1", rusqlite::params![id])?;
+        self.conn
+            .execute("DELETE FROM groups WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
     pub fn get_subscription_by_group(&self, group_id: &str) -> Result<Option<Subscription>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM subscriptions WHERE group_id = ?1 LIMIT 1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM subscriptions WHERE group_id = ?1 LIMIT 1")?;
         let mut rows = stmt.query_map([group_id], |row| Subscription::try_from(row))?;
         match rows.next() {
             Some(Ok(sub)) => Ok(Some(sub)),
@@ -418,7 +430,10 @@ impl Database {
     }
 
     pub fn delete_subscriptions_by_group(&self, group_id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM subscriptions WHERE group_id = ?1", rusqlite::params![group_id])?;
+        self.conn.execute(
+            "DELETE FROM subscriptions WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )?;
         Ok(())
     }
 
@@ -434,11 +449,17 @@ impl Database {
         )?;
         let rows = stmt.query_map([], |row| Group::try_from(row))?;
         let mut groups = Vec::new();
-        for row in rows { groups.push(row?); }
+        for row in rows {
+            groups.push(row?);
+        }
         Ok(groups)
     }
 
-    pub fn subscription_upsert_profiles(&self, _group_id: &str, profiles: &[Profile]) -> Result<()> {
+    pub fn subscription_upsert_profiles(
+        &self,
+        _group_id: &str,
+        profiles: &[Profile],
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut upsert = tx.prepare(
@@ -452,10 +473,25 @@ impl Database {
             )?;
             for p in profiles {
                 upsert.execute(rusqlite::params![
-                    p.id, p.config_type, p.core_type, p.remarks, p.address, p.port,
-                    p.user_id, p.security, p.network, p.stream_settings, p.protocol_settings,
-                    p.is_sub, p.sub_id, p.group_id, p.sub_uid, p.sort_order, p.is_active,
-                    p.created_at, p.updated_at,
+                    p.id,
+                    p.config_type,
+                    p.core_type,
+                    p.remarks,
+                    p.address,
+                    p.port,
+                    p.user_id,
+                    p.security,
+                    p.network,
+                    p.stream_settings,
+                    p.protocol_settings,
+                    p.is_sub,
+                    p.sub_id,
+                    p.group_id,
+                    p.sub_uid,
+                    p.sort_order,
+                    p.is_active,
+                    p.created_at,
+                    p.updated_at,
                 ])?;
             }
         }
@@ -463,7 +499,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn move_orphans_to_graveyard(&self, group_id: &str, active_sub_uids: &[u64], graveyard_id: &str) -> Result<usize> {
+    pub fn move_orphans_to_graveyard(
+        &self,
+        group_id: &str,
+        active_sub_uids: &[u64],
+        graveyard_id: &str,
+    ) -> Result<usize> {
         if active_sub_uids.is_empty() {
             return Ok(self.conn.execute(
                 "UPDATE profiles SET group_id = ?1, updated_at = datetime('now') WHERE group_id = ?2 AND is_sub = 1 AND sub_uid != 0",
@@ -471,10 +512,14 @@ impl Database {
             )?);
         }
         let profiles_in_group: Vec<Profile> = {
-            let mut stmt = self.conn.prepare("SELECT * FROM profiles WHERE group_id = ?1 AND is_sub = 1 AND sub_uid != 0")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM profiles WHERE group_id = ?1 AND is_sub = 1 AND sub_uid != 0",
+            )?;
             let rows = stmt.query_map([group_id], |row| Profile::try_from(row))?;
             let mut v = Vec::new();
-            for row in rows { v.push(row?); }
+            for row in rows {
+                v.push(row?);
+            }
             v
         };
         let mut moved = 0;

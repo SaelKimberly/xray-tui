@@ -1,5 +1,5 @@
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
 
 use crate::protocol::Protocol;
@@ -198,18 +198,22 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 "server": address,
                 "server_port": port
             });
-            if let Some(username) = p_settings.get("username").or_else(|| p_settings.get("user"))
+            if let Some(username) = p_settings
+                .get("username")
+                .or_else(|| p_settings.get("user"))
                 && let Some(u) = username.as_str()
-                    && !u.is_empty() {
-                        out["username"] = json!(u);
-                        if let Some(password) = p_settings
-                            .get("password")
-                            .or_else(|| p_settings.get("pass"))
-                            .and_then(|v| v.as_str())
-                            && !password.is_empty() {
-                                out["password"] = json!(password);
-                            }
-                    }
+                && !u.is_empty()
+            {
+                out["username"] = json!(u);
+                if let Some(password) = p_settings
+                    .get("password")
+                    .or_else(|| p_settings.get("pass"))
+                    .and_then(|v| v.as_str())
+                    && !password.is_empty()
+                {
+                    out["password"] = json!(password);
+                }
+            }
             Ok(out)
         }
         Protocol::Http => {
@@ -219,18 +223,22 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 "server": address,
                 "server_port": port
             });
-            if let Some(username) = p_settings.get("username").or_else(|| p_settings.get("user"))
+            if let Some(username) = p_settings
+                .get("username")
+                .or_else(|| p_settings.get("user"))
                 && let Some(u) = username.as_str()
-                    && !u.is_empty() {
-                        out["username"] = json!(u);
-                        if let Some(password) = p_settings
-                            .get("password")
-                            .or_else(|| p_settings.get("pass"))
-                            .and_then(|v| v.as_str())
-                            && !password.is_empty() {
-                                out["password"] = json!(password);
-                            }
-                    }
+                && !u.is_empty()
+            {
+                out["username"] = json!(u);
+                if let Some(password) = p_settings
+                    .get("password")
+                    .or_else(|| p_settings.get("pass"))
+                    .and_then(|v| v.as_str())
+                    && !password.is_empty()
+                {
+                    out["password"] = json!(password);
+                }
+            }
             Ok(out)
         }
         _ => Err(BuildError::InvalidProfile(format!(
@@ -402,10 +410,7 @@ mod tests {
 
     fn assert_has_standard_outbounds(json: &Value) {
         let outbounds = json["outbounds"].as_array().expect("outbounds array");
-        let tags: Vec<&str> = outbounds
-            .iter()
-            .filter_map(|o| o["tag"].as_str())
-            .collect();
+        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
         assert!(tags.contains(&"direct"), "missing direct");
         assert!(tags.contains(&"block"), "missing block");
     }
@@ -414,8 +419,7 @@ mod tests {
     fn singbox_tuic_config() {
         let profile = test_profile(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "tuic");
@@ -425,10 +429,10 @@ mod tests {
     #[test]
     fn singbox_hysteria2_config() {
         let mut profile = test_profile(Protocol::Hysteria2.to_i32());
-        profile.protocol_settings = Some(r#"{"password": "sekret", "up_mbps": 50, "down_mbps": 200}"#.to_string());
+        profile.protocol_settings =
+            Some(r#"{"password": "sekret", "up_mbps": 50, "down_mbps": 200}"#.to_string());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "hysteria2");
@@ -442,8 +446,7 @@ mod tests {
     fn singbox_shadowsocks_config() {
         let profile = test_profile(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
@@ -453,8 +456,7 @@ mod tests {
     fn singbox_socks_config() {
         let profile = test_profile(Protocol::Socks.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "socks");
@@ -464,8 +466,7 @@ mod tests {
     fn singbox_http_config() {
         let profile = test_profile(Protocol::Http.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "http");
@@ -476,8 +477,7 @@ mod tests {
         let mut profile = test_profile(Protocol::Tuic.to_i32());
         profile.protocol_settings = Some(r#"{"password": "pass123"}"#.to_string());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let proxy = &json["outbounds"].as_array().unwrap()[0];
         assert_eq!(proxy["tls"]["enabled"], true);
@@ -489,8 +489,7 @@ mod tests {
     fn singbox_default_inbound() {
         let profile = test_profile(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 1);
@@ -502,11 +501,13 @@ mod tests {
     fn singbox_experimental_config() {
         let profile = test_profile(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let exp = &json["experimental"]["v2ray_api"];
-        assert_eq!(exp["listen"], format!("127.0.0.1:{}", crate::config_builder::API_PORT));
+        assert_eq!(
+            exp["listen"],
+            format!("127.0.0.1:{}", crate::config_builder::API_PORT)
+        );
         assert_eq!(exp["stats"]["enabled"], true);
     }
 
@@ -546,8 +547,7 @@ mod tests {
             rule_set_url: None,
             sort_order: Some(0),
         }];
-        let config =
-            SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let route = &json["route"];
         assert_eq!(route["rules"].as_array().unwrap().len(), 1);

@@ -227,20 +227,38 @@ mod tests {
     #[test]
     fn from_str_round_trip_all_variants() {
         for variant in [
-            Protocol::Vmess, Protocol::Vless, Protocol::Shadowsocks,
-            Protocol::Shadowsocks2022, Protocol::Socks, Protocol::Http,
-            Protocol::Trojan, Protocol::WireGuard, Protocol::Hysteria2,
-            Protocol::DokodemoDoor, Protocol::Freedom, Protocol::Blackhole,
-            Protocol::Dns, Protocol::Loopback, Protocol::Custom,
-            Protocol::Tuic, Protocol::Hysteria, Protocol::Naive,
-            Protocol::AnyTls, Protocol::ShadowTls, Protocol::Tor,
-            Protocol::Ssh, Protocol::Tailscale, Protocol::ShadowsocksR,
-            Protocol::Redirect, Protocol::TProxy, Protocol::Mixed,
+            Protocol::Vmess,
+            Protocol::Vless,
+            Protocol::Shadowsocks,
+            Protocol::Shadowsocks2022,
+            Protocol::Socks,
+            Protocol::Http,
+            Protocol::Trojan,
+            Protocol::WireGuard,
+            Protocol::Hysteria2,
+            Protocol::DokodemoDoor,
+            Protocol::Freedom,
+            Protocol::Blackhole,
+            Protocol::Dns,
+            Protocol::Loopback,
+            Protocol::Custom,
+            Protocol::Tuic,
+            Protocol::Hysteria,
+            Protocol::Naive,
+            Protocol::AnyTls,
+            Protocol::ShadowTls,
+            Protocol::Tor,
+            Protocol::Ssh,
+            Protocol::Tailscale,
+            Protocol::ShadowsocksR,
+            Protocol::Redirect,
+            Protocol::TProxy,
+            Protocol::Mixed,
         ] {
             let s = variant.to_string();
-            let parsed: Protocol = s.parse().unwrap_or_else(|_| {
-                panic!("failed to parse protocol string: {s}")
-            });
+            let parsed: Protocol = s
+                .parse()
+                .unwrap_or_else(|_| panic!("failed to parse protocol string: {s}"));
             assert_eq!(parsed, variant);
         }
     }
@@ -248,7 +266,10 @@ mod tests {
     #[test]
     fn is_singbox_only_consistency() {
         for variant in SINGBOX_ONLY_PROTOCOLS {
-            assert!(variant.is_singbox_only(), "{variant:?} should be sing-box only");
+            assert!(
+                variant.is_singbox_only(),
+                "{variant:?} should be sing-box only"
+            );
         }
         // Check a few xray-native ones are NOT singbox only
         assert!(!Protocol::Vmess.is_singbox_only());
@@ -267,9 +288,9 @@ mod tests {
             ("shadowsocksr", Protocol::ShadowsocksR),
             ("tproxy", Protocol::TProxy),
         ] {
-            let parsed: Protocol = input.parse().unwrap_or_else(|_| {
-                panic!("failed to parse {input}")
-            });
+            let parsed: Protocol = input
+                .parse()
+                .unwrap_or_else(|_| panic!("failed to parse {input}"));
             assert_eq!(parsed, expected, "compact variant {input}");
         }
     }

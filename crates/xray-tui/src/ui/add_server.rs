@@ -1,12 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
-use xray_tui_core::protocol::Protocol;
+use xray_tui_config::forms::{FieldSection, FormFieldType, form_fields_for};
 use xray_tui_core::SINGBOX_ONLY_PROTOCOLS;
-use xray_tui_config::forms::{form_fields_for, FieldSection, FormFieldType};
+use xray_tui_core::protocol::Protocol;
 
 use crate::{AppMode, AppState};
 
@@ -79,7 +79,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         } => {
             render_form(frame, area, *p, fields, *focus_index, false);
         }
-        AppMode::EditServer { profile_id, fields, focus_index } => {
+        AppMode::EditServer {
+            profile_id,
+            fields,
+            focus_index,
+        } => {
             let proto = state
                 .db
                 .get_profile(profile_id)
@@ -124,12 +128,18 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
 // ── Protocol picker ──────────────────────────────────────────────────────
 
 fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().title("Select Protocol").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Select Protocol")
+        .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let xray_header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let singbox_header_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let xray_header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let singbox_header_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
     let selected_style = Style::default()
         .fg(Color::Black)
         .bg(Color::LightYellow)
@@ -258,7 +268,14 @@ fn render_form(
                     label_style
                 },
             ),
-            Span::styled(value_text, if is_focused { focus_style } else { Style::default() }),
+            Span::styled(
+                value_text,
+                if is_focused {
+                    focus_style
+                } else {
+                    Style::default()
+                },
+            ),
             Span::styled(section_hint, hint_style),
         ];
         lines.push(Line::from(spans));
@@ -280,7 +297,10 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
     let is_import = matches!(&state.mode, AppMode::ImportUrl { .. });
     let is_form = matches!(
         &state.mode,
-        AppMode::AddServer { protocol: Some(_), .. } | AppMode::EditServer { .. }
+        AppMode::AddServer {
+            protocol: Some(_),
+            ..
+        } | AppMode::EditServer { .. }
     );
 
     if is_picker {
@@ -352,10 +372,9 @@ fn handle_import_key(state: &mut AppState, key: &KeyEvent) {
         _ => (None, false),
     };
 
-    if should_import
-        && let Some(url) = url_to_import {
-            state.import_url(&url);
-        }
+    if should_import && let Some(url) = url_to_import {
+        state.import_url(&url);
+    }
 }
 
 fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
@@ -443,8 +462,7 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
 
             match ff.field_type {
                 FormFieldType::Select(options) => {
-                    let current_idx =
-                        options.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                    let current_idx = options.iter().position(|o| *o == val.as_str()).unwrap_or(0);
                     let new_idx = (current_idx + 1) % options.len();
                     val.clear();
                     val.push_str(options[new_idx]);
@@ -477,24 +495,22 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Esc => state.cancel_form(),
-        KeyCode::Left | KeyCode::Right
-            if *focus_index < form_fields.len() => {
-                let ff = &form_fields[*focus_index];
-                if let FormFieldType::Select(options) = ff.field_type {
-                    let (_, ref mut val) = fields[*focus_index];
-                    let current_idx =
-                        options.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                    let new_idx = if key.code == KeyCode::Right {
-                        (current_idx + 1) % options.len()
-                    } else if current_idx == 0 {
-                        options.len() - 1
-                    } else {
-                        current_idx - 1
-                    };
-                    val.clear();
-                    val.push_str(options[new_idx]);
-                }
+        KeyCode::Left | KeyCode::Right if *focus_index < form_fields.len() => {
+            let ff = &form_fields[*focus_index];
+            if let FormFieldType::Select(options) = ff.field_type {
+                let (_, ref mut val) = fields[*focus_index];
+                let current_idx = options.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                let new_idx = if key.code == KeyCode::Right {
+                    (current_idx + 1) % options.len()
+                } else if current_idx == 0 {
+                    options.len() - 1
+                } else {
+                    current_idx - 1
+                };
+                val.clear();
+                val.push_str(options[new_idx]);
             }
+        }
         _ => {}
     }
 }

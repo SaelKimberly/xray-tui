@@ -2,9 +2,9 @@
 
 use std::mem::MaybeUninit;
 
+use crate::import_export::parse_share_url;
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use crate::import_export::parse_share_url;
 
 use xray_tui_db::models::Profile;
 
@@ -102,7 +102,8 @@ impl StreamingDecoder {
         // Save trailing bytes as pending for next call
         #[allow(clippy::needless_range_loop)]
         for i in 0..remainder {
-            self.pending_input[i] = MaybeUninit::new(unsafe { work[aligned_len + i].assume_init() });
+            self.pending_input[i] =
+                MaybeUninit::new(unsafe { work[aligned_len + i].assume_init() });
         }
         self.pending_input_len = remainder;
 
@@ -188,9 +189,11 @@ impl StreamingDecoder {
                 self.state = encoding;
                 Ok(decoded)
             }
-            EncodingState::StdB64 => STANDARD_NO_PAD.decode_to_vec(trimmed)
+            EncodingState::StdB64 => STANDARD_NO_PAD
+                .decode_to_vec(trimmed)
                 .map_err(|e| format!("base64 decode error: {e}")),
-            EncodingState::UrlSafeB64 => URL_SAFE_NO_PAD.decode_to_vec(trimmed)
+            EncodingState::UrlSafeB64 => URL_SAFE_NO_PAD
+                .decode_to_vec(trimmed)
                 .map_err(|e| format!("base64 decode error: {e}")),
             EncodingState::Raw => Ok(data.to_vec()),
         }
@@ -318,33 +321,32 @@ fn process_text_std(data: &[u8]) -> Vec<String> {
 /// (e.g., `vmess://...vless://...trojan://...`).
 #[must_use]
 pub fn subscription_url_split(text: &str) -> Vec<String> {
-    static SCHEMA_AC: once_cell::sync::Lazy<AhoCorasick> =
-        once_cell::sync::Lazy::new(|| {
-            AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .match_kind(aho_corasick::MatchKind::LeftmostFirst)
-                .build([
-                    "vmess://",
-                    "vless://",
-                    "trojan://",
-                    "ss://",
-                    "ssr://",
-                    "hysteria2://",
-                    "hysteria://",
-                    "hy2://",
-                    "hy://",
-                    "tuic://",
-                    "socks://",
-                    "socks5://",
-                    "http://",
-                    "naive+https://",
-                    "naive+quic://",
-                    "anytls://",
-                    "shadowtls://",
-                    "wireguard://",
-                ])
-                .unwrap()
-        });
+    static SCHEMA_AC: once_cell::sync::Lazy<AhoCorasick> = once_cell::sync::Lazy::new(|| {
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+            .build([
+                "vmess://",
+                "vless://",
+                "trojan://",
+                "ss://",
+                "ssr://",
+                "hysteria2://",
+                "hysteria://",
+                "hy2://",
+                "hy://",
+                "tuic://",
+                "socks://",
+                "socks5://",
+                "http://",
+                "naive+https://",
+                "naive+quic://",
+                "anytls://",
+                "shadowtls://",
+                "wireguard://",
+            ])
+            .unwrap()
+    });
 
     let mut last_start: Option<usize> = None;
     let mut chunks = Vec::new();
@@ -425,9 +427,7 @@ mod tests {
     fn test_streaming_decoder_simple() {
         let mut decoder = StreamingDecoder::new();
         // Base64 of "hello\nworld\n"
-        let b64 = base64_simd::STANDARD.encode_to_string(
-            b"vmess://abc123\nvless://def456\n",
-        );
+        let b64 = base64_simd::STANDARD.encode_to_string(b"vmess://abc123\nvless://def456\n");
         let result = decoder.feed(b64.as_bytes()).unwrap();
         assert!(!result.is_empty(), "Should find URLs in decoded data");
     }

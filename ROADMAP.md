@@ -53,15 +53,15 @@
 - ✅ Subscription format detection (base64, plain, v2rayN, sing-box) — streaming decoder with auto-encoding detection
 - ✅ Scheduled auto-update
 
-## Phase 5 — Speed Testing
+## Phase 5 — Speed Testing ✅
 
-- TCP ping (connect timeout test)
-- Real ping (HTTP request through proxy)
-- Speed test (download test through proxy)
-- UDP test
-- Fast batch ping (all servers)
-- Sort by results, remove invalid servers
-- Test result caching in SQLite
+- ✅ TCP ping (connect timeout test)
+- ✅ Real ping (HTTP request through proxy)
+- ✅ Speed test (download test through proxy)
+- ✅ UDP test
+- ✅ Fast batch ping (all servers)
+- ✅ Sort by results, remove invalid servers
+- ✅ Test result caching in SQLite
 
 ## Phase 6 — Settings Panel
 

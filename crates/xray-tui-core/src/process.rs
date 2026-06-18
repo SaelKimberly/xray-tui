@@ -1,4 +1,4 @@
-use crate::bin_manager::{get_core_info, BinError};
+use crate::bin_manager::{BinError, get_core_info};
 use crate::config_builder::BackendConfig;
 use crate::core_type::CoreType;
 use std::path::{Path, PathBuf};
@@ -89,9 +89,10 @@ impl CoreManager {
     ) -> Result<(), ProcessError> {
         // Stop any running core of a different type
         if let Some(running) = &self.current
-            && running.core_type != core_type {
-                self.stop().await?;
-            }
+            && running.core_type != core_type
+        {
+            self.stop().await?;
+        }
 
         let info = get_core_info(core_type)
             .ok_or_else(|| ProcessError::Startup("Unknown core type".to_string()))?;
@@ -109,7 +110,13 @@ impl CoreManager {
         let args: Vec<String> = info
             .args_template
             .split(' ')
-            .map(|part| if part == "{0}" { config_str.clone() } else { part.to_string() })
+            .map(|part| {
+                if part == "{0}" {
+                    config_str.clone()
+                } else {
+                    part.to_string()
+                }
+            })
             .collect();
 
         // Spawn process

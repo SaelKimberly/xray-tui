@@ -95,7 +95,6 @@ fn default_listen() -> String {
     "127.0.0.1".to_owned()
 }
 
-
 pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]

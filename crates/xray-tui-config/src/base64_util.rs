@@ -38,7 +38,9 @@ pub fn decode_base64(data: &str) -> Result<Vec<u8>, base64_simd::Error> {
     let trimmed = data.trim_end_matches(|c: char| c == '=' || c.is_whitespace());
 
     if trimmed.is_empty() {
-        return Err(base64_simd::STANDARD_NO_PAD.decode_to_vec(b"!").unwrap_err());
+        return Err(base64_simd::STANDARD_NO_PAD
+            .decode_to_vec(b"!")
+            .unwrap_err());
     }
 
     'block: {

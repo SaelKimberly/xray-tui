@@ -5,11 +5,15 @@ use std::path::Path;
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use xray_tui_config::AppConfig;
-use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{find_binary, resolve_core, BuildParams, CoreManager, ConfigBuilder, CoreType};
 use xray_tui_core::grpc_client;
-use xray_tui_db::models::{DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat, Subscription, GRAVEYARD_GROUP_ID};
+use xray_tui_core::protocol::Protocol;
+use xray_tui_core::speed_test::TestType;
+use xray_tui_core::{BuildParams, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core};
 use xray_tui_db::Database;
+use xray_tui_db::models::{
+    DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule, ServerStat,
+    Subscription,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -80,9 +84,7 @@ pub enum AppMode {
         error: Option<String>,
     },
     /// Managing subscription groups
-    ManageGroups {
-        selected: usize,
-    },
+    ManageGroups { selected: usize },
     /// Adding a new subscription group
     AddGroup {
         fields: Vec<(String, String)>,
@@ -94,8 +96,9 @@ pub enum AppMode {
         fields: Vec<(String, String)>,
         focus_index: usize,
     },
+    /// Speed test menu overlay
+    SpeedTestMenu { selected: usize },
 }
-
 
 /// Events from the core process manager to the UI event loop.
 #[derive(Debug, Clone)]
@@ -114,6 +117,14 @@ pub enum CoreEvent {
     SubscriptionsUpdated {
         group_id: String,
         count: usize,
+        error: Option<String>,
+    },
+    /// Result from a speed test operation
+    SpeedTestResult {
+        profile_id: String,
+        test_type: TestType,
+        latency_ms: Option<u64>,
+        speed_bps: Option<u64>,
         error: Option<String>,
     },
 }
@@ -150,6 +161,16 @@ pub struct AppState {
     pub clipboard: Option<String>,
     pub confirmation: Option<ConfirmAction>,
     pub updating_groups: HashSet<String>,
+    /// Profile IDs currently being tested
+    pub testing_profiles: HashSet<String>,
+    /// Progress for batch tests: (completed, total)
+    pub test_progress: Option<(usize, usize)>,
+}
+
+/// Internal helper for batch ping deduplication.
+struct UniqueTarget {
+    key: (String, u16),
+    profile_ids: Vec<String>,
 }
 
 impl AppState {
@@ -179,6 +200,8 @@ impl AppState {
             clipboard: None,
             confirmation: None,
             updating_groups: HashSet::new(),
+            testing_profiles: HashSet::new(),
+            test_progress: None,
             system_stats: None,
         };
         state.reload_profiles();
@@ -217,40 +240,48 @@ impl AppState {
     }
 
     pub fn filtered_profiles(&self) -> Vec<&ProfileRow> {
-        let mut filtered: Vec<&ProfileRow> = self.profiles.iter().filter(|row| {
-            // Group filter
-            if let Some(group_id) = &self.selected_group_id
-                && row.profile.group_id.as_deref() != Some(group_id.as_str())
-            {
-                return false;
-            }
-            if !self.search_query.is_empty() {
-                let q = self.search_query.to_lowercase();
-                let remarks = row.profile.remarks.as_deref().unwrap_or("");
-                let address = row.profile.address.as_deref().unwrap_or("");
-                let port = row.profile.port.map(|p| p.to_string()).unwrap_or_default();
-                if !remarks.to_lowercase().contains(&q)
-                    && !address.to_lowercase().contains(&q)
-                    && !port.contains(&q)
+        let mut filtered: Vec<&ProfileRow> = self
+            .profiles
+            .iter()
+            .filter(|row| {
+                // Group filter
+                if let Some(group_id) = &self.selected_group_id
+                    && row.profile.group_id.as_deref() != Some(group_id.as_str())
                 {
                     return false;
                 }
-            }
-            true
-        }).collect();
+                if !self.search_query.is_empty() {
+                    let q = self.search_query.to_lowercase();
+                    let remarks = row.profile.remarks.as_deref().unwrap_or("");
+                    let address = row.profile.address.as_deref().unwrap_or("");
+                    let port = row.profile.port.map(|p| p.to_string()).unwrap_or_default();
+                    if !remarks.to_lowercase().contains(&q)
+                        && !address.to_lowercase().contains(&q)
+                        && !port.contains(&q)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
 
         let asc = self.sort_ascending;
         filtered.sort_by(|a, b| {
             let cmp = match self.sort_column {
                 SortColumn::ConfigType => a.profile.config_type.cmp(&b.profile.config_type),
-                SortColumn::Remarks => {
-                    a.profile.remarks.as_deref().unwrap_or("")
-                        .cmp(b.profile.remarks.as_deref().unwrap_or(""))
-                }
-                SortColumn::Address => {
-                    a.profile.address.as_deref().unwrap_or("")
-                        .cmp(b.profile.address.as_deref().unwrap_or(""))
-                }
+                SortColumn::Remarks => a
+                    .profile
+                    .remarks
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.profile.remarks.as_deref().unwrap_or("")),
+                SortColumn::Address => a
+                    .profile
+                    .address
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.profile.address.as_deref().unwrap_or("")),
                 SortColumn::Port => {
                     let pa = a.profile.port.unwrap_or(0);
                     let pb = b.profile.port.unwrap_or(0);
@@ -267,16 +298,29 @@ impl AppState {
                     sa.cmp(&sb)
                 }
                 SortColumn::Traffic => {
-                    let ta = a.stats.as_ref().map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0)).unwrap_or(0);
-                    let tb = b.stats.as_ref().map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0)).unwrap_or(0);
+                    let ta = a
+                        .stats
+                        .as_ref()
+                        .map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0))
+                        .unwrap_or(0);
+                    let tb = b
+                        .stats
+                        .as_ref()
+                        .map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0))
+                        .unwrap_or(0);
                     ta.cmp(&tb)
                 }
                 SortColumn::Core => {
                     let resolve = |row: &&ProfileRow| -> String {
-                        let protocol = Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
-                        let core = resolve_core(protocol, Some(
-                            CoreType::from_str(&row.profile.core_type).unwrap_or(CoreType::Auto),
-                        ));
+                        let protocol = Protocol::try_from_i32(row.profile.config_type)
+                            .unwrap_or(Protocol::Custom);
+                        let core = resolve_core(
+                            protocol,
+                            Some(
+                                CoreType::from_str(&row.profile.core_type)
+                                    .unwrap_or(CoreType::Auto),
+                            ),
+                        );
                         core.to_string()
                     };
                     resolve(a).cmp(&resolve(b))
@@ -330,7 +374,9 @@ impl AppState {
 
     fn selected_profile_id(&self) -> Option<String> {
         let filtered = self.filtered_profiles();
-        filtered.get(self.selected_index).map(|r| r.profile.id.clone())
+        filtered
+            .get(self.selected_index)
+            .map(|r| r.profile.id.clone())
     }
 
     fn fields_to_profile(&self, protocol: Protocol, fields: &[(String, String)]) -> Profile {
@@ -373,10 +419,16 @@ impl AppState {
                 "security" => profile.security = Some(value.clone()),
                 "network" => profile.network = Some(value.clone()),
                 // Stream settings (dot-separated keys)
-                _ if key.starts_with("tls.") || key.starts_with("ws.") || key.starts_with("grpc.")
-                    || key.starts_with("reality.") || key.starts_with("tcp.")
-                    || *key == "sni" || *key == "alpn" || *key == "fingerprint"
-                    || *key == "allow_insecure" => {
+                _ if key.starts_with("tls.")
+                    || key.starts_with("ws.")
+                    || key.starts_with("grpc.")
+                    || key.starts_with("reality.")
+                    || key.starts_with("tcp.")
+                    || *key == "sni"
+                    || *key == "alpn"
+                    || *key == "fingerprint"
+                    || *key == "allow_insecure" =>
+                {
                     let json_val = if value == "true" {
                         serde_json::Value::Bool(true)
                     } else if value == "false" {
@@ -415,7 +467,11 @@ impl AppState {
 
     pub fn confirm_add_server(&mut self) {
         let (protocol, fields) = match &self.mode {
-            AppMode::AddServer { protocol: Some(p), fields, .. } => (*p, fields.clone()),
+            AppMode::AddServer {
+                protocol: Some(p),
+                fields,
+                ..
+            } => (*p, fields.clone()),
             _ => {
                 self.add_log("error", "Cannot confirm: no protocol selected");
                 return;
@@ -426,14 +482,22 @@ impl AppState {
             self.add_log("error", &format!("Failed to add server: {e}"));
             return;
         }
-        self.add_log("info", &format!("Added server: {}", profile.remarks.as_deref().unwrap_or("unnamed")));
+        self.add_log(
+            "info",
+            &format!(
+                "Added server: {}",
+                profile.remarks.as_deref().unwrap_or("unnamed")
+            ),
+        );
         self.mode = AppMode::List;
         self.reload_profiles();
     }
 
     pub fn confirm_edit_server(&mut self) {
         let (profile_id, fields) = match &self.mode {
-            AppMode::EditServer { profile_id, fields, .. } => (profile_id.clone(), fields.clone()),
+            AppMode::EditServer {
+                profile_id, fields, ..
+            } => (profile_id.clone(), fields.clone()),
             _ => return,
         };
         let mut profile = match self.db.get_profile(&profile_id) {
@@ -501,7 +565,8 @@ impl AppState {
     pub fn import_url(&mut self, url: &str) {
         match xray_tui_config::import_export::parse_share_url(url) {
             Ok(profile) => {
-                let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
+                let protocol =
+                    Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
                 let fields = profile_to_fields(&profile);
                 self.mode = AppMode::AddServer {
                     protocol: Some(protocol),
@@ -533,7 +598,10 @@ impl AppState {
         let prev_id = &filtered[idx - 1].profile.id;
         let a_order = filtered[idx].profile.sort_order.unwrap_or(0);
         let b_order = filtered[idx - 1].profile.sort_order.unwrap_or(0);
-        if let Err(e) = self.db.reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)]) {
+        if let Err(e) = self
+            .db
+            .reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)])
+        {
             self.add_log("error", &format!("Failed to reorder: {e}"));
         }
         self.reload_profiles();
@@ -552,7 +620,10 @@ impl AppState {
         let next_id = &filtered[idx + 1].profile.id;
         let a_order = filtered[idx].profile.sort_order.unwrap_or(0);
         let b_order = filtered[idx + 1].profile.sort_order.unwrap_or(0);
-        if let Err(e) = self.db.reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)]) {
+        if let Err(e) = self
+            .db
+            .reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)])
+        {
             self.add_log("error", &format!("Failed to reorder: {e}"));
         }
         self.reload_profiles();
@@ -585,7 +656,10 @@ impl AppState {
         let protocol = match Protocol::try_from_i32(profile.config_type) {
             Some(p) => p,
             None => {
-                self.add_log("error", &format!("Unknown protocol: {}", profile.config_type));
+                self.add_log(
+                    "error",
+                    &format!("Unknown protocol: {}", profile.config_type),
+                );
                 return;
             }
         };
@@ -644,15 +718,14 @@ impl AppState {
 
         tokio::spawn(async move {
             // 1. Build config
-            let backend_config = match ConfigBuilder::build(
-                &profile, core_type, &params, &routing, &dns,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(CoreEvent::Error(format!("Config build failed: {e}")));
-                    return;
-                }
-            };
+            let backend_config =
+                match ConfigBuilder::build(&profile, core_type, &params, &routing, &dns) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(CoreEvent::Error(format!("Config build failed: {e}")));
+                        return;
+                    }
+                };
 
             // 2. Find binary
             let bin_path = match find_binary(core_type, &bin_dir) {
@@ -760,6 +833,278 @@ impl AppState {
         self.add_log("info", "Disconnected");
     }
 
+    // ── Speed test methods ────────────────────────────────────────
+
+    /// Start TCP ping on the given profile. Returns immediately; result arrives via CoreEvent.
+    pub fn start_tcp_ping(&mut self, profile_id: &str) {
+        if self.testing_profiles.contains(profile_id) {
+            self.add_log("warn", "Test already in progress for this profile");
+            return;
+        }
+
+        // Find the profile and extract address:port
+        let row = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
+            Some(r) => r,
+            None => {
+                self.add_log("error", "Profile not found for TCP ping");
+                return;
+            }
+        };
+        let addr = match &row.profile.address {
+            Some(a) => a.clone(),
+            None => {
+                self.add_log("error", "Profile has no address");
+                return;
+            }
+        };
+        let port = match row.profile.port {
+            Some(p) if p > 0 && p <= 65535 => p as u16,
+            _ => {
+                self.add_log("error", "Profile has invalid port");
+                return;
+            }
+        };
+
+        let tx = match &self.core_event_tx {
+            Some(tx) => tx.clone(),
+            None => {
+                self.add_log("error", "Core event channel not initialized");
+                return;
+            }
+        };
+
+        let pid = profile_id.to_string();
+        self.testing_profiles.insert(pid.clone());
+        let timeout_dur = std::time::Duration::from_secs(5);
+
+        tokio::spawn(async move {
+            let result = xray_tui_core::speed_test::tcp_ping(&addr, port, timeout_dur).await;
+            let (latency_ms, error) = match result {
+                Ok(dur) => (Some(dur.as_millis() as u64), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let _ = tx.send(CoreEvent::SpeedTestResult {
+                profile_id: pid,
+                test_type: TestType::TcpPing,
+                latency_ms,
+                speed_bps: None,
+                error,
+            });
+        });
+    }
+
+    /// Start real ping (HTTP through proxy) on the given profile.
+    pub fn start_real_ping(&mut self, profile_id: &str) {
+        if self.testing_profiles.contains(profile_id) {
+            return;
+        }
+        if self.connected_core.is_none() {
+            self.add_log("warn", "Core not connected — proxy required for real ping");
+            return;
+        }
+        let tx = match &self.core_event_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+        let pid = profile_id.to_string();
+        self.testing_profiles.insert(pid.clone());
+        let proxy_addr = self.config.inbound.listen.clone();
+        let proxy_port = self.config.inbound.socks_port;
+        let test_url = "http://www.gstatic.com/generate_204".to_string();
+        let timeout_dur = std::time::Duration::from_secs(5);
+
+        tokio::spawn(async move {
+            let result = xray_tui_core::speed_test::real_ping(
+                &proxy_addr,
+                proxy_port,
+                &test_url,
+                timeout_dur,
+            )
+            .await;
+            let (latency_ms, error) = match result {
+                Ok(dur) => (Some(dur.as_millis() as u64), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let _ = tx.send(CoreEvent::SpeedTestResult {
+                profile_id: pid,
+                test_type: TestType::RealPing,
+                latency_ms,
+                speed_bps: None,
+                error,
+            });
+        });
+    }
+
+    /// Start speed test (download through proxy) on the given profile.
+    pub fn start_speed_test(&mut self, profile_id: &str) {
+        if self.testing_profiles.contains(profile_id) {
+            return;
+        }
+        if self.connected_core.is_none() {
+            self.add_log("warn", "Core not connected — proxy required for speed test");
+            return;
+        }
+        let tx = match &self.core_event_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+        let pid = profile_id.to_string();
+        self.testing_profiles.insert(pid.clone());
+        let proxy_addr = self.config.inbound.listen.clone();
+        let proxy_port = self.config.inbound.socks_port;
+        let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
+        let min_dur = std::time::Duration::from_secs(3);
+        let max_dur = std::time::Duration::from_secs(10);
+
+        tokio::spawn(async move {
+            let result = xray_tui_core::speed_test::speed_test(
+                &proxy_addr,
+                proxy_port,
+                &test_url,
+                min_dur,
+                max_dur,
+            )
+            .await;
+            let (speed_bps, error) = match result {
+                Ok(bps) => (Some(bps), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let _ = tx.send(CoreEvent::SpeedTestResult {
+                profile_id: pid,
+                test_type: TestType::SpeedTest,
+                latency_ms: None,
+                speed_bps,
+                error,
+            });
+        });
+    }
+
+    /// Start UDP test on the given profile.
+    pub fn start_udp_test(&mut self, profile_id: &str) {
+        if self.testing_profiles.contains(profile_id) {
+            return;
+        }
+        if self.connected_core.is_none() {
+            self.add_log("warn", "Core not connected — proxy required for UDP test");
+            return;
+        }
+        let tx = match &self.core_event_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+        let pid = profile_id.to_string();
+        self.testing_profiles.insert(pid.clone());
+        let proxy_addr = self.config.inbound.listen.clone();
+        let proxy_port = self.config.inbound.socks_port;
+        let timeout_dur = std::time::Duration::from_secs(5);
+
+        tokio::spawn(async move {
+            let result =
+                xray_tui_core::speed_test::udp_test(&proxy_addr, proxy_port, timeout_dur).await;
+            let (latency_ms, error) = match result {
+                Ok(dur) => (Some(dur.as_millis() as u64), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let _ = tx.send(CoreEvent::SpeedTestResult {
+                profile_id: pid,
+                test_type: TestType::UdpTest,
+                latency_ms,
+                speed_bps: None,
+                error,
+            });
+        });
+    }
+
+    /// Batch TCP ping all visible (filtered) profiles, deduplicating by address:port.
+    pub fn start_batch_ping(&mut self) {
+        let visible = self.filtered_profiles();
+        if visible.is_empty() {
+            self.add_log("info", "No profiles to ping");
+            return;
+        }
+
+        let tx = match &self.core_event_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+
+        // Deduplicate: collect unique (address, port) pairs and the profiles that share them
+        let mut unique_targets: Vec<UniqueTarget> = Vec::new();
+        for row in &visible {
+            let addr = match &row.profile.address {
+                Some(a) => a.clone(),
+                None => continue,
+            };
+            let port = match row.profile.port {
+                Some(p) if p > 0 && p <= 65535 => p as u16,
+                _ => continue,
+            };
+            let key = (addr.clone(), port);
+            // Find or create the target
+            match unique_targets.iter_mut().find(|t| t.key == key) {
+                Some(t) => t.profile_ids.push(row.profile.id.clone()),
+                None => unique_targets.push(UniqueTarget {
+                    key,
+                    profile_ids: vec![row.profile.id.clone()],
+                }),
+            }
+        }
+
+        // All testing flags now set after the visible borrow is dropped
+        for target in &unique_targets {
+            for pid in &target.profile_ids {
+                self.testing_profiles.insert(pid.clone());
+            }
+        }
+
+        let total = unique_targets.iter().map(|t| t.profile_ids.len()).sum();
+        self.test_progress = Some((0, total));
+        let timeout_dur = std::time::Duration::from_secs(5);
+
+        tokio::spawn(async move {
+            for target in &unique_targets {
+                let result =
+                    xray_tui_core::speed_test::tcp_ping(&target.key.0, target.key.1, timeout_dur)
+                        .await;
+                let (latency_ms, error) = match result {
+                    Ok(dur) => (Some(dur.as_millis() as u64), None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+
+                for pid in &target.profile_ids {
+                    let _ = tx.send(CoreEvent::SpeedTestResult {
+                        profile_id: pid.clone(),
+                        test_type: TestType::TcpPing,
+                        latency_ms,
+                        speed_bps: None,
+                        error: error.clone(),
+                    });
+                }
+            }
+            // Batch progress is cleared in poll_core_events
+        });
+    }
+    /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
+    pub fn remove_failed_servers(&mut self) {
+        let to_remove: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|r| {
+                r.extension
+                    .as_ref()
+                    .map(|e| e.delay == Some(-1))
+                    .unwrap_or(false)
+            })
+            .map(|r| r.profile.id.clone())
+            .collect();
+        let count = to_remove.len();
+        for id in to_remove {
+            self.delete_profile(&id);
+        }
+        self.multi_select.clear();
+        self.add_log("info", &format!("Removed {count} failed server(s)"));
+    }
+
     /// Poll core event channel and update state accordingly.
     pub fn poll_core_events(&mut self) {
         while let Some(rx) = self.core_event_rx.as_mut() {
@@ -807,14 +1152,22 @@ impl AppState {
                         self.add_log("error", &format!("Failed to save stats: {e}"));
                     }
                     // Update in-memory ProfileRow to avoid full reload
-                    if let Some(row) = self.profiles.iter_mut().find(|r| r.profile.id == profile_id) {
+                    if let Some(row) = self
+                        .profiles
+                        .iter_mut()
+                        .find(|r| r.profile.id == profile_id)
+                    {
                         row.stats = Some(stats);
                     }
                 }
                 CoreEvent::SysStatsUpdate(stats) => {
                     self.system_stats = Some(stats);
                 }
-                CoreEvent::SubscriptionsUpdated { group_id, count, error } => {
+                CoreEvent::SubscriptionsUpdated {
+                    group_id,
+                    count,
+                    error,
+                } => {
                     self.updating_groups.remove(&group_id);
                     if let Some(err) = error {
                         self.add_log("error", &format!("Subscription update failed: {err}"));
@@ -823,6 +1176,83 @@ impl AppState {
                     }
                     self.reload_profiles();
                     self.reload_groups();
+                }
+                CoreEvent::SpeedTestResult {
+                    profile_id,
+                    test_type,
+                    latency_ms,
+                    speed_bps,
+                    error,
+                } => {
+                    self.testing_profiles.remove(&profile_id);
+
+                    // Update profile extension and extract name in a scoped block
+                    // to drop the mutable borrow before further self-method calls.
+                    let name = {
+                        let row = self
+                            .profiles
+                            .iter_mut()
+                            .find(|r| r.profile.id == profile_id);
+                        match row {
+                            Some(row) => {
+                                let ext = row.extension.get_or_insert_with(|| ProfileExtension {
+                                    profile_id: profile_id.clone(),
+                                    delay: None,
+                                    speed: None,
+                                    sort_order: None,
+                                    ip_info: None,
+                                });
+                                match test_type {
+                                    TestType::TcpPing | TestType::RealPing | TestType::UdpTest => {
+                                        ext.delay = latency_ms.map(|v| v as i32);
+                                    }
+                                    TestType::SpeedTest => {
+                                        ext.speed = speed_bps
+                                            .map(|v| std::cmp::min(v, i32::MAX as u64) as i32);
+                                    }
+                                }
+                                let _ = self.db.upsert_profile_extension(ext);
+                                row.profile.remarks.clone().unwrap_or(profile_id.clone())
+                            }
+                            None => profile_id.clone(),
+                        }
+                    };
+
+                    match error {
+                        Some(ref err) => {
+                            self.add_log(
+                                "warn",
+                                &format!("{test_type:?} failed for {name}: {err}"),
+                            );
+                        }
+                        None => {
+                            let latency_str =
+                                latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default();
+                            let speed_str =
+                                speed_bps.map(|bps| format!("{bps}bps")).unwrap_or_default();
+                            let detail = if !speed_str.is_empty() {
+                                speed_str
+                            } else if !latency_str.is_empty() {
+                                latency_str
+                            } else {
+                                "success".to_string()
+                            };
+                            self.add_log("info", &format!("{test_type:?} {name}: {detail}"));
+                        }
+                    }
+
+                    // Update batch progress — use take() to avoid borrowing self.test_progress
+                    if let Some((done, total)) = self.test_progress.take() {
+                        let new_done = done + 1;
+                        if new_done >= total {
+                            self.add_log(
+                                "info",
+                                &format!("Batch complete: {new_done}/{total} profiles tested"),
+                            );
+                        } else {
+                            self.test_progress = Some((new_done, total));
+                        }
+                    }
                 }
             }
         }
@@ -837,22 +1267,38 @@ impl AppState {
             ("update_interval".into(), "1440".into()),
             ("core_type".into(), "auto".into()),
         ];
-        self.mode = AppMode::AddGroup { fields, focus_index: 0 };
+        self.mode = AppMode::AddGroup {
+            fields,
+            focus_index: 0,
+        };
     }
 
     pub fn start_edit_group(&mut self, group_id: &str) {
         let group = match self.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g.clone(),
-            None => { self.add_log("error", "Group not found"); return; }
+            None => {
+                self.add_log("error", "Group not found");
+                return;
+            }
         };
         let fields = vec![
             ("name".into(), group.name.unwrap_or_default()),
-            ("subscription_url".into(), group.subscription_url.unwrap_or_default()),
+            (
+                "subscription_url".into(),
+                group.subscription_url.unwrap_or_default(),
+            ),
             ("user_agent".into(), group.user_agent.unwrap_or_default()),
             ("update_interval".into(), "1440".into()),
-            ("core_type".into(), group.core_type.unwrap_or_else(|| "auto".into())),
+            (
+                "core_type".into(),
+                group.core_type.unwrap_or_else(|| "auto".into()),
+            ),
         ];
-        self.mode = AppMode::EditGroup { group_id: group_id.into(), fields, focus_index: 0 };
+        self.mode = AppMode::EditGroup {
+            group_id: group_id.into(),
+            fields,
+            focus_index: 0,
+        };
     }
 
     pub fn confirm_add_group(&mut self) {
@@ -889,19 +1335,30 @@ impl AppState {
             error_message: None,
         };
         let _ = self.db.upsert_subscription(&sub);
-        self.add_log("info", &format!("Group '{}' added", group.name.as_deref().unwrap_or("unnamed")));
+        self.add_log(
+            "info",
+            &format!(
+                "Group '{}' added",
+                group.name.as_deref().unwrap_or("unnamed")
+            ),
+        );
         self.mode = AppMode::List;
         self.reload_groups();
     }
 
     pub fn confirm_edit_group(&mut self) {
         let (group_id, fields) = match &self.mode {
-            AppMode::EditGroup { group_id, fields, .. } => (group_id.clone(), fields.clone()),
+            AppMode::EditGroup {
+                group_id, fields, ..
+            } => (group_id.clone(), fields.clone()),
             _ => return,
         };
         let mut group = match self.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g.clone(),
-            None => { self.add_log("error", "Group not found"); return; }
+            None => {
+                self.add_log("error", "Group not found");
+                return;
+            }
         };
         group.name = get_field(&fields, "name");
         group.subscription_url = get_field(&fields, "subscription_url");
@@ -942,20 +1399,31 @@ impl AppState {
     // ── Subscription update ──────────────────────────────────────────
 
     pub fn update_group_subscriptions(&mut self, group_id: &str) {
-        if self.updating_groups.contains(group_id) { return; }
+        if self.updating_groups.contains(group_id) {
+            return;
+        }
         let group = match self.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g.clone(),
-            None => { self.add_log("error", "Group not found"); return; }
+            None => {
+                self.add_log("error", "Group not found");
+                return;
+            }
         };
         let url = match &group.subscription_url {
             Some(u) if !u.is_empty() => u.clone(),
-            _ => { self.add_log("warn", "Group has no subscription URL"); return; }
+            _ => {
+                self.add_log("warn", "Group has no subscription URL");
+                return;
+            }
         };
 
         self.updating_groups.insert(group_id.to_string());
         let gid = group_id.to_string();
         let tx = self.core_event_tx.clone();
-        let user_agent = group.user_agent.clone().unwrap_or_else(|| "xray-tui/0.1".into());
+        let user_agent = group
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| "xray-tui/0.1".into());
         let db_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
             .join("xray-tui")
@@ -1008,18 +1476,21 @@ impl AppState {
 
         let now = format_now();
         let mut sub_uids: Vec<u64> = Vec::with_capacity(profiles.len());
-        let enriched: Vec<Profile> = profiles.into_iter().map(|mut p| {
-            p.sub_uid = Some(p.compute_sub_uid() as i64);
-            p.group_id = Some(group_id.clone());
-            p.is_sub = Some(1);
-            p.sub_id = Some(uuid::Uuid::new_v4().to_string());
-            p.updated_at = Some(now.clone());
-            if p.created_at.is_none() {
-                p.created_at = Some(now.clone());
-            }
-            sub_uids.push(p.sub_uid.unwrap_or(0) as u64);
-            p
-        }).collect();
+        let enriched: Vec<Profile> = profiles
+            .into_iter()
+            .map(|mut p| {
+                p.sub_uid = Some(p.compute_sub_uid() as i64);
+                p.group_id = Some(group_id.clone());
+                p.is_sub = Some(1);
+                p.sub_id = Some(uuid::Uuid::new_v4().to_string());
+                p.updated_at = Some(now.clone());
+                if p.created_at.is_none() {
+                    p.created_at = Some(now.clone());
+                }
+                sub_uids.push(p.sub_uid.unwrap_or(0) as u64);
+                p
+            })
+            .collect();
 
         if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched) {
             return (group_id, 0, Some(format!("DB upsert: {e}")));
@@ -1045,10 +1516,12 @@ impl AppState {
     }
 
     pub fn update_all_subscriptions(&mut self) {
-        let group_ids: Vec<String> = self.groups.iter()
+        let group_ids: Vec<String> = self
+            .groups
+            .iter()
             .filter(|g| {
                 g.id != GRAVEYARD_GROUP_ID
-                && g.subscription_url.as_deref().is_some_and(|u| !u.is_empty())
+                    && g.subscription_url.as_deref().is_some_and(|u| !u.is_empty())
             })
             .map(|g| g.id.clone())
             .collect();
@@ -1059,7 +1532,9 @@ impl AppState {
 
     /// Start a background task to check and update subscriptions.
     pub fn spawn_auto_update(&mut self) {
-        let Some(tx) = self.core_event_tx.clone() else { return };
+        let Some(tx) = self.core_event_tx.clone() else {
+            return;
+        };
         let db_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
             .join("xray-tui")
@@ -1088,7 +1563,10 @@ impl AppState {
                         Some(u) => u.clone(),
                         None => continue,
                     };
-                    let ua = group.user_agent.clone().unwrap_or_else(|| "xray-tui/0.1".into());
+                    let ua = group
+                        .user_agent
+                        .clone()
+                        .unwrap_or_else(|| "xray-tui/0.1".into());
                     let gid = group.id.clone();
                     let result = Self::do_update_subscription(url, ua, gid, db_path.clone()).await;
                     let _ = tx.send(CoreEvent::SubscriptionsUpdated {
@@ -1136,34 +1614,36 @@ fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
 
     // Flatten stream_settings into dotted keys
     if let Some(ss) = &profile.stream_settings
-        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ss) {
-            for (k, v) in obj {
-                let val = match &v {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    _ => continue,
-                };
-                fields.push((k, val));
-            }
+        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ss)
+    {
+        for (k, v) in obj {
+            let val = match &v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            fields.push((k, val));
         }
+    }
 
     // Flatten protocol_settings
     if let Some(ps) = &profile.protocol_settings
-        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ps) {
-            for (k, v) in obj {
-                let val = match &v {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    _ => continue,
-                };
-                // Skip duplicates already set explicitly
-                if !fields.iter().any(|(fk, _)| fk == &k) {
-                    fields.push((k, val));
-                }
+        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(ps)
+    {
+        for (k, v) in obj {
+            let val = match &v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            // Skip duplicates already set explicitly
+            if !fields.iter().any(|(fk, _)| fk == &k) {
+                fields.push((k, val));
             }
         }
+    }
 
     fields
 }
@@ -1178,7 +1658,8 @@ fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
 
 /// Get a value from a form field list, returning None if empty or missing.
 pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
-    fields.iter()
+    fields
+        .iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.clone())
         .filter(|v| !v.is_empty())
@@ -1202,7 +1683,9 @@ fn format_now() -> String {
     let mut remaining = days as i64;
     loop {
         let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if remaining < days_in_year { break; }
+        if remaining < days_in_year {
+            break;
+        }
         remaining -= days_in_year;
         y += 1;
     }
@@ -1213,7 +1696,9 @@ fn format_now() -> String {
     };
     let mut m = 1;
     for &md in &month_days {
-        if remaining < md { break; }
+        if remaining < md {
+            break;
+        }
         remaining -= md;
         m += 1;
     }
