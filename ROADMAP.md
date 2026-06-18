@@ -29,7 +29,7 @@
 - ✅ Add server forms per protocol (VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, WireGuard, Hysteria2, Hysteria v1, TUIC, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, Dokodemo-door, Custom)
 - ✅ Core type selector per profile: auto-detect (default), force xray, force sing-box
 - ✅ Edit/delete/clone/copy servers
-- ✅ Share URL import (vmess://, vless://, ss://, trojan://, socks://, hysteria://, hysteria2://, tuic://, naive://, anytls://, shadowtls://, wireguard://)
+- ✅ Share URL import (vmess://, vless://, ss://, trojan://, socks://, hysteria://, hysteria2://, tuic://, naive://, anytls://, shadowtls://, wireguard://, ssr://, http://) — all 14 protocols with fallback chain
 - ✅ Multi-server selection operations
 - ✅ Set default server, move/reorder servers
 ## Phase 3 — Core Integration
@@ -50,7 +50,7 @@
 - Add/edit/delete subscription groups
 - Update all/group subscriptions (HTTP download + parse)
 - Update via proxy
-- Subscription format detection (base64, plain, v2rayN, sing-box)
+- ✅ Subscription format detection (base64, plain, v2rayN, sing-box) — streaming decoder with auto-encoding detection
 - Scheduled auto-update
 
 ## Phase 5 — Speed Testing

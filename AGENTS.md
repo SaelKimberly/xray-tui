@@ -18,9 +18,12 @@ cargo run
 - `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
-- `crates/xray-tui-config/src/lib.rs` — config management
-- `crates/xray-tui-config/src/forms.rs` — per-protocol form field definitions (27 protocols)
-- `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (12 protocols)
+- `crates/xray-tui-config/src/lib.rs` — config management, module registration
+- `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain)
+- `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
+- `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
+- `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
+- `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch
@@ -105,6 +108,11 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - gRPC via `tonic` crate
 - HTTP via `reqwest` crate
 - SQLite via `rusqlite` crate
+- Use `base64-simd` for SIMD-accelerated base64 decode/encode
+- Use `escape8259` for JSON string unescaping
+- Use `memchr` for vectorized byte search
+- Use `simdutf8` for SIMD UTF-8 validation
+- Use `urlencoding` for percent-decoding
 
 ## Verification
 
