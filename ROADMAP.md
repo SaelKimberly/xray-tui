@@ -12,13 +12,17 @@
 - ✅ Shared data models/enums (CoreType, Protocol, resolve_core, 7 model structs)
 - ✅ Workspace builds with `cargo build`, tests pass with `cargo test`, clippy clean
 
-## Phase 1 — TUI Shell
+## Phase 1 — TUI Shell ✅
 
-- Ratatui main layout: tabbed panel structure (Profiles, Settings, Routing, DNS, Logs, Statistics)
-- Profile list DataGrid with sortable columns (type, remarks, address, port, delay, speed, traffic, core)
-- Group/subscription filter strip
-- Status bar shows core type when connected (`[xray]` / `[sing-box]`)
-- Log panel, keyboard shortcuts navigation
+- ✅ Ratatui main layout: tabbed panel structure (Profiles, Settings, Routing, DNS, Logs, Statistics)
+- ✅ Profile list DataGrid with sortable columns (type, remarks, address, port, delay, speed, traffic, core)
+- ✅ Group/subscription filter strip with live client-side search
+- ✅ Status bar showing connection status + key hints (`[Tab] Next  [Ctrl+Q] Quit`)
+- ✅ Tab navigation (Tab/Shift+Tab), profile list navigation (Up/Down/Home/End)
+- ✅ Placeholder screens for Settings, Routing, DNS, Logs, Statistics
+- ✅ DB query methods: get_all_profiles, get_profiles_by_group, get_all_groups, get_profile_extension, get_server_stats, get_all_profiles_with_details
+- ✅ AppState with filtered/sorted profile list
+- ✅ Keyboard shortcuts: q/Ctrl+C quit, / search, Esc clear filter, Tab cycle tabs
 
 ## Phase 2 — Profile CRUD
 

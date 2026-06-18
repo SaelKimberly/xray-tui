@@ -4,10 +4,9 @@
 
 ```
 xray-tui (bin)
-  ├── xray-tui-core
-  │   ├── xray-tui-db
-  │   └── xray-tui-config
-  └── xray-tui-db  (for direct read in some screens)
+  ├── xray-tui-core     (Protocol, CoreType, resolve_core)
+  ├── xray-tui-db       (Database, query methods, models)
+  └── xray-tui-config   (AppConfig load/save)
 ```
 
 ## Crate Responsibilities
@@ -16,25 +15,49 @@ xray-tui (bin)
 
 Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, initializes all subsystems, enters the ratatui event loop.
 
-**Subsystems initialized at startup:**
-- Database connection (via xray-tui-db)
-- App configuration (load from ~/.config/xray-tui/config.json)
-- Core manager (dual-backend process lifecycle)
-- Statistics manager (gRPC stats polling via StatsProvider trait)
-- Task manager (scheduled subscription updates)
-- Log buffer (circular buffer of core output)
+**Shared state** (`crates/xray-tui/src/lib.rs`):
+
+```rust
+pub enum Tab { Profiles, Settings, Routing, Dns, Logs, Statistics }
+pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
+pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
+pub struct LogLine { level: String, message: String }
+
+pub struct AppState {
+    pub db: Database,
+    pub config: AppConfig,
+    pub current_tab: Tab,
+    pub profiles: Vec<ProfileRow>,
+    pub groups: Vec<Group>,
+    pub selected_group_id: Option<String>,
+    pub selected_index: usize,
+    pub sort_column: SortColumn,
+    pub sort_ascending: bool,
+    pub search_query: String,
+    pub search_focused: bool,
+    pub log_buffer: Vec<LogLine>,
+    pub connected_core: Option<CoreType>,
+    pub should_quit: bool,
+}
+```
+
+AppState provides:
+- `filtered_profiles()` — group filter + search filter + sort by column
+- `reload_profiles()` / `reload_groups()` — DB reload
+- `add_log()` — capped circular log buffer (1000 entries)
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
-- `mod.rs` — Main event loop, layout, tab routing
-- `profiles.rs` — Server list DataGrid, group filter, context menu (shows core type badge)
-- `add_server.rs` — Protocol-specific form for adding/editing servers with core type selector
-- `settings.rs` — Settings panel (multi-tab: Core, Inbound, DNS, Policy, GUI)
-- `routing.rs` — Routing rules list + rule editor
-- `dns.rs` — DNS configuration editor
-- `logs.rs` — Real-time log viewer
-- `statistics.rs` — Traffic statistics display per server
-- `subscription.rs` — Subscription management
-- `status_bar.rs` — Bottom status bar strip with connected core indicator
+
+- `mod.rs` — Main event loop, tab rendering, keyboard handler, placeholder renderer
+- `profiles.rs` — Profile list DataGrid with sortable columns, group filter, search bar
+- `status_bar.rs` — Bottom strip: connection indicator + key hints
+- `settings.rs` — **Placeholder** (Phase 1: "Coming Soon")
+- `routing.rs` — **Placeholder** (Phase 1: "Coming Soon")
+- `dns.rs` — **Placeholder** (Phase 1: "Coming Soon")
+- `logs.rs` — **Placeholder** (Phase 1: "Coming Soon")
+- `statistics.rs` — **Placeholder** (Phase 1: "Coming Soon")
+
+Future screens (Phase 2+): `add_server.rs`, `subscription.rs`, settings panels, routing editor, log viewer, statistics panels.
 
 ### xray-tui-core (library crate)
 

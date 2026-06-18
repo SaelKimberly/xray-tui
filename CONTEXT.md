@@ -8,11 +8,11 @@ Feature target: feature parity with v2rayN (C# desktop GUI) for all protocols su
 ```
 xray-tui/
 ├── crates/
-│   ├── xray-tui/          # Binary: ratatui event loop, all screens
+│   ├── xray-tui/          # Binary: ratatui event loop + all screens
+│   │   └── src/ui/         # TUI screen modules (profiles, status_bar, 5 placeholders)
 │   ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
-│   ├── xray-tui-db/       # Library: SQLite persistence layer
+│   ├── xray-tui-db/       # Library: SQLite persistence layer + query methods
 │   └── xray-tui-config/   # Library: import/export format parsers, JSON config management
-├── thirdparty/            # Cloned reference repos (read-only)
 │   ├── Xray-core/         # Source of truth for protocols and behavior
 │   ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
 │   ├── v2rayN/            # Source of truth for UI/UX feature set

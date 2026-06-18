@@ -14,10 +14,17 @@ cargo run
 ## Key Source Files
 
 ### Crate entry points
-- `crates/xray-tui/src/main.rs` — binary entry, runtime init
+- `crates/xray-tui/src/main.rs` — binary entry, tokio::main, subsystem init
+- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
-- `crates/xray-tui-db/src/lib.rs` — database layer
+- `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management
+
+### TUI screens (crates/xray-tui/src/ui/)
+- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing
+- `profiles.rs` — profile list DataGrid with group filter + search
+- `status_bar.rs` — bottom connection indicator + key hints
+- `settings.rs`, `routing.rs`, `dns.rs`, `logs.rs`, `statistics.rs` — placeholder screens
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API
