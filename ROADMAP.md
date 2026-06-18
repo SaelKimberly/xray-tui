@@ -63,17 +63,17 @@
 - ✅ Sort by results, remove invalid servers
 - ✅ Test result caching in SQLite
 
-## Phase 6 — Settings Panel
-
-- Core type/settings, log level
-- Inbound config (SOCKS, HTTP, mixed ports, sniffing)
-- DNS settings (simple + advanced)
-- Routing rules management (add/edit/delete/reorder)
-- GUI settings (language (en/zh), theme, refresh interval)
-- System proxy integration (set/unset HTTP_PROXY)
-- TUN mode config
-- Mux/fragment config
-- Statistics toggle
+## Phase 6 — Settings Panel ✅
+-
+- ✅ Core type/settings, log level
+- ✅ Inbound config (SOCKS, HTTP, mixed ports, sniffing)
+- ✅ DNS settings (simple + advanced)
+- ✅ Routing rules management (add/edit/delete/reorder)
+- ✅ GUI settings (language (en/zh), theme, refresh interval)
+- ✅ System proxy integration (set/unset HTTP_PROXY)
+- ✅ TUN mode config
+- ✅ Mux/fragment config
+- ✅ Statistics toggle
 
 ## Phase 7 — Advanced Features
 

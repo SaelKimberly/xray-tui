@@ -19,21 +19,12 @@ use xray_tui_db::models::{
 pub enum Tab {
     Profiles,
     Settings,
-    Routing,
-    Dns,
     Logs,
     Statistics,
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[
-        Tab::Profiles,
-        Tab::Settings,
-        Tab::Routing,
-        Tab::Dns,
-        Tab::Logs,
-        Tab::Statistics,
-    ];
+    pub const ALL: &[Tab] = &[Tab::Profiles, Tab::Settings, Tab::Logs, Tab::Statistics];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,11 +49,43 @@ pub struct LogLine {
     pub level: String,
     pub message: String,
 }
+
+/// Sub-modes for the Settings panel.
+#[derive(Debug, Clone)]
+pub enum SettingsMode {
+    Menu { selected: usize },
+    CoreForm { fields: Vec<(String, String)>, focus_index: usize },
+    GuiForm { fields: Vec<(String, String)>, focus_index: usize },
+    InboundForm { fields: Vec<(String, String)>, focus_index: usize },
+    RoutingList { selected: usize },
+    RoutingForm { rule_id: Option<String>, fields: Vec<(String, String)>, focus_index: usize },
+    DnsForm { fields: Vec<(String, String)>, focus_index: usize },
+    SystemProxyForm { fields: Vec<(String, String)>, focus_index: usize },
+    TunForm { fields: Vec<(String, String)>, focus_index: usize },
+    MuxForm { fields: Vec<(String, String)>, focus_index: usize },
+    StatsForm { fields: Vec<(String, String)>, focus_index: usize },
+}
+
+/// Identifies which section of the Settings panel is being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    Core,
+    Gui,
+    Inbound,
+    Routing,
+    Dns,
+    SystemProxy,
+    Tun,
+    Mux,
+    Stats,
+}
 /// Tracks what the UI is currently showing.
 #[derive(Debug, Clone)]
 pub enum AppMode {
     /// The main profile list
     List,
+    /// Settings panel (menu or sub-form)
+    Settings { mode: SettingsMode },
     /// Adding a new server
     AddServer {
         /// Selected protocol (None while protocol picker shown)
@@ -533,6 +556,278 @@ impl AppState {
 
     pub fn cancel_form(&mut self) {
         self.mode = AppMode::List;
+    }
+
+    // ── Settings helpers ──────────────────────────────────────────────────
+
+    pub fn enter_settings(&mut self) {
+        self.mode = AppMode::Settings {
+            mode: SettingsMode::Menu { selected: 0 },
+        };
+    }
+
+    fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
+        use crate::SettingsSection::*;
+        match section {
+            Core => {
+                vec![
+                    ("xray_path".into(), self.config.core.xray_path.clone().unwrap_or_default()),
+                    ("sing_box_path".into(), self.config.core.sing_box_path.clone().unwrap_or_default()),
+                    ("default_core".into(), format!("{:?}", self.config.core.core_type.unwrap_or(xray_tui_core::CoreType::Auto))),
+                    ("log_level".into(), self.config.core.log_level.clone()),
+                ]
+            }
+            Gui => {
+                vec![
+                    ("language".into(), self.config.gui.language.clone()),
+                    ("theme".into(), self.config.gui.theme.clone().unwrap_or_default()),
+                    ("refresh_interval".into(), self.config.gui.refresh_interval_secs.to_string()),
+                ]
+            }
+            Inbound => {
+                vec![
+                    ("socks_port".into(), self.config.inbound.socks_port.to_string()),
+                    ("http_port".into(), self.config.inbound.http_port.map(|p| p.to_string()).unwrap_or_default()),
+                    ("mixed_port".into(), self.config.inbound.mixed_port.map(|p| p.to_string()).unwrap_or_default()),
+                    ("listen".into(), self.config.inbound.listen.clone()),
+                    ("sniffing".into(), if self.config.inbound.sniffing { "true".into() } else { "false".into() }),
+                ]
+            }
+            Dns => {
+                if let Ok(Some(dns)) = self.db.get_dns_settings() {
+                    vec![
+                        ("servers".into(), dns.servers.unwrap_or_default()),
+                        ("hosts".into(), dns.hosts.unwrap_or_default()),
+                        ("query_strategy".into(), dns.query_strategy.unwrap_or_default()),
+                        ("disable_cache".into(), if dns.disable_cache.unwrap_or(0) != 0 { "true".into() } else { "false".into() }),
+                        ("disable_fallback".into(), if dns.disable_fallback.unwrap_or(0) != 0 { "true".into() } else { "false".into() }),
+                        ("client_ip".into(), dns.client_ip.unwrap_or_default()),
+                    ]
+                } else {
+                    vec![
+                        ("servers".into(), String::new()),
+                        ("hosts".into(), String::new()),
+                        ("query_strategy".into(), String::new()),
+                        ("disable_cache".into(), "false".into()),
+                        ("disable_fallback".into(), "false".into()),
+                        ("client_ip".into(), String::new()),
+                    ]
+                }
+            }
+            SystemProxy => {
+                vec![
+                    ("enabled".into(), if self.config.system_proxy.enabled { "true".into() } else { "false".into() }),
+                    ("http_port".into(), self.config.system_proxy.http_port.map(|p| p.to_string()).unwrap_or_default()),
+                    ("socks_port".into(), self.config.system_proxy.socks_port.map(|p| p.to_string()).unwrap_or_default()),
+                    ("bypass".into(), self.config.system_proxy.bypass.clone().unwrap_or_default()),
+                ]
+            }
+            Tun => {
+                vec![
+                    ("enabled".into(), if self.config.tun.enabled { "true".into() } else { "false".into() }),
+                    ("interface_name".into(), self.config.tun.interface_name.clone().unwrap_or_default()),
+                    ("mtu".into(), self.config.tun.mtu.map(|v| v.to_string()).unwrap_or_default()),
+                ]
+            }
+            Mux => {
+                vec![
+                    ("enabled".into(), if self.config.mux.enabled { "true".into() } else { "false".into() }),
+                    ("concurrency".into(), self.config.mux.concurrency.map(|v| v.to_string()).unwrap_or_default()),
+                    ("fragment_enabled".into(), if self.config.mux.fragment_enabled { "true".into() } else { "false".into() }),
+                    ("fragment_packets".into(), self.config.mux.fragment_packets.clone().unwrap_or_default()),
+                    ("fragment_length".into(), self.config.mux.fragment_length.clone().unwrap_or_default()),
+                    ("fragment_interval".into(), self.config.mux.fragment_interval.clone().unwrap_or_default()),
+                ]
+            }
+            Stats => {
+                vec![
+                    ("enabled".into(), if self.config.statistics.enabled { "true".into() } else { "false".into() }),
+                ]
+            }
+            Routing => {
+                // Not a form — uses list/edit overlay
+                vec![]
+            }
+        }
+    }
+
+    fn apply_settings_fields(&mut self, section: SettingsSection, fields: &[(String, String)]) {
+        use crate::SettingsSection::*;
+        let get = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+        let get_opt = |key: &str| {
+            let v = get(key);
+            if v.is_empty() { None } else { Some(v) }
+        };
+        match section {
+            Core => {
+                self.config.core.xray_path = get_opt("xray_path");
+                self.config.core.sing_box_path = get_opt("sing_box_path");
+                let core_str = get("default_core");
+                self.config.core.core_type = if core_str.is_empty() || core_str == "Auto" {
+                    None
+                } else {
+                    core_str.parse::<xray_tui_core::CoreType>().ok()
+                };
+                if !get("log_level").is_empty() {
+                    self.config.core.log_level = get("log_level");
+                }
+            }
+            Gui => {
+                self.config.gui.language = get("language");
+                self.config.gui.theme = get_opt("theme");
+                if let Ok(v) = get("refresh_interval").parse::<u64>() {
+                    self.config.gui.refresh_interval_secs = v;
+                }
+            }
+            Inbound => {
+                if let Ok(v) = get("socks_port").parse::<u16>() {
+                    self.config.inbound.socks_port = v;
+                }
+                self.config.inbound.http_port = get("http_port").parse::<u16>().ok();
+                self.config.inbound.mixed_port = get("mixed_port").parse::<u16>().ok();
+                if !get("listen").is_empty() {
+                    self.config.inbound.listen = get("listen");
+                }
+                self.config.inbound.sniffing = get("sniffing") == "true";
+            }
+            SystemProxy => {
+                self.config.system_proxy.enabled = get("enabled") == "true";
+                self.config.system_proxy.http_port = get("http_port").parse::<u16>().ok();
+                self.config.system_proxy.socks_port = get("socks_port").parse::<u16>().ok();
+                self.config.system_proxy.bypass = get_opt("bypass");
+            }
+            Tun => {
+                self.config.tun.enabled = get("enabled") == "true";
+                self.config.tun.interface_name = get_opt("interface_name");
+                self.config.tun.mtu = get("mtu").parse::<u16>().ok();
+            }
+            Mux => {
+                self.config.mux.enabled = get("enabled") == "true";
+                self.config.mux.concurrency = get("concurrency").parse::<u8>().ok();
+                self.config.mux.fragment_enabled = get("fragment_enabled") == "true";
+                self.config.mux.fragment_packets = get_opt("fragment_packets");
+                self.config.mux.fragment_length = get_opt("fragment_length");
+                self.config.mux.fragment_interval = get_opt("fragment_interval");
+            }
+            Stats => {
+                self.config.statistics.enabled = get("enabled") == "true";
+            }
+            // Dns and Routing are handled separately (DB-backed)
+            Dns | Routing => {}
+        }
+    }
+
+    pub fn enter_settings_form(&mut self, section: SettingsSection) {
+        let fields = self.build_settings_fields(section);
+        let mode = match section {
+            SettingsSection::Core => SettingsMode::CoreForm { fields, focus_index: 0 },
+            SettingsSection::Gui => SettingsMode::GuiForm { fields, focus_index: 0 },
+            SettingsSection::Inbound => SettingsMode::InboundForm { fields, focus_index: 0 },
+            SettingsSection::Routing => SettingsMode::RoutingList { selected: 0 },
+            SettingsSection::Dns => SettingsMode::DnsForm { fields, focus_index: 0 },
+            SettingsSection::SystemProxy => SettingsMode::SystemProxyForm { fields, focus_index: 0 },
+            SettingsSection::Tun => SettingsMode::TunForm { fields, focus_index: 0 },
+            SettingsSection::Mux => SettingsMode::MuxForm { fields, focus_index: 0 },
+            SettingsSection::Stats => SettingsMode::StatsForm { fields, focus_index: 0 },
+        };
+        self.mode = AppMode::Settings { mode };
+    }
+
+    pub fn save_settings_form(&mut self, section: SettingsSection, fields: &[(String, String)]) {
+        self.apply_settings_fields(section, fields);
+        if let Err(e) = self.config.save() {
+            self.add_log("error", &format!("Failed to save config: {e}"));
+        } else {
+            self.add_log("info", "Settings saved");
+        }
+        self.enter_settings();
+    }
+
+    pub fn save_routing_rule(&mut self, rule_id: Option<String>, fields: &[(String, String)]) {
+        let id = rule_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let get = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+        let get_opt = |key: &str| {
+            let v = get(key);
+            if v.is_empty() { None } else { Some(v) }
+        };
+        let rule = RoutingRule {
+            id,
+            group_id: None,
+            r#type: get("type").parse::<i32>().unwrap_or(0),
+            domain_matcher: get_opt("domain_matcher"),
+            domains: get_opt("domains"),
+            ips: get_opt("ips"),
+            inbound_tags: get_opt("inbound_tags"),
+            port: get_opt("port"),
+            source_ports: get_opt("source_ports"),
+            network: get_opt("network"),
+            protocols: get_opt("protocols"),
+            domain_strategy: get_opt("domain_strategy"),
+            outbound_tag: get_opt("outbound_tag"),
+            balancer_tag: get_opt("balancer_tag"),
+            rule_set_file: get_opt("rule_set_file"),
+            rule_set_url: get_opt("rule_set_url"),
+            sort_order: None,
+        };
+        let result = if rule_id.is_some() {
+            self.db.update_routing_rule(&rule)
+        } else {
+            self.db.insert_routing_rule(&rule)
+        };
+        match result {
+            Ok(()) => self.add_log("info", "Routing rule saved"),
+            Err(e) => self.add_log("error", &format!("Failed to save routing rule: {e}")),
+        }
+    }
+
+    pub fn save_dns_settings(&mut self, fields: &[(String, String)]) {
+        let id = self
+            .db
+            .get_dns_settings()
+            .ok()
+            .flatten()
+            .map(|d| d.id)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let get = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+        let get_opt = |key: &str| {
+            let v = get(key);
+            if v.is_empty() { None } else { Some(v) }
+        };
+        let dns = DnsSetting {
+            id,
+            name: None,
+            servers: get_opt("servers"),
+            hosts: get_opt("hosts"),
+            query_strategy: get_opt("query_strategy"),
+            disable_cache: Some(if get("disable_cache") == "true" { 1 } else { 0 }),
+            disable_fallback: Some(if get("disable_fallback") == "true" { 1 } else { 0 }),
+            client_ip: get_opt("client_ip"),
+        };
+        match self.db.upsert_dns_settings(&dns) {
+            Ok(()) => self.add_log("info", "DNS settings saved"),
+            Err(e) => self.add_log("error", &format!("Failed to save DNS settings: {e}")),
+        }
     }
 
     pub fn delete_profile(&mut self, id: &str) {

@@ -10,6 +10,14 @@ pub struct AppConfig {
     pub gui: GuiConfig,
     #[serde(default)]
     pub inbound: InboundConfig,
+    #[serde(default)]
+    pub tun: TunConfig,
+    #[serde(default)]
+    pub mux: MuxConfig,
+    #[serde(default)]
+    pub system_proxy: SystemProxyConfig,
+    #[serde(default)]
+    pub statistics: StatisticsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +91,53 @@ impl Default for InboundConfig {
             mixed_port: None,
             listen: default_listen(),
             sniffing: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TunConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub interface_name: Option<String>,
+    pub mtu: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MuxConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub concurrency: Option<u8>,
+    #[serde(default)]
+    pub fragment_enabled: bool,
+    pub fragment_packets: Option<String>,
+    pub fragment_length: Option<String>,
+    pub fragment_interval: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub http_port: Option<u16>,
+    pub socks_port: Option<u16>,
+    pub bypass: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatisticsConfig {
+    #[serde(default = "default_stats_enabled")]
+    pub enabled: bool,
+}
+
+fn default_stats_enabled() -> bool {
+    true
+}
+
+impl Default for StatisticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stats_enabled(),
         }
     }
 }

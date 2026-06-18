@@ -8,7 +8,7 @@ Feature target: feature parity with v2rayN (C# desktop GUI) for all protocols su
 ```
 xray-tui/
 ├── xray-tui/          # Binary: ratatui event loop + all screens
-│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, statistics, groups, 4 placeholders)
+│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, settings, groups, logs, statistics)
 ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
 ├── xray-tui-db/       # Library: SQLite persistence layer + query methods
 ├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management
@@ -43,7 +43,7 @@ xray-tui/
 | **Subscription group** | A named group of proxy profiles fetched from a subscription URL |
 | **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update |
 | **Graveyard** | Destination group (`sub-graveyard`) for orphaned subscription profiles; purged after 24h |
-| **AppMode** | Application mode enum (List / AddServer / EditServer / ImportUrl / ManageGroups / AddGroup / EditGroup / SpeedTestMenu) — controls which screen renders |
+| **AppMode** | Application mode enum (List / Settings / AddServer / EditServer / ImportUrl / ManageGroups / AddGroup / EditGroup / SpeedTestMenu) — controls which screen renders. Settings variant opens the full settings panel with sub-modes (Menu, config forms, routing list/form, DNS form). |
 | **Transport** | The network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around the transport |
 | **Config Type** | The proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |

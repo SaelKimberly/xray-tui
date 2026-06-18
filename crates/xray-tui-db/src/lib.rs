@@ -57,7 +57,7 @@ impl Database {
     }
 }
 
-use models::{Group, Profile, ProfileExtension, ServerStat, Subscription};
+use models::{Group, Profile, ProfileExtension, RoutingRule, DnsSetting, ServerStat, Subscription};
 use rusqlite::Row;
 
 // ── Row conversion impls ──────────────────────────────────────────────
@@ -149,6 +149,49 @@ impl TryFrom<&Row<'_>> for ServerStat {
             total_up: row.get("total_up")?,
             total_down: row.get("total_down")?,
             last_updated: row.get("last_updated")?,
+        })
+    }
+}
+
+impl TryFrom<&Row<'_>> for RoutingRule {
+    type Error = rusqlite::Error;
+
+    fn try_from(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("id")?,
+            group_id: row.get("group_id")?,
+            r#type: row.get("type")?,
+            domain_matcher: row.get("domain_matcher")?,
+            domains: row.get("domains")?,
+            ips: row.get("ips")?,
+            inbound_tags: row.get("inbound_tags")?,
+            port: row.get("port")?,
+            source_ports: row.get("source_ports")?,
+            network: row.get("network")?,
+            protocols: row.get("protocols")?,
+            domain_strategy: row.get("domain_strategy")?,
+            outbound_tag: row.get("outbound_tag")?,
+            balancer_tag: row.get("balancer_tag")?,
+            rule_set_file: row.get("rule_set_file")?,
+            rule_set_url: row.get("rule_set_url")?,
+            sort_order: row.get("sort_order")?,
+        })
+    }
+}
+
+impl TryFrom<&Row<'_>> for DnsSetting {
+    type Error = rusqlite::Error;
+
+    fn try_from(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("id")?,
+            name: row.get("name")?,
+            servers: row.get("servers")?,
+            hosts: row.get("hosts")?,
+            query_strategy: row.get("query_strategy")?,
+            disable_cache: row.get("disable_cache")?,
+            disable_fallback: row.get("disable_fallback")?,
+            client_ip: row.get("client_ip")?,
         })
     }
 }
@@ -542,4 +585,87 @@ impl Database {
         )?;
         Ok(count)
     }
+
+    // ── Routing rules ──────────────────────────────────────────────────
+
+    pub fn get_all_routing_rules(&self) -> Result<Vec<RoutingRule>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM routing_rules ORDER BY sort_order")?;
+        let rows = stmt.query_map([], |row| RoutingRule::try_from(row))?;
+        let mut rules = Vec::new();
+        for row in rows {
+            rules.push(row?);
+        }
+        Ok(rules)
+    }
+
+    pub fn insert_routing_rule(&self, r: &RoutingRule) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO routing_rules (id, group_id, type, domain_matcher, domains, ips, inbound_tags, port, source_ports, network, protocols, domain_strategy, outbound_tag, balancer_tag, rule_set_file, rule_set_url, sort_order) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            rusqlite::params![
+                r.id, r.group_id, r.r#type, r.domain_matcher, r.domains, r.ips,
+                r.inbound_tags, r.port, r.source_ports, r.network, r.protocols,
+                r.domain_strategy, r.outbound_tag, r.balancer_tag, r.rule_set_file,
+                r.rule_set_url, r.sort_order,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_routing_rule(&self, r: &RoutingRule) -> Result<()> {
+        self.conn.execute(
+            "UPDATE routing_rules SET group_id=?1, type=?2, domain_matcher=?3, domains=?4, ips=?5, inbound_tags=?6, port=?7, source_ports=?8, network=?9, protocols=?10, domain_strategy=?11, outbound_tag=?12, balancer_tag=?13, rule_set_file=?14, rule_set_url=?15, sort_order=?16 WHERE id=?17",
+            rusqlite::params![
+                r.group_id, r.r#type, r.domain_matcher, r.domains, r.ips,
+                r.inbound_tags, r.port, r.source_ports, r.network, r.protocols,
+                r.domain_strategy, r.outbound_tag, r.balancer_tag, r.rule_set_file,
+                r.rule_set_url, r.sort_order, r.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_routing_rule(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM routing_rules WHERE id = ?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    pub fn reorder_routing_rules(&self, ids: &[(String, i32)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE routing_rules SET sort_order = ?1 WHERE id = ?2")?;
+            for (id, order) in ids {
+                stmt.execute(rusqlite::params![order, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── DNS settings ───────────────────────────────────────────────────
+
+    pub fn get_dns_settings(&self) -> Result<Option<DnsSetting>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM dns_settings LIMIT 1")?;
+        let mut rows = stmt.query_map([], |row| DnsSetting::try_from(row))?;
+        match rows.next() {
+            Some(Ok(dns)) => Ok(Some(dns)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_dns_settings(&self, dns: &DnsSetting) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO dns_settings (id, name, servers, hosts, query_strategy, disable_cache, disable_fallback, client_ip) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![dns.id, dns.name, dns.servers, dns.hosts, dns.query_strategy, dns.disable_cache, dns.disable_fallback, dns.client_ip],
+        )?;
+        Ok(())
+    }
 }
+
+

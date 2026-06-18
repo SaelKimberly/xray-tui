@@ -15,7 +15,7 @@ cargo run
 
 ### Crate entry points
 - `crates/xray-tui/src/main.rs` — binary entry, tokio::main, subsystem init
-- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine
+- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode, SettingsSection
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
@@ -29,11 +29,14 @@ cargo run
 - `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping, speed test, UDP test, batch ping) using tokio + reqwest SOCKS5 proxy
 
 ### TUI screens (crates/xray-tui/src/ui/)
-:- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
+- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 - `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
+- `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics), routing rules list+form, reorder. Full rewrite Phase 6.
 - `status_bar.rs` — bottom connection indicator + key hints
 - `groups.rs` — subscription group list overlay, add/edit form
+- `logs.rs` — log viewer
+- `statistics.rs` — live traffic and system stats display
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API

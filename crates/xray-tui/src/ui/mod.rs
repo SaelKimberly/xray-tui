@@ -1,9 +1,7 @@
 pub mod add_server;
-pub mod dns;
 pub mod groups;
 pub mod logs;
 pub mod profiles;
-pub mod routing;
 pub mod settings;
 pub mod statistics;
 pub mod status_bar;
@@ -30,8 +28,8 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-:- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let (tx, rx) = mpsc::channel::<Event>();
     std::thread::spawn(move || {
         while let Ok(ev) = event::read() {
@@ -104,6 +102,17 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.should_quit = true
             }
             _ => groups::handle_key(state, key),
+        }
+        return;
+    }
+
+    // Settings mode: route to settings handler (with Ctrl+C quit)
+    if matches!(&state.mode, crate::AppMode::Settings { .. }) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.should_quit = true;
+            }
+            _ => settings::handle_key(state, key),
         }
         return;
     }
@@ -300,6 +309,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.set_active(&id);
             }
         }
+        KeyCode::Enter if state.current_tab == Tab::Settings => {
+            state.enter_settings();
+        }
         KeyCode::Char(' ') if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
                 state.toggle_multi_select(&id);
@@ -439,6 +451,10 @@ fn render(frame: &mut Frame, state: &AppState) {
             crate::AppMode::EditGroup { .. } => {
                 groups::render_group_form(frame, chunks[1], state, true);
             }
+            crate::AppMode::Settings { .. } => {
+                render_tabs(frame, chunks[0], state);
+                settings::render(frame, chunks[1], state);
+            }
             _ => {}
         }
         status_bar::render(frame, chunks[2], state);
@@ -450,8 +466,6 @@ fn render(frame: &mut Frame, state: &AppState) {
     match state.current_tab {
         Tab::Profiles => profiles::render(frame, chunks[1], state),
         Tab::Settings => settings::render(frame, chunks[1], state),
-        Tab::Routing => routing::render(frame, chunks[1], state),
-        Tab::Dns => dns::render(frame, chunks[1], state),
         Tab::Logs => logs::render(frame, chunks[1], state),
         Tab::Statistics => statistics::render(frame, chunks[1], state),
     }
@@ -540,8 +554,6 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
             let name = match tab {
                 Tab::Profiles => " Profiles ",
                 Tab::Settings => " Settings ",
-                Tab::Routing => " Routing ",
-                Tab::Dns => " DNS ",
                 Tab::Logs => " Logs ",
                 Tab::Statistics => " Statistics ",
             };

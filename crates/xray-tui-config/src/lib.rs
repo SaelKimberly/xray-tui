@@ -6,4 +6,7 @@ pub mod import_export;
 pub mod permissive_json;
 pub mod subscription;
 
-pub use app_config::AppConfig;
+pub use app_config::{
+    AppConfig, CoreConfig, GuiConfig, InboundConfig, MuxConfig, StatisticsConfig,
+    SystemProxyConfig, TunConfig,
+};

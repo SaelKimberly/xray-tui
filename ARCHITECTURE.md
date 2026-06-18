@@ -18,9 +18,9 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 **Shared state** (`crates/xray-tui/src/lib.rs`):
 
 ```rust
-pub enum Tab { Profiles, Settings, Routing, Dns, Logs, Statistics }
+pub enum Tab { Profiles, Settings, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
-pub enum AppMode { List, AddServer{..}, EditServer{..}, ImportUrl{..}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
+pub enum AppMode { List, Settings{..}, AddServer{..}, EditServer{..}, ImportUrl{..}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
 pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
 pub struct LogLine { level: String, message: String }
 
@@ -90,9 +90,10 @@ AppState provides:
 - `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, placeholder renderer
 - `statistics.rs` — Live stats display: traffic (today/total up/down), system stats (memory, goroutines, uptime), connection info (API endpoint, status). Data driven by StatsUpdate/SysStatsUpdate CoreEvents from the polling loop.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
-- `settings.rs` — **Placeholder** (Phase 1: "Coming Soon")
+- `settings.rs` — Full settings panel (Phase 6). Menu listing 9 config sections: Core, GUI, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
+- `logs.rs` — Log viewer
 ...
-Future screens (Phase 5+): settings panels, routing editor, log viewer.
+Future screens (Phase 7+): config template editor, global hotkeys, etc.
 
 **`speed_test.rs`** — Async speed test engine:
 ```rust
