@@ -462,6 +462,7 @@ mod tests {
             is_active: Some(0),
             created_at: None,
             updated_at: None,
+            sub_uid: None,
         }
     }
 

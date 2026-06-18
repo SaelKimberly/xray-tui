@@ -6,7 +6,7 @@ use ratatui::Frame;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{resolve_core, CoreType};
 
-use crate::AppState;
+use crate::{AppState, ConfirmAction};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows = state.filtered_profiles();
@@ -23,8 +23,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     render_filter_strip(frame, chunks[0], state);
     render_data_grid(frame, chunks[1], &rows, selected, state);
 
-    // Delete confirmation overlay
-    if let Some(ref delete_id) = state.confirm_delete {
+    // Delete confirmation overlay (profiles only)
+    if let Some(ConfirmAction::DeleteProfile(ref delete_id)) = state.confirmation {
         let profile_name = rows
             .iter()
             .find(|r| r.profile.id == *delete_id)

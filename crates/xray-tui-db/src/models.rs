@@ -1,3 +1,4 @@
+use rapidhash::v3::{RapidStreamHasherV3, DEFAULT_RAPID_SECRETS};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +21,33 @@ pub struct Profile {
     pub is_active: Option<i32>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub sub_uid: Option<i64>,
 }
+
+impl Profile {
+    pub fn compute_sub_uid(&self) -> u64 {
+        let mut h = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
+        h.write(&self.config_type.to_le_bytes());
+        h.write(b":");
+        h.write(self.address.as_deref().unwrap_or("").as_bytes());
+        h.write(b":");
+        h.write(&self.port.unwrap_or(0).to_le_bytes());
+        h.write(b":");
+        h.write(self.user_id.as_deref().unwrap_or("").as_bytes());
+        h.write(b":");
+        h.write(self.security.as_deref().unwrap_or("").as_bytes());
+        h.write(b":");
+        h.write(self.network.as_deref().unwrap_or("").as_bytes());
+        h.write(b":");
+        h.write(self.stream_settings.as_deref().unwrap_or("").as_bytes());
+        h.write(b":");
+        h.write(self.protocol_settings.as_deref().unwrap_or("").as_bytes());
+        h.finish()
+    }
+}
+
+pub const GRAVEYARD_GROUP_ID: &str = "00000000-0000-0000-0000-000000000001";
+pub const GRAVEYARD_GROUP_TTL_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {

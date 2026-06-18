@@ -34,10 +34,10 @@ pub struct AppState {
     pub selected_group_id: Option<String>,
     pub selected_index: usize,
     pub multi_select: HashSet<String>,
-    pub confirm_delete: Option<String>,
     pub clipboard: Option<String>,
+    pub confirmation: Option<ConfirmAction>,
+    pub updating_groups: HashSet<String>,
     pub sort_column: SortColumn,
-    pub sort_ascending: bool,
     pub search_query: String,
     pub search_focused: bool,
     pub log_buffer: Vec<LogLine>,
@@ -86,14 +86,11 @@ AppState provides:
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
 - `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, placeholder renderer
-- `profiles.rs` — Profile list DataGrid with sortable columns, group filter, search bar, multi-select indicator, delete confirmation overlay
-- `add_server.rs` — Form screen for add/edit, protocol picker, field editing, import URL screen
 - `statistics.rs` — Live stats display: traffic (today/total up/down), system stats (memory, goroutines, uptime), connection info (API endpoint, status). Data driven by StatsUpdate/SysStatsUpdate CoreEvents from the polling loop.
+- `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `settings.rs` — **Placeholder** (Phase 1: "Coming Soon")
-- `dns.rs` — **Placeholder** (Phase 1: "Coming Soon")
-- `logs.rs` — **Placeholder** (Phase 1: "Coming Soon")
-
-Future screens (Phase 4+): `subscription.rs`, settings panels, routing editor, log viewer.
+...
+Future screens (Phase 5+): settings panels, routing editor, log viewer.
 
 ### xray-tui-core (library crate)
 

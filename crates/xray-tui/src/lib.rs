@@ -8,7 +8,7 @@ use xray_tui_config::AppConfig;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{find_binary, resolve_core, BuildParams, CoreManager, ConfigBuilder, CoreType};
 use xray_tui_core::grpc_client;
-use xray_tui_db::models::{DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat};
+use xray_tui_db::models::{DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat, Subscription, GRAVEYARD_GROUP_ID};
 use xray_tui_db::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +79,21 @@ pub enum AppMode {
         input: String,
         error: Option<String>,
     },
+    /// Managing subscription groups
+    ManageGroups {
+        selected: usize,
+    },
+    /// Adding a new subscription group
+    AddGroup {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    /// Editing an existing subscription group
+    EditGroup {
+        group_id: String,
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
 }
 
 
@@ -96,6 +111,17 @@ pub enum CoreEvent {
         total_down: i64,
     },
     SysStatsUpdate(grpc_client::SysStats),
+    SubscriptionsUpdated {
+        group_id: String,
+        count: usize,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    DeleteProfile(String),
+    DeleteGroup(String),
 }
 
 pub struct AppState {
@@ -121,8 +147,9 @@ pub struct AppState {
     pub should_quit: bool,
     pub mode: AppMode,
     pub multi_select: HashSet<String>,
-    pub confirm_delete: Option<String>,
     pub clipboard: Option<String>,
+    pub confirmation: Option<ConfirmAction>,
+    pub updating_groups: HashSet<String>,
 }
 
 impl AppState {
@@ -150,11 +177,13 @@ impl AppState {
             mode: AppMode::List,
             multi_select: HashSet::new(),
             clipboard: None,
-            confirm_delete: None,
+            confirmation: None,
+            updating_groups: HashSet::new(),
             system_stats: None,
         };
         state.reload_profiles();
         state.reload_groups();
+        state.spawn_auto_update();
         state
     }
 
@@ -306,7 +335,7 @@ impl AppState {
 
     fn fields_to_profile(&self, protocol: Protocol, fields: &[(String, String)]) -> Profile {
         let id = uuid::Uuid::new_v4().to_string();
-        let now = iso_now();
+        let now = format_now();
         let mut profile = Profile {
             id,
             config_type: protocol.to_i32(),
@@ -326,6 +355,7 @@ impl AppState {
             is_active: None,
             created_at: Some(now.clone()),
             updated_at: Some(now),
+            sub_uid: None,
         };
         let mut stream_map = serde_json::Map::new();
         let mut proto_map = serde_json::Map::new();
@@ -426,7 +456,7 @@ impl AppState {
         profile.network = new_profile.network;
         profile.stream_settings = new_profile.stream_settings;
         profile.protocol_settings = new_profile.protocol_settings;
-        profile.updated_at = Some(iso_now());
+        profile.updated_at = Some(format_now());
 
         if let Err(e) = self.db.update_profile(&profile) {
             self.add_log("error", &format!("Failed to update server: {e}"));
@@ -447,7 +477,7 @@ impl AppState {
             return;
         }
         self.add_log("info", "Profile deleted");
-        self.confirm_delete = None;
+        self.confirmation = None;
         self.multi_select.remove(id);
         self.reload_profiles();
     }
@@ -771,7 +801,7 @@ impl AppState {
                         today_down: Some(today_down as i32),
                         total_up: Some(total_up as i32),
                         total_down: Some(total_down as i32),
-                        last_updated: Some(crate::iso_now()),
+                        last_updated: Some(crate::format_now()),
                     };
                     if let Err(e) = self.db.upsert_server_stats(&stats) {
                         self.add_log("error", &format!("Failed to save stats: {e}"));
@@ -784,8 +814,292 @@ impl AppState {
                 CoreEvent::SysStatsUpdate(stats) => {
                     self.system_stats = Some(stats);
                 }
+                CoreEvent::SubscriptionsUpdated { group_id, count, error } => {
+                    self.updating_groups.remove(&group_id);
+                    if let Some(err) = error {
+                        self.add_log("error", &format!("Subscription update failed: {err}"));
+                    } else {
+                        self.add_log("info", &format!("Subscription updated: {count} profiles"));
+                    }
+                    self.reload_profiles();
+                    self.reload_groups();
+                }
             }
         }
+    }
+    // ── Group management ─────────────────────────────────────────────
+
+    pub fn start_add_group(&mut self) {
+        let fields = vec![
+            ("name".into(), String::new()),
+            ("subscription_url".into(), String::new()),
+            ("user_agent".into(), String::new()),
+            ("update_interval".into(), "1440".into()),
+            ("core_type".into(), "auto".into()),
+        ];
+        self.mode = AppMode::AddGroup { fields, focus_index: 0 };
+    }
+
+    pub fn start_edit_group(&mut self, group_id: &str) {
+        let group = match self.groups.iter().find(|g| g.id == group_id) {
+            Some(g) => g.clone(),
+            None => { self.add_log("error", "Group not found"); return; }
+        };
+        let fields = vec![
+            ("name".into(), group.name.unwrap_or_default()),
+            ("subscription_url".into(), group.subscription_url.unwrap_or_default()),
+            ("user_agent".into(), group.user_agent.unwrap_or_default()),
+            ("update_interval".into(), "1440".into()),
+            ("core_type".into(), group.core_type.unwrap_or_else(|| "auto".into())),
+        ];
+        self.mode = AppMode::EditGroup { group_id: group_id.into(), fields, focus_index: 0 };
+    }
+
+    pub fn confirm_add_group(&mut self) {
+        let fields = match &self.mode {
+            AppMode::AddGroup { fields, .. } => fields.clone(),
+            _ => return,
+        };
+        let group = Group {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: get_field(&fields, "name"),
+            subscription_url: get_field(&fields, "subscription_url"),
+            subscription_enabled: Some(1),
+            user_agent: get_field(&fields, "user_agent"),
+            convert_target: None,
+            core_type: get_field(&fields, "core_type"),
+            sort_order: Some((self.groups.len() + 1) as i32),
+        };
+        if let Err(e) = self.db.insert_group(&group) {
+            self.add_log("error", &format!("Failed to add group: {e}"));
+            return;
+        }
+        // Create subscription tracking row
+        let interval: i32 = get_field(&fields, "update_interval")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1440);
+        let sub = Subscription {
+            id: uuid::Uuid::new_v4().to_string(),
+            group_id: Some(group.id.clone()),
+            url: group.subscription_url.clone().unwrap_or_default(),
+            last_updated: None,
+            update_interval: Some(interval),
+            user_agent: group.user_agent.clone(),
+            status: Some("idle".into()),
+            error_message: None,
+        };
+        let _ = self.db.upsert_subscription(&sub);
+        self.add_log("info", &format!("Group '{}' added", group.name.as_deref().unwrap_or("unnamed")));
+        self.mode = AppMode::List;
+        self.reload_groups();
+    }
+
+    pub fn confirm_edit_group(&mut self) {
+        let (group_id, fields) = match &self.mode {
+            AppMode::EditGroup { group_id, fields, .. } => (group_id.clone(), fields.clone()),
+            _ => return,
+        };
+        let mut group = match self.groups.iter().find(|g| g.id == group_id) {
+            Some(g) => g.clone(),
+            None => { self.add_log("error", "Group not found"); return; }
+        };
+        group.name = get_field(&fields, "name");
+        group.subscription_url = get_field(&fields, "subscription_url");
+        group.user_agent = get_field(&fields, "user_agent");
+        group.core_type = get_field(&fields, "core_type");
+        if let Err(e) = self.db.update_group(&group) {
+            self.add_log("error", &format!("Failed to update group: {e}"));
+            return;
+        }
+        // Update subscription tracking row
+        let interval: i32 = get_field(&fields, "update_interval")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1440);
+        if let Ok(Some(mut sub)) = self.db.get_subscription_by_group(&group_id) {
+            sub.url = group.subscription_url.clone().unwrap_or_default();
+            sub.update_interval = Some(interval);
+            sub.user_agent = group.user_agent.clone();
+            let _ = self.db.upsert_subscription(&sub);
+        }
+        self.add_log("info", "Group updated");
+        self.mode = AppMode::List;
+        self.reload_groups();
+    }
+
+    pub fn delete_group(&mut self, group_id: &str) {
+        if let Err(e) = self.db.delete_group(group_id) {
+            self.add_log("error", &format!("Failed to delete group: {e}"));
+            return;
+        }
+        let _ = self.db.delete_subscriptions_by_group(group_id);
+        self.add_log("info", "Group deleted");
+        self.selected_group_id = None;
+        self.confirmation = None;
+        self.reload_groups();
+        self.reload_profiles();
+    }
+
+    // ── Subscription update ──────────────────────────────────────────
+
+    pub fn update_group_subscriptions(&mut self, group_id: &str) {
+        if self.updating_groups.contains(group_id) { return; }
+        let group = match self.groups.iter().find(|g| g.id == group_id) {
+            Some(g) => g.clone(),
+            None => { self.add_log("error", "Group not found"); return; }
+        };
+        let url = match &group.subscription_url {
+            Some(u) if !u.is_empty() => u.clone(),
+            _ => { self.add_log("warn", "Group has no subscription URL"); return; }
+        };
+
+        self.updating_groups.insert(group_id.to_string());
+        let gid = group_id.to_string();
+        let tx = self.core_event_tx.clone();
+        let user_agent = group.user_agent.clone().unwrap_or_else(|| "xray-tui/0.1".into());
+        let db_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
+            .join("xray-tui")
+            .join("xray-tui.db");
+
+        tokio::spawn(async move {
+            let result = Self::do_update_subscription(url, user_agent, gid.clone(), db_path).await;
+            if let Some(tx) = &tx {
+                let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                    group_id: result.0,
+                    count: result.1,
+                    error: result.2,
+                });
+            }
+        });
+    }
+
+    async fn do_update_subscription(
+        url: String,
+        user_agent: String,
+        group_id: String,
+        db_path: std::path::PathBuf,
+    ) -> (String, usize, Option<String>) {
+        let client = match reqwest::Client::builder()
+            .user_agent(&user_agent)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return (group_id, 0, Some(e.to_string())),
+        };
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => return (group_id, 0, Some(format!("HTTP: {e}"))),
+        };
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return (group_id, 0, Some(format!("Body: {e}"))),
+        };
+
+        let profiles = match xray_tui_config::subscription::parse_subscription_data(&bytes) {
+            Ok(p) => p,
+            Err(e) => return (group_id, 0, Some(e)),
+        };
+
+        let db = match Database::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => return (group_id, 0, Some(format!("DB: {e}"))),
+        };
+
+        let now = format_now();
+        let mut sub_uids: Vec<u64> = Vec::with_capacity(profiles.len());
+        let enriched: Vec<Profile> = profiles.into_iter().map(|mut p| {
+            p.sub_uid = Some(p.compute_sub_uid() as i64);
+            p.group_id = Some(group_id.clone());
+            p.is_sub = Some(1);
+            p.sub_id = Some(uuid::Uuid::new_v4().to_string());
+            p.updated_at = Some(now.clone());
+            if p.created_at.is_none() {
+                p.created_at = Some(now.clone());
+            }
+            sub_uids.push(p.sub_uid.unwrap_or(0) as u64);
+            p
+        }).collect();
+
+        if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched) {
+            return (group_id, 0, Some(format!("DB upsert: {e}")));
+        }
+
+        let _ = db.move_orphans_to_graveyard(&group_id, &sub_uids, GRAVEYARD_GROUP_ID);
+        let _ = db.purge_graveyard(GRAVEYARD_GROUP_ID, 24);
+
+        let now_str = format_now();
+        let sub = Subscription {
+            id: uuid::Uuid::new_v4().to_string(),
+            group_id: Some(group_id.clone()),
+            url: url.clone(),
+            last_updated: Some(now_str),
+            update_interval: Some(1440),
+            user_agent: Some(user_agent),
+            status: Some("ok".into()),
+            error_message: None,
+        };
+        let _ = db.upsert_subscription(&sub);
+
+        (group_id, enriched.len(), None)
+    }
+
+    pub fn update_all_subscriptions(&mut self) {
+        let group_ids: Vec<String> = self.groups.iter()
+            .filter(|g| {
+                g.id != GRAVEYARD_GROUP_ID
+                && g.subscription_url.as_deref().is_some_and(|u| !u.is_empty())
+            })
+            .map(|g| g.id.clone())
+            .collect();
+        for gid in group_ids {
+            self.update_group_subscriptions(&gid);
+        }
+    }
+
+    /// Start a background task to check and update subscriptions.
+    pub fn spawn_auto_update(&mut self) {
+        let Some(tx) = self.core_event_tx.clone() else { return };
+        let db_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
+            .join("xray-tui")
+            .join("xray-tui.db");
+
+        tokio::spawn(async move {
+            use std::time::Duration;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            loop {
+                let db = match Database::open(&db_path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        continue;
+                    }
+                };
+                let due_groups = match db.get_groups_due_update() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        continue;
+                    }
+                };
+                for group in &due_groups {
+                    let url = match &group.subscription_url {
+                        Some(u) => u.clone(),
+                        None => continue,
+                    };
+                    let ua = group.user_agent.clone().unwrap_or_else(|| "xray-tui/0.1".into());
+                    let gid = group.id.clone();
+                    let result = Self::do_update_subscription(url, ua, gid, db_path.clone()).await;
+                    let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                        group_id: result.0,
+                        count: result.1,
+                        error: result.2,
+                    });
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
     }
 }
 
@@ -862,7 +1176,15 @@ fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
     }
 }
 
-fn iso_now() -> String {
+/// Get a value from a form field list, returning None if empty or missing.
+pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
+    fields.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+}
+
+fn format_now() -> String {
     // Simple ISO 8601 without chrono dependency
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

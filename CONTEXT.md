@@ -8,7 +8,7 @@ Feature target: feature parity with v2rayN (C# desktop GUI) for all protocols su
 ```
 xray-tui/
 ├── xray-tui/          # Binary: ratatui event loop + all screens
-│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, statistics, 4 placeholders)
+│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, statistics, groups, 4 placeholders)
 ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
 ├── xray-tui-db/       # Library: SQLite persistence layer + query methods
 ├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management
@@ -40,9 +40,10 @@ xray-tui/
 |---|---|
 | **Inbound** | Local listening port/protocol that accepts traffic (SOCKS, HTTP, etc.) |
 | **Outbound** | Remote proxy server connection (VMess, VLESS, Shadowsocks, etc.) |
-| **Profile/Server** | A single outbound proxy configuration (address, port, protocol, credentials, transport, core type) |
-| **Core Type** | The proxy backend binary assigned to a profile — xray or sing-box |
-| **AppMode** | Application mode enum (List / AddServer / EditServer / ImportUrl) — controls which screen renders
+| **Subscription group** | A named group of proxy profiles fetched from a subscription URL |
+| **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update |
+| **Graveyard** | Destination group (`sub-graveyard`) for orphaned subscription profiles; purged after 24h |
+| **AppMode** | Application mode enum (List / AddServer / EditServer / ImportUrl / ManageGroups / AddGroup / EditGroup) — controls which screen renders |
 | **Transport** | The network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around the transport |
 | **Config Type** | The proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |

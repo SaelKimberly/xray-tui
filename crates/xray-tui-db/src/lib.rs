@@ -37,11 +37,24 @@ impl Database {
 
     fn initialize_schema(&self) -> Result<()> {
         schema::create_tables(&self.conn)?;
+
+        // Ensure graveyard group exists
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM groups WHERE id = ?1",
+            rusqlite::params![models::GRAVEYARD_GROUP_ID],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        if count == 0 {
+            self.conn.execute(
+                "INSERT INTO groups (id, name, subscription_enabled) VALUES (?1, ?2, 0)",
+                rusqlite::params![models::GRAVEYARD_GROUP_ID, "sub-graveyard"],
+            )?;
+        }
         Ok(())
     }
 }
 
-use models::{Group, Profile, ProfileExtension, ServerStat};
+use models::{Group, Profile, ProfileExtension, ServerStat, Subscription};
 use rusqlite::Row;
 
 // ── Row conversion impls ──────────────────────────────────────────────
@@ -69,9 +82,28 @@ impl TryFrom<&Row<'_>> for Profile {
             is_active: row.get("is_active")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
+            sub_uid: row.get("sub_uid")?,
         })
     }
 }
+
+impl TryFrom<&Row<'_>> for Subscription {
+    type Error = rusqlite::Error;
+
+    fn try_from(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("id")?,
+            group_id: row.get("group_id")?,
+            url: row.get("url")?,
+            last_updated: row.get("last_updated")?,
+            update_interval: row.get("update_interval")?,
+            user_agent: row.get("user_agent")?,
+            status: row.get("status")?,
+            error_message: row.get("error_message")?,
+        })
+    }
+}
+
 
 impl TryFrom<&Row<'_>> for Group {
     type Error = rusqlite::Error;
@@ -246,11 +278,11 @@ impl Database {
 
     pub fn insert_profile(&self, p: &Profile) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO profiles (id, config_type, core_type, remarks, address, port, user_id, security, network, stream_settings, protocol_settings, is_sub, sub_id, group_id, sort_order, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO profiles (id, config_type, core_type, remarks, address, port, user_id, security, network, stream_settings, protocol_settings, is_sub, sub_id, group_id, sub_uid, sort_order, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             rusqlite::params![
                 p.id, p.config_type, p.core_type, p.remarks, p.address, p.port,
                 p.user_id, p.security, p.network, p.stream_settings, p.protocol_settings,
-                p.is_sub, p.sub_id, p.group_id, p.sort_order, p.is_active,
+                p.is_sub, p.sub_id, p.group_id, p.sub_uid, p.sort_order, p.is_active,
                 p.created_at, p.updated_at,
             ],
         )?;
@@ -259,16 +291,17 @@ impl Database {
 
     pub fn update_profile(&self, p: &Profile) -> Result<()> {
         self.conn.execute(
-            "UPDATE profiles SET config_type=?1, core_type=?2, remarks=?3, address=?4, port=?5, user_id=?6, security=?7, network=?8, stream_settings=?9, protocol_settings=?10, is_sub=?11, sub_id=?12, group_id=?13, sort_order=?14, is_active=?15, updated_at=?16 WHERE id=?17",
+            "UPDATE profiles SET config_type=?1, core_type=?2, remarks=?3, address=?4, port=?5, user_id=?6, security=?7, network=?8, stream_settings=?9, protocol_settings=?10, is_sub=?11, sub_id=?12, group_id=?13, sub_uid=?14, sort_order=?15, is_active=?16, updated_at=?17 WHERE id=?18",
             rusqlite::params![
                 p.config_type, p.core_type, p.remarks, p.address, p.port,
                 p.user_id, p.security, p.network, p.stream_settings, p.protocol_settings,
-                p.is_sub, p.sub_id, p.group_id, p.sort_order, p.is_active,
+                p.is_sub, p.sub_id, p.group_id, p.sub_uid, p.sort_order, p.is_active,
                 p.updated_at, p.id,
             ],
         )?;
         Ok(())
     }
+
 
     pub fn delete_profile(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", rusqlite::params![id])?;
@@ -365,5 +398,103 @@ impl Database {
         }
         self.conn.execute("DELETE FROM groups WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
+    }
+    pub fn get_subscription_by_group(&self, group_id: &str) -> Result<Option<Subscription>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM subscriptions WHERE group_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map([group_id], |row| Subscription::try_from(row))?;
+        match rows.next() {
+            Some(Ok(sub)) => Ok(Some(sub)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_subscription(&self, sub: &Subscription) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO subscriptions (id, group_id, url, last_updated, update_interval, user_agent, status, error_message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![sub.id, sub.group_id, sub.url, sub.last_updated, sub.update_interval, sub.user_agent, sub.status, sub.error_message],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_subscriptions_by_group(&self, group_id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM subscriptions WHERE group_id = ?1", rusqlite::params![group_id])?;
+        Ok(())
+    }
+
+    pub fn get_groups_due_update(&self) -> Result<Vec<Group>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.* FROM groups g
+             LEFT JOIN subscriptions s ON s.group_id = g.id
+             WHERE g.subscription_enabled = 1
+               AND g.subscription_url IS NOT NULL
+               AND g.subscription_url != ''
+               AND (s.last_updated IS NULL
+                    OR datetime(s.last_updated, '+' || COALESCE(s.update_interval, 1440) || ' minutes') < datetime('now'))"
+        )?;
+        let rows = stmt.query_map([], |row| Group::try_from(row))?;
+        let mut groups = Vec::new();
+        for row in rows { groups.push(row?); }
+        Ok(groups)
+    }
+
+    pub fn subscription_upsert_profiles(&self, _group_id: &str, profiles: &[Profile]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut upsert = tx.prepare(
+                "INSERT INTO profiles (id, config_type, core_type, remarks, address, port, user_id, security, network, stream_settings, protocol_settings, is_sub, sub_id, group_id, sub_uid, sort_order, is_active, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+                 ON CONFLICT(group_id, sub_uid) WHERE sub_uid != 0 DO UPDATE SET
+                 remarks=excluded.remarks, address=excluded.address, port=excluded.port,
+                 user_id=excluded.user_id, security=excluded.security, network=excluded.network,
+                 stream_settings=excluded.stream_settings, protocol_settings=excluded.protocol_settings,
+                 updated_at=excluded.updated_at"
+            )?;
+            for p in profiles {
+                upsert.execute(rusqlite::params![
+                    p.id, p.config_type, p.core_type, p.remarks, p.address, p.port,
+                    p.user_id, p.security, p.network, p.stream_settings, p.protocol_settings,
+                    p.is_sub, p.sub_id, p.group_id, p.sub_uid, p.sort_order, p.is_active,
+                    p.created_at, p.updated_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn move_orphans_to_graveyard(&self, group_id: &str, active_sub_uids: &[u64], graveyard_id: &str) -> Result<usize> {
+        if active_sub_uids.is_empty() {
+            return Ok(self.conn.execute(
+                "UPDATE profiles SET group_id = ?1, updated_at = datetime('now') WHERE group_id = ?2 AND is_sub = 1 AND sub_uid != 0",
+                rusqlite::params![graveyard_id, group_id],
+            )?);
+        }
+        let profiles_in_group: Vec<Profile> = {
+            let mut stmt = self.conn.prepare("SELECT * FROM profiles WHERE group_id = ?1 AND is_sub = 1 AND sub_uid != 0")?;
+            let rows = stmt.query_map([group_id], |row| Profile::try_from(row))?;
+            let mut v = Vec::new();
+            for row in rows { v.push(row?); }
+            v
+        };
+        let mut moved = 0;
+        for p in &profiles_in_group {
+            if !active_sub_uids.contains(&(p.sub_uid.unwrap_or(0) as u64)) {
+                self.conn.execute(
+                    "UPDATE profiles SET group_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    rusqlite::params![graveyard_id, p.id],
+                )?;
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
+    pub fn purge_graveyard(&self, graveyard_id: &str, ttl_hours: i64) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM profiles WHERE group_id = ?1 AND updated_at < datetime('now', ?2)",
+            rusqlite::params![graveyard_id, format!("-{} hours", ttl_hours)],
+        )?;
+        Ok(count)
     }
 }

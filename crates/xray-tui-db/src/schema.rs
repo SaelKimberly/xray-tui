@@ -15,7 +15,7 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             protocol_settings   TEXT,
             is_sub              INTEGER DEFAULT 0,
             sub_id              TEXT,
-            group_id            TEXT,
+            sub_uid             INTEGER NOT NULL DEFAULT 0,
             sort_order          INTEGER DEFAULT 0,
             is_active           INTEGER DEFAULT 0,
             created_at          TEXT,
@@ -92,5 +92,13 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             last_updated        TEXT
         );
         ",
-    )
+    )?;
+
+    // Migration v2: add sub_uid column (ignore error if already exists)
+    let _ = conn.execute_batch("ALTER TABLE profiles ADD COLUMN sub_uid INTEGER NOT NULL DEFAULT 0;");
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_profiles_group_sub_uid ON profiles(group_id, sub_uid) WHERE sub_uid != 0;",
+    );
+
+    Ok(())
 }

@@ -25,14 +25,14 @@ cargo run
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
+- `crates/xray-tui-db/src/models.rs` — Profile (compute_sub_uid), Group, Subscription, GRAVEYARD_GROUP_ID
 
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch
 - `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `status_bar.rs` — bottom connection indicator + key hints
-- `statistics.rs` — live stats display (traffic up/down, system stats, connection info)
-- `settings.rs`, `routing.rs`, `dns.rs`, `logs.rs` — placeholder screens
+- `groups.rs` — subscription group list overlay, add/edit form
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API
@@ -86,9 +86,15 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 3. Create `XxxFmt::parse_share_url` and `XxxFmt::format_share_url` in `crates/xray-tui-config/src/import_export.rs`
 4. Add profile validation in the appropriate config builder (`xray.rs` or `singbox.rs`)
 5. Reference: v2rayN's individual `*Fmt.cs` files for format specs; sing-box's `option/*.go` for JSON config structs
+### Adding subscription management features
+1. `confirm_add_group()` / `confirm_edit_group()` in `crates/xray-tui/src/lib.rs` handle form submit
+2. `update_group_subscriptions()` / `do_update_subscription()` in same file handle HTTP fetch + parse + DB upsert
+3. `subscription_upsert_profiles()` in `crates/xray-tui-db/src/lib.rs` handles content-based dedup via `ON CONFLICT(group_id, sub_uid)`
+4. `move_orphans_to_graveyard()` / `purge_graveyard()` handle stale profile cleanup
+5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
+6. Refer to `groups.rs` for group management overlay UI patterns (matching `add_server.rs` form conventions)
 
-### Adding a database migration
-1. Add versioned SQL migration to `xray-tui-db/src/migrations/`
+### Determining which core a protocol belongs to
 2. Register version in the migration runner
 
 ### Determining which core a protocol belongs to
@@ -119,10 +125,11 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - gRPC via `tonic` crate
 - HTTP via `reqwest` crate
 - SQLite via `rusqlite` crate
-- Use `base64-simd` for SIMD-accelerated base64 decode/encode
+- Use `reqwest` for HTTP client (subscription fetch)
 - Use `escape8259` for JSON string unescaping
 - Use `memchr` for vectorized byte search
-- Use `simdutf8` for SIMD UTF-8 validation
+- Use `rapidhash` for content-based profile deduplication (compute_sub_uid)
+- Use `base64-simd` for SIMD-accelerated base64 decode/encode
 - Use `urlencoding` for percent-decoding
 
 ## Verification

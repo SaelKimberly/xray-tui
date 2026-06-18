@@ -5,6 +5,7 @@ pub mod profiles;
 pub mod routing;
 pub mod settings;
 pub mod statistics;
+pub mod groups;
 pub mod status_bar;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -19,7 +20,7 @@ use ratatui::{Frame, Terminal};
 use std::io;
 use std::time::Duration;
 use std::sync::mpsc;
-use crate::{AppState, Tab};
+use crate::{AppMode, AppState, ConfirmAction, Tab};
 
 // ── Entry point ───────────────────────────────────────────────────────
 
@@ -86,6 +87,21 @@ fn handle_event(ev: &Event, state: &mut AppState) {
 }
 
 fn handle_key(key: &KeyEvent, state: &mut AppState) {
+    // Group management overlay mode: pass to groups handler
+    if matches!(&state.mode, crate::AppMode::ManageGroups { .. }) {
+        groups::handle_key(state, key);
+        return;
+    }
+
+    // Group form mode: route to groups handler (with Ctrl+C quit)
+    if matches!(&state.mode, crate::AppMode::AddGroup { .. } | crate::AppMode::EditGroup { .. }) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => state.should_quit = true,
+            _ => groups::handle_key(state, key),
+        }
+        return;
+    }
+
     // Form mode: route all keys to add_server handler (except Ctrl+C quit)
     if !matches!(state.mode, crate::AppMode::List) {
         match key.code {
@@ -116,15 +132,20 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 
     // Delete confirmation: only y/n/esc
-    if state.confirm_delete.is_some() {
+    if let Some(ref confirm) = state.confirmation {
+        match confirm {
+            ConfirmAction::DeleteProfile(_) | ConfirmAction::DeleteGroup(_) => {},
+        }
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                if let Some(id) = state.confirm_delete.take() {
-                    state.delete_profile(&id);
+                match state.confirmation.take() {
+                    Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
+                    Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
+                    None => {}
                 }
             }
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
-                state.confirm_delete = None;
+                state.confirmation = None;
             }
             _ => {}
         }
@@ -204,6 +225,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.start_edit_profile(&id);
             }
         }
+        KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
+            state.mode = AppMode::ManageGroups { selected: 0 };
+        }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
                 let ids: Vec<String> = state.multi_select.iter().cloned().collect();
@@ -212,7 +236,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 }
                 state.multi_select.clear();
             } else if let Some(id) = state.selected_profile_id() {
-                state.confirm_delete = Some(id);
+                state.confirmation = Some(ConfirmAction::DeleteProfile(id));
             }
         }
         KeyCode::Char('c' | 'C') if !key.modifiers.contains(KeyModifiers::CONTROL) && state.current_tab == Tab::Profiles => {
@@ -235,8 +259,8 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     }
         }
         KeyCode::Esc => {
-            if state.confirm_delete.is_some() {
-                state.confirm_delete = None;
+            if state.confirmation.is_some() {
+                state.confirmation = None;
             } else {
                 state.selected_group_id = None;
             }
@@ -258,6 +282,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         .split(frame.area());
 
     // In form/import mode, render form instead of tabs
+    // In form/import/modal mode, render appropriate UI
     if !matches!(state.mode, crate::AppMode::List) {
         match &state.mode {
             crate::AppMode::AddServer { .. } | crate::AppMode::EditServer { .. } => {
@@ -265,6 +290,15 @@ fn render(frame: &mut Frame, state: &AppState) {
             }
             crate::AppMode::ImportUrl { .. } => {
                 add_server::render_import_url(frame, chunks[1], state);
+            }
+            crate::AppMode::ManageGroups { .. } => {
+                groups::render_group_overlay(frame, chunks[1], state);
+            }
+            crate::AppMode::AddGroup { .. } => {
+                groups::render_group_form(frame, chunks[1], state, false);
+            }
+            crate::AppMode::EditGroup { .. } => {
+                groups::render_group_form(frame, chunks[1], state, true);
             }
             _ => {}
         }

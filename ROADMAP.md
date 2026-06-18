@@ -45,13 +45,13 @@
 - ✅ Auto-detect xray and sing-box binary paths (PATH, configured paths)
 - ✅ Process spawn/kill/restart lifecycle with health polling
 
-## Phase 4 — Subscription Management
-
-- Add/edit/delete subscription groups
-- Update all/group subscriptions (HTTP download + parse)
+## Phase 4 — Subscription Management ✅
+-
+- ✅ Add/edit/delete subscription groups
+- ✅ Update all/group subscriptions (HTTP download + parse)
 - Update via proxy
 - ✅ Subscription format detection (base64, plain, v2rayN, sing-box) — streaming decoder with auto-encoding detection
-- Scheduled auto-update
+- ✅ Scheduled auto-update
 
 ## Phase 5 — Speed Testing
 

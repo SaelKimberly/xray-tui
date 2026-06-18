@@ -1057,6 +1057,7 @@ fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
         is_active: Some(0),
         created_at: None,
         updated_at: None,
+        sub_uid: None,
     }
 }
 
