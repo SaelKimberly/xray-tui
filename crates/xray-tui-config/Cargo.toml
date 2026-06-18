@@ -1,0 +1,11 @@
+[package]
+name = "xray-tui-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+dirs = "6"
+xray-tui-core = { path = "../xray-tui-core" }

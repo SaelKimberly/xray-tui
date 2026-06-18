@@ -1,7 +1,12 @@
 [package]
 name = "xray-tui"
-
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+xray-tui-core = { path = "../xray-tui-core" }
+xray-tui-db = { path = "../xray-tui-db" }
+xray-tui-config = { path = "../xray-tui-config" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

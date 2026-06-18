@@ -1,15 +1,16 @@
 # xray-tui — Roadmap
 
-## Phase 0 — Foundation (scaffolding)
+## Phase 0 — Foundation (scaffolding) ✅
 
-- Cargo workspace with 4 crates: xray-tui (bin), xray-tui-core (lib), xray-tui-db (lib), xray-tui-config (lib)
-- SQLite schema (tables: profiles, groups, subscriptions, routing_rules, dns_settings, profile_extensions, server_stats)
-- `profiles` table includes `core_type TEXT NOT NULL DEFAULT 'xray'` — selects proxy backend (xray / sing-box / auto)
-- `groups` table includes `core_type TEXT` — optional per-group override for subscription servers
-- **CoreType enum**: `Xray` | `SingBox` | `Auto` (Auto resolves via protocol-core mapping table)
-- Protocol enum covers both backends: xray-native protocols + sing-box-only protocols (TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect)
-- Application config JSON file format
-- Shared data models/enums
+- ✅ Cargo workspace with 4 crates: xray-tui (bin), xray-tui-core (lib), xray-tui-db (lib), xray-tui-config (lib)
+- ✅ SQLite schema (tables: profiles, groups, subscriptions, routing_rules, dns_settings, profile_extensions, server_stats)
+- ✅ `profiles` table includes `core_type TEXT NOT NULL DEFAULT 'xray'` — selects proxy backend (xray / sing-box / auto)
+- ✅ `groups` table includes `core_type TEXT` — optional per-group override for subscription servers
+- ✅ **CoreType enum**: `Xray` | `SingBox` | `Auto` (Auto resolves via protocol-core mapping table)
+- ✅ Protocol enum covers both backends: xray-native protocols + sing-box-only protocols (TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect)
+- ✅ Application config JSON file format (AppConfig struct with CoreConfig, GuiConfig, InboundConfig)
+- ✅ Shared data models/enums (CoreType, Protocol, resolve_core, 7 model structs)
+- ✅ Workspace builds with `cargo build`, tests pass with `cargo test`, clippy clean
 
 ## Phase 1 — TUI Shell
 

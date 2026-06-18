@@ -4,3 +4,5 @@
 .omp/
 __pycache__/
 ralph.yml
+/thirdparty/**
+!/thirdparty/*.md
