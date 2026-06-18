@@ -44,9 +44,8 @@ pub struct AppState {
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub connection_error: Option<String>,
-    pub core_event_rx: Option<UnboundedReceiver<CoreEvent>>,
-    pub core_event_tx: Option<UnboundedSender<CoreEvent>>,
     pub disconnect_tx: Option<oneshot::Sender<()>>,
+    pub system_stats: Option<SysStats>,
     pub should_quit: bool,
 }
 
@@ -57,9 +56,15 @@ pub enum CoreEvent {
     Connected(CoreType),
     Disconnected,
     Error(String),
+    StatsUpdate {
+        profile_id: String,
+        today_up: i64,
+        today_down: i64,
+        total_up: i64,
+        total_down: i64,
+    },
+    SysStatsUpdate(SysStats),
 }
-```
-The `CoreEvent` channel uses `tokio::sync::mpsc::unbounded` for async communication between the
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
 The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
@@ -83,14 +88,12 @@ AppState provides:
 - `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, placeholder renderer
 - `profiles.rs` — Profile list DataGrid with sortable columns, group filter, search bar, multi-select indicator, delete confirmation overlay
 - `add_server.rs` — Form screen for add/edit, protocol picker, field editing, import URL screen
-- `status_bar.rs` — Bottom strip: connection indicator + key hints
+- `statistics.rs` — Live stats display: traffic (today/total up/down), system stats (memory, goroutines, uptime), connection info (API endpoint, status). Data driven by StatsUpdate/SysStatsUpdate CoreEvents from the polling loop.
 - `settings.rs` — **Placeholder** (Phase 1: "Coming Soon")
-- `routing.rs` — **Placeholder** (Phase 1: "Coming Soon")
 - `dns.rs` — **Placeholder** (Phase 1: "Coming Soon")
 - `logs.rs` — **Placeholder** (Phase 1: "Coming Soon")
-- `statistics.rs` — **Placeholder** (Phase 1: "Coming Soon")
 
-Future screens (Phase 3+): `subscription.rs`, settings panels, routing editor, log viewer, statistics panels.
+Future screens (Phase 4+): `subscription.rs`, settings panels, routing editor, log viewer.
 
 ### xray-tui-core (library crate)
 
@@ -148,10 +151,14 @@ impl CoreManager {
 2. Build config via `ConfigBuilder::build()`
 3. Write JSON config to temp file in config_dir
 4. Spawn `xray run -c <path>` or `sing-box run -c <path>`
-5. Spawn stderr reader task forwarding lines via log_tx
-6. Poll process readiness (check stderr for "start" message, max 10s)
-7. Send `CoreEvent::Connected` / `CoreEvent::Error` on the event channel
-8. Wait for `stop_rx` signal, then kill child + remove config file
+8. Poll for readiness (check process hasn't exited early, max 10s)
+9. Send `CoreEvent::Connected` on the event channel
+10. Create `StatsProvider` via `grpc_client::create_stats_provider(core_type)`
+11. Enter stats polling + wait loop: every 3s call `provider.query_stats()` for traffic deltas;
+    every 3rd tick (~9s) also call `provider.get_sys_stats()`. Send `StatsUpdate`/`SysStatsUpdate`
+    events. Loop exits when `stop_rx` receives the disconnect signal.
+12. Kill child process + remove config file
+13. Send `CoreEvent::Disconnected`
 
 
 **`bin_manager.rs`** — Binary discovery and archive extraction
@@ -202,6 +209,10 @@ impl ConfigBuilder {
         dns: &DnsSetting,
     ) -> Result<BackendConfig, BuildError>;
 }
+  "inbounds": [
+    { "tag": "socks-in", "protocol": "socks", "listen": "127.0.0.1", "port": 10808 },
+    { "tag": "api", "protocol": "dokodemo-door", "listen": "127.0.0.1", "port": 62789 }
+  ],
   "outbounds": [
     { "tag": "proxy", "protocol": "vmess", "settings": { ... },
       "streamSettings": { ... }, "mux": { ... } },
@@ -215,7 +226,7 @@ impl ConfigBuilder {
   },
   "dns": { "servers": [...], "hosts": {...} },
   "stats": {},
-  "api": { "services": ["HandlerService", "LoggerService", "StatsService"] },
+  "api": { "tag": "api", "services": ["HandlerService", "LoggerService", "StatsService"] },
   "policy": {
     "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
     "system": { "statsInboundUplink": true, "statsOutboundUplink": true }
@@ -241,7 +252,7 @@ impl ConfigBuilder {
   },
   "experimental": {
     "v2ray_api": {
-      "listen": "127.0.0.1:8080",
+      "listen": "127.0.0.1:62789",
       "stats": { "enabled": true, "outbounds": ["proxy", "direct"] }
     }
   }
@@ -264,28 +275,33 @@ fn resolve_core(protocol: ProtocolType, profile_override: Option<CoreType>) -> C
         Some(CoreType::Auto) | None => core_for_protocol(protocol),
         Some(core_type) => core_type,
     }
-}
-```
+**`grpc_client.rs`** — gRPC StatsService abstraction
 
-Mapping: TUIC, Hysteria, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → `SingBox`. All others (VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, WireGuard, Hysteria2, Dokodemo-door, Freedom, Blackhole, DNS, Loopback, Custom) → `Xray`.
+Proto definition in `crates/xray-tui-core/proto/stats.proto` (vendored sing-box stats proto), compiled
+via `build.rs` using `tonic_build`. Package `experimental.v2rayapi`, 3 RPCs: `GetStats`, `QueryStats`,
+`GetSysStats`.
 
----
-
-**`grpc_client.rs`** — gRPC stats abstraction
 ```rust
+pub const API_ENDPOINT: &str = "http://127.0.0.1:62789";
+
 #[async_trait]
-pub trait StatsProvider {
-    async fn query_stats(&self, name: &str, reset: bool) -> Result<StatsResponse>;
-    async fn subscribe_logs(&self) -> Result<mpsc::Receiver<LogEntry>>;
-    async fn get_rules(&self) -> Result<Vec<RoutingRule>>;
+pub trait StatsProvider: Send + Sync {
+    async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<Stat>, GrpcError>;
+    async fn get_sys_stats(&self) -> Result<SysStats, GrpcError>;
+    fn api_endpoint(&self) -> &str;
 }
 ```
 
-Two implementations:
-- `XrayGrpcClient` — connects to xray-core's gRPC API port, uses tonic with xray proto definitions from `thirdparty/Xray-core/app/`
-- `SingBoxGrpcClient` — connects to sing-box's `experimental.v2ray_api` gRPC port, uses tonic with the same v2ray proto interface
+Two implementations — `XrayGrpcClient` and `SingBoxGrpcClient` — both connect to the same endpoint
+(`127.0.0.1:62789`) and use the same `StatsServiceClient<Channel>`. They are separate types for
+type-level distinction only; both backends expose the same V2Ray-compatible gRPC API.
 
-Both produce the same response types consumed by the TUI.
+Factory function:
+```rust
+pub async fn create_stats_provider(core_type: CoreType) -> Result<Box<dyn StatsProvider>, GrpcError>
+```
+
+Helpers: `format_bytes(i64) -> String`, `format_uptime(u32) -> String`.
 
 ---
 

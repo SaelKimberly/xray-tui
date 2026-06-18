@@ -19,6 +19,7 @@ cargo run
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
+- `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
 - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain)
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
@@ -30,7 +31,8 @@ cargo run
 - `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `status_bar.rs` — bottom connection indicator + key hints
-- `settings.rs`, `routing.rs`, `dns.rs`, `logs.rs`, `statistics.rs` — placeholder screens
+- `statistics.rs` — live stats display (traffic up/down, system stats, connection info)
+- `settings.rs`, `routing.rs`, `dns.rs`, `logs.rs` — placeholder screens
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API
@@ -94,6 +96,15 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Reference `thirdparty/Xray-core/proxy/` directory listing for xray-core protocols
 - Update `protocol_core_mapping.rs` with the new entry
 - Protocols present in both: prefer xray-core (user can override profile core_type to force sing-box)
+
+
+### Adding a new gRPC-based feature (stats, logs, routing API)
+1. Add/update proto definition in `crates/xray-tui-core/proto/` and re-run build (auto-compiled via build.rs)
+2. Add query method to `StatsProvider` trait in `grpc_client.rs`
+3. Implement in both `XrayGrpcClient` and `SingBoxGrpcClient`
+4. Add a `CoreEvent` variant in `crates/xray-tui/src/lib.rs` and handle in `poll_core_events()`
+5. For polling: add to the select loop in `connect_to_profile()` with appropriate interval
+6. For UI: update the relevant screen module in `crates/xray-tui/src/ui/`
 
 ## Style Guide
 

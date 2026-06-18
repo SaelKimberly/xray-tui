@@ -8,7 +8,7 @@ Feature target: feature parity with v2rayN (C# desktop GUI) for all protocols su
 ```
 xray-tui/
 ├── xray-tui/          # Binary: ratatui event loop + all screens
-│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, 5 placeholders)
+│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, statistics, 4 placeholders)
 ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
 ├── xray-tui-db/       # Library: SQLite persistence layer + query methods
 ├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management

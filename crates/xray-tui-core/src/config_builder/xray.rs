@@ -72,6 +72,7 @@ pub struct StatsConfig {}
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiConfig {
+    pub tag: &'static str,
     pub services: Vec<&'static str>,
 }
 
@@ -110,6 +111,7 @@ impl XrayConfigBuilder {
             dns: build_dns(dns),
             stats: StatsConfig {},
             api: ApiConfig {
+                tag: "api",
                 services: vec!["HandlerService", "LoggerService", "StatsService"],
             },
             policy: PolicyConfig {
@@ -158,6 +160,15 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
         });
     }
 
+    // API inbound for gRPC Commander
+    inbounds.push(Inbound {
+        listen: "127.0.0.1".into(),
+        port: super::API_PORT,
+        protocol: "dokodemo-door",
+        settings: json!({ "address": "127.0.0.1" }),
+        sniffing: json!({ "enabled": false, "destOverride": [] }),
+        tag: "api".into(),
+    });
     inbounds
 }
 
@@ -601,9 +612,11 @@ mod tests {
             XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 1, "should have 1 inbound (SOCKS)");
+        assert_eq!(inbounds.len(), 2, "should have 2 inbounds (SOCKS + API)");
         assert_eq!(inbounds[0]["protocol"], "socks");
         assert_eq!(inbounds[0]["port"], 10808);
+        assert_eq!(inbounds[1]["protocol"], "dokodemo-door");
+        assert_eq!(inbounds[1]["tag"], "api");
     }
 
     #[test]
@@ -615,9 +628,13 @@ mod tests {
             XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 2, "should have 2 inbounds (SOCKS + HTTP)");
+        assert_eq!(inbounds.len(), 3, "should have 3 inbounds (SOCKS + HTTP + API)");
+        assert_eq!(inbounds[0]["protocol"], "socks");
+        assert_eq!(inbounds[0]["port"], 10808);
         assert_eq!(inbounds[1]["protocol"], "http");
         assert_eq!(inbounds[1]["port"], 10809);
+        assert_eq!(inbounds[2]["protocol"], "dokodemo-door");
+        assert_eq!(inbounds[2]["tag"], "api");
     }
 
     #[test]

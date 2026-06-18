@@ -105,7 +105,7 @@ impl SingBoxConfigBuilder {
             dns: build_dns(dns),
             experimental: ExperimentalConfig {
                 v2ray_api: V2RayApi {
-                    listen: "127.0.0.1:8080".to_string(),
+                    listen: format!("127.0.0.1:{}", super::API_PORT),
                     stats: StatsConfig {
                         enabled: true,
                         outbounds: vec!["proxy", "direct"],
@@ -505,7 +505,7 @@ mod tests {
             SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let exp = &json["experimental"]["v2ray_api"];
-        assert_eq!(exp["listen"], "127.0.0.1:8080");
+        assert_eq!(exp["listen"], format!("127.0.0.1:{}", crate::config_builder::API_PORT));
         assert_eq!(exp["stats"]["enabled"], true);
     }
 

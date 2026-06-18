@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use xray_tui_config::AppConfig;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{find_binary, resolve_core, BuildParams, CoreManager, ConfigBuilder, CoreType};
+use xray_tui_core::grpc_client;
 use xray_tui_db::models::{DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat};
 use xray_tui_db::Database;
 
@@ -87,6 +88,14 @@ pub enum CoreEvent {
     Connected(CoreType),
     Disconnected,
     Error(String),
+    StatsUpdate {
+        profile_id: String,
+        today_up: i64,
+        today_down: i64,
+        total_up: i64,
+        total_down: i64,
+    },
+    SysStatsUpdate(grpc_client::SysStats),
 }
 
 pub struct AppState {
@@ -104,6 +113,7 @@ pub struct AppState {
     pub log_buffer: Vec<LogLine>,
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
+    pub system_stats: Option<grpc_client::SysStats>,
     pub connection_error: Option<String>,
     pub core_event_rx: Option<mpsc::UnboundedReceiver<CoreEvent>>,
     pub core_event_tx: Option<mpsc::UnboundedSender<CoreEvent>>,
@@ -141,6 +151,7 @@ impl AppState {
             multi_select: HashSet::new(),
             clipboard: None,
             confirm_delete: None,
+            system_stats: None,
         };
         state.reload_profiles();
         state.reload_groups();
@@ -558,7 +569,7 @@ impl AppState {
         }
 
         // Create disconnect signal channel
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.disconnect_tx = Some(stop_tx);
         self.connecting = true;
         self.connection_error = None;
@@ -635,8 +646,71 @@ impl AppState {
             // 4. Signal connected
             let _ = tx.send(CoreEvent::Connected(core_type));
 
-            // 5. Wait for stop signal
-            let _ = stop_rx.await;
+            let profile_id = profile.id.clone();
+            let provider = match grpc_client::create_stats_provider(core_type).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let _ = tx.send(CoreEvent::Error(format!("Stats API unavailable: {e}")));
+                    None
+                }
+            };
+
+            let poll_interval = std::time::Duration::from_secs(3);
+            let mut ticker = tokio::time::interval(poll_interval);
+            ticker.tick().await; // skip first immediate tick
+            let mut sys_tick_counter = 0u8;
+
+            // 5. Stats polling + wait loop
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        if let Some(ref provider) = provider {
+                            match provider.query_stats("outbound>>>*>>>traffic>>>*", true).await {
+                                Ok(stats) => {
+                                    let mut today_up = 0i64;
+                                    let mut today_down = 0i64;
+                                    for stat in &stats {
+                                        if stat.name.contains(">>>uplink") {
+                                            today_up += stat.value;
+                                        } else if stat.name.contains(">>>downlink") {
+                                            today_down += stat.value;
+                                        }
+                                    }
+                                    let _ = tx.send(CoreEvent::StatsUpdate {
+                                        profile_id: profile_id.clone(),
+                                        today_up,
+                                        today_down,
+                                        total_up: today_up,
+                                        total_down: today_down,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(CoreEvent::Error(format!("Stats query failed: {e}")));
+                                }
+                            }
+
+                            // Every 3rd tick (~9s), also query system stats
+                            sys_tick_counter += 1;
+                            if sys_tick_counter >= 3 {
+                                sys_tick_counter = 0;
+                                match provider.get_sys_stats().await {
+                                    Ok(sys) => {
+                                        let _ = tx.send(CoreEvent::SysStatsUpdate(sys));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(CoreEvent::Error(
+                                            format!("Sys stats query failed: {e}"),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // 6. Stop core
             let _ = manager.stop().await;
@@ -683,6 +757,32 @@ impl AppState {
                     self.connecting = false;
                     self.connected_core = None;
                     self.add_log("error", &format!("Connection error: {err}"));
+                }
+                CoreEvent::StatsUpdate {
+                    profile_id,
+                    today_up,
+                    today_down,
+                    total_up,
+                    total_down,
+                } => {
+                    let stats = ServerStat {
+                        profile_id: profile_id.clone(),
+                        today_up: Some(today_up as i32),
+                        today_down: Some(today_down as i32),
+                        total_up: Some(total_up as i32),
+                        total_down: Some(total_down as i32),
+                        last_updated: Some(crate::iso_now()),
+                    };
+                    if let Err(e) = self.db.upsert_server_stats(&stats) {
+                        self.add_log("error", &format!("Failed to save stats: {e}"));
+                    }
+                    // Update in-memory ProfileRow to avoid full reload
+                    if let Some(row) = self.profiles.iter_mut().find(|r| r.profile.id == profile_id) {
+                        row.stats = Some(stats);
+                    }
+                }
+                CoreEvent::SysStatsUpdate(stats) => {
+                    self.system_stats = Some(stats);
                 }
             }
         }

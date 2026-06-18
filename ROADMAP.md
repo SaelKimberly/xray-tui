@@ -39,7 +39,7 @@
 - ✅ `SingBoxProcess` for sing-box (spawn `sing-box run -c <path>`)
 - ✅ Config builder split: `config_builder_xray.rs` (xray-core JSON) + `config_builder_singbox.rs` (sing-box JSON)
 - ✅ Protocol → Core auto-resolution: TUIC/Hysteria/Naïve/AnyTLS/ShadowTLS/Tor/SSH → sing-box; all others → xray-core
-- 🔲 gRPC API abstraction: `StatsProvider` trait for stats + logs; xray uses native gRPC, sing-box uses experimental v2ray_api
+- ✅ gRPC API abstraction: `StatsProvider` trait for stats; xray uses native gRPC, sing-box uses experimental v2ray_api. Stats polling loop (3s interval) in connect_to_profile. Live Statistics tab with traffic and system stats.
 - ✅ One-core-at-a-time: switching profiles between backends stops current core, starts the other
 - ✅ Connect/disconnect flow
 - ✅ Auto-detect xray and sing-box binary paths (PATH, configured paths)

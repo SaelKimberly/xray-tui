@@ -4,6 +4,9 @@ pub mod xray;
 use crate::core_type::CoreType;
 use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
 
+
+/// Port for the gRPC Stats API (shared by xray-core and sing-box).
+pub const API_PORT: u16 = 62789;
 /// Parameters extracted from app config for building backend configs.
 /// Avoids a circular dependency on `xray-tui-config`.
 #[derive(Debug, Clone)]
