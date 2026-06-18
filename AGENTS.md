@@ -1,0 +1,110 @@
+# xray-tui — Agent Guide
+
+## Project Identity
+
+Rust TUI client for Xray-core and Sing-box. Target: feature parity with v2rayN (C# GUI) for all protocols supported by either backend.
+
+## Quick Start
+
+```bash
+cargo build --release
+cargo run
+```
+
+## Key Source Files
+
+### Crate entry points
+- `crates/xray-tui/src/main.rs` — binary entry, runtime init
+- `crates/xray-tui-core/src/lib.rs` — core logic facade
+- `crates/xray-tui-db/src/lib.rs` — database layer
+- `crates/xray-tui-config/src/lib.rs` — config management
+
+### Reference repos (read-only — never edit)
+- `thirdparty/Xray-core/` — protocol behavior, config schema, API
+- `thirdparty/sing-box/` — sing-box protocol types, config format, API compatibility
+- `thirdparty/v2rayN/` — feature reference, UI patterns
+
+### Key Rust proxy references
+- `thirdparty/shoes/` — Rust proxy protocol implementations (VMess, VLESS, Reality, etc.)
+- `thirdparty/leaf/` — Embeddable Rust proxy framework pattern
+- `thirdparty/shadowsocks-rust/` — Mature SS implementation, protocol dependency
+
+### Sing-box reference files (critical for implementation)
+- `thirdparty/sing-box/constant/proxy.go` — all protocol type strings (`TypeTUIC`, `TypeHysteria`, etc.)
+- `thirdparty/sing-box/option/outbound.go` — per-protocol outbound options structs
+- `thirdparty/sing-box/option/options.go` — top-level JSON config struct (`_Options`)
+- `thirdparty/sing-box/option/rule.go` — routing rule options
+- `thirdparty/sing-box/docs/configuration/outbound/` — human-readable config docs per protocol
+- `thirdparty/sing-box/experimental/v2rayapi.go` — V2Ray API experimental feature
+- `thirdparty/sing-box/docs/configuration/experimental/clash-api.md` — Clash API feature
+
+## Critical Design Decisions
+
+1. **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. The TUI writes JSON configs and manages the binary lifetime.
+2. **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, Shadowsocks, etc.) → xray-core by default. User overrides per-profile.
+3. **One core at a time**: Only one backend process runs per connection session. Switching profiles between backends stops the current core and starts the other. Matches v2rayN.
+4. **Ratatui + Crossterm** — TUI framework. Async via tokio. Single render thread with async tasks sending updates via mpsc channels.
+5. **SQLite via rusqlite** — Single DB file for all persistent data.
+6. **Multi-crate workspace** — Separation: bin crate (TUI) + 3 lib crates (core, db, config).
+7. **Config generation** — Two builders: xray.rs (ports v2rayN's CoreConfigContextBuilder) and singbox.rs (ports sing-box JSON format).
+8. **gRPC stats abstraction**: `StatsProvider` trait with `XrayGrpcClient` (xray-core native gRPC) and `SingBoxGrpcClient` (sing-box V2Ray API experimental).
+9. **Sing-box config differs structurally** from xray-core: `type` vs `protocol`, `route` vs `routing`, `experimental.v2ray_api` vs `stats`+`api`+`policy`, different TLS/transport key names.
+10. **Sing-box V2Ray API is experimental**: May require build tag `with_v2ray_api`. If unavailable, stats/logs show "not supported by core".
+
+## Protocols: In Scope
+
+### Xray-core native
+VMess (AES/Chacha20/None/AEAD security), VLESS (with flow control: xtls-rprx-vision), Shadowsocks, Shadowsocks-2022, SOCKS, HTTP, Trojan, WireGuard, Hysteria v2, Dokodemo-door, Freedom, Blackhole, DNS, Loopback, Custom
+
+### Sing-box only (extra beyond xray-core)
+TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect, TProxy, Mixed (inbound)
+
+## Protocols: Out of Scope
+
+Anything requiring a third binary backend beyond xray-core or sing-box.
+
+## Common Tasks
+
+### Adding a new protocol form
+1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
+2. Create form fields in `add_server.rs` matching that protocol's parameters
+3. Create `XxxFmt::parse_share_url` and `XxxFmt::format_share_url` in `xray-tui-config`
+4. Add profile validation in the appropriate config builder (`xray.rs` or `singbox.rs`)
+5. Reference: v2rayN's individual `*Fmt.cs` files for format specs; sing-box's `option/*.go` for JSON config structs
+
+### Making a UI screen
+1. Create file in `crates/xray-tui/src/ui/`
+2. Implement ratatui `Widget` or render function
+3. Register in `crates/xray-tui/src/ui/mod.rs` tab routing
+4. Wire keyboard handling in the main event loop
+
+### Adding a database migration
+1. Add versioned SQL migration to `xray-tui-db/src/migrations/`
+2. Register version in the migration runner
+
+### Determining which core a protocol belongs to
+- Reference `thirdparty/sing-box/constant/proxy.go` for sing-box protocol type strings
+- Reference `thirdparty/Xray-core/proxy/` directory listing for xray-core protocols
+- Update `protocol_core_mapping.rs` with the new entry
+- Protocols present in both: prefer xray-core (user can override profile core_type to force sing-box)
+
+## Style Guide
+
+- Rust 2024 edition
+- Follow clippy with default settings
+- Format with `rustfmt` (use `cargo fmt`)
+- Tests go next to code in same file (unit) or `tests/` (integration)
+- Use `thiserror` for error types
+- Use `anyhow` for error propagation where appropriate
+- Use `serde` for JSON serialization
+- Use `tokio` for async runtime
+- gRPC via `tonic` crate
+- HTTP via `reqwest` crate
+- SQLite via `rusqlite` crate
+
+## Verification
+
+- `cargo test` — runs all tests
+- `cargo clippy` — lint
+- `cargo build --release` — release build
+- Manual: run xray-tui against real xray-core and sing-box binaries, verify connect/speedtest/disconnect flow for both backends
