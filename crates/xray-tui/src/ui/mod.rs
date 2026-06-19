@@ -47,6 +47,11 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     state.core_event_tx = Some(core_tx);
     state.core_event_rx = Some(core_rx);
 
+    // Trigger startup version check if enabled
+    if state.config.updates.check_on_startup {
+        state.spawn_update_check();
+    }
+
     while !state.should_quit {
         loop {
             match rx.try_recv() {

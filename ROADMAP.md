@@ -80,7 +80,7 @@
 - Full config template editor (raw JSON) — supports both xray-core and sing-box formats
 - Global hotkey bindings
 - Config backup/restore (WebDAV)
-- Version update check
+- ✅ Version update check — GitHub releases API, download, install with .bak rollback, Updates settings form with per-core status
 - JSON config import/export (auto-detect format)
 - QR code display for share URLs
 - Clash API compatible UI tab (proxies view, connections view) — via sing-box experimental.clash_api

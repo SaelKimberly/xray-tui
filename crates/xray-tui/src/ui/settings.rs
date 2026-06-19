@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::{AppMode, AppState, SettingsMode, SettingsSection};
+use xray_tui_core::CoreType;
 
 // ── Menu items ──────────────────────────────────────────────────────────
 
@@ -17,8 +18,9 @@ const MENU_ITEMS: &[(&str, &str)] = &[
     ("DNS Settings", "servers, hosts, query strategy, cache"),
     ("System Proxy", "enable/disable HTTP_PROXY, ports, bypass"),
     ("TUN Mode", "enabled, interface name, MTU"),
-    ("Mux / Fragment", "enabled, concurrency, fragment config"),
+    ("Mux", "multiplexing settings"),
     ("Statistics", "enable/disable stats collection"),
+    ("Updates", "check and install backend updates"),
 ];
 
 /// Separator position between active sections and deferred ones
@@ -40,6 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             | SettingsMode::DnsForm { .. } => render_form(frame, area, state),
             SettingsMode::RoutingList { .. } => render_routing_list(frame, area, state),
             SettingsMode::RoutingForm { .. } => render_routing_form(frame, area, state),
+            SettingsMode::UpdateForm { .. } => render_update_form(frame, area, state),
         }
     }
 }
@@ -61,6 +64,7 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::DnsForm { .. } => handle_form_key(state, key),
         SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key),
         SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key),
+        SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key),
     }
 }
 
@@ -164,6 +168,7 @@ fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
                 6 => SettingsSection::Tun,
                 7 => SettingsSection::Mux,
                 8 => SettingsSection::Stats,
+                9 => SettingsSection::Updates,
                 _ => return,
             };
             state.enter_settings_form(section);
@@ -174,7 +179,6 @@ fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
         _ => {}
     }
 }
-
 // ── Form rendering ──────────────────────────────────────────────────────
 
 fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
@@ -187,6 +191,7 @@ fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
         SettingsMode::TunForm { .. } => " TUN Mode ",
         SettingsMode::MuxForm { .. } => " Mux / Fragment ",
         SettingsMode::StatsForm { .. } => " Statistics ",
+        SettingsMode::UpdateForm { .. } => " Backend Updates ",
         _ => " Settings ",
     }
 }
@@ -340,6 +345,7 @@ fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
         SettingsMode::SystemProxyForm { .. } => Some(SettingsSection::SystemProxy),
         SettingsMode::TunForm { .. } => Some(SettingsSection::Tun),
         SettingsMode::MuxForm { .. } => Some(SettingsSection::Mux),
+        SettingsMode::UpdateForm { .. } => Some(SettingsSection::Updates),
         SettingsMode::StatsForm { .. } => Some(SettingsSection::Stats),
         _ => None,
     }
@@ -457,6 +463,183 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 val.clear();
                 val.push_str(options[new_idx]);
             }
+        }
+        _ => {}
+    }
+}
+
+// ── Update form ──────────────────────────────────────────────────────────
+
+fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
+    let status_xray = match &state.mode {
+        AppMode::Settings {
+            mode: SettingsMode::UpdateForm { status_xray, .. },
+        } => status_xray,
+        _ => return,
+    };
+    let status_singbox = match &state.mode {
+        AppMode::Settings {
+            mode: SettingsMode::UpdateForm { status_singbox, .. },
+        } => status_singbox,
+        _ => return,
+    };
+
+    let title = " Backend Updates ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let label_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let avail_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let error_style = Style::default().fg(Color::Red);
+    let hint_style = Style::default().fg(Color::Gray);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ── Xray-core ──
+    lines.push(Line::from(Span::styled("  Xray-core", header_style)));
+    if let Some(ver) = &status_xray.current_version {
+        lines.push(Line::from(format!("    Current: {ver}")));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "    Current: not installed",
+            label_style,
+        )));
+    }
+    if let Some(ver) = &status_xray.latest_version {
+        lines.push(Line::from(format!("    Latest:  {ver}")));
+    } else if status_xray.error.is_some() {
+        lines.push(Line::from(Span::styled(
+            "    Latest:  (check failed)",
+            error_style,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "    Latest:  (checking...)",
+            hint_style,
+        )));
+    }
+    if status_xray.update_available {
+        lines.push(Line::from(Span::styled(
+            "    [Update available!]",
+            avail_style,
+        )));
+    }
+    if status_xray.downloading {
+        lines.push(Line::from(Span::styled(
+            "    Downloading...",
+            hint_style,
+        )));
+    }
+    if let Some(err) = &status_xray.error {
+        lines.push(Line::from(Span::styled(
+            format!("    Error: {err}"),
+            error_style,
+        )));
+    }
+
+    // ── Sing-box ──
+    lines.push(Line::from(Span::styled("  Sing-box", header_style)));
+    if let Some(ver) = &status_singbox.current_version {
+        lines.push(Line::from(format!("    Current: {ver}")));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "    Current: not installed",
+            label_style,
+        )));
+    }
+    if let Some(ver) = &status_singbox.latest_version {
+        lines.push(Line::from(format!("    Latest:  {ver}")));
+    } else if status_singbox.error.is_some() {
+        lines.push(Line::from(Span::styled(
+            "    Latest:  (check failed)",
+            error_style,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "    Latest:  (checking...)",
+            hint_style,
+        )));
+    }
+    if status_singbox.update_available {
+        lines.push(Line::from(Span::styled(
+            "    [Update available!]",
+            avail_style,
+        )));
+    }
+    if status_singbox.downloading {
+        lines.push(Line::from(Span::styled(
+            "    Downloading...",
+            hint_style,
+        )));
+    }
+    if let Some(err) = &status_singbox.error {
+        lines.push(Line::from(Span::styled(
+            format!("    Error: {err}"),
+            error_style,
+        )));
+    }
+
+    // Action hints
+    lines.push(Line::from(""));
+    let any_updates = status_xray.update_available || status_singbox.update_available;
+    let help = if any_updates {
+        " [C] Check for Updates  [D] Download & Install  [Esc] Back "
+    } else {
+        " [C] Check for Updates  [Esc] Back "
+    };
+    lines.push(Line::from(Span::styled(help, hint_style)));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Char('c') | KeyCode::Char('C') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.spawn_update_check();
+            // Refresh the form with current status
+            let status_xray = state.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
+            let status_singbox = state.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+            state.mode = AppMode::Settings {
+                mode: SettingsMode::UpdateForm { status_xray, status_singbox },
+            };
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            // Download updates for all cores that have them available
+            let any_updates = state.update_status.values().any(|s| s.update_available);
+            if !any_updates {
+                return;
+            }
+            // Check each core and trigger download if available
+            let xray_avail = state.update_status.get(&CoreType::Xray).map(|s| s.update_available).unwrap_or(false);
+            let singbox_avail = state.update_status.get(&CoreType::SingBox).map(|s| s.update_available).unwrap_or(false);
+
+            if xray_avail {
+                state.spawn_update_download(CoreType::Xray);
+            }
+            if singbox_avail {
+                state.spawn_update_download(CoreType::SingBox);
+            }
+            // Refresh the form with current status
+            let status_xray = state.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
+            let status_singbox = state.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+            state.mode = AppMode::Settings {
+                mode: SettingsMode::UpdateForm { status_xray, status_singbox },
+            };
+        }
+        KeyCode::Esc => {
+            state.enter_settings();
         }
         _ => {}
     }

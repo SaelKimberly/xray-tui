@@ -48,6 +48,27 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         }
     };
 
+    // Append update indicator if any backend has an update available
+    let update_indicator = if state.update_status.values().any(|s| s.update_available) {
+        let cores: Vec<&str> = state.update_status.iter()
+            .filter(|(_, s)| s.update_available)
+            .map(|(ct, _)| match ct {
+                xray_tui_core::CoreType::Xray => "xray",
+                xray_tui_core::CoreType::SingBox => "sing-box",
+                xray_tui_core::CoreType::Auto => "",
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cores.is_empty() {
+            String::new()
+        } else {
+            format!(" [Update: {}]", cores.join(", "))
+        }
+    } else {
+        String::new()
+    };
+    let left_text = format!("{left_text}{update_indicator}");
+
     let right_text = if state.connected_core.is_some() {
         " [Ctrl+Shift+C] Disconnect  [Tab] Next  [Ctrl+Q] Quit "
     } else if state.connecting {

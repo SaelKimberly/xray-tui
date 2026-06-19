@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub system_proxy: SystemProxyConfig,
     #[serde(default)]
     pub statistics: StatisticsConfig,
+    #[serde(default)]
+    pub updates: UpdateConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,5 +222,32 @@ mod tests {
         let json = r#"{"core":{"core_type":"xray"},"gui":{},"inbound":{}}"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.core.core_type, Some(CoreType::Xray));
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default = "default_update_check_enabled")]
+    pub check_on_startup: bool,
+    #[serde(default)]
+    pub last_check: Option<String>,
+    #[serde(default)]
+    pub xray_latest_known: Option<String>,
+    #[serde(default)]
+    pub sing_box_latest_known: Option<String>,
+}
+
+fn default_update_check_enabled() -> bool {
+    true
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            last_check: None,
+            xray_latest_known: None,
+            sing_box_latest_known: None,
+        }
     }
 }

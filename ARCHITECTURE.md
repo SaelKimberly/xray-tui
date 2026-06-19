@@ -46,6 +46,7 @@ pub struct AppState {
     pub connection_error: Option<String>,
     pub disconnect_tx: Option<oneshot::Sender<()>>,
     pub system_stats: Option<SysStats>,
+    pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub should_quit: bool,
 }
 
@@ -62,10 +63,11 @@ pub enum CoreEvent {
         today_down: i64,
         total_up: i64,
         total_down: i64,
-    },
     SysStatsUpdate(SysStats),
     SubscriptionsUpdated { group_id, count, error },
     SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, error },
+    UpdateCheckResult { core_type, current_version, latest_version, error },
+    UpdateCompleted { core_type, old_version, new_version, success, error },
 }
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
@@ -88,9 +90,8 @@ AppState provides:
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
 - `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, placeholder renderer
-- `statistics.rs` — Live stats display: traffic (today/total up/down), system stats (memory, goroutines, uptime), connection info (API endpoint, status). Data driven by StatsUpdate/SysStatsUpdate CoreEvents from the polling loop.
+- `settings.rs` — Full settings panel (Phase 6). Menu listing 10 config sections: Core, GUI, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
-- `settings.rs` — Full settings panel (Phase 6). Menu listing 9 config sections: Core, GUI, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
 - `logs.rs` — Log viewer
 ...
 Future screens (Phase 7+): config template editor, global hotkeys, etc.
@@ -324,6 +325,9 @@ Helpers: `format_bytes(i64) -> String`, `format_uptime(u32) -> String`.
 pub async fn update_subscription(url: &str, proxy: Option<&str>) -> Result<Vec<Profile>>;
 ```
 Parses base64-encoded share URLs, plain URL lists, v2rayN subscription formats, and sing-box format.
+
+**`updater.rs`** — Backend binary auto-update
+Functions: `get_current_version()` (run `{core} version`, parse output), `get_latest_version()` (GitHub releases API), `download_release()` (streaming download via reqwest, progress tracking), `install_binary()` (extract archive → verify binary runs → .bak existing → copy all files → remove .bak on success, restore from .bak on failure).
 
 **`speedtest.rs`** — Speed testing logic (same as single-core design)
 

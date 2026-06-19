@@ -20,6 +20,7 @@ cargo run
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
+- `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
 - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain)
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
@@ -106,6 +107,15 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 5. Add menu item in `render_speed_test_menu()` in `crates/xray-tui/src/ui/mod.rs`
 6. Add key handler entry in `handle_key()` menu navigation
 
+### Adding a backend auto-update feature
+1. Create functions in `crates/xray-tui-core/src/updater.rs`: `get_current_version` (runs subprocess), `get_latest_version` (GitHub releases API), `download_release` (streaming download to temp dir), `install_binary` (extract to temp → verify → .bak → copy all → remove .bak on success/restore from .bak on failure)
+2. Add `UpdateCheckResult` and `UpdateCompleted` variants to `CoreEvent` enum in `crates/xray-tui/src/lib.rs`; handle them in `poll_core_events()` to update `update_status: HashMap<CoreType, BackendUpdateStatus>`
+3. Add `spawn_update_check()` and `spawn_update_download()` methods on `AppState` — each spawns a tokio task that calls updater functions and sends results back through the core event channel
+4. Add `UpdateForm` to `SettingsMode` and `Updates` to `SettingsSection`; wire into `enter_settings_form()` with snapshot of current status
+5. Create `render_update_form()` and `handle_update_form_key()` in `settings.rs` — C triggers check, D triggers download for all available updates, Esc goes back
+6. Add update-available indicator (colored `[Update: ...]`) to `status_bar.rs`
+7. Add startup check in `ui::run()` gated by `config.updates.check_on_startup`
+
 ### Determining which core a protocol belongs to
 2. Register version in the migration runner
 
@@ -114,7 +124,6 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Reference `thirdparty/Xray-core/proxy/` directory listing for xray-core protocols
 - Update `protocol_core_mapping.rs` with the new entry
 - Protocols present in both: prefer xray-core (user can override profile core_type to force sing-box)
-
 
 ### Adding a new gRPC-based feature (stats, logs, routing API)
 1. Add/update proto definition in `crates/xray-tui-core/proto/` and re-run build (auto-compiled via build.rs)
@@ -132,6 +141,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Tests go next to code in same file (unit) or `tests/` (integration)
 - Use `thiserror` for error types
 - Use `anyhow` for error propagation where appropriate
+- Use `semver` for version parsing and comparison (backend updater)
 - Use `serde` for JSON serialization
 - Use `tokio` for async runtime
 - gRPC via `tonic` crate

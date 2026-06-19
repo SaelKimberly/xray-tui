@@ -1,6 +1,6 @@
 pub mod ui;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use tokio::sync::mpsc;
@@ -64,6 +64,7 @@ pub enum SettingsMode {
     TunForm { fields: Vec<(String, String)>, focus_index: usize },
     MuxForm { fields: Vec<(String, String)>, focus_index: usize },
     StatsForm { fields: Vec<(String, String)>, focus_index: usize },
+    UpdateForm { status_xray: BackendUpdateStatus, status_singbox: BackendUpdateStatus },
 }
 
 /// Identifies which section of the Settings panel is being edited.
@@ -78,6 +79,7 @@ pub enum SettingsSection {
     Tun,
     Mux,
     Stats,
+    Updates,
 }
 /// Tracks what the UI is currently showing.
 #[derive(Debug, Clone)]
@@ -150,6 +152,21 @@ pub enum CoreEvent {
         speed_bps: Option<u64>,
         error: Option<String>,
     },
+    /// Result of a version check for a proxy backend.
+    UpdateCheckResult {
+        core_type: CoreType,
+        current_version: Option<String>,
+        latest_version: Option<String>,
+        error: Option<String>,
+    },
+    /// Result of a download+install operation.
+    UpdateCompleted {
+        core_type: CoreType,
+        old_version: Option<String>,
+        new_version: String,
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +174,16 @@ pub enum ConfirmAction {
     DeleteProfile(String),
     DeleteGroup(String),
 }
+#[derive(Debug, Clone, Default)]
+pub struct BackendUpdateStatus {
+    pub current_version: Option<String>,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub downloading: bool,
+    pub download_progress: Option<(u64, u64)>,
+    pub error: Option<String>,
+}
+
 
 pub struct AppState {
     pub db: Database,
@@ -188,6 +215,8 @@ pub struct AppState {
     pub testing_profiles: HashSet<String>,
     /// Progress for batch tests: (completed, total)
     pub test_progress: Option<(usize, usize)>,
+    /// Cached update status for both backends.
+    pub update_status: HashMap<CoreType, BackendUpdateStatus>,
 }
 
 /// Internal helper for batch ping deduplication.
@@ -202,6 +231,7 @@ impl AppState {
             db,
             config,
             current_tab: Tab::Profiles,
+            update_status: HashMap::new(),
             profiles: Vec::new(),
             groups: Vec::new(),
             selected_group_id: None,
@@ -645,7 +675,9 @@ impl AppState {
                 ]
             }
             Routing => {
-                // Not a form — uses list/edit overlay
+                vec![]
+            }
+            Updates => {
                 vec![]
             }
         }
@@ -720,7 +752,7 @@ impl AppState {
                 self.config.statistics.enabled = get("enabled") == "true";
             }
             // Dns and Routing are handled separately (DB-backed)
-            Dns | Routing => {}
+            Dns | Routing | Updates => {}
         }
     }
 
@@ -736,6 +768,11 @@ impl AppState {
             SettingsSection::Tun => SettingsMode::TunForm { fields, focus_index: 0 },
             SettingsSection::Mux => SettingsMode::MuxForm { fields, focus_index: 0 },
             SettingsSection::Stats => SettingsMode::StatsForm { fields, focus_index: 0 },
+            SettingsSection::Updates => {
+                let status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
+                let status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+                SettingsMode::UpdateForm { status_xray, status_singbox }
+            }
         };
         self.mode = AppMode::Settings { mode };
     }
@@ -1549,6 +1586,43 @@ impl AppState {
                         }
                     }
                 }
+                CoreEvent::UpdateCheckResult { core_type, current_version, latest_version, error } => {
+                    let status = self.update_status.entry(core_type).or_default();
+                    status.current_version = current_version.clone();
+                    status.latest_version = latest_version.clone();
+                    status.update_available = match (&current_version, &latest_version) {
+                        (Some(cur_str), Some(latest_str)) => {
+                            let cur = xray_tui_core::updater::parse_version(cur_str);
+                            let latest = xray_tui_core::updater::parse_version(latest_str);
+                            match (cur, latest) {
+                                (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    status.error = error;
+                    if let Some(ref ver) = latest_version {
+                        match core_type {
+                            CoreType::Xray => self.config.updates.xray_latest_known = Some(ver.clone()),
+                            CoreType::SingBox => self.config.updates.sing_box_latest_known = Some(ver.clone()),
+                            CoreType::Auto => {}
+                        }
+                    }
+                }
+                CoreEvent::UpdateCompleted { core_type, old_version, new_version, success, error } => {
+                    let status = self.update_status.entry(core_type).or_default();
+                    status.downloading = false;
+                    status.download_progress = None;
+                    if success {
+                        status.current_version = Some(new_version.clone());
+                        status.update_available = false;
+                        self.add_log("info", &format!("{core_type} updated: {} → {}", old_version.as_deref().unwrap_or("none"), new_version));
+                    } else {
+                        status.error = error.clone();
+                        self.add_log("error", &format!("{core_type} update failed: {:?}", error));
+                    }
+                }
             }
         }
     }
@@ -1823,6 +1897,94 @@ impl AppState {
         for gid in group_ids {
             self.update_group_subscriptions(&gid);
         }
+    }
+
+    /// Spawn async task to check for backend updates on startup or manual trigger.
+    pub fn spawn_update_check(&mut self) {
+        let Some(tx) = self.core_event_tx.clone() else {
+            return;
+        };
+        let bin_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
+            .join("xray-tui");
+        for &core_type in &[CoreType::Xray, CoreType::SingBox] {
+            let tx = tx.clone();
+            let bin_dir = bin_dir.clone();
+            tokio::spawn(async move {
+                let current = xray_tui_core::updater::get_current_version(core_type, &bin_dir).await;
+                let latest = xray_tui_core::updater::get_latest_version(core_type).await;
+                let error = if current.is_none() && latest.is_none() {
+                    Some("binary not found and check failed".into())
+                } else if latest.is_none() {
+                    Some("failed to check latest version".into())
+                } else {
+                    None
+                };
+                let _ = tx.send(CoreEvent::UpdateCheckResult {
+                    core_type,
+                    current_version: current,
+                    latest_version: latest,
+                    error,
+                });
+            });
+        }
+    }
+
+    /// Spawn async task to download and install an update for the given core.
+    pub fn spawn_update_download(&mut self, core_type: CoreType) {
+        // Guard: don't download if already downloading
+        if self.update_status.get(&core_type).map(|s| s.downloading).unwrap_or(false) {
+            return;
+        }
+        // Guard: don't download if core is currently running
+        if self.connected_core == Some(core_type) {
+            self.add_log("warn", &format!("Cannot update {core_type} while it's running. Disconnect first."));
+            return;
+        }
+
+        let latest = match self.update_status.get(&core_type).and_then(|s| s.latest_version.clone()) {
+            Some(v) => v,
+            None => return,
+        };
+        let Some(tx) = self.core_event_tx.clone() else {
+            return;
+        };
+        let bin_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
+            .join("xray-tui");
+        let client = reqwest::Client::new();
+        let temp_dir = std::env::temp_dir().join("xray-tui-update");
+
+        self.update_status.entry(core_type).or_default().downloading = true;
+
+        tokio::spawn(async move {
+            // Download
+            let archive = match xray_tui_core::updater::download_release(&client, core_type, &latest, &temp_dir).await {
+                Ok(path) => path,
+                Err(e) => {
+                    let _ = tx.send(CoreEvent::UpdateCompleted {
+                        core_type, old_version: None, new_version: latest,
+                        success: false, error: Some(e),
+                    });
+                    return;
+                }
+            };
+            // Install
+            let result = xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
+            let (success, error) = match result {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e)),
+            };
+            // Clean up temp file
+            let _ = std::fs::remove_file(&archive);
+            let _ = std::fs::remove_dir_all(&temp_dir);
+
+            let old_version = None;
+            let _ = tx.send(CoreEvent::UpdateCompleted {
+                core_type, old_version, new_version: latest,
+                success, error,
+            });
+        });
     }
 
     /// Start a background task to check and update subscriptions.

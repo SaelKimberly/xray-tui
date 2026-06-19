@@ -6,6 +6,7 @@ pub mod process;
 pub mod protocol;
 pub mod protocol_core_mapping;
 pub mod speed_test;
+pub mod updater;
 
 pub use bin_manager::{CoreBinInfo, find_binary, get_core_info};
 pub use config_builder::{BackendConfig, BuildError, BuildParams, ConfigBuilder};
