@@ -94,6 +94,7 @@ AppState provides:
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `logs.rs` — Log viewer
 ...
+- `theme.rs` — Central color palette and Style definitions (Theme struct with 19 constants across 6 groups)
 Future screens (Phase 7+): config template editor, global hotkeys, etc.
 
 **`speed_test.rs`** — Async speed test engine:

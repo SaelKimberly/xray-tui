@@ -36,8 +36,8 @@ cargo run
 - `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics), routing rules list+form, reorder. Full rewrite Phase 6.
 - `status_bar.rs` — bottom connection indicator + key hints
 - `groups.rs` — subscription group list overlay, add/edit form
-- `logs.rs` — log viewer
 - `statistics.rs` — live traffic and system stats display
+- `theme.rs` — central color palette and Style definitions (Theme struct)
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API
@@ -165,3 +165,9 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - **DO NOT use `ast_edit`** — this tool is forbidden. Use `edit` for all code changes. `ast_edit` previews corrupt session state.
 - Use `search` for content search, NOT `grep`/`rg`/`awk` in bash.
 - Use `read` for file display, NOT `cat`/`head`/`tail`/`ls` in bash.
+
+## UI Manual Reference
+
+`TUI_MANUAL.md` documents all screens, keyboard shortcuts, and common workflows.
+Consult it when implementing UI changes, writing automated TUI tests with `tui-test` tools,
+or verifying expected screen content and key behavior.
