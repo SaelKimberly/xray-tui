@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::{AppMode, AppState, SettingsMode, SettingsSection};
 use xray_tui_core::CoreType;
-
+use crate::ui::theme::Theme;
 // ── Menu items ──────────────────────────────────────────────────────────
 
 const MENU_ITEMS: &[(&str, &str)] = &[
@@ -81,7 +81,8 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" Settings ")
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -91,7 +92,6 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         let is_selected = i == selected;
 
         if i == SEPARATOR_AFTER + 1 {
-            // Separator line before "System Proxy"
             lines.push(Line::from(Span::raw(" ─────")));
         }
 
@@ -102,7 +102,7 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
                 .bg(Color::Gray)
                 .add_modifier(Modifier::BOLD)
         } else if i > SEPARATOR_AFTER {
-            Style::default().fg(Color::DarkGray)
+            Theme::HINT
         } else {
             Style::default().fg(Color::White)
         };
@@ -114,17 +114,14 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         if is_selected {
             lines.push(Line::from(Span::styled(
                 format!("    {desc}"),
-                Style::default().fg(Color::DarkGray),
+                Theme::HINT,
             )));
         }
     }
 
     lines.push(Line::from(""));
     let help = " [↑/↓] Navigate  [Enter] Open  [Esc] Close ";
-    lines.push(Line::from(Span::styled(
-        help,
-        Style::default().fg(Color::DarkGray),
-    )));
+    lines.push(Line::from(Span::styled(help, Theme::HINT)));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);

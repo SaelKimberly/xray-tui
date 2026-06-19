@@ -5,6 +5,7 @@ pub mod profiles;
 pub mod settings;
 pub mod statistics;
 pub mod status_bar;
+pub mod theme;
 
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -16,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use std::io;
 use std::sync::mpsc;
@@ -89,8 +90,24 @@ fn handle_event(ev: &Event, state: &mut AppState) {
         handle_key(key, state);
     }
 }
-
 fn handle_key(key: &KeyEvent, state: &mut AppState) {
+    // Delete confirmation: only y/n/esc — check before mode dispatch so
+    // confirmation is handled even when inside a sub-mode like ManageGroups.
+    if state.confirmation.is_some() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
+                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
+                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
+                None => {}
+            },
+            KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
+                state.confirmation = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Group management overlay mode: pass to groups handler
     if matches!(&state.mode, crate::AppMode::ManageGroups { .. }) {
         groups::handle_key(state, key);
@@ -123,7 +140,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 
     // Form mode: route all keys to add_server handler (except Ctrl+C quit)
-    if !matches!(state.mode, crate::AppMode::List) {
+    if !matches!(state.mode, crate::AppMode::List) && !matches!(&state.mode, crate::AppMode::Help) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.should_quit = true;
@@ -215,34 +232,30 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     _ => {}
                 }
             }
+
             KeyCode::Esc => {
                 state.mode = crate::AppMode::List;
             }
-            _ => {}
-        }
-        return;
-    }
-
-    // Delete confirmation: only y/n/esc
-    if let Some(ref confirm) = state.confirmation {
-        match confirm {
-            ConfirmAction::DeleteProfile(_) | ConfirmAction::DeleteGroup(_) => {}
-        }
-        match key.code {
-            KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
-                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
-                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
-                None => {}
-            },
-            KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
-                state.confirmation = None;
+            KeyCode::Char('?') => {
+                state.previous_mode = Some(Box::new(state.mode.clone()));
+                state.mode = crate::AppMode::Help;
             }
             _ => {}
         }
         return;
     }
 
+
     match key.code {
+        // Help mode: Esc or ? to close, ignore other keys
+        KeyCode::Char('?') | KeyCode::Esc if matches!(&state.mode, crate::AppMode::Help) => {
+            state.mode = *state.previous_mode.take().unwrap_or(Box::new(crate::AppMode::List));
+        }
+        // Open help overlay from List mode
+        KeyCode::Char('?') if !matches!(&state.mode, crate::AppMode::Help) => {
+            state.previous_mode = Some(Box::new(state.mode.clone()));
+            state.mode = crate::AppMode::Help;
+        }
         KeyCode::Char('q' | 'Q') => {
             state.should_quit = true;
         }
@@ -418,14 +431,13 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────
-
 fn render(frame: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Tab row
-            Constraint::Min(0),    // Content area
-            Constraint::Length(1), // Status bar
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
@@ -440,6 +452,21 @@ fn render(frame: &mut Frame, state: &AppState) {
             status_bar::render(frame, chunks[2], state);
             return;
         }
+
+        // Help overlay: render base UI first, then overlay help
+        if matches!(&state.mode, crate::AppMode::Help) {
+            render_tabs(frame, chunks[0], state);
+            match state.current_tab {
+                Tab::Profiles => profiles::render(frame, chunks[1], state),
+                Tab::Settings => settings::render(frame, chunks[1], state),
+                Tab::Logs => logs::render(frame, chunks[1], state),
+                Tab::Statistics => statistics::render(frame, chunks[1], state),
+            }
+            render_help_overlay(frame, chunks[1], state);
+            status_bar::render(frame, chunks[2], state);
+            return;
+        }
+
         match &state.mode {
             crate::AppMode::AddServer { .. } | crate::AppMode::EditServer { .. } => {
                 add_server::render(frame, chunks[1], state);
@@ -465,20 +492,112 @@ fn render(frame: &mut Frame, state: &AppState) {
         status_bar::render(frame, chunks[2], state);
         return;
     }
-
     render_tabs(frame, chunks[0], state);
-
     match state.current_tab {
         Tab::Profiles => profiles::render(frame, chunks[1], state),
         Tab::Settings => settings::render(frame, chunks[1], state),
         Tab::Logs => logs::render(frame, chunks[1], state),
         Tab::Statistics => statistics::render(frame, chunks[1], state),
     }
-
     status_bar::render(frame, chunks[2], state);
 }
+fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
+    // Determine context from previous mode
+    match &state.mode {
+        _ if state.current_tab == Tab::Profiles => vec![
+            ("↑↓ / PgUp PgDn", "Navigate profiles"),
+            ("Enter", "Set as active server"),
+            ("Ctrl+Enter", "Connect to selected server"),
+            ("Space", "Toggle multi-select"),
+            ("a", "Add new server"),
+            ("e", "Edit selected server"),
+            ("d", "Delete selected server(s)"),
+            ("c", "Clone selected server"),
+            ("g", "Manage subscription groups"),
+            ("t", "Open speed test menu"),
+            ("o", "Cycle sort column"),
+            ("/", "Search/filter"),
+            ("Ctrl+V", "Import share URL"),
+            ("Ctrl+Shift+C", "Copy share URL"),
+            ("Tab / Shift+Tab", "Cycle tabs"),
+            ("?", "Toggle this help"),
+            ("q / Ctrl+C", "Quit"),
+        ],
+        _ if state.current_tab == Tab::Settings => vec![
+            ("↑↓", "Navigate settings menu"),
+            ("Enter", "Open selected section"),
+            ("Esc", "Close settings"),
+            ("Tab / Shift+Tab", "Cycle tabs"),
+            ("?", "Toggle this help"),
+            ("q / Ctrl+C", "Quit"),
+        ],
+        _ if state.current_tab == Tab::Statistics => vec![
+            ("Tab / Shift+Tab", "Cycle tabs"),
+            ("?", "Toggle this help"),
+            ("q / Ctrl+C", "Quit"),
+        ],
+        _ if state.current_tab == Tab::Logs => vec![
+            ("Tab / Shift+Tab", "Cycle tabs"),
+            ("?", "Toggle this help"),
+            ("q / Ctrl+C", "Quit"),
+        ],
+        _ => vec![
+            ("Tab / Shift+Tab", "Cycle tabs"),
+            ("?", "Toggle this help"),
+            ("q / Ctrl+C", "Quit"),
+        ],
+    }
+}
 
-/// Render the speed test menu as a centered overlay.
+fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let content = help_content(state);
+    let lines: Vec<Line> = content
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!(" {:<20}", key), crate::ui::theme::Theme::HINT),
+                Span::raw("  "),
+                Span::styled(*desc, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+
+    let popup_width = 52u16.min(area.width.saturating_sub(4));
+    let popup_height = (content.len() as u16 + 2).min(area.height.saturating_sub(4));
+
+    let vert_pad = (area.height.saturating_sub(popup_height)) / 2;
+    let horiz_pad = (area.width.saturating_sub(popup_width)) / 2;
+
+    let popup_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(vert_pad),
+            Constraint::Length(popup_height),
+            Constraint::Min(0),
+        ])
+        .split(area)[1];
+    let popup_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(horiz_pad),
+            Constraint::Length(popup_width),
+            Constraint::Min(0),
+        ])
+        .split(popup_area)[1];
+
+    let block = Block::default()
+        .title(" Keyboard Shortcuts ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let menu_items = [
         "TCP Ping (Selected)",
@@ -545,7 +664,6 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .style(Style::default().bg(Color::Rgb(30, 30, 40)));
-
     let paragraph = Paragraph::new(lines)
         .block(block)
         .alignment(ratatui::layout::Alignment::Left);
@@ -553,7 +671,7 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, popup_area);
 }
 fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let spans: Vec<Span> = Tab::ALL
+    let titles: Vec<Line> = Tab::ALL
         .iter()
         .map(|tab| {
             let name = match tab {
@@ -562,22 +680,23 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Tab::Logs => " Logs ",
                 Tab::Statistics => " Statistics ",
             };
-            let selected = *tab == state.current_tab;
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
-            };
-            Span::styled(name, style)
+            Line::from(Span::styled(
+                name,
+                crate::ui::theme::Theme::TAB_DESELECTED,
+            ))
         })
         .collect();
 
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    let tabs = Tabs::new(titles)
+        .select(
+            Tab::ALL
+                .iter()
+                .position(|t| *t == state.current_tab)
+                .unwrap_or(0),
+        )
+        .highlight_style(crate::ui::theme::Theme::TAB_SELECTED)
+        .divider(Span::raw(""));
+    frame.render_widget(tabs, area);
 }
 
 pub fn render_placeholder_screen(frame: &mut Frame, area: Rect, name: &str) {

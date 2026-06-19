@@ -2,24 +2,39 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{CoreType, resolve_core};
 
+use crate::ui::theme::Theme;
 use crate::{AppState, ConfirmAction};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows = state.filtered_profiles();
     let selected = state.selected_index;
-
+    let gauge_height = state.test_progress.map_or(0, |_| 1u16);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(gauge_height),
+            Constraint::Min(0),
+        ])
         .split(area);
 
     render_filter_strip(frame, chunks[0], state);
-    render_data_grid(frame, chunks[1], &rows, selected, state);
 
+    // Progress gauge for batch tests
+    if let Some((done, total)) = state.test_progress {
+        let progress = done as f64 / total.max(1) as f64;
+        let gauge = Gauge::default()
+            .gauge_style(Theme::PROGRESS_FILL)
+            .label(format!(" Batch: {done}/{total} "))
+            .ratio(progress);
+        frame.render_widget(gauge, chunks[1]);
+    }
+
+    render_data_grid(frame, chunks[2], &rows, selected, state);
     // Delete confirmation overlay (profiles only)
     if let Some(ConfirmAction::DeleteProfile(ref delete_id)) = state.confirmation {
         let profile_name = rows
@@ -57,12 +72,7 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let group_text = format!(" Group: {}", group_name);
-    let group_span = Span::styled(
-        group_text,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let group_span = Span::styled(group_text, Theme::CONTAINER_TITLE);
 
     let search_text = if state.search_focused {
         format!("/ {}_", state.search_query)
@@ -71,7 +81,7 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         format!("/ {}", state.search_query)
     };
-    let search_span = Span::styled(search_text, Style::default().fg(Color::Yellow));
+    let search_span = Span::styled(search_text, Theme::WARNING);
 
     let line = Line::from(vec![group_span, Span::raw("  "), search_span]);
     let paragraph = Paragraph::new(line);
@@ -85,126 +95,127 @@ fn render_data_grid(
     selected_index: usize,
     state: &AppState,
 ) {
-    let block = Block::default().borders(Borders::TOP);
+    let block = Block::default()
+        .title(" Profiles ")
+        .borders(Borders::ALL)
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let header_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightBlue)
-        .add_modifier(Modifier::BOLD);
+    // Header row
+    let header_cells = [
+        " #  ", "Type    ", "Remarks                  ",
+        "Address                        ", "Port  ",
+        "Delay ", "Speed ", "Traffic   ", "Core    ",
+    ]
+    .iter()
+    .map(|h| Cell::from(*h).style(Theme::TABLE_HEADER));
+    let header = Row::new(header_cells);
 
-    let mut text_lines: Vec<Line> = Vec::new();
+    // Data rows
+    let data_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let is_selected = i == selected_index;
+            let row_style = if is_selected {
+                Theme::TABLE_ROW_SELECTED
+            } else if i % 2 == 1 {
+                Theme::TABLE_ROW_ALT
+            } else {
+                Theme::TABLE_ROW_NORMAL
+            };
 
-    let header_line = Line::from(
-        vec![
-            cell_span("  #", 5),
-            cell_span("Type", 8),
-            cell_span("Remarks", 24),
-            cell_span("Address", 30),
-            cell_span("Port", 6),
-            cell_span("Delay", 6),
-            cell_span("Speed", 6),
-            cell_span("Traffic", 10),
-            cell_span("Core", 8),
-        ]
-        .into_iter()
-        .map(|s| s.style(header_style))
-        .collect::<Vec<_>>(),
-    );
-    text_lines.push(header_line);
+            let protocol =
+                Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
+            let core = resolve_core(
+                protocol,
+                Some(
+                    row.profile
+                        .core_type
+                        .parse::<CoreType>()
+                        .unwrap_or(CoreType::Auto),
+                ),
+            );
 
-    for (i, row) in rows.iter().enumerate() {
-        let is_selected = i == selected_index;
+            let core_color = match core {
+                CoreType::Xray => Color::Blue,
+                CoreType::SingBox => Color::Green,
+                CoreType::Auto => Color::White,
+            };
 
-        let protocol = Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
-        let core = resolve_core(
-            protocol,
-            Some(
-                row.profile
-                    .core_type
-                    .parse::<CoreType>()
-                    .unwrap_or(CoreType::Auto),
-            ),
-        );
+            let is_multi = state.multi_select.contains(&row.profile.id);
+            let idx_str = if is_multi {
+                "  *".to_string()
+            } else {
+                format!("{:>3}", i + 1)
+            };
 
-        let core_color = match core {
-            CoreType::Xray => Color::Blue,
-            CoreType::SingBox => Color::Green,
-            CoreType::Auto => Color::White,
-        };
+            let type_str = format!("{:.8}", protocol.to_string());
+            let remarks = row.profile.remarks.as_deref().unwrap_or("");
+            let remarks_str = truncate_pad(remarks, 24);
+            let address = row.profile.address.as_deref().unwrap_or("");
+            let address_str = truncate_pad(address, 30);
+            let port_str = row
+                .profile
+                .port
+                .map(|p| format!("{:>6}", p))
+                .unwrap_or_else(|| "     -".to_string());
+            let delay_str = row
+                .extension
+                .as_ref()
+                .and_then(|e| e.delay)
+                .map(|d| format!("{:>6}", d))
+                .unwrap_or_else(|| "     -".to_string());
+            let speed_str = row
+                .extension
+                .as_ref()
+                .and_then(|e| e.speed)
+                .map(|s| format!("{:>6}", s))
+                .unwrap_or_else(|| "     -".to_string());
+            let traffic = row
+                .stats
+                .as_ref()
+                .map(|s| {
+                    let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
+                    format_traffic(total as u64)
+                })
+                .unwrap_or_else(|| "        -".to_string());
+            let core_str = core.to_string();
 
-        let row_style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightYellow)
-                .add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default().fg(core_color)
-        };
+            let cells = vec![
+                Cell::from(idx_str),
+                Cell::from(type_str),
+                Cell::from(remarks_str),
+                Cell::from(address_str),
+                Cell::from(port_str.trim().to_string()),
+                Cell::from(delay_str.trim().to_string()),
+                Cell::from(speed_str.trim().to_string()),
+                Cell::from(traffic.trim().to_string()),
+                Cell::from(core_str).style(Style::default().fg(core_color)),
+            ];
 
-        let is_multi = state.multi_select.contains(&row.profile.id);
-        let idx_str = if is_multi {
-            "  *".to_string()
-        } else {
-            format!("{:>3}", i + 1)
-        };
+            Row::new(cells).style(row_style)
+        })
+        .collect();
 
-        let type_str = format!("{:.8}", protocol.to_string());
-        let remarks = row.profile.remarks.as_deref().unwrap_or("");
-        let remarks_str = truncate_pad(remarks, 24);
-        let address = row.profile.address.as_deref().unwrap_or("");
-        let address_str = truncate_pad(address, 30);
-        let port_str = row
-            .profile
-            .port
-            .map(|p| format!("{:>6}", p))
-            .unwrap_or_else(|| "     -".to_string());
-        let delay_str = row
-            .extension
-            .as_ref()
-            .and_then(|e| e.delay)
-            .map(|d| format!("{:>6}", d))
-            .unwrap_or_else(|| "     -".to_string());
-        let speed_str = row
-            .extension
-            .as_ref()
-            .and_then(|e| e.speed)
-            .map(|s| format!("{:>6}", s))
-            .unwrap_or_else(|| "     -".to_string());
-        let traffic = row
-            .stats
-            .as_ref()
-            .map(|s| {
-                let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
-                format_traffic(total as u64)
-            })
-            .unwrap_or_else(|| "        -".to_string());
-        let core_str = format!("{:>8}", core.to_string());
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Length(8),
+        Constraint::Length(24),
+        Constraint::Length(30),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Length(8),
+    ];
 
-        let cells: Vec<Span> = vec![
-            Span::raw(format!("{:>5}", idx_str)),
-            Span::raw(format!("{:>8}", type_str)),
-            Span::raw(format!("{:>24}", remarks_str)),
-            Span::raw(format!("{:>30}", address_str)),
-            Span::raw(format!("{:>6}", port_str)),
-            Span::raw(format!("{:>6}", delay_str)),
-            Span::raw(format!("{:>6}", speed_str)),
-            Span::raw(format!("{:>10}", traffic)),
-            Span::styled(format!("{:>8}", core_str), Style::default().fg(core_color)),
-        ];
-
-        let line = Line::from(cells).style(row_style);
-        text_lines.push(line);
-    }
-
-    let paragraph = Paragraph::new(text_lines);
-    frame.render_widget(paragraph, inner);
-}
-
-fn cell_span(label: &str, width: usize) -> Span<'static> {
-    let padded = format!("{:width$}", label, width = width);
-    Span::raw(padded)
+    let table = Table::new(data_rows, widths)
+        .header(header)
+        .column_spacing(0);
+    frame.render_widget(table, inner);
 }
 
 fn truncate_pad(s: &str, width: usize) -> String {

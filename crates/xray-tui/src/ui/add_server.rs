@@ -9,6 +9,7 @@ use xray_tui_core::SINGBOX_ONLY_PROTOCOLS;
 use xray_tui_core::protocol::Protocol;
 
 use crate::{AppMode, AppState};
+use crate::ui::theme::Theme;
 
 /// Protocol picker layout groups
 const XRAY_PROTOCOLS: &[Protocol] = &[
@@ -130,7 +131,8 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title("Select Protocol")
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_style(crate::ui::theme::Theme::CONTAINER_BORDER);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -202,10 +204,13 @@ fn render_form(
     _is_edit: bool,
 ) {
     let title = format!(" {protocol} ");
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(crate::ui::theme::Theme::CONTAINER_BORDER)
+        .title_style(crate::ui::theme::Theme::CONTAINER_TITLE);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
     let form_fields = form_fields_for(protocol);
     let focus_style = Style::default()
         .fg(Color::Black)
@@ -215,7 +220,7 @@ fn render_form(
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
     let required_style = Style::default().fg(Color::Red);
-    let hint_style = Style::default().fg(Color::Gray);
+    let hint_style = Theme::HINT;
 
     let mut lines: Vec<Line> = Vec::new();
 

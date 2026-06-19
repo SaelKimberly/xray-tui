@@ -2,11 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-
+use ratatui::widgets::{Block, Borders, Paragraph};
+use crate::ui::theme::Theme;
 use crate::AppState;
 use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
-
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let connected = state.connected_core.is_some();
     let has_profile = !state.profiles.is_empty() && state.selected_index < state.profiles.len();
@@ -98,19 +97,23 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     lines.push(Line::from(format!("  API endpoint:  {API_ENDPOINT}")));
 
     let status_style = if connected {
-        Style::default().fg(Color::Green)
+        Theme::SUCCESS
     } else {
-        Style::default().fg(Color::Red)
+        Theme::ERROR
     };
     lines.push(Line::from(vec![
         Span::raw("  Status:       "),
         Span::styled("Connected", status_style),
     ]));
 
-    let block = Block::default().title(" Statistics ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Statistics ")
+        .borders(Borders::ALL)
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 

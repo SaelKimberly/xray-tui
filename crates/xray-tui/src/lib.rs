@@ -86,7 +86,8 @@ pub enum SettingsSection {
 pub enum AppMode {
     /// The main profile list
     List,
-    /// Settings panel (menu or sub-form)
+    /// Help overlay
+    Help,
     Settings { mode: SettingsMode },
     /// Adding a new server
     AddServer {
@@ -207,6 +208,8 @@ pub struct AppState {
     pub disconnect_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub should_quit: bool,
     pub mode: AppMode,
+    /// Previous mode before opening help overlay
+    pub previous_mode: Option<Box<AppMode>>,
     pub multi_select: HashSet<String>,
     pub clipboard: Option<String>,
     pub confirmation: Option<ConfirmAction>,
@@ -249,6 +252,7 @@ impl AppState {
             disconnect_tx: None,
             should_quit: false,
             mode: AppMode::List,
+            previous_mode: None,
             multi_select: HashSet::new(),
             clipboard: None,
             confirmation: None,
@@ -1796,7 +1800,7 @@ impl AppState {
         let db_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
             .join("xray-tui")
-            .join("xray-tui.db");
+            .join("data.db");
 
         tokio::spawn(async move {
             let result = Self::do_update_subscription(url, user_agent, gid.clone(), db_path).await;
@@ -1995,7 +1999,7 @@ impl AppState {
         let db_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
             .join("xray-tui")
-            .join("xray-tui.db");
+            .join("data.db");
 
         tokio::spawn(async move {
             use std::time::Duration;

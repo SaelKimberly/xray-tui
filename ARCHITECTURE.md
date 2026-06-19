@@ -20,7 +20,7 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 ```rust
 pub enum Tab { Profiles, Settings, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
-pub enum AppMode { List, Settings{..}, AddServer{..}, EditServer{..}, ImportUrl{..}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
+pub enum AppMode { List, Help, Settings{..}, AddServer{..}, EditServer{..}, ImportUrl{..}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
 pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
 pub struct LogLine { level: String, message: String }
 
@@ -47,6 +47,7 @@ pub struct AppState {
     pub disconnect_tx: Option<oneshot::Sender<()>>,
     pub system_stats: Option<SysStats>,
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
+    pub previous_mode: Option<Box<AppMode>>,
     pub should_quit: bool,
 }
 
@@ -89,7 +90,7 @@ AppState provides:
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
-- `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, placeholder renderer
+:- `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, help overlay (context-sensitive keybinding reference), placeholder renderer
 - `settings.rs` — Full settings panel (Phase 6). Menu listing 10 config sections: Core, GUI, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `logs.rs` — Log viewer

@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::{AppMode, AppState, ConfirmAction};
-
+use crate::ui::theme::Theme;
 pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     // Centered overlay: ~70% width, ~70% height
     let overlay_area = Rect::new(
@@ -24,7 +24,8 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Groups ")
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
     let inner = block.inner(overlay_area);
     frame.render_widget(block, overlay_area);
 
@@ -117,7 +118,7 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     // Footer
     let footer = Paragraph::new(Line::from(Span::styled(
         " [a] Add  [e] Edit  [d] Delete  [u] Update  [Shift+U] Update All  [Enter] Filter  [Esc] Close ",
-        Style::default().fg(Color::DarkGray),
+        Theme::HINT,
     )));
     frame.render_widget(footer, chunks[1]);
 }
@@ -126,7 +127,8 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Group ")
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -185,7 +187,7 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
     // Hint
     let hint = Paragraph::new(Line::from(Span::styled(
         " Tab/S-Tab: navigate  Enter: save  Esc: cancel ",
-        Style::default().fg(Color::DarkGray),
+        Theme::HINT,
     )));
     frame.render_widget(
         hint,
