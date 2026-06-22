@@ -143,6 +143,22 @@ impl CoreManager {
             }
         });
 
+        // Read stdout for logs (xray-core logs to stdout by default)
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProcessError::Startup("Failed to capture stdout".to_string()))?;
+        let log_tx = self.log_tx.clone();
+        tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if log_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
         // Poll for readiness (check process hasn't exited early)
         let max_retries = 20; // 500ms * 20 = 10s
         for _ in 0..max_retries {

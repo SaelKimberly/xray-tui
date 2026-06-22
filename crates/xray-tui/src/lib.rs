@@ -167,6 +167,11 @@ pub enum CoreEvent {
         total_down: i64,
     },
     SysStatsUpdate(grpc_client::SysStats),
+    /// A log line from the core process stderr.
+    LogLine {
+        level: String,
+        message: String,
+    },
     SubscriptionsUpdated {
         group_id: String,
         count: usize,
@@ -226,6 +231,8 @@ pub struct AppState {
     pub subscriptions: Vec<Subscription>,
     pub selected_group_id: Option<String>,
     pub selected_index: usize,
+    /// Scroll offset from the bottom of the log buffer (0 = newest visible).
+    pub log_scroll: usize,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub search_query: String,
@@ -279,6 +286,7 @@ impl AppState {
             search_query: String::new(),
             search_focused: false,
             log_buffer: Vec::new(),
+            log_scroll: 0,
             connected_core: None,
             connecting: false,
             connection_error: None,
@@ -1167,6 +1175,9 @@ impl AppState {
 
         // Need to move params into the async block
 
+        // Create log forwarding channel
+        let (log_line_tx, mut log_line_rx) = mpsc::unbounded_channel::<String>();
+
         tokio::spawn(async move {
             // 1. Build config
             let backend_config =
@@ -1191,7 +1202,7 @@ impl AppState {
             };
 
             // 3. Start core
-            let mut manager = CoreManager::new(bin_configs_dir);
+            let mut manager = CoreManager::with_log_channel(bin_configs_dir, log_line_tx);
             if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
                 let _ = tx.send(CoreEvent::Error(format!("Failed to start core: {e}")));
                 return;
@@ -1199,6 +1210,15 @@ impl AppState {
 
             // 4. Signal connected
             let _ = tx.send(CoreEvent::Connected(core_type));
+
+            // Forward stderr log lines as CoreEvent::LogLine
+            let log_tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(line) = log_line_rx.recv().await {
+                    let (level, message) = parse_log_level(&line);
+                    let _ = log_tx.send(CoreEvent::LogLine { level, message });
+                }
+            });
 
             let profile_id = profile.id.clone();
 
@@ -1664,6 +1684,9 @@ impl AppState {
                 }
                 CoreEvent::SysStatsUpdate(stats) => {
                     self.system_stats = Some(stats);
+                }
+                CoreEvent::LogLine { level, message } => {
+                    self.add_log(&level, &message);
                 }
                 CoreEvent::SubscriptionsUpdated {
                     group_id,
@@ -2367,4 +2390,72 @@ fn format_now() -> String {
 
 fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn parse_log_level(line: &str) -> (String, String) {
+    let trimmed = line.trim();
+    // Sing-box JSON format: {"level":"info","time":"...","msg":"..."}
+    if trimmed.starts_with('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let raw_level = parsed
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("info");
+            let level = if raw_level == "warn" {
+                "warning".to_string()
+            } else {
+                raw_level.to_string()
+            };
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or(trimmed);
+            return (level, msg.to_string());
+        }
+    }
+    // Xray-core bracket format: "2024/01/01 12:00:00 [Info] message"
+    if let Some(bracket_start) = trimmed.find('[') {
+        if let Some(bracket_end) = trimmed[bracket_start..].find(']') {
+            let raw = &trimmed[bracket_start + 1..bracket_start + bracket_end];
+            let lower = raw.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "info" | "warning" | "warn" | "error" | "debug" | "fatal" | "panic"
+            ) {
+                let msg = trimmed[bracket_start + bracket_end + 1..].trim().to_string();
+                let level = if lower == "warn" {
+                    "warning".to_string()
+                } else {
+                    lower
+                };
+                return (level, msg);
+            }
+        }
+    }
+    // Fallback
+    ("info".to_string(), trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parse_xray_log() {
+        let (level, msg) = parse_log_level("2024/01/01 [Info] Server started");
+        assert_eq!(level, "info");
+        assert!(msg.contains("Server started"));
+    }
+    #[test]
+    fn parse_singbox_json() {
+        let (level, msg) =
+            parse_log_level(r#"{"level":"warn","time":"...","msg":"timeout"}"#);
+        assert_eq!(level, "warning");
+        assert_eq!(msg, "timeout");
+    }
+    #[test]
+    fn parse_fallback() {
+        let (level, msg) = parse_log_level("raw output");
+        assert_eq!(level, "info");
+        assert_eq!(msg, "raw output");
+    }
 }

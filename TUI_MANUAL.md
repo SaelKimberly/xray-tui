@@ -84,13 +84,25 @@ updates. `Esc` returns to menu.
 
 ### Logs
 
-A bordered container displaying:
+A bordered container displaying live log output from the connected core process.
+When no core is running, shows:
 
 ```
-Log viewer — coming in a future update
+┌ Logs ───────────────────────────────────────────────────┐
+│No logs                                                  │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Placeholder — no functionality yet.
+After connecting to a profile, the core's stdout (xray-core) and stderr (sing-box)
+log lines appear in real time. Log levels are color-coded:
+
+- **error/fatal/panic** — red bold (`Theme::ERROR`)
+- **warning/warn** — yellow (`Theme::WARNING`)
+- **info** — default terminal color
+- **debug/trace** — gray (`Theme::HINT`)
+
+The buffer holds the most recent 1000 log lines. Scrolling is bottom-anchored
+(0 = newest line visible at bottom of viewport).
 
 ---
 
@@ -331,7 +343,19 @@ appended when updates are available for installed backends.
 | `D`              | Download and install updates        |
 | `Esc`            | Return to settings menu             |
 
-### Logs / Statistics Tabs
+### Logs Tab
+
+| Key               | Action                              |
+| ----------------- | ----------------------------------- |
+| `↑` / `↓`        | Scroll logs                         |
+| `PgUp` / `PgDn`  | Page up/down (20 lines)            |
+| `Home`           | Jump to oldest log entry            |
+| `End`            | Jump to newest log entry            |
+| `Tab` / `Shift+Tab` | Cycle tabs                       |
+| `?`              | Toggle help overlay                 |
+| `q` / `Ctrl+C`   | Quit application                    |
+
+### Statistics Tab
 
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |

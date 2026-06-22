@@ -29,13 +29,15 @@ cargo run
 - `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
 - `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping, speed test, UDP test, batch ping) using tokio + reqwest SOCKS5 proxy
 
+- `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 - `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics), routing rules list+form, reorder. Full rewrite Phase 6.
 - `status_bar.rs` — bottom connection indicator + key hints
-- `groups.rs` — group management overlay with list/add/edit/clear/delete, system group handling
+- `groups.rs` — system-group-aware management (is_system guard, clear action)
+- `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - `statistics.rs` — live traffic and system stats display
 - `theme.rs` — central color palette and Style definitions (Theme struct)
 

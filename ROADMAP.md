@@ -19,7 +19,7 @@
 - ✅ Group/subscription filter strip with live client-side search
 - ✅ Status bar showing connection status + key hints (`[Tab] Next  [Ctrl+Q] Quit`)
 - ✅ Tab navigation (Tab/Shift+Tab), profile list navigation (Up/Down/Home/End)
-- ✅ Placeholder screens for Settings, Routing, DNS, Statistics (Logs remains placeholder — Phase 9)
+- ✅ Placeholder screens for Settings, Routing, DNS, Statistics
 - ✅ DB query methods: get_all_profiles, get_profiles_by_group, get_all_groups, get_profile_extension, get_server_stats, get_all_profiles_with_details
 - ✅ AppState with filtered/sorted profile list
 - ✅ Keyboard shortcuts: q/Ctrl+C quit, / search, Esc clear filter, Tab cycle tabs
@@ -77,7 +77,7 @@
 
 ## Phase 7 — Advanced Features
 
-- ☐ Logs tab — wire existing stderr streaming pipeline to TUI display (scrollable, filterable)
+- ✅ Logs tab — wire core stdout/stderr pipeline to TUI display with live scrolling, color-coded log levels, and keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - ☐ Sing-box config builder completeness — implement config generation for all 11 broken protocols (ShadowsocksR, Hysteria v1, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, VMess, VLESS, Trojan, WireGuard)
 - ☐ WireGuard sing-box peer model — complete form fields for multi-peer arrays, pre-shared keys, allowed IPs
 - ☐ Advanced form fields — add multiplex, V2Ray transport (WS/gRPC/QUIC/HTTPUpgrade), TLS options (ECH, uTLS fingerprint, Fragment) to protocol forms

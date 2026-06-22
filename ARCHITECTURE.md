@@ -64,11 +64,17 @@ pub enum CoreEvent {
         today_down: i64,
         total_up: i64,
         total_down: i64,
+    },
     SysStatsUpdate(SysStats),
     SubscriptionsUpdated { group_id, count, error },
     SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, error },
     UpdateCheckResult { core_type, current_version, latest_version, error },
     UpdateCompleted { core_type, old_version, new_version, success, error },
+    /// A log line from the core process stdout (xray-core) or stderr (sing-box).
+    LogLine {
+        level: String,
+        message: String,
+    },
 }
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
@@ -134,7 +140,7 @@ pub struct CoreProcess {
     child: Option<Child>,
     config_path: PathBuf,
     pub core_type: CoreType,
-    log_tx: UnboundedSender<String>,  // stderr forwarded to TUI
+    log_tx: UnboundedSender<String>,  // process stdout/stderr forwarded to TUI
 }
 
 pub enum RunningCore {
@@ -522,7 +528,7 @@ Refresh profile list in UI
 ## Error Handling Strategy
 
 - **Process crashes**: Detected via `Child::try_wait()`. Auto-restart with backoff (1s, 2s, 4s, max 30s). UI shows error state with core type.
-- **Config errors**: Builder validates before writing. Core stderr parsed for config errors. Shown in log panel.
+- **Config errors**: Builder validates before writing. Core output parsed for config errors. Shown in log panel.
 - **Core binary not found**: Detection at startup and profile connect time. Profiles for the missing core show "binary not found" in connect UI.
 - **gRPC connection failure**: Retry with backoff. If core is running but API not responding, show degraded state (stats unavailable). Sing-box V2Ray API may be missing if built without `with_v2ray_api` tag.
 - **Network errors** (subscription download, speed test): Show timeout/failure per-server. Don't block UI.

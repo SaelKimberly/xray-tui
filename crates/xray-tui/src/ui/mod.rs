@@ -319,6 +319,28 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::End if state.current_tab == Tab::Profiles => {
             state.selected_index = state.filtered_len().saturating_sub(1);
         }
+        // Logs tab scrolling
+        KeyCode::Up if state.current_tab == Tab::Logs => {
+            let max_scroll = state.log_buffer.len().saturating_sub(1);
+            if state.log_scroll < max_scroll {
+                state.log_scroll += 1;
+            }
+        }
+        KeyCode::Down if state.current_tab == Tab::Logs => {
+            state.log_scroll = state.log_scroll.saturating_sub(1);
+        }
+        KeyCode::PageUp if state.current_tab == Tab::Logs => {
+            state.log_scroll = state.log_scroll.saturating_add(20);
+        }
+        KeyCode::PageDown if state.current_tab == Tab::Logs => {
+            state.log_scroll = state.log_scroll.saturating_sub(20);
+        }
+        KeyCode::Home if state.current_tab == Tab::Logs => {
+            state.log_scroll = state.log_buffer.len().saturating_sub(1);
+        }
+        KeyCode::End if state.current_tab == Tab::Logs => {
+            state.log_scroll = 0;
+        }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
@@ -580,6 +602,9 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
             ("q / Ctrl+C", "Quit"),
         ],
         _ if state.current_tab == Tab::Logs => vec![
+            ("↑↓", "Scroll logs"),
+            ("PgUp / PgDn", "Page up/down"),
+            ("Home / End", "Jump to oldest/newest"),
             ("Tab / Shift+Tab", "Cycle tabs"),
             ("?", "Toggle this help"),
             ("q / Ctrl+C", "Quit"),
