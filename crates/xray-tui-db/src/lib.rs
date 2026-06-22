@@ -55,6 +55,97 @@ impl Database {
         }
         Ok(())
     }
+
+    /// One-time backfill: normalize all existing profile remarks.
+    /// Uses user_version pragma to run exactly once.
+    pub fn normalize_all_remarks(&self) -> Result<()> {
+        let version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap_or(0);
+        if version >= 1 {
+            return Ok(());
+        }
+
+        let profiles = self.get_all_profiles()?;
+        let mut count = 0u32;
+        let tx = self.conn.unchecked_transaction()?;
+        for p in &profiles {
+            if let Some(ref r) = p.remarks {
+                let normalized = normalize_remark(r);
+                if &normalized != r {
+                    tx.execute(
+                        "UPDATE profiles SET remarks = ?1 WHERE id = ?2",
+                        rusqlite::params![normalized, p.id],
+                    )?;
+                    count += 1;
+                }
+            }
+        }
+        tx.commit()?;
+
+        if count > 0 {
+            eprintln!("Backfilled {count} profile remarks");
+        }
+        self.conn
+            .pragma_update(None, "user_version", 1)?;
+        Ok(())
+    }
+
+}
+
+/// Percent-decode a string. Fallback to original on failure.
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_val(bytes[i + 1]);
+            let lo = hex_val(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+#[inline]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Normalize a remark string: percent-decode, trim, collapse inner whitespace.
+fn normalize_remark(s: &str) -> String {
+    let decoded = percent_decode(s);
+    let mut out = String::with_capacity(decoded.len());
+    let mut prev_was_space = false;
+    for c in decoded.chars() {
+        if c.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_was_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() { String::new() } else { trimmed.to_string() }
 }
 
 use models::{Group, Profile, ProfileExtension, RoutingRule, DnsSetting, ServerStat, Subscription};
@@ -464,6 +555,16 @@ impl Database {
         }
     }
 
+    pub fn get_all_subscriptions(&self) -> Result<Vec<Subscription>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM subscriptions ORDER BY group_id")?;
+        let rows = stmt.query_map([], |row| Subscription::try_from(row))?;
+        let mut subs = Vec::new();
+        for row in rows {
+            subs.push(row?);
+        }
+        Ok(subs)
+    }
+
     pub fn upsert_subscription(&self, sub: &Subscription) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO subscriptions (id, group_id, url, last_updated, update_interval, user_agent, status, error_message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -667,5 +768,3 @@ impl Database {
         Ok(())
     }
 }
-
-

@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::{AppMode, AppState, ConfirmAction};
 use crate::ui::theme::Theme;
+use crate::ui::profiles::truncate_pad;
 pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     // Centered overlay: ~70% width, ~70% height
     let overlay_area = Rect::new(
@@ -87,7 +88,10 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 "N"
             };
-            let status = "idle"; // TODO: look up from subscriptions table
+            let status = state.subscriptions.iter()
+                .find(|s| s.group_id.as_deref() == Some(&g.id))
+                .and_then(|s| s.status.as_deref())
+                .unwrap_or("idle");
             let last_up = "-";
 
             let style = if i == selected {
@@ -95,24 +99,22 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 Style::default()
             };
-
             Line::from(vec![Span::styled(
                 format!(
                     " {:<20} │ {:<30} │ {} │ {:<10} │ {}",
-                    name, url, enabled, status, last_up
+                    name, truncate_pad(url, 30), enabled, status, last_up
                 ),
                 style,
             )])
         })
         .collect();
 
-    for (i, row) in rows.iter().enumerate() {
-        if i < list_area.height as usize {
-            frame.render_widget(
-                row.clone(),
-                Rect::new(list_area.x, list_area.y + i as u16, list_area.width, 1),
-            );
-        }
+    let scroll_offset = selected.saturating_sub(list_area.height as usize - 1);
+    for (i, row) in rows.iter().enumerate().skip(scroll_offset).take(list_area.height as usize) {
+        frame.render_widget(
+            row.clone(),
+            Rect::new(list_area.x, list_area.y + (i - scroll_offset) as u16, list_area.width, 1),
+        );
     }
 
     // Footer
@@ -226,15 +228,19 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                         state.confirmation = Some(ConfirmAction::DeleteGroup(id));
                     }
                 }
-                KeyCode::Char('u' | 'U') => {
+                KeyCode::Char('u') => {
                     let gid = state.groups.get(sel).map(|g| g.id.clone());
                     if let Some(id) = gid {
                         state.update_group_subscriptions(&id);
                     }
                 }
+                KeyCode::Char('U') => {
+                    state.update_all_subscriptions();
+                }
                 KeyCode::Enter => {
                     if let Some(g) = state.groups.get(sel) {
                         state.selected_group_id = Some(g.id.clone());
+                        state.filter_cache_valid.set(false);
                     }
                     state.mode = AppMode::List;
                 }

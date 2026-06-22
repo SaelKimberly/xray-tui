@@ -155,13 +155,16 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         match key.code {
             KeyCode::Char(c) => {
                 state.search_query.push(c);
+                state.filter_cache_valid.set(false);
             }
             KeyCode::Backspace => {
                 state.search_query.pop();
+                state.filter_cache_valid.set(false);
             }
             KeyCode::Esc => {
                 state.search_focused = false;
                 state.search_query.clear();
+                state.filter_cache_valid.set(false);
             }
             _ => {}
         }
@@ -225,6 +228,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     6 => {
                         state.sort_column = SortColumn::Delay;
                         state.sort_ascending = true;
+                        state.filter_cache_valid.set(false);
                     }
                     7 => {
                         state.remove_failed_servers();
@@ -290,7 +294,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.selected_index = state.selected_index.saturating_sub(1);
         }
         KeyCode::Down if state.current_tab == Tab::Profiles => {
-            let max = state.filtered_profiles().len().saturating_sub(1);
+            let max = state.filtered_len().saturating_sub(1);
             if state.selected_index < max {
                 state.selected_index += 1;
             }
@@ -299,7 +303,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.selected_index = 0;
         }
         KeyCode::End if state.current_tab == Tab::Profiles => {
-            state.selected_index = state.filtered_profiles().len().saturating_sub(1);
+            state.selected_index = state.filtered_len().saturating_sub(1);
         }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -338,6 +342,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('/') if state.current_tab == Tab::Profiles => {
             state.search_focused = true;
             state.search_query.clear();
+            state.filter_cache_valid.set(false);
         }
         // Speed test menu
         KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
@@ -362,6 +367,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             let next_idx = (current_idx + 1) % all.len();
             state.sort_column = all[next_idx];
             state.sort_ascending = true;
+            state.filter_cache_valid.set(false);
         }
         // CRUD shortcuts (profiles tab)
         KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {
@@ -398,8 +404,12 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
+            let clipboard_text = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut cb| cb.get_text().ok())
+                .unwrap_or_default();
             state.mode = crate::AppMode::ImportUrl {
-                input: String::new(),
+                input: clipboard_text,
                 error: None,
             };
         }
@@ -424,6 +434,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.confirmation = None;
             } else {
                 state.selected_group_id = None;
+                state.filter_cache_valid.set(false);
             }
         }
         _ => {}

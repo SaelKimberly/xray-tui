@@ -16,7 +16,8 @@ pub struct SingBoxConfig {
     pub outbounds: Vec<Value>,
     pub route: RouteConfig,
     pub dns: SingBoxDnsConfig,
-    pub experimental: ExperimentalConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<ExperimentalConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,7 +56,10 @@ pub struct SingBoxDnsConfig {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExperimentalConfig {
-    pub v2ray_api: V2RayApi,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v2ray_api: Option<V2RayApi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clash_api: Option<ClashApiOptions>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +74,12 @@ pub struct V2RayApi {
 pub struct StatsConfig {
     pub enabled: bool,
     pub outbounds: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClashApiOptions {
+    pub external_controller: String,
 }
 
 // ── Builder ──────────────────────────────────────────────────────────
@@ -103,17 +113,20 @@ impl SingBoxConfigBuilder {
             outbounds,
             route: build_routing(routing),
             dns: build_dns(dns),
-            experimental: ExperimentalConfig {
-                v2ray_api: V2RayApi {
+            experimental: Some(ExperimentalConfig {
+                v2ray_api: params.v2ray_api_enabled.then(|| V2RayApi {
                     listen: format!("127.0.0.1:{}", super::API_PORT),
                     stats: StatsConfig {
                         enabled: true,
                         outbounds: vec!["proxy", "direct"],
                     },
-                },
-            },
+                }),
+                clash_api: params.clash_api_enabled.then(|| ClashApiOptions {
+                    external_controller: format!("127.0.0.1:{}", super::CLASH_API_PORT),
+                }),
+            }),
         })
-    }
+}
 }
 
 fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
@@ -366,6 +379,8 @@ mod tests {
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
         let params = BuildParams {
+            v2ray_api_enabled: true,
+            clash_api_enabled: false,
             log_level: "warning".to_string(),
             socks_port: 10808,
             http_port: None,
@@ -503,12 +518,32 @@ mod tests {
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
-        let exp = &json["experimental"]["v2ray_api"];
+        let exp = &json["experimental"];
+        let v2ray = &exp["v2ray_api"];
         assert_eq!(
-            exp["listen"],
+            v2ray["listen"],
             format!("127.0.0.1:{}", crate::config_builder::API_PORT)
         );
-        assert_eq!(exp["stats"]["enabled"], true);
+        assert_eq!(v2ray["stats"]["enabled"], true);
+        // clash_api should be absent when clash_api_enabled is false
+        assert!(exp["clash_api"].is_null(), "clash_api should be absent");
+    }
+
+    #[test]
+    fn singbox_clash_api_config() {
+        let profile = test_profile(Protocol::Tuic.to_i32());
+        let (mut params, rules, dns) = default_params();
+        params.clash_api_enabled = true;
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        let exp = &json["experimental"];
+        // clash_api should be present when clash_api_enabled is true
+        assert_eq!(
+            exp["clash_api"]["external_controller"],
+            format!("127.0.0.1:{}", crate::config_builder::CLASH_API_PORT)
+        );
+        // v2ray_api should still be present (it was true in default_params)
+        assert!(exp["v2ray_api"].is_object(), "v2ray_api should be present");
     }
 
     #[test]

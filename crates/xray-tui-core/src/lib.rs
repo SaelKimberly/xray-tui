@@ -9,7 +9,7 @@ pub mod speed_test;
 pub mod updater;
 
 pub use bin_manager::{CoreBinInfo, find_binary, get_core_info};
-pub use config_builder::{BackendConfig, BuildError, BuildParams, ConfigBuilder};
+pub use config_builder::{BackendConfig, BuildError, BuildParams, CLASH_API_PORT, ConfigBuilder};
 pub use core_type::CoreType;
 pub use grpc_client::{
     API_ENDPOINT, GrpcError, StatsProvider, SysStats, create_stats_provider, format_bytes,

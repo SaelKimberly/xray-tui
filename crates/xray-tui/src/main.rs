@@ -16,6 +16,9 @@ async fn main() -> Result<()> {
         .join("data.db");
     let db = Database::open(&db_path)?;
 
+    // 2a. Backfill — normalize any unnormalized remarks from before this change
+    db.normalize_all_remarks()?;
+
     // 3. Create shared state
     let mut state = AppState::new(db, config);
 

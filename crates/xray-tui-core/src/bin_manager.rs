@@ -25,25 +25,33 @@ pub fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo> {
 pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
     let info = get_core_info(core_type)?;
 
-    // 1. Check managed binary directory
-    for exe in info.exe_names {
-        let managed = bin_dir.join(exe);
-        if managed.is_file() {
-            // Check if executable (on Unix, file must be executable)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = managed.metadata()
-                    && meta.permissions().mode() & 0o111 != 0
+    // 1. Check managed binary directory (inside per-core subdirectory)
+    let core_dir = bin_dir.join(core_type.to_string());
+    if core_dir.is_dir() {
+        for exe in info.exe_names {
+            let managed = core_dir.join(exe);
+            if managed.is_file() {
+                // Check if executable (on Unix, file must be executable)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = managed.metadata()
+                        && meta.permissions().mode() & 0o111 != 0
+                    {
+                        return Some(managed);
+                    }
+                }
+                #[cfg(not(unix))]
                 {
                     return Some(managed);
                 }
             }
-            #[cfg(not(unix))]
-            {
-                return Some(managed);
-            }
         }
+    }
+
+    // 1b. If flat check failed, search recursively inside core_dir
+    if let Some(path) = find_binary_recursive(&core_dir, info.exe_names) {
+        return Some(path);
     }
 
     // 2. Check PATH via `which` command
@@ -62,6 +70,39 @@ pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+/// Search recursively for any of the given executable names in `dir`.
+/// Returns the first match that passes the executable check (Unix).
+fn find_binary_recursive(dir: &Path, exe_names: &[&str]) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&current) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && exe_names.contains(&name)
+                {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = path.metadata()
+                            && meta.permissions().mode() & 0o111 != 0
+                        {
+                            return Some(path);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
@@ -193,5 +234,152 @@ mod tests {
     #[test]
     fn get_core_info_auto_is_none() {
         assert!(get_core_info(CoreType::Auto).is_none());
+    }
+
+    #[test]
+    fn find_binary_managed_path_resolution() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-find-binary");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create managed binary at tmp/xray/xray
+        let core_dir = tmp.join("xray");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let binary = core_dir.join("xray");
+        std::fs::write(&binary, "fake binary content").unwrap();
+        // Mark executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Should find binary at tmp/xray/xray (managed path)
+        let found = find_binary(CoreType::Xray, &tmp);
+        assert!(found.is_some(), "should find managed binary");
+        assert_eq!(found.unwrap(), binary, "should return managed path, not PATH");
+
+        // Binary outside core subdir should NOT be found by managed-path check
+        // (it would only be found via which/PATH if xray is in PATH)
+        let wrong_binary = tmp.join("xray_bad");
+        std::fs::write(&wrong_binary, "wrong location").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrong_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found2 = find_binary(CoreType::Xray, &tmp);
+        // Should still find the correct managed one, not wrong_binary
+        assert_eq!(found2, Some(binary));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_binary_singbox_managed_path() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-find-singbox");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let core_dir = tmp.join("sing-box");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let binary = core_dir.join("sing-box");
+        std::fs::write(&binary, "fake sing-box").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let found = find_binary(CoreType::SingBox, &tmp);
+        assert!(found.is_some(), "should find managed sing-box binary");
+        assert_eq!(found.unwrap(), binary);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn find_binary_skips_non_executable_in_managed_dir() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-find-non-exec");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create managed binary at tmp/xray/xray WITHOUT executable bit
+        let core_dir = tmp.join("xray");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let binary = core_dir.join("xray");
+        std::fs::write(&binary, "fake non-executable binary").unwrap();
+        // Intentionally NOT setting executable permissions
+
+        // Non-executable file in managed dir must be skipped.
+        // Falls through to which(PATH). If xray is in PATH, returns that;
+        // otherwise returns None. Either way, the managed-dir path is not returned.
+        let found = find_binary(CoreType::Xray, &tmp);
+        assert_ne!(found.as_deref(), Some(binary.as_path()), "non-executable managed file must be skipped");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_binary_recursive_singbox_versioned_dir() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-find-recursive-singbox");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create versioned subdirectory like sing-box-1.13.13-linux-amd64/sing-box
+        let version_dir = tmp.join("sing-box/sing-box-1.13.13-linux-amd64");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let binary = version_dir.join("sing-box");
+        std::fs::write(&binary, "fake sing-box").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let found = find_binary(CoreType::SingBox, &tmp);
+        assert!(found.is_some(), "should find sing-box via recursive search");
+        assert!(
+            found.as_deref().unwrap().to_string_lossy().contains("sing-box-1.13.13-linux-amd64/sing-box"),
+            "should find binary inside versioned subdirectory"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_binary_flat_wins_over_recursive() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-flat-wins");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create flat binary at tmp/sing-box/sing-box
+        let core_dir = tmp.join("sing-box");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let flat_binary = core_dir.join("sing-box");
+        std::fs::write(&flat_binary, "flat sing-box").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&flat_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Create nested binary too
+        let version_dir = core_dir.join("sing-box-1.13.13-linux-amd64");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let nested_binary = version_dir.join("sing-box");
+        std::fs::write(&nested_binary, "nested sing-box").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&nested_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let found = find_binary(CoreType::SingBox, &tmp);
+        assert_eq!(found.as_deref(), Some(flat_binary.as_path()), "flat binary should win over nested");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

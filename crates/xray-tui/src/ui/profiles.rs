@@ -34,7 +34,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         frame.render_widget(gauge, chunks[1]);
     }
 
-    render_data_grid(frame, chunks[2], &rows, selected, state);
+    // Window: only build Row widgets for rows within the visible area
+    let inner_height = chunks[2].height.saturating_sub(1) as usize;
+    let total = rows.len();
+    let scroll_offset = if total <= inner_height {
+        0
+    } else {
+        selected.saturating_sub(inner_height / 2).min(total - inner_height)
+    };
+    let visible_end = (scroll_offset + inner_height).min(total);
+    let visible_rows = &rows[scroll_offset..visible_end];
+    let adjusted_selected = selected - scroll_offset;
+
+    render_data_grid(frame, chunks[2], visible_rows, adjusted_selected, scroll_offset, state);
     // Delete confirmation overlay (profiles only)
     if let Some(ConfirmAction::DeleteProfile(ref delete_id)) = state.confirmation {
         let profile_name = rows
@@ -93,6 +105,7 @@ fn render_data_grid(
     area: Rect,
     rows: &[&crate::ProfileRow],
     selected_index: usize,
+    scroll_offset: usize,
     state: &AppState,
 ) {
     let block = Block::default()
@@ -149,7 +162,7 @@ fn render_data_grid(
             let idx_str = if is_multi {
                 "  *".to_string()
             } else {
-                format!("{:>3}", i + 1)
+                format!("{:>3}", scroll_offset + i + 1)
             };
 
             let type_str = format!("{:.8}", protocol.to_string());
@@ -218,9 +231,19 @@ fn render_data_grid(
     frame.render_widget(table, inner);
 }
 
-fn truncate_pad(s: &str, width: usize) -> String {
-    if s.len() > width {
-        format!("{:width$}", &s[..width.saturating_sub(1)], width = width)
+pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(s) > width {
+        let mut char_w = 0usize;
+        let mut end = 0usize;
+        for (i, c) in s.char_indices() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            if char_w + cw > width.saturating_sub(1) {
+                break;
+            }
+            char_w += cw;
+            end = i + c.len_utf8();
+        }
+        format!("{:width$}", &s[..end], width = width)
     } else {
         format!("{:width$}", s, width = width)
     }

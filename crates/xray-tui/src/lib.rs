@@ -1,14 +1,16 @@
 pub mod ui;
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use tokio::sync::mpsc;
+use futures_util::StreamExt;
 use xray_tui_config::AppConfig;
 use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{BuildParams, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core};
+use xray_tui_core::{BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
     DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule, ServerStat,
@@ -126,12 +128,21 @@ pub enum AppMode {
     SpeedTestMenu { selected: usize },
 }
 
+/// Parsed line from sing-box Clash API `/traffic` streaming endpoint.
+#[derive(serde::Deserialize)]
+struct ClashTraffic {
+    up: i64,
+    down: i64,
+}
+
 /// Events from the core process manager to the UI event loop.
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
     Connected(CoreType),
     Disconnected,
     Error(String),
+    /// Non-fatal stats error — keeps connected_core intact
+    StatsError(String),
     StatsUpdate {
         profile_id: String,
         today_up: i64,
@@ -191,7 +202,11 @@ pub struct AppState {
     pub config: AppConfig,
     pub current_tab: Tab,
     pub profiles: Vec<ProfileRow>,
+    /// Cached filtered/sorted profile indices for performance.
+    pub cached_filtered_indices: RefCell<Vec<usize>>,
+    pub filter_cache_valid: Cell<bool>,
     pub groups: Vec<Group>,
+    pub subscriptions: Vec<Subscription>,
     pub selected_group_id: Option<String>,
     pub selected_index: usize,
     pub sort_column: SortColumn,
@@ -236,7 +251,10 @@ impl AppState {
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),
             profiles: Vec::new(),
+            cached_filtered_indices: RefCell::new(Vec::new()),
+            filter_cache_valid: Cell::new(true),
             groups: Vec::new(),
+            subscriptions: Vec::new(),
             selected_group_id: None,
             selected_index: 0,
             sort_column: SortColumn::Remarks,
@@ -263,6 +281,7 @@ impl AppState {
         };
         state.reload_profiles();
         state.reload_groups();
+        state.subscriptions = state.db.get_all_subscriptions().unwrap_or_default();
         state.spawn_auto_update();
         state
     }
@@ -284,6 +303,7 @@ impl AppState {
                 self.profiles.clear();
             }
         }
+        self.filter_cache_valid.set(false);
     }
 
     pub fn reload_groups(&mut self) {
@@ -297,11 +317,21 @@ impl AppState {
     }
 
     pub fn filtered_profiles(&self) -> Vec<&ProfileRow> {
-        let mut filtered: Vec<&ProfileRow> = self
+        if !self.filter_cache_valid.get() {
+            let indices = self.compute_filtered_indices();
+            *self.cached_filtered_indices.borrow_mut() = indices;
+            self.filter_cache_valid.set(true);
+        }
+        let indices = self.cached_filtered_indices.borrow();
+        indices.iter().map(|&i| &self.profiles[i]).collect()
+    }
+
+    fn compute_filtered_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
             .profiles
             .iter()
-            .filter(|row| {
-                // Group filter
+            .enumerate()
+            .filter(|(_, row)| {
                 if let Some(group_id) = &self.selected_group_id
                     && row.profile.group_id.as_deref() != Some(group_id.as_str())
                 {
@@ -321,46 +351,51 @@ impl AppState {
                 }
                 true
             })
+            .map(|(i, _)| i)
             .collect();
 
         let asc = self.sort_ascending;
-        filtered.sort_by(|a, b| {
+        indices.sort_by(|&a, &b| {
+            let a_row = &self.profiles[a];
+            let b_row = &self.profiles[b];
             let cmp = match self.sort_column {
-                SortColumn::ConfigType => a.profile.config_type.cmp(&b.profile.config_type),
-                SortColumn::Remarks => a
+                SortColumn::ConfigType => {
+                    a_row.profile.config_type.cmp(&b_row.profile.config_type)
+                }
+                SortColumn::Remarks => a_row
                     .profile
                     .remarks
                     .as_deref()
                     .unwrap_or("")
-                    .cmp(b.profile.remarks.as_deref().unwrap_or("")),
-                SortColumn::Address => a
+                    .cmp(b_row.profile.remarks.as_deref().unwrap_or("")),
+                SortColumn::Address => a_row
                     .profile
                     .address
                     .as_deref()
                     .unwrap_or("")
-                    .cmp(b.profile.address.as_deref().unwrap_or("")),
+                    .cmp(b_row.profile.address.as_deref().unwrap_or("")),
                 SortColumn::Port => {
-                    let pa = a.profile.port.unwrap_or(0);
-                    let pb = b.profile.port.unwrap_or(0);
+                    let pa = a_row.profile.port.unwrap_or(0);
+                    let pb = b_row.profile.port.unwrap_or(0);
                     pa.cmp(&pb)
                 }
                 SortColumn::Delay => {
-                    let da = a.extension.as_ref().and_then(|e| e.delay).unwrap_or(-1);
-                    let db = b.extension.as_ref().and_then(|e| e.delay).unwrap_or(-1);
+                    let da = a_row.extension.as_ref().and_then(|e| e.delay).unwrap_or(-1);
+                    let db = b_row.extension.as_ref().and_then(|e| e.delay).unwrap_or(-1);
                     da.cmp(&db)
                 }
                 SortColumn::Speed => {
-                    let sa = a.extension.as_ref().and_then(|e| e.speed).unwrap_or(-1);
-                    let sb = b.extension.as_ref().and_then(|e| e.speed).unwrap_or(-1);
+                    let sa = a_row.extension.as_ref().and_then(|e| e.speed).unwrap_or(-1);
+                    let sb = b_row.extension.as_ref().and_then(|e| e.speed).unwrap_or(-1);
                     sa.cmp(&sb)
                 }
                 SortColumn::Traffic => {
-                    let ta = a
+                    let ta = a_row
                         .stats
                         .as_ref()
                         .map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0))
                         .unwrap_or(0);
-                    let tb = b
+                    let tb = b_row
                         .stats
                         .as_ref()
                         .map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0))
@@ -368,7 +403,7 @@ impl AppState {
                     ta.cmp(&tb)
                 }
                 SortColumn::Core => {
-                    let resolve = |row: &&ProfileRow| -> String {
+                    let resolve = |row: &ProfileRow| -> String {
                         let protocol = Protocol::try_from_i32(row.profile.config_type)
                             .unwrap_or(Protocol::Custom);
                         let core = resolve_core(
@@ -380,12 +415,21 @@ impl AppState {
                         );
                         core.to_string()
                     };
-                    resolve(a).cmp(&resolve(b))
+                    resolve(a_row).cmp(&resolve(b_row))
                 }
             };
             if asc { cmp } else { cmp.reverse() }
         });
-        filtered
+        indices
+    }
+
+    pub fn filtered_len(&self) -> usize {
+        if !self.filter_cache_valid.get() {
+            let indices = self.compute_filtered_indices();
+            *self.cached_filtered_indices.borrow_mut() = indices;
+            self.filter_cache_valid.set(true);
+        }
+        self.cached_filtered_indices.borrow().len()
     }
 
     pub fn add_log(&mut self, level: &str, message: &str) {
@@ -468,7 +512,7 @@ impl AppState {
                 continue;
             }
             match key.as_str() {
-                "remarks" => profile.remarks = Some(value.clone()),
+                "remarks" => profile.remarks = Some(xray_tui_config::import_export::normalize_remark(value)),
                 "address" => profile.address = Some(value.clone()),
                 "port" => profile.port = value.parse::<i32>().ok(),
                 "core_type" => profile.core_type = value.clone(),
@@ -1024,6 +1068,8 @@ impl AppState {
         };
 
         let params = BuildParams {
+            v2ray_api_enabled: matches!(core_type, CoreType::Xray),
+            clash_api_enabled: matches!(core_type, CoreType::SingBox),
             log_level: self.config.core.log_level.clone(),
             socks_port: self.config.inbound.socks_port,
             http_port: self.config.inbound.http_port,
@@ -1047,7 +1093,7 @@ impl AppState {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| Path::new(".").to_path_buf())
             .join("xray-tui");
-        let bin_dir = config_dir.join("bin").join(core_type.to_string());
+        let bin_dir = config_dir.join("bin");
         let bin_configs_dir = config_dir.join("binConfigs");
 
         // Need to move params into the async block
@@ -1086,67 +1132,114 @@ impl AppState {
             let _ = tx.send(CoreEvent::Connected(core_type));
 
             let profile_id = profile.id.clone();
-            let provider = match grpc_client::create_stats_provider(core_type).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    let _ = tx.send(CoreEvent::Error(format!("Stats API unavailable: {e}")));
-                    None
-                }
-            };
 
-            let poll_interval = std::time::Duration::from_secs(3);
-            let mut ticker = tokio::time::interval(poll_interval);
-            ticker.tick().await; // skip first immediate tick
-            let mut sys_tick_counter = 0u8;
-
-            // 5. Stats polling + wait loop
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => {
-                        break;
+            if core_type == CoreType::Xray {
+                // === gRPC polling loop (xray-core) ===
+                let provider = match grpc_client::create_stats_provider(CoreType::Xray).await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        let _ = tx.send(CoreEvent::Error(format!("Stats API unavailable: {e}")));
+                        None
                     }
-                    _ = ticker.tick() => {
-                        if let Some(ref provider) = provider {
-                            match provider.query_stats("outbound>>>*>>>traffic>>>*", true).await {
-                                Ok(stats) => {
-                                    let mut today_up = 0i64;
-                                    let mut today_down = 0i64;
-                                    for stat in &stats {
-                                        if stat.name.contains(">>>uplink") {
-                                            today_up += stat.value;
-                                        } else if stat.name.contains(">>>downlink") {
-                                            today_down += stat.value;
+                };
+                let poll_interval = std::time::Duration::from_secs(3);
+                let mut ticker = tokio::time::interval(poll_interval);
+                ticker.tick().await;
+                let mut sys_tick_counter = 0u8;
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        _ = ticker.tick() => {
+                            if let Some(ref provider) = provider {
+                                match provider.query_stats("outbound>>>*>>>traffic>>>*", true).await {
+                                    Ok(stats) => {
+                                        let mut today_up = 0i64;
+                                        let mut today_down = 0i64;
+                                        for stat in &stats {
+                                            if stat.name.contains(">>>uplink") {
+                                                today_up += stat.value;
+                                            } else if stat.name.contains(">>>downlink") {
+                                                today_down += stat.value;
+                                            }
                                         }
-                                    }
-                                    let _ = tx.send(CoreEvent::StatsUpdate {
-                                        profile_id: profile_id.clone(),
-                                        today_up,
-                                        today_down,
-                                        total_up: today_up,
-                                        total_down: today_down,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(CoreEvent::Error(format!("Stats query failed: {e}")));
-                                }
-                            }
-
-                            // Every 3rd tick (~9s), also query system stats
-                            sys_tick_counter += 1;
-                            if sys_tick_counter >= 3 {
-                                sys_tick_counter = 0;
-                                match provider.get_sys_stats().await {
-                                    Ok(sys) => {
-                                        let _ = tx.send(CoreEvent::SysStatsUpdate(sys));
+                                        let _ = tx.send(CoreEvent::StatsUpdate {
+                                            profile_id: profile_id.clone(),
+                                            today_up,
+                                            today_down,
+                                            total_up: today_up,
+                                            total_down: today_down,
+                                        });
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(CoreEvent::Error(
-                                            format!("Sys stats query failed: {e}"),
-                                        ));
+                                        let _ = tx.send(CoreEvent::Error(format!("Stats query failed: {e}")));
+                                    }
+                                }
+                                // sys stats every 3rd tick (~9s)
+                                sys_tick_counter += 1;
+                                if sys_tick_counter >= 3 {
+                                    sys_tick_counter = 0;
+                                    match provider.get_sys_stats().await {
+                                        Ok(sys) => { let _ = tx.send(CoreEvent::SysStatsUpdate(sys)); }
+                                        Err(e) => {
+                                            let _ = tx.send(CoreEvent::Error(
+                                                format!("Sys stats query failed: {e}"),
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            } else {
+                // === Sing-box Clash API /traffic streaming ===
+                let url = format!("http://127.0.0.1:{}/traffic", CLASH_API_PORT);
+
+                match reqwest::Client::new().get(&url).send().await {
+                    Ok(resp) => {
+                        let mut stream = Box::pin(resp.bytes_stream());
+                        let mut buf = Vec::new();
+                        let mut session_up: i64 = 0;
+                        let mut session_down: i64 = 0;
+                        loop {
+                            tokio::select! {
+                                _ = &mut stop_rx => break,
+                                chunk = stream.next() => {
+                                    match chunk {
+                                        Some(Ok(bytes)) => {
+                                            buf.extend_from_slice(&bytes);
+                                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                                let line: Vec<u8> = buf.drain(..=pos).collect();
+                                                let trimmed = line.as_slice().trim_ascii();
+                                                if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
+                                                    session_up += t.up;
+                                                    session_down += t.down;
+                                                    let _ = tx.send(CoreEvent::StatsUpdate {
+                                                        profile_id: profile_id.clone(),
+                                                        today_up: session_up,
+                                                        today_down: session_down,
+                                                        total_up: session_up,
+                                                        total_down: session_down,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            let _ = tx.send(CoreEvent::StatsError(
+                                                format!("Clash API stream error: {e}")
+                                            ));
+                                            break;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(CoreEvent::StatsError(
+                            format!("Clash API unavailable (is sing-box running?): {e}")
+                        ));
                     }
                 }
             }
@@ -1469,6 +1562,10 @@ impl AppState {
                     self.connected_core = None;
                     self.add_log("error", &format!("Connection error: {err}"));
                 }
+                CoreEvent::StatsError(msg) => {
+                    self.connection_error = Some(msg.clone());
+                    self.add_log("warning", &format!("Stats error: {msg}"));
+                }
                 CoreEvent::StatsUpdate {
                     profile_id,
                     today_up,
@@ -1512,6 +1609,7 @@ impl AppState {
                     }
                     self.reload_profiles();
                     self.reload_groups();
+                    self.subscriptions = self.db.get_all_subscriptions().unwrap_or_default();
                 }
                 CoreEvent::SpeedTestResult {
                     profile_id,
@@ -1594,16 +1692,21 @@ impl AppState {
                     let status = self.update_status.entry(core_type).or_default();
                     status.current_version = current_version.clone();
                     status.latest_version = latest_version.clone();
-                    status.update_available = match (&current_version, &latest_version) {
-                        (Some(cur_str), Some(latest_str)) => {
-                            let cur = xray_tui_core::updater::parse_version(cur_str);
-                            let latest = xray_tui_core::updater::parse_version(latest_str);
-                            match (cur, latest) {
-                                (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
-                                _ => false,
+                    status.update_available = match &current_version {
+                        // Not installed but latest known → install available
+                        None => latest_version.is_some(),
+                        // Both known → compare versions
+                        Some(cur_str) => match &latest_version {
+                            Some(latest_str) => {
+                                let cur = xray_tui_core::updater::parse_version(cur_str);
+                                let latest = xray_tui_core::updater::parse_version(latest_str);
+                                match (cur, latest) {
+                                    (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
+                                    _ => false,
+                                }
                             }
-                        }
-                        _ => false,
+                            None => false,
+                        },
                     };
                     status.error = error;
                     if let Some(ref ver) = latest_version {
@@ -1612,6 +1715,11 @@ impl AppState {
                             CoreType::SingBox => self.config.updates.sing_box_latest_known = Some(ver.clone()),
                             CoreType::Auto => {}
                         }
+                    }
+                    // Refresh form snapshots if currently viewing the updates form
+                    if let AppMode::Settings { mode: SettingsMode::UpdateForm { status_xray, status_singbox } } = &mut self.mode {
+                        *status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
+                        *status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
                     }
                 }
                 CoreEvent::UpdateCompleted { core_type, old_version, new_version, success, error } => {
@@ -1625,6 +1733,11 @@ impl AppState {
                     } else {
                         status.error = error.clone();
                         self.add_log("error", &format!("{core_type} update failed: {:?}", error));
+                    }
+                    // Refresh form snapshots if currently viewing the updates form
+                    if let AppMode::Settings { mode: SettingsMode::UpdateForm { status_xray, status_singbox } } = &mut self.mode {
+                        *status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
+                        *status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
                     }
                 }
             }
@@ -1910,7 +2023,7 @@ impl AppState {
         };
         let bin_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
-            .join("xray-tui");
+            .join("xray-tui/bin");
         for &core_type in &[CoreType::Xray, CoreType::SingBox] {
             let tx = tx.clone();
             let bin_dir = bin_dir.clone();
@@ -1950,14 +2063,15 @@ impl AppState {
             Some(v) => v,
             None => return,
         };
+        let old_version = self.update_status.get(&core_type).and_then(|s| s.current_version.clone());
         let Some(tx) = self.core_event_tx.clone() else {
             return;
         };
         let bin_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
-            .join("xray-tui");
+            .join("xray-tui/bin");
         let client = reqwest::Client::new();
-        let temp_dir = std::env::temp_dir().join("xray-tui-update");
+        let temp_dir = std::env::temp_dir().join(format!("xray-tui-update-{core_type}"));
 
         self.update_status.entry(core_type).or_default().downloading = true;
 
@@ -1967,7 +2081,7 @@ impl AppState {
                 Ok(path) => path,
                 Err(e) => {
                     let _ = tx.send(CoreEvent::UpdateCompleted {
-                        core_type, old_version: None, new_version: latest,
+                        core_type, old_version: old_version.clone(), new_version: latest,
                         success: false, error: Some(e),
                     });
                     return;
@@ -1983,7 +2097,7 @@ impl AppState {
             let _ = std::fs::remove_file(&archive);
             let _ = std::fs::remove_dir_all(&temp_dir);
 
-            let old_version = None;
+            let old_version = old_version.clone();
             let _ = tx.send(CoreEvent::UpdateCompleted {
                 core_type, old_version, new_version: latest,
                 success, error,

@@ -108,7 +108,10 @@ pub fn parse_share_url(url: &str) -> Result<Profile> {
     };
 
     // Try primary parser first
-    if let Ok(profile) = PARSE_ORDER[primary_idx](url) {
+    if let Ok(mut profile) = PARSE_ORDER[primary_idx](url) {
+        if let Some(ref r) = profile.remarks.clone() {
+            profile.remarks = Some(normalize_remark(r));
+        }
         return Ok(profile);
     }
 
@@ -119,7 +122,12 @@ pub fn parse_share_url(url: &str) -> Result<Profile> {
             continue;
         }
         match parser(url) {
-            Ok(profile) => return Ok(profile),
+            Ok(mut profile) => {
+                if let Some(ref r) = profile.remarks.clone() {
+                    profile.remarks = Some(normalize_remark(r));
+                }
+                return Ok(profile);
+            }
             Err(e) => last_error = e,
         }
     }
@@ -1150,7 +1158,7 @@ fn split_share_url(url: &str) -> Result<UrlComponents> {
     // 3. Extract fragment
     let fragment = unparsed.split_once('#').map(|(r, f)| {
         unparsed = r;
-        f.to_string()
+        percent_decode(f)
     });
 
     // 4. Extract query
@@ -1280,6 +1288,26 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+/// Normalize a remark string: percent-decode, trim, collapse inner whitespace.
+pub fn normalize_remark(s: &str) -> String {
+    let decoded = percent_decode(s);
+    let mut out = String::with_capacity(decoded.len());
+    let mut prev_was_space = false;
+    for c in decoded.chars() {
+        if c.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_was_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() { String::new() } else { trimmed.to_string() }
 }
 
 #[inline]
@@ -1581,6 +1609,42 @@ fn format_http(profile: &Profile) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_remark_basic() {
+        assert_eq!(normalize_remark("hello"), "hello");
+    }
+
+    #[test]
+    fn normalize_remark_percent_decoded() {
+        // Japanese "test" in percent-encoded UTF-8
+        let result = normalize_remark("%E6%B5%8B%E8%AF%95");
+        assert_eq!(result, "测试");
+    }
+
+    #[test]
+    fn normalize_remark_whitespace_collapsed() {
+        assert_eq!(normalize_remark("  hello   world  "), "hello world");
+        assert_eq!(normalize_remark("\tfoo \n bar\r\n baz"), "foo bar baz");
+    }
+
+    #[test]
+    fn normalize_remark_emoji_percent_decoded() {
+        // Grinning face emoji
+        let result = normalize_remark("%F0%9F%98%80");
+        assert_eq!(result, "😀");
+    }
+
+    #[test]
+    fn normalize_remark_empty_after_trim() {
+        assert_eq!(normalize_remark("  "), "");
+        assert_eq!(normalize_remark("%20%20"), "");
+    }
+
+    #[test]
+    fn normalize_remark_no_change_for_plain_text() {
+        assert_eq!(normalize_remark("  My Server 1  "), "My Server 1");
+    }
 
     #[test]
     fn roundtrip_vmess() {

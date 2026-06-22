@@ -15,6 +15,7 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             protocol_settings   TEXT,
             is_sub              INTEGER DEFAULT 0,
             sub_id              TEXT,
+            group_id            TEXT,
             sub_uid             INTEGER NOT NULL DEFAULT 0,
             sort_order          INTEGER DEFAULT 0,
             is_active           INTEGER DEFAULT 0,
@@ -95,11 +96,20 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     )?;
 
     // Migration v2: add sub_uid column (ignore error if already exists)
-    let _ =
-        conn.execute_batch("ALTER TABLE profiles ADD COLUMN sub_uid INTEGER NOT NULL DEFAULT 0;");
+    let _ = conn.execute_batch("ALTER TABLE profiles ADD COLUMN sub_uid INTEGER NOT NULL DEFAULT 0;");
+    // Migration v3: add group_id column (ignore error if already exists)
+    let _ = conn.execute_batch("ALTER TABLE profiles ADD COLUMN group_id TEXT REFERENCES groups(id);");
+
+    // Rebuild index as UNIQUE — previous schema had non-unique (or none if migration failed midway through)
+    let _ = conn.execute_batch("DROP INDEX IF EXISTS idx_profiles_group_sub_uid;");
+    // Deduplicate before creating UNIQUE index
     let _ = conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_profiles_group_sub_uid ON profiles(group_id, sub_uid) WHERE sub_uid != 0;",
+        "DELETE FROM profiles WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM profiles WHERE sub_uid != 0 AND group_id IS NOT NULL
+            GROUP BY group_id, sub_uid
+        ) AND sub_uid != 0 AND group_id IS NOT NULL;"
     );
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_group_sub_uid ON profiles(group_id, sub_uid) WHERE sub_uid != 0;")?;
 
     Ok(())
 }

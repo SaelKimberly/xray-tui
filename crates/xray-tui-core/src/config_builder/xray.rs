@@ -469,6 +469,8 @@ mod tests {
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
         let params = BuildParams {
+            v2ray_api_enabled: true,
+            clash_api_enabled: false,
             log_level: "warning".to_string(),
             socks_port: 10808,
             http_port: None,

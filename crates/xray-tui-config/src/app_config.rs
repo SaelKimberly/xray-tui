@@ -126,10 +126,16 @@ pub struct SystemProxyConfig {
     pub bypass: Option<String>,
 }
 
+fn default_clash_api_port() -> u16 {
+    9090
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatisticsConfig {
     #[serde(default = "default_stats_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_clash_api_port")]
+    pub clash_api_port: u16,
 }
 
 fn default_stats_enabled() -> bool {
@@ -140,6 +146,7 @@ impl Default for StatisticsConfig {
     fn default() -> Self {
         Self {
             enabled: default_stats_enabled(),
+            clash_api_port: default_clash_api_port(),
         }
     }
 }

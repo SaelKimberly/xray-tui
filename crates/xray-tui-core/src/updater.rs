@@ -21,8 +21,8 @@ pub async fn get_current_version(core_type: CoreType, bin_dir: &Path) -> Option<
         CoreType::Auto => return None,
     };
 
-    // Try managed bin_dir first, then PATH
-    let bin_path = bin_dir.join(exe);
+    // Try managed bin_dir first (inside per-core subdirectory), then PATH
+    let bin_path = bin_dir.join(core_type.to_string()).join(exe);
     let cmd = if bin_path.is_file() {
         bin_path.to_string_lossy().to_string()
     } else {
@@ -147,7 +147,12 @@ pub async fn download_release(
 
 /// Extract archive, verify binary, install all files to bin_dir.
 pub async fn install_binary(archive: &Path, core_type: CoreType, bin_dir: &Path) -> Result<(), String> {
-    let temp_dir = std::env::temp_dir().join("xray-tui-install");
+    let suffix = match core_type {
+        CoreType::Xray => "xray",
+        CoreType::SingBox => "sing-box",
+        CoreType::Auto => return Err("cannot install for Auto core type".into()),
+    };
+    let temp_dir = std::env::temp_dir().join(format!("xray-tui-install-{suffix}"));
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("failed to create temp dir: {e}"))?;
 
@@ -179,7 +184,7 @@ pub async fn install_binary(archive: &Path, core_type: CoreType, bin_dir: &Path)
 
     // Verify binary runs
     let output = tokio::process::Command::new(&binary)
-        .arg("--version")
+        .arg("version")
         .output()
         .await
         .map_err(|e| format!("failed to execute extracted binary: {e}"))?;
@@ -256,7 +261,7 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Option<String> {
 
     let url = match core_type {
         CoreType::Xray => format!(
-            "https://github.com/XTLS/Xray-core/releases/download/v{version}/Xray-linux-{arch}.tar.gz",
+            "https://github.com/XTLS/Xray-core/releases/download/v{version}/Xray-linux-{arch}.zip",
             version = version.strip_prefix('v').unwrap_or(version),
         ),
         CoreType::SingBox => format!(
@@ -349,9 +354,88 @@ mod tests {
     #[test]
     fn test_release_asset_url() {
         let xray_url = release_asset_url(CoreType::Xray, "v1.8.10").unwrap();
-        assert!(xray_url.contains("Xray-linux-64.tar.gz"));
+        assert!(xray_url.contains("Xray-linux-64.zip"));
 
         let singbox_url = release_asset_url(CoreType::SingBox, "v1.10.3").unwrap();
         assert!(singbox_url.contains("sing-box-1.10.3-linux-amd64.tar.gz"));
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn get_current_version_finds_managed_binary() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-updater-managed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("xray")).unwrap();
+
+        // Create a fake xray binary that outputs version info
+        let binary = tmp.join("xray").join("xray");
+        std::fs::write(&binary, "#!/bin/sh\necho \"xray 1.8.4\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let version = rt.block_on(get_current_version(CoreType::Xray, &tmp));
+        assert_eq!(version, Some("1.8.4".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn get_current_version_with_singbox_managed_binary() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-updater-singbox");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("sing-box")).unwrap();
+
+        let binary = tmp.join("sing-box").join("sing-box");
+        std::fs::write(&binary, "#!/bin/sh\necho \"sing-box 1.10.3\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let version = rt.block_on(get_current_version(CoreType::SingBox, &tmp));
+        assert_eq!(version, Some("1.10.3".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn find_binary_and_get_current_version_combined() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-updater-combined");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("xray")).unwrap();
+
+        let binary = tmp.join("xray").join("xray");
+        std::fs::write(&binary, "#!/bin/sh\necho \"xray 2.0.0\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // find_binary should find the managed binary
+        let found = crate::bin_manager::find_binary(CoreType::Xray, &tmp);
+        assert!(found.is_some(), "find_binary should find managed xray");
+        assert_eq!(found.unwrap(), binary, "find_binary should return the managed path");
+
+        // get_current_version should parse the version from the same binary
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let version = rt.block_on(get_current_version(CoreType::Xray, &tmp));
+        assert_eq!(version, Some("2.0.0".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn get_current_version_returns_none_when_binary_missing() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-updater-missing");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let version = rt.block_on(get_current_version(CoreType::Xray, &tmp));
+        // Should be None since no binary exists in managed dir and likely not in PATH
+        assert!(version.is_none(), "should return None when no binary found");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
+
