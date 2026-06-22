@@ -19,7 +19,7 @@
 - ✅ Group/subscription filter strip with live client-side search
 - ✅ Status bar showing connection status + key hints (`[Tab] Next  [Ctrl+Q] Quit`)
 - ✅ Tab navigation (Tab/Shift+Tab), profile list navigation (Up/Down/Home/End)
-- ✅ Placeholder screens for Settings, Routing, DNS, Logs, Statistics
+- ✅ Placeholder screens for Settings, Routing, DNS, Statistics (Logs remains placeholder — Phase 9)
 - ✅ DB query methods: get_all_profiles, get_profiles_by_group, get_all_groups, get_profile_extension, get_server_stats, get_all_profiles_with_details
 - ✅ AppState with filtered/sorted profile list
 - ✅ Keyboard shortcuts: q/Ctrl+C quit, / search, Esc clear filter, Tab cycle tabs
@@ -49,7 +49,7 @@
 -
 - ✅ Add/edit/delete subscription groups
 - ✅ Update all/group subscriptions (HTTP download + parse)
-- Update via proxy
+- ☐ Update via proxy
 - ✅ Subscription format detection (base64, plain, v2rayN, sing-box) — streaming decoder with auto-encoding detection
 - ✅ Scheduled auto-update
 
@@ -77,22 +77,73 @@
 
 ## Phase 7 — Advanced Features
 
-- Full config template editor (raw JSON) — supports both xray-core and sing-box formats
-- Global hotkey bindings
-- Config backup/restore (WebDAV)
+- ☐ Logs tab — wire existing stderr streaming pipeline to TUI display (scrollable, filterable)
+- ☐ Sing-box config builder completeness — implement config generation for all 11 broken protocols (ShadowsocksR, Hysteria v1, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, VMess, VLESS, Trojan, WireGuard)
+- ☐ WireGuard sing-box peer model — complete form fields for multi-peer arrays, pre-shared keys, allowed IPs
+- ☐ Advanced form fields — add multiplex, V2Ray transport (WS/gRPC/QUIC/HTTPUpgrade), TLS options (ECH, uTLS fingerprint, Fragment) to protocol forms
 - ✅ ProfileCore dedup — normalized schema (profile_cores + group_profiles) eliminates redundant storage for shared configs
 - ✅ Version update check — GitHub releases API, download, install with .bak rollback, Updates settings form with per-core status
-- JSON config import/export (auto-detect format)
 - ✅ Batch import — bulk import multiple share URLs at once via AppMode::BatchImport with scrollable results list
-- QR code display for share URLs
-- Clash API compatible UI tab (proxies view, connections view) — via sing-box experimental.clash_api
 
 ## Phase 8 — Polish & Release
 
-- i18n (en, zh, ru, fa)
-- Theme system (dark/light/custom)
-- Responsive layout for terminal resize
-- Error handling & recovery flows
-- man page / --help
-- CI/CD, packaging
-- Performance optimization
+- ☐ i18n (en, zh, ru, fa)
+- ☐ Theme system (dark/light/custom)
+- ☐ Responsive layout for terminal resize
+- ☐ Error handling & recovery flows
+- ☐ man page / --help
+- ☐ CI/CD, packaging
+- ☐ Performance optimization
+- ☐ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
+- ☐ Log to file toggle — core log persistence with configurable path
+- ☐ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile
+- ☐ Default skip cert verify — global security toggle in Core settings
+- ☐ Clear all stats — reset traffic counters per profile or globally
+- ☐ Mux protocol selector — per-profile sing-box mux protocol choice
+
+## Phase 9 — v2rayN Parity
+
+### Routing
+
+- ☐ Proxy chain — front proxy (入口代理) + back proxy (落地代理) per subscription group, with tag-based outbound chaining
+- ☐ Policy groups/balancers — Xray 4 types (random/leastPing/leastLoad/leastConn) + sing-box 1 type, alias-based node selection with nested groups
+- ☐ Routing mode switcher — quick Rule/Global/Direct/Unchanged toggle in status bar
+- ☐ Rule set sources — custom geosite/geoip URLs with auto-update per routing rule
+- ☐ Routing rules import/export — JSON array clipboard operations
+- ☐ Process-based routing — per-process split tunneling (v2rayN v7.23.0 feature)
+- ☐ End fragment support — outbound fragment for CDN evasion
+
+### Subscription
+
+- ☐ Multi-URL subscriptions — optional extra URLs merged into one group
+- ☐ Regex filtering — filter imported profiles by alias during subscription update
+- ☐ Subscription conversion target — convert between core types on import (convert_target field exists, always None)
+- ☐ SIP008 format — Shadowsocks SIP008 subscription format support
+- ☐ SOCKS4/5 share link import — socks:// scheme with SOCKS4 auth fields
+
+### Clash
+
+- ☐ Clash Mixin — YAML overlay injected into sing-box config for Clash-compatible features
+- ☐ Clash API proxies view — real-time proxy group selector TUI tab
+- ☐ Clash API connections view — real-time active connection monitor TUI tab
+
+### Core Management
+
+- ☐ Automatic server failover — health-check based fallback between profiles in a group
+- ☐ Batch test parameters — configurable concurrency, timeout, test URL per test type
+- ☐ PAC system proxy mode — PAC file generation with GFWList integration (HTTP proxy only currently)
+- ☐ Multi-core simultaneous support — run xray-core and sing-box concurrently for different groups
+
+### System Integration
+
+- ☐ Auto startup — systemd user service / autostart desktop file / launchd plist
+- ☐ Sudo password input — polkit/privileged operation support for TUN mode on Linux/macOS
+- ☐ Global hotkey bindings — system-wide key combinations for common actions
+- ☐ DBUS integration — system proxy set via networkmanager/gsetting D-Bus instead of env vars
+
+### Config & Advanced
+
+- ☐ Full config template editor — raw JSON editor for both xray-core and sing-box formats
+- ☐ Config backup/restore — WebDAV cloud backup with scheduled auto-backup
+- ☐ JSON config import/export — export full profile as JSON, import auto-detect format
+- ☐ QR code display — render share URL as ANSI QR code in terminal

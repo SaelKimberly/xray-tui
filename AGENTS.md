@@ -85,6 +85,8 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
+**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features — logs, sing-box builder completeness, advanced forms) is in progress. Phase 8 (Polish & Release — i18n, themes, packaging) is planned. Phase 9 (v2rayN Parity — proxy chains, policy groups, Clash dashboard, subscription enhancements) captures the remaining feature gaps for full v2rayN feature parity. See `ROADMAP.md` for full details.
+
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
 2. Create form fields in `crates/xray-tui-config/src/forms.rs` matching that protocol's parameters
@@ -124,9 +126,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 7. Add startup check in `ui::run()` gated by `config.updates.check_on_startup`
 
 ### Determining which core a protocol belongs to
-2. Register version in the migration runner
 
-### Determining which core a protocol belongs to
 - Reference `thirdparty/sing-box/constant/proxy.go` for sing-box protocol type strings
 - Reference `thirdparty/Xray-core/proxy/` directory listing for xray-core protocols
 - Update `protocol_core_mapping.rs` with the new entry
