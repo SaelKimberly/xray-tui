@@ -24,6 +24,38 @@ pub struct Profile {
     pub sub_uid: Option<i64>,
 }
 
+/// Deduplicated core profile data — one row per unique server config.
+/// Keyed by sub_uid hash. Referenced by group_profiles table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileCore {
+    pub sub_uid: i64,
+    pub config_type: i32,
+    pub core_type: String,
+    pub address: Option<String>,
+    pub port: Option<i32>,
+    pub user_id: Option<String>,
+    pub security: Option<String>,
+    pub network: Option<String>,
+    pub stream_settings: Option<String>,
+    pub protocol_settings: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Per-group profile instance — links core data to a group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupProfile {
+    pub id: String,
+    pub sub_uid: i64,
+    pub group_id: String,
+    pub remarks: Option<String>,
+    pub is_sub: Option<i32>,
+    pub sub_id: Option<String>,
+    pub sort_order: Option<i32>,
+    pub is_active: Option<i32>,
+    pub updated_at: Option<String>,
+    pub created_at: Option<String>,
+}
+
 impl Profile {
     pub fn compute_sub_uid(&self) -> u64 {
         let mut h = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
@@ -48,6 +80,8 @@ impl Profile {
 
 pub const GRAVEYARD_GROUP_ID: &str = "00000000-0000-0000-0000-000000000001";
 pub const GRAVEYARD_GROUP_TTL_HOURS: i64 = 24;
+pub const ALL_GROUP_ID: &str = "00000000-0000-0000-0000-000000000000";
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
@@ -59,6 +93,7 @@ pub struct Group {
     pub convert_target: Option<i32>,
     pub core_type: Option<String>,
     pub sort_order: Option<i32>,
+    pub is_system: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,7 +20,7 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 ```rust
 pub enum Tab { Profiles, Settings, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
-pub enum AppMode { List, Help, Settings{..}, AddServer{..}, EditServer{..}, ImportUrl{..}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
+pub enum AppMode { List, Help, Settings{..}, AddServer{..}, EditServer{..}, ImportUrl{..}, BatchImport{results: Vec<BatchImportItem>, scroll: usize}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
 pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
 pub struct LogLine { level: String, message: String }
 
@@ -58,9 +58,9 @@ pub enum CoreEvent {
     Connected(CoreType),
     Disconnected,
     Error(String),
+    ClearGroup(String),
     StatsUpdate {
         profile_id: String,
-        today_up: i64,
         today_down: i64,
         total_up: i64,
         total_down: i64,
@@ -74,7 +74,7 @@ spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is calle
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
 The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
 
-AppState provides:
+- `import_url()` / `start_batch_import()` — parse share URL(s) and add profile(s)
 - `filtered_profiles()` — group filter + search filter + sort by column
 - `reload_profiles()` / `reload_groups()` — DB reload
 - `add_log()` — capped circular log buffer (1000 entries)

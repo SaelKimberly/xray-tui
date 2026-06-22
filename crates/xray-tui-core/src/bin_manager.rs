@@ -170,6 +170,74 @@ fn extract_tar_gz(archive: &Path, target_dir: &Path) -> Result<(), BinError> {
         entry.unpack_in(target_dir)?;
     }
 
+    flatten_single_top_dir(target_dir);
+    Ok(())
+}
+
+/// If `dir` contains only a single subdirectory (no standalone files at top level),
+/// move all contents of that subdirectory up one level and remove the subdirectory.
+///
+/// Handles archives that wrap their payload in a versioned directory
+/// (e.g., `sing-box-X.Y.Z-linux-amd64/sing-box`).
+pub(crate) fn flatten_single_top_dir(dir: &Path) {
+    let entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+
+    let mut subdirs = Vec::new();
+    let mut have_file = false;
+    for entry in &entries {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            subdirs.push(entry.path());
+        } else {
+            have_file = true;
+        }
+    }
+
+    if subdirs.len() != 1 || have_file {
+        return; // nothing to flatten
+    }
+
+    let top_dir = &subdirs[0];
+    if let Ok(rd) = std::fs::read_dir(top_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let dst = dir.join(&name);
+            let src = entry.path();
+            // Try rename (fast, same filesystem) then fall back to copy+delete
+            if let Err(e) = std::fs::rename(&src, &dst)
+                && e.kind() == std::io::ErrorKind::CrossesDevices
+            {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    let _ = copy_dir_contents(&src, &dst).map(|_| {
+                        let _ = std::fs::remove_dir_all(&src);
+                    });
+                } else if std::fs::copy(&src, &dst).is_ok() {
+                    let _ = std::fs::remove_file(&src);
+                }
+                // else: permission denied, etc. — skip this entry
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(top_dir);
+}
+
+/// Recursively copy all entries from `src_dir` into `dst_dir`.
+fn copy_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(dst_dir)?;
+    for entry in std::fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let src = entry.path();
+        let dst = dst_dir.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_contents(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
     Ok(())
 }
 
@@ -382,4 +450,66 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn flatten_single_top_dir_moves_contents_up() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-flatten");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("version-dir")).unwrap();
+
+        std::fs::write(tmp.join("version-dir/binary"), "binary_content").unwrap();
+        std::fs::write(tmp.join("version-dir/config.json"), r#"{"key":"value"}"#).unwrap();
+
+        flatten_single_top_dir(&tmp);
+
+        assert!(tmp.join("binary").exists(), "binary should be at top level");
+        assert!(tmp.join("config.json").exists(), "config should be at top level");
+        assert!(!tmp.join("version-dir").exists(), "version dir should be removed");
+        assert_eq!(std::fs::read_to_string(tmp.join("binary")).unwrap(), "binary_content");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn flatten_single_top_dir_noop_when_files_present() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-flatten-noop");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("subdir")).unwrap();
+        std::fs::write(tmp.join("top_file"), "top").unwrap();
+
+        flatten_single_top_dir(&tmp);
+
+        assert!(tmp.join("subdir").exists(), "subdir should remain");
+        assert!(tmp.join("top_file").exists(), "top file should remain");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn flatten_single_top_dir_noop_multiple_dirs() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-flatten-multi");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("dir1")).unwrap();
+        std::fs::create_dir_all(&tmp.join("dir2")).unwrap();
+
+        flatten_single_top_dir(&tmp);
+
+        assert!(tmp.join("dir1").exists(), "dir1 should remain");
+        assert!(tmp.join("dir2").exists(), "dir2 should remain");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn flatten_single_top_dir_empty_dir() {
+        let tmp = std::env::temp_dir().join("xray-tui-test-flatten-empty");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir(&tmp).unwrap();
+
+        flatten_single_top_dir(&tmp);
+        assert!(tmp.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
+

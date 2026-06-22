@@ -67,4 +67,11 @@ impl Theme {
         .fg(Color::Green);
     pub const HINT: Style = Style::new()
         .fg(Color::Gray);
+    pub const STATUS_FOOTER: Style = Style::new()
+        .bg(Color::Rgb(15, 25, 50))
+        .fg(Color::Rgb(180, 200, 220));
+    pub const FOOTER_LABEL: Style = Style::new()
+        .fg(Color::Rgb(120, 150, 180));
+    pub const FOOTER_VALUE: Style = Style::new()
+        .fg(Color::White);
 }

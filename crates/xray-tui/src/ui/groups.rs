@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::{AppMode, AppState, ConfirmAction};
+use xray_tui_db::models::Group;
 use crate::ui::theme::Theme;
 use crate::ui::profiles::truncate_pad;
 pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -74,13 +75,19 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     ]);
     frame.render_widget(header, chunks[0]);
 
-    // Scrollable group list
+    // Scrollable group list — system groups first
     let list_area = chunks[0];
-    let rows: Vec<Line> = state
-        .groups
+    let mut sorted_groups: Vec<(usize, &Group)> = state.groups.iter().enumerate().collect();
+    sorted_groups.sort_by_key(|(_, g)| {
+        // System groups first (is_system == 1 → sort_key 0), then user groups
+        let is_sys = g.is_system.unwrap_or(0);
+        (1 - is_sys, g.name.as_deref().unwrap_or(""))
+    });
+    let rows: Vec<Line> = sorted_groups
         .iter()
-        .enumerate()
-        .map(|(i, g)| {
+        .map(|(orig_idx, g)| {
+            let is_system = g.is_system.unwrap_or(0) == 1;
+            let is_selected = *orig_idx == selected;
             let name = g.name.as_deref().unwrap_or("unnamed");
             let url = g.subscription_url.as_deref().unwrap_or("-");
             let enabled = if g.subscription_enabled.unwrap_or(0) == 1 {
@@ -94,15 +101,29 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
                 .unwrap_or("idle");
             let last_up = "-";
 
-            let style = if i == selected {
-                Style::default().bg(Color::Blue).fg(Color::White)
+            let display_name = if is_system {
+                format!("[system] {name}")
             } else {
-                Style::default()
+                name.to_string()
+            };
+
+            let style = if is_selected {
+                if is_system {
+                    Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::Rgb(180, 200, 220))
+                } else {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                }
+            } else {
+                if is_system {
+                    Style::default().fg(Color::Rgb(100, 120, 140))
+                } else {
+                    Style::default()
+                }
             };
             Line::from(vec![Span::styled(
                 format!(
-                    " {:<20} │ {:<30} │ {} │ {:<10} │ {}",
-                    name, truncate_pad(url, 30), enabled, status, last_up
+                    " {:<27} │ {:<30} │ {} │ {:<10} │ {}",
+                    truncate_pad(&display_name, 27), truncate_pad(url, 30), enabled, status, last_up
                 ),
                 style,
             )])
@@ -214,24 +235,42 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     state.mode = AppMode::ManageGroups { selected: sel };
                 }
                 KeyCode::Char('e' | 'E') => {
-                    let gid = state.groups.get(sel).map(|g| g.id.clone());
-                    if let Some(id) = gid {
-                        state.start_edit_group(&id);
+                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    if !is_system {
+                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        if let Some(id) = gid {
+                            state.start_edit_group(&id);
+                        }
                     }
                 }
                 KeyCode::Char('a' | 'A') => {
                     state.start_add_group();
                 }
                 KeyCode::Char('d' | 'D') => {
-                    let gid = state.groups.get(sel).map(|g| g.id.clone());
-                    if let Some(id) = gid {
-                        state.confirmation = Some(ConfirmAction::DeleteGroup(id));
+                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    if !is_system {
+                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        if let Some(id) = gid {
+                            state.confirmation = Some(ConfirmAction::DeleteGroup(id));
+                        }
+                    }
+                }
+                KeyCode::Char('c' | 'C') => {
+                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    if !is_system {
+                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        if let Some(id) = gid {
+                            state.confirmation = Some(ConfirmAction::ClearGroup(id));
+                        }
                     }
                 }
                 KeyCode::Char('u') => {
-                    let gid = state.groups.get(sel).map(|g| g.id.clone());
-                    if let Some(id) = gid {
-                        state.update_group_subscriptions(&id);
+                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    if !is_system {
+                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        if let Some(id) = gid {
+                            state.update_group_subscriptions(&id);
+                        }
                     }
                 }
                 KeyCode::Char('U') => {

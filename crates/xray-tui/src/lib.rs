@@ -13,7 +13,7 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule, ServerStat,
+    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule, ServerStat,
     Subscription,
 };
 
@@ -126,6 +126,22 @@ pub enum AppMode {
     },
     /// Speed test menu overlay
     SpeedTestMenu { selected: usize },
+    /// Batch import multiple share URLs
+    BatchImport {
+        /// Parsed/split profiles for each URL
+        results: Vec<BatchImportItem>,
+        /// Current scroll position
+        scroll: usize,
+    },
+}
+
+/// A single item in a batch import list.
+#[derive(Debug, Clone)]
+pub struct BatchImportItem {
+    pub url: String,
+    pub profile: Option<Profile>,
+    pub error: Option<String>,
+    pub imported: bool,
 }
 
 /// Parsed line from sing-box Clash API `/traffic` streaming endpoint.
@@ -185,6 +201,7 @@ pub enum CoreEvent {
 pub enum ConfirmAction {
     DeleteProfile(String),
     DeleteGroup(String),
+    ClearGroup(String),
 }
 #[derive(Debug, Clone, Default)]
 pub struct BackendUpdateStatus {
@@ -563,6 +580,7 @@ impl AppState {
         if !proto_map.is_empty() {
             profile.protocol_settings = Some(serde_json::to_string(&proto_map).unwrap_or_default());
         }
+        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
         profile
     }
 
@@ -621,6 +639,7 @@ impl AppState {
         profile.network = new_profile.network;
         profile.stream_settings = new_profile.stream_settings;
         profile.protocol_settings = new_profile.protocol_settings;
+        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
         profile.updated_at = Some(format_now());
 
         if let Err(e) = self.db.update_profile(&profile) {
@@ -962,6 +981,56 @@ impl AppState {
                 };
             }
         }
+    }
+
+    pub fn start_batch_import(&mut self, urls: &[String]) {
+        let results: Vec<BatchImportItem> = urls
+            .iter()
+            .map(|url| match xray_tui_config::import_export::parse_share_url(url) {
+                Ok(profile) => BatchImportItem {
+                    url: url.clone(),
+                    profile: Some(profile),
+                    error: None,
+                    imported: false,
+                },
+                Err(e) => BatchImportItem {
+                    url: url.clone(),
+                    profile: None,
+                    error: Some(e.to_string()),
+                    imported: false,
+                },
+            })
+            .collect();
+        self.mode = AppMode::BatchImport { results, scroll: 0 };
+    }
+
+    pub fn confirm_batch_import(&mut self) {
+        let items = match &self.mode {
+            AppMode::BatchImport { results, .. } => results.clone(),
+            _ => return,
+        };
+        let now = format_now();
+        let mut imported = 0usize;
+        let mut errors = 0usize;
+        for item in &items {
+            if let Some(mut profile) = item.profile.clone() {
+                profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+                if profile.created_at.is_none() {
+                    profile.created_at = Some(now.clone());
+                }
+                if profile.updated_at.is_none() {
+                    profile.updated_at = Some(now.clone());
+                }
+                if self.db.insert_profile(&profile).is_ok() {
+                    imported += 1;
+                } else {
+                    errors += 1;
+                }
+            }
+        }
+        self.add_log("info", &format!("Batch import: {imported} imported, {errors} errors"));
+        self.mode = AppMode::List;
+        self.reload_profiles();
     }
 
     pub fn move_profile_up(&mut self) {
@@ -1801,6 +1870,7 @@ impl AppState {
             convert_target: None,
             core_type: get_field(&fields, "core_type"),
             sort_order: Some((self.groups.len() + 1) as i32),
+            is_system: None,
         };
         if let Err(e) = self.db.insert_group(&group) {
             self.add_log("error", &format!("Failed to add group: {e}"));
@@ -1879,6 +1949,19 @@ impl AppState {
         self.selected_group_id = None;
         self.confirmation = None;
         self.reload_groups();
+        self.reload_profiles();
+    }
+
+    pub fn clear_group(&mut self, group_id: &str) {
+        match self.db.clear_group(group_id) {
+            Ok(count) => {
+                self.add_log("info", &format!("Cleared {count} profiles from group"));
+            }
+            Err(e) => {
+                self.add_log("error", &format!("Failed to clear group: {e}"));
+            }
+        }
+        self.confirmation = None;
         self.reload_profiles();
     }
 
@@ -2007,6 +2090,7 @@ impl AppState {
             .iter()
             .filter(|g| {
                 g.id != GRAVEYARD_GROUP_ID
+                    && g.id != ALL_GROUP_ID
                     && g.subscription_url.as_deref().is_some_and(|u| !u.is_empty())
             })
             .map(|g| g.id.clone())

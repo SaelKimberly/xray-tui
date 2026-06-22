@@ -444,7 +444,7 @@ mod tests {
     use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
 
     fn test_profile(config_type: i32) -> Profile {
-        Profile {
+        let mut profile = Profile {
             id: "test-id".to_string(),
             config_type,
             core_type: String::new(),
@@ -464,7 +464,9 @@ mod tests {
             created_at: None,
             updated_at: None,
             sub_uid: None,
-        }
+        };
+        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+        profile
     }
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
@@ -692,5 +694,26 @@ mod tests {
         let ss = proxy["streamSettings"].as_object().unwrap();
         assert_eq!(ss["network"], "ws");
         assert_eq!(ss["security"], "tls");
+    }
+
+    #[test]
+    fn vless_reality_stream_settings_passed_through() {
+        let mut profile = test_profile(Protocol::Vless.to_i32());
+        profile.stream_settings = Some(
+            json!({"security": "reality", "realitySettings": {"publicKey": "testkey", "shortId": "abc123"}})
+                .to_string(),
+        );
+        let (params, rules, dns) = default_params();
+        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_xray_top_level(&json);
+        assert_proxy_outbound(&json, "vless");
+        let outbounds = json["outbounds"].as_array().unwrap();
+        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();
+        let ss = proxy["streamSettings"].as_object().unwrap();
+        assert_eq!(ss["security"], "reality");
+        let rs = ss["realitySettings"].as_object().unwrap();
+        assert_eq!(rs["publicKey"], "testkey");
+        assert_eq!(rs["shortId"], "abc123");
     }
 }

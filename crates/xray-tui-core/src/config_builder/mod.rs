@@ -78,7 +78,7 @@ mod tests {
     use crate::protocol::Protocol;
 
     fn test_profile(config_type: i32) -> Profile {
-        Profile {
+        let mut profile = Profile {
             id: "test-smoke".to_string(),
             config_type,
             core_type: String::new(),
@@ -98,7 +98,9 @@ mod tests {
             created_at: None,
             updated_at: None,
             sub_uid: None,
-        }
+        };
+        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+        profile
     }
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {

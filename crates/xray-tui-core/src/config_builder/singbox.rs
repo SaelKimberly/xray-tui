@@ -354,7 +354,7 @@ mod tests {
     use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
 
     fn test_profile(config_type: i32) -> Profile {
-        Profile {
+        let mut profile = Profile {
             id: "test-id".to_string(),
             config_type,
             core_type: String::new(),
@@ -374,7 +374,9 @@ mod tests {
             created_at: None,
             updated_at: None,
             sub_uid: None,
-        }
+        };
+        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+        profile
     }
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {

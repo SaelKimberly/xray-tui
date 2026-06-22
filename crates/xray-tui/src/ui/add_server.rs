@@ -519,3 +519,121 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         _ => {}
     }
 }
+
+pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (results, scroll) = match &state.mode {
+        AppMode::BatchImport { results, scroll } => (results, scroll),
+        _ => return,
+    };
+
+    let block = Block::default()
+        .title(" Batch Import ")
+        .borders(Borders::ALL)
+        .border_style(crate::ui::theme::Theme::CONTAINER_BORDER)
+        .title_style(crate::ui::theme::Theme::CONTAINER_TITLE);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_visible = inner.height.saturating_sub(2) as usize;
+    let total = results.len();
+    let scroll = *scroll;
+
+    // Status header
+    let ok_count = results.iter().filter(|r| r.profile.is_some()).count();
+    let err_count = results.iter().filter(|r| r.profile.is_none()).count();
+    let header = format!(" {ok_count} valid, {err_count} invalid — Enter to import, Esc to cancel ");
+    let header_style = Style::default().fg(Color::Cyan);
+    let header_line = Line::from(Span::styled(&header, header_style));
+    frame.render_widget(Paragraph::new(header_line), Rect::new(inner.x, inner.y, inner.width, 1));
+
+    // URL list
+    let list_y = inner.y + 1;
+    let list_height = max_visible.saturating_sub(1).min(total.saturating_sub(scroll));
+    for i in 0..list_height {
+        let idx = scroll + i;
+        if idx >= total {
+            break;
+        }
+        let item = &results[idx];
+
+        // Status icon
+        let (icon, icon_style) = if item.profile.is_some() {
+            (" ✓", Style::default().fg(Color::Green))
+        } else {
+            (" ✗", Style::default().fg(Color::Red))
+        };
+
+        // URL display (truncate to fit)
+        let max_url_len = inner.width.saturating_sub(5) as usize;
+        let display = if item.url.len() > max_url_len {
+            format!("{}…", &item.url[..max_url_len.saturating_sub(1)])
+        } else {
+            item.url.clone()
+        };
+
+        let icon_span = Span::styled(icon, icon_style);
+        let url_span = Span::raw(&display);
+        let line = Line::from(vec![icon_span, Span::raw(" "), url_span]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, list_y + i as u16, inner.width, 1),
+        );
+    }
+
+    // Scroll indicator
+    if total > max_visible.saturating_sub(1) {
+        let scroll_text = format!(
+            " [{}-{}/{}] ",
+            scroll + 1,
+            (scroll + max_visible.saturating_sub(1)).min(total),
+            total
+        );
+        let scroll_style = Style::default().fg(Color::DarkGray);
+        let scroll_line = Line::from(Span::styled(&scroll_text, scroll_style));
+        let scroll_y = inner.y + inner.height.saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new(scroll_line),
+            Rect::new(inner.x + inner.width.saturating_sub(scroll_text.len() as u16 + 2), scroll_y, scroll_text.len() as u16 + 2, 1),
+        );
+    }
+}
+
+pub fn handle_batch_import_key(state: &mut AppState, key: &KeyEvent) {
+    let results_len = match &state.mode {
+        AppMode::BatchImport { results, .. } => results.len(),
+        _ => return,
+    };
+    let scroll = match &state.mode {
+        AppMode::BatchImport { scroll, .. } => *scroll,
+        _ => return,
+    };
+    match key.code {
+        KeyCode::Down => {
+            let new_scroll = (scroll + 1).min(results_len.saturating_sub(1));
+            state.mode = AppMode::BatchImport {
+                results: match &state.mode {
+                    AppMode::BatchImport { results, .. } => results.clone(),
+                    _ => return,
+                },
+                scroll: new_scroll,
+            };
+        }
+        KeyCode::Up => {
+            let new_scroll = scroll.saturating_sub(1);
+            state.mode = AppMode::BatchImport {
+                results: match &state.mode {
+                    AppMode::BatchImport { results, .. } => results.clone(),
+                    _ => return,
+                },
+                scroll: new_scroll,
+            };
+        }
+        KeyCode::Enter => {
+            state.confirm_batch_import();
+        }
+        KeyCode::Esc => {
+            state.mode = AppMode::List;
+        }
+        _ => {}
+    }
+}

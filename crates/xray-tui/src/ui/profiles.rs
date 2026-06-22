@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{CoreType, resolve_core};
+use xray_tui_core::{CoreType, resolve_core, format_bytes, format_uptime};
 
 use crate::ui::theme::Theme;
 use crate::{AppState, ConfirmAction};
@@ -19,6 +19,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Length(1),
             Constraint::Length(gauge_height),
             Constraint::Min(0),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -47,29 +48,45 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let adjusted_selected = selected - scroll_offset;
 
     render_data_grid(frame, chunks[2], visible_rows, adjusted_selected, scroll_offset, state);
-    // Delete confirmation overlay (profiles only)
-    if let Some(ConfirmAction::DeleteProfile(ref delete_id)) = state.confirmation {
-        let profile_name = rows
-            .iter()
-            .find(|r| r.profile.id == *delete_id)
-            .and_then(|r| r.profile.remarks.as_deref())
-            .unwrap_or("unknown");
-        let overlay_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Red)
-            .add_modifier(Modifier::BOLD);
-        let overlay_text = format!(" Delete \"{profile_name}\"? (y/N) ");
-        let overlay_para = Paragraph::new(overlay_text.clone()).style(overlay_style);
-        let overlay_area = Rect::new(
-            area.width
-                .saturating_sub(overlay_text.len() as u16 + 4)
-                .min(area.width),
-            area.height.saturating_sub(2),
-            overlay_text.len() as u16 + 4,
-            1,
-        );
-        frame.render_widget(overlay_para, overlay_area);
+    render_footer(frame, chunks[3], state);
+    // Confirmation overlays: DeleteProfile and ClearGroup
+    match state.confirmation {
+        Some(ConfirmAction::DeleteProfile(ref delete_id)) => {
+            let profile_name = rows
+                .iter()
+                .find(|r| r.profile.id == *delete_id)
+                .and_then(|r| r.profile.remarks.as_deref())
+                .unwrap_or("unknown");
+            render_confirmation_overlay(frame, area, &format!(" Delete \"{profile_name}\"? (y/N) "));
+        }
+        Some(ConfirmAction::ClearGroup(ref group_id)) => {
+            let group_name = state
+                .groups
+                .iter()
+                .find(|g| g.id == *group_id)
+                .and_then(|g| g.name.as_deref())
+                .unwrap_or("unknown");
+            render_confirmation_overlay(frame, area, &format!(" Clear all profiles in \"{group_name}\"? (y/N) "));
+        }
+        _ => {}
     }
+}
+
+fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
+    let overlay_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Red)
+        .add_modifier(Modifier::BOLD);
+    let overlay_para = Paragraph::new(text.to_string()).style(overlay_style);
+    let overlay_area = Rect::new(
+        area.width
+            .saturating_sub(text.len() as u16 + 4)
+            .min(area.width),
+        area.height.saturating_sub(2),
+        text.len() as u16 + 4,
+        1,
+    );
+    frame.render_widget(overlay_para, overlay_area);
 }
 
 fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -259,4 +276,78 @@ fn format_traffic(bytes: u64) -> String {
     } else {
         format!("{:>4}B ", bytes)
     }
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.height < 1 {
+        return;
+    }
+
+    let has_profile = state.selected_index < state.profiles.len();
+    let connected = state.connected_core.is_some();
+
+    let mut lines = Vec::new();
+
+    // Line 1: server info (always present if profiles exist)
+    if has_profile {
+        let row = &state.profiles[state.selected_index];
+        let protocol = Protocol::try_from_i32(row.profile.config_type)
+            .unwrap_or(Protocol::Custom);
+        let core = resolve_core(
+            protocol,
+            Some(row.profile.core_type.parse::<CoreType>().unwrap_or(CoreType::Auto)),
+        );
+        let remarks = row.profile.remarks.as_deref().unwrap_or("-");
+        let addr = row.profile.address.as_deref().unwrap_or("-");
+        let port = row.profile.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+
+        lines.push(Line::from(vec![
+            Span::styled(" Server: ", Theme::FOOTER_LABEL),
+            Span::styled(remarks, Theme::FOOTER_VALUE),
+            Span::styled(format!("  {}:{}  ", addr, port), Theme::FOOTER_VALUE),
+            Span::styled(format!("[{}] ", protocol), Theme::FOOTER_VALUE),
+            Span::styled(core.to_string(), Theme::FOOTER_VALUE),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(" Server: (none selected)", Theme::FOOTER_LABEL)));
+    }
+
+    // Line 2: traffic
+    if connected && has_profile {
+        if let Some(ref stats) = state.profiles[state.selected_index].stats {
+            let tu = format_traffic(stats.total_up.unwrap_or(0) as u64);
+            let td = format_traffic(stats.total_down.unwrap_or(0) as u64);
+            let du = format_traffic(stats.today_up.unwrap_or(0) as u64);
+            let dd = format_traffic(stats.today_down.unwrap_or(0) as u64);
+            lines.push(Line::from(vec![
+                Span::styled(" Traffic: ", Theme::FOOTER_LABEL),
+                Span::styled(format!("Today {}↑  {}↓  ", du.trim(), dd.trim()), Theme::FOOTER_VALUE),
+                Span::styled(format!("Total {}↑  {}↓", tu.trim(), td.trim()), Theme::FOOTER_VALUE),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(" Traffic: (no data yet)", Theme::FOOTER_LABEL)));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(" Traffic: (not connected)", Theme::FOOTER_LABEL)));
+    }
+
+    // Line 3: system stats
+    if connected {
+        if let Some(ref sys) = state.system_stats {
+            let mem = format_bytes(sys.alloc as i64);
+            lines.push(Line::from(vec![
+                Span::styled(" System: ", Theme::FOOTER_LABEL),
+                Span::styled(format!("Mem: {}  ", mem), Theme::FOOTER_VALUE),
+                Span::styled(format!("Goroutines: {}  ", sys.num_goroutine), Theme::FOOTER_VALUE),
+                Span::styled(format!("Uptime: {}", format_uptime(sys.uptime)), Theme::FOOTER_VALUE),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(" System: (no data yet)", Theme::FOOTER_LABEL)));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(" System: (not connected)", Theme::FOOTER_LABEL)));
+    }
+
+    let footer = Paragraph::new(lines).style(Theme::STATUS_FOOTER);
+    frame.render_widget(footer, area);
 }

@@ -12,16 +12,29 @@ from base64 import b64decode
 from pathlib import Path
 from urllib.parse import unquote
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "xray-tui"
+CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "xray-tui"
+)
 DB_PATH = CONFIG_DIR / "data.db"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 BINARY = Path(__file__).resolve().parent.parent / "target/release/xray-tui"
 
 CONFIG_TYPE = {
-    "vmess": 1, "vless": 5, "trojan": 6, "ss": 3, "ssr": 0,
-    "socks": 4, "http": 10, "hysteria2": 7, "hysteria": 0,
-    "tuic": 8, "wireguard": 9, "naive+https": 12, "naive+quic": 12,
-    "anytls": 11, "shadowtls": 0,
+    "vmess": 1,
+    "vless": 5,
+    "trojan": 6,
+    "ss": 3,
+    "ssr": 0,
+    "socks": 4,
+    "http": 10,
+    "hysteria2": 7,
+    "hysteria": 0,
+    "tuic": 8,
+    "wireguard": 9,
+    "naive+https": 12,
+    "naive+quic": 12,
+    "anytls": 11,
+    "shadowtls": 0,
 }
 
 
@@ -29,14 +42,14 @@ def sanitize(s):
     """Keep only ASCII printable chars, safe for byte-slicing."""
     if not s:
         return ""
-    return re.sub(r'[^\x20-\x7E]', ' ', s).strip()[:200]
+    return re.sub(r"[^\x20-\x7E]", " ", s).strip()[:200]
 
 
 def load_subscription_urls(yaml_path):
     urls = []
     with open(yaml_path) as f:
         for line in f:
-            m = re.match(r'\s*-\s*(https?://\S+)', line)
+            m = re.match(r"\s*-\s*(https?://\S+)", line)
             if m:
                 urls.append(m.group(1))
     return urls
@@ -109,7 +122,7 @@ def _parse_userpass_url(rest):
     port = 0
     if ":" in hostport:
         if hostport.startswith("["):
-            m = re.match(r'^\[([^\]]+)\]:(\d+)$', hostport)
+            m = re.match(r"^\[([^\]]+)\]:(\d+)$", hostport)
             if m:
                 address = m.group(1)
                 port = int(m.group(2))
@@ -140,7 +153,9 @@ def parse_shadowsocks(url):
         b64part, hp = rest.split("@", 1)
         hostport = hp
         try:
-            padded = b64part + "=" * (4 - len(b64part) % 4) if len(b64part) % 4 else b64part
+            padded = (
+                b64part + "=" * (4 - len(b64part) % 4) if len(b64part) % 4 else b64part
+            )
             decoded = b64decode(padded).decode("utf-8", errors="replace")
             if ":" in decoded:
                 _, password = decoded.split(":", 1)
@@ -150,7 +165,7 @@ def parse_shadowsocks(url):
     port = 0
     if ":" in hostport:
         if hostport.startswith("["):
-            m = re.match(r'^\[([^\]]+)\]:(\d+)$', hostport)
+            m = re.match(r"^\[([^\]]+)\]:(\d+)$", hostport)
             if m:
                 address = m.group(1)
                 port = int(m.group(2))
@@ -183,7 +198,9 @@ def parse_shadowsocksr(url):
                 k, v = p.split("=", 1)
                 if k in ("remarks", "name"):
                     try:
-                        r = b64decode(v + "=" * (4 - len(v) % 4)).decode("utf-8", errors="replace")
+                        r = b64decode(v + "=" * (4 - len(v) % 4)).decode(
+                            "utf-8", errors="replace"
+                        )
                         remarks = sanitize(r)
                     except Exception:
                         remarks = v
@@ -215,7 +232,7 @@ def parse_simple(url):
     port = 0
     if ":" in rest:
         if rest.startswith("["):
-            m = re.match(r'^\[([^\]]+)\]:(\d+)$', rest)
+            m = re.match(r"^\[([^\]]+)\]:(\d+)$", rest)
             if m:
                 address = m.group(1)
                 port = int(m.group(2))
@@ -235,15 +252,25 @@ def parse_simple(url):
 
 
 PARSERS = {
-    "vmess": parse_vmess, "vless": parse_vless, "trojan": parse_trojan,
-    "ss": parse_shadowsocks, "ssr": parse_shadowsocksr,
-    "socks": parse_socks, "socks5": parse_socks,
-    "http": parse_http, "https": parse_http,
-    "hysteria2": parse_simple, "hy2": parse_simple,
-    "hysteria": parse_simple, "hy": parse_simple,
-    "tuic": parse_simple, "naive+https": parse_simple,
-    "naive+quic": parse_simple, "anytls": parse_simple,
-    "shadowtls": parse_simple, "wireguard": parse_simple,
+    "vmess": parse_vmess,
+    "vless": parse_vless,
+    "trojan": parse_trojan,
+    "ss": parse_shadowsocks,
+    "ssr": parse_shadowsocksr,
+    "socks": parse_socks,
+    "socks5": parse_socks,
+    "http": parse_http,
+    "https": parse_http,
+    "hysteria2": parse_simple,
+    "hy2": parse_simple,
+    "hysteria": parse_simple,
+    "hy": parse_simple,
+    "tuic": parse_simple,
+    "naive+https": parse_simple,
+    "naive+quic": parse_simple,
+    "anytls": parse_simple,
+    "shadowtls": parse_simple,
+    "wireguard": parse_simple,
 }
 
 
@@ -268,19 +295,21 @@ def main():
     conn.execute("PRAGMA journal_mode=WAL")
 
     try:
-        conn.execute("ALTER TABLE profiles ADD COLUMN group_id TEXT REFERENCES groups(id)")
+        conn.execute(
+            "ALTER TABLE profiles ADD COLUMN group_id TEXT REFERENCES groups(id)"
+        )
         print("Added group_id column")
     except sqlite3.OperationalError:
         print("group_id exists")
 
     for i, sub_url in enumerate(urls):
-        name = f"Sub-{i+1:02d}"
-        gid = f"group-{i+1:04d}-{hashlib.md5(sub_url.encode()).hexdigest()[:8]}"
+        name = f"Sub-{i + 1:02d}"
+        gid = f"group-{i + 1:04d}-{hashlib.md5(sub_url.encode()).hexdigest()[:8]}"
         conn.execute(
             "INSERT OR IGNORE INTO groups (id, name, subscription_url, subscription_enabled) VALUES (?, ?, ?, 1)",
             (gid, name, sub_url),
         )
-        sid = f"sub-{i+1:04d}-{hashlib.md5(sub_url.encode()).hexdigest()[:8]}"
+        sid = f"sub-{i + 1:04d}-{hashlib.md5(sub_url.encode()).hexdigest()[:8]}"
         conn.execute(
             "INSERT OR IGNORE INTO subscriptions (id, group_id, url, status) VALUES (?, ?, ?, 'idle')",
             (sid, gid, sub_url),
@@ -295,7 +324,7 @@ def main():
     failed_lines = 0
 
     for fi, fixture_file in enumerate(fixture_files):
-        gid = f"group-{fi+1:04d}-{hashlib.md5(urls[fi].encode()).hexdigest()[:8]}"
+        gid = f"group-{fi + 1:04d}-{hashlib.md5(urls[fi].encode()).hexdigest()[:8]}"
         with open(fixture_file, "r", errors="replace") as f:
             lines = f.readlines()
 
@@ -327,8 +356,20 @@ def main():
                    VALUES (?, ?, 'auto', ?, ?, ?, ?,
                            1, ?, ?, ?, ?,
                            0, ?, ?)""",
-                (f"prof-{pid[:32]}", ct, remarks, address, port, uid,
-                 fi, gid, sub_uid, pi, now, now),
+                (
+                    f"prof-{pid[:32]}",
+                    ct,
+                    remarks,
+                    address,
+                    port,
+                    uid,
+                    fi,
+                    gid,
+                    sub_uid,
+                    pi,
+                    now,
+                    now,
+                ),
             )
             pi += 1
             total_profiles += 1

@@ -249,7 +249,11 @@ fn parse_vless(url: &str) -> Result<Profile> {
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "security" => {
-                // tls/none
+                if v == "reality" {
+                    let mut ss = stream_settings(profile.stream_settings.as_deref());
+                    ss.insert("security".into(), serde_json::Value::String("reality".into()));
+                    profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                }
             }
             "sni" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
@@ -301,6 +305,34 @@ fn parse_vless(url: &str) -> Result<Profile> {
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "encryption" => { /* ignored */ }
+            "pbk" | "publicKey" => {
+                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let rs = ss.entry(String::from("realitySettings"))
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(obj) = rs.as_object_mut() {
+                    obj.insert("publicKey".into(), serde_json::Value::String(v.to_string()));
+                }
+                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+            }
+            "sid" | "shortId" => {
+                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let rs = ss.entry(String::from("realitySettings"))
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(obj) = rs.as_object_mut() {
+                    obj.insert("shortId".into(), serde_json::Value::String(v.to_string()));
+                }
+                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+            }
+            "spx" | "spiderX" => {
+                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let rs = ss.entry(String::from("realitySettings"))
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(obj) = rs.as_object_mut() {
+                    obj.insert("spiderX".into(), serde_json::Value::String(v.to_string()));
+                }
+                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+            }
+            "headerType" => { /* transport header type — defaults to "none" */ }
             _ => {}
         }
     }
@@ -319,6 +351,9 @@ fn format_vless(profile: &Profile) -> Result<String> {
     {
         query.push(("flow".into(), flow.to_string()));
     }
+    if let Some(net) = &profile.network {
+        query.push(("type".into(), net.clone()));
+    }
     if let Some(ss) = &profile.stream_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
     {
@@ -327,6 +362,20 @@ fn format_vless(profile: &Profile) -> Result<String> {
         }
         if let Some(fp) = v.get("fingerprint").and_then(|f| f.as_str()) {
             query.push(("fp".into(), fp.to_string()));
+        }
+        if v.get("security").and_then(|s| s.as_str()) == Some("reality") {
+            query.push(("security".into(), "reality".into()));
+        }
+        if let Some(rs) = v.get("realitySettings").and_then(|r| r.as_object()) {
+            if let Some(pbk) = rs.get("publicKey").and_then(|s| s.as_str()) {
+                query.push(("pbk".into(), pbk.to_string()));
+            }
+            if let Some(sid) = rs.get("shortId").and_then(|s| s.as_str()) {
+                query.push(("sid".into(), sid.to_string()));
+            }
+            if let Some(spx) = rs.get("spiderX").and_then(|s| s.as_str()) {
+                query.push(("spx".into(), spx.to_string()));
+            }
         }
     }
 
@@ -354,11 +403,12 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
         .split_once('@')
         .ok_or_else(|| ImportError::Parse("missing @ in ss:// URL".into()))?;
 
-    let (host_part, fragment) = rest2
+    let (host_part_raw, fragment) = rest2
         .split_once('#')
         .map(|(h, f)| (h, Some(f.to_string())))
         .unwrap_or((rest2, None));
-
+    // SIP002: trailing ? before # indicates empty query string
+    let host_part = host_part_raw.strip_suffix('?').unwrap_or(host_part_raw);
     let (address, port_str) = host_part
         .rsplit_once(':')
         .ok_or_else(|| ImportError::Parse("missing port in ss:// URL".into()))?;
@@ -1721,5 +1771,156 @@ mod tests {
             parse_share_url("unknown://x"),
             Err(ImportError::UnsupportedScheme)
         ));
+    }
+
+    const WORKING_URL_1: &str = "vless://a5ea9247-79f3-4655-aece-3fb51e1e669e@146.103.99.45:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=rezerv.yunus.guru&fp=firefox&pbk=S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg&sid=a7ec6c3316eddb11&type=tcp&headerType=none#%5B332ms%20%D0%A4%D0%B8%D0%BD%D0%BB%D1%8F%D0%BD%D0%B4%D0%B8%D1%8F%20FI%20%F0%9F%87%AB%F0%9F%87%AE%20%40vlesstrojan%5D";
+    const WORKING_URL_2: &str = "vless://a5ea9247-79f3-4655-aece-3fb51e1e669e@144.124.241.233:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=rezerv1.yunus.guru&fp=firefox&pbk=-X9CZv5MYKivpxPVP1vdgFKf2AJWmZ0Pju-j8LFmlh4&sid=6c88854e73e86773&type=tcp&headerType=none#%5B333ms%20%D0%A4%D0%B8%D0%BD%D0%BB%D1%8F%D0%BD%D0%B4%D0%B8%D1%8F%20FI%20%F0%9F%87%AB%F0%9F%87%AE%20%40vlesstrojan%5D";
+    const WORKING_URL_3: &str = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTprMWRCT21PQjRvcWk3VW1wMzdhMWJR@82.38.31.192:8080?#%5B164ms%20%D0%90%D0%B2%D1%81%D1%82%D1%80%D0%B8%D1%8F%20AT%20%F0%9F%87%A6%F0%9F%87%B9%20%40vlesstrojan%5D";
+    const WORKING_URL_4: &str = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpDSm1UQ0N4N0x0dWQ@108.181.126.122:8388?#%5B140ms%20%D0%90%D0%B2%D1%81%D1%82%D1%80%D0%B8%D1%8F%20AT%20%F0%9F%87%A6%F0%9F%87%B9%20%40vlesstrojan%5D";
+
+    #[test]
+    fn parse_working_txt_urls() {
+        // ── VLESS Reality URL 1 ──
+        let p = parse_share_url(WORKING_URL_1).unwrap();
+        assert_eq!(p.config_type, Protocol::Vless.to_i32());
+        assert_eq!(p.address.as_deref(), Some("146.103.99.45"));
+        assert_eq!(p.port, Some(443));
+        assert_eq!(
+            p.user_id.as_deref(),
+            Some("a5ea9247-79f3-4655-aece-3fb51e1e669e")
+        );
+        assert_eq!(p.network.as_deref(), Some("tcp"));
+        assert!(p.remarks.as_ref().unwrap().contains("Финляндия"));
+
+        // Reality params now extracted (parser fix applied)
+        if let Some(ss) = &p.stream_settings {
+            let v: serde_json::Value =
+                serde_json::from_str(ss).expect("stream_settings must be valid JSON");
+            let obj = v.as_object().expect("stream_settings must be an object");
+            assert_eq!(obj["sni"], "rezerv.yunus.guru");
+            assert_eq!(obj["fingerprint"], "firefox");
+            assert_eq!(obj["security"], "reality");
+            let rs = obj
+                .get("realitySettings")
+                .expect("realitySettings should be present")
+                .as_object()
+                .expect("realitySettings must be an object");
+            assert_eq!(rs["publicKey"], "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg");
+            assert_eq!(rs["shortId"], "a7ec6c3316eddb11");
+        } else {
+            panic!("VLESS URL should have stream_settings");
+        }
+
+        // ── VLESS Reality URL 2 ──
+        let p = parse_share_url(WORKING_URL_2).unwrap();
+        assert_eq!(p.config_type, Protocol::Vless.to_i32());
+        assert_eq!(p.address.as_deref(), Some("144.124.241.233"));
+        assert_eq!(p.port, Some(443));
+        assert_eq!(
+            p.user_id.as_deref(),
+            Some("a5ea9247-79f3-4655-aece-3fb51e1e669e")
+        );
+        assert_eq!(p.network.as_deref(), Some("tcp"));
+
+        // Reality params now extracted (parser fix applied)
+        if let Some(ss) = &p.stream_settings {
+            let v: serde_json::Value =
+                serde_json::from_str(ss).expect("stream_settings must be valid JSON");
+            let obj = v.as_object().expect("stream_settings must be an object");
+            assert_eq!(obj["sni"], "rezerv1.yunus.guru");
+            assert_eq!(obj["fingerprint"], "firefox");
+            assert_eq!(obj["security"], "reality");
+            let rs = obj
+                .get("realitySettings")
+                .expect("realitySettings should be present")
+                .as_object()
+                .expect("realitySettings must be an object");
+            assert_eq!(rs["publicKey"], "-X9CZv5MYKivpxPVP1vdgFKf2AJWmZ0Pju-j8LFmlh4");
+            assert_eq!(rs["shortId"], "6c88854e73e86773");
+        } else {
+            panic!("VLESS URL should have stream_settings");
+        }
+
+        // ── Shadowsocks URL 3 ──
+        let p = parse_share_url(WORKING_URL_3).unwrap();
+        assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
+        assert_eq!(p.address.as_deref(), Some("82.38.31.192"));
+        assert_eq!(p.port, Some(8080));
+        assert!(p.remarks.as_ref().unwrap().contains("Австрия"));
+        if let Some(ps) = &p.protocol_settings {
+            let v: serde_json::Value =
+                serde_json::from_str(ps).expect("protocol_settings must be valid JSON");
+            assert_eq!(v["method"], "chacha20-ietf-poly1305");
+        } else {
+            panic!("Shadowsocks URL should have protocol_settings");
+        }
+        assert_eq!(
+            p.user_id.as_deref(),
+            Some("k1dBOmOB4oqi7Ump37a1bQ")
+        );
+
+        // ── Shadowsocks URL 4 ──
+        let p = parse_share_url(WORKING_URL_4).unwrap();
+        assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
+        assert_eq!(p.address.as_deref(), Some("108.181.126.122"));
+        assert_eq!(p.port, Some(8388));
+        if let Some(ps) = &p.protocol_settings {
+            let v: serde_json::Value =
+                serde_json::from_str(ps).expect("protocol_settings must be valid JSON");
+            assert_eq!(v["method"], "chacha20-ietf-poly1305");
+        } else {
+            panic!("Shadowsocks URL should have protocol_settings");
+        }
+        assert_eq!(
+            p.user_id.as_deref(),
+            Some("CJmTCCx7Ltud")
+        );
+    }
+
+    #[test]
+    fn roundtrip_vless_reality() {
+        // Parse working VLESS Reality URL, format back, re-parse
+        let p1 = parse_share_url(WORKING_URL_1).unwrap();
+        let url = format_share_url(&p1).unwrap();
+        assert!(url.starts_with("vless://"));
+        // Re-parse should preserve all Reality fields
+        let p2 = parse_share_url(&url).unwrap();
+        assert_eq!(p2.config_type, Protocol::Vless.to_i32());
+        assert_eq!(p2.address, p1.address);
+        assert_eq!(p2.port, p1.port);
+        assert_eq!(p2.user_id, p1.user_id);
+        assert_eq!(p2.network, p1.network);
+        // Compare stream_settings (Reality params)
+        if let (Some(ss1), Some(ss2)) = (&p1.stream_settings, &p2.stream_settings) {
+            let v1: serde_json::Value =
+                serde_json::from_str(ss1).expect("stream_settings must be valid JSON");
+            let v2: serde_json::Value =
+                serde_json::from_str(ss2).expect("stream_settings must be valid JSON");
+            assert_eq!(v1["security"], v2["security"]);
+            assert_eq!(v1["realitySettings"], v2["realitySettings"]);
+            assert_eq!(v1["sni"], v2["sni"]);
+            assert_eq!(v1["fingerprint"], v2["fingerprint"]);
+        } else {
+            panic!("Both profiles should have stream_settings");
+        }
+    }
+
+    #[test]
+    fn roundtrip_shadowsocks_real() {
+        let p1 = parse_share_url(WORKING_URL_3).unwrap();
+        let url = format_share_url(&p1).unwrap();
+        assert!(url.starts_with("ss://"));
+        let p2 = parse_share_url(&url).unwrap();
+        assert_eq!(p2.config_type, Protocol::Shadowsocks.to_i32());
+        assert_eq!(p2.address, p1.address);
+        assert_eq!(p2.port, p1.port);
+        assert_eq!(p2.user_id, p1.user_id);
+        if let (Some(ps1), Some(ps2)) = (&p1.protocol_settings, &p2.protocol_settings) {
+            let v1: serde_json::Value =
+                serde_json::from_str(ps1).expect("protocol_settings must be valid JSON");
+            let v2: serde_json::Value =
+                serde_json::from_str(ps2).expect("protocol_settings must be valid JSON");
+            assert_eq!(v1["method"], v2["method"]);
+        }
     }
 }

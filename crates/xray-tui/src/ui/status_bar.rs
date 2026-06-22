@@ -88,6 +88,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",
         crate::AppMode::SpeedTestMenu { .. } => " Speed Test",
+        crate::AppMode::BatchImport { .. } => " Batch Import",
         crate::AppMode::Help => " Help",
         _ => "",
     };

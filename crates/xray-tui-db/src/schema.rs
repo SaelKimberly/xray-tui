@@ -1,11 +1,10 @@
 pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS profiles (
-            id                  TEXT PRIMARY KEY NOT NULL,
+        CREATE TABLE IF NOT EXISTS profile_cores (
+            sub_uid             INTEGER PRIMARY KEY NOT NULL,
             config_type         INTEGER NOT NULL,
             core_type           TEXT NOT NULL DEFAULT 'xray',
-            remarks             TEXT,
             address             TEXT,
             port                INTEGER,
             user_id             TEXT,
@@ -13,15 +12,26 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             network             TEXT,
             stream_settings     TEXT,
             protocol_settings   TEXT,
+            created_at          TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS group_profiles (
+            id                  TEXT PRIMARY KEY NOT NULL,
+            sub_uid             INTEGER NOT NULL REFERENCES profile_cores(sub_uid),
+            group_id            TEXT NOT NULL REFERENCES groups(id),
+            remarks             TEXT,
             is_sub              INTEGER DEFAULT 0,
             sub_id              TEXT,
-            group_id            TEXT,
-            sub_uid             INTEGER NOT NULL DEFAULT 0,
             sort_order          INTEGER DEFAULT 0,
             is_active           INTEGER DEFAULT 0,
+            updated_at          TEXT,
             created_at          TEXT,
-            updated_at          TEXT
+            UNIQUE(group_id, sub_uid)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_group_profiles_sub_uid ON group_profiles(sub_uid);
+        CREATE INDEX IF NOT EXISTS idx_group_profiles_group_id ON group_profiles(group_id);
+        CREATE INDEX IF NOT EXISTS idx_group_profiles_active ON group_profiles(group_id, is_active);
 
         CREATE TABLE IF NOT EXISTS groups (
             id                  TEXT PRIMARY KEY NOT NULL,
@@ -31,7 +41,8 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             user_agent          TEXT,
             convert_target      INTEGER,
             core_type           TEXT,
-            sort_order          INTEGER DEFAULT 0
+            sort_order          INTEGER DEFAULT 0,
+            is_system           INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -94,22 +105,6 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         );
         ",
     )?;
-
-    // Migration v2: add sub_uid column (ignore error if already exists)
-    let _ = conn.execute_batch("ALTER TABLE profiles ADD COLUMN sub_uid INTEGER NOT NULL DEFAULT 0;");
-    // Migration v3: add group_id column (ignore error if already exists)
-    let _ = conn.execute_batch("ALTER TABLE profiles ADD COLUMN group_id TEXT REFERENCES groups(id);");
-
-    // Rebuild index as UNIQUE — previous schema had non-unique (or none if migration failed midway through)
-    let _ = conn.execute_batch("DROP INDEX IF EXISTS idx_profiles_group_sub_uid;");
-    // Deduplicate before creating UNIQUE index
-    let _ = conn.execute_batch(
-        "DELETE FROM profiles WHERE rowid NOT IN (
-            SELECT MIN(rowid) FROM profiles WHERE sub_uid != 0 AND group_id IS NOT NULL
-            GROUP BY group_id, sub_uid
-        ) AND sub_uid != 0 AND group_id IS NOT NULL;"
-    );
-    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_group_sub_uid ON profiles(group_id, sub_uid) WHERE sub_uid != 0;")?;
 
     Ok(())
 }

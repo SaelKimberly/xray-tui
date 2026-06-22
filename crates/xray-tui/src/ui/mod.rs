@@ -6,7 +6,7 @@ pub mod settings;
 pub mod statistics;
 pub mod status_bar;
 pub mod theme;
-
+use xray_tui_config::subscription::subscription_url_split;
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -98,6 +98,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
                 Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
                 Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
+                Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id),
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -139,8 +140,18 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
-    // Form mode: route all keys to add_server handler (except Ctrl+C quit)
-    if !matches!(state.mode, crate::AppMode::List) && !matches!(&state.mode, crate::AppMode::Help) {
+    // BatchImport: route all keys to batch import handler
+    if matches!(&state.mode, crate::AppMode::BatchImport { .. }) {
+        add_server::handle_batch_import_key(state, key);
+        return;
+    }
+
+    // Form mode: route all keys to add_server handler (except Ctrl+C quit, SpeedTestMenu, BatchImport)
+    if !matches!(state.mode, crate::AppMode::List)
+        && !matches!(&state.mode, crate::AppMode::Help)
+        && !matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. })
+        && !matches!(&state.mode, crate::AppMode::BatchImport { .. })
+    {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.should_quit = true;
@@ -243,6 +254,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('?') => {
                 state.previous_mode = Some(Box::new(state.mode.clone()));
                 state.mode = crate::AppMode::Help;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.should_quit = true;
             }
             _ => {}
         }
@@ -408,10 +422,25 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 .ok()
                 .and_then(|mut cb| cb.get_text().ok())
                 .unwrap_or_default();
-            state.mode = crate::AppMode::ImportUrl {
-                input: clipboard_text,
-                error: None,
-            };
+
+            let urls = subscription_url_split(&clipboard_text);
+            match urls.len() {
+                0 => {
+                    state.mode = crate::AppMode::ImportUrl {
+                        input: clipboard_text,
+                        error: Some("No valid share URLs found".into()),
+                    };
+                }
+                1 => {
+                    state.mode = crate::AppMode::ImportUrl {
+                        input: clipboard_text,
+                        error: None,
+                    };
+                }
+                _ => {
+                    state.start_batch_import(&urls);
+                }
+            }
         }
         KeyCode::Char('S')
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -493,6 +522,9 @@ fn render(frame: &mut Frame, state: &AppState) {
             }
             crate::AppMode::EditGroup { .. } => {
                 groups::render_group_form(frame, chunks[1], state, true);
+            }
+            crate::AppMode::BatchImport { .. } => {
+                add_server::render_batch_import(frame, chunks[1], state);
             }
             crate::AppMode::Settings { .. } => {
                 render_tabs(frame, chunks[0], state);

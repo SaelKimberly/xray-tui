@@ -80,8 +80,10 @@
 - Full config template editor (raw JSON) — supports both xray-core and sing-box formats
 - Global hotkey bindings
 - Config backup/restore (WebDAV)
+- ✅ ProfileCore dedup — normalized schema (profile_cores + group_profiles) eliminates redundant storage for shared configs
 - ✅ Version update check — GitHub releases API, download, install with .bak rollback, Updates settings form with per-core status
 - JSON config import/export (auto-detect format)
+- ✅ Batch import — bulk import multiple share URLs at once via AppMode::BatchImport with scrollable results list
 - QR code display for share URLs
 - Clash API compatible UI tab (proxies view, connections view) — via sing-box experimental.clash_api
 

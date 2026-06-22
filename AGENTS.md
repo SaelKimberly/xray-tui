@@ -26,7 +26,7 @@ cargo run
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
-- `crates/xray-tui-db/src/models.rs` — Profile (compute_sub_uid), Group, Subscription, GRAVEYARD_GROUP_ID
+- `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
 - `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping, speed test, UDP test, batch ping) using tokio + reqwest SOCKS5 proxy
 
 ### TUI screens (crates/xray-tui/src/ui/)
@@ -35,7 +35,7 @@ cargo run
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics), routing rules list+form, reorder. Full rewrite Phase 6.
 - `status_bar.rs` — bottom connection indicator + key hints
-- `groups.rs` — subscription group list overlay, add/edit form
+- `groups.rs` — group management overlay with list/add/edit/clear/delete, system group handling
 - `statistics.rs` — live traffic and system stats display
 - `theme.rs` — central color palette and Style definitions (Theme struct)
 
@@ -97,6 +97,13 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 3. `subscription_upsert_profiles()` in `crates/xray-tui-db/src/lib.rs` handles content-based dedup via `ON CONFLICT(group_id, sub_uid)`
 4. `move_orphans_to_graveyard()` / `purge_graveyard()` handle stale profile cleanup
 5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
+
+### Adding batch import for share URLs
+1. Parse each URL with `parse_share_url()` from `xray_tui_config::import_export`
+2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }` 
+3. Render scrollable success/failure list in `profiles.rs` (`render_batch_import()`)
+4. Batch import mode handles keys: Up/Down scroll, Enter saves all successful imports via `db.add_profile()`, Esc cancels
+5. Reference `crates/xray-tui/src/lib.rs` `start_batch_import()` method for the pattern
 6. Refer to `groups.rs` for group management overlay UI patterns (matching `add_server.rs` form conventions)
 
 ### Adding a new speed test type
@@ -153,6 +160,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Use `rapidhash` for content-based profile deduplication (compute_sub_uid)
 - Use `base64-simd` for SIMD-accelerated base64 decode/encode
 - Use `urlencoding` for percent-decoding
+- Use `uuid` for system group IDs (`ALL_GROUP_ID`)
 
 ## Verification
 
