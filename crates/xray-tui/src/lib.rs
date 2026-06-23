@@ -186,6 +186,7 @@ pub enum CoreEvent {
         group_id: String,
         count: usize,
         error: Option<String>,
+        warnings: Vec<String>,
     },
     /// Result from a speed test operation
     SpeedTestResult {
@@ -1338,7 +1339,7 @@ impl AppState {
                 let provider = match grpc_client::create_stats_provider(CoreType::Xray).await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        let _ = tx.send(CoreEvent::Error(format!("Stats API unavailable: {e}")));
+                        let _ = tx.send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
                         None
                     }
                 };
@@ -1371,7 +1372,7 @@ impl AppState {
                                         });
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(CoreEvent::Error(format!("Stats query failed: {e}")));
+                                    let _ = tx.send(CoreEvent::StatsError(format!("Stats query failed: {e}")));
                                     }
                                 }
                                 // sys stats every 3rd tick (~9s)
@@ -1381,7 +1382,7 @@ impl AppState {
                                     match provider.get_sys_stats().await {
                                         Ok(sys) => { let _ = tx.send(CoreEvent::SysStatsUpdate(sys)); }
                                         Err(e) => {
-                                            let _ = tx.send(CoreEvent::Error(
+                                            let _ = tx.send(CoreEvent::StatsError(
                                                 format!("Sys stats query failed: {e}"),
                                             ));
                                         }
@@ -1776,6 +1777,7 @@ impl AppState {
                     total_up,
                     total_down,
                 } => {
+                    self.connection_error = None;
                     let stats = ServerStat {
                         profile_id: profile_id.clone(),
                         today_up: Some(today_up as i32),
@@ -1816,8 +1818,12 @@ impl AppState {
                     group_id,
                     count,
                     error,
+                    warnings,
                 } => {
                     self.updating_groups.remove(&group_id);
+                    for w in &warnings {
+                        self.add_log("warn", w, "subscription");
+                    }
                     if let Some(err) = error {
                         self.log_trace("error", "subscription", &format!("Subscription update failed: {err}"));
                     } else {
@@ -2155,7 +2161,8 @@ impl AppState {
                 let _ = tx.send(CoreEvent::SubscriptionsUpdated {
                     group_id: result.0,
                     count: result.1,
-                    error: result.2,
+                    warnings: result.2,
+                    error: result.3,
                 });
             }
         });
@@ -2166,32 +2173,32 @@ impl AppState {
         user_agent: String,
         group_id: String,
         db_path: std::path::PathBuf,
-        validation: ValidationSettings,
-    ) -> (String, usize, Option<String>) {
+        validation: xray_tui_config::import_export::ValidationSettings,
+    ) -> (String, usize, Vec<String>, Option<String>) {
         let client = match reqwest::Client::builder()
             .user_agent(&user_agent)
             .timeout(std::time::Duration::from_secs(30))
             .build()
         {
             Ok(c) => c,
-            Err(e) => return (group_id, 0, Some(e.to_string())),
+            Err(e) => return (group_id, 0, Vec::new(), Some(e.to_string())),
         };
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
-            Err(e) => return (group_id, 0, Some(format!("HTTP: {e}"))),
+            Err(e) => return (group_id, 0, Vec::new(), Some(format!("HTTP: {e}"))),
         };
         let bytes = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => return (group_id, 0, Some(format!("Body: {e}"))),
+            Err(e) => return (group_id, 0, Vec::new(), Some(format!("Body: {e}"))),
         };
-        let profiles = match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
-            Ok(p) => p,
-            Err(e) => return (group_id, 0, Some(e)),
+        let (profiles, warnings) = match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
+            Ok((p, w)) => (p, w),
+            Err(e) => return (group_id, 0, Vec::new(), Some(e)),
         };
 
         let db = match Database::open(&db_path) {
             Ok(d) => d,
-            Err(e) => return (group_id, 0, Some(format!("DB: {e}"))),
+            Err(e) => return (group_id, 0, Vec::new(), Some(format!("DB: {e}"))),
         };
 
         let now = format_now();
@@ -2213,7 +2220,7 @@ impl AppState {
             .collect();
 
         if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched) {
-            return (group_id, 0, Some(format!("DB upsert: {e}")));
+            return (group_id, 0, Vec::new(), Some(format!("DB upsert: {e}")));
         }
 
         let _ = db.move_orphans_to_graveyard(&group_id, &sub_uids, GRAVEYARD_GROUP_ID);
@@ -2232,7 +2239,7 @@ impl AppState {
         };
         let _ = db.upsert_subscription(&sub);
 
-        (group_id, enriched.len(), None)
+        (group_id, enriched.len(), warnings, None)
     }
 
     pub fn update_all_subscriptions(&mut self) {
@@ -2382,7 +2389,8 @@ impl AppState {
                     let _ = tx.send(CoreEvent::SubscriptionsUpdated {
                         group_id: result.0,
                         count: result.1,
-                        error: result.2,
+                        warnings: result.2,
+                        error: result.3,
                     });
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;

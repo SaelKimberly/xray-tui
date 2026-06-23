@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 
 pub(crate) mod proto_gen {
-    tonic::include_proto!("experimental.v2rayapi");
+    tonic::include_proto!("v2ray.core.app.stats.command");
 }
 
 use proto_gen as proto;

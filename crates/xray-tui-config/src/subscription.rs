@@ -366,19 +366,16 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Result of parsing subscription data, including any validation errors.
-pub struct SubscriptionParseResult {
-    pub profiles: Vec<Profile>,
-    pub unparseable_count: usize,
-    pub validation_errors: Vec<String>,
-}
 
 /// Parse base64-encoded subscription data into a list of Profiles.
+///
+/// Returns `(profiles, warnings)` on success, where `warnings` is a list of
+/// validation non-fatal error messages for URLs that could not be parsed.
 ///
 /// # Errors
 ///
 /// Returns an error if the data cannot be decoded.
-pub fn parse_subscription_data(data: &[u8], settings: &ValidationSettings) -> Result<Vec<Profile>, String> {
+pub fn parse_subscription_data(data: &[u8], settings: &ValidationSettings) -> Result<(Vec<Profile>, Vec<String>), String> {
     let mut decoder = StreamingDecoder::new();
     let mut all_urls = Vec::new();
 
@@ -394,19 +391,20 @@ pub fn parse_subscription_data(data: &[u8], settings: &ValidationSettings) -> Re
 
     // Parse each URL into a Profile
     let mut profiles = Vec::new();
+    let mut warnings = Vec::new();
     for url in &all_urls {
         match parse_share_url(url, settings) {
             Ok(profile) => profiles.push(profile),
             Err(e) => {
-                // Log validation errors but don't fail the whole subscription
+                // Collect validation warnings but don't fail the whole subscription
                 if matches!(e, crate::import_export::ImportError::Validation(_)) {
-                    tracing::warn!("Subscription URL validation failed: {e}");
+                    warnings.push(format!("Subscription URL validation failed: {e}"));
                 }
             }
         }
     }
 
-    Ok(profiles)
+    Ok((profiles, warnings))
 }
 
 #[cfg(test)]
@@ -454,10 +452,10 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[test]
     fn test_parse_subscription_data_empty() {
         let settings = crate::import_export::ValidationSettings::default();
-        let result = parse_subscription_data(b"", &settings).unwrap();
-        assert!(result.is_empty());
+        let (profiles, warnings) = parse_subscription_data(b"", &settings).unwrap();
+        assert!(profiles.is_empty());
+        assert!(warnings.is_empty());
     }
 }

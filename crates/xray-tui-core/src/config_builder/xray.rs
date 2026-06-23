@@ -367,47 +367,52 @@ fn build_block_outbound() -> Outbound {
 // ── Routing ──────────────────────────────────────────────────────────
 
 fn build_routing(rules: &[RoutingRule]) -> RoutingConfig {
-    let json_rules: Vec<Value> = rules
-        .iter()
-        .filter_map(|r| {
-            let mut rule = json!({ "type": "field" });
-            if let Some(domains) = &r.domains {
-                rule["domain"] = json!(parse_comma_list(domains));
-            }
-            if let Some(ips) = &r.ips {
-                rule["ip"] = json!(parse_comma_list(ips));
-            }
-            if let Some(inbound_tags) = &r.inbound_tags {
-                rule["inboundTag"] = json!(parse_comma_list(inbound_tags));
-            }
-            if let Some(port) = &r.port {
-                rule["port"] = json!(port);
-            }
-            if let Some(source_ports) = &r.source_ports {
-                rule["sourcePort"] = json!(source_ports);
-            }
-            if let Some(network) = &r.network {
-                rule["network"] = json!(network);
-            }
-            // outboundTag or balancerTag
-            if let Some(tag) = &r.outbound_tag {
-                rule["outboundTag"] = json!(tag);
-            } else if let Some(tag) = &r.balancer_tag {
-                rule["balancerTag"] = json!(tag);
-            } else {
-                // Skip rules without a target outbound
-                return None;
-            }
-            Some(rule)
-        })
-        .collect();
-
+    // Mandatory: route API inbound traffic to the internal API handler.
+    // Without this rule, xray-core tunnels gRPC connections through the proxy outbound.
+    let api_rule = json!({
+        "type": "field",
+        "inboundTag": ["api"],
+        "outboundTag": "api"
+    });
+    let mut json_rules: Vec<Value> = vec![api_rule];
+    json_rules.extend(rules.iter().filter_map(|r| {
+        let mut rule = json!({ "type": "field" });
+        if let Some(domains) = &r.domains {
+            rule["domain"] = json!(parse_comma_list(domains));
+        }
+        if let Some(ips) = &r.ips {
+            rule["ip"] = json!(parse_comma_list(ips));
+        }
+        if let Some(inbound_tags) = &r.inbound_tags {
+            rule["inboundTag"] = json!(parse_comma_list(inbound_tags));
+        }
+        if let Some(port) = &r.port {
+            rule["port"] = json!(port);
+        }
+        if let Some(source_ports) = &r.source_ports {
+            rule["sourcePort"] = json!(source_ports);
+        }
+        if let Some(network) = &r.network {
+            rule["network"] = json!(network);
+        }
+        // outboundTag or balancerTag
+        if let Some(tag) = &r.outbound_tag {
+            rule["outboundTag"] = json!(tag);
+        } else if let Some(tag) = &r.balancer_tag {
+            rule["balancerTag"] = json!(tag);
+        } else {
+            // Skip rules without a target outbound
+            return None;
+        }
+        Some(rule)
+    }));
     RoutingConfig {
         domain_strategy: "AsIs".to_string(),
         rules: json_rules,
         balancers: vec![],
     }
 }
+
 
 // ── DNS ──────────────────────────────────────────────────────────────
 
@@ -674,10 +679,14 @@ mod tests {
         let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let routing_rules = json["routing"]["rules"].as_array().unwrap();
-        assert_eq!(routing_rules.len(), 1);
-        assert_eq!(routing_rules[0]["domain"][0], "example.com");
-        assert_eq!(routing_rules[0]["network"], "tcp");
-        assert_eq!(routing_rules[0]["outboundTag"], "direct");
+        // First rule is the mandatory API routing rule
+        assert_eq!(routing_rules.len(), 2);
+        assert_eq!(routing_rules[0]["inboundTag"][0], "api");
+        assert_eq!(routing_rules[0]["outboundTag"], "api");
+        // Second rule is the user-defined domain rule
+        assert_eq!(routing_rules[1]["domain"][0], "example.com");
+        assert_eq!(routing_rules[1]["network"], "tcp");
+        assert_eq!(routing_rules[1]["outboundTag"], "direct");
     }
 
     #[test]

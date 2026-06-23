@@ -70,15 +70,17 @@ pub enum CoreEvent {
     Connected(CoreType),
     Disconnected,
     Error(String),
+    StatsError(String),
     ClearGroup(String),
     StatsUpdate {
         profile_id: String,
+        today_up: i64,
         today_down: i64,
         total_up: i64,
         total_down: i64,
     },
     SysStatsUpdate(SysStats),
-    SubscriptionsUpdated { group_id, count, error },
+    SubscriptionsUpdated { group_id, count, error, warnings },
     SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, error },
     UpdateCheckResult { core_type, current_version, latest_version, error },
     UpdateCompleted { core_type, old_version, new_version, success, error },
@@ -87,7 +89,6 @@ pub enum CoreEvent {
         level: String,
         message: String,
     },
-    },
     /// A log line from the TUI internals forwarded through tracing subscriber.
     TuiLog {
         target: String,
@@ -95,6 +96,7 @@ pub enum CoreEvent {
         message: String,
     },
 }
+```
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
 The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
