@@ -12,6 +12,7 @@ use crate::ui::theme::Theme;
 
 const MENU_ITEMS: &[(&str, &str)] = &[
     ("Core Settings", "binary paths, log level, default core type"),
+    ("Protocol Core", "per-protocol core type override"),
     ("GUI Settings", "language, theme, refresh interval"),
     ("Inbound Settings", "ports, listen address, sniffing"),
     ("Routing Rules", "add/edit/delete/reorder rules"),
@@ -39,7 +40,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             | SettingsMode::TunForm { .. }
             | SettingsMode::MuxForm { .. }
             | SettingsMode::StatsForm { .. }
-            | SettingsMode::DnsForm { .. } => render_form(frame, area, state),
+            | SettingsMode::DnsForm { .. }
+            | SettingsMode::ProtocolCoreForm { .. } => render_form(frame, area, state),
             SettingsMode::RoutingList { .. } => render_routing_list(frame, area, state),
             SettingsMode::RoutingForm { .. } => render_routing_form(frame, area, state),
             SettingsMode::UpdateForm { .. } => render_update_form(frame, area, state),
@@ -61,7 +63,8 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::TunForm { .. }
         | SettingsMode::MuxForm { .. }
         | SettingsMode::StatsForm { .. }
-        | SettingsMode::DnsForm { .. } => handle_form_key(state, key),
+        | SettingsMode::DnsForm { .. }
+        | SettingsMode::ProtocolCoreForm { .. } => handle_form_key(state, key),
         SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key),
         SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key),
         SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key),
@@ -188,11 +191,36 @@ fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
         SettingsMode::TunForm { .. } => " TUN Mode ",
         SettingsMode::MuxForm { .. } => " Mux / Fragment ",
         SettingsMode::StatsForm { .. } => " Statistics ",
+        SettingsMode::ProtocolCoreForm { .. } => " Protocol Core ",
         SettingsMode::UpdateForm { .. } => " Backend Updates ",
         _ => " Settings ",
     }
 }
 
+pub static PROTOCOL_CORE_DEFS: &[(&str, &str, &str)] = &[
+    ("vmess", "VMess", "Select:Auto,Xray,SingBox"),
+    ("vless", "VLESS", "Select:Auto,Xray,SingBox"),
+    ("ss", "Shadowsocks", "Select:Auto,Xray,SingBox"),
+    ("shadowsocks-2022", "SS-2022", "Select:Auto,Xray,SingBox"),
+    ("socks", "SOCKS", "Select:Auto,Xray,SingBox"),
+    ("http", "HTTP", "Select:Auto,Xray,SingBox"),
+    ("trojan", "Trojan", "Select:Auto,Xray,SingBox"),
+    ("wire-guard", "WireGuard", "Select:Auto,Xray,SingBox"),
+    ("hy2", "Hysteria2", "Select:Auto,Xray,SingBox"),
+    ("hy", "Hysteria", "Select:Auto,Xray,SingBox"),
+    ("tuic", "TUIC", "Select:Auto,Xray,SingBox"),
+    ("naive", "Naïve", "Select:Auto,Xray,SingBox"),
+    ("any-tls", "AnyTLS", "Select:Auto,Xray,SingBox"),
+    ("shadow-tls", "ShadowTLS", "Select:Auto,Xray,SingBox"),
+    ("tor", "Tor", "Select:Auto,Xray,SingBox"),
+    ("ssh", "SSH", "Select:Auto,Xray,SingBox"),
+    ("ssr", "ShadowsocksR", "Select:Auto,Xray,SingBox"),
+    ("redirect", "Redirect", "Select:Auto,Xray,SingBox"),
+    ("dokodemo-door", "Dokodemo-door", "Select:Auto,Xray,SingBox"),
+    ("t-proxy", "TProxy", "Select:Auto,Xray,SingBox"),
+    ("mixed", "Mixed", "Select:Auto,Xray,SingBox"),
+    ("tailscale", "Tailscale", "Select:Auto,Xray,SingBox"),
+];
 fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str, &'static str)] {
     // &[(key, label, field_type)]
     // field_type: "Text", "Number", "Boolean", "Select" (comma-separated)
@@ -242,7 +270,7 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
             ("fragment_length", "Fragment Length", "Text"),
             ("fragment_interval", "Fragment Interval", "Text"),
         ],
-        SettingsMode::StatsForm { .. } => &[("enabled", "Enabled", "Boolean")],
+        SettingsMode::ProtocolCoreForm { .. } => PROTOCOL_CORE_DEFS,
         _ => &[],
     }
 }
@@ -260,7 +288,8 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
         | SettingsMode::SystemProxyForm { fields, focus_index }
         | SettingsMode::TunForm { fields, focus_index }
         | SettingsMode::MuxForm { fields, focus_index }
-        | SettingsMode::StatsForm { fields, focus_index } => (fields, *focus_index),
+        | SettingsMode::StatsForm { fields, focus_index }
+        | SettingsMode::ProtocolCoreForm { fields, focus_index } => (fields, *focus_index),
         _ => return,
     };
 
@@ -343,6 +372,7 @@ fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
         SettingsMode::TunForm { .. } => Some(SettingsSection::Tun),
         SettingsMode::MuxForm { .. } => Some(SettingsSection::Mux),
         SettingsMode::UpdateForm { .. } => Some(SettingsSection::Updates),
+        SettingsMode::ProtocolCoreForm { .. } => Some(SettingsSection::ProtocolCore),
         SettingsMode::StatsForm { .. } => Some(SettingsSection::Stats),
         _ => None,
     }
@@ -377,7 +407,8 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 | SettingsMode::SystemProxyForm { fields, focus_index }
                 | SettingsMode::TunForm { fields, focus_index }
                 | SettingsMode::MuxForm { fields, focus_index }
-                | SettingsMode::StatsForm { fields, focus_index },
+                | SettingsMode::StatsForm { fields, focus_index }
+                | SettingsMode::ProtocolCoreForm { fields, focus_index },
         } => (fields, focus_index),
         _ => return,
     };

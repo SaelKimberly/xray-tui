@@ -83,6 +83,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             crate::SettingsMode::DnsForm { .. } => " Settings > DNS",
             crate::SettingsMode::RoutingList { .. } => " Settings > Routing",
             crate::SettingsMode::UpdateForm { .. } => " Settings > Updates",
+            crate::SettingsMode::ProtocolCoreForm { .. } => " Settings > Protocol Core",
             crate::SettingsMode::RoutingForm { .. } => " Settings > Routing",
         },
         crate::AppMode::AddServer { .. } => " Add Server",
@@ -142,7 +143,7 @@ fn build_hints(state: &AppState) -> &'static str {
                     } else if state.connecting {
                         " [Tab] Next  [?] Help  [Ctrl+Q] Quit "
                     } else {
-                        " [Ctrl+Enter] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                        " [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
                     }
                 }
                 crate::Tab::Settings => {

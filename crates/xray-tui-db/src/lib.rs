@@ -507,6 +507,9 @@ impl Database {
         self.conn.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", [id])?;
         self.conn.execute("DELETE FROM server_stats WHERE profile_id = ?1", [id])?;
         self.conn.execute("DELETE FROM group_profiles WHERE id = ?1", [id])?;
+        // Also delete the ALL-group mirror entry if it exists
+        let mirror_id = format!("{id}-all");
+        self.conn.execute("DELETE FROM group_profiles WHERE id = ?1", [&mirror_id])?;
         if let Some(su) = sub_uid {
             let remaining: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM group_profiles WHERE sub_uid = ?1", [su], |row| row.get(0),

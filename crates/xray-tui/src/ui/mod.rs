@@ -364,6 +364,12 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::End if state.current_tab == Tab::Logs => {
             state.log_scroll = 0;
         }
+        KeyCode::Char('c') if state.current_tab == Tab::Logs => {
+            state.logs_show_core = !state.logs_show_core;
+        }
+        KeyCode::Char('t') if state.current_tab == Tab::Logs => {
+            state.logs_show_tui = !state.logs_show_tui;
+        }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
@@ -377,6 +383,14 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.move_profile_down();
         }
         KeyCode::Enter
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
+            if let Some(id) = state.selected_profile_id() {
+                state.connect_to_profile(&id);
+            }
+        }
+        KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
@@ -440,6 +454,12 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
             state.mode = AppMode::ManageGroups { selected: 0 };
         }
+        KeyCode::Char('[') if state.current_tab == Tab::Profiles => {
+            state.cycle_group(-1);
+        }
+        KeyCode::Char(']') if state.current_tab == Tab::Profiles => {
+            state.cycle_group(1);
+        }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
                 let ids: Vec<String> = state.multi_select.iter().cloned().collect();
@@ -500,7 +520,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile)
             {
                 state.clipboard = Some(url);
-                state.add_log("info", "Share URL copied to clipboard");
+                state.add_log("info", "Share URL copied to clipboard", "tui");
             }
         }
         KeyCode::Esc => {
@@ -535,7 +555,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),      // 0: tabs
-            Constraint::Min(0),         // 1: content
+            Constraint::Min(3),         // 1: content
             Constraint::Length(ph),     // 2: actions panel
             Constraint::Length(1),      // 3: status bar
         ])
@@ -632,12 +652,14 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("↑↓ / PgUp PgDn", "Navigate profiles"),
                     ("Enter", "Set as active server"),
                     ("Ctrl+Enter", "Connect to selected server"),
+                    ("Ctrl+G", "Connect to selected server"),
                     ("Space", "Toggle multi-select"),
                     ("a", "Add new server"),
                     ("e", "Edit selected server"),
                     ("d", "Delete selected server(s)"),
                     ("c", "Clone selected server"),
                     ("g", "Manage subscription groups"),
+                    ("[ / ]", "Cycle groups"),
                     ("t", "Open speed test menu"),
                     ("o", "Cycle sort column"),
                     ("/", "Search/filter"),
@@ -655,15 +677,17 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],
-                Tab::Statistics => vec![
-                    ("Tab / Shift+Tab", "Cycle tabs"),
-                    ("?", "Toggle this help"),
-                    ("q / Ctrl+C", "Quit"),
-                ],
                 Tab::Logs => vec![
                     ("↑↓", "Scroll logs"),
                     ("PgUp / PgDn", "Page up/down"),
                     ("Home / End", "Jump to oldest/newest"),
+                    ("c", "Toggle core logs"),
+                    ("t", "Toggle TUI logs"),
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                Tab::Statistics => vec![
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),

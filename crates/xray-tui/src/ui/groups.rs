@@ -86,9 +86,10 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     });
     let rows: Vec<Line> = sorted_groups
         .iter()
-        .map(|(orig_idx, g)| {
+        .enumerate()
+        .map(|(visual_pos, (_, g))| {
             let is_system = g.is_system.unwrap_or(0) == 1;
-            let is_selected = *orig_idx == selected;
+            let is_selected = visual_pos == selected;
             let name = g.name.as_deref().unwrap_or("unnamed");
             let url = g.subscription_url.as_deref().unwrap_or("-");
             let enabled = if g.subscription_enabled.unwrap_or(0) == 1 {
@@ -130,7 +131,6 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             )])
         })
         .collect();
-
     let scroll_offset = selected.saturating_sub(list_area.height as usize - 1);
     for (i, row) in rows.iter().enumerate().skip(scroll_offset).take(list_area.height as usize) {
         frame.render_widget(
@@ -141,7 +141,7 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Footer
     let footer = Paragraph::new(Line::from(Span::styled(
-        " [a] Add  [e] Edit  [d] Delete  [u] Update  [Shift+U] Update All  [Enter] Filter  [Esc] Close ",
+        " [a] Add  [e] Edit  [d] Delete  [c] Clear  [u] Update  [Shift+U] Update All  [Enter] Filter  [Esc] Close ",
         Theme::HINT,
     )));
     frame.render_widget(footer, chunks[1]);
@@ -259,9 +259,11 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     state.mode = AppMode::ManageGroups { selected: sel };
                 }
                 KeyCode::Char('e' | 'E') => {
-                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
+                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
+                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
                     if !is_system {
-                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
                             state.start_edit_group(&id);
                         }
@@ -271,27 +273,33 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     state.start_add_group();
                 }
                 KeyCode::Char('d' | 'D') => {
-                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
+                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
+                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
                     if !is_system {
-                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
                             state.confirmation = Some(ConfirmAction::DeleteGroup(id));
                         }
                     }
                 }
                 KeyCode::Char('c' | 'C') => {
-                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
+                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
+                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
                     if !is_system {
-                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
                             state.confirmation = Some(ConfirmAction::ClearGroup(id));
                         }
                     }
                 }
                 KeyCode::Char('u') => {
-                    let is_system = state.groups.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
+                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
+                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
                     if !is_system {
-                        let gid = state.groups.get(sel).map(|g| g.id.clone());
+                        let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
                             state.update_group_subscriptions(&id);
                         }
@@ -301,7 +309,10 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     state.update_all_subscriptions();
                 }
                 KeyCode::Enter => {
-                    if let Some(g) = state.groups.get(sel) {
+                    // Build sorted list matching render order
+                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
+                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
+                    if let Some(g) = sorted.get(sel) {
                         state.selected_group_id = Some(g.id.clone());
                         state.filter_cache_valid.set(false);
                     }

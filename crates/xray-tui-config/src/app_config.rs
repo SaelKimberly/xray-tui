@@ -31,6 +31,8 @@ pub struct CoreConfig {
     pub core_type: Option<CoreType>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default)]
+    pub protocol_core_overrides: std::collections::HashMap<String, String>,
 }
 
 impl Default for CoreConfig {
@@ -40,6 +42,7 @@ impl Default for CoreConfig {
             sing_box_path: None,
             core_type: None,
             log_level: default_log_level(),
+            protocol_core_overrides: std::collections::HashMap::new(),
         }
     }
 }

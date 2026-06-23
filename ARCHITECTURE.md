@@ -22,7 +22,7 @@ pub enum Tab { Profiles, Settings, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
 pub enum AppMode { List, Help, Settings{..}, AddServer{..}, EditServer{..}, ImportUrl{..}, BatchImport{results: Vec<BatchImportItem>, scroll: usize}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
 pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
-pub struct LogLine { level: String, message: String }
+pub struct LogLine { level: String, message: String, source: String }
 
 pub struct AppState {
     pub db: Database,
@@ -41,6 +41,8 @@ pub struct AppState {
     pub test_progress: Option<(usize, usize)>,
     pub search_focused: bool,
     pub log_buffer: Vec<LogLine>,
+    pub logs_show_core: bool,
+    pub logs_show_tui: bool,
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub connection_error: Option<String>,
@@ -100,7 +102,7 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `import_url()` / `start_batch_import()` — parse share URL(s) and add profile(s)
 - `filtered_profiles()` — group filter + search filter + sort by column
 - `reload_profiles()` / `reload_groups()` — DB reload
-- `add_log()` — capped circular log buffer (1000 entries)
+- `add_log()` — capped circular log buffer (1000 entries), takes level, message, and source
 - `start_add_server()` / `start_edit_profile()` — enter form mode
 - `confirm_add_server()` / `confirm_edit_server()` / `cancel_form()` — form lifecycle
 - `delete_profile()` / `clone_profile()` — CRUD operations
@@ -108,15 +110,16 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `set_active()` — set default server
 - `import_url()` — parse share URL and add profile
 - `connect_to_profile(&mut self, profile_id: &str)` — spawn async CoreManager task, send CoreEvents
+- `cycle_group(dir: i8)` — cycle to next/previous group, skipping graveyard
+- `resolved_core(row: &ProfileRow) -> CoreType` — 3-level core resolution: profile override → config per-protocol override → auto-detect
 - `disconnect(&mut self)` — send stop signal via disconnect_tx oneshot
 - `poll_core_events(&mut self)` — drain core event channel each frame, update state
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
-:- `mod.rs` — Main event loop, tab rendering, keyboard handler, AppMode dispatch, help overlay (context-sensitive keybinding reference), placeholder renderer
-- `settings.rs` — Full settings panel (Phase 6). Menu listing 10 config sections: Core, GUI, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
+:- `settings.rs` — Full settings panel (Phase 6). Menu listing 11 config sections: Core, GUI, Protocol Core, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
-- `logs.rs` — Log viewer
+:- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs)
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 ...
 - `theme.rs` — Central color palette and Style definitions (Theme struct with 19 constants across 6 groups)

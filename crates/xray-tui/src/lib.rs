@@ -1,4 +1,5 @@
 pub mod ui;
+use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,7 @@ pub struct ProfileRow {
 pub struct LogLine {
     pub level: String,
     pub message: String,
+    pub source: String,
 }
 
 /// Sub-modes for the Settings panel.
@@ -67,6 +69,7 @@ pub enum SettingsMode {
     MuxForm { fields: Vec<(String, String)>, focus_index: usize },
     StatsForm { fields: Vec<(String, String)>, focus_index: usize },
     UpdateForm { status_xray: BackendUpdateStatus, status_singbox: BackendUpdateStatus },
+    ProtocolCoreForm { fields: Vec<(String, String)>, focus_index: usize },
 }
 
 /// Identifies which section of the Settings panel is being edited.
@@ -81,6 +84,7 @@ pub enum SettingsSection {
     Tun,
     Mux,
     Stats,
+    ProtocolCore,
     Updates,
 }
 /// Tracks what the UI is currently showing.
@@ -239,6 +243,8 @@ pub struct AppState {
     pub selected_index: usize,
     /// Scroll offset from the bottom of the log buffer (0 = newest visible).
     pub log_scroll: usize,
+    pub logs_show_core: bool,
+    pub logs_show_tui: bool,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub search_query: String,
@@ -305,6 +311,8 @@ impl AppState {
             search_focused: false,
             log_buffer: Vec::new(),
             log_scroll: 0,
+            logs_show_core: true,
+            logs_show_tui: true,
             connected_core: None,
             connecting: false,
             connection_error: None,
@@ -353,7 +361,7 @@ impl AppState {
                     .collect();
             }
             Err(e) => {
-                self.add_log("error", &format!("Failed to load profiles: {e}"));
+                self.add_log("error", &format!("Failed to load profiles: {e}"), "tui");
                 self.profiles.clear();
             }
         }
@@ -364,7 +372,7 @@ impl AppState {
         match self.db.get_all_groups() {
             Ok(groups) => self.groups = groups,
             Err(e) => {
-                self.add_log("error", &format!("Failed to load groups: {e}"));
+                self.add_log("error", &format!("Failed to load groups: {e}"), "tui");
                 self.groups.clear();
             }
         }
@@ -486,10 +494,39 @@ impl AppState {
         self.cached_filtered_indices.borrow().len()
     }
 
-    pub fn add_log(&mut self, level: &str, message: &str) {
+    pub fn cycle_group(&mut self, dir: i8) {
+        if self.groups.is_empty() {
+            return;
+        }
+        let current_idx = self.selected_group_id.as_ref().and_then(|id| {
+            self.groups.iter().position(|g| g.id == *id)
+        });
+        let len = self.groups.len();
+        let skip_graveyard = |idx: usize| -> bool {
+            self.groups.get(idx).map(|g| g.id == *GRAVEYARD_GROUP_ID).unwrap_or(false)
+        };
+        let new_idx = if let Some(idx) = current_idx {
+            let mut next = (idx as isize + dir as isize).rem_euclid(len as isize) as usize;
+            // Skip past graveyard
+            for _ in 0..len {
+                if !skip_graveyard(next) {
+                    break;
+                }
+                next = (next as isize + dir as isize).rem_euclid(len as isize) as usize;
+            }
+            next
+        } else {
+            // No group selected → start at first non-graveyard group
+            self.groups.iter().position(|g| g.id != *GRAVEYARD_GROUP_ID).unwrap_or(0)
+        };
+        self.selected_group_id = Some(self.groups[new_idx].id.clone());
+        self.filter_cache_valid.set(false);
+    }
+    pub fn add_log(&mut self, level: &str, message: &str, source: &str) {
         self.log_buffer.push(LogLine {
             level: level.to_owned(),
             message: message.to_owned(),
+            source: source.to_owned(),
         });
         if self.log_buffer.len() > 1000 {
             self.log_buffer.remove(0);
@@ -503,7 +540,20 @@ impl AppState {
             "warn" | "warning" => tracing::warn!(target: "tui", "{message}"),
             _ => tracing::info!(target: "tui", "{message}"),
         }
-        self.add_log(level, message);
+        self.add_log(level, message, "tui");
+    }
+
+    /// Resolve which core a profile row should use, considering (in order):
+    /// 1. Per-profile override (row.profile.core_type)
+    /// 2. Per-protocol config override (config.core.protocol_core_overrides)
+    /// 3. Hardcoded auto-detection (core_for_protocol via resolve_core)
+    pub fn resolved_core(&self, row: &ProfileRow) -> CoreType {
+        let protocol = Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
+        let profile_override = row.profile.core_type.parse::<CoreType>().ok();
+        let config_override = self.config.core.protocol_core_overrides
+            .get(&protocol.to_string())
+            .and_then(|s| s.parse::<CoreType>().ok());
+        resolve_core(protocol, config_override.or(profile_override))
     }
     // ── CRUD operations ──────────────────────────────────────────────────
 
@@ -526,8 +576,8 @@ impl AppState {
                     focus_index: 0,
                 };
             }
-            Ok(None) => self.add_log("error", &format!("Profile {id} not found")),
-            Err(e) => self.add_log("error", &format!("Failed to load profile: {e}")),
+            Ok(None) => self.add_log("error", &format!("Profile {id} not found"), "tui"),
+            Err(e) => self.add_log("error", &format!("Failed to load profile: {e}"), "tui"),
         }
     }
 
@@ -668,7 +718,7 @@ impl AppState {
         let mut profile = match self.db.get_profile(&profile_id) {
             Ok(Some(p)) => p,
             _ => {
-                self.add_log("error", "Profile not found for edit");
+                self.add_log("error", "Profile not found for edit", "tui");
                 return;
             }
         };
@@ -689,10 +739,10 @@ impl AppState {
         profile.updated_at = Some(format_now());
 
         if let Err(e) = self.db.update_profile(&profile) {
-            self.add_log("error", &format!("Failed to update server: {e}"));
+            self.add_log("error", &format!("Failed to update server: {e}"), "tui");
             return;
         }
-        self.add_log("info", "Server updated");
+        self.add_log("info", "Server updated", "tui");
         self.mode = AppMode::List;
         self.reload_profiles();
     }
@@ -790,6 +840,15 @@ impl AppState {
             Routing => {
                 vec![]
             }
+            ProtocolCore => {
+                PROTOCOL_CORE_DEFS.iter().map(|(key, _label, _)| {
+                    let val = self.config.core.protocol_core_overrides
+                        .get(*key)
+                        .cloned()
+                        .unwrap_or_else(|| "Auto".to_string());
+                    (key.to_string(), val)
+                }).collect()
+            }
             Updates => {
                 vec![]
             }
@@ -864,6 +923,15 @@ impl AppState {
             Stats => {
                 self.config.statistics.enabled = get("enabled") == "true";
             }
+            ProtocolCore => {
+                for (key, val) in fields {
+                    if val == "Auto" {
+                        self.config.core.protocol_core_overrides.remove(key.as_str());
+                    } else {
+                        self.config.core.protocol_core_overrides.insert(key.clone(), val.clone());
+                    }
+                }
+            }
             // Dns and Routing are handled separately (DB-backed)
             Dns | Routing | Updates => {}
         }
@@ -881,6 +949,7 @@ impl AppState {
             SettingsSection::Tun => SettingsMode::TunForm { fields, focus_index: 0 },
             SettingsSection::Mux => SettingsMode::MuxForm { fields, focus_index: 0 },
             SettingsSection::Stats => SettingsMode::StatsForm { fields, focus_index: 0 },
+            SettingsSection::ProtocolCore => SettingsMode::ProtocolCoreForm { fields, focus_index: 0 },
             SettingsSection::Updates => {
                 let status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
                 let status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
@@ -893,9 +962,9 @@ impl AppState {
     pub fn save_settings_form(&mut self, section: SettingsSection, fields: &[(String, String)]) {
         self.apply_settings_fields(section, fields);
         if let Err(e) = self.config.save() {
-            self.add_log("error", &format!("Failed to save config: {e}"));
+            self.add_log("error", &format!("Failed to save config: {e}"), "tui");
         } else {
-            self.add_log("info", "Settings saved");
+            self.add_log("info", "Settings saved", "tui");
         }
         self.enter_settings();
     }
@@ -939,8 +1008,8 @@ impl AppState {
             self.db.insert_routing_rule(&rule)
         };
         match result {
-            Ok(()) => self.add_log("info", "Routing rule saved"),
-            Err(e) => self.add_log("error", &format!("Failed to save routing rule: {e}")),
+            Ok(()) => self.add_log("info", "Routing rule saved", "tui"),
+            Err(e) => self.add_log("error", &format!("Failed to save routing rule: {e}"), "tui"),
         }
     }
 
@@ -975,17 +1044,17 @@ impl AppState {
             client_ip: get_opt("client_ip"),
         };
         match self.db.upsert_dns_settings(&dns) {
-            Ok(()) => self.add_log("info", "DNS settings saved"),
-            Err(e) => self.add_log("error", &format!("Failed to save DNS settings: {e}")),
+            Ok(()) => self.add_log("info", "DNS settings saved", "tui"),
+            Err(e) => self.add_log("error", &format!("Failed to save DNS settings: {e}"), "tui"),
         }
     }
 
     pub fn delete_profile(&mut self, id: &str) {
         if let Err(e) = self.db.delete_profile(id) {
-            self.add_log("error", &format!("Failed to delete profile: {e}"));
+            self.add_log("error", &format!("Failed to delete profile: {e}"), "tui");
             return;
         }
-        self.add_log("info", "Profile deleted");
+        self.add_log("info", "Profile deleted", "tui");
         self.confirmation = None;
         self.multi_select.remove(id);
         self.reload_profiles();
@@ -994,10 +1063,10 @@ impl AppState {
     pub fn clone_profile(&mut self, id: &str) {
         let new_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = self.db.clone_profile(id, &new_id) {
-            self.add_log("error", &format!("Failed to clone profile: {e}"));
+            self.add_log("error", &format!("Failed to clone profile: {e}"), "tui");
             return;
         }
-        self.add_log("info", "Profile cloned");
+        self.add_log("info", "Profile cloned", "tui");
         self.reload_profiles();
     }
 
@@ -1019,7 +1088,7 @@ impl AppState {
                     fields,
                     focus_index: 0,
                 };
-                self.add_log("info", "URL imported successfully");
+                self.add_log("info", "URL imported successfully", "tui");
             }
             Err(e) => {
                 self.mode = AppMode::ImportUrl {
@@ -1076,7 +1145,7 @@ impl AppState {
                 }
             }
         }
-        self.add_log("info", &format!("Batch import: {imported} imported, {errors} errors"));
+        self.add_log("info", &format!("Batch import: {imported} imported, {errors} errors"), "tui");
         self.mode = AppMode::List;
         self.reload_profiles();
     }
@@ -1099,7 +1168,7 @@ impl AppState {
             .db
             .reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)])
         {
-            self.add_log("error", &format!("Failed to reorder: {e}"));
+            self.add_log("error", &format!("Failed to reorder: {e}"), "tui");
         }
         self.reload_profiles();
     }
@@ -1121,14 +1190,14 @@ impl AppState {
             .db
             .reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)])
         {
-            self.add_log("error", &format!("Failed to reorder: {e}"));
+            self.add_log("error", &format!("Failed to reorder: {e}"), "tui");
         }
         self.reload_profiles();
     }
 
     pub fn set_active(&mut self, id: &str) {
         if let Err(e) = self.db.update_profile_active(id) {
-            self.add_log("error", &format!("Failed to set active: {e}"));
+            self.add_log("error", &format!("Failed to set active: {e}"), "tui");
             return;
         }
         self.reload_profiles();
@@ -1145,7 +1214,7 @@ impl AppState {
         let profile = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
             Some(r) => r.profile.clone(),
             None => {
-                self.add_log("error", "Profile not found for connection");
+                self.add_log("error", "Profile not found for connection", "tui");
                 return;
             }
         };
@@ -1156,6 +1225,7 @@ impl AppState {
                 self.add_log(
                     "error",
                     &format!("Unknown protocol: {}", profile.config_type),
+                    "tui",
                 );
                 return;
             }
@@ -1180,7 +1250,7 @@ impl AppState {
             Some(tx) => tx.clone(),
             None => {
                 self.connecting = false;
-                self.add_log("error", "Core event channel not initialized");
+                self.add_log("error", "Core event channel not initialized", "tui");
                 return;
             }
         };
@@ -1398,7 +1468,7 @@ impl AppState {
     /// Start TCP ping on the given profile. Returns immediately; result arrives via CoreEvent.
     pub fn start_tcp_ping(&mut self, profile_id: &str) {
         if self.testing_profiles.contains(profile_id) {
-            self.add_log("warn", "Test already in progress for this profile");
+            self.add_log("warn", "Test already in progress for this profile", "tui");
             return;
         }
 
@@ -1406,21 +1476,21 @@ impl AppState {
         let row = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
             Some(r) => r,
             None => {
-                self.add_log("error", "Profile not found for TCP ping");
+                self.add_log("error", "Profile not found for TCP ping", "tui");
                 return;
             }
         };
         let addr = match &row.profile.address {
             Some(a) => a.clone(),
             None => {
-                self.add_log("error", "Profile has no address");
+                self.add_log("error", "Profile has no address", "tui");
                 return;
             }
         };
         let port = match row.profile.port {
             Some(p) if p > 0 && p <= 65535 => p as u16,
             _ => {
-                self.add_log("error", "Profile has invalid port");
+                self.add_log("error", "Profile has invalid port", "tui");
                 return;
             }
         };
@@ -1428,7 +1498,7 @@ impl AppState {
         let tx = match &self.core_event_tx {
             Some(tx) => tx.clone(),
             None => {
-                self.add_log("error", "Core event channel not initialized");
+                self.add_log("error", "Core event channel not initialized", "tui");
                 return;
             }
         };
@@ -1459,7 +1529,7 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log("warn", "Core not connected — proxy required for real ping");
+            self.add_log("warn", "Core not connected — proxy required for real ping", "tui");
             return;
         }
         let tx = match &self.core_event_tx {
@@ -1501,7 +1571,7 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log("warn", "Core not connected — proxy required for speed test");
+            self.add_log("warn", "Core not connected — proxy required for speed test", "tui");
             return;
         }
         let tx = match &self.core_event_tx {
@@ -1545,7 +1615,7 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log("warn", "Core not connected — proxy required for UDP test");
+            self.add_log("warn", "Core not connected — proxy required for UDP test", "tui");
             return;
         }
         let tx = match &self.core_event_tx {
@@ -1579,7 +1649,7 @@ impl AppState {
     pub fn start_batch_ping(&mut self) {
         let visible = self.filtered_profiles();
         if visible.is_empty() {
-            self.add_log("info", "No profiles to ping");
+            self.add_log("info", "No profiles to ping", "tui");
             return;
         }
 
@@ -1662,7 +1732,7 @@ impl AppState {
             self.delete_profile(&id);
         }
         self.multi_select.clear();
-        self.add_log("info", &format!("Removed {count} failed server(s)"));
+        self.add_log("info", &format!("Removed {count} failed server(s)"), "tui");
     }
 
     /// Poll core event channel and update state accordingly.
@@ -1715,7 +1785,7 @@ impl AppState {
                         last_updated: Some(crate::format_now()),
                     };
                     if let Err(e) = self.db.upsert_server_stats(&stats) {
-                        self.add_log("error", &format!("Failed to save stats: {e}"));
+                        self.add_log("error", &format!("Failed to save stats: {e}"), "tui");
                     }
                     // Update in-memory ProfileRow to avoid full reload
                     if let Some(row) = self
@@ -1734,12 +1804,12 @@ impl AppState {
                 }
                 CoreEvent::LogLine { level, message } => {
                     self.last_core_log = Some((level.clone(), message.clone()));
-                    self.add_log(&level, &message);
+                    self.add_log(&level, &message, "core");
                 }
                 CoreEvent::TuiLog { target, level, message } => {
                     self.last_tui_log = Some((target.clone(), level.clone(), message.clone()));
                     if target == "validation" {
-                        self.add_log(&level, &message);
+                        self.add_log(&level, &message, "tui");
                     }
                 }
                 CoreEvent::SubscriptionsUpdated {
@@ -1877,10 +1947,10 @@ impl AppState {
                     if success {
                         status.current_version = Some(new_version.clone());
                         status.update_available = false;
-                        self.add_log("info", &format!("{core_type} updated: {} → {}", old_version.as_deref().unwrap_or("none"), new_version));
+                        self.add_log("info", &format!("{core_type} updated: {} → {}", old_version.as_deref().unwrap_or("none"), new_version), "tui");
                     } else {
                         status.error = error.clone();
-                        self.add_log("error", &format!("{core_type} update failed: {:?}", error));
+                        self.add_log("error", &format!("{core_type} update failed: {:?}", error), "tui");
                     }
                     // Refresh form snapshots if currently viewing the updates form
                     if let AppMode::Settings { mode: SettingsMode::UpdateForm { status_xray, status_singbox } } = &mut self.mode {
@@ -1911,7 +1981,7 @@ impl AppState {
         let group = match self.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g.clone(),
             None => {
-                self.add_log("error", "Group not found");
+                self.add_log("error", "Group not found", "tui");
                 return;
             }
         };
@@ -1952,7 +2022,7 @@ impl AppState {
             is_system: None,
         };
         if let Err(e) = self.db.insert_group(&group) {
-            self.add_log("error", &format!("Failed to add group: {e}"));
+            self.add_log("error", &format!("Failed to add group: {e}"), "tui");
             return;
         }
         // Create subscription tracking row
@@ -1976,6 +2046,7 @@ impl AppState {
                 "Group '{}' added",
                 group.name.as_deref().unwrap_or("unnamed")
             ),
+            "tui",
         );
         self.mode = AppMode::List;
         self.reload_groups();
@@ -1991,7 +2062,7 @@ impl AppState {
         let mut group = match self.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g.clone(),
             None => {
-                self.add_log("error", "Group not found");
+                self.add_log("error", "Group not found", "tui");
                 return;
             }
         };
@@ -2000,7 +2071,7 @@ impl AppState {
         group.user_agent = get_field(&fields, "user_agent");
         group.core_type = get_field(&fields, "core_type");
         if let Err(e) = self.db.update_group(&group) {
-            self.add_log("error", &format!("Failed to update group: {e}"));
+            self.add_log("error", &format!("Failed to update group: {e}"), "tui");
             return;
         }
         // Update subscription tracking row
@@ -2013,18 +2084,18 @@ impl AppState {
             sub.user_agent = group.user_agent.clone();
             let _ = self.db.upsert_subscription(&sub);
         }
-        self.add_log("info", "Group updated");
+        self.add_log("info", "Group updated", "tui");
         self.mode = AppMode::List;
         self.reload_groups();
     }
 
     pub fn delete_group(&mut self, group_id: &str) {
         if let Err(e) = self.db.delete_group(group_id) {
-            self.add_log("error", &format!("Failed to delete group: {e}"));
+            self.add_log("error", &format!("Failed to delete group: {e}"), "tui");
             return;
         }
         let _ = self.db.delete_subscriptions_by_group(group_id);
-        self.add_log("info", "Group deleted");
+        self.add_log("info", "Group deleted", "tui");
         self.selected_group_id = None;
         self.confirmation = None;
         self.reload_groups();
@@ -2034,10 +2105,10 @@ impl AppState {
     pub fn clear_group(&mut self, group_id: &str) {
         match self.db.clear_group(group_id) {
             Ok(count) => {
-                self.add_log("info", &format!("Cleared {count} profiles from group"));
+                self.add_log("info", &format!("Cleared {count} profiles from group"), "tui");
             }
             Err(e) => {
-                self.add_log("error", &format!("Failed to clear group: {e}"));
+                self.add_log("error", &format!("Failed to clear group: {e}"), "tui");
             }
         }
         self.confirmation = None;
@@ -2053,14 +2124,14 @@ impl AppState {
         let group = match self.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g.clone(),
             None => {
-                self.add_log("error", "Group not found");
+                self.add_log("error", "Group not found", "tui");
                 return;
             }
         };
         let url = match &group.subscription_url {
             Some(u) if !u.is_empty() => u.clone(),
             _ => {
-                self.add_log("warn", "Group has no subscription URL");
+                self.add_log("warn", "Group has no subscription URL", "tui");
                 return;
             }
         };
@@ -2219,7 +2290,7 @@ impl AppState {
         }
         // Guard: don't download if core is currently running
         if self.connected_core == Some(core_type) {
-            self.add_log("warn", &format!("Cannot update {core_type} while it's running. Disconnect first."));
+            self.add_log("warn", &format!("Cannot update {core_type} while it's running. Disconnect first."), "tui");
             return;
         }
 

@@ -1,10 +1,9 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{CoreType, resolve_core};
+
 
 use crate::ui::theme::Theme;
 use crate::ui::render_confirmation_overlay;
@@ -37,7 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     // Window: only build Row widgets for rows within the visible area
-    let inner_height = chunks[2].height.saturating_sub(1) as usize;
+    let inner_height = chunks[2].height.saturating_sub(3) as usize;
     let total = rows.len();
     let scroll_offset = if total <= inner_height {
         0
@@ -48,7 +47,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let visible_rows = &rows[scroll_offset..visible_end];
     let adjusted_selected = selected - scroll_offset;
 
-    render_data_grid(frame, chunks[2], visible_rows, adjusted_selected, scroll_offset, state);
+    let show_group = state.selected_group_id.is_none()
+        || state.selected_group_id.as_deref() == Some(xray_tui_db::models::ALL_GROUP_ID);
+    // Hide Group column on narrow terminals (needs ≥107 cols to fit)
+    let show_group = show_group && frame.area().width >= 107;
+    render_data_grid(frame, chunks[2], visible_rows, adjusted_selected, scroll_offset, show_group, state);
     render_footer(frame, chunks[3], state);
     // Confirmation overlays: DeleteProfile and ClearGroup
     match state.confirmation {
@@ -100,13 +103,13 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
-
 fn render_data_grid(
     frame: &mut Frame,
     area: Rect,
     rows: &[&crate::ProfileRow],
     selected_index: usize,
     scroll_offset: usize,
+    show_group: bool,
     state: &AppState,
 ) {
     let block = Block::default()
@@ -118,14 +121,32 @@ fn render_data_grid(
     frame.render_widget(block, area);
 
     // Header row
-    let header_cells = [
+    let mut header_items = vec![
         " #  ", "Type    ", "Remarks                  ",
         "Address                        ", "Port  ",
-        "Delay ", "Speed ", "Traffic   ", "Core    ",
-    ]
-    .iter()
-    .map(|h| Cell::from(*h).style(Theme::TABLE_HEADER));
+        "Delay ", "Speed ", "Traffic   ",
+    ];
+    if show_group {
+        header_items.insert(3, "Group       ");
+    }
+    let header_cells = header_items.iter()
+        .map(|h| Cell::from(*h).style(Theme::TABLE_HEADER));
     let header = Row::new(header_cells);
+
+    // Column widths
+    let mut widths = vec![
+        Constraint::Length(5),
+        Constraint::Length(8),
+        Constraint::Length(24),
+        Constraint::Length(30),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(10),
+    ];
+    if show_group {
+        widths.insert(3, Constraint::Length(12));
+    }
 
     // Data rows
     let data_rows: Vec<Row> = rows
@@ -143,23 +164,8 @@ fn render_data_grid(
 
             let protocol =
                 Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
-            let core = resolve_core(
-                protocol,
-                Some(
-                    row.profile
-                        .core_type
-                        .parse::<CoreType>()
-                        .unwrap_or(CoreType::Auto),
-                ),
-            );
-
-            let core_color = match core {
-                CoreType::Xray => Color::Blue,
-                CoreType::SingBox => Color::Green,
-                CoreType::Auto => Color::White,
-            };
-
             let is_multi = state.multi_select.contains(&row.profile.id);
+
             let idx_str = if is_multi {
                 "  *".to_string()
             } else {
@@ -196,36 +202,31 @@ fn render_data_grid(
                     format_traffic(total as u64)
                 })
                 .unwrap_or_else(|| "        -".to_string());
-            let core_str = core.to_string();
 
-            let cells = vec![
+            // Build cells — insert Group cell after remarks if on All tab
+            let mut cells = vec![
                 Cell::from(idx_str),
                 Cell::from(type_str),
-                Cell::from(remarks_str),
+                Cell::from(remarks_str.clone()),
+            ];
+            if show_group {
+                let group_name = row.profile.group_id.as_deref()
+                    .and_then(|gid| state.groups.iter().find(|g| g.id == *gid))
+                    .and_then(|g| g.name.as_deref())
+                    .unwrap_or("-");
+                cells.push(Cell::from(truncate_pad(group_name, 12)));
+            }
+            cells.extend_from_slice(&[
                 Cell::from(address_str),
                 Cell::from(port_str.trim().to_string()),
                 Cell::from(delay_str.trim().to_string()),
                 Cell::from(speed_str.trim().to_string()),
                 Cell::from(traffic.trim().to_string()),
-                Cell::from(core_str).style(Style::default().fg(core_color)),
-            ];
+            ]);
 
             Row::new(cells).style(row_style)
         })
         .collect();
-
-    let widths = [
-        Constraint::Length(5),
-        Constraint::Length(8),
-        Constraint::Length(24),
-        Constraint::Length(30),
-        Constraint::Length(6),
-        Constraint::Length(6),
-        Constraint::Length(6),
-        Constraint::Length(10),
-        Constraint::Length(8),
-    ];
-
     let table = Table::new(data_rows, widths)
         .header(header)
         .column_spacing(0);
@@ -271,27 +272,19 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let line = if has_profile {
         let row = &state.profiles[state.selected_index];
-        let protocol = Protocol::try_from_i32(row.profile.config_type)
-            .unwrap_or(Protocol::Custom);
-        let core = resolve_core(
-            protocol,
-            Some(row.profile.core_type.parse::<CoreType>().unwrap_or(CoreType::Auto)),
-        );
+        let core = state.resolved_core(row);
         let remarks = row.profile.remarks.as_deref().unwrap_or("-");
         let addr = row.profile.address.as_deref().unwrap_or("-");
         let port = row.profile.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-
         Line::from(vec![
             Span::styled(" Server: ", Theme::FOOTER_LABEL),
             Span::styled(remarks, Theme::FOOTER_VALUE),
             Span::styled(format!("  {}:{}  ", addr, port), Theme::FOOTER_VALUE),
-            Span::styled(format!("[{}] ", protocol), Theme::FOOTER_VALUE),
-            Span::styled(core.to_string(), Theme::FOOTER_VALUE),
+            Span::styled(format!("[{}] ", core), Theme::FOOTER_VALUE),
         ])
     } else {
         Line::from(Span::styled(" Server: (none selected)", Theme::FOOTER_LABEL))
     };
-
     let footer = Paragraph::new(line).style(Theme::STATUS_FOOTER);
     frame.render_widget(footer, area);
 }
