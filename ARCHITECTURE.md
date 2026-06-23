@@ -56,6 +56,8 @@ pub struct AppState {
     pub last_core_log: Option<(String, String)>,
     pub last_tui_log: Option<(String, String, String)>,
     pub last_test_tcp: Option<u64>,
+    pub testing_details: HashMap<String, TestType>,
+    pub logs_show_validation: bool,
     pub last_test_real: Option<u64>,
     /// terminal height (Atomics for interior mutability across render thread)
     pub term_height: AtomicU16,
@@ -79,9 +81,8 @@ pub enum CoreEvent {
         total_up: i64,
         total_down: i64,
     },
-    SysStatsUpdate(SysStats),
+    SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, ip_info, error },
     SubscriptionsUpdated { group_id, count, error, warnings },
-    SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, error },
     UpdateCheckResult { core_type, current_version, latest_version, error },
     UpdateCompleted { core_type, old_version, new_version, success, error },
     /// A log line from the core process stdout (xray-core) or stderr (sing-box).
@@ -94,6 +95,13 @@ pub enum CoreEvent {
         target: String,
         level: String,
         message: String,
+    },
+    /// Update the displayed test type for a profile without triggering cleanup.
+    /// Used by batch_then_real_ping to switch from TcpPing→RealPing emoji
+    /// after TCP completes but before real ping starts.
+    TestTypeUpdate {
+        profile_id: String,
+        test_type: TestType,
     },
 }
 ```
@@ -119,26 +127,32 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
-:- `settings.rs` — Full settings panel (Phase 6). Menu listing 11 config sections: Core, GUI, Protocol Core, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
+::- `settings.rs` — Full settings panel (Phase 6). Menu listing 12 config sections: Core, GUI, Protocol Core, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
-:- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs)
+::- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 ...
 - `theme.rs` — Central color palette and Style definitions (Theme struct with 19 constants across 6 groups)
 
-**`speed_test.rs`** — Async speed test engine:
+:**`speed_test.rs`** — Async speed test engine:
 ```rust
 pub enum TestType { TcpPing, RealPing, SpeedTest, UdpTest }
+pub struct RealPingResult { pub latency_ms: u64, pub ip_info: Option<String> }
 pub enum SpeedTestError { Io, Timeout, Proxy, Http, InvalidAddress }
 pub async fn tcp_ping(addr: &str, port: u16, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
-pub async fn real_ping(proxy: &str, port: u16, url: &str, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
+pub async fn real_ping(proxy: &str, port: u16, url: &str, retries: u32, test_timeout: Duration) -> Result<RealPingResult, SpeedTestError>;
 pub async fn speed_test(proxy: &str, port: u16, url: &str, min_duration: Duration, max_duration: Duration) -> Result<u64, SpeedTestError>;
 pub async fn udp_test(proxy: &str, port: u16, test_timeout: Duration) -> Result<Duration, SpeedTestError>;
 ```
 tcp_ping connects directly to the target address. real_ping, speed_test, and udp_test route through the active SOCKS5 proxy.
-Results are sent via CoreEvent::SpeedTestResult and handled in poll_core_events(), which updates the ProfileExtension
-(delay for ping/udp, speed for speed_test) in memory and persists via upsert_profile_extension().
+`real_ping` sends up to `retries` HTTP GETs through SOCKS5, takes the fastest 2xx response, and optionally
+fetches IP info (ISP/location) from a configurable `ip_api_url` through the same proxy. Returns `RealPingResult`
+with both latency and IP metadata.
+Results are sent via CoreEvent::SpeedTestResult (with optional `ip_info` field) and handled in poll_core_events(),
+which updates the ProfileExtension (delay, ip_info) in memory and persists via upsert_profile_extension().
 Batch ping mode deduplicates by (address, port) using the UniqueTarget helper struct.
+`batch_then_real_ping` runs TCP ping on all profiles, selects the fastest N (batch_page_size), then runs real ping
+on those with IP info fetch. Sends `TestTypeUpdate` events mid-flow to update displayed emoji.
 
 ### xray-tui-core (library crate)
 

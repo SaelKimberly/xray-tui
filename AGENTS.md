@@ -15,7 +15,7 @@ cargo run
 
 ### Crate entry points
     - `crates/xray-tui/src/main.rs` — binary entry, tokio::main, TuiLogLayer tracing subscriber + subsystem init
-- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode, SettingsSection
+:- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode (incl. SpeedTestForm), SettingsSection (incl. SpeedTest), CoreEvent (incl. TestTypeUpdate), testing_details map
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
@@ -27,14 +27,14 @@ cargo run
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 - `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
-- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping, speed test, UDP test, batch ping) using tokio + reqwest SOCKS5 proxy
+:- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping with IP info, speed test, UDP test, batch ping, batch-then-real-ping) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig.
 
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
-- `profiles.rs` — profile list DataGrid, multi-select indicator, delete confirmation overlay
+:- `profiles.rs` — profile list DataGrid with connected indicator, IP info column, multi-sort indicators, graveyard group filter; multi-select, delete confirmation, batch import overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
-- `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics/Protocol Core), routing rules list+form, reorder. Full rewrite Phase 6.
+:- `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics/Protocol Core/SpeedTest), routing rules list+form, reorder. Full rewrite Phase 6.
 - `status_bar.rs` — bottom connection indicator + key hints
 - `groups.rs` — system-group-aware management (is_system guard, clear action)
 - `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
@@ -88,7 +88,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
-**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features — logs, sing-box builder completeness, advanced forms) has completed sing-box config builder for all 17 outbound protocols and normalized profile schema. Phase 8 (Polish & Release — i18n, themes, packaging) is planned. Phase 9 (v2rayN Parity — proxy chains, policy groups, Clash dashboard, subscription enhancements) captures the remaining feature gaps for full v2rayN feature parity. See `ROADMAP.md` for full details.
+**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter). Phase 8 (Polish & Release) planned. Phase 9 (v2rayN Parity) captures remaining feature gaps.
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`

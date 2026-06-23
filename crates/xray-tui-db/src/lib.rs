@@ -460,7 +460,7 @@ impl Database {
         )?;
 
         // 2. Insert group profile (target group)
-        let group_id = p.group_id.as_deref().unwrap_or(models::ALL_GROUP_ID);
+        let group_id = p.group_id.as_deref().unwrap_or(models::GRAVEYARD_GROUP_ID);
         self.conn.execute(
             "INSERT OR REPLACE INTO group_profiles (id, sub_uid, group_id, remarks, is_sub, sub_id, sort_order, is_active, updated_at, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -469,7 +469,7 @@ impl Database {
         )?;
 
         // 3. Mirror to "All" group (same core, different group id)
-        if group_id != models::ALL_GROUP_ID {
+        if group_id != models::ALL_GROUP_ID && group_id != models::GRAVEYARD_GROUP_ID {
             let all_id = format!("{}-all", p.id);
             self.conn.execute(
                 "INSERT OR IGNORE INTO group_profiles (id, sub_uid, group_id, remarks, is_sub, sub_id, sort_order, is_active, updated_at, created_at)
@@ -492,7 +492,7 @@ impl Database {
             rusqlite::params![sub_uid, p.config_type, p.core_type, p.address, p.port,
                 p.user_id, p.security, p.network, p.stream_settings, p.protocol_settings, p.created_at],
         )?;
-        let group_id = p.group_id.as_deref().unwrap_or(models::ALL_GROUP_ID);
+        let group_id = p.group_id.as_deref().unwrap_or(models::GRAVEYARD_GROUP_ID);
         self.conn.execute(
             "UPDATE group_profiles SET sub_uid=?1, group_id=?2, remarks=?3, is_sub=?4, sub_id=?5, sort_order=?6, is_active=?7, updated_at=?8 WHERE id=?9",
             rusqlite::params![sub_uid, group_id, p.remarks, p.is_sub, p.sub_id, p.sort_order, p.is_active, p.updated_at, p.id],
@@ -776,6 +776,17 @@ impl Database {
                     p.sort_order, p.is_active, p.updated_at, p.created_at,
                 ])?;
             }
+        }
+
+        // 4. Promote graveyard orphans: remove graveyard rows for sub_uids now in this group
+        if group_id != models::ALL_GROUP_ID && group_id != models::GRAVEYARD_GROUP_ID {
+            let _removed = tx.execute(
+                "DELETE FROM group_profiles
+                 WHERE group_id = ?1 AND sub_uid IN (
+                     SELECT sub_uid FROM group_profiles WHERE group_id = ?2 AND sub_uid > 0
+                 )",
+                rusqlite::params![models::GRAVEYARD_GROUP_ID, group_id],
+            ).unwrap_or(0);
         }
 
         tx.commit()?;

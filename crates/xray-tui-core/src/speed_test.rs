@@ -13,6 +13,13 @@ pub enum TestType {
     UdpTest,
 }
 
+/// Result of a real ping (HTTP through SOCKS5 proxy) test.
+#[derive(Debug, Clone)]
+pub struct RealPingResult {
+    pub latency_ms: u64,
+    pub ip_info: Option<String>,
+}
+
 #[derive(Error, Debug)]
 pub enum SpeedTestError {
     #[error("IO error: {0}")]
@@ -42,25 +49,78 @@ pub async fn tcp_ping(
     }
 }
 
-/// Real ping: HTTP GET through SOCKS5 proxy to `url`, measure response time.
-/// The `proxy` parameter is `listen_addr` (IP string), `port` is socks proxy port.
+/// Real ping: send HTTP GET requests through SOCKS5 proxy to `url`, measure fastest response time.
+/// Uses `socks5://` (NOT `socks5h://`) — the proxy resolves DNS locally.
+/// Up to `retries` requests are sent; the fastest 2xx response wins.
+/// On success, optionally fetches IP info from `ip_api_url` through the same proxy.
 pub async fn real_ping(
     proxy: &str,
     port: u16,
     url: &str,
+    ip_api_url: &str,
     test_timeout: Duration,
-) -> Result<Duration, SpeedTestError> {
-    let proxy_url = format!("socks5h://{proxy}:{port}");
+    retries: u32,
+) -> Result<RealPingResult, SpeedTestError> {
+    let proxy_url = format!("socks5://{proxy}:{port}");
     let client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
         .timeout(test_timeout)
         .build()?;
 
-    let start = std::time::Instant::now();
-    let resp = client.get(url).send().await?;
-    // Check HTTP status; consume self to get proper reqwest::Error conversion
-    let _resp = resp.error_for_status()?;
-    Ok(start.elapsed())
+    let mut best_latency = None;
+    let mut last_error = None;
+
+    for attempt in 0..retries {
+        let start = std::time::Instant::now();
+        match client.get(url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    match best_latency {
+                        None => best_latency = Some(elapsed),
+                        Some(best) if elapsed < best => best_latency = Some(elapsed),
+                        _ => {}
+                    }
+                } else {
+                    last_error = Some(SpeedTestError::Http(
+                        resp.error_for_status().unwrap_err(),
+                    ));
+                }
+            }
+            Err(e) => {
+                last_error = Some(SpeedTestError::Http(e));
+            }
+        }
+
+        if attempt + 1 < retries {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let latency_ms = best_latency.ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            SpeedTestError::Proxy("all retries failed".to_string())
+        })
+    })?;
+    // Fetch IP info on success
+    let ip_info = fetch_ip_info(&client, ip_api_url).await;
+
+    Ok(RealPingResult { latency_ms, ip_info })
+}
+
+/// Fetch IP address and location info through the same SOCKS5 proxy.
+async fn fetch_ip_info(client: &reqwest::Client, ip_api_url: &str) -> Option<String> {
+    match client.get(ip_api_url).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
+                let country = json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
+                Some(format!("{ip} | {country}"))
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 /// Speed test: download `url` through SOCKS5 proxy, measure throughput.

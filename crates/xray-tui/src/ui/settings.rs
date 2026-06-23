@@ -22,6 +22,7 @@ const MENU_ITEMS: &[(&str, &str)] = &[
     ("Mux", "multiplexing settings"),
     ("Statistics", "enable/disable stats collection"),
     ("Updates", "check and install backend updates"),
+    ("Speed Test", "ping URL, IP API, timeouts, batch settings"),
 ];
 
 /// Separator position between active sections and deferred ones
@@ -41,14 +42,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             | SettingsMode::MuxForm { .. }
             | SettingsMode::StatsForm { .. }
             | SettingsMode::DnsForm { .. }
-            | SettingsMode::ProtocolCoreForm { .. } => render_form(frame, area, state),
+            | SettingsMode::ProtocolCoreForm { .. }
+            | SettingsMode::SpeedTestForm { .. } => render_form(frame, area, state),
             SettingsMode::RoutingList { .. } => render_routing_list(frame, area, state),
             SettingsMode::RoutingForm { .. } => render_routing_form(frame, area, state),
             SettingsMode::UpdateForm { .. } => render_update_form(frame, area, state),
         }
     }
 }
-
 pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
     let mode = match &state.mode {
         AppMode::Settings { mode } => mode.clone(),
@@ -64,7 +65,8 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::MuxForm { .. }
         | SettingsMode::StatsForm { .. }
         | SettingsMode::DnsForm { .. }
-        | SettingsMode::ProtocolCoreForm { .. } => handle_form_key(state, key),
+        | SettingsMode::ProtocolCoreForm { .. }
+        | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key),
         SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key),
         SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key),
         SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key),
@@ -160,15 +162,17 @@ fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
         KeyCode::Enter => {
             let section = match selected {
                 0 => SettingsSection::Core,
-                1 => SettingsSection::Gui,
-                2 => SettingsSection::Inbound,
-                3 => SettingsSection::Routing,
-                4 => SettingsSection::Dns,
-                5 => SettingsSection::SystemProxy,
-                6 => SettingsSection::Tun,
-                7 => SettingsSection::Mux,
-                8 => SettingsSection::Stats,
-                9 => SettingsSection::Updates,
+                1 => SettingsSection::ProtocolCore,
+                2 => SettingsSection::Gui,
+                3 => SettingsSection::Inbound,
+                4 => SettingsSection::Routing,
+                5 => SettingsSection::Dns,
+                6 => SettingsSection::SystemProxy,
+                7 => SettingsSection::Tun,
+                8 => SettingsSection::Mux,
+                9 => SettingsSection::Stats,
+                10 => SettingsSection::Updates,
+                11 => SettingsSection::SpeedTest,
                 _ => return,
             };
             state.enter_settings_form(section);
@@ -179,8 +183,6 @@ fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
         _ => {}
     }
 }
-// ── Form rendering ──────────────────────────────────────────────────────
-
 fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
     match mode {
         SettingsMode::CoreForm { .. } => " Core Settings ",
@@ -193,6 +195,7 @@ fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
         SettingsMode::StatsForm { .. } => " Statistics ",
         SettingsMode::ProtocolCoreForm { .. } => " Protocol Core ",
         SettingsMode::UpdateForm { .. } => " Backend Updates ",
+        SettingsMode::SpeedTestForm { .. } => " Speed Test Settings ",
         _ => " Settings ",
     }
 }
@@ -271,6 +274,16 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
             ("fragment_interval", "Fragment Interval", "Text"),
         ],
         SettingsMode::ProtocolCoreForm { .. } => PROTOCOL_CORE_DEFS,
+        SettingsMode::SpeedTestForm { .. } => &[
+            ("ping_url", "Ping Test URL", "Text"),
+            ("ip_api_url", "IP API URL", "Text"),
+            ("tcp_timeout_secs", "TCP Timeout (sec)", "Number"),
+            ("real_ping_timeout_secs", "Real Ping Timeout (sec)", "Number"),
+            ("batch_page_size", "Batch Page Size", "Number"),
+            ("batch_delay_ms", "Batch Delay (ms)", "Number"),
+            ("real_ping_retries", "Real Ping Retries", "Number"),
+            ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
+        ],
         _ => &[],
     }
 }
@@ -289,7 +302,8 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
         | SettingsMode::TunForm { fields, focus_index }
         | SettingsMode::MuxForm { fields, focus_index }
         | SettingsMode::StatsForm { fields, focus_index }
-        | SettingsMode::ProtocolCoreForm { fields, focus_index } => (fields, *focus_index),
+        | SettingsMode::ProtocolCoreForm { fields, focus_index }
+        | SettingsMode::SpeedTestForm { fields, focus_index } => (fields, *focus_index),
         _ => return,
     };
 
@@ -374,6 +388,7 @@ fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
         SettingsMode::UpdateForm { .. } => Some(SettingsSection::Updates),
         SettingsMode::ProtocolCoreForm { .. } => Some(SettingsSection::ProtocolCore),
         SettingsMode::StatsForm { .. } => Some(SettingsSection::Stats),
+        SettingsMode::SpeedTestForm { .. } => Some(SettingsSection::SpeedTest),
         _ => None,
     }
 }
@@ -408,7 +423,8 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                 | SettingsMode::TunForm { fields, focus_index }
                 | SettingsMode::MuxForm { fields, focus_index }
                 | SettingsMode::StatsForm { fields, focus_index }
-                | SettingsMode::ProtocolCoreForm { fields, focus_index },
+                | SettingsMode::ProtocolCoreForm { fields, focus_index }
+                | SettingsMode::SpeedTestForm { fields, focus_index },
         } => (fields, focus_index),
         _ => return,
     };

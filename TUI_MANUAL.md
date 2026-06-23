@@ -326,7 +326,7 @@ appended when updates are available for installed backends.
 | ----------------------- | ---------------------------------------- |
 | Profiles (disconnected) | `[F1] Actions Log  [Ctrl+Enter] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
 | Profiles (connecting)   | `[F1] Actions Log  [Tab] Next  [?] Help  [Ctrl+Q] Quit`   |
-| Profiles (connected)    | `[F1] Actions Log  [Ctrl+Shift+C] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
+ | Profiles (connected)    | `[F1] Actions Log  [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
 | Settings menu           | `[↑↓] Navigate  [Enter] Open  [Esc] Close` |
 | Settings form           | `[Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel` |
 | Speed test menu         | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
@@ -354,14 +354,14 @@ appended when updates are available for installed backends.
 | `o`              | Cycle sort column (8 columns)       |
 | `/`              | Focus search/filter input           |
 | `Ctrl+V`         | Import share URL                    |
-| `Ctrl+Shift+C`   | Copy selected server's share URL    |
+ | `Ctrl+Shift+S`   | Copy selected server's share URL    |
 | `Ctrl+↑`         | Move selected profile up            |
 | `Ctrl+↓`         | Move selected profile down          |
 | `Tab` / `Shift+Tab` | Cycle through tabs               |
 | `?`              | Toggle help overlay                 |
 | `q` / `Ctrl+C`   | Quit application                    |
 | `F1`             | Toggle actions log compact/full view |
-| `Ctrl+Shift+C`   | Disconnect from active server       |
+ | `Ctrl+D`   | Disconnect from active server       |
 
 ### Settings Tab
 
@@ -475,7 +475,7 @@ appended when updates are available for installed backends.
 5. Statistics tab becomes active with traffic data
 
 **Disconnect:**
-1. Press `Ctrl+Shift+C`
+ 1. Press `Ctrl+D`
 2. Status bar returns to `Disconnected`
 
 ### Subscription group management

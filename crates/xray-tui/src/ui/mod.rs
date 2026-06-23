@@ -219,7 +219,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
             KeyCode::Down => {
                 if let crate::AppMode::SpeedTestMenu { ref mut selected } = state.mode {
-                    let max = 7usize;
+                    let max = 8usize;
                     if *selected < max {
                         *selected += 1;
                     }
@@ -260,11 +260,14 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.start_batch_ping();
                     }
                     6 => {
+                        state.start_batch_then_real_ping();
+                    }
+                    7 => {
                         state.sort_column = SortColumn::Delay;
                         state.sort_ascending = true;
                         state.filter_cache_valid.set(false);
                     }
-                    7 => {
+                    8 => {
                         state.remove_failed_servers();
                     }
                     _ => {}
@@ -300,7 +303,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('q' | 'Q') => {
             state.should_quit = true;
         }
-        KeyCode::Char('C')
+        KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected_core.is_some() =>
         {
             state.disconnect();
@@ -370,6 +373,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('t') if state.current_tab == Tab::Logs => {
             state.logs_show_tui = !state.logs_show_tui;
         }
+        KeyCode::Char('v') if state.current_tab == Tab::Logs => {
+            state.logs_show_validation = !state.logs_show_validation;
+        }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
@@ -421,8 +427,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
             state.mode = crate::AppMode::SpeedTestMenu { selected: 0 };
         }
-        // Cycle sort column
+        // Cycle sort column — preserve selection by profile ID
         KeyCode::Char('o' | 'O') if state.current_tab == Tab::Profiles => {
+            let selected_id = state.selected_profile_id();
             let all = &[
                 SortColumn::Remarks,
                 SortColumn::Address,
@@ -441,6 +448,13 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.sort_column = all[next_idx];
             state.sort_ascending = true;
             state.filter_cache_valid.set(false);
+            // Restore selection by profile ID
+            if let Some(pid) = selected_id {
+                let filtered = state.filtered_profiles();
+                if let Some(pos) = filtered.iter().position(|r| r.profile.id == pid) {
+                    state.selected_index = pos;
+                }
+            }
         }
         // CRUD shortcuts (profiles tab)
         KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {
@@ -664,8 +678,9 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("o", "Cycle sort column"),
                     ("/", "Search/filter"),
                     ("Ctrl+V", "Import share URL"),
-                    ("Ctrl+Shift+C", "Copy share URL"),
+                    ("Ctrl+Shift+S", "Copy share URL"),
                     ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("Ctrl+D", "Disconnect"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],
@@ -683,6 +698,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("Home / End", "Jump to oldest/newest"),
                     ("c", "Toggle core logs"),
                     ("t", "Toggle TUI logs"),
+                    ("v", "Toggle validation/subscription logs"),
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
@@ -759,7 +775,8 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         "Speed Test (Selected)",
         "UDP Test (Selected)",
         "",
-        "Batch TCP Ping (All Visible)",
+        "TCP Ping (All Visible)",
+        "TCP + Real Ping (All Visible)",
         "Sort by Delay",
         "Remove Bad Servers",
     ];

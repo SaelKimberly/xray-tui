@@ -44,7 +44,7 @@ xray-tui/
 | **ALL_GROUP_ID** | Fixed UUID (`00000000-0000-0000-0000-000000000000`) identifying the system "All" group for showing every profile across groups |
 | **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update |
 | **Graveyard** | Destination group (`sub-graveyard`) for orphaned subscription profiles; purged after 24h |
-| **AppMode** | Application mode enum (List / Help / Settings / AddServer / EditServer / ImportUrl / BatchImport / ManageGroups / AddGroup / EditGroup / SpeedTestMenu) — controls which screen renders. Help variant shows context-sensitive keyboard shortcuts overlay and uses `previous_mode` to restore the prior screen. Settings variant opens the full settings panel with sub-modes (Menu, config forms, routing list/form, DNS form). BatchImport shows a scrollable list of parsed share URL results for bulk import. |
+|- **testing_details** | `HashMap<String, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
 | **Transport** | The network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around the transport |
 | **Config Type** | The proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |
@@ -70,4 +70,4 @@ xray-tui/
 - `crates/xray-tui-db/src/models.rs` — ProfileCore struct for deduplicated server configs, Profile as JOIN view, ALL_GROUP_ID constant
 - `crates/xray-tui/src/ui/groups.rs` — system-group-aware management (is_system guard, clear action)
 - `crates/xray-tui/src/ui/actions_log.rs` — live event log panel: connection status, speed test results, core/TUI logs, traffic/memory
-- `crates/xray-tui/src/lib.rs` — BatchImport mode, ClearGroup event, start_batch_import method
+:- `crates/xray-tui/src/lib.rs` — BatchImport mode, ClearGroup event, start_batch_import method, batch-then-real-ping flow, testing_details HashMap, logs_show_validation toggle, SpeedTestConfig

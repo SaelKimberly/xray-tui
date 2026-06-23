@@ -2,10 +2,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
+use ratatui::style::Modifier;
+use xray_tui_db::models::GRAVEYARD_GROUP_ID;
 use xray_tui_core::protocol::Protocol;
+use xray_tui_core::speed_test::TestType;
 
 
 use crate::ui::theme::Theme;
+use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
 use crate::{AppState, ConfirmAction};
 
@@ -121,31 +125,55 @@ fn render_data_grid(
     frame.render_widget(block, area);
 
     // Header row
-    let mut header_items = vec![
-        " #  ", "Type    ", "Remarks                  ",
-        "Address                        ", "Port  ",
-        "Delay ", "Speed ", "Traffic   ",
+    let mut header_items: Vec<String> = vec![
+        "   ".into(), " #  ".into(), "Type    ".into(), "Remarks                  ".into(),
+        "Address                        ".into(), "Port  ".into(),
+        "│".into(),
+        "Delay ".into(), "Speed ".into(), "IP                   ".into(), "Traffic   ".into(),
     ];
     if show_group {
-        header_items.insert(3, "Group       ");
+        header_items.insert(4, "Group       ".into());
+    }
+
+    // Sort indicator: append arrow to the sorted column's header
+    let arrow = if state.sort_ascending { "↑" } else { "↓" };
+    let sort_idx: Option<usize> = match state.sort_column {
+        SortColumn::ConfigType => Some(2),
+        SortColumn::Remarks => Some(3),
+        SortColumn::Address => Some(4 + show_group as usize),
+        SortColumn::Port => Some(5 + show_group as usize),
+        SortColumn::Delay => Some(7 + show_group as usize),
+        SortColumn::Speed => Some(8 + show_group as usize),
+        SortColumn::Traffic => Some(10 + show_group as usize),
+        _ => None, // Core and other non-visible columns
+    };
+    if let Some(idx) = sort_idx {
+        if let Some(item) = header_items.get_mut(idx) {
+            let trimmed = item.trim_end();
+            let width = item.len();
+            *item = format!("{:width$}", format!("{} {}", trimmed, arrow), width = width);
+        }
     }
     let header_cells = header_items.iter()
-        .map(|h| Cell::from(*h).style(Theme::TABLE_HEADER));
+        .map(|h| Cell::from(h.as_str()).style(Theme::TABLE_HEADER));
     let header = Row::new(header_cells);
 
     // Column widths
     let mut widths = vec![
+        Constraint::Length(3),
         Constraint::Length(5),
         Constraint::Length(8),
         Constraint::Length(24),
         Constraint::Length(30),
         Constraint::Length(6),
+        Constraint::Length(1), // Separator
         Constraint::Length(6),
         Constraint::Length(6),
+        Constraint::Length(20),
         Constraint::Length(10),
     ];
     if show_group {
-        widths.insert(3, Constraint::Length(12));
+        widths.insert(4, Constraint::Length(12));
     }
 
     // Data rows
@@ -154,14 +182,27 @@ fn render_data_grid(
         .enumerate()
         .map(|(i, row)| {
             let is_selected = i == selected_index;
-            let row_style = if is_selected {
-                Theme::TABLE_ROW_SELECTED
-            } else if i % 2 == 1 {
-                Theme::TABLE_ROW_ALT
-            } else {
-                Theme::TABLE_ROW_NORMAL
+            let is_connected = state.connected_profile_id.as_deref() == Some(&row.profile.id);
+            let row_style = match (is_selected, is_connected) {
+                (true, true) => Theme::TABLE_ROW_CONNECTED.add_modifier(Modifier::UNDERLINED),
+                (false, true) => Theme::TABLE_ROW_CONNECTED,
+                (true, false) => Theme::TABLE_ROW_SELECTED,
+                (false, false) if i % 2 == 1 => Theme::TABLE_ROW_ALT,
+                (false, false) => Theme::TABLE_ROW_NORMAL,
             };
 
+            let indicator = if is_connected {
+                String::from(" ●")
+            } else if let Some(test_type) = state.testing_details.get(&row.profile.id) {
+                match test_type {
+                    TestType::TcpPing => String::from("↔ "),
+                    TestType::RealPing => String::from("◎ "),
+                    TestType::SpeedTest => String::from("⇩ "),
+                    TestType::UdpTest => String::from("↗ "),
+                }
+            } else {
+                String::from("  ")
+            };
             let protocol =
                 Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
             let is_multi = state.multi_select.contains(&row.profile.id);
@@ -194,6 +235,13 @@ fn render_data_grid(
                 .and_then(|e| e.speed)
                 .map(|s| format!("{:>6}", s))
                 .unwrap_or_else(|| "     -".to_string());
+            let ip_info_str = row
+                .extension
+                .as_ref()
+                .and_then(|e| e.ip_info.as_deref())
+                .map(|ip| truncate_pad(ip, 19))
+                .unwrap_or_else(|| "     -".to_string());
+
             let traffic = row
                 .stats
                 .as_ref()
@@ -202,15 +250,15 @@ fn render_data_grid(
                     format_traffic(total as u64)
                 })
                 .unwrap_or_else(|| "        -".to_string());
-
-            // Build cells — insert Group cell after remarks if on All tab
             let mut cells = vec![
+                Cell::from(indicator),
                 Cell::from(idx_str),
                 Cell::from(type_str),
                 Cell::from(remarks_str.clone()),
             ];
             if show_group {
                 let group_name = row.profile.group_id.as_deref()
+                    .filter(|gid| *gid != GRAVEYARD_GROUP_ID)
                     .and_then(|gid| state.groups.iter().find(|g| g.id == *gid))
                     .and_then(|g| g.name.as_deref())
                     .unwrap_or("-");
@@ -219,8 +267,10 @@ fn render_data_grid(
             cells.extend_from_slice(&[
                 Cell::from(address_str),
                 Cell::from(port_str.trim().to_string()),
+                Cell::from("│"),
                 Cell::from(delay_str.trim().to_string()),
                 Cell::from(speed_str.trim().to_string()),
+                Cell::from(ip_info_str.trim().to_string()),
                 Cell::from(traffic.trim().to_string()),
             ]);
 

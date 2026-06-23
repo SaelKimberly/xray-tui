@@ -21,6 +21,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub updates: UpdateConfig,
     #[serde(default)]
+    pub speed_test: SpeedTestConfig,
+    #[serde(default)]
     pub parsing: ParsingSettings,
 }
 
@@ -260,6 +262,61 @@ impl Default for UpdateConfig {
             last_check: None,
             xray_latest_known: None,
             sing_box_latest_known: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedTestConfig {
+    #[serde(default = "default_ping_url")]
+    pub ping_url: String,
+    #[serde(default = "default_ip_api_url")]
+    pub ip_api_url: String,
+    #[serde(default = "default_tcp_timeout_secs")]
+    pub tcp_timeout_secs: u64,
+    #[serde(default = "default_real_ping_timeout_secs")]
+    pub real_ping_timeout_secs: u64,
+    #[serde(default = "default_batch_page_size")]
+    pub batch_page_size: usize,
+    #[serde(default = "default_batch_delay_ms")]
+    pub batch_delay_ms: u64,
+    #[serde(default = "default_real_ping_retries")]
+    pub real_ping_retries: u32,
+    #[serde(default = "default_real_ping_concurrency")]
+    pub real_ping_concurrency: usize,
+}
+
+fn default_ping_url() -> String {
+    "https://www.gstatic.com/generate_204".to_string()
+}
+
+fn default_ip_api_url() -> String {
+    "http://ip-api.com/json/".to_string()
+}
+
+fn default_tcp_timeout_secs() -> u64 { 5 }
+
+fn default_real_ping_timeout_secs() -> u64 { 5 }
+
+fn default_batch_page_size() -> usize { 1000 }
+
+fn default_batch_delay_ms() -> u64 { 1000 }
+
+fn default_real_ping_retries() -> u32 { 2 }
+
+fn default_real_ping_concurrency() -> usize { 5 }
+
+impl Default for SpeedTestConfig {
+    fn default() -> Self {
+        Self {
+            ping_url: default_ping_url(),
+            ip_api_url: default_ip_api_url(),
+            tcp_timeout_secs: default_tcp_timeout_secs(),
+            real_ping_timeout_secs: default_real_ping_timeout_secs(),
+            batch_page_size: default_batch_page_size(),
+            batch_delay_ms: default_batch_delay_ms(),
+            real_ping_retries: default_real_ping_retries(),
+            real_ping_concurrency: default_real_ping_concurrency(),
         }
     }
 }
