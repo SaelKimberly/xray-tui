@@ -57,11 +57,25 @@ impl Protocol {
             10 => Some(Self::Http),
             11 => Some(Self::AnyTls),
             12 => Some(Self::Naive),
+            13 => Some(Self::ShadowsocksR),
+            14 => Some(Self::Hysteria),
+            15 => Some(Self::ShadowTls),
+            16 => Some(Self::Tor),
+            17 => Some(Self::Ssh),
+            18 => Some(Self::Tailscale),
+            19 => Some(Self::Redirect),
+            20 => Some(Self::TProxy),
+            21 => Some(Self::Mixed),
+            22 => Some(Self::DokodemoDoor),
+            23 => Some(Self::Freedom),
+            24 => Some(Self::Blackhole),
+            25 => Some(Self::Dns),
+            26 => Some(Self::Loopback),
+            27 => Some(Self::Shadowsocks2022),
             _ => None,
         }
     }
 
-    /// Inverse of `try_from_i32`.
     pub fn to_i32(self) -> i32 {
         match self {
             Self::Vmess => 1,
@@ -76,8 +90,21 @@ impl Protocol {
             Self::Http => 10,
             Self::AnyTls => 11,
             Self::Naive => 12,
-            // Sing-box only protocols that don't appear in v2rayN's EConfigType
-            _ => 0,
+            Self::ShadowsocksR => 13,
+            Self::Hysteria => 14,
+            Self::ShadowTls => 15,
+            Self::Tor => 16,
+            Self::Ssh => 17,
+            Self::Tailscale => 18,
+            Self::Redirect => 19,
+            Self::TProxy => 20,
+            Self::Mixed => 21,
+            Self::DokodemoDoor => 22,
+            Self::Freedom => 23,
+            Self::Blackhole => 24,
+            Self::Dns => 25,
+            Self::Loopback => 26,
+            Self::Shadowsocks2022 => 27,
         }
     }
 }

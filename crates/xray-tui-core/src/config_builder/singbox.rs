@@ -254,6 +254,241 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             }
             Ok(out)
         }
+        Protocol::ShadowsocksR => {
+            let method = p_settings
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("aes-256-cfb");
+            Ok(json!({
+                "tag": "proxy",
+                "type": "shadowsocksr",
+                "server": address,
+                "server_port": port,
+                "method": method,
+                "password": user_id,
+                "obfs": p_settings.get("obfs").and_then(|v| v.as_str()).unwrap_or(""),
+                "obfs_param": p_settings.get("obfs_param").and_then(|v| v.as_str()).unwrap_or(""),
+                "protocol": p_settings.get("protocol").and_then(|v| v.as_str()).unwrap_or(""),
+                "protocol_param": p_settings.get("protocol_param").and_then(|v| v.as_str()).unwrap_or(""),
+            }))
+        }
+        Protocol::Hysteria => {
+            let auth = p_settings.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+            let up = p_settings.get("up_mbps").and_then(|v| v.as_u64()).unwrap_or(100);
+            let down = p_settings.get("down_mbps").and_then(|v| v.as_u64()).unwrap_or(100);
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "hysteria",
+                "server": address,
+                "server_port": port,
+                "up_mbps": up,
+                "down_mbps": down,
+            });
+            if !auth.is_empty() {
+                out["auth_str"] = json!(auth);
+            }
+            if let Some(obfs) = p_settings.get("obfs").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                out["obfs"] = json!(obfs);
+            }
+            // Hysteria v1 always uses TLS
+            let mut tls = serde_json::Map::new();
+            tls.insert("enabled".into(), json!(true));
+            let sni = p_settings.get("sni").and_then(|v| v.as_str()).unwrap_or(address);
+            tls.insert("server_name".into(), json!(sni));
+            if p_settings.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false) {
+                tls.insert("insecure".into(), json!(true));
+            }
+            out["tls"] = json!(tls);
+            Ok(out)
+        }
+        Protocol::Naive => {
+            let username = p_settings.get("user").and_then(|v| v.as_str()).unwrap_or("");
+            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or(user_id);
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "naive",
+                "server": address,
+                "server_port": port,
+                "password": password,
+            });
+            if !username.is_empty() {
+                out["username"] = json!(username);
+            }
+            if let Some(tls) = build_tls(profile) {
+                out["tls"] = tls;
+            }
+            Ok(out)
+        }
+        Protocol::AnyTls => {
+            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "anytls",
+                "server": address,
+                "server_port": port,
+                "password": password,
+            });
+            if let Some(tls) = build_tls(profile) {
+                out["tls"] = tls;
+            }
+            Ok(out)
+        }
+        Protocol::ShadowTls => {
+            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let version = p_settings.get("version").and_then(|v| v.as_i64()).or_else(|| {
+                p_settings.get("version").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok())
+            }).unwrap_or(3);
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "shadowtls",
+                "server": address,
+                "server_port": port,
+                "password": password,
+                "version": version,
+            });
+            if let Some(tls) = build_tls(profile) {
+                out["tls"] = tls;
+            }
+            Ok(out)
+        }
+        Protocol::Tor => {
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "tor",
+            });
+            if let Some(data_dir) = p_settings.get("data_dir").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                out["data_directory"] = json!(data_dir);
+            }
+            Ok(out)
+        }
+        Protocol::Ssh => {
+            let ssh_host = p_settings.get("host").and_then(|v| v.as_str()).unwrap_or(address);
+            let ssh_port = p_settings.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(port as u64);
+            let username = p_settings.get("username").and_then(|v| v.as_str()).unwrap_or("root");
+            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let private_key = p_settings.get("private_key").and_then(|v| v.as_str()).unwrap_or("");
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "ssh",
+                "server": ssh_host,
+                "server_port": ssh_port,
+                "user": username,
+            });
+            if !password.is_empty() {
+                out["password"] = json!(password);
+            }
+            if !private_key.is_empty() {
+                out["private_key"] = json!([private_key]);
+            }
+            Ok(out)
+        }
+        Protocol::Tailscale => {
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "tailscale",
+            });
+            if let Some(key) = p_settings.get("auth_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                out["auth_key"] = json!(key);
+            }
+            if let Some(url) = p_settings.get("control_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                out["control_url"] = json!(url);
+            }
+            if p_settings.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false) {
+                out["ephemeral"] = json!(true);
+            }
+            Ok(out)
+        }
+        Protocol::Vmess => {
+            let security = profile.security.as_deref().unwrap_or("auto");
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "vmess",
+                "server": address,
+                "server_port": port,
+                "uuid": user_id,
+                "security": security,
+            });
+            if let Some(tls) = build_tls(profile) {
+                out["tls"] = tls;
+            }
+            if let Some(net) = profile.network.as_deref().filter(|s| !s.is_empty()) {
+                out["network"] = json!(net);
+            }
+            Ok(out)
+        }
+        Protocol::Vless => {
+            let flow = p_settings.get("flow").and_then(|v| v.as_str()).unwrap_or("");
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "vless",
+                "server": address,
+                "server_port": port,
+                "uuid": user_id,
+            });
+            if !flow.is_empty() {
+                out["flow"] = json!(flow);
+            }
+            if let Some(tls) = build_tls(profile) {
+                out["tls"] = tls;
+            }
+            if let Some(net) = profile.network.as_deref().filter(|s| !s.is_empty()) {
+                out["network"] = json!(net);
+            }
+            Ok(out)
+        }
+        Protocol::Trojan => {
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "trojan",
+                "server": address,
+                "server_port": port,
+                "password": user_id,
+            });
+            if let Some(tls) = build_tls(profile) {
+                out["tls"] = tls;
+            }
+            Ok(out)
+        }
+        Protocol::WireGuard => {
+            let private_key = p_settings.get("private_key").and_then(|v| v.as_str()).unwrap_or("");
+            let public_key = p_settings.get("public_key").and_then(|v| v.as_str()).unwrap_or("");
+            let allowed_ips = p_settings.get("allowed_ips").and_then(|v| v.as_str()).unwrap_or("0.0.0.0/0");
+            let mtu = p_settings.get("mtu").and_then(|v| v.as_u64()).unwrap_or(1420);
+
+            // Peer endpoint: URL import sets profile.address:port; form stores in protocol_settings["endpoint"]
+            let profile_addr = profile.address.as_deref().filter(|s| !s.is_empty());
+            let (peer_addr, peer_port): (String, u16) = if let Some(addr) = profile_addr {
+                (addr.to_string(), port)
+            } else if let Some(ep) = p_settings.get("endpoint").and_then(|v| v.as_str()) {
+                if let Some((host, port_str)) = ep.rsplit_once(':') {
+                    (host.to_string(), port_str.parse::<u16>().unwrap_or(51820))
+                } else {
+                    (ep.to_string(), 51820)
+                }
+            } else {
+                (String::new(), 0u16)
+            };
+
+            let mut out = json!({
+                "tag": "proxy",
+                "type": "wireguard",
+                "private_key": private_key,
+                "address": [],
+                "mtu": mtu,
+            });
+
+            if !public_key.is_empty() && !peer_addr.is_empty() {
+                let peer = json!({
+                    "address": peer_addr,
+                    "port": peer_port,
+                    "public_key": public_key,
+                    "allowed_ips": [allowed_ips],
+                });
+                out["peers"] = json!([peer]);
+            }
+
+            Ok(out)
+        }
         _ => Err(BuildError::InvalidProfile(format!(
             "Protocol {protocol:?} not supported for sing-box outbound"
         ))),
@@ -344,6 +579,141 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
         .map(|part| part.trim())
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+fn parse_settings(profile: &Profile) -> (Value, Value) {
+    let p = profile
+        .protocol_settings
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+    let s = profile
+        .stream_settings
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+    (p, s)
+}
+
+/// Build the TLS sub-object for sing-box outbound.
+/// Checks both protocol_settings (URL imports) and stream_settings (forms).
+fn build_tls(profile: &Profile) -> Option<Value> {
+    let (p_settings, s_settings) = parse_settings(profile);
+
+    let enabled = p_settings
+        .get("sni")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || s_settings
+            .get("tls.enable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
+        || s_settings
+            .get("reality.show")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+    if !enabled {
+        return None;
+    }
+
+    let mut tls = serde_json::Map::new();
+    tls.insert("enabled".into(), json!(true));
+
+    // server_name: protocol.sni > stream.sni > profile.address
+    let sni = p_settings
+        .get("sni")
+        .and_then(|v| v.as_str())
+        .or_else(|| s_settings.get("sni").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile.address.as_deref().filter(|s| !s.is_empty()));
+    if let Some(sni) = sni {
+        tls.insert("server_name".into(), json!(sni));
+    }
+
+    // insecure: protocol.insecure > protocol.allow_insecure > stream.allow_insecure
+    let insecure = p_settings
+        .get("insecure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || p_settings
+            .get("allow_insecure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || s_settings
+            .get("allow_insecure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    if insecure {
+        tls.insert("insecure".into(), json!(true));
+    }
+
+    // alpn: comma-separated string
+    let alpn = p_settings
+        .get("alpn")
+        .and_then(|v| v.as_str())
+        .or_else(|| s_settings.get("alpn").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty());
+    if let Some(a) = alpn {
+        let parts: Vec<&str> = a.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        if !parts.is_empty() {
+            tls.insert("alpn".into(), json!(parts));
+        }
+    }
+
+    // utls.fingerprint: stream.fingerprint
+    if let Some(fp) = s_settings
+        .get("fingerprint")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let mut utls = serde_json::Map::new();
+        utls.insert("enabled".into(), json!(true));
+        utls.insert("fingerprint".into(), json!(fp));
+        tls.insert("utls".into(), json!(utls));
+    }
+
+    // reality: check both URL-import (security) and form (reality.show) paths
+    let is_reality = s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
+        || s_settings.get("reality.show").and_then(|v| v.as_bool()).unwrap_or(false);
+    if is_reality {
+        let mut reality = serde_json::Map::new();
+        reality.insert("enabled".into(), json!(true));
+        // stream_settings reality keys: URL import uses flat "pbk"/"sid"/"spx"
+        // realitySettings sub-object also checked for backwards compat
+        if let Some(pbk) = s_settings.get("pbk").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            .or_else(|| s_settings.get("realitySettings")
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get("publicKey").and_then(|v| v.as_str()))
+            )
+        {
+            reality.insert("public_key".into(), json!(pbk));
+        }
+        if let Some(sid) = s_settings.get("sid").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            .or_else(|| s_settings.get("realitySettings")
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get("shortId").and_then(|v| v.as_str()))
+            )
+        {
+            reality.insert("short_id".into(), json!(sid));
+        }
+        if let Some(spx) = s_settings.get("spx").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            .or_else(|| s_settings.get("realitySettings")
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get("spiderX").and_then(|v| v.as_str()))
+            )
+        {
+            reality.insert("short_id".into(), json!(spx));
+        }
+        // Only add reality block if it has meaningful content beyond "enabled"
+        if reality.len() > 1 {
+            tls.insert("reality".into(), json!(reality));
+        }
+    }
+
+    Some(json!(tls))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -549,9 +919,182 @@ mod tests {
     }
 
     #[test]
-    fn singbox_unsupported_protocol_returns_error() {
-        // Vless is xray-native, not sing-box
-        let profile = test_profile(Protocol::Vless.to_i32());
+    fn singbox_shadowsocksr_config() {
+        let mut profile = test_profile(Protocol::ShadowsocksR.to_i32());
+        profile.config_type = Protocol::ShadowsocksR.to_i32();
+        profile.protocol_settings = Some(r#"{"method":"aes-256-cfb","obfs":"tls1.2_ticket_auth","obfs_param":"www.example.com","protocol":"auth_aes128_md5","protocol_param":"test"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "shadowsocksr");
+        assert_has_standard_outbounds(&json);
+        let proxy = &json["outbounds"].as_array().unwrap()[0];
+        assert_eq!(proxy["method"], "aes-256-cfb");
+        assert_eq!(proxy["obfs"], "tls1.2_ticket_auth");
+    }
+
+    #[test]
+    fn singbox_hysteria_config() {
+        let mut profile = test_profile(Protocol::Hysteria.to_i32());
+        profile.config_type = Protocol::Hysteria.to_i32();
+        profile.protocol_settings = Some(r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "hysteria");
+        assert_has_standard_outbounds(&json);
+        let proxy = &json["outbounds"].as_array().unwrap()[0];
+        assert_eq!(proxy["auth_str"], "test123");
+        assert_eq!(proxy["up_mbps"], 50);
+        assert_eq!(proxy["down_mbps"], 100);
+        assert_eq!(proxy["tls"]["server_name"], "custom.example.com");
+    }
+
+    #[test]
+    fn singbox_naive_config() {
+        let mut profile = test_profile(Protocol::Naive.to_i32());
+        profile.config_type = Protocol::Naive.to_i32();
+        profile.protocol_settings = Some(r#"{"user":"me","password":"pass456"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "naive");
+        assert_has_standard_outbounds(&json);
+    }
+
+    #[test]
+    fn singbox_anytls_config() {
+        let mut profile = test_profile(Protocol::AnyTls.to_i32());
+        profile.config_type = Protocol::AnyTls.to_i32();
+        profile.protocol_settings = Some(r#"{"password":"any-secret","sni":"tls.example.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "anytls");
+        assert_has_standard_outbounds(&json);
+    }
+
+    #[test]
+    fn singbox_shadowtls_config() {
+        let mut profile = test_profile(Protocol::ShadowTls.to_i32());
+        profile.config_type = Protocol::ShadowTls.to_i32();
+        profile.protocol_settings = Some(r#"{"password":"shadow-pw","version":"3","sni":"shadow.example.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "shadowtls");
+        assert_has_standard_outbounds(&json);
+        let proxy = &json["outbounds"].as_array().unwrap()[0];
+        assert_eq!(proxy["version"], 3);
+    }
+
+    #[test]
+    fn singbox_tor_config() {
+        let profile = test_profile(Protocol::Tor.to_i32());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "tor");
+        assert_has_standard_outbounds(&json);
+    }
+
+    #[test]
+    fn singbox_ssh_config() {
+        let mut profile = test_profile(Protocol::Ssh.to_i32());
+        profile.protocol_settings = Some(r#"{"host":"ssh.example.com","ssh_port":2222,"username":"admin","password":"ssh-pw"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "ssh");
+        assert_has_standard_outbounds(&json);
+        let proxy = &json["outbounds"].as_array().unwrap()[0];
+        assert_eq!(proxy["server"], "ssh.example.com");
+        assert_eq!(proxy["server_port"], 2222);
+        assert_eq!(proxy["user"], "admin");
+    }
+
+    #[test]
+    fn singbox_tailscale_config() {
+        let mut profile = test_profile(Protocol::Tailscale.to_i32());
+        profile.protocol_settings = Some(r#"{"auth_key":"tskey-auth-xxxx","control_url":"https://control.tailscale.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "tailscale");
+        assert_has_standard_outbounds(&json);
+    }
+
+    #[test]
+    fn singbox_vmess_config() {
+        let mut profile = test_profile(Protocol::Vmess.to_i32());
+        profile.stream_settings = Some(r#"{"tls.enable":true,"sni":"vmess.example.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "vmess");
+        assert_has_standard_outbounds(&json);
+        assert_eq!(json["outbounds"].as_array().unwrap()[0]["tls"]["enabled"], true);
+    }
+
+    #[test]
+    fn singbox_vless_config() {
+        let mut profile = test_profile(Protocol::Vless.to_i32());
+        profile.protocol_settings = Some(r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "vless");
+        assert_has_standard_outbounds(&json);
+        let proxy = &json["outbounds"].as_array().unwrap()[0];
+        assert_eq!(proxy["flow"], "xtls-rprx-vision");
+        assert_eq!(proxy["tls"]["server_name"], "vless.example.com");
+    }
+
+    #[test]
+    fn singbox_trojan_config() {
+        let mut profile = test_profile(Protocol::Trojan.to_i32());
+        profile.stream_settings = Some(r#"{"tls.enable":true,"sni":"trojan.example.com"}"#.to_string());
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "trojan");
+        assert_has_standard_outbounds(&json);
+        assert_eq!(json["outbounds"].as_array().unwrap()[0]["tls"]["server_name"], "trojan.example.com");
+    }
+
+    #[test]
+    fn singbox_wireguard_config() {
+        let mut profile = test_profile(Protocol::WireGuard.to_i32());
+        profile.protocol_settings = Some(r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820"}"#.to_string());
+        profile.address = None;
+        profile.port = None;
+        let (params, rules, dns) = default_params();
+        let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        assert_proxy_outbound(&json, "wireguard");
+        assert_has_standard_outbounds(&json);
+        let proxy = &json["outbounds"].as_array().unwrap()[0];
+        assert_eq!(proxy["mtu"], 1380);
+        assert_eq!(proxy["peers"][0]["address"], "wg.example.com");
+        assert_eq!(proxy["peers"][0]["port"], 51820);
+    }
+
+    #[test]
+    fn singbox_truly_unsupported_protocol_returns_error() {
+        // Dns is xray-only, not supported by sing-box outbound builder
+        let profile = test_profile(Protocol::Dns.to_i32());
         let (params, rules, dns) = default_params();
         let result = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns);
         assert!(result.is_err(), "unsupported protocol should return error");
