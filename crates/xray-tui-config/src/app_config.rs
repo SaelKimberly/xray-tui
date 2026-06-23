@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub statistics: StatisticsConfig,
     #[serde(default)]
     pub updates: UpdateConfig,
+    #[serde(default)]
+    pub parsing: ParsingSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,4 +259,12 @@ impl Default for UpdateConfig {
             sing_box_latest_known: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParsingSettings {
+    #[serde(default)]
+    pub allow_private_ips: bool,
+    #[serde(default)]
+    pub reject_insecure: bool,
 }

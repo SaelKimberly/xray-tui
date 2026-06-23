@@ -6,7 +6,7 @@ use std::path::Path;
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use futures_util::StreamExt;
-use xray_tui_config::AppConfig;
+use xray_tui_config::{AppConfig, ValidationSettings};
 use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
@@ -172,6 +172,12 @@ pub enum CoreEvent {
         level: String,
         message: String,
     },
+    /// A log line from the TUI internals via tracing.
+    TuiLog {
+        target: String,
+        level: String,
+        message: String,
+    },
     SubscriptionsUpdated {
         group_id: String,
         count: usize,
@@ -259,6 +265,17 @@ pub struct AppState {
     pub test_progress: Option<(usize, usize)>,
     /// Cached update status for both backends.
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
+    pub actions_compact: bool,
+    pub connected_profile_id: Option<String>,
+    pub last_core_log: Option<(String, String)>,
+    pub last_tui_log: Option<(String, String, String)>,
+    pub last_test_tcp: Option<u64>,
+    pub last_test_real: Option<u64>,
+    pub last_test_speed: Option<u64>,
+    pub current_traffic_up: i64,
+    pub current_traffic_down: i64,
+    pub current_memory: u64,
+    pub term_height: Cell<u16>,
 }
 
 /// Internal helper for batch ping deduplication.
@@ -269,6 +286,7 @@ struct UniqueTarget {
 
 impl AppState {
     pub fn new(db: Database, config: AppConfig) -> Self {
+        let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = Self {
             db,
             config,
@@ -290,8 +308,8 @@ impl AppState {
             connected_core: None,
             connecting: false,
             connection_error: None,
-            core_event_rx: None,
-            core_event_tx: None,
+            core_event_rx: Some(core_rx),
+            core_event_tx: Some(core_tx),
             disconnect_tx: None,
             should_quit: false,
             mode: AppMode::List,
@@ -303,6 +321,17 @@ impl AppState {
             testing_profiles: HashSet::new(),
             test_progress: None,
             system_stats: None,
+            actions_compact: false,
+            connected_profile_id: None,
+            last_core_log: None,
+            last_tui_log: None,
+            last_test_tcp: None,
+            last_test_real: None,
+            last_test_speed: None,
+            current_traffic_up: 0,
+            current_traffic_down: 0,
+            current_memory: 0,
+            term_height: Cell::new(80),
         };
         state.reload_profiles();
         state.reload_groups();
@@ -466,6 +495,16 @@ impl AppState {
             self.log_buffer.remove(0);
         }
     }
+    /// Log to the TUI log buffer AND emit a tracing event (target "tui").
+    pub fn log_trace(&mut self, level: &str, _target: &str, message: &str) {
+        match level {
+            "info" => tracing::info!(target: "tui", "{message}"),
+            "error" => tracing::error!(target: "tui", "{message}"),
+            "warn" | "warning" => tracing::warn!(target: "tui", "{message}"),
+            _ => tracing::info!(target: "tui", "{message}"),
+        }
+        self.add_log(level, message);
+    }
     // ── CRUD operations ──────────────────────────────────────────────────
 
     pub fn start_add_server(&mut self) {
@@ -600,17 +639,16 @@ impl AppState {
                 ..
             } => (*p, fields.clone()),
             _ => {
-                self.add_log("error", "Cannot confirm: no protocol selected");
+                self.log_trace("error", "tui", "Cannot confirm: no protocol selected");
                 return;
             }
         };
         let profile = self.fields_to_profile(protocol, &fields);
         if let Err(e) = self.db.insert_profile(&profile) {
-            self.add_log("error", &format!("Failed to add server: {e}"));
+            self.log_trace("error", "tui", &format!("Failed to add server: {e}"));
             return;
         }
-        self.add_log(
-            "info",
+        self.log_trace("info", "tui",
             &format!(
                 "Added server: {}",
                 profile.remarks.as_deref().unwrap_or("unnamed")
@@ -970,7 +1008,8 @@ impl AppState {
     }
 
     pub fn import_url(&mut self, url: &str) {
-        match xray_tui_config::import_export::parse_share_url(url) {
+        let settings = ValidationSettings::from(self.config.parsing.clone());
+        match xray_tui_config::import_export::parse_share_url(url, &settings) {
             Ok(profile) => {
                 let protocol =
                     Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
@@ -992,9 +1031,10 @@ impl AppState {
     }
 
     pub fn start_batch_import(&mut self, urls: &[String]) {
+        let settings = ValidationSettings::from(self.config.parsing.clone());
         let results: Vec<BatchImportItem> = urls
             .iter()
-            .map(|url| match xray_tui_config::import_export::parse_share_url(url) {
+            .map(|url| match xray_tui_config::import_export::parse_share_url(url, &settings) {
                 Ok(profile) => BatchImportItem {
                     url: url.clone(),
                     profile: Some(profile),
@@ -1133,6 +1173,7 @@ impl AppState {
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.disconnect_tx = Some(stop_tx);
         self.connecting = true;
+        self.connected_profile_id = Some(profile_id.to_string());
         self.connection_error = None;
 
         let tx = match &self.core_event_tx {
@@ -1347,8 +1388,9 @@ impl AppState {
             let _ = tx.send(());
         }
         self.connected_core = None;
+        self.connected_profile_id = None;
         self.connecting = false;
-        self.add_log("info", "Disconnected");
+        self.log_trace("info", "core", "Disconnected");
     }
 
     // ── Speed test methods ────────────────────────────────────────
@@ -1636,24 +1678,26 @@ impl AppState {
                     self.connected_core = Some(core_type);
                     self.connecting = false;
                     self.connection_error = None;
-                    self.add_log("info", &format!("Connected [{core_type}]"));
+                    self.log_trace("info", "core", &format!("Connected [{core_type}]"));
                 }
                 CoreEvent::Disconnected => {
                     // Ignore stale Disconnected if already reconnecting
                     if !self.connecting {
                         self.connected_core = None;
-                        self.add_log("info", "Core process stopped");
+                        self.connected_profile_id = None;
+                        self.log_trace("info", "core", "Core process stopped");
                     }
                 }
                 CoreEvent::Error(err) => {
                     self.connection_error = Some(err.clone());
                     self.connecting = false;
                     self.connected_core = None;
-                    self.add_log("error", &format!("Connection error: {err}"));
+                    self.log_trace("error", "core", &format!("Connection error: {err}"));
+                    self.connected_profile_id = None;
                 }
                 CoreEvent::StatsError(msg) => {
                     self.connection_error = Some(msg.clone());
-                    self.add_log("warning", &format!("Stats error: {msg}"));
+                    self.log_trace("warning", "core", &format!("Stats error: {msg}"));
                 }
                 CoreEvent::StatsUpdate {
                     profile_id,
@@ -1681,12 +1725,22 @@ impl AppState {
                     {
                         row.stats = Some(stats);
                     }
+                    self.current_traffic_up = total_up;
+                    self.current_traffic_down = total_down;
                 }
                 CoreEvent::SysStatsUpdate(stats) => {
+                    self.current_memory = stats.alloc;
                     self.system_stats = Some(stats);
                 }
                 CoreEvent::LogLine { level, message } => {
+                    self.last_core_log = Some((level.clone(), message.clone()));
                     self.add_log(&level, &message);
+                }
+                CoreEvent::TuiLog { target, level, message } => {
+                    self.last_tui_log = Some((target.clone(), level.clone(), message.clone()));
+                    if target == "validation" {
+                        self.add_log(&level, &message);
+                    }
                 }
                 CoreEvent::SubscriptionsUpdated {
                     group_id,
@@ -1695,9 +1749,9 @@ impl AppState {
                 } => {
                     self.updating_groups.remove(&group_id);
                     if let Some(err) = error {
-                        self.add_log("error", &format!("Subscription update failed: {err}"));
+                        self.log_trace("error", "subscription", &format!("Subscription update failed: {err}"));
                     } else {
-                        self.add_log("info", &format!("Subscription updated: {count} profiles"));
+                        self.log_trace("info", "subscription", &format!("Subscription updated: {count} profiles"));
                     }
                     self.reload_profiles();
                     self.reload_groups();
@@ -1746,10 +1800,7 @@ impl AppState {
 
                     match error {
                         Some(ref err) => {
-                            self.add_log(
-                                "warn",
-                                &format!("{test_type:?} failed for {name}: {err}"),
-                            );
+                            self.log_trace("warn", "speedtest", &format!("{test_type:?} failed for {name}: {err}"));
                         }
                         None => {
                             let latency_str =
@@ -1763,18 +1814,23 @@ impl AppState {
                             } else {
                                 "success".to_string()
                             };
-                            self.add_log("info", &format!("{test_type:?} {name}: {detail}"));
+                            self.log_trace("info", "speedtest", &format!("{test_type:?} {name}: {detail}"));
                         }
+                    }
+
+                    // Update tracking fields for actions log
+                    match test_type {
+                        TestType::TcpPing => self.last_test_tcp = latency_ms,
+                        TestType::RealPing => self.last_test_real = latency_ms,
+                        TestType::SpeedTest => self.last_test_speed = speed_bps,
+                        TestType::UdpTest => {} // no tracking for UDP
                     }
 
                     // Update batch progress — use take() to avoid borrowing self.test_progress
                     if let Some((done, total)) = self.test_progress.take() {
                         let new_done = done + 1;
                         if new_done >= total {
-                            self.add_log(
-                                "info",
-                                &format!("Batch complete: {new_done}/{total} profiles tested"),
-                            );
+                            self.log_trace("info", "speedtest", &format!("Batch complete: {new_done}/{total} profiles tested"));
                         } else {
                             self.test_progress = Some((new_done, total));
                         }
@@ -2021,8 +2077,9 @@ impl AppState {
             .join("xray-tui")
             .join("data.db");
 
+        let validation: ValidationSettings = self.config.parsing.clone().into();
         tokio::spawn(async move {
-            let result = Self::do_update_subscription(url, user_agent, gid.clone(), db_path).await;
+            let result = Self::do_update_subscription(url, user_agent, gid.clone(), db_path, validation).await;
             if let Some(tx) = &tx {
                 let _ = tx.send(CoreEvent::SubscriptionsUpdated {
                     group_id: result.0,
@@ -2038,6 +2095,7 @@ impl AppState {
         user_agent: String,
         group_id: String,
         db_path: std::path::PathBuf,
+        validation: ValidationSettings,
     ) -> (String, usize, Option<String>) {
         let client = match reqwest::Client::builder()
             .user_agent(&user_agent)
@@ -2055,8 +2113,7 @@ impl AppState {
             Ok(b) => b,
             Err(e) => return (group_id, 0, Some(format!("Body: {e}"))),
         };
-
-        let profiles = match xray_tui_config::subscription::parse_subscription_data(&bytes) {
+        let profiles = match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
             Ok(p) => p,
             Err(e) => return (group_id, 0, Some(e)),
         };
@@ -2221,7 +2278,7 @@ impl AppState {
             .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
             .join("xray-tui")
             .join("data.db");
-
+        let validation: ValidationSettings = self.config.parsing.clone().into();
         tokio::spawn(async move {
             use std::time::Duration;
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -2250,7 +2307,7 @@ impl AppState {
                         .clone()
                         .unwrap_or_else(|| "xray-tui/0.1".into());
                     let gid = group.id.clone();
-                    let result = Self::do_update_subscription(url, ua, gid, db_path.clone()).await;
+                    let result = Self::do_update_subscription(url, ua, gid, db_path.clone(), validation.clone()).await;
                     let _ = tx.send(CoreEvent::SubscriptionsUpdated {
                         group_id: result.0,
                         count: result.1,

@@ -231,6 +231,65 @@ Opened with `?` from any main screen. Rounded-border centered modal listing
 keyboard shortcuts grouped by current context (Profiles, Settings, Statistics,
 or Logs). `Esc` or `?` closes.
 
+
+### Actions Log
+
+A live state information panel showing current system state, connection info,
+test results, and recent log lines. Supports two views toggled with `F1`:
+
+**Compact bar** (1 line, default in terminals <20 rows tall):
+
+```
+⠋ VMess/my-server 1.2.3.4:443 | TCP:45ms RP:120ms SPD:15Mbps | ⬆1.2GB ⬇3.4GB | Info Xray 1.8.0 started
+```
+
+Connection indicators:
+- `⠋` yellow — connecting
+- `●` green — connected
+- `⏹` red — error
+- `⏏` yellow — disconnected (profile selected but not connected)
+- `○` gray — no profile
+
+Segments (compact): server info, test results (only when available), traffic,
+last core log snippet.
+
+**Full panel** (8 rows, default in terminals ≥20 rows tall):
+
+```
+┌─ ⚙ Actions Log ───────────────────────────────────────┐
+│ ● Connected [xray]                                      │
+│ 🖥 VLESS  us.example.com:443                            │
+│ ⏱ TCP:45ms  RP:120ms  SPD:15Mbps                       │
+│ 📊 ⬆1.2GB  ⬇3.4GB    💾 64.2MB                         │
+│ 📋 Core: [Info] Xray 1.8.0 started                      │
+│ 📋 TUI:  [Info] Connected [xray] (core)                 │
+└────────────────────────────────────────────────────────┘
+```
+
+Rows:
+1. Connection status (icon + state + backend type)
+2. Server info (protocol, remarks, address, port)
+3. Test results (TCP ping, real ping, speed — `-` for unavailable)
+4. Traffic (upload/download from stats API) and memory usage
+5. Last core log line (from core process stderr/log channel)
+6. Last TUI log line (from `tracing` events, with target tag)
+
+**Behavior:**
+- Default view depends on terminal height: compact if <20 rows, full if ≥20
+- `F1` toggles between compact and full at any time
+- In terminals <20 rows, full panel replaces content area as an overlay.
+  Press `F1` or `Esc` to close the overlay.
+- In normal terminals, full panel renders inline below the tab bar.
+  Content area adjusts automatically.
+
+Tracing integration (backend logging):
+- TUI internals emit `tracing` events via `tracing-subscriber` with a
+  custom `TuiLogLayer` that forwards events to the core event channel
+- Events carry a `target` field (`core`, `tui`, `speedtest`, `subscription`)
+- Viewable in the Actions Log panel and (if stderr is captured) in
+  `RUST_LOG=xray_tui=info stderr.log`
+- Key operations (connect, disconnect, speed test, subscription updates)
+  emit tracing events for real-time visibility
 ---
 
 ## Status Bar
@@ -265,16 +324,14 @@ appended when updates are available for installed backends.
 
 | Context                 | Hints                                    |
 | ----------------------- | ---------------------------------------- |
-| Profiles (disconnected) | `[Ctrl+Enter] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
-| Profiles (connecting)   | `[Tab] Next  [?] Help  [Ctrl+Q] Quit`   |
-| Profiles (connected)    | `[Ctrl+Shift+C] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
+| Profiles (disconnected) | `[F1] Actions Log  [Ctrl+Enter] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
+| Profiles (connecting)   | `[F1] Actions Log  [Tab] Next  [?] Help  [Ctrl+Q] Quit`   |
+| Profiles (connected)    | `[F1] Actions Log  [Ctrl+Shift+C] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
 | Settings menu           | `[↑↓] Navigate  [Enter] Open  [Esc] Close` |
 | Settings form           | `[Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel` |
 | Speed test menu         | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
 | Help overlay            | `[Esc] Close help`                       |
-| Logs / Statistics       | `[?] Help  [Ctrl+Q] Quit`               |
-
----
+| Logs / Statistics       | `[F1] Actions Log  [?] Help  [Ctrl+Q] Quit`               |
 
 ## Keyboard Shortcuts — Full Reference
 
@@ -303,6 +360,7 @@ appended when updates are available for installed backends.
 | `Tab` / `Shift+Tab` | Cycle through tabs               |
 | `?`              | Toggle help overlay                 |
 | `q` / `Ctrl+C`   | Quit application                    |
+| `F1`             | Toggle actions log compact/full view |
 | `Ctrl+Shift+C`   | Disconnect from active server       |
 
 ### Settings Tab

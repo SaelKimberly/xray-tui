@@ -14,14 +14,14 @@ cargo run
 ## Key Source Files
 
 ### Crate entry points
-- `crates/xray-tui/src/main.rs` — binary entry, tokio::main, subsystem init
+    - `crates/xray-tui/src/main.rs` — binary entry, tokio::main, TuiLogLayer tracing subscriber + subsystem init
 - `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode, SettingsSection
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 - `crates/xray-tui-db/src/lib.rs` — database layer + query methods
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
-- `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain)
+    - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain) with per-profile validation via ValidationSettings
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
@@ -40,6 +40,7 @@ cargo run
 - `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - `statistics.rs` — live traffic and system stats display
 - `theme.rs` — central color palette and Style definitions (Theme struct)
+- `actions_log.rs` — live state info panel: connection status, server info, test results, traffic/memory, recent logs
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API
@@ -103,8 +104,8 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
 
 ### Adding batch import for share URLs
-1. Parse each URL with `parse_share_url()` from `xray_tui_config::import_export`
-2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }` 
+1. Parse each URL with `parse_share_url(url, &config.validation)` from `xray_tui_config::import_export`
+2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }`
 3. Render scrollable success/failure list in `profiles.rs` (`render_batch_import()`)
 4. Batch import mode handles keys: Up/Down scroll, Enter saves all successful imports via `db.add_profile()`, Esc cancels
 5. Reference `crates/xray-tui/src/lib.rs` `start_batch_import()` method for the pattern

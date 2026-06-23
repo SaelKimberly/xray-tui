@@ -49,6 +49,16 @@ pub struct AppState {
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub previous_mode: Option<Box<AppMode>>,
     pub should_quit: bool,
+    pub actions_compact: bool,
+    pub connected_profile_id: Option<String>,
+    pub last_core_log: Option<(String, String)>,
+    pub last_tui_log: Option<(String, String, String)>,
+    pub last_test_tcp: Option<u64>,
+    pub last_test_real: Option<u64>,
+    /// terminal height (Atomics for interior mutability across render thread)
+    pub term_height: AtomicU16,
+    pub core_event_tx: Option<UnboundedSender<CoreEvent>>,
+    pub core_event_rx: Option<UnboundedReceiver<CoreEvent>>,
 }
 
 ### CoreEvent Channel
@@ -72,6 +82,13 @@ pub enum CoreEvent {
     UpdateCompleted { core_type, old_version, new_version, success, error },
     /// A log line from the core process stdout (xray-core) or stderr (sing-box).
     LogLine {
+        level: String,
+        message: String,
+    },
+    },
+    /// A log line from the TUI internals forwarded through tracing subscriber.
+    TuiLog {
+        target: String,
         level: String,
         message: String,
     },
@@ -100,9 +117,9 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `settings.rs` — Full settings panel (Phase 6). Menu listing 10 config sections: Core, GUI, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates. Each opens a form overlay. Routing/DNS forms persist to DB; all others persist to AppConfig JSON.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `logs.rs` — Log viewer
+- `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 ...
 - `theme.rs` — Central color palette and Style definitions (Theme struct with 19 constants across 6 groups)
-Future screens (Phase 7+): config template editor, global hotkeys, etc.
 
 **`speed_test.rs`** — Async speed test engine:
 ```rust

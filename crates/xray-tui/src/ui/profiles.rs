@@ -1,12 +1,13 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{CoreType, resolve_core, format_bytes, format_uptime};
+use xray_tui_core::{CoreType, resolve_core};
 
 use crate::ui::theme::Theme;
+use crate::ui::render_confirmation_overlay;
 use crate::{AppState, ConfirmAction};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -19,7 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Length(1),
             Constraint::Length(gauge_height),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -70,23 +71,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         _ => {}
     }
-}
-
-fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
-    let overlay_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Red)
-        .add_modifier(Modifier::BOLD);
-    let overlay_para = Paragraph::new(text.to_string()).style(overlay_style);
-    let overlay_area = Rect::new(
-        area.width
-            .saturating_sub(text.len() as u16 + 4)
-            .min(area.width),
-        area.height.saturating_sub(2),
-        text.len() as u16 + 4,
-        1,
-    );
-    frame.render_widget(overlay_para, overlay_area);
 }
 
 fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -284,12 +268,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let has_profile = state.selected_index < state.profiles.len();
-    let connected = state.connected_core.is_some();
 
-    let mut lines = Vec::new();
-
-    // Line 1: server info (always present if profiles exist)
-    if has_profile {
+    let line = if has_profile {
         let row = &state.profiles[state.selected_index];
         let protocol = Protocol::try_from_i32(row.profile.config_type)
             .unwrap_or(Protocol::Custom);
@@ -301,53 +281,17 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         let addr = row.profile.address.as_deref().unwrap_or("-");
         let port = row.profile.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
 
-        lines.push(Line::from(vec![
+        Line::from(vec![
             Span::styled(" Server: ", Theme::FOOTER_LABEL),
             Span::styled(remarks, Theme::FOOTER_VALUE),
             Span::styled(format!("  {}:{}  ", addr, port), Theme::FOOTER_VALUE),
             Span::styled(format!("[{}] ", protocol), Theme::FOOTER_VALUE),
             Span::styled(core.to_string(), Theme::FOOTER_VALUE),
-        ]));
+        ])
     } else {
-        lines.push(Line::from(Span::styled(" Server: (none selected)", Theme::FOOTER_LABEL)));
-    }
+        Line::from(Span::styled(" Server: (none selected)", Theme::FOOTER_LABEL))
+    };
 
-    // Line 2: traffic
-    if connected && has_profile {
-        if let Some(ref stats) = state.profiles[state.selected_index].stats {
-            let tu = format_traffic(stats.total_up.unwrap_or(0) as u64);
-            let td = format_traffic(stats.total_down.unwrap_or(0) as u64);
-            let du = format_traffic(stats.today_up.unwrap_or(0) as u64);
-            let dd = format_traffic(stats.today_down.unwrap_or(0) as u64);
-            lines.push(Line::from(vec![
-                Span::styled(" Traffic: ", Theme::FOOTER_LABEL),
-                Span::styled(format!("Today {}↑  {}↓  ", du.trim(), dd.trim()), Theme::FOOTER_VALUE),
-                Span::styled(format!("Total {}↑  {}↓", tu.trim(), td.trim()), Theme::FOOTER_VALUE),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(" Traffic: (no data yet)", Theme::FOOTER_LABEL)));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(" Traffic: (not connected)", Theme::FOOTER_LABEL)));
-    }
-
-    // Line 3: system stats
-    if connected {
-        if let Some(ref sys) = state.system_stats {
-            let mem = format_bytes(sys.alloc as i64);
-            lines.push(Line::from(vec![
-                Span::styled(" System: ", Theme::FOOTER_LABEL),
-                Span::styled(format!("Mem: {}  ", mem), Theme::FOOTER_VALUE),
-                Span::styled(format!("Goroutines: {}  ", sys.num_goroutine), Theme::FOOTER_VALUE),
-                Span::styled(format!("Uptime: {}", format_uptime(sys.uptime)), Theme::FOOTER_VALUE),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(" System: (no data yet)", Theme::FOOTER_LABEL)));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(" System: (not connected)", Theme::FOOTER_LABEL)));
-    }
-
-    let footer = Paragraph::new(lines).style(Theme::STATUS_FOOTER);
+    let footer = Paragraph::new(line).style(Theme::STATUS_FOOTER);
     frame.render_widget(footer, area);
 }

@@ -849,7 +849,7 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
         KeyCode::Char('d' | 'D') => {
             if !rules.is_empty() && selected < rules.len() {
                 let _ = state.db.delete_routing_rule(&rules[selected].id);
-                state.add_log("info", "Routing rule deleted");
+                state.log_trace("info", "tui", "Routing rule deleted");
                 let new_max = rules.len().saturating_sub(2);
                 if let AppMode::Settings {
                     mode: SettingsMode::RoutingList { ref mut selected },

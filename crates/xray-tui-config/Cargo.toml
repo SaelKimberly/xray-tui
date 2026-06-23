@@ -20,3 +20,4 @@ xray-tui-db = { path = "../xray-tui-db" }
 uuid = { version = "1", features = ["v4"] }
 smallvec = { version = "1", features = ["const_new"] }
 once_cell = "1"
+tracing = "0.1"

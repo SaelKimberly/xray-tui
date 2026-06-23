@@ -5,6 +5,7 @@ pub mod profiles;
 pub mod settings;
 pub mod statistics;
 pub mod status_bar;
+pub mod actions_log;
 pub mod theme;
 use xray_tui_config::subscription::subscription_url_split;
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
@@ -23,6 +24,22 @@ use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
 
+pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
+    let overlay_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Red)
+        .add_modifier(Modifier::BOLD);
+    let overlay_para = Paragraph::new(text.to_string()).style(overlay_style);
+    let overlay_area = Rect::new(
+        area.width
+            .saturating_sub(text.len() as u16 + 4)
+            .min(area.width),
+        area.height.saturating_sub(2),
+        text.len() as u16 + 4,
+        1,
+    );
+    frame.render_widget(overlay_para, overlay_area);
+}
 // ── Entry point ───────────────────────────────────────────────────────
 
 pub fn run(state: &mut AppState) -> anyhow::Result<()> {
@@ -31,6 +48,8 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    let ts = terminal.size().unwrap_or_default();
+    state.actions_compact = ts.height < 20;
     let (tx, rx) = mpsc::channel::<Event>();
     std::thread::spawn(move || {
         while let Ok(ev) = event::read() {
@@ -43,10 +62,7 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     let refresh_interval = Duration::from_secs(state.config.gui.refresh_interval_secs);
     let mut last_tick = std::time::Instant::now();
 
-    // Create core event channel for async core process communication
-    let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
-    state.core_event_tx = Some(core_tx);
-    state.core_event_rx = Some(core_rx);
+    // (channels already created in AppState::new)
 
     // Trigger startup version check if enabled
     if state.config.updates.check_on_startup {
@@ -71,7 +87,8 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
         if last_tick.elapsed() >= refresh_interval {
             last_tick = std::time::Instant::now();
         }
-
+        let ts = terminal.size().unwrap_or_default();
+        state.term_height.set(ts.height);
         terminal.draw(|f| render(f, &*state))?;
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -106,6 +123,12 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
             _ => {}
         }
+        return;
+    }
+
+    // F1 toggles actions panel compact/full — works across all modes
+    if matches!(key.code, KeyCode::F(1)) {
+        state.actions_compact = !state.actions_compact;
         return;
     }
 
@@ -481,7 +504,9 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
         }
         KeyCode::Esc => {
-            if state.confirmation.is_some() {
+            if !state.actions_compact && state.term_height.get() < 20 {
+                state.actions_compact = true; // close overlay in small terminal
+            } else if state.confirmation.is_some() {
                 state.confirmation = None;
             } else {
                 state.selected_group_id = None;
@@ -492,32 +517,66 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
     }
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────
 fn render(frame: &mut Frame, state: &AppState) {
+    const FULL_PANEL_HEIGHT: u16 = 8;
+    const SMALL_THRESH: u16 = 20;
+
+    let is_small = frame.area().height < SMALL_THRESH;
+    let overlay = !state.actions_compact && is_small;
+    let ph = if overlay {
+        0
+    } else if state.actions_compact {
+        1
+    } else {
+        FULL_PANEL_HEIGHT
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(1),      // 0: tabs
+            Constraint::Min(0),         // 1: content
+            Constraint::Length(ph),     // 2: actions panel
+            Constraint::Length(1),      // 3: status bar
         ])
         .split(frame.area());
 
-    // In form/import mode, render form instead of tabs
-    // In form/import/modal mode, render appropriate UI
+    // Overlay mode: full panel replaces content area in small terminals
+    if overlay {
+        render_tabs(frame, chunks[0], state);
+        actions_log::render_full(frame, chunks[1], state);
+        status_bar::render(frame, chunks[3], state);
+        return;
+    }
+
+    // Inline: render actions panel at bottom (chunks[2])
+    if state.actions_compact {
+        actions_log::render_compact(frame, chunks[2], state);
+    } else {
+        actions_log::render_full(frame, chunks[2], state);
+    }
+    // Render tabs — only in modes that show them (not AddServer, EditServer, ImportUrl, Group forms, BatchImport)
+    let is_form_mode = matches!(&state.mode,
+        crate::AppMode::AddServer { .. }
+        | crate::AppMode::EditServer { .. }
+        | crate::AppMode::ImportUrl { .. }
+        | crate::AppMode::ManageGroups { .. }
+        | crate::AppMode::AddGroup { .. }
+        | crate::AppMode::EditGroup { .. }
+        | crate::AppMode::BatchImport { .. }
+    );
+    if !is_form_mode {
+        render_tabs(frame, chunks[0], state);
+    }
     if !matches!(state.mode, crate::AppMode::List) {
-        // SpeedTestMenu renders the profiles underneath, then overlays the menu
         if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
-            render_tabs(frame, chunks[0], state);
             profiles::render(frame, chunks[1], state);
             render_speed_test_menu(frame, chunks[1], state);
-            status_bar::render(frame, chunks[2], state);
+            status_bar::render(frame, chunks[3], state);
             return;
         }
 
-        // Help overlay: render base UI first, then overlay help
         if matches!(&state.mode, crate::AppMode::Help) {
-            render_tabs(frame, chunks[0], state);
             match state.current_tab {
                 Tab::Profiles => profiles::render(frame, chunks[1], state),
                 Tab::Settings => settings::render(frame, chunks[1], state),
@@ -525,7 +584,7 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Tab::Statistics => statistics::render(frame, chunks[1], state),
             }
             render_help_overlay(frame, chunks[1], state);
-            status_bar::render(frame, chunks[2], state);
+            status_bar::render(frame, chunks[3], state);
             return;
         }
 
@@ -549,71 +608,74 @@ fn render(frame: &mut Frame, state: &AppState) {
                 add_server::render_batch_import(frame, chunks[1], state);
             }
             crate::AppMode::Settings { .. } => {
-                render_tabs(frame, chunks[0], state);
                 settings::render(frame, chunks[1], state);
             }
             _ => {}
         }
-        status_bar::render(frame, chunks[2], state);
+        status_bar::render(frame, chunks[3], state);
         return;
     }
-    render_tabs(frame, chunks[0], state);
+
     match state.current_tab {
         Tab::Profiles => profiles::render(frame, chunks[1], state),
         Tab::Settings => settings::render(frame, chunks[1], state),
         Tab::Logs => logs::render(frame, chunks[1], state),
         Tab::Statistics => statistics::render(frame, chunks[1], state),
     }
-    status_bar::render(frame, chunks[2], state);
+    status_bar::render(frame, chunks[3], state);
 }
 fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
-    // Determine context from previous mode
     match &state.mode {
-        _ if state.current_tab == Tab::Profiles => vec![
-            ("↑↓ / PgUp PgDn", "Navigate profiles"),
-            ("Enter", "Set as active server"),
-            ("Ctrl+Enter", "Connect to selected server"),
-            ("Space", "Toggle multi-select"),
-            ("a", "Add new server"),
-            ("e", "Edit selected server"),
-            ("d", "Delete selected server(s)"),
-            ("c", "Clone selected server"),
-            ("g", "Manage subscription groups"),
-            ("t", "Open speed test menu"),
-            ("o", "Cycle sort column"),
-            ("/", "Search/filter"),
-            ("Ctrl+V", "Import share URL"),
-            ("Ctrl+Shift+C", "Copy share URL"),
-            ("Tab / Shift+Tab", "Cycle tabs"),
-            ("?", "Toggle this help"),
-            ("q / Ctrl+C", "Quit"),
-        ],
-        _ if state.current_tab == Tab::Settings => vec![
-            ("↑↓", "Navigate settings menu"),
-            ("Enter", "Open selected section"),
-            ("Esc", "Close settings"),
-            ("Tab / Shift+Tab", "Cycle tabs"),
-            ("?", "Toggle this help"),
-            ("q / Ctrl+C", "Quit"),
-        ],
-        _ if state.current_tab == Tab::Statistics => vec![
-            ("Tab / Shift+Tab", "Cycle tabs"),
-            ("?", "Toggle this help"),
-            ("q / Ctrl+C", "Quit"),
-        ],
-        _ if state.current_tab == Tab::Logs => vec![
-            ("↑↓", "Scroll logs"),
-            ("PgUp / PgDn", "Page up/down"),
-            ("Home / End", "Jump to oldest/newest"),
-            ("Tab / Shift+Tab", "Cycle tabs"),
-            ("?", "Toggle this help"),
-            ("q / Ctrl+C", "Quit"),
-        ],
-        _ => vec![
-            ("Tab / Shift+Tab", "Cycle tabs"),
-            ("?", "Toggle this help"),
-            ("q / Ctrl+C", "Quit"),
-        ],
+        crate::AppMode::Help => match state.previous_mode.as_deref().cloned().unwrap_or(AppMode::List) {
+            AppMode::List => match state.current_tab {
+                Tab::Profiles => vec![
+                    ("↑↓ / PgUp PgDn", "Navigate profiles"),
+                    ("Enter", "Set as active server"),
+                    ("Ctrl+Enter", "Connect to selected server"),
+                    ("Space", "Toggle multi-select"),
+                    ("a", "Add new server"),
+                    ("e", "Edit selected server"),
+                    ("d", "Delete selected server(s)"),
+                    ("c", "Clone selected server"),
+                    ("g", "Manage subscription groups"),
+                    ("t", "Open speed test menu"),
+                    ("o", "Cycle sort column"),
+                    ("/", "Search/filter"),
+                    ("Ctrl+V", "Import share URL"),
+                    ("Ctrl+Shift+C", "Copy share URL"),
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                Tab::Settings => vec![
+                    ("↑↓", "Navigate settings menu"),
+                    ("Enter", "Open selected section"),
+                    ("Esc", "Close settings"),
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                Tab::Statistics => vec![
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                Tab::Logs => vec![
+                    ("↑↓", "Scroll logs"),
+                    ("PgUp / PgDn", "Page up/down"),
+                    ("Home / End", "Jump to oldest/newest"),
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+            },
+            _ => vec![
+                ("Tab / Shift+Tab", "Cycle tabs"),
+                ("?", "Toggle this help"),
+                ("q / Ctrl+C", "Quit"),
+            ],
+        },
+        _ => Vec::new(),
     }
 }
 

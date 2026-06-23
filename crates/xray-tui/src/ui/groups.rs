@@ -9,6 +9,7 @@ use crate::{AppMode, AppState, ConfirmAction};
 use xray_tui_db::models::Group;
 use crate::ui::theme::Theme;
 use crate::ui::profiles::truncate_pad;
+use crate::ui::render_confirmation_overlay;
 pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     // Centered overlay: ~70% width, ~70% height
     let overlay_area = Rect::new(
@@ -144,6 +145,29 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         Theme::HINT,
     )));
     frame.render_widget(footer, chunks[1]);
+
+    // Confirmation overlays: DeleteGroup and ClearGroup
+    match state.confirmation {
+        Some(ConfirmAction::DeleteGroup(ref group_id)) => {
+            let group_name = state
+                .groups
+                .iter()
+                .find(|g| g.id == *group_id)
+                .and_then(|g| g.name.as_deref())
+                .unwrap_or("unknown");
+            render_confirmation_overlay(frame, area, &format!(" Delete \"{group_name}\"? (y/N) "));
+        }
+        Some(ConfirmAction::ClearGroup(ref group_id)) => {
+            let group_name = state
+                .groups
+                .iter()
+                .find(|g| g.id == *group_id)
+                .and_then(|g| g.name.as_deref())
+                .unwrap_or("unknown");
+            render_confirmation_overlay(frame, area, &format!(" Clear all profiles in \"{group_name}\"? (y/N) "));
+        }
+        _ => {}
+    }
 }
 
 pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editing: bool) {
