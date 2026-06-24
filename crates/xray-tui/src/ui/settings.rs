@@ -26,6 +26,7 @@ const MENU_ITEMS: &[(&str, &str)] = &[
     ("Statistics", "enable/disable stats collection"),
     ("Updates", "check and install backend updates"),
     ("Speed Test", "ping URL, IP API, timeouts, batch settings"),
+    ("Logging", "log retention, batch size"),
 ];
 
 /// Separator position between active sections and deferred ones
@@ -46,6 +47,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             | SettingsMode::StatsForm { .. }
             | SettingsMode::DnsForm { .. }
             | SettingsMode::ProtocolCoreForm { .. }
+            | SettingsMode::LoggingForm { .. }
             | SettingsMode::SpeedTestForm { .. } => render_form(frame, area, state),
             SettingsMode::RoutingList { .. } => render_routing_list(frame, area, state),
             SettingsMode::RoutingForm { .. } => render_routing_form(frame, area, state),
@@ -69,6 +71,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::StatsForm { .. }
         | SettingsMode::DnsForm { .. }
         | SettingsMode::ProtocolCoreForm { .. }
+        | SettingsMode::LoggingForm { .. }
         | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key),
         SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key).await,
         SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key).await,
@@ -171,6 +174,7 @@ async fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
                 9 => SettingsSection::Stats,
                 10 => SettingsSection::Updates,
                 11 => SettingsSection::SpeedTest,
+                12 => SettingsSection::Logging,
                 _ => return,
             };
             state.enter_settings_form(section).await;
@@ -192,8 +196,8 @@ fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
         SettingsMode::MuxForm { .. } => " Mux / Fragment ",
         SettingsMode::StatsForm { .. } => " Statistics ",
         SettingsMode::ProtocolCoreForm { .. } => " Protocol Core ",
-        SettingsMode::UpdateForm { .. } => " Backend Updates ",
         SettingsMode::SpeedTestForm { .. } => " Speed Test Settings ",
+        SettingsMode::LoggingForm { .. } => " Logging ",
         _ => " Settings ",
     }
 }
@@ -290,6 +294,10 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
         ],
+        SettingsMode::LoggingForm { .. } => &[
+            ("log_ttl_hours", "Log Retention (hours)", "Number"),
+            ("log_batch_size", "Log Batch Size", "Number"),
+        ],
         _ => &[],
     }
 }
@@ -337,6 +345,10 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
             focus_index,
         }
         | SettingsMode::SpeedTestForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::LoggingForm {
             fields,
             focus_index,
         } => (fields, *focus_index),
@@ -426,8 +438,8 @@ fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
         SettingsMode::MuxForm { .. } => Some(SettingsSection::Mux),
         SettingsMode::UpdateForm { .. } => Some(SettingsSection::Updates),
         SettingsMode::ProtocolCoreForm { .. } => Some(SettingsSection::ProtocolCore),
-        SettingsMode::StatsForm { .. } => Some(SettingsSection::Stats),
         SettingsMode::SpeedTestForm { .. } => Some(SettingsSection::SpeedTest),
+        SettingsMode::LoggingForm { .. } => Some(SettingsSection::Logging),
         _ => None,
     }
 }
@@ -491,6 +503,10 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
                     focus_index,
                 }
                 | SettingsMode::SpeedTestForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::LoggingForm {
                     fields,
                     focus_index,
                 },

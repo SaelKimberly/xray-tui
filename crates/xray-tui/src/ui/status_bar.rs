@@ -74,6 +74,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             crate::SettingsMode::RoutingList { .. } => " Settings > Routing",
             crate::SettingsMode::UpdateForm { .. } => " Settings > Updates",
             crate::SettingsMode::ProtocolCoreForm { .. } => " Settings > Protocol Core",
+            crate::SettingsMode::LoggingForm { .. } => " Settings > Logging",
             crate::SettingsMode::SpeedTestForm { .. } => " Settings > Speed Test",
             crate::SettingsMode::RoutingForm { .. } => " Settings > Routing",
         },

@@ -28,13 +28,15 @@ cargo run
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 - `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
 :- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping with IP info, speed test, UDP test, batch ping, batch-then-real-ping) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig.
+- `crates/xray-tui-db/src/log_repo.rs` — LogRepository for DB-backed log persistence (insert_batch, get_filtered, delete_older_than)
+- `crates/xray-tui-core/src/log_worker.rs` — LogStorageWorker background task: batch writes + filtered queries via dedicated connection
 
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 :- `profiles.rs` — profile list DataGrid with connected indicator, IP info column, multi-sort indicators, graveyard group filter; multi-select, delete confirmation, batch import overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
-:- `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics/Protocol Core/SpeedTest), routing rules list+form, reorder. Full rewrite Phase 6.
+:- `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics/Protocol Core/SpeedTest/Logging), routing rules list+form, reorder. Full rewrite Phase 6.
 - `status_bar.rs` — bottom connection indicator + key hints
 - `groups.rs` — system-group-aware management (is_system guard, clear action)
 - `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
@@ -88,7 +90,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
-**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter). Phase 8 (Polish & Release) planned. Phase 9 (v2rayN Parity) captures remaining feature gaps.
+**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Turso-backed log storage** (LogStorageWorker, LogRepository, logs table, TTL, Settings→Logging form). Phase 8 (Polish & Release) planned. Phase 9 (v2rayN Parity) captures remaining feature gaps.
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
@@ -102,6 +104,18 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 3. `subscription_upsert_profiles()` in `crates/xray-tui-db/src/lib.rs` handles content-based dedup via `ON CONFLICT(group_id, sub_uid)`
 4. `move_orphans_to_graveyard()` / `purge_graveyard()` handle stale profile cleanup
 5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
+
+### Adding log storage features
+1. Add `logs` table + indexes in `crates/xray-tui-db/src/schema.rs` (`create_tables()`)
+2. Define `LogEntry` struct in `crates/xray-tui-db/src/models.rs`
+3. Create `LogRepository` in `crates/xray-tui-db/src/log_repo.rs` with `insert_batch()`, `get_filtered()`, `delete_older_than()`
+4. Create `LogStorageWorker` in `crates/xray-tui-core/src/log_worker.rs` — unified write+query loop with pending batch merging
+5. Modify `TuiLogLayer` in `main.rs` to dual-send: `core_event_tx` (TUI display) + `log_worker_tx` (persistence)
+6. Wire `log_worker_tx` through `AppState`, forward non-tui logs in `add_log()`
+7. Add `LogConfig` to `AppConfig` (ttl_hours, batch_size)
+8. Add `Logging` section to Settings (SettingsMode, SettingsSection, form fields)
+9. Use `BEGIN IMMEDIATE` on dedicated connection (not main connection) with `busy_timeout(500ms)` to avoid lock contention
+10. All connections to the same DB must use the same `PRAGMA journal_mode` (`'wal'` recommended for bulk insert performance)
 
 ### Adding batch import for share URLs
 1. Parse each URL with `parse_share_url(url, &config.validation)` from `xray_tui_config::import_export`
@@ -160,8 +174,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Use `reqwest` for HTTP client (subscription fetch)
 - Use `escape8259` for JSON string unescaping
 - Use `memchr` for vectorized byte search
-- Use `rapidhash` for content-based profile deduplication (compute_sub_uid)
-- Use `base64-simd` for SIMD-accelerated base64 decode/encode
+:- `tokio` for async runtime (also direct dep in xray-tui-db for retry backoff sleep)
 - Use `urlencoding` for percent-decoding
 - Use `uuid` for system group IDs (`ALL_GROUP_ID`)
 

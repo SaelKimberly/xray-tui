@@ -2,6 +2,7 @@ pub mod bin_manager;
 pub mod config_builder;
 pub mod core_type;
 pub mod grpc_client;
+pub mod log_worker;
 pub mod process;
 pub mod protocol;
 pub mod protocol_core_mapping;

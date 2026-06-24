@@ -7,7 +7,7 @@ pub mod permissive_json;
 pub mod subscription;
 
 pub use app_config::{
-    AppConfig, CoreConfig, GuiConfig, InboundConfig, MuxConfig, ParsingSettings, StatisticsConfig,
-    SystemProxyConfig, TunConfig,
+    AppConfig, CoreConfig, GuiConfig, InboundConfig, LogConfig, MuxConfig, ParsingSettings,
+    StatisticsConfig, SystemProxyConfig, TunConfig,
 };
 pub use import_export::ValidationSettings;

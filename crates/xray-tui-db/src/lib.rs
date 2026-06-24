@@ -1,5 +1,12 @@
+pub mod log_repo;
 pub mod models;
 pub mod schema;
+
+pub use log_repo::LogRepository;
+pub use models::LogEntry;
+/// Re-export for consumer crates (log_worker) that need the connection type
+/// without depending on `turso` directly.
+pub use turso::Connection as DbConnection;
 
 use std::path::Path;
 
@@ -21,6 +28,7 @@ pub type Result<T, E = DatabaseError> = std::result::Result<T, E>;
 pub type ProfileWithDetails = (Profile, Option<ProfileExtension>, Option<ServerStat>);
 
 pub struct Database {
+    db: turso::Database,
     conn: turso::Connection,
 }
 
@@ -295,7 +303,6 @@ impl DnsSetting {
         })
     }
 }
-
 // ── Database ──────────────────────────────────────────────────────────
 
 impl Database {
@@ -309,7 +316,12 @@ impl Database {
             .await
             .map_err(DatabaseError::Turso)?;
         let conn = db.connect().map_err(DatabaseError::Turso)?;
-        let db_ = Self { conn };
+        // 5s busy_timeout so queries wait for active transactions instead of
+        // failing immediately with SQLITE_BUSY (e.g., during bulk subscription
+        // upserts that hold the write lock for extended periods).
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(DatabaseError::Turso)?;
+        let db_ = Self { db, conn };
         db_.initialize_schema().await?;
         Ok(db_)
     }
@@ -320,9 +332,33 @@ impl Database {
             .await
             .map_err(DatabaseError::Turso)?;
         let conn = db.connect().map_err(DatabaseError::Turso)?;
-        let db_ = Self { conn };
+        let db_ = Self { db, conn };
         db_.initialize_schema().await?;
         Ok(db_)
+    }
+
+    /// Open an additional connection to the same database
+    /// (for the log storage worker to avoid lock contention).
+    ///
+    /// Configures 500ms `busy_timeout` so `BEGIN IMMEDIATE` waits for
+    /// the main connection's transaction to finish before returning `Busy`.
+    pub async fn new_connection(&self) -> std::result::Result<turso::Connection, DatabaseError> {
+        let conn = self.db.connect().map_err(DatabaseError::Turso)?;
+        // Wait up to 500ms for locks (BEGIN IMMEDIATE in the flush path).
+        // Using the std Duration path since turso busy_timeout is synchronous.
+        conn.busy_timeout(std::time::Duration::from_millis(500))
+            .map_err(DatabaseError::Turso)?;
+        // WAL journal mode for good concurrent read/write performance.
+        // Must match the main connection's journal mode.
+        conn.pragma_update("journal_mode", "wal")
+            .await
+            .map_err(DatabaseError::Turso)?;
+        Ok(conn)
+    }
+
+    /// Get a reference to the underlying database connection.
+    pub fn connection(&self) -> &turso::Connection {
+        &self.conn
     }
 
     async fn initialize_schema(&self) -> Result<()> {
@@ -406,7 +442,6 @@ impl Database {
         Ok(())
     }
 }
-
 // ── Helper functions ──────────────────────────────────────────────────
 
 /// Percent-decode a string. Fallback to original on failure.

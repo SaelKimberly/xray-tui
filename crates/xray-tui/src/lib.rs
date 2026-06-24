@@ -7,9 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 use xray_tui_config::{AppConfig, ValidationSettings};
 use xray_tui_core::grpc_client;
+use xray_tui_core::log_worker::LogWorkerMessage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
@@ -17,8 +19,8 @@ use xray_tui_core::{
 };
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule,
-    ServerStat, Subscription,
+    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, LogEntry, Profile, ProfileExtension,
+    RoutingRule, ServerStat, Subscription,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +117,10 @@ pub enum SettingsMode {
         fields: Vec<(String, String)>,
         focus_index: usize,
     },
+    LoggingForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
 }
 
 /// Identifies which section of the Settings panel is being edited.
@@ -132,6 +138,7 @@ pub enum SettingsSection {
     ProtocolCore,
     Updates,
     SpeedTest,
+    Logging,
 }
 /// Tracks what the UI is currently showing.
 #[derive(Debug, Clone)]
@@ -346,6 +353,7 @@ pub struct AppState {
     pub current_memory: u64,
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
+    pub log_worker_tx: Option<mpsc::UnboundedSender<LogWorkerMessage>>,
 }
 
 /// Internal helper for batch ping deduplication.
@@ -405,6 +413,7 @@ impl AppState {
             current_traffic_up: 0,
             current_traffic_down: 0,
             current_memory: 0,
+            log_worker_tx: None,
             routing_rules: Vec::new(),
             term_height: Cell::new(80),
         };
@@ -605,6 +614,11 @@ impl AppState {
         self.filter_cache_valid.set(false);
     }
     pub fn add_log(&mut self, level: &str, message: &str, source: &str) {
+        // Skip trace and debug levels — too verbose for both the TUI buffer
+        // and persistent storage.
+        if level == "trace" || level == "debug" {
+            return;
+        }
         self.log_buffer.push(LogLine {
             level: level.to_owned(),
             message: message.to_owned(),
@@ -618,6 +632,26 @@ impl AppState {
                 .position(|l| l.source != "core")
                 .unwrap_or(0);
             self.log_buffer.remove(evict);
+        }
+
+        // Forward non-tui logs to the storage worker (tui logs are already
+        // sent by TuiLogLayer to avoid duplication).
+        if source != "tui"
+            && let Some(ref tx) = self.log_worker_tx
+        {
+            let entry = LogEntry {
+                id: None,
+                timestamp_nanos: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64,
+                level: level.to_owned(),
+                target: String::new(),
+                message: message.to_owned(),
+                metadata_json: None,
+                source: source.to_owned(),
+            };
+            let _ = tx.send(LogWorkerMessage::Entry(entry));
         }
     }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
@@ -1133,6 +1167,18 @@ impl AppState {
                     ),
                 ]
             }
+            Logging => {
+                vec![
+                    (
+                        "log_ttl_hours".into(),
+                        self.config.logging.ttl_hours.to_string(),
+                    ),
+                    (
+                        "log_batch_size".into(),
+                        self.config.logging.batch_size.to_string(),
+                    ),
+                ]
+            }
         }
     }
 
@@ -1247,6 +1293,14 @@ impl AppState {
             }
             // Dns and Routing are handled separately (DB-backed)
             Dns | Routing | Updates => {}
+            Logging => {
+                if let Ok(v) = get("log_ttl_hours").parse::<u64>() {
+                    self.config.logging.ttl_hours = v;
+                }
+                if let Ok(v) = get("log_batch_size").parse::<usize>() {
+                    self.config.logging.batch_size = v;
+                }
+            }
         }
     }
     pub async fn enter_settings_form(&mut self, section: SettingsSection) {
@@ -1309,6 +1363,10 @@ impl AppState {
                 }
             }
             SettingsSection::SpeedTest => SettingsMode::SpeedTestForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Logging => SettingsMode::LoggingForm {
                 fields,
                 focus_index: 0,
             },
@@ -3056,15 +3114,33 @@ impl AppState {
         let db = self.db.clone();
         let validation: ValidationSettings = self.config.parsing.clone().into();
         tokio::spawn(async move {
-            let result =
-                Self::do_update_subscription(url, user_agent, gid.clone(), db, validation).await;
-            if let Some(tx) = &tx {
-                let _ = tx.send(CoreEvent::SubscriptionsUpdated {
-                    group_id: result.0,
-                    count: result.1,
-                    warnings: result.2,
-                    error: result.3,
-                });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                Self::do_update_subscription(url, user_agent, gid.clone(), db, validation),
+            )
+            .await;
+            match result {
+                Ok(inner) => {
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                            group_id: inner.0,
+                            count: inner.1,
+                            warnings: inner.2,
+                            error: inner.3,
+                        });
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(target: "tui", "Subscription update timed out after 120s");
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                            group_id: gid.clone(),
+                            count: 0,
+                            warnings: Vec::new(),
+                            error: Some("Subscription update timed out after 120s".into()),
+                        });
+                    }
+                }
             }
         });
     }
@@ -3097,7 +3173,15 @@ impl AppState {
                 Ok((p, w)) => (p, w),
                 Err(e) => return (group_id, 0, Vec::new(), Some(e)),
             };
-
+        tracing::info!(
+            target: "tui",
+            "Parsed {} profiles, {} warnings from subscription",
+            profiles.len(),
+            warnings.len()
+        );
+        if profiles.is_empty() {
+            tracing::info!(target: "tui", "Subscription returned 0 usable profiles — all URLs may have failed validation");
+        }
         let now = format_now();
         let mut sub_uids: Vec<u64> = Vec::with_capacity(profiles.len());
         let enriched: Vec<Profile> = profiles
@@ -3115,10 +3199,16 @@ impl AppState {
                 p
             })
             .collect();
-
+        tracing::info!(
+            target: "tui",
+            "Starting DB upsert for {} enriched profiles",
+            enriched.len()
+        );
         if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched).await {
+            tracing::error!(target: "tui", "DB upsert failed: {e}");
             return (group_id, 0, Vec::new(), Some(format!("DB upsert: {e}")));
         }
+        tracing::info!(target: "tui", "DB upsert succeeded");
 
         let _ = db
             .move_orphans_to_graveyard(&group_id, &sub_uids, GRAVEYARD_GROUP_ID)

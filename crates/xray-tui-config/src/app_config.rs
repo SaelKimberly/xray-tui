@@ -23,6 +23,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub speed_test: SpeedTestConfig,
     #[serde(default)]
+    pub logging: LogConfig,
+    #[serde(default)]
     pub parsing: ParsingSettings,
 }
 
@@ -339,4 +341,28 @@ pub struct ParsingSettings {
     pub allow_private_ips: bool,
     #[serde(default)]
     pub reject_insecure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_ttl_hours")]
+    pub ttl_hours: u64,
+    #[serde(default = "default_log_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            ttl_hours: default_log_ttl_hours(),
+            batch_size: default_log_batch_size(),
+        }
+    }
+}
+
+fn default_log_ttl_hours() -> u64 {
+    72
+}
+fn default_log_batch_size() -> usize {
+    500
 }

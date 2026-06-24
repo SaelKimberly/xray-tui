@@ -158,3 +158,14 @@ pub struct ServerStat {
     pub total_down: Option<i32>,
     pub last_updated: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub id: Option<i64>,
+    pub timestamp_nanos: i64,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+    pub metadata_json: Option<String>,
+    pub source: String,
+}

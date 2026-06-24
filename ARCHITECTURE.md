@@ -62,6 +62,7 @@ pub struct AppState {
     /// terminal height (Atomics for interior mutability across render thread)
     pub term_height: AtomicU16,
     pub core_event_tx: Option<UnboundedSender<CoreEvent>>,
+    pub log_worker_tx: Option<UnboundedSender<LogWorkerMessage>>,
     pub core_event_rx: Option<UnboundedReceiver<CoreEvent>>,
 }
 
@@ -112,7 +113,7 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `import_url()` / `start_batch_import()` — parse share URL(s) and add profile(s)
 - `filtered_profiles()` — group filter + search filter + sort by column
 - `reload_profiles()` / `reload_groups()` — DB reload
-- `add_log()` — capped circular log buffer (1000 entries), takes level, message, and source
+- `add_log()` — capped circular log buffer (1000 entries) + forwards non-TUI entries to LogStorageWorker for DB persistence; takes level, message, and source
 - `start_add_server()` / `start_edit_profile()` — enter form mode
 - `confirm_add_server()` / `confirm_edit_server()` / `cancel_form()` — form lifecycle
 - `delete_profile()` / `clone_profile()` — CRUD operations
@@ -469,10 +470,26 @@ CREATE TABLE IF NOT EXISTS server_stats (
     total_up INTEGER NOT NULL DEFAULT 0,
     total_down INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS logs (
+    id              INTEGER PRIMARY KEY,
+    timestamp_nanos BIGINT NOT NULL,
+    level           TEXT NOT NULL DEFAULT 'info',
+    target          TEXT NOT NULL DEFAULT '',
+    message         TEXT NOT NULL,
+    metadata_json   TEXT,
+    source          TEXT NOT NULL DEFAULT 'tui'
+);
+CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp_nanos);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
+CREATE INDEX IF NOT EXISTS idx_logs_source ON logs(source);
 ```
 
 **Repository pattern** — Each table gets a typed repo (same as single-core design).
 
+
+**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and dual-sends to (a) `core_event_tx` for in-memory `log_buffer` display and (b) `LogWorkerMessage::Entry` via `log_worker_tx` for persistence. The `LogStorageWorker` (in `log_worker.rs`) runs a `tokio::select!` loop accepting entries and queries. Entries are batched (500 or 100ms) and flushed via `LogRepository::insert_batch()` on a **dedicated connection** using `BEGIN IMMEDIATE` + `busy_timeout(500ms)`. Filtered queries merge the pending batch with DB results (newest-first ordering). TTL cleanup runs hourly via a background tokio task (deletes logs older than `ttl_hours`, defaults 72h).
 **Migration approach**: migratus-like version numbering in a `schema_version` table.
 
 ### xray-tui-config (library crate)
@@ -530,24 +547,41 @@ log panel shows core output, stats panel receives traffic updates
 ```
 
 ## Data Flow: Subscription Update
-
 ```
-User clicks "Update subscription" for a group
+User clicks "Update subscription" for a group (or auto-update timer fires)
+        │
+        ▼
+tokio::spawn(async move { do_update_subscription(...) })
+  → 120s timeout wrapper (prevents silent hang)
+  → tracing::info! checkpoints at each step for status bar visibility
         │
         ▼
 HTTP GET subscription_url → download response body
         │
         ▼
-Auto-detect: base64? plain URL list? v2rayN format? sing-box format?
+Streaming base64 decoder → URL list
+  → parse_share_url() for each URL → Vec<Profile>
+  → validate_security() emits tracing::warn!(target: "validation", ...)
         │
         ▼
-For each server in response:
-  parse_share_url(server_url) → Profile struct
-  resolve_core(profile.protocol, group.core_type) → assign core_type
-  ProfileRepo::upsert(profile)  (match by address+port+userId as dedup key)
+Enrich each Profile: compute sub_uid (rapidhash), set group_id, is_sub, sub_id
         │
         ▼
-Refresh profile list in UI
+subscription_upsert_profiles() — single BEGIN DEFERRED transaction:
+  1. INSERT OR REPLACE INTO profile_cores (dedup by sub_uid)
+  2. INSERT INTO group_profiles ON CONFLICT(group_id, sub_uid) DO UPDATE
+  3. INSERT OR IGNORE INTO group_profiles (ALL_GROUP_ID mirror)
+  4. DELETE graveyard orphans promoted back to this group
+        │
+        ▼
+move_orphans_to_graveyard() + purge_graveyard()
+upsert_subscription() — update subscription metadata
+        │
+        ▼
+Send CoreEvent::SubscriptionsUpdated via core_event_tx
+        │
+        ▼
+Handler: add_log warnings → log_trace success/error → reload_profiles → reload_groups → load_subscriptions
 ```
 
 ## gRPC API Services
@@ -577,4 +611,5 @@ Single tokio async runtime on the main thread for I/O. Ratatui rendering in a sy
 - Process monitor task → TUI: `process_event_tx` (Started, Stopped, Crashed(error))
 - Stats poll task → TUI: `stats_update_tx` (IndexId, TodayUp, TodayDown, etc.)
 - Log reader task → TUI: `log_line_tx` (timestamp, level, message)
+- Log storage worker → DB: `LogStorageWorker` receives entries via `log_worker_tx`, batches every 100ms, flushes to `logs` table on a dedicated connection
 - TUI event loop: polls all channels + terminal events + renders frame
