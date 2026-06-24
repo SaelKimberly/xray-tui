@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use serde::Deserialize;
+use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_db::models::Profile;
-use std::net::IpAddr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
@@ -110,7 +110,9 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
     let has_known_scheme = primary_idx.is_some();
 
     // Try primary parser first (if scheme is known)
-    if let Some(idx) = primary_idx && let Ok(profile) = PARSE_ORDER[idx](url) {
+    if let Some(idx) = primary_idx
+        && let Ok(profile) = PARSE_ORDER[idx](url)
+    {
         return normalize_and_validate(profile, settings);
     }
 
@@ -119,7 +121,9 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
     let mut last_error = ImportError::UnsupportedScheme;
     let mut validation_error = None;
     for (i, parser) in PARSE_ORDER.iter().enumerate() {
-        if let Some(skip) = primary_idx && i == skip {
+        if let Some(skip) = primary_idx
+            && i == skip
+        {
             continue;
         }
         match parser(url) {
@@ -296,7 +300,10 @@ fn parse_vless(url: &str) -> Result<Profile> {
             "security" => {
                 if v == "reality" {
                     let mut ss = stream_settings(profile.stream_settings.as_deref());
-                    ss.insert("security".into(), serde_json::Value::String("reality".into()));
+                    ss.insert(
+                        "security".into(),
+                        serde_json::Value::String("reality".into()),
+                    );
                     profile.stream_settings = Some(serde_json::to_string(&ss)?);
                 }
             }
@@ -352,7 +359,8 @@ fn parse_vless(url: &str) -> Result<Profile> {
             "encryption" => { /* ignored */ }
             "pbk" | "publicKey" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                let rs = ss.entry(String::from("realitySettings"))
+                let rs = ss
+                    .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
                     obj.insert("publicKey".into(), serde_json::Value::String(v.to_string()));
@@ -361,7 +369,8 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "sid" | "shortId" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                let rs = ss.entry(String::from("realitySettings"))
+                let rs = ss
+                    .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
                     obj.insert("shortId".into(), serde_json::Value::String(v.to_string()));
@@ -370,7 +379,8 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "spx" | "spiderX" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                let rs = ss.entry(String::from("realitySettings"))
+                let rs = ss
+                    .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
                     obj.insert("spiderX".into(), serde_json::Value::String(v.to_string()));
@@ -466,12 +476,15 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
     let inner = String::from_utf8_lossy(&decoded);
 
     if let Some((userinfo, hostport)) = inner.split_once('@') {
-        let (method, password) = userinfo.split_once(':')
+        let (method, password) = userinfo
+            .split_once(':')
             .ok_or_else(|| ImportError::Parse("missing : in ss:// userinfo".into()))?;
         let hostport_clean = hostport.strip_suffix('?').unwrap_or(hostport);
-        let (host, port_str) = hostport_clean.rsplit_once(':')
+        let (host, port_str) = hostport_clean
+            .rsplit_once(':')
             .ok_or_else(|| ImportError::Parse("missing port in ss:// fallback".into()))?;
-        let port: i32 = port_str.parse()
+        let port: i32 = port_str
+            .parse()
             .map_err(|_| ImportError::Parse("invalid port in ss:// fallback".into()))?;
         let protocol = if method.starts_with("2022-blake3-") {
             Protocol::Shadowsocks2022
@@ -481,7 +494,10 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
         let mut profile = base_profile(protocol, host, port);
         profile.user_id = Some(password.to_string());
         let mut ps = serde_json::Map::new();
-        ps.insert("method".into(), serde_json::Value::String(method.to_string()));
+        ps.insert(
+            "method".into(),
+            serde_json::Value::String(method.to_string()),
+        );
         profile.protocol_settings = Some(serde_json::to_string(&ps)?);
         return Ok(profile);
     }
@@ -524,7 +540,10 @@ fn parse_shadowsocks_sip002(userinfo_b64: &str, rest2: &str) -> Result<Profile> 
     profile.remarks = fragment;
     profile.user_id = Some(password.to_string());
     let mut ps = serde_json::Map::new();
-    ps.insert("method".into(), serde_json::Value::String(method.to_string()));
+    ps.insert(
+        "method".into(),
+        serde_json::Value::String(method.to_string()),
+    );
     profile.protocol_settings = Some(serde_json::to_string(&ps)?);
     Ok(profile)
 }
@@ -1397,8 +1416,14 @@ fn parse_hostport(s: &str) -> (String, Option<u16>) {
     let mut remaining = s;
     let mut selected_port = None;
     while let Some((h, p)) = remaining.rsplit_once(':') {
-        let digit_len = p.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(p.len());
-        if digit_len > 0 && digit_len <= 5 && let Ok(parsed) = p[..digit_len].parse::<u16>() {
+        let digit_len = p
+            .bytes()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(p.len());
+        if digit_len > 0
+            && digit_len <= 5
+            && let Ok(parsed) = p[..digit_len].parse::<u16>()
+        {
             selected_port = Some(parsed);
             remaining = h;
             break;
@@ -1480,7 +1505,11 @@ pub fn normalize_remark(s: &str) -> String {
         }
     }
     let trimmed = out.trim();
-    if trimmed.is_empty() { String::new() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[inline]
@@ -1567,14 +1596,13 @@ fn protocol_settings(existing: Option<&str>) -> serde_json::Map<String, serde_js
 /// Format: `ssr://base64(host:port:protocol:method:obfs:base64(password)/?params)`
 fn parse_shadowsocksr(url: &str) -> Result<Profile> {
     let b64 = url.strip_prefix("ssr://").unwrap_or(url);
-    let decoded = crate::base64_util::decode_base64(b64)
-        .or_else(|_| {
-            // Some providers double-encode — try URL-decoding first
-            let url_decoded = urlencoding::decode(b64)
-                .map_err(|_| ImportError::Parse("invalid base64 in ssr URL".into()))?;
-            crate::base64_util::decode_base64(&url_decoded)
-                .map_err(|_| ImportError::Parse("invalid base64 in ssr URL (after URL-decode)".into()))
-        })?;
+    let decoded = crate::base64_util::decode_base64(b64).or_else(|_| {
+        // Some providers double-encode — try URL-decoding first
+        let url_decoded = urlencoding::decode(b64)
+            .map_err(|_| ImportError::Parse("invalid base64 in ssr URL".into()))?;
+        crate::base64_util::decode_base64(&url_decoded)
+            .map_err(|_| ImportError::Parse("invalid base64 in ssr URL (after URL-decode)".into()))
+    })?;
     let text = String::from_utf8(decoded)
         .map_err(|_| ImportError::Parse("invalid UTF-8 in ssr URL".into()))?;
 
@@ -1797,7 +1825,6 @@ pub struct ValidationSettings {
     pub reject_insecure: bool,
 }
 
-
 impl From<crate::app_config::ParsingSettings> for ValidationSettings {
     fn from(p: crate::app_config::ParsingSettings) -> Self {
         Self {
@@ -1911,7 +1938,9 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
             // at minimum, need public_key in protocol_settings
             if let Some(ps) = &profile.protocol_settings {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-                    let has_pubkey = v.get("public_key").and_then(|s| s.as_str())
+                    let has_pubkey = v
+                        .get("public_key")
+                        .and_then(|s| s.as_str())
                         .is_some_and(|s| !s.is_empty());
                     if !has_pubkey {
                         return Err(missing("public_key in protocol_settings"));
@@ -1980,15 +2009,16 @@ fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()>
 
 /// Security validation: check for insecure settings and log warnings.
 fn validate_security(profile: &Profile) -> Result<()> {
-    if let Some(ss) = &profile.stream_settings && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
+    if let Some(ss) = &profile.stream_settings
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
         && (v.get("allow_insecure").and_then(|s| s.as_bool()) == Some(true)
             || v.get("insecure").and_then(|s| s.as_str()) == Some("1"))
-        {
-            tracing::warn!(target: "validation",
-                "Profile {} has allow_insecure=true",
-                profile.remarks.as_deref().unwrap_or("(unnamed)")
-            );
-        }
+    {
+        tracing::warn!(target: "validation",
+            "Profile {} has allow_insecure=true",
+            profile.remarks.as_deref().unwrap_or("(unnamed)")
+        );
+    }
     Ok(())
 }
 
@@ -2027,7 +2057,6 @@ mod tests {
         let result = normalize_remark("%F0%9F%98%80");
         assert_eq!(result, "😀");
     }
-
 
     #[test]
     fn normalize_remark_empty_after_trim() {
@@ -2147,7 +2176,10 @@ mod tests {
                 .expect("realitySettings should be present")
                 .as_object()
                 .expect("realitySettings must be an object");
-            assert_eq!(rs["publicKey"], "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg");
+            assert_eq!(
+                rs["publicKey"],
+                "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg"
+            );
             assert_eq!(rs["shortId"], "a7ec6c3316eddb11");
         } else {
             panic!("VLESS URL should have stream_settings");
@@ -2177,7 +2209,10 @@ mod tests {
                 .expect("realitySettings should be present")
                 .as_object()
                 .expect("realitySettings must be an object");
-            assert_eq!(rs["publicKey"], "-X9CZv5MYKivpxPVP1vdgFKf2AJWmZ0Pju-j8LFmlh4");
+            assert_eq!(
+                rs["publicKey"],
+                "-X9CZv5MYKivpxPVP1vdgFKf2AJWmZ0Pju-j8LFmlh4"
+            );
             assert_eq!(rs["shortId"], "6c88854e73e86773");
         } else {
             panic!("VLESS URL should have stream_settings");
@@ -2196,10 +2231,7 @@ mod tests {
         } else {
             panic!("Shadowsocks URL should have protocol_settings");
         }
-        assert_eq!(
-            p.user_id.as_deref(),
-            Some("k1dBOmOB4oqi7Ump37a1bQ")
-        );
+        assert_eq!(p.user_id.as_deref(), Some("k1dBOmOB4oqi7Ump37a1bQ"));
 
         // ── Shadowsocks URL 4 ──
         let p = parse_share_url(WORKING_URL_4, &permissive_settings()).unwrap();
@@ -2213,10 +2245,7 @@ mod tests {
         } else {
             panic!("Shadowsocks URL should have protocol_settings");
         }
-        assert_eq!(
-            p.user_id.as_deref(),
-            Some("CJmTCCx7Ltud")
-        );
+        assert_eq!(p.user_id.as_deref(), Some("CJmTCCx7Ltud"));
     }
 
     #[test]
@@ -2274,7 +2303,10 @@ mod tests {
         let qr = serde_json::json!({ "v": 2, "ps": "test", "add": "", "port": 443, "id": "uuid" });
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         let url = format!("vmess://{b64}");
-        let settings = ValidationSettings { allow_private_ips: false, reject_insecure: false };
+        let settings = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
         assert!(matches!(
             parse_share_url(&url, &settings),
             Err(ImportError::Validation(_))
@@ -2285,7 +2317,10 @@ mod tests {
     fn reject_private_ip() {
         // Any protocol with 127.0.0.1 should be rejected when allow_private_ips=false
         let url = "vless://uuid@127.0.0.1:443?encryption=none#test";
-        let settings = ValidationSettings { allow_private_ips: false, reject_insecure: false };
+        let settings = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
         assert!(matches!(
             parse_share_url(url, &settings),
             Err(ImportError::Validation(_))
@@ -2296,7 +2331,10 @@ mod tests {
     fn accept_private_ip_when_allowed() {
         // Same URL with allow_private_ips=true should succeed
         let url = "vless://uuid@127.0.0.1:443?encryption=none#test";
-        let settings = ValidationSettings { allow_private_ips: true, reject_insecure: false };
+        let settings = ValidationSettings {
+            allow_private_ips: true,
+            reject_insecure: false,
+        };
         let p = parse_share_url(url, &settings).unwrap();
         assert_eq!(p.address.as_deref(), Some("127.0.0.1"));
     }
@@ -2304,7 +2342,10 @@ mod tests {
     #[test]
     fn reject_localhost_hostname() {
         let url = "vless://uuid@localhost:443?encryption=none#test";
-        let settings = ValidationSettings { allow_private_ips: false, reject_insecure: false };
+        let settings = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
         assert!(matches!(
             parse_share_url(url, &settings),
             Err(ImportError::Validation(_))
@@ -2319,10 +2360,12 @@ mod tests {
         // Note: some permissive parsers (e.g. http) produce profiles with degraded
         // addresses, so the exact error type may vary.
         let url = "xyzzy://192.168.1.1:443";
-        let settings = ValidationSettings { allow_private_ips: false, reject_insecure: false };
+        let settings = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
         assert!(parse_share_url(url, &settings).is_err());
     }
-
 
     #[test]
     fn vmess_trailing_garbage() {

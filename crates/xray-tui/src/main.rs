@@ -1,8 +1,9 @@
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::field::{Field, Visit};
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::layer::Layer as _;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use xray_tui::AppState;
 use xray_tui_config::AppConfig;
@@ -34,7 +35,11 @@ impl<S> tracing_subscriber::Layer<S> for TuiLogLayer
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let mut visitor = LogVisitor(String::new());
         event.record(&mut visitor);
         let message = visitor.0;
@@ -61,13 +66,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| Path::new(".").to_path_buf())
         .join("xray-tui")
         .join("data.db");
-    let db = Database::open(&db_path)?;
-
-    // 2a. Backfill — normalize any unnormalized remarks from before this change
-    db.normalize_all_remarks()?;
-
-    // 3. Create shared state
-    let mut state = AppState::new(db, config);
+    let db = Database::open(&db_path).await?;
+    db.normalize_all_remarks().await?;
+    let mut state = AppState::new(Arc::new(db), config).await;
 
     // 4. Install tracing subscriber with TuiLogLayer
     let (tui_log_tx, mut tui_log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -79,7 +80,9 @@ async fn main() -> Result<()> {
                 .with_writer(std::io::stderr)
                 .with_filter(tracing_subscriber::EnvFilter::new("xray_tui=info")),
         )
-        .with(TuiLogLayer { tx: tui_log_tx.clone() })
+        .with(TuiLogLayer {
+            tx: tui_log_tx.clone(),
+        })
         .try_init()
         .is_err()
     {
@@ -105,7 +108,7 @@ async fn main() -> Result<()> {
     }
 
     // 5. Enter ratatui event loop
-    xray_tui::ui::run(&mut state)?;
+    xray_tui::ui::run(&mut state).await?;
 
     Ok(())
 }

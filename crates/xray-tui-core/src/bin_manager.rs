@@ -326,7 +326,11 @@ mod tests {
         // Should find binary at tmp/xray/xray (managed path)
         let found = find_binary(CoreType::Xray, &tmp);
         assert!(found.is_some(), "should find managed binary");
-        assert_eq!(found.unwrap(), binary, "should return managed path, not PATH");
+        assert_eq!(
+            found.unwrap(),
+            binary,
+            "should return managed path, not PATH"
+        );
 
         // Binary outside core subdir should NOT be found by managed-path check
         // (it would only be found via which/PATH if xray is in PATH)
@@ -335,7 +339,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrong_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&wrong_binary, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         let found2 = find_binary(CoreType::Xray, &tmp);
         // Should still find the correct managed one, not wrong_binary
@@ -385,7 +390,11 @@ mod tests {
         // Falls through to which(PATH). If xray is in PATH, returns that;
         // otherwise returns None. Either way, the managed-dir path is not returned.
         let found = find_binary(CoreType::Xray, &tmp);
-        assert_ne!(found.as_deref(), Some(binary.as_path()), "non-executable managed file must be skipped");
+        assert_ne!(
+            found.as_deref(),
+            Some(binary.as_path()),
+            "non-executable managed file must be skipped"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -410,7 +419,11 @@ mod tests {
         let found = find_binary(CoreType::SingBox, &tmp);
         assert!(found.is_some(), "should find sing-box via recursive search");
         assert!(
-            found.as_deref().unwrap().to_string_lossy().contains("sing-box-1.13.13-linux-amd64/sing-box"),
+            found
+                .as_deref()
+                .unwrap()
+                .to_string_lossy()
+                .contains("sing-box-1.13.13-linux-amd64/sing-box"),
             "should find binary inside versioned subdirectory"
         );
 
@@ -442,11 +455,16 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&nested_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&nested_binary, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
 
         let found = find_binary(CoreType::SingBox, &tmp);
-        assert_eq!(found.as_deref(), Some(flat_binary.as_path()), "flat binary should win over nested");
+        assert_eq!(
+            found.as_deref(),
+            Some(flat_binary.as_path()),
+            "flat binary should win over nested"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -463,9 +481,18 @@ mod tests {
         flatten_single_top_dir(&tmp);
 
         assert!(tmp.join("binary").exists(), "binary should be at top level");
-        assert!(tmp.join("config.json").exists(), "config should be at top level");
-        assert!(!tmp.join("version-dir").exists(), "version dir should be removed");
-        assert_eq!(std::fs::read_to_string(tmp.join("binary")).unwrap(), "binary_content");
+        assert!(
+            tmp.join("config.json").exists(),
+            "config should be at top level"
+        );
+        assert!(
+            !tmp.join("version-dir").exists(),
+            "version dir should be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("binary")).unwrap(),
+            "binary_content"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -512,4 +539,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
-

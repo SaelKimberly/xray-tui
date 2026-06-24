@@ -294,17 +294,29 @@ fn default_ip_api_url() -> String {
     "http://ip-api.com/json/".to_string()
 }
 
-fn default_tcp_timeout_secs() -> u64 { 5 }
+fn default_tcp_timeout_secs() -> u64 {
+    5
+}
 
-fn default_real_ping_timeout_secs() -> u64 { 5 }
+fn default_real_ping_timeout_secs() -> u64 {
+    5
+}
 
-fn default_batch_page_size() -> usize { 1000 }
+fn default_batch_page_size() -> usize {
+    1000
+}
 
-fn default_batch_delay_ms() -> u64 { 1000 }
+fn default_batch_delay_ms() -> u64 {
+    1000
+}
 
-fn default_real_ping_retries() -> u32 { 2 }
+fn default_real_ping_retries() -> u32 {
+    2
+}
 
-fn default_real_ping_concurrency() -> usize { 5 }
+fn default_real_ping_concurrency() -> usize {
+    5
+}
 
 impl Default for SpeedTestConfig {
     fn default() -> Self {

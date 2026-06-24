@@ -2,7 +2,7 @@
 
 use std::mem::MaybeUninit;
 
-use crate::import_export::{parse_share_url, ValidationSettings};
+use crate::import_export::{ValidationSettings, parse_share_url};
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 
@@ -366,7 +366,6 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
     chunks
 }
 
-
 /// Parse base64-encoded subscription data into a list of Profiles.
 ///
 /// Returns `(profiles, warnings)` on success, where `warnings` is a list of
@@ -375,7 +374,10 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error if the data cannot be decoded.
-pub fn parse_subscription_data(data: &[u8], settings: &ValidationSettings) -> Result<(Vec<Profile>, Vec<String>), String> {
+pub fn parse_subscription_data(
+    data: &[u8],
+    settings: &ValidationSettings,
+) -> Result<(Vec<Profile>, Vec<String>), String> {
     let mut decoder = StreamingDecoder::new();
     let mut all_urls = Vec::new();
 

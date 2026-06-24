@@ -1,13 +1,13 @@
 use xray_tui_core::grpc_client::format_bytes;
 use xray_tui_core::protocol::Protocol;
 
-use crate::ui::theme::Theme;
 use crate::AppState;
+use crate::ui::theme::Theme;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
     if state.connecting {
@@ -41,15 +41,20 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
 
     match row {
         Some(r) => {
-            let proto =
-                Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
+            let proto = Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
             let remarks = r.profile.remarks.clone().unwrap_or_default();
             let addr = r.profile.address.clone().unwrap_or_default();
             let port = r.profile.port.unwrap_or(0) as u16;
             let core = state.resolved_core(r).to_string();
             (proto.to_string(), remarks, addr, port, core)
         }
-        None => ("-".to_string(), "No server".to_string(), String::new(), 0, String::new()),
+        None => (
+            "-".to_string(),
+            "No server".to_string(),
+            String::new(),
+            0,
+            String::new(),
+        ),
     }
 }
 

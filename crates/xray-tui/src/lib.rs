@@ -1,21 +1,24 @@
 pub mod ui;
 use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
+use futures_util::StreamExt;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use futures_util::StreamExt;
 use xray_tui_config::{AppConfig, ValidationSettings};
 use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core};
+use xray_tui_core::{
+    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core,
+};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule, ServerStat,
-    Subscription,
+    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule,
+    ServerStat, Subscription,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,20 +60,61 @@ pub struct LogLine {
 /// Sub-modes for the Settings panel.
 #[derive(Debug, Clone)]
 pub enum SettingsMode {
-    Menu { selected: usize },
-    CoreForm { fields: Vec<(String, String)>, focus_index: usize },
-    GuiForm { fields: Vec<(String, String)>, focus_index: usize },
-    InboundForm { fields: Vec<(String, String)>, focus_index: usize },
-    RoutingList { selected: usize },
-    RoutingForm { rule_id: Option<String>, fields: Vec<(String, String)>, focus_index: usize },
-    DnsForm { fields: Vec<(String, String)>, focus_index: usize },
-    SystemProxyForm { fields: Vec<(String, String)>, focus_index: usize },
-    TunForm { fields: Vec<(String, String)>, focus_index: usize },
-    MuxForm { fields: Vec<(String, String)>, focus_index: usize },
-    StatsForm { fields: Vec<(String, String)>, focus_index: usize },
-    UpdateForm { status_xray: BackendUpdateStatus, status_singbox: BackendUpdateStatus },
-    ProtocolCoreForm { fields: Vec<(String, String)>, focus_index: usize },
-    SpeedTestForm { fields: Vec<(String, String)>, focus_index: usize },
+    Menu {
+        selected: usize,
+    },
+    CoreForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    GuiForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    InboundForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    RoutingList {
+        selected: usize,
+    },
+    RoutingForm {
+        rule_id: Option<String>,
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    DnsForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    SystemProxyForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    TunForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    MuxForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    StatsForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    UpdateForm {
+        status_xray: BackendUpdateStatus,
+        status_singbox: BackendUpdateStatus,
+    },
+    ProtocolCoreForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
+    SpeedTestForm {
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+    },
 }
 
 /// Identifies which section of the Settings panel is being edited.
@@ -96,7 +140,9 @@ pub enum AppMode {
     List,
     /// Help overlay
     Help,
-    Settings { mode: SettingsMode },
+    Settings {
+        mode: SettingsMode,
+    },
     /// Adding a new server
     AddServer {
         /// Selected protocol (None while protocol picker shown)
@@ -118,7 +164,9 @@ pub enum AppMode {
         error: Option<String>,
     },
     /// Managing subscription groups
-    ManageGroups { selected: usize },
+    ManageGroups {
+        selected: usize,
+    },
     /// Adding a new subscription group
     AddGroup {
         fields: Vec<(String, String)>,
@@ -131,7 +179,9 @@ pub enum AppMode {
         focus_index: usize,
     },
     /// Speed test menu overlay
-    SpeedTestMenu { selected: usize },
+    SpeedTestMenu {
+        selected: usize,
+    },
     /// Batch import multiple share URLs
     BatchImport {
         /// Parsed/split profiles for each URL
@@ -239,9 +289,8 @@ pub struct BackendUpdateStatus {
     pub error: Option<String>,
 }
 
-
 pub struct AppState {
-    pub db: Database,
+    pub db: Arc<Database>,
     pub config: AppConfig,
     pub current_tab: Tab,
     pub profiles: Vec<ProfileRow>,
@@ -296,6 +345,7 @@ pub struct AppState {
     pub current_traffic_down: i64,
     pub current_memory: u64,
     pub term_height: Cell<u16>,
+    pub routing_rules: Vec<RoutingRule>,
 }
 
 /// Internal helper for batch ping deduplication.
@@ -305,7 +355,7 @@ struct UniqueTarget {
 }
 
 impl AppState {
-    pub fn new(db: Database, config: AppConfig) -> Self {
+    pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
         let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = Self {
             db,
@@ -355,17 +405,18 @@ impl AppState {
             current_traffic_up: 0,
             current_traffic_down: 0,
             current_memory: 0,
+            routing_rules: Vec::new(),
             term_height: Cell::new(80),
         };
-        state.reload_profiles();
-        state.reload_groups();
-        state.subscriptions = state.db.get_all_subscriptions().unwrap_or_default();
+        state.reload_profiles().await;
+        state.reload_groups().await;
+        state.subscriptions = state.db.get_all_subscriptions().await.unwrap_or_default();
         state.spawn_auto_update();
         state
     }
 
-    pub fn reload_profiles(&mut self) {
-        match self.db.get_all_profiles_with_details() {
+    pub async fn reload_profiles(&mut self) {
+        match self.db.get_all_profiles_with_details().await {
             Ok(rows) => {
                 self.profiles = rows
                     .into_iter()
@@ -384,14 +435,17 @@ impl AppState {
         self.filter_cache_valid.set(false);
     }
 
-    pub fn reload_groups(&mut self) {
-        match self.db.get_all_groups() {
+    pub async fn reload_groups(&mut self) {
+        match self.db.get_all_groups().await {
             Ok(groups) => self.groups = groups,
             Err(e) => {
                 self.add_log("error", &format!("Failed to load groups: {e}"), "tui");
                 self.groups.clear();
             }
         }
+    }
+    pub async fn reload_routing_rules(&mut self) {
+        self.routing_rules = self.db.get_all_routing_rules().await.unwrap_or_default();
     }
 
     pub fn filtered_profiles(&self) -> Vec<&ProfileRow> {
@@ -416,12 +470,11 @@ impl AppState {
                     return false;
                 }
                 // When viewing All, skip graveyard profiles and mirror rows
-                if self.selected_group_id.is_none() {
-                    if row.profile.group_id.as_deref() == Some(GRAVEYARD_GROUP_ID)
-                        || row.profile.group_id.as_deref() == Some(ALL_GROUP_ID)
-                    {
-                        return false;
-                    }
+                if self.selected_group_id.is_none()
+                    && (row.profile.group_id.as_deref() == Some(GRAVEYARD_GROUP_ID)
+                        || row.profile.group_id.as_deref() == Some(ALL_GROUP_ID))
+                {
+                    return false;
                 }
                 if !self.search_query.is_empty() {
                     let q = self.search_query.to_lowercase();
@@ -445,9 +498,7 @@ impl AppState {
             let a_row = &self.profiles[a];
             let b_row = &self.profiles[b];
             let cmp = match self.sort_column {
-                SortColumn::ConfigType => {
-                    a_row.profile.config_type.cmp(&b_row.profile.config_type)
-                }
+                SortColumn::ConfigType => a_row.profile.config_type.cmp(&b_row.profile.config_type),
                 SortColumn::Remarks => a_row
                     .profile
                     .remarks
@@ -522,12 +573,16 @@ impl AppState {
         if self.groups.is_empty() {
             return;
         }
-        let current_idx = self.selected_group_id.as_ref().and_then(|id| {
-            self.groups.iter().position(|g| g.id == *id)
-        });
+        let current_idx = self
+            .selected_group_id
+            .as_ref()
+            .and_then(|id| self.groups.iter().position(|g| g.id == *id));
         let len = self.groups.len();
         let skip_graveyard = |idx: usize| -> bool {
-            self.groups.get(idx).map(|g| g.id == *GRAVEYARD_GROUP_ID).unwrap_or(false)
+            self.groups
+                .get(idx)
+                .map(|g| g.id == *GRAVEYARD_GROUP_ID)
+                .unwrap_or(false)
         };
         let new_idx = if let Some(idx) = current_idx {
             let mut next = (idx as isize + dir as isize).rem_euclid(len as isize) as usize;
@@ -541,7 +596,10 @@ impl AppState {
             next
         } else {
             // No group selected → start at first non-graveyard group
-            self.groups.iter().position(|g| g.id != *GRAVEYARD_GROUP_ID).unwrap_or(0)
+            self.groups
+                .iter()
+                .position(|g| g.id != *GRAVEYARD_GROUP_ID)
+                .unwrap_or(0)
         };
         self.selected_group_id = Some(self.groups[new_idx].id.clone());
         self.filter_cache_valid.set(false);
@@ -554,7 +612,9 @@ impl AppState {
         });
         if self.log_buffer.len() > 1000 {
             // Evict oldest non-core entry first, so core logs aren't drowned out
-            let evict = self.log_buffer.iter()
+            let evict = self
+                .log_buffer
+                .iter()
                 .position(|l| l.source != "core")
                 .unwrap_or(0);
             self.log_buffer.remove(evict);
@@ -578,7 +638,10 @@ impl AppState {
     pub fn resolved_core(&self, row: &ProfileRow) -> CoreType {
         let protocol = Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
         let profile_override = row.profile.core_type.parse::<CoreType>().ok();
-        let config_override = self.config.core.protocol_core_overrides
+        let config_override = self
+            .config
+            .core
+            .protocol_core_overrides
             .get(&protocol.to_string())
             .and_then(|s| s.parse::<CoreType>().ok());
         resolve_core(protocol, config_override.or(profile_override))
@@ -594,8 +657,8 @@ impl AppState {
         };
     }
 
-    pub fn start_edit_profile(&mut self, id: &str) {
-        match self.db.get_profile(id) {
+    pub async fn start_edit_profile(&mut self, id: &str) {
+        match self.db.get_profile(id).await {
             Ok(Some(profile)) => {
                 let fields = profile_to_fields(&profile);
                 self.mode = AppMode::EditServer {
@@ -654,7 +717,9 @@ impl AppState {
                 continue;
             }
             match key.as_str() {
-                "remarks" => profile.remarks = Some(xray_tui_config::import_export::normalize_remark(value)),
+                "remarks" => {
+                    profile.remarks = Some(xray_tui_config::import_export::normalize_remark(value))
+                }
                 "address" => profile.address = Some(value.clone()),
                 "port" => profile.port = value.parse::<i32>().ok(),
                 "core_type" => profile.core_type = value.clone(),
@@ -709,7 +774,7 @@ impl AppState {
         profile
     }
 
-    pub fn confirm_add_server(&mut self) {
+    pub async fn confirm_add_server(&mut self) {
         let (protocol, fields) = match &self.mode {
             AppMode::AddServer {
                 protocol: Some(p),
@@ -723,33 +788,36 @@ impl AppState {
         };
         let mut profile = self.fields_to_profile(protocol, &fields);
         // Assign to currently selected real group (not All or Graveyard)
-        if let Some(gid) = &self.selected_group_id {
-            if gid != ALL_GROUP_ID && gid != GRAVEYARD_GROUP_ID {
-                profile.group_id = Some(gid.clone());
-            }
+        if let Some(gid) = &self.selected_group_id
+            && gid != ALL_GROUP_ID
+            && gid != GRAVEYARD_GROUP_ID
+        {
+            profile.group_id = Some(gid.clone());
         }
-        if let Err(e) = self.db.insert_profile(&profile) {
+        if let Err(e) = self.db.insert_profile(&profile).await {
             self.log_trace("error", "tui", &format!("Failed to add server: {e}"));
             return;
         }
-        self.log_trace("info", "tui",
+        self.log_trace(
+            "info",
+            "tui",
             &format!(
                 "Added server: {}",
                 profile.remarks.as_deref().unwrap_or("unnamed")
             ),
         );
         self.mode = AppMode::List;
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
-    pub fn confirm_edit_server(&mut self) {
+    pub async fn confirm_edit_server(&mut self) {
         let (profile_id, fields) = match &self.mode {
             AppMode::EditServer {
                 profile_id, fields, ..
             } => (profile_id.clone(), fields.clone()),
             _ => return,
         };
-        let mut profile = match self.db.get_profile(&profile_id) {
+        let mut profile = match self.db.get_profile(&profile_id).await {
             Ok(Some(p)) => p,
             _ => {
                 self.add_log("error", "Profile not found for edit", "tui");
@@ -772,13 +840,13 @@ impl AppState {
         profile.sub_uid = Some(profile.compute_sub_uid() as i64);
         profile.updated_at = Some(format_now());
 
-        if let Err(e) = self.db.update_profile(&profile) {
+        if let Err(e) = self.db.update_profile(&profile).await {
             self.add_log("error", &format!("Failed to update server: {e}"), "tui");
             return;
         }
         self.add_log("info", "Server updated", "tui");
         self.mode = AppMode::List;
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
     pub fn cancel_form(&mut self) {
@@ -793,41 +861,103 @@ impl AppState {
         };
     }
 
-    fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
+    async fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
         use crate::SettingsSection::*;
         match section {
             Core => {
                 vec![
-                    ("xray_path".into(), self.config.core.xray_path.clone().unwrap_or_default()),
-                    ("sing_box_path".into(), self.config.core.sing_box_path.clone().unwrap_or_default()),
-                    ("default_core".into(), format!("{:?}", self.config.core.core_type.unwrap_or(xray_tui_core::CoreType::Auto))),
+                    (
+                        "xray_path".into(),
+                        self.config.core.xray_path.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "sing_box_path".into(),
+                        self.config.core.sing_box_path.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "default_core".into(),
+                        format!(
+                            "{:?}",
+                            self.config
+                                .core
+                                .core_type
+                                .unwrap_or(xray_tui_core::CoreType::Auto)
+                        ),
+                    ),
                     ("log_level".into(), self.config.core.log_level.clone()),
                 ]
             }
             Gui => {
                 vec![
                     ("language".into(), self.config.gui.language.clone()),
-                    ("theme".into(), self.config.gui.theme.clone().unwrap_or_default()),
-                    ("refresh_interval".into(), self.config.gui.refresh_interval_secs.to_string()),
+                    (
+                        "theme".into(),
+                        self.config.gui.theme.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "refresh_interval".into(),
+                        self.config.gui.refresh_interval_secs.to_string(),
+                    ),
                 ]
             }
             Inbound => {
                 vec![
-                    ("socks_port".into(), self.config.inbound.socks_port.to_string()),
-                    ("http_port".into(), self.config.inbound.http_port.map(|p| p.to_string()).unwrap_or_default()),
-                    ("mixed_port".into(), self.config.inbound.mixed_port.map(|p| p.to_string()).unwrap_or_default()),
+                    (
+                        "socks_port".into(),
+                        self.config.inbound.socks_port.to_string(),
+                    ),
+                    (
+                        "http_port".into(),
+                        self.config
+                            .inbound
+                            .http_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_default(),
+                    ),
+                    (
+                        "mixed_port".into(),
+                        self.config
+                            .inbound
+                            .mixed_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_default(),
+                    ),
                     ("listen".into(), self.config.inbound.listen.clone()),
-                    ("sniffing".into(), if self.config.inbound.sniffing { "true".into() } else { "false".into() }),
+                    (
+                        "sniffing".into(),
+                        if self.config.inbound.sniffing {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
+                    ),
                 ]
             }
             Dns => {
-                if let Ok(Some(dns)) = self.db.get_dns_settings() {
+                if let Ok(Some(dns)) = self.db.get_dns_settings().await {
                     vec![
                         ("servers".into(), dns.servers.unwrap_or_default()),
                         ("hosts".into(), dns.hosts.unwrap_or_default()),
-                        ("query_strategy".into(), dns.query_strategy.unwrap_or_default()),
-                        ("disable_cache".into(), if dns.disable_cache.unwrap_or(0) != 0 { "true".into() } else { "false".into() }),
-                        ("disable_fallback".into(), if dns.disable_fallback.unwrap_or(0) != 0 { "true".into() } else { "false".into() }),
+                        (
+                            "query_strategy".into(),
+                            dns.query_strategy.unwrap_or_default(),
+                        ),
+                        (
+                            "disable_cache".into(),
+                            if dns.disable_cache.unwrap_or(0) != 0 {
+                                "true".into()
+                            } else {
+                                "false".into()
+                            },
+                        ),
+                        (
+                            "disable_fallback".into(),
+                            if dns.disable_fallback.unwrap_or(0) != 0 {
+                                "true".into()
+                            } else {
+                                "false".into()
+                            },
+                        ),
                         ("client_ip".into(), dns.client_ip.unwrap_or_default()),
                     ]
                 } else {
@@ -843,59 +973,164 @@ impl AppState {
             }
             SystemProxy => {
                 vec![
-                    ("enabled".into(), if self.config.system_proxy.enabled { "true".into() } else { "false".into() }),
-                    ("http_port".into(), self.config.system_proxy.http_port.map(|p| p.to_string()).unwrap_or_default()),
-                    ("socks_port".into(), self.config.system_proxy.socks_port.map(|p| p.to_string()).unwrap_or_default()),
-                    ("bypass".into(), self.config.system_proxy.bypass.clone().unwrap_or_default()),
+                    (
+                        "enabled".into(),
+                        if self.config.system_proxy.enabled {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
+                    ),
+                    (
+                        "http_port".into(),
+                        self.config
+                            .system_proxy
+                            .http_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_default(),
+                    ),
+                    (
+                        "socks_port".into(),
+                        self.config
+                            .system_proxy
+                            .socks_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_default(),
+                    ),
+                    (
+                        "bypass".into(),
+                        self.config.system_proxy.bypass.clone().unwrap_or_default(),
+                    ),
                 ]
             }
             Tun => {
                 vec![
-                    ("enabled".into(), if self.config.tun.enabled { "true".into() } else { "false".into() }),
-                    ("interface_name".into(), self.config.tun.interface_name.clone().unwrap_or_default()),
-                    ("mtu".into(), self.config.tun.mtu.map(|v| v.to_string()).unwrap_or_default()),
+                    (
+                        "enabled".into(),
+                        if self.config.tun.enabled {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
+                    ),
+                    (
+                        "interface_name".into(),
+                        self.config.tun.interface_name.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "mtu".into(),
+                        self.config
+                            .tun
+                            .mtu
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                    ),
                 ]
             }
             Mux => {
                 vec![
-                    ("enabled".into(), if self.config.mux.enabled { "true".into() } else { "false".into() }),
-                    ("concurrency".into(), self.config.mux.concurrency.map(|v| v.to_string()).unwrap_or_default()),
-                    ("fragment_enabled".into(), if self.config.mux.fragment_enabled { "true".into() } else { "false".into() }),
-                    ("fragment_packets".into(), self.config.mux.fragment_packets.clone().unwrap_or_default()),
-                    ("fragment_length".into(), self.config.mux.fragment_length.clone().unwrap_or_default()),
-                    ("fragment_interval".into(), self.config.mux.fragment_interval.clone().unwrap_or_default()),
+                    (
+                        "enabled".into(),
+                        if self.config.mux.enabled {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
+                    ),
+                    (
+                        "concurrency".into(),
+                        self.config
+                            .mux
+                            .concurrency
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                    ),
+                    (
+                        "fragment_enabled".into(),
+                        if self.config.mux.fragment_enabled {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
+                    ),
+                    (
+                        "fragment_packets".into(),
+                        self.config.mux.fragment_packets.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "fragment_length".into(),
+                        self.config.mux.fragment_length.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "fragment_interval".into(),
+                        self.config
+                            .mux
+                            .fragment_interval
+                            .clone()
+                            .unwrap_or_default(),
+                    ),
                 ]
             }
             Stats => {
-                vec![
-                    ("enabled".into(), if self.config.statistics.enabled { "true".into() } else { "false".into() }),
-                ]
+                vec![(
+                    "enabled".into(),
+                    if self.config.statistics.enabled {
+                        "true".into()
+                    } else {
+                        "false".into()
+                    },
+                )]
             }
             Routing => {
                 vec![]
             }
-            ProtocolCore => {
-                PROTOCOL_CORE_DEFS.iter().map(|(key, _label, _)| {
-                    let val = self.config.core.protocol_core_overrides
+            ProtocolCore => PROTOCOL_CORE_DEFS
+                .iter()
+                .map(|(key, _label, _)| {
+                    let val = self
+                        .config
+                        .core
+                        .protocol_core_overrides
                         .get(*key)
                         .cloned()
                         .unwrap_or_else(|| "Auto".to_string());
                     (key.to_string(), val)
-                }).collect()
-            }
+                })
+                .collect(),
             Updates => {
                 vec![]
             }
             SpeedTest => {
                 vec![
                     ("ping_url".into(), self.config.speed_test.ping_url.clone()),
-                    ("ip_api_url".into(), self.config.speed_test.ip_api_url.clone()),
-                    ("tcp_timeout_secs".into(), self.config.speed_test.tcp_timeout_secs.to_string()),
-                    ("real_ping_timeout_secs".into(), self.config.speed_test.real_ping_timeout_secs.to_string()),
-                    ("batch_page_size".into(), self.config.speed_test.batch_page_size.to_string()),
-                    ("batch_delay_ms".into(), self.config.speed_test.batch_delay_ms.to_string()),
-                    ("real_ping_retries".into(), self.config.speed_test.real_ping_retries.to_string()),
-                    ("real_ping_concurrency".into(), self.config.speed_test.real_ping_concurrency.to_string()),
+                    (
+                        "ip_api_url".into(),
+                        self.config.speed_test.ip_api_url.clone(),
+                    ),
+                    (
+                        "tcp_timeout_secs".into(),
+                        self.config.speed_test.tcp_timeout_secs.to_string(),
+                    ),
+                    (
+                        "real_ping_timeout_secs".into(),
+                        self.config.speed_test.real_ping_timeout_secs.to_string(),
+                    ),
+                    (
+                        "batch_page_size".into(),
+                        self.config.speed_test.batch_page_size.to_string(),
+                    ),
+                    (
+                        "batch_delay_ms".into(),
+                        self.config.speed_test.batch_delay_ms.to_string(),
+                    ),
+                    (
+                        "real_ping_retries".into(),
+                        self.config.speed_test.real_ping_retries.to_string(),
+                    ),
+                    (
+                        "real_ping_concurrency".into(),
+                        self.config.speed_test.real_ping_concurrency.to_string(),
+                    ),
                 ]
             }
         }
@@ -972,9 +1207,15 @@ impl AppState {
             ProtocolCore => {
                 for (key, val) in fields {
                     if val == "Auto" {
-                        self.config.core.protocol_core_overrides.remove(key.as_str());
+                        self.config
+                            .core
+                            .protocol_core_overrides
+                            .remove(key.as_str());
                     } else {
-                        self.config.core.protocol_core_overrides.insert(key.clone(), val.clone());
+                        self.config
+                            .core
+                            .protocol_core_overrides
+                            .insert(key.clone(), val.clone());
                     }
                 }
             }
@@ -1008,27 +1249,69 @@ impl AppState {
             Dns | Routing | Updates => {}
         }
     }
-    pub fn enter_settings_form(&mut self, section: SettingsSection) {
-        let fields = self.build_settings_fields(section);
+    pub async fn enter_settings_form(&mut self, section: SettingsSection) {
+        let fields = self.build_settings_fields(section).await;
         let mode = match section {
-            SettingsSection::Core => SettingsMode::CoreForm { fields, focus_index: 0 },
-            SettingsSection::Gui => SettingsMode::GuiForm { fields, focus_index: 0 },
-            SettingsSection::Inbound => SettingsMode::InboundForm { fields, focus_index: 0 },
-            SettingsSection::Routing => SettingsMode::RoutingList { selected: 0 },
-            SettingsSection::Dns => SettingsMode::DnsForm { fields, focus_index: 0 },
-            SettingsSection::SystemProxy => SettingsMode::SystemProxyForm { fields, focus_index: 0 },
-            SettingsSection::Tun => SettingsMode::TunForm { fields, focus_index: 0 },
-            SettingsSection::Mux => SettingsMode::MuxForm { fields, focus_index: 0 },
-            SettingsSection::Stats => SettingsMode::StatsForm { fields, focus_index: 0 },
-            SettingsSection::ProtocolCore => SettingsMode::ProtocolCoreForm { fields, focus_index: 0 },
+            SettingsSection::Core => SettingsMode::CoreForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Gui => SettingsMode::GuiForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Inbound => SettingsMode::InboundForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Routing => {
+                self.reload_routing_rules().await;
+                SettingsMode::RoutingList { selected: 0 }
+            }
+            SettingsSection::Dns => SettingsMode::DnsForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::SystemProxy => SettingsMode::SystemProxyForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Tun => SettingsMode::TunForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Mux => SettingsMode::MuxForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::Stats => SettingsMode::StatsForm {
+                fields,
+                focus_index: 0,
+            },
+            SettingsSection::ProtocolCore => SettingsMode::ProtocolCoreForm {
+                fields,
+                focus_index: 0,
+            },
             SettingsSection::Updates => {
-                let status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
-                let status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
-                SettingsMode::UpdateForm { status_xray, status_singbox }
+                let status_xray = self
+                    .update_status
+                    .get(&CoreType::Xray)
+                    .cloned()
+                    .unwrap_or_default();
+                let status_singbox = self
+                    .update_status
+                    .get(&CoreType::SingBox)
+                    .cloned()
+                    .unwrap_or_default();
+                SettingsMode::UpdateForm {
+                    status_xray,
+                    status_singbox,
+                }
             }
-            SettingsSection::SpeedTest => {
-                SettingsMode::SpeedTestForm { fields, focus_index: 0 }
-            }
+            SettingsSection::SpeedTest => SettingsMode::SpeedTestForm {
+                fields,
+                focus_index: 0,
+            },
         };
         self.mode = AppMode::Settings { mode };
     }
@@ -1043,8 +1326,14 @@ impl AppState {
         self.enter_settings();
     }
 
-    pub fn save_routing_rule(&mut self, rule_id: Option<String>, fields: &[(String, String)]) {
-        let id = rule_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    pub async fn save_routing_rule(
+        &mut self,
+        rule_id: Option<String>,
+        fields: &[(String, String)],
+    ) {
+        let id = rule_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let get = |key: &str| {
             fields
                 .iter()
@@ -1077,20 +1366,22 @@ impl AppState {
             sort_order: None,
         };
         let result = if rule_id.is_some() {
-            self.db.update_routing_rule(&rule)
+            self.db.update_routing_rule(&rule).await
         } else {
-            self.db.insert_routing_rule(&rule)
+            self.db.insert_routing_rule(&rule).await
         };
         match result {
             Ok(()) => self.add_log("info", "Routing rule saved", "tui"),
             Err(e) => self.add_log("error", &format!("Failed to save routing rule: {e}"), "tui"),
         }
+        self.reload_routing_rules().await;
     }
 
-    pub fn save_dns_settings(&mut self, fields: &[(String, String)]) {
+    pub async fn save_dns_settings(&mut self, fields: &[(String, String)]) {
         let id = self
             .db
             .get_dns_settings()
+            .await
             .ok()
             .flatten()
             .map(|d| d.id)
@@ -1114,34 +1405,38 @@ impl AppState {
             hosts: get_opt("hosts"),
             query_strategy: get_opt("query_strategy"),
             disable_cache: Some(if get("disable_cache") == "true" { 1 } else { 0 }),
-            disable_fallback: Some(if get("disable_fallback") == "true" { 1 } else { 0 }),
+            disable_fallback: Some(if get("disable_fallback") == "true" {
+                1
+            } else {
+                0
+            }),
             client_ip: get_opt("client_ip"),
         };
-        match self.db.upsert_dns_settings(&dns) {
+        match self.db.upsert_dns_settings(&dns).await {
             Ok(()) => self.add_log("info", "DNS settings saved", "tui"),
             Err(e) => self.add_log("error", &format!("Failed to save DNS settings: {e}"), "tui"),
         }
     }
 
-    pub fn delete_profile(&mut self, id: &str) {
-        if let Err(e) = self.db.delete_profile(id) {
+    pub async fn delete_profile(&mut self, id: &str) {
+        if let Err(e) = self.db.delete_profile(id).await {
             self.add_log("error", &format!("Failed to delete profile: {e}"), "tui");
             return;
         }
         self.add_log("info", "Profile deleted", "tui");
         self.confirmation = None;
         self.multi_select.remove(id);
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
-    pub fn clone_profile(&mut self, id: &str) {
+    pub async fn clone_profile(&mut self, id: &str) {
         let new_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = self.db.clone_profile(id, &new_id) {
+        if let Err(e) = self.db.clone_profile(id, &new_id).await {
             self.add_log("error", &format!("Failed to clone profile: {e}"), "tui");
             return;
         }
         self.add_log("info", "Profile cloned", "tui");
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
     pub fn toggle_multi_select(&mut self, id: &str) {
@@ -1177,25 +1472,27 @@ impl AppState {
         let settings = ValidationSettings::from(self.config.parsing.clone());
         let results: Vec<BatchImportItem> = urls
             .iter()
-            .map(|url| match xray_tui_config::import_export::parse_share_url(url, &settings) {
-                Ok(profile) => BatchImportItem {
-                    url: url.clone(),
-                    profile: Some(profile),
-                    error: None,
-                    imported: false,
+            .map(
+                |url| match xray_tui_config::import_export::parse_share_url(url, &settings) {
+                    Ok(profile) => BatchImportItem {
+                        url: url.clone(),
+                        profile: Some(profile),
+                        error: None,
+                        imported: false,
+                    },
+                    Err(e) => BatchImportItem {
+                        url: url.clone(),
+                        profile: None,
+                        error: Some(e.to_string()),
+                        imported: false,
+                    },
                 },
-                Err(e) => BatchImportItem {
-                    url: url.clone(),
-                    profile: None,
-                    error: Some(e.to_string()),
-                    imported: false,
-                },
-            })
+            )
             .collect();
         self.mode = AppMode::BatchImport { results, scroll: 0 };
     }
 
-    pub fn confirm_batch_import(&mut self) {
+    pub async fn confirm_batch_import(&mut self) {
         let items = match &self.mode {
             AppMode::BatchImport { results, .. } => results.clone(),
             _ => return,
@@ -1206,10 +1503,11 @@ impl AppState {
         for item in &items {
             if let Some(mut profile) = item.profile.clone() {
                 // Assign to currently selected real group (not All or Graveyard)
-                if let Some(gid) = &self.selected_group_id {
-                    if gid != ALL_GROUP_ID && gid != GRAVEYARD_GROUP_ID {
-                        profile.group_id = Some(gid.clone());
-                    }
+                if let Some(gid) = &self.selected_group_id
+                    && gid != ALL_GROUP_ID
+                    && gid != GRAVEYARD_GROUP_ID
+                {
+                    profile.group_id = Some(gid.clone());
                 }
                 profile.sub_uid = Some(profile.compute_sub_uid() as i64);
                 if profile.created_at.is_none() {
@@ -1218,19 +1516,23 @@ impl AppState {
                 if profile.updated_at.is_none() {
                     profile.updated_at = Some(now.clone());
                 }
-                if self.db.insert_profile(&profile).is_ok() {
+                if self.db.insert_profile(&profile).await.is_ok() {
                     imported += 1;
                 } else {
                     errors += 1;
                 }
             }
         }
-        self.add_log("info", &format!("Batch import: {imported} imported, {errors} errors"), "tui");
+        self.add_log(
+            "info",
+            &format!("Batch import: {imported} imported, {errors} errors"),
+            "tui",
+        );
         self.mode = AppMode::List;
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
-    pub fn move_profile_up(&mut self) {
+    pub async fn move_profile_up(&mut self) {
         let id = match self.selected_profile_id() {
             Some(id) => id,
             None => return,
@@ -1247,13 +1549,14 @@ impl AppState {
         if let Err(e) = self
             .db
             .reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)])
+            .await
         {
             self.add_log("error", &format!("Failed to reorder: {e}"), "tui");
         }
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
-    pub fn move_profile_down(&mut self) {
+    pub async fn move_profile_down(&mut self) {
         let id = match self.selected_profile_id() {
             Some(id) => id,
             None => return,
@@ -1269,18 +1572,19 @@ impl AppState {
         if let Err(e) = self
             .db
             .reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)])
+            .await
         {
             self.add_log("error", &format!("Failed to reorder: {e}"), "tui");
         }
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
-    pub fn set_active(&mut self, id: &str) {
-        if let Err(e) = self.db.update_profile_active(id) {
+    pub async fn set_active(&mut self, id: &str) {
+        if let Err(e) = self.db.update_profile_active(id).await {
             self.add_log("error", &format!("Failed to set active: {e}"), "tui");
             return;
         }
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
     // ── Core connection management ──────────────────────────────────────
@@ -1418,7 +1722,8 @@ impl AppState {
                 let provider = match grpc_client::create_stats_provider(CoreType::Xray).await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        let _ = tx.send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
+                        let _ =
+                            tx.send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
                         None
                     }
                 };
@@ -1517,9 +1822,9 @@ impl AppState {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(CoreEvent::StatsError(
-                            format!("Clash API unavailable (is sing-box running?): {e}")
-                        ));
+                        let _ = tx.send(CoreEvent::StatsError(format!(
+                            "Clash API unavailable (is sing-box running?): {e}"
+                        )));
                     }
                 }
             }
@@ -1621,7 +1926,10 @@ impl AppState {
         };
         let profile = row.profile.clone();
         let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
-        let core_override = self.config.core.protocol_core_overrides
+        let core_override = self
+            .config
+            .core
+            .protocol_core_overrides
             .get(protocol.to_string().as_str())
             .and_then(|s| s.parse::<CoreType>().ok());
         let core_type = resolve_core(protocol, core_override);
@@ -1665,7 +1973,8 @@ impl AppState {
         let proxy_port = self.config.inbound.socks_port;
         let ping_url = self.config.speed_test.ping_url.clone();
         let ip_api_url = self.config.speed_test.ip_api_url.clone();
-        let timeout_dur = std::time::Duration::from_secs(self.config.speed_test.real_ping_timeout_secs);
+        let timeout_dur =
+            std::time::Duration::from_secs(self.config.speed_test.real_ping_timeout_secs);
         let retries = self.config.speed_test.real_ping_retries;
 
         tokio::spawn(async move {
@@ -1685,7 +1994,8 @@ impl AppState {
             }
 
             // 2. Build config
-            let backend_config = match ConfigBuilder::build(&profile, core_type, &params, &[], &dns) {
+            let backend_config = match ConfigBuilder::build(&profile, core_type, &params, &[], &dns)
+            {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(CoreEvent::SpeedTestResult {
@@ -1739,7 +2049,12 @@ impl AppState {
 
             // 6. Run real ping through the temp core's proxy
             let result = xray_tui_core::speed_test::real_ping(
-                &proxy_addr, proxy_port, &ping_url, &ip_api_url, timeout_dur, retries,
+                &proxy_addr,
+                proxy_port,
+                &ping_url,
+                &ip_api_url,
+                timeout_dur,
+                retries,
             )
             .await;
 
@@ -1769,7 +2084,11 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log("warn", "Core not connected — proxy required for speed test", "tui");
+            self.add_log(
+                "warn",
+                "Core not connected — proxy required for speed test",
+                "tui",
+            );
             return;
         }
         let tx = match &self.core_event_tx {
@@ -1778,7 +2097,8 @@ impl AppState {
         };
         let pid = profile_id.to_string();
         self.testing_profiles.insert(pid.clone());
-        self.testing_details.insert(pid.clone(), TestType::SpeedTest);
+        self.testing_details
+            .insert(pid.clone(), TestType::SpeedTest);
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
         let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
@@ -1815,7 +2135,11 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log("warn", "Core not connected — proxy required for UDP test", "tui");
+            self.add_log(
+                "warn",
+                "Core not connected — proxy required for UDP test",
+                "tui",
+            );
             return;
         }
         let tx = match &self.core_event_tx {
@@ -1900,9 +2224,12 @@ impl AppState {
             // Split into pages of batch_page_size
             for chunk in unique_targets.chunks(batch_page_size) {
                 for target in chunk {
-                    let result =
-                        xray_tui_core::speed_test::tcp_ping(&target.key.0, target.key.1, timeout_dur)
-                            .await;
+                    let result = xray_tui_core::speed_test::tcp_ping(
+                        &target.key.0,
+                        target.key.1,
+                        timeout_dur,
+                    )
+                    .await;
                     let (latency_ms, error) = match result {
                         Ok(dur) => (Some(dur.as_millis() as u64), None),
                         Err(e) => (None, Some(e.to_string())),
@@ -1964,11 +2291,17 @@ impl AppState {
         // Store a representative profile per target for config building
         let mut batch_targets: Vec<(UniqueTarget, Profile)> = Vec::new();
         for target in &unique_targets {
-            if let Some(row) = visible.iter().find(|r| target.profile_ids.contains(&r.profile.id)) {
-                batch_targets.push((UniqueTarget {
-                    key: target.key.clone(),
-                    profile_ids: target.profile_ids.clone(),
-                }, row.profile.clone()));
+            if let Some(row) = visible
+                .iter()
+                .find(|r| target.profile_ids.contains(&r.profile.id))
+            {
+                batch_targets.push((
+                    UniqueTarget {
+                        key: target.key.clone(),
+                        profile_ids: target.profile_ids.clone(),
+                    },
+                    row.profile.clone(),
+                ));
             }
         }
 
@@ -1991,7 +2324,8 @@ impl AppState {
         self.test_progress = Some((0, total_steps));
 
         let tcp_timeout = std::time::Duration::from_secs(self.config.speed_test.tcp_timeout_secs);
-        let real_ping_timeout = std::time::Duration::from_secs(self.config.speed_test.real_ping_timeout_secs);
+        let real_ping_timeout =
+            std::time::Duration::from_secs(self.config.speed_test.real_ping_timeout_secs);
         let batch_page_size = self.config.speed_test.batch_page_size;
         let batch_delay = std::time::Duration::from_millis(self.config.speed_test.batch_delay_ms);
         let retries = self.config.speed_test.real_ping_retries;
@@ -2024,8 +2358,11 @@ impl AppState {
                     let profile = &item.1;
 
                     let result = xray_tui_core::speed_test::tcp_ping(
-                        &target.key.0, target.key.1, tcp_timeout,
-                    ).await;
+                        &target.key.0,
+                        target.key.1,
+                        tcp_timeout,
+                    )
+                    .await;
                     let (latency_ms, error) = match result {
                         Ok(dur) => (Some(dur.as_millis() as u64), None),
                         Err(e) => (None, Some(e.to_string())),
@@ -2102,10 +2439,17 @@ impl AppState {
                                 return;
                             }
 
-                            let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
+                            let protocol = Protocol::try_from_i32(profile.config_type)
+                                .unwrap_or(Protocol::Custom);
                             let resolved_core = resolve_core(protocol, None);
 
-                            let backend_config = match ConfigBuilder::build(&profile, resolved_core, &params, &[], &dns) {
+                            let backend_config = match ConfigBuilder::build(
+                                &profile,
+                                resolved_core,
+                                &params,
+                                &[],
+                                &dns,
+                            ) {
                                 Ok(c) => c,
                                 Err(_) => {
                                     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -2122,8 +2466,13 @@ impl AppState {
                             };
 
                             let (log_line_tx, _log_rx) = mpsc::unbounded_channel();
-                            let mut manager = CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
-                            if manager.start(resolved_core, &backend_config, &bin_path).await.is_err() {
+                            let mut manager =
+                                CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
+                            if manager
+                                .start(resolved_core, &backend_config, &bin_path)
+                                .await
+                                .is_err()
+                            {
                                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                                 return;
                             }
@@ -2131,9 +2480,14 @@ impl AppState {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
                             let result = xray_tui_core::speed_test::real_ping(
-                                &proxy_addr, socks_port, &ping_url, &ip_api_url,
-                                real_ping_timeout, retries,
-                            ).await;
+                                &proxy_addr,
+                                socks_port,
+                                &ping_url,
+                                &ip_api_url,
+                                real_ping_timeout,
+                                retries,
+                            )
+                            .await;
 
                             let (latency_ms, ip_info, error) = match result {
                                 Ok(rp) => (Some(rp.latency_ms), rp.ip_info, None),
@@ -2169,7 +2523,7 @@ impl AppState {
         });
     }
     /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
-    pub fn remove_failed_servers(&mut self) {
+    pub async fn remove_failed_servers(&mut self) {
         let to_remove: Vec<String> = self
             .profiles
             .iter()
@@ -2183,14 +2537,14 @@ impl AppState {
             .collect();
         let count = to_remove.len();
         for id in to_remove {
-            self.delete_profile(&id);
+            self.delete_profile(&id).await;
         }
         self.multi_select.clear();
         self.add_log("info", &format!("Removed {count} failed server(s)"), "tui");
     }
 
     /// Poll core event channel and update state accordingly.
-    pub fn poll_core_events(&mut self) {
+    pub async fn poll_core_events(&mut self) {
         while let Some(rx) = self.core_event_rx.as_mut() {
             let event = match rx.try_recv() {
                 Ok(event) => event,
@@ -2239,7 +2593,7 @@ impl AppState {
                         total_down: Some(total_down as i32),
                         last_updated: Some(crate::format_now()),
                     };
-                    if let Err(e) = self.db.upsert_server_stats(&stats) {
+                    if let Err(e) = self.db.upsert_server_stats(&stats).await {
                         self.add_log("error", &format!("Failed to save stats: {e}"), "tui");
                     }
                     // Update in-memory ProfileRow to avoid full reload
@@ -2261,7 +2615,11 @@ impl AppState {
                     self.last_core_log = Some((level.clone(), message.clone()));
                     self.add_log(&level, &message, "core");
                 }
-                CoreEvent::TuiLog { target, level, message } => {
+                CoreEvent::TuiLog {
+                    target,
+                    level,
+                    message,
+                } => {
                     self.last_tui_log = Some((target.clone(), level.clone(), message.clone()));
                     if target == "validation" {
                         self.add_log(&level, &message, "validation");
@@ -2278,15 +2636,26 @@ impl AppState {
                         self.add_log("warn", w, "subscription");
                     }
                     if let Some(err) = error {
-                        self.log_trace("error", "subscription", &format!("Subscription update failed: {err}"));
+                        self.log_trace(
+                            "error",
+                            "subscription",
+                            &format!("Subscription update failed: {err}"),
+                        );
                     } else {
-                        self.log_trace("info", "subscription", &format!("Subscription updated: {count} profiles"));
+                        self.log_trace(
+                            "info",
+                            "subscription",
+                            &format!("Subscription updated: {count} profiles"),
+                        );
                     }
-                    self.reload_profiles();
-                    self.reload_groups();
-                    self.subscriptions = self.db.get_all_subscriptions().unwrap_or_default();
+                    self.reload_profiles().await;
+                    self.reload_groups().await;
+                    self.subscriptions = self.db.get_all_subscriptions().await.unwrap_or_default();
                 }
-                CoreEvent::TestTypeUpdate { profile_id, test_type } => {
+                CoreEvent::TestTypeUpdate {
+                    profile_id,
+                    test_type,
+                } => {
                     self.testing_details.insert(profile_id, test_type);
                 }
                 CoreEvent::SpeedTestResult {
@@ -2329,7 +2698,7 @@ impl AppState {
                                             .map(|v| std::cmp::min(v, i32::MAX as u64) as i32);
                                     }
                                 }
-                                let _ = self.db.upsert_profile_extension(ext);
+                                let _ = self.db.upsert_profile_extension(ext).await;
                                 row.profile.remarks.clone().unwrap_or(profile_id.clone())
                             }
                             None => profile_id.clone(),
@@ -2338,7 +2707,11 @@ impl AppState {
 
                     match error {
                         Some(ref err) => {
-                            self.log_trace("warn", "speedtest", &format!("{test_type:?} failed for {name}: {err}"));
+                            self.log_trace(
+                                "warn",
+                                "speedtest",
+                                &format!("{test_type:?} failed for {name}: {err}"),
+                            );
                         }
                         None => {
                             let latency_str =
@@ -2352,7 +2725,11 @@ impl AppState {
                             } else {
                                 "success".to_string()
                             };
-                            self.log_trace("info", "speedtest", &format!("{test_type:?} {name}: {detail}"));
+                            self.log_trace(
+                                "info",
+                                "speedtest",
+                                &format!("{test_type:?} {name}: {detail}"),
+                            );
                         }
                     }
 
@@ -2368,13 +2745,22 @@ impl AppState {
                     if let Some((done, total)) = self.test_progress.take() {
                         let new_done = done + 1;
                         if new_done >= total {
-                            self.log_trace("info", "speedtest", &format!("Batch complete: {new_done}/{total} profiles tested"));
+                            self.log_trace(
+                                "info",
+                                "speedtest",
+                                &format!("Batch complete: {new_done}/{total} profiles tested"),
+                            );
                         } else {
                             self.test_progress = Some((new_done, total));
                         }
                     }
                 }
-                CoreEvent::UpdateCheckResult { core_type, current_version, latest_version, error } => {
+                CoreEvent::UpdateCheckResult {
+                    core_type,
+                    current_version,
+                    latest_version,
+                    error,
+                } => {
                     let status = self.update_status.entry(core_type).or_default();
                     status.current_version = current_version.clone();
                     status.latest_version = latest_version.clone();
@@ -2397,33 +2783,85 @@ impl AppState {
                     status.error = error;
                     if let Some(ref ver) = latest_version {
                         match core_type {
-                            CoreType::Xray => self.config.updates.xray_latest_known = Some(ver.clone()),
-                            CoreType::SingBox => self.config.updates.sing_box_latest_known = Some(ver.clone()),
+                            CoreType::Xray => {
+                                self.config.updates.xray_latest_known = Some(ver.clone())
+                            }
+                            CoreType::SingBox => {
+                                self.config.updates.sing_box_latest_known = Some(ver.clone())
+                            }
                             CoreType::Auto => {}
                         }
                     }
                     // Refresh form snapshots if currently viewing the updates form
-                    if let AppMode::Settings { mode: SettingsMode::UpdateForm { status_xray, status_singbox } } = &mut self.mode {
-                        *status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
-                        *status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+                    if let AppMode::Settings {
+                        mode:
+                            SettingsMode::UpdateForm {
+                                status_xray,
+                                status_singbox,
+                            },
+                    } = &mut self.mode
+                    {
+                        *status_xray = self
+                            .update_status
+                            .get(&CoreType::Xray)
+                            .cloned()
+                            .unwrap_or_default();
+                        *status_singbox = self
+                            .update_status
+                            .get(&CoreType::SingBox)
+                            .cloned()
+                            .unwrap_or_default();
                     }
                 }
-                CoreEvent::UpdateCompleted { core_type, old_version, new_version, success, error } => {
+                CoreEvent::UpdateCompleted {
+                    core_type,
+                    old_version,
+                    new_version,
+                    success,
+                    error,
+                } => {
                     let status = self.update_status.entry(core_type).or_default();
                     status.downloading = false;
                     status.download_progress = None;
                     if success {
                         status.current_version = Some(new_version.clone());
                         status.update_available = false;
-                        self.add_log("info", &format!("{core_type} updated: {} → {}", old_version.as_deref().unwrap_or("none"), new_version), "tui");
+                        self.add_log(
+                            "info",
+                            &format!(
+                                "{core_type} updated: {} → {}",
+                                old_version.as_deref().unwrap_or("none"),
+                                new_version
+                            ),
+                            "tui",
+                        );
                     } else {
                         status.error = error.clone();
-                        self.add_log("error", &format!("{core_type} update failed: {:?}", error), "tui");
+                        self.add_log(
+                            "error",
+                            &format!("{core_type} update failed: {:?}", error),
+                            "tui",
+                        );
                     }
                     // Refresh form snapshots if currently viewing the updates form
-                    if let AppMode::Settings { mode: SettingsMode::UpdateForm { status_xray, status_singbox } } = &mut self.mode {
-                        *status_xray = self.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
-                        *status_singbox = self.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+                    if let AppMode::Settings {
+                        mode:
+                            SettingsMode::UpdateForm {
+                                status_xray,
+                                status_singbox,
+                            },
+                    } = &mut self.mode
+                    {
+                        *status_xray = self
+                            .update_status
+                            .get(&CoreType::Xray)
+                            .cloned()
+                            .unwrap_or_default();
+                        *status_singbox = self
+                            .update_status
+                            .get(&CoreType::SingBox)
+                            .cloned()
+                            .unwrap_or_default();
                     }
                 }
             }
@@ -2473,7 +2911,7 @@ impl AppState {
         };
     }
 
-    pub fn confirm_add_group(&mut self) {
+    pub async fn confirm_add_group(&mut self) {
         let fields = match &self.mode {
             AppMode::AddGroup { fields, .. } => fields.clone(),
             _ => return,
@@ -2489,7 +2927,7 @@ impl AppState {
             sort_order: Some((self.groups.len() + 1) as i32),
             is_system: None,
         };
-        if let Err(e) = self.db.insert_group(&group) {
+        if let Err(e) = self.db.insert_group(&group).await {
             self.add_log("error", &format!("Failed to add group: {e}"), "tui");
             return;
         }
@@ -2507,7 +2945,7 @@ impl AppState {
             status: Some("idle".into()),
             error_message: None,
         };
-        let _ = self.db.upsert_subscription(&sub);
+        let _ = self.db.upsert_subscription(&sub).await;
         self.add_log(
             "info",
             &format!(
@@ -2517,10 +2955,10 @@ impl AppState {
             "tui",
         );
         self.mode = AppMode::List;
-        self.reload_groups();
+        self.reload_groups().await;
     }
 
-    pub fn confirm_edit_group(&mut self) {
+    pub async fn confirm_edit_group(&mut self) {
         let (group_id, fields) = match &self.mode {
             AppMode::EditGroup {
                 group_id, fields, ..
@@ -2538,7 +2976,7 @@ impl AppState {
         group.subscription_url = get_field(&fields, "subscription_url");
         group.user_agent = get_field(&fields, "user_agent");
         group.core_type = get_field(&fields, "core_type");
-        if let Err(e) = self.db.update_group(&group) {
+        if let Err(e) = self.db.update_group(&group).await {
             self.add_log("error", &format!("Failed to update group: {e}"), "tui");
             return;
         }
@@ -2546,41 +2984,45 @@ impl AppState {
         let interval: i32 = get_field(&fields, "update_interval")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1440);
-        if let Ok(Some(mut sub)) = self.db.get_subscription_by_group(&group_id) {
+        if let Ok(Some(mut sub)) = self.db.get_subscription_by_group(&group_id).await {
             sub.url = group.subscription_url.clone().unwrap_or_default();
             sub.update_interval = Some(interval);
             sub.user_agent = group.user_agent.clone();
-            let _ = self.db.upsert_subscription(&sub);
+            let _ = self.db.upsert_subscription(&sub).await;
         }
         self.add_log("info", "Group updated", "tui");
         self.mode = AppMode::List;
-        self.reload_groups();
+        self.reload_groups().await;
     }
 
-    pub fn delete_group(&mut self, group_id: &str) {
-        if let Err(e) = self.db.delete_group(group_id) {
+    pub async fn delete_group(&mut self, group_id: &str) {
+        if let Err(e) = self.db.delete_group(group_id).await {
             self.add_log("error", &format!("Failed to delete group: {e}"), "tui");
             return;
         }
-        let _ = self.db.delete_subscriptions_by_group(group_id);
+        let _ = self.db.delete_subscriptions_by_group(group_id).await;
         self.add_log("info", "Group deleted", "tui");
         self.selected_group_id = None;
         self.confirmation = None;
-        self.reload_groups();
-        self.reload_profiles();
+        self.reload_groups().await;
+        self.reload_profiles().await;
     }
 
-    pub fn clear_group(&mut self, group_id: &str) {
-        match self.db.clear_group(group_id) {
+    pub async fn clear_group(&mut self, group_id: &str) {
+        match self.db.clear_group(group_id).await {
             Ok(count) => {
-                self.add_log("info", &format!("Cleared {count} profiles from group"), "tui");
+                self.add_log(
+                    "info",
+                    &format!("Cleared {count} profiles from group"),
+                    "tui",
+                );
             }
             Err(e) => {
                 self.add_log("error", &format!("Failed to clear group: {e}"), "tui");
             }
         }
         self.confirmation = None;
-        self.reload_profiles();
+        self.reload_profiles().await;
     }
 
     // ── Subscription update ──────────────────────────────────────────
@@ -2611,14 +3053,11 @@ impl AppState {
             .user_agent
             .clone()
             .unwrap_or_else(|| "xray-tui/0.1".into());
-        let db_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
-            .join("xray-tui")
-            .join("data.db");
-
+        let db = self.db.clone();
         let validation: ValidationSettings = self.config.parsing.clone().into();
         tokio::spawn(async move {
-            let result = Self::do_update_subscription(url, user_agent, gid.clone(), db_path, validation).await;
+            let result =
+                Self::do_update_subscription(url, user_agent, gid.clone(), db, validation).await;
             if let Some(tx) = &tx {
                 let _ = tx.send(CoreEvent::SubscriptionsUpdated {
                     group_id: result.0,
@@ -2634,7 +3073,7 @@ impl AppState {
         url: String,
         user_agent: String,
         group_id: String,
-        db_path: std::path::PathBuf,
+        db: Arc<Database>,
         validation: xray_tui_config::import_export::ValidationSettings,
     ) -> (String, usize, Vec<String>, Option<String>) {
         let client = match reqwest::Client::builder()
@@ -2653,15 +3092,11 @@ impl AppState {
             Ok(b) => b,
             Err(e) => return (group_id, 0, Vec::new(), Some(format!("Body: {e}"))),
         };
-        let (profiles, warnings) = match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
-            Ok((p, w)) => (p, w),
-            Err(e) => return (group_id, 0, Vec::new(), Some(e)),
-        };
-
-        let db = match Database::open(&db_path) {
-            Ok(d) => d,
-            Err(e) => return (group_id, 0, Vec::new(), Some(format!("DB: {e}"))),
-        };
+        let (profiles, warnings) =
+            match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
+                Ok((p, w)) => (p, w),
+                Err(e) => return (group_id, 0, Vec::new(), Some(e)),
+            };
 
         let now = format_now();
         let mut sub_uids: Vec<u64> = Vec::with_capacity(profiles.len());
@@ -2681,12 +3116,14 @@ impl AppState {
             })
             .collect();
 
-        if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched) {
+        if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched).await {
             return (group_id, 0, Vec::new(), Some(format!("DB upsert: {e}")));
         }
 
-        let _ = db.move_orphans_to_graveyard(&group_id, &sub_uids, GRAVEYARD_GROUP_ID);
-        let _ = db.purge_graveyard(GRAVEYARD_GROUP_ID, 24);
+        let _ = db
+            .move_orphans_to_graveyard(&group_id, &sub_uids, GRAVEYARD_GROUP_ID)
+            .await;
+        let _ = db.purge_graveyard(GRAVEYARD_GROUP_ID, 24).await;
 
         let now_str = format_now();
         let sub = Subscription {
@@ -2699,7 +3136,7 @@ impl AppState {
             status: Some("ok".into()),
             error_message: None,
         };
-        let _ = db.upsert_subscription(&sub);
+        let _ = db.upsert_subscription(&sub).await;
 
         (group_id, enriched.len(), warnings, None)
     }
@@ -2732,7 +3169,8 @@ impl AppState {
             let tx = tx.clone();
             let bin_dir = bin_dir.clone();
             tokio::spawn(async move {
-                let current = xray_tui_core::updater::get_current_version(core_type, &bin_dir).await;
+                let current =
+                    xray_tui_core::updater::get_current_version(core_type, &bin_dir).await;
                 let latest = xray_tui_core::updater::get_latest_version(core_type).await;
                 let error = if current.is_none() && latest.is_none() {
                     Some("binary not found and check failed".into())
@@ -2754,20 +3192,36 @@ impl AppState {
     /// Spawn async task to download and install an update for the given core.
     pub fn spawn_update_download(&mut self, core_type: CoreType) {
         // Guard: don't download if already downloading
-        if self.update_status.get(&core_type).map(|s| s.downloading).unwrap_or(false) {
+        if self
+            .update_status
+            .get(&core_type)
+            .map(|s| s.downloading)
+            .unwrap_or(false)
+        {
             return;
         }
         // Guard: don't download if core is currently running
         if self.connected_core == Some(core_type) {
-            self.add_log("warn", &format!("Cannot update {core_type} while it's running. Disconnect first."), "tui");
+            self.add_log(
+                "warn",
+                &format!("Cannot update {core_type} while it's running. Disconnect first."),
+                "tui",
+            );
             return;
         }
 
-        let latest = match self.update_status.get(&core_type).and_then(|s| s.latest_version.clone()) {
+        let latest = match self
+            .update_status
+            .get(&core_type)
+            .and_then(|s| s.latest_version.clone())
+        {
             Some(v) => v,
             None => return,
         };
-        let old_version = self.update_status.get(&core_type).and_then(|s| s.current_version.clone());
+        let old_version = self
+            .update_status
+            .get(&core_type)
+            .and_then(|s| s.current_version.clone());
         let Some(tx) = self.core_event_tx.clone() else {
             return;
         };
@@ -2781,18 +3235,26 @@ impl AppState {
 
         tokio::spawn(async move {
             // Download
-            let archive = match xray_tui_core::updater::download_release(&client, core_type, &latest, &temp_dir).await {
+            let archive = match xray_tui_core::updater::download_release(
+                &client, core_type, &latest, &temp_dir,
+            )
+            .await
+            {
                 Ok(path) => path,
                 Err(e) => {
                     let _ = tx.send(CoreEvent::UpdateCompleted {
-                        core_type, old_version: old_version.clone(), new_version: latest,
-                        success: false, error: Some(e),
+                        core_type,
+                        old_version: old_version.clone(),
+                        new_version: latest,
+                        success: false,
+                        error: Some(e),
                     });
                     return;
                 }
             };
             // Install
-            let result = xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
+            let result =
+                xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
             let (success, error) = match result {
                 Ok(_) => (true, None),
                 Err(e) => (false, Some(e)),
@@ -2803,8 +3265,11 @@ impl AppState {
 
             let old_version = old_version.clone();
             let _ = tx.send(CoreEvent::UpdateCompleted {
-                core_type, old_version, new_version: latest,
-                success, error,
+                core_type,
+                old_version,
+                new_version: latest,
+                success,
+                error,
             });
         });
     }
@@ -2814,23 +3279,13 @@ impl AppState {
         let Some(tx) = self.core_event_tx.clone() else {
             return;
         };
-        let db_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
-            .join("xray-tui")
-            .join("data.db");
+        let db = self.db.clone();
         let validation: ValidationSettings = self.config.parsing.clone().into();
         tokio::spawn(async move {
             use std::time::Duration;
             tokio::time::sleep(Duration::from_secs(10)).await;
             loop {
-                let db = match Database::open(&db_path) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        continue;
-                    }
-                };
-                let due_groups = match db.get_groups_due_update() {
+                let due_groups = match db.get_groups_due_update().await {
                     Ok(g) => g,
                     Err(_) => {
                         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -2847,7 +3302,9 @@ impl AppState {
                         .clone()
                         .unwrap_or_else(|| "xray-tui/0.1".into());
                     let gid = group.id.clone();
-                    let result = Self::do_update_subscription(url, ua, gid, db_path.clone(), validation.clone()).await;
+                    let result =
+                        Self::do_update_subscription(url, ua, gid, db.clone(), validation.clone())
+                            .await;
                     let _ = tx.send(CoreEvent::SubscriptionsUpdated {
                         group_id: result.0,
                         count: result.1,
@@ -2993,41 +3450,43 @@ fn is_leap(year: i64) -> bool {
 fn parse_log_level(line: &str) -> (String, String) {
     let trimmed = line.trim();
     // Sing-box JSON format: {"level":"info","time":"...","msg":"..."}
-    if trimmed.starts_with('{') {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            let raw_level = parsed
-                .get("level")
-                .and_then(|v| v.as_str())
-                .unwrap_or("info");
-            let level = if raw_level == "warn" {
-                "warning".to_string()
-            } else {
-                raw_level.to_string()
-            };
-            let msg = parsed
-                .get("msg")
-                .and_then(|v| v.as_str())
-                .unwrap_or(trimmed);
-            return (level, msg.to_string());
-        }
+    if trimmed.starts_with('{')
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        let raw_level = parsed
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info");
+        let level = if raw_level == "warn" {
+            "warning".to_string()
+        } else {
+            raw_level.to_string()
+        };
+        let msg = parsed
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or(trimmed);
+        return (level, msg.to_string());
     }
     // Xray-core bracket format: "2024/01/01 12:00:00 [Info] message"
-    if let Some(bracket_start) = trimmed.find('[') {
-        if let Some(bracket_end) = trimmed[bracket_start..].find(']') {
-            let raw = &trimmed[bracket_start + 1..bracket_start + bracket_end];
-            let lower = raw.to_lowercase();
-            if matches!(
-                lower.as_str(),
-                "info" | "warning" | "warn" | "error" | "debug" | "fatal" | "panic"
-            ) {
-                let msg = trimmed[bracket_start + bracket_end + 1..].trim().to_string();
-                let level = if lower == "warn" {
-                    "warning".to_string()
-                } else {
-                    lower
-                };
-                return (level, msg);
-            }
+    if let Some(bracket_start) = trimmed.find('[')
+        && let Some(bracket_end) = trimmed[bracket_start..].find(']')
+    {
+        let raw = &trimmed[bracket_start + 1..bracket_start + bracket_end];
+        let lower = raw.to_lowercase();
+        if matches!(
+            lower.as_str(),
+            "info" | "warning" | "warn" | "error" | "debug" | "fatal" | "panic"
+        ) {
+            let msg = trimmed[bracket_start + bracket_end + 1..]
+                .trim()
+                .to_string();
+            let level = if lower == "warn" {
+                "warning".to_string()
+            } else {
+                lower
+            };
+            return (level, msg);
         }
     }
     // Fallback
@@ -3045,8 +3504,7 @@ mod tests {
     }
     #[test]
     fn parse_singbox_json() {
-        let (level, msg) =
-            parse_log_level(r#"{"level":"warn","time":"...","msg":"timeout"}"#);
+        let (level, msg) = parse_log_level(r#"{"level":"warn","time":"...","msg":"timeout"}"#);
         assert_eq!(level, "warning");
         assert_eq!(msg, "timeout");
     }

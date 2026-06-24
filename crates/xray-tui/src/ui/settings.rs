@@ -5,13 +5,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::ui::theme::Theme;
 use crate::{AppMode, AppState, SettingsMode, SettingsSection};
 use xray_tui_core::CoreType;
-use crate::ui::theme::Theme;
 // ── Menu items ──────────────────────────────────────────────────────────
 
 const MENU_ITEMS: &[(&str, &str)] = &[
-    ("Core Settings", "binary paths, log level, default core type"),
+    (
+        "Core Settings",
+        "binary paths, log level, default core type",
+    ),
     ("Protocol Core", "per-protocol core type override"),
     ("GUI Settings", "language, theme, refresh interval"),
     ("Inbound Settings", "ports, listen address, sniffing"),
@@ -50,13 +53,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 }
-pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
+pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     let mode = match &state.mode {
         AppMode::Settings { mode } => mode.clone(),
         _ => return,
     };
     match mode {
-        SettingsMode::Menu { .. } => handle_menu_key(state, key),
+        SettingsMode::Menu { .. } => handle_menu_key(state, key).await,
         SettingsMode::CoreForm { .. }
         | SettingsMode::GuiForm { .. }
         | SettingsMode::InboundForm { .. }
@@ -67,8 +70,8 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::DnsForm { .. }
         | SettingsMode::ProtocolCoreForm { .. }
         | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key),
-        SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key),
-        SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key),
+        SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key).await,
+        SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key).await,
         SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key),
     }
 }
@@ -112,15 +115,9 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::White)
         };
 
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{name}"),
-            style,
-        )));
+        lines.push(Line::from(Span::styled(format!("{prefix}{name}"), style)));
         if is_selected {
-            lines.push(Line::from(Span::styled(
-                format!("    {desc}"),
-                Theme::HINT,
-            )));
+            lines.push(Line::from(Span::styled(format!("    {desc}"), Theme::HINT)));
         }
     }
 
@@ -132,7 +129,7 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, inner);
 }
 
-fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
     let selected = match &state.mode {
         AppMode::Settings {
             mode: SettingsMode::Menu { selected },
@@ -152,9 +149,10 @@ fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Down => {
             let max = MENU_ITEMS.len().saturating_sub(1);
-            if selected < max && let AppMode::Settings {
-                mode: SettingsMode::Menu { ref mut selected },
-            } = state.mode
+            if selected < max
+                && let AppMode::Settings {
+                    mode: SettingsMode::Menu { ref mut selected },
+                } = state.mode
             {
                 *selected += 1;
             }
@@ -175,7 +173,7 @@ fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
                 11 => SettingsSection::SpeedTest,
                 _ => return,
             };
-            state.enter_settings_form(section);
+            state.enter_settings_form(section).await;
         }
         KeyCode::Esc => {
             state.mode = AppMode::List;
@@ -249,7 +247,11 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
         SettingsMode::DnsForm { .. } => &[
             ("servers", "Servers (JSON)", "Text"),
             ("hosts", "Hosts (JSON)", "Text"),
-            ("query_strategy", "Query Strategy", "Select:,,UseIP,UseIPv4,UseIPv6"),
+            (
+                "query_strategy",
+                "Query Strategy",
+                "Select:,,UseIP,UseIPv4,UseIPv6",
+            ),
             ("disable_cache", "Disable Cache", "Boolean"),
             ("disable_fallback", "Disable Fallback", "Boolean"),
             ("client_ip", "Client IP", "Text"),
@@ -278,7 +280,11 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
             ("ping_url", "Ping Test URL", "Text"),
             ("ip_api_url", "IP API URL", "Text"),
             ("tcp_timeout_secs", "TCP Timeout (sec)", "Number"),
-            ("real_ping_timeout_secs", "Real Ping Timeout (sec)", "Number"),
+            (
+                "real_ping_timeout_secs",
+                "Real Ping Timeout (sec)",
+                "Number",
+            ),
             ("batch_page_size", "Batch Page Size", "Number"),
             ("batch_delay_ms", "Batch Delay (ms)", "Number"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
@@ -294,16 +300,46 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
         _ => return,
     };
     let (fields, focus_index) = match mode {
-        SettingsMode::CoreForm { fields, focus_index }
-        | SettingsMode::GuiForm { fields, focus_index }
-        | SettingsMode::InboundForm { fields, focus_index }
-        | SettingsMode::DnsForm { fields, focus_index }
-        | SettingsMode::SystemProxyForm { fields, focus_index }
-        | SettingsMode::TunForm { fields, focus_index }
-        | SettingsMode::MuxForm { fields, focus_index }
-        | SettingsMode::StatsForm { fields, focus_index }
-        | SettingsMode::ProtocolCoreForm { fields, focus_index }
-        | SettingsMode::SpeedTestForm { fields, focus_index } => (fields, *focus_index),
+        SettingsMode::CoreForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::GuiForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::InboundForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::DnsForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::SystemProxyForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::TunForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::MuxForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::StatsForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::ProtocolCoreForm {
+            fields,
+            focus_index,
+        }
+        | SettingsMode::SpeedTestForm {
+            fields,
+            focus_index,
+        } => (fields, *focus_index),
         _ => return,
     };
 
@@ -355,7 +391,10 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
         let value_text = format!("[{}]", display_val);
 
         let spans = vec![
-            Span::styled(label_text, if is_focused { focus_style } else { label_style }),
+            Span::styled(
+                label_text,
+                if is_focused { focus_style } else { label_style },
+            ),
             Span::styled(
                 value_text,
                 if is_focused {
@@ -415,16 +454,46 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     let (fields, focus_index) = match &mut state.mode {
         AppMode::Settings {
             mode:
-                SettingsMode::CoreForm { fields, focus_index }
-                | SettingsMode::GuiForm { fields, focus_index }
-                | SettingsMode::InboundForm { fields, focus_index }
-                | SettingsMode::DnsForm { fields, focus_index }
-                | SettingsMode::SystemProxyForm { fields, focus_index }
-                | SettingsMode::TunForm { fields, focus_index }
-                | SettingsMode::MuxForm { fields, focus_index }
-                | SettingsMode::StatsForm { fields, focus_index }
-                | SettingsMode::ProtocolCoreForm { fields, focus_index }
-                | SettingsMode::SpeedTestForm { fields, focus_index },
+                SettingsMode::CoreForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::GuiForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::InboundForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::DnsForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::SystemProxyForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::TunForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::MuxForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::StatsForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::ProtocolCoreForm {
+                    fields,
+                    focus_index,
+                }
+                | SettingsMode::SpeedTestForm {
+                    fields,
+                    focus_index,
+                },
         } => (fields, focus_index),
         _ => return,
     };
@@ -580,10 +649,7 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
         )));
     }
     if status_xray.downloading {
-        lines.push(Line::from(Span::styled(
-            "    Downloading...",
-            hint_style,
-        )));
+        lines.push(Line::from(Span::styled("    Downloading...", hint_style)));
     }
     if let Some(err) = &status_xray.error {
         lines.push(Line::from(Span::styled(
@@ -622,10 +688,7 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
         )));
     }
     if status_singbox.downloading {
-        lines.push(Line::from(Span::styled(
-            "    Downloading...",
-            hint_style,
-        )));
+        lines.push(Line::from(Span::styled("    Downloading...", hint_style)));
     }
     if let Some(err) = &status_singbox.error {
         lines.push(Line::from(Span::styled(
@@ -650,13 +713,26 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
 fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
     match key.code {
-        KeyCode::Char('c') | KeyCode::Char('C') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             state.spawn_update_check();
             // Refresh the form with current status
-            let status_xray = state.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
-            let status_singbox = state.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+            let status_xray = state
+                .update_status
+                .get(&CoreType::Xray)
+                .cloned()
+                .unwrap_or_default();
+            let status_singbox = state
+                .update_status
+                .get(&CoreType::SingBox)
+                .cloned()
+                .unwrap_or_default();
             state.mode = AppMode::Settings {
-                mode: SettingsMode::UpdateForm { status_xray, status_singbox },
+                mode: SettingsMode::UpdateForm {
+                    status_xray,
+                    status_singbox,
+                },
             };
         }
         KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -666,8 +742,16 @@ fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
                 return;
             }
             // Check each core and trigger download if available
-            let xray_avail = state.update_status.get(&CoreType::Xray).map(|s| s.update_available).unwrap_or(false);
-            let singbox_avail = state.update_status.get(&CoreType::SingBox).map(|s| s.update_available).unwrap_or(false);
+            let xray_avail = state
+                .update_status
+                .get(&CoreType::Xray)
+                .map(|s| s.update_available)
+                .unwrap_or(false);
+            let singbox_avail = state
+                .update_status
+                .get(&CoreType::SingBox)
+                .map(|s| s.update_available)
+                .unwrap_or(false);
 
             if xray_avail {
                 state.spawn_update_download(CoreType::Xray);
@@ -676,10 +760,21 @@ fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
                 state.spawn_update_download(CoreType::SingBox);
             }
             // Refresh the form with current status
-            let status_xray = state.update_status.get(&CoreType::Xray).cloned().unwrap_or_default();
-            let status_singbox = state.update_status.get(&CoreType::SingBox).cloned().unwrap_or_default();
+            let status_xray = state
+                .update_status
+                .get(&CoreType::Xray)
+                .cloned()
+                .unwrap_or_default();
+            let status_singbox = state
+                .update_status
+                .get(&CoreType::SingBox)
+                .cloned()
+                .unwrap_or_default();
             state.mode = AppMode::Settings {
-                mode: SettingsMode::UpdateForm { status_xray, status_singbox },
+                mode: SettingsMode::UpdateForm {
+                    status_xray,
+                    status_singbox,
+                },
             };
         }
         KeyCode::Esc => {
@@ -699,8 +794,7 @@ fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
         _ => 0,
     };
 
-    // Load rules from DB
-    let rules = state.db.get_all_routing_rules().unwrap_or_default();
+    let rules = &state.routing_rules;
 
     // Centered overlay
     let overlay_area = Rect::new(
@@ -719,15 +813,39 @@ fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     // Header
     let header = Line::from(vec![
-        Span::styled(" #  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("Type  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("Domains/IPs                    ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("Outbound Tag", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " #  ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Type  ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Domains/IPs                    ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Outbound Tag",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
     frame.render_widget(header, chunks[0]);
 
@@ -756,13 +874,14 @@ fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
         rows.push(Line::from(vec![
             Span::styled(
                 format!("{:>2}  ", i + 1),
-                if is_selected { style } else { Style::default().fg(Color::DarkGray) },
+                if is_selected {
+                    style
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
             ),
             Span::styled(format!("{}  ", rule.r#type), style),
-            Span::styled(
-                truncate_to(&targets, 32),
-                style,
-            ),
+            Span::styled(truncate_to(&targets, 32), style),
             Span::styled(outbound.to_string(), style),
         ]));
     }
@@ -780,7 +899,7 @@ fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(footer, chunks[2]);
 }
 
-fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
     let selected = match &state.mode {
         AppMode::Settings {
             mode: SettingsMode::RoutingList { selected },
@@ -788,10 +907,8 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
         _ => return,
     };
 
-    let rules = match state.db.get_all_routing_rules() {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+    state.reload_routing_rules().await;
+    let rules = &state.routing_rules;
     let max = rules.len().saturating_sub(1);
 
     match key.code {
@@ -816,13 +933,14 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                 for (idx, (_, order)) in ids.iter_mut().enumerate() {
                     *order = idx as i32;
                 }
-                let _ = state.db.reorder_routing_rules(&ids);
+                let _ = state.db.reorder_routing_rules(&ids).await;
                 if let AppMode::Settings {
                     mode: SettingsMode::RoutingList { ref mut selected },
                 } = state.mode
                 {
                     *selected = selected.saturating_sub(1);
                 }
+                state.reload_routing_rules().await;
             }
         }
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -846,13 +964,14 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                 for (idx, (_, order)) in ids.iter_mut().enumerate() {
                     *order = idx as i32;
                 }
-                let _ = state.db.reorder_routing_rules(&ids);
+                let _ = state.db.reorder_routing_rules(&ids).await;
                 if let AppMode::Settings {
                     mode: SettingsMode::RoutingList { ref mut selected },
                 } = state.mode
                 {
                     *selected += 1;
                 }
+                state.reload_routing_rules().await;
             }
         }
         KeyCode::Up => {
@@ -864,9 +983,10 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Down => {
-            if selected < max && let AppMode::Settings {
-                mode: SettingsMode::RoutingList { ref mut selected },
-            } = state.mode
+            if selected < max
+                && let AppMode::Settings {
+                    mode: SettingsMode::RoutingList { ref mut selected },
+                } = state.mode
             {
                 *selected += 1;
             }
@@ -894,16 +1014,24 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Char('d' | 'D') => {
-            if !rules.is_empty() && selected < rules.len() {
-                let _ = state.db.delete_routing_rule(&rules[selected].id);
+            let (rule_id, list_len) = if !rules.is_empty() && selected < rules.len() {
+                (Some(rules[selected].id.clone()), rules.len())
+            } else {
+                (None, 0)
+            };
+            if let Some(id) = rule_id {
+                let _ = state.db.delete_routing_rule(&id).await;
                 state.log_trace("info", "tui", "Routing rule deleted");
-                let new_max = rules.len().saturating_sub(2);
+                let new_max = list_len.saturating_sub(2);
                 if let AppMode::Settings {
                     mode: SettingsMode::RoutingList { ref mut selected },
-                } = state.mode && *selected > new_max && new_max > 0
+                } = state.mode
+                    && *selected > new_max
+                    && new_max > 0
                 {
                     *selected = new_max;
                 }
+                state.reload_routing_rules().await;
             }
         }
         KeyCode::Esc => {
@@ -919,9 +1047,20 @@ fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
 
 fn routing_rule_fields(rule: Option<&crate::RoutingRule>) -> Vec<(String, String)> {
     let keys = [
-        "type", "domain_matcher", "domains", "ips", "inbound_tags", "port", "source_ports",
-        "network", "protocols", "domain_strategy", "outbound_tag", "balancer_tag",
-        "rule_set_file", "rule_set_url",
+        "type",
+        "domain_matcher",
+        "domains",
+        "ips",
+        "inbound_tags",
+        "port",
+        "source_ports",
+        "network",
+        "protocols",
+        "domain_strategy",
+        "outbound_tag",
+        "balancer_tag",
+        "rule_set_file",
+        "rule_set_url",
     ];
     keys.iter()
         .map(|k| {
@@ -970,7 +1109,12 @@ const ROUTING_FIELD_DEFS: &[(&str, &str, &str)] = &[
 fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let (fields, focus_index) = match &state.mode {
         AppMode::Settings {
-            mode: SettingsMode::RoutingForm { fields, focus_index, .. },
+            mode:
+                SettingsMode::RoutingForm {
+                    fields,
+                    focus_index,
+                    ..
+                },
         } => (fields, *focus_index),
         _ => return,
     };
@@ -1029,7 +1173,10 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
         let value_text = format!("[{}]", display_val);
 
         let spans = vec![
-            Span::styled(label_text, if is_focused { focus_style } else { label_style }),
+            Span::styled(
+                label_text,
+                if is_focused { focus_style } else { label_style },
+            ),
             Span::styled(
                 value_text,
                 if is_focused {
@@ -1050,7 +1197,7 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, inner);
 }
 
-fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
     let (rule_id, fields, focus_index) = match &mut state.mode {
         AppMode::Settings {
             mode:
@@ -1115,7 +1262,9 @@ fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Enter => {
             let saved_fields = fields.clone();
-            state.save_routing_rule(rule_id.clone(), &saved_fields);
+            state
+                .save_routing_rule(rule_id.clone(), &saved_fields)
+                .await;
             state.mode = AppMode::Settings {
                 mode: SettingsMode::RoutingList { selected: 0 },
             };

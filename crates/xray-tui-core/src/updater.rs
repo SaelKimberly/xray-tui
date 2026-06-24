@@ -41,13 +41,11 @@ pub async fn get_current_version(core_type: CoreType, bin_dir: &Path) -> Option<
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Extract the first version-like token (e.g., "1.8.4" from "xray 1.8.4 ...")
-    let version_str = stdout
-        .split_whitespace()
-        .find(|token| {
-            let stripped = token.strip_prefix('v').unwrap_or(token);
-            stripped.chars().next().is_some_and(|c| c.is_ascii_digit())
-                && stripped.chars().any(|c| c == '.')
-        })?;
+    let version_str = stdout.split_whitespace().find(|token| {
+        let stripped = token.strip_prefix('v').unwrap_or(token);
+        stripped.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && stripped.chars().any(|c| c == '.')
+    })?;
 
     let stripped = version_str.strip_prefix('v').unwrap_or(version_str);
     if Version::parse(stripped).is_ok() {
@@ -71,9 +69,7 @@ pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
         CoreType::Auto => return None,
     };
 
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -100,8 +96,13 @@ pub async fn download_release(
     version: &str,
     dest_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let url = release_asset_url(core_type, version)
-        .ok_or_else(|| format!("unsupported platform: {}-{}", std::env::consts::ARCH, std::env::consts::OS))?;
+    let url = release_asset_url(core_type, version).ok_or_else(|| {
+        format!(
+            "unsupported platform: {}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        )
+    })?;
 
     let filename = url.rsplit('/').next().unwrap_or("archive.tar.gz");
     let dest = dest_dir.join(filename);
@@ -146,7 +147,11 @@ pub async fn download_release(
 }
 
 /// Extract archive, verify binary, install all files to bin_dir.
-pub async fn install_binary(archive: &Path, core_type: CoreType, bin_dir: &Path) -> Result<(), String> {
+pub async fn install_binary(
+    archive: &Path,
+    core_type: CoreType,
+    bin_dir: &Path,
+) -> Result<(), String> {
     let suffix = match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
@@ -174,8 +179,7 @@ pub async fn install_binary(archive: &Path, core_type: CoreType, bin_dir: &Path)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&binary)
-            .map_err(|e| format!("cannot stat binary: {e}"))?;
+        let meta = std::fs::metadata(&binary).map_err(|e| format!("cannot stat binary: {e}"))?;
         let mut perms = meta.permissions();
         perms.set_mode(perms.mode() | 0o111);
         std::fs::set_permissions(&binary, perms)
@@ -208,7 +212,13 @@ pub async fn install_binary(archive: &Path, core_type: CoreType, bin_dir: &Path)
     });
 
     // Remove old .bak if present
-    let bak_dir = bin_dir.join(format!("{}.bak", core_bin_dir.file_name().unwrap_or_default().to_string_lossy()));
+    let bak_dir = bin_dir.join(format!(
+        "{}.bak",
+        core_bin_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
     let _ = std::fs::remove_dir_all(&bak_dir);
 
     // Rename existing directory to .bak
@@ -218,8 +228,7 @@ pub async fn install_binary(archive: &Path, core_type: CoreType, bin_dir: &Path)
     }
 
     // Copy all extracted files
-    std::fs::create_dir_all(&core_bin_dir)
-        .map_err(|e| format!("failed to create bin dir: {e}"))?;
+    std::fs::create_dir_all(&core_bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
 
     if let Err(e) = copy_recursively(&temp_dir, &core_bin_dir) {
         // Restore from backup
@@ -414,7 +423,11 @@ mod tests {
         // find_binary should find the managed binary
         let found = crate::bin_manager::find_binary(CoreType::Xray, &tmp);
         assert!(found.is_some(), "find_binary should find managed xray");
-        assert_eq!(found.unwrap(), binary, "find_binary should return the managed path");
+        assert_eq!(
+            found.unwrap(),
+            binary,
+            "find_binary should return the managed path"
+        );
 
         // get_current_version should parse the version from the same binary
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -438,4 +451,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
-

@@ -1,3 +1,4 @@
+pub mod actions_log;
 pub mod add_server;
 pub mod groups;
 pub mod logs;
@@ -5,9 +6,7 @@ pub mod profiles;
 pub mod settings;
 pub mod statistics;
 pub mod status_bar;
-pub mod actions_log;
 pub mod theme;
-use xray_tui_config::subscription::subscription_url_split;
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -21,8 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use std::io;
-use std::sync::mpsc;
 use std::time::Duration;
+use xray_tui_config::subscription::subscription_url_split;
 
 pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
     let overlay_style = Style::default()
@@ -42,7 +41,7 @@ pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
 }
 // ── Entry point ───────────────────────────────────────────────────────
 
-pub fn run(state: &mut AppState) -> anyhow::Result<()> {
+pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -50,15 +49,14 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let ts = terminal.size().unwrap_or_default();
     state.actions_compact = ts.height < 20;
-    let (tx, rx) = mpsc::channel::<Event>();
-    std::thread::spawn(move || {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    tokio::task::spawn_blocking(move || {
         while let Ok(ev) = event::read() {
             if tx.send(ev).is_err() {
                 break;
             }
         }
     });
-
     let refresh_interval = Duration::from_secs(state.config.gui.refresh_interval_secs);
     let mut last_tick = std::time::Instant::now();
 
@@ -68,13 +66,12 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
     if state.config.updates.check_on_startup {
         state.spawn_update_check();
     }
-
     while !state.should_quit {
         loop {
             match rx.try_recv() {
-                Ok(ev) => handle_event(&ev, state),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Ok(ev) => handle_event(&ev, state).await,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     state.should_quit = true;
                     break;
                 }
@@ -82,7 +79,7 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
         }
 
         // Process core process events (connect/disconnect/error)
-        state.poll_core_events();
+        state.poll_core_events().await;
 
         if last_tick.elapsed() >= refresh_interval {
             last_tick = std::time::Instant::now();
@@ -90,7 +87,7 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
         let ts = terminal.size().unwrap_or_default();
         state.term_height.set(ts.height);
         terminal.draw(|f| render(f, &*state))?;
-        std::thread::sleep(Duration::from_millis(16));
+        tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
     disable_raw_mode()?;
@@ -102,20 +99,20 @@ pub fn run(state: &mut AppState) -> anyhow::Result<()> {
 
 // ── Event handling ────────────────────────────────────────────────────
 
-fn handle_event(ev: &Event, state: &mut AppState) {
+async fn handle_event(ev: &Event, state: &mut AppState) {
     if let Event::Key(key) = ev {
-        handle_key(key, state);
+        handle_key(key, state).await;
     }
 }
-fn handle_key(key: &KeyEvent, state: &mut AppState) {
+async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // Delete confirmation: only y/n/esc — check before mode dispatch so
     // confirmation is handled even when inside a sub-mode like ManageGroups.
     if state.confirmation.is_some() {
         match key.code {
             KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
-                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id),
-                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id),
-                Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id),
+                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id).await,
+                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
+                Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -134,7 +131,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
 
     // Group management overlay mode: pass to groups handler
     if matches!(&state.mode, crate::AppMode::ManageGroups { .. }) {
-        groups::handle_key(state, key);
+        groups::handle_key(state, key).await;
         return;
     }
 
@@ -147,7 +144,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.should_quit = true
             }
-            _ => groups::handle_key(state, key),
+            _ => groups::handle_key(state, key).await,
         }
         return;
     }
@@ -158,14 +155,14 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.should_quit = true;
             }
-            _ => settings::handle_key(state, key),
+            _ => settings::handle_key(state, key).await,
         }
         return;
     }
 
     // BatchImport: route all keys to batch import handler
     if matches!(&state.mode, crate::AppMode::BatchImport { .. }) {
-        add_server::handle_batch_import_key(state, key);
+        add_server::handle_batch_import_key(state, key).await;
         return;
     }
 
@@ -179,7 +176,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.should_quit = true;
             }
-            _ => add_server::handle_key(state, key),
+            _ => add_server::handle_key(state, key).await,
         }
         return;
     }
@@ -268,7 +265,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.filter_cache_valid.set(false);
                     }
                     8 => {
-                        state.remove_failed_servers();
+                        state.remove_failed_servers().await;
                     }
                     _ => {}
                 }
@@ -289,11 +286,13 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
-
     match key.code {
         // Help mode: Esc or ? to close, ignore other keys
         KeyCode::Char('?') | KeyCode::Esc if matches!(&state.mode, crate::AppMode::Help) => {
-            state.mode = *state.previous_mode.take().unwrap_or(Box::new(crate::AppMode::List));
+            state.mode = *state
+                .previous_mode
+                .take()
+                .unwrap_or(Box::new(crate::AppMode::List));
         }
         // Open help overlay from List mode
         KeyCode::Char('?') if !matches!(&state.mode, crate::AppMode::Help) => {
@@ -380,13 +379,13 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            state.move_profile_up();
+            state.move_profile_up().await;
         }
         KeyCode::Down
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            state.move_profile_down();
+            state.move_profile_down().await;
         }
         KeyCode::Enter
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -407,7 +406,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
 
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
-                state.set_active(&id);
+                state.set_active(&id).await;
             }
         }
         KeyCode::Enter if state.current_tab == Tab::Settings => {
@@ -462,7 +461,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('e' | 'E') if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
-                state.start_edit_profile(&id);
+                state.start_edit_profile(&id).await;
             }
         }
         KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
@@ -478,7 +477,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if state.multi_select.len() >= 2 {
                 let ids: Vec<String> = state.multi_select.iter().cloned().collect();
                 for id in &ids {
-                    state.delete_profile(id);
+                    state.delete_profile(id).await;
                 }
                 state.multi_select.clear();
             } else if let Some(id) = state.selected_profile_id() {
@@ -490,7 +489,7 @@ fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && state.current_tab == Tab::Profiles =>
         {
             if let Some(id) = state.selected_profile_id() {
-                state.clone_profile(&id);
+                state.clone_profile(&id).await;
             }
         }
         KeyCode::Char('v')
@@ -568,10 +567,10 @@ fn render(frame: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),      // 0: tabs
-            Constraint::Min(3),         // 1: content
-            Constraint::Length(ph),     // 2: actions panel
-            Constraint::Length(1),      // 3: status bar
+            Constraint::Length(1),  // 0: tabs
+            Constraint::Min(3),     // 1: content
+            Constraint::Length(ph), // 2: actions panel
+            Constraint::Length(1),  // 3: status bar
         ])
         .split(frame.area());
 
@@ -590,14 +589,15 @@ fn render(frame: &mut Frame, state: &AppState) {
         actions_log::render_full(frame, chunks[2], state);
     }
     // Render tabs — only in modes that show them (not AddServer, EditServer, ImportUrl, Group forms, BatchImport)
-    let is_form_mode = matches!(&state.mode,
+    let is_form_mode = matches!(
+        &state.mode,
         crate::AppMode::AddServer { .. }
-        | crate::AppMode::EditServer { .. }
-        | crate::AppMode::ImportUrl { .. }
-        | crate::AppMode::ManageGroups { .. }
-        | crate::AppMode::AddGroup { .. }
-        | crate::AppMode::EditGroup { .. }
-        | crate::AppMode::BatchImport { .. }
+            | crate::AppMode::EditServer { .. }
+            | crate::AppMode::ImportUrl { .. }
+            | crate::AppMode::ManageGroups { .. }
+            | crate::AppMode::AddGroup { .. }
+            | crate::AppMode::EditGroup { .. }
+            | crate::AppMode::BatchImport { .. }
     );
     if !is_form_mode {
         render_tabs(frame, chunks[0], state);
@@ -660,7 +660,12 @@ fn render(frame: &mut Frame, state: &AppState) {
 }
 fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
     match &state.mode {
-        crate::AppMode::Help => match state.previous_mode.as_deref().cloned().unwrap_or(AppMode::List) {
+        crate::AppMode::Help => match state
+            .previous_mode
+            .as_deref()
+            .cloned()
+            .unwrap_or(AppMode::List)
+        {
             AppMode::List => match state.current_tab {
                 Tab::Profiles => vec![
                     ("↑↓ / PgUp PgDn", "Navigate profiles"),
@@ -851,10 +856,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Tab::Logs => " Logs ",
                 Tab::Statistics => " Statistics ",
             };
-            Line::from(Span::styled(
-                name,
-                crate::ui::theme::Theme::TAB_DESELECTED,
-            ))
+            Line::from(Span::styled(name, crate::ui::theme::Theme::TAB_DESELECTED))
         })
         .collect();
 

@@ -67,7 +67,7 @@ cargo run
 2. **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, Shadowsocks, etc.) → xray-core by default. User overrides per-profile.
 3. **One core at a time**: Only one backend process runs per connection session. Switching profiles between backends stops the current core and starts the other. Matches v2rayN.
 4. **Ratatui + Crossterm** — TUI framework. Async via tokio. Single render thread with async tasks sending updates via mpsc channels.
-5. **SQLite via rusqlite** — Single DB file for all persistent data.
+5. **SQLite via turso (async)** — Single DB file for all persistent data. Async pure-Rust SQLite engine. All DB methods are `async fn` with `#[repr(usize)]` column enums for compile-time safe row extraction. Transaction via `unchecked_transaction().await`. Connection wrapped in `Arc<Database>` for shared access across tasks.
 6. **Multi-crate workspace** — Separation: bin crate (TUI) + 3 lib crates (core, db, config).
 7. **Config generation** — Two builders: xray.rs (ports v2rayN's CoreConfigContextBuilder) and singbox.rs (ports sing-box JSON format).
 8. **gRPC stats abstraction**: `StatsProvider` trait with `XrayGrpcClient` (xray-core native gRPC) and `SingBoxGrpcClient` (sing-box V2Ray API experimental).
@@ -156,7 +156,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Use `tokio` for async runtime
 - gRPC via `tonic` crate
 - HTTP via `reqwest` crate
-- SQLite via `rusqlite` crate
+- SQLite via `turso` crate (async)
 - Use `reqwest` for HTTP client (subscription fetch)
 - Use `escape8259` for JSON string unescaping
 - Use `memchr` for vectorized byte search

@@ -8,8 +8,8 @@ use xray_tui_config::forms::{FieldSection, FormFieldType, form_fields_for};
 use xray_tui_core::SINGBOX_ONLY_PROTOCOLS;
 use xray_tui_core::protocol::Protocol;
 
-use crate::{AppMode, AppState};
 use crate::ui::theme::Theme;
+use crate::{AppMode, AppState};
 
 /// Protocol picker layout groups
 const XRAY_PROTOCOLS: &[Protocol] = &[
@@ -81,16 +81,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             render_form(frame, area, *p, fields, *focus_index, false);
         }
         AppMode::EditServer {
-            profile_id,
+            profile_id: _,
             fields,
             focus_index,
         } => {
-            let proto = state
-                .db
-                .get_profile(profile_id)
-                .ok()
-                .flatten()
-                .and_then(|p| Protocol::try_from_i32(p.config_type))
+            let proto = crate::get_field(fields, "config_type")
+                .and_then(|v| v.parse::<i32>().ok())
+                .and_then(Protocol::try_from_i32)
                 .unwrap_or(Protocol::Custom);
             render_form(frame, area, proto, fields, *focus_index, true);
         }
@@ -296,7 +293,7 @@ fn render_form(
 
 // ── Key handler ──────────────────────────────────────────────────────────
 
-pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
+pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     // Determine mode type first without borrowing state.mode deeply
     let is_picker = matches!(&state.mode, AppMode::AddServer { protocol: None, .. });
     let is_import = matches!(&state.mode, AppMode::ImportUrl { .. });
@@ -319,7 +316,7 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
     }
 
     if is_form {
-        handle_form_key(state, key);
+        handle_form_key(state, key).await;
     }
 }
 
@@ -382,7 +379,7 @@ fn handle_import_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
-fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     // Extract protocol from current mode
     let protocol = match &state.mode {
         AppMode::AddServer {
@@ -391,6 +388,7 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         AppMode::EditServer { profile_id, .. } => state
             .db
             .get_profile(profile_id)
+            .await
             .ok()
             .flatten()
             .and_then(|p| Protocol::try_from_i32(p.config_type)),
@@ -453,9 +451,9 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if is_edit {
-                state.confirm_edit_server();
+                state.confirm_edit_server().await;
             } else {
-                state.confirm_add_server();
+                state.confirm_add_server().await;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -494,9 +492,9 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Enter => {
             if is_edit {
-                state.confirm_edit_server();
+                state.confirm_edit_server().await;
             } else {
-                state.confirm_add_server();
+                state.confirm_add_server().await;
             }
         }
         KeyCode::Esc => state.cancel_form(),
@@ -541,14 +539,20 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
     // Status header
     let ok_count = results.iter().filter(|r| r.profile.is_some()).count();
     let err_count = results.iter().filter(|r| r.profile.is_none()).count();
-    let header = format!(" {ok_count} valid, {err_count} invalid — Enter to import, Esc to cancel ");
+    let header =
+        format!(" {ok_count} valid, {err_count} invalid — Enter to import, Esc to cancel ");
     let header_style = Style::default().fg(Color::Cyan);
     let header_line = Line::from(Span::styled(&header, header_style));
-    frame.render_widget(Paragraph::new(header_line), Rect::new(inner.x, inner.y, inner.width, 1));
+    frame.render_widget(
+        Paragraph::new(header_line),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
 
     // URL list
     let list_y = inner.y + 1;
-    let list_height = max_visible.saturating_sub(1).min(total.saturating_sub(scroll));
+    let list_height = max_visible
+        .saturating_sub(1)
+        .min(total.saturating_sub(scroll));
     for i in 0..list_height {
         let idx = scroll + i;
         if idx >= total {
@@ -593,12 +597,17 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
         let scroll_y = inner.y + inner.height.saturating_sub(1);
         frame.render_widget(
             Paragraph::new(scroll_line),
-            Rect::new(inner.x + inner.width.saturating_sub(scroll_text.len() as u16 + 2), scroll_y, scroll_text.len() as u16 + 2, 1),
+            Rect::new(
+                inner.x + inner.width.saturating_sub(scroll_text.len() as u16 + 2),
+                scroll_y,
+                scroll_text.len() as u16 + 2,
+                1,
+            ),
         );
     }
 }
 
-pub fn handle_batch_import_key(state: &mut AppState, key: &KeyEvent) {
+pub async fn handle_batch_import_key(state: &mut AppState, key: &KeyEvent) {
     let results_len = match &state.mode {
         AppMode::BatchImport { results, .. } => results.len(),
         _ => return,
@@ -629,7 +638,7 @@ pub fn handle_batch_import_key(state: &mut AppState, key: &KeyEvent) {
             };
         }
         KeyCode::Enter => {
-            state.confirm_batch_import();
+            state.confirm_batch_import().await;
         }
         KeyCode::Esc => {
             state.mode = AppMode::List;

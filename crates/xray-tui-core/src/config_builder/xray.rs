@@ -413,7 +413,6 @@ fn build_routing(rules: &[RoutingRule]) -> RoutingConfig {
     }
 }
 
-
 // ── DNS ──────────────────────────────────────────────────────────────
 
 fn build_dns(dns: &DnsSetting) -> DnsConfig {

@@ -25,7 +25,7 @@ pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, s
 pub struct LogLine { level: String, message: String, source: String }
 
 pub struct AppState {
-    pub db: Database,
+    pub db: Arc<Database>,
     pub config: AppConfig,
     pub current_tab: Tab,
     pub mode: AppMode,
@@ -50,7 +50,7 @@ pub struct AppState {
     pub system_stats: Option<SysStats>,
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub previous_mode: Option<Box<AppMode>>,
-    pub should_quit: bool,
+    pub routing_rules: Vec<RoutingRule>,
     pub actions_compact: bool,
     pub connected_profile_id: Option<String>,
     pub last_core_log: Option<(String, String)>,

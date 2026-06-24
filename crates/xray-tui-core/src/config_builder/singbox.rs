@@ -126,7 +126,7 @@ impl SingBoxConfigBuilder {
                 }),
             }),
         })
-}
+    }
 }
 
 fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
@@ -273,9 +273,18 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             }))
         }
         Protocol::Hysteria => {
-            let auth = p_settings.get("auth").and_then(|v| v.as_str()).unwrap_or("");
-            let up = p_settings.get("up_mbps").and_then(|v| v.as_u64()).unwrap_or(100);
-            let down = p_settings.get("down_mbps").and_then(|v| v.as_u64()).unwrap_or(100);
+            let auth = p_settings
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let up = p_settings
+                .get("up_mbps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100);
+            let down = p_settings
+                .get("down_mbps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100);
             let mut out = json!({
                 "tag": "proxy",
                 "type": "hysteria",
@@ -287,23 +296,40 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             if !auth.is_empty() {
                 out["auth_str"] = json!(auth);
             }
-            if let Some(obfs) = p_settings.get("obfs").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(obfs) = p_settings
+                .get("obfs")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 out["obfs"] = json!(obfs);
             }
             // Hysteria v1 always uses TLS
             let mut tls = serde_json::Map::new();
             tls.insert("enabled".into(), json!(true));
-            let sni = p_settings.get("sni").and_then(|v| v.as_str()).unwrap_or(address);
+            let sni = p_settings
+                .get("sni")
+                .and_then(|v| v.as_str())
+                .unwrap_or(address);
             tls.insert("server_name".into(), json!(sni));
-            if p_settings.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if p_settings
+                .get("insecure")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 tls.insert("insecure".into(), json!(true));
             }
             out["tls"] = json!(tls);
             Ok(out)
         }
         Protocol::Naive => {
-            let username = p_settings.get("user").and_then(|v| v.as_str()).unwrap_or("");
-            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or(user_id);
+            let username = p_settings
+                .get("user")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let password = p_settings
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or(user_id);
             let mut out = json!({
                 "tag": "proxy",
                 "type": "naive",
@@ -320,7 +346,10 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             Ok(out)
         }
         Protocol::AnyTls => {
-            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let password = p_settings
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let mut out = json!({
                 "tag": "proxy",
                 "type": "anytls",
@@ -334,10 +363,20 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             Ok(out)
         }
         Protocol::ShadowTls => {
-            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let version = p_settings.get("version").and_then(|v| v.as_i64()).or_else(|| {
-                p_settings.get("version").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok())
-            }).unwrap_or(3);
+            let password = p_settings
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let version = p_settings
+                .get("version")
+                .and_then(|v| v.as_i64())
+                .or_else(|| {
+                    p_settings
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                })
+                .unwrap_or(3);
             let mut out = json!({
                 "tag": "proxy",
                 "type": "shadowtls",
@@ -356,17 +395,36 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 "tag": "proxy",
                 "type": "tor",
             });
-            if let Some(data_dir) = p_settings.get("data_dir").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(data_dir) = p_settings
+                .get("data_dir")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 out["data_directory"] = json!(data_dir);
             }
             Ok(out)
         }
         Protocol::Ssh => {
-            let ssh_host = p_settings.get("host").and_then(|v| v.as_str()).unwrap_or(address);
-            let ssh_port = p_settings.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(port as u64);
-            let username = p_settings.get("username").and_then(|v| v.as_str()).unwrap_or("root");
-            let password = p_settings.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let private_key = p_settings.get("private_key").and_then(|v| v.as_str()).unwrap_or("");
+            let ssh_host = p_settings
+                .get("host")
+                .and_then(|v| v.as_str())
+                .unwrap_or(address);
+            let ssh_port = p_settings
+                .get("ssh_port")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(port as u64);
+            let username = p_settings
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root");
+            let password = p_settings
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let private_key = p_settings
+                .get("private_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let mut out = json!({
                 "tag": "proxy",
                 "type": "ssh",
@@ -387,13 +445,25 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 "tag": "proxy",
                 "type": "tailscale",
             });
-            if let Some(key) = p_settings.get("auth_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(key) = p_settings
+                .get("auth_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 out["auth_key"] = json!(key);
             }
-            if let Some(url) = p_settings.get("control_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(url) = p_settings
+                .get("control_url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 out["control_url"] = json!(url);
             }
-            if p_settings.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if p_settings
+                .get("ephemeral")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 out["ephemeral"] = json!(true);
             }
             Ok(out)
@@ -417,7 +487,10 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             Ok(out)
         }
         Protocol::Vless => {
-            let flow = p_settings.get("flow").and_then(|v| v.as_str()).unwrap_or("");
+            let flow = p_settings
+                .get("flow")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let mut out = json!({
                 "tag": "proxy",
                 "type": "vless",
@@ -450,10 +523,22 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             Ok(out)
         }
         Protocol::WireGuard => {
-            let private_key = p_settings.get("private_key").and_then(|v| v.as_str()).unwrap_or("");
-            let public_key = p_settings.get("public_key").and_then(|v| v.as_str()).unwrap_or("");
-            let allowed_ips = p_settings.get("allowed_ips").and_then(|v| v.as_str()).unwrap_or("0.0.0.0/0");
-            let mtu = p_settings.get("mtu").and_then(|v| v.as_u64()).unwrap_or(1420);
+            let private_key = p_settings
+                .get("private_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let public_key = p_settings
+                .get("public_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let allowed_ips = p_settings
+                .get("allowed_ips")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0.0.0.0/0");
+            let mtu = p_settings
+                .get("mtu")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1420);
 
             // Peer endpoint: URL import sets profile.address:port; form stores in protocol_settings["endpoint"]
             let profile_addr = profile.address.as_deref().filter(|s| !s.is_empty());
@@ -657,7 +742,11 @@ fn build_tls(profile: &Profile) -> Option<Value> {
         .or_else(|| s_settings.get("alpn").and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty());
     if let Some(a) = alpn {
-        let parts: Vec<&str> = a.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = a
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         if !parts.is_empty() {
             tls.insert("alpn".into(), json!(parts));
         }
@@ -677,33 +766,51 @@ fn build_tls(profile: &Profile) -> Option<Value> {
 
     // reality: check both URL-import (security) and form (reality.show) paths
     let is_reality = s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
-        || s_settings.get("reality.show").and_then(|v| v.as_bool()).unwrap_or(false);
+        || s_settings
+            .get("reality.show")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     if is_reality {
         let mut reality = serde_json::Map::new();
         reality.insert("enabled".into(), json!(true));
         // stream_settings reality keys: URL import uses flat "pbk"/"sid"/"spx"
         // realitySettings sub-object also checked for backwards compat
-        if let Some(pbk) = s_settings.get("pbk").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-            .or_else(|| s_settings.get("realitySettings")
-                .and_then(|v| v.as_object())
-                .and_then(|m| m.get("publicKey").and_then(|v| v.as_str()))
-            )
+        if let Some(pbk) = s_settings
+            .get("pbk")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                s_settings
+                    .get("realitySettings")
+                    .and_then(|v| v.as_object())
+                    .and_then(|m| m.get("publicKey").and_then(|v| v.as_str()))
+            })
         {
             reality.insert("public_key".into(), json!(pbk));
         }
-        if let Some(sid) = s_settings.get("sid").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-            .or_else(|| s_settings.get("realitySettings")
-                .and_then(|v| v.as_object())
-                .and_then(|m| m.get("shortId").and_then(|v| v.as_str()))
-            )
+        if let Some(sid) = s_settings
+            .get("sid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                s_settings
+                    .get("realitySettings")
+                    .and_then(|v| v.as_object())
+                    .and_then(|m| m.get("shortId").and_then(|v| v.as_str()))
+            })
         {
             reality.insert("short_id".into(), json!(sid));
         }
-        if let Some(spx) = s_settings.get("spx").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-            .or_else(|| s_settings.get("realitySettings")
-                .and_then(|v| v.as_object())
-                .and_then(|m| m.get("spiderX").and_then(|v| v.as_str()))
-            )
+        if let Some(spx) = s_settings
+            .get("spx")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                s_settings
+                    .get("realitySettings")
+                    .and_then(|v| v.as_object())
+                    .and_then(|m| m.get("spiderX").and_then(|v| v.as_str()))
+            })
         {
             reality.insert("short_id".into(), json!(spx));
         }
@@ -938,7 +1045,10 @@ mod tests {
     fn singbox_hysteria_config() {
         let mut profile = test_profile(Protocol::Hysteria.to_i32());
         profile.config_type = Protocol::Hysteria.to_i32();
-        profile.protocol_settings = Some(r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#.to_string());
+        profile.protocol_settings = Some(
+            r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#
+                .to_string(),
+        );
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -969,7 +1079,8 @@ mod tests {
     fn singbox_anytls_config() {
         let mut profile = test_profile(Protocol::AnyTls.to_i32());
         profile.config_type = Protocol::AnyTls.to_i32();
-        profile.protocol_settings = Some(r#"{"password":"any-secret","sni":"tls.example.com"}"#.to_string());
+        profile.protocol_settings =
+            Some(r#"{"password":"any-secret","sni":"tls.example.com"}"#.to_string());
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -982,7 +1093,9 @@ mod tests {
     fn singbox_shadowtls_config() {
         let mut profile = test_profile(Protocol::ShadowTls.to_i32());
         profile.config_type = Protocol::ShadowTls.to_i32();
-        profile.protocol_settings = Some(r#"{"password":"shadow-pw","version":"3","sni":"shadow.example.com"}"#.to_string());
+        profile.protocol_settings = Some(
+            r#"{"password":"shadow-pw","version":"3","sni":"shadow.example.com"}"#.to_string(),
+        );
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1007,7 +1120,10 @@ mod tests {
     #[test]
     fn singbox_ssh_config() {
         let mut profile = test_profile(Protocol::Ssh.to_i32());
-        profile.protocol_settings = Some(r#"{"host":"ssh.example.com","ssh_port":2222,"username":"admin","password":"ssh-pw"}"#.to_string());
+        profile.protocol_settings = Some(
+            r#"{"host":"ssh.example.com","ssh_port":2222,"username":"admin","password":"ssh-pw"}"#
+                .to_string(),
+        );
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1023,7 +1139,10 @@ mod tests {
     #[test]
     fn singbox_tailscale_config() {
         let mut profile = test_profile(Protocol::Tailscale.to_i32());
-        profile.protocol_settings = Some(r#"{"auth_key":"tskey-auth-xxxx","control_url":"https://control.tailscale.com"}"#.to_string());
+        profile.protocol_settings = Some(
+            r#"{"auth_key":"tskey-auth-xxxx","control_url":"https://control.tailscale.com"}"#
+                .to_string(),
+        );
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1035,20 +1154,25 @@ mod tests {
     #[test]
     fn singbox_vmess_config() {
         let mut profile = test_profile(Protocol::Vmess.to_i32());
-        profile.stream_settings = Some(r#"{"tls.enable":true,"sni":"vmess.example.com"}"#.to_string());
+        profile.stream_settings =
+            Some(r#"{"tls.enable":true,"sni":"vmess.example.com"}"#.to_string());
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "vmess");
         assert_has_standard_outbounds(&json);
-        assert_eq!(json["outbounds"].as_array().unwrap()[0]["tls"]["enabled"], true);
+        assert_eq!(
+            json["outbounds"].as_array().unwrap()[0]["tls"]["enabled"],
+            true
+        );
     }
 
     #[test]
     fn singbox_vless_config() {
         let mut profile = test_profile(Protocol::Vless.to_i32());
-        profile.protocol_settings = Some(r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#.to_string());
+        profile.protocol_settings =
+            Some(r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#.to_string());
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1063,14 +1187,18 @@ mod tests {
     #[test]
     fn singbox_trojan_config() {
         let mut profile = test_profile(Protocol::Trojan.to_i32());
-        profile.stream_settings = Some(r#"{"tls.enable":true,"sni":"trojan.example.com"}"#.to_string());
+        profile.stream_settings =
+            Some(r#"{"tls.enable":true,"sni":"trojan.example.com"}"#.to_string());
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "trojan");
         assert_has_standard_outbounds(&json);
-        assert_eq!(json["outbounds"].as_array().unwrap()[0]["tls"]["server_name"], "trojan.example.com");
+        assert_eq!(
+            json["outbounds"].as_array().unwrap()[0]["tls"]["server_name"],
+            "trojan.example.com"
+        );
     }
 
     #[test]

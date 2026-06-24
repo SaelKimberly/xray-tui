@@ -5,11 +5,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::{AppMode, AppState, ConfirmAction};
-use xray_tui_db::models::Group;
-use crate::ui::theme::Theme;
 use crate::ui::profiles::truncate_pad;
 use crate::ui::render_confirmation_overlay;
+use crate::ui::theme::Theme;
+use crate::{AppMode, AppState, ConfirmAction};
+use xray_tui_db::models::Group;
 pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     // Centered overlay: ~70% width, ~70% height
     let overlay_area = Rect::new(
@@ -97,7 +97,9 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 "N"
             };
-            let status = state.subscriptions.iter()
+            let status = state
+                .subscriptions
+                .iter()
                 .find(|s| s.group_id.as_deref() == Some(&g.id))
                 .and_then(|s| s.status.as_deref())
                 .unwrap_or("idle");
@@ -111,7 +113,9 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
 
             let style = if is_selected {
                 if is_system {
-                    Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::Rgb(180, 200, 220))
+                    Style::default()
+                        .bg(Color::Rgb(40, 50, 70))
+                        .fg(Color::Rgb(180, 200, 220))
                 } else {
                     Style::default().bg(Color::Blue).fg(Color::White)
                 }
@@ -125,17 +129,31 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             Line::from(vec![Span::styled(
                 format!(
                     " {:<27} │ {:<30} │ {} │ {:<10} │ {}",
-                    truncate_pad(&display_name, 27), truncate_pad(url, 30), enabled, status, last_up
+                    truncate_pad(&display_name, 27),
+                    truncate_pad(url, 30),
+                    enabled,
+                    status,
+                    last_up
                 ),
                 style,
             )])
         })
         .collect();
     let scroll_offset = selected.saturating_sub(list_area.height as usize - 1);
-    for (i, row) in rows.iter().enumerate().skip(scroll_offset).take(list_area.height as usize) {
+    for (i, row) in rows
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(list_area.height as usize)
+    {
         frame.render_widget(
             row.clone(),
-            Rect::new(list_area.x, list_area.y + (i - scroll_offset) as u16, list_area.width, 1),
+            Rect::new(
+                list_area.x,
+                list_area.y + (i - scroll_offset) as u16,
+                list_area.width,
+                1,
+            ),
         );
     }
 
@@ -164,7 +182,11 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
                 .find(|g| g.id == *group_id)
                 .and_then(|g| g.name.as_deref())
                 .unwrap_or("unknown");
-            render_confirmation_overlay(frame, area, &format!(" Clear all profiles in \"{group_name}\"? (y/N) "));
+            render_confirmation_overlay(
+                frame,
+                area,
+                &format!(" Clear all profiles in \"{group_name}\"? (y/N) "),
+            );
         }
         _ => {}
     }
@@ -242,7 +264,7 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
     );
 }
 
-pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
+pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     match &state.mode {
         AppMode::ManageGroups { selected } => {
             let mut sel = *selected;
@@ -260,8 +282,16 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Char('e' | 'E') => {
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
-                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    sorted.sort_by_key(|g| {
+                        (
+                            1 - g.is_system.unwrap_or(0),
+                            g.name.as_deref().unwrap_or(""),
+                        )
+                    });
+                    let is_system = sorted
+                        .get(sel)
+                        .map(|g| g.is_system == Some(1))
+                        .unwrap_or(false);
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -274,8 +304,16 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Char('d' | 'D') => {
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
-                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    sorted.sort_by_key(|g| {
+                        (
+                            1 - g.is_system.unwrap_or(0),
+                            g.name.as_deref().unwrap_or(""),
+                        )
+                    });
+                    let is_system = sorted
+                        .get(sel)
+                        .map(|g| g.is_system == Some(1))
+                        .unwrap_or(false);
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -285,8 +323,16 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Char('c' | 'C') => {
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
-                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    sorted.sort_by_key(|g| {
+                        (
+                            1 - g.is_system.unwrap_or(0),
+                            g.name.as_deref().unwrap_or(""),
+                        )
+                    });
+                    let is_system = sorted
+                        .get(sel)
+                        .map(|g| g.is_system == Some(1))
+                        .unwrap_or(false);
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -296,8 +342,16 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Char('u') => {
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
-                    let is_system = sorted.get(sel).map(|g| g.is_system == Some(1)).unwrap_or(false);
+                    sorted.sort_by_key(|g| {
+                        (
+                            1 - g.is_system.unwrap_or(0),
+                            g.name.as_deref().unwrap_or(""),
+                        )
+                    });
+                    let is_system = sorted
+                        .get(sel)
+                        .map(|g| g.is_system == Some(1))
+                        .unwrap_or(false);
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -311,7 +365,12 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 KeyCode::Enter => {
                     // Build sorted list matching render order
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| (1 - g.is_system.unwrap_or(0), g.name.as_deref().unwrap_or("")));
+                    sorted.sort_by_key(|g| {
+                        (
+                            1 - g.is_system.unwrap_or(0),
+                            g.name.as_deref().unwrap_or(""),
+                        )
+                    });
                     if let Some(g) = sorted.get(sel) {
                         state.selected_group_id = Some(g.id.clone());
                         state.filter_cache_valid.set(false);
@@ -364,8 +423,8 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Enter => {
                     match &state.mode {
-                        AppMode::AddGroup { .. } => state.confirm_add_group(),
-                        AppMode::EditGroup { .. } => state.confirm_edit_group(),
+                        AppMode::AddGroup { .. } => state.confirm_add_group().await,
+                        AppMode::EditGroup { .. } => state.confirm_edit_group().await,
                         _ => {}
                     }
                     return;

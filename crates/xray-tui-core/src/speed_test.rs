@@ -82,9 +82,7 @@ pub async fn real_ping(
                         _ => {}
                     }
                 } else {
-                    last_error = Some(SpeedTestError::Http(
-                        resp.error_for_status().unwrap_err(),
-                    ));
+                    last_error = Some(SpeedTestError::Http(resp.error_for_status().unwrap_err()));
                 }
             }
             Err(e) => {
@@ -97,14 +95,15 @@ pub async fn real_ping(
         }
     }
     let latency_ms = best_latency.ok_or_else(|| {
-        last_error.unwrap_or_else(|| {
-            SpeedTestError::Proxy("all retries failed".to_string())
-        })
+        last_error.unwrap_or_else(|| SpeedTestError::Proxy("all retries failed".to_string()))
     })?;
     // Fetch IP info on success
     let ip_info = fetch_ip_info(&client, ip_api_url).await;
 
-    Ok(RealPingResult { latency_ms, ip_info })
+    Ok(RealPingResult {
+        latency_ms,
+        ip_info,
+    })
 }
 
 /// Fetch IP address and location info through the same SOCKS5 proxy.

@@ -1,4 +1,4 @@
-pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub async fn create_tables(conn: &turso::Connection) -> turso::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS profile_cores (
@@ -104,7 +104,8 @@ pub fn create_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             last_updated        TEXT
         );
         ",
-    )?;
+    )
+    .await?;
 
     Ok(())
 }

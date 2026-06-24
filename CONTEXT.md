@@ -61,7 +61,7 @@ xray-tui/
 - **Xray-core runs as a subprocess**; the TUI writes JSON config files and communicates via gRPC API.
 - **Sing-box runs as a subprocess**; the TUI writes JSON config files and communicates via sing-box's experimental V2Ray API (gRPC compatible).
 - **TUI framework**: **Ratatui + Crossterm** (async via tokio).
-- **Storage**: **SQLite** via `rusqlite` (single DB file) for profiles, subscriptions, routing, DNS, stats.
+- **Storage**: **SQLite** via `turso` (async, single DB file) for profiles, subscriptions, routing, DNS, stats.
 - **Multi-crate workspace**: `xray-tui` (bin), `xray-tui-core` (lib), `xray-tui-db` (lib), `xray-tui-config` (lib).
 - **Protocols in scope**: Everything supported natively by either Xray-core or Sing-box. No third binary backends.
 

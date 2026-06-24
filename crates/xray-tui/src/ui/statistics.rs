@@ -1,10 +1,10 @@
+use crate::AppState;
+use crate::ui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use crate::ui::theme::Theme;
-use crate::AppState;
 use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let connected = state.connected_core.is_some();

@@ -82,7 +82,6 @@ pub const GRAVEYARD_GROUP_ID: &str = "00000000-0000-0000-0000-000000000001";
 pub const GRAVEYARD_GROUP_TTL_HOURS: i64 = 24;
 pub const ALL_GROUP_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub id: String,

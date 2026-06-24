@@ -29,25 +29,39 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     let core_label = if state.logs_show_core { "ON" } else { "OFF" };
     let tui_label = if state.logs_show_tui { "ON" } else { "OFF" };
-    let val_label = if state.logs_show_validation { "ON" } else { "OFF" };
+    let val_label = if state.logs_show_validation {
+        "ON"
+    } else {
+        "OFF"
+    };
     let bar = Line::from(Span::styled(
-        format!(" [C]ore: {}  [T]UI: {}  [V]alidation: {}", core_label, tui_label, val_label),
+        format!(
+            " [C]ore: {}  [T]UI: {}  [V]alidation: {}",
+            core_label, tui_label, val_label
+        ),
         Theme::HINT,
     ));
     frame.render_widget(Paragraph::new(bar), filter_area);
 
     // Filter log buffer by source
-    let filtered: Vec<&crate::LogLine> = state.log_buffer.iter()
-        .filter(|l| (l.source == "core" && state.logs_show_core)
-                 || (l.source == "tui" && state.logs_show_tui)
-                 || ((l.source == "validation" || l.source == "subscription") && state.logs_show_validation)
-                 || (l.source != "core" && l.source != "tui" && l.source != "validation" && l.source != "subscription"))
+    let filtered: Vec<&crate::LogLine> = state
+        .log_buffer
+        .iter()
+        .filter(|l| {
+            (l.source == "core" && state.logs_show_core)
+                || (l.source == "tui" && state.logs_show_tui)
+                || ((l.source == "validation" || l.source == "subscription")
+                    && state.logs_show_validation)
+                || (l.source != "core"
+                    && l.source != "tui"
+                    && l.source != "validation"
+                    && l.source != "subscription")
+        })
         .collect();
 
     let log_count = filtered.len();
     if log_count == 0 {
-        let paragraph = Paragraph::new(Line::from("No logs"))
-            .style(Theme::HINT);
+        let paragraph = Paragraph::new(Line::from("No logs")).style(Theme::HINT);
         frame.render_widget(paragraph, log_area);
         return;
     }

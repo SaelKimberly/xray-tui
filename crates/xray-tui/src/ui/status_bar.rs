@@ -4,8 +4,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::ui::theme::Theme;
 use crate::AppState;
+use crate::ui::theme::Theme;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -28,31 +28,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             Theme::WARNING,
         )
     } else if !state.testing_profiles.is_empty() {
-        (
-            " Testing...".to_string(),
-            Theme::WARNING,
-        )
+        (" Testing...".to_string(), Theme::WARNING)
     } else if let Some(err) = &state.connection_error {
-        (
-            format!(" Error: {err}"),
-            Theme::ERROR,
-        )
+        (format!(" Error: {err}"), Theme::ERROR)
     } else {
         match &state.connected_core {
-            Some(core) => (
-                format!(" Connected [{}]", core),
-                Theme::SUCCESS,
-            ),
-            None => (
-                " Disconnected".to_string(),
-                Theme::ERROR,
-            ),
+            Some(core) => (format!(" Connected [{}]", core), Theme::SUCCESS),
+            None => (" Disconnected".to_string(), Theme::ERROR),
         }
     };
 
     // Append update indicator if any backend has an update available
     let update_indicator = if state.update_status.values().any(|s| s.update_available) {
-        let cores: Vec<&str> = state.update_status.iter()
+        let cores: Vec<&str> = state
+            .update_status
+            .iter()
             .filter(|(_, s)| s.update_available)
             .map(|(ct, _)| match ct {
                 xray_tui_core::CoreType::Xray => "xray",
@@ -124,16 +114,10 @@ fn build_hints(state: &AppState) -> &'static str {
         return " [Esc] Close help ";
     }
     match &state.mode {
-        crate::AppMode::SpeedTestMenu { .. } => {
-            " [↑↓] Navigate  [Enter] Select  [Esc] Close "
-        }
+        crate::AppMode::SpeedTestMenu { .. } => " [↑↓] Navigate  [Enter] Select  [Esc] Close ",
         crate::AppMode::Settings { mode } => match mode {
-            crate::SettingsMode::Menu { .. } => {
-                " [↑↓] Navigate  [Enter] Open  [Esc] Close "
-            }
-            _ => {
-                " [Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel "
-            }
+            crate::SettingsMode::Menu { .. } => " [↑↓] Navigate  [Enter] Open  [Esc] Close ",
+            _ => " [Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel ",
         },
         _ => {
             // Default tab-based hints
@@ -147,12 +131,8 @@ fn build_hints(state: &AppState) -> &'static str {
                         " [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
                     }
                 }
-                crate::Tab::Settings => {
-                    " [Enter] Open  [?] Help  [Ctrl+Q] Quit "
-                }
-                crate::Tab::Logs | crate::Tab::Statistics => {
-                    " [?] Help  [Ctrl+Q] Quit "
-                }
+                crate::Tab::Settings => " [Enter] Open  [?] Help  [Ctrl+Q] Quit ",
+                crate::Tab::Logs | crate::Tab::Statistics => " [?] Help  [Ctrl+Q] Quit ",
             }
         }
     }

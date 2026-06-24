@@ -139,7 +139,8 @@ mod tests {
     fn build_singbox_tuic_via_dispatch() {
         let profile = test_profile(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(&profile, CoreType::SingBox, &params, &rules, &dns).unwrap();
+        let config =
+            ConfigBuilder::build(&profile, CoreType::SingBox, &params, &rules, &dns).unwrap();
         assert!(matches!(config, BackendConfig::SingBox(_)));
     }
 
@@ -148,7 +149,8 @@ mod tests {
         // Shadowsocks is supported by both xray and sing-box builders
         let profile = test_profile(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(&profile, CoreType::SingBox, &params, &rules, &dns).unwrap();
+        let config =
+            ConfigBuilder::build(&profile, CoreType::SingBox, &params, &rules, &dns).unwrap();
         assert!(matches!(config, BackendConfig::SingBox(_)));
     }
 

@@ -1,16 +1,15 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
-use ratatui::style::Modifier;
-use xray_tui_db::models::GRAVEYARD_GROUP_ID;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
+use xray_tui_db::models::GRAVEYARD_GROUP_ID;
 
-
-use crate::ui::theme::Theme;
 use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
+use crate::ui::theme::Theme;
 use crate::{AppState, ConfirmAction};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -45,7 +44,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let scroll_offset = if total <= inner_height {
         0
     } else {
-        selected.saturating_sub(inner_height / 2).min(total - inner_height)
+        selected
+            .saturating_sub(inner_height / 2)
+            .min(total - inner_height)
     };
     let visible_end = (scroll_offset + inner_height).min(total);
     let visible_rows = &rows[scroll_offset..visible_end];
@@ -55,7 +56,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         || state.selected_group_id.as_deref() == Some(xray_tui_db::models::ALL_GROUP_ID);
     // Hide Group column on narrow terminals (needs ≥107 cols to fit)
     let show_group = show_group && frame.area().width >= 107;
-    render_data_grid(frame, chunks[2], visible_rows, adjusted_selected, scroll_offset, show_group, state);
+    render_data_grid(
+        frame,
+        chunks[2],
+        visible_rows,
+        adjusted_selected,
+        scroll_offset,
+        show_group,
+        state,
+    );
     render_footer(frame, chunks[3], state);
     // Confirmation overlays: DeleteProfile and ClearGroup
     match state.confirmation {
@@ -65,7 +74,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 .find(|r| r.profile.id == *delete_id)
                 .and_then(|r| r.profile.remarks.as_deref())
                 .unwrap_or("unknown");
-            render_confirmation_overlay(frame, area, &format!(" Delete \"{profile_name}\"? (y/N) "));
+            render_confirmation_overlay(
+                frame,
+                area,
+                &format!(" Delete \"{profile_name}\"? (y/N) "),
+            );
         }
         Some(ConfirmAction::ClearGroup(ref group_id)) => {
             let group_name = state
@@ -74,7 +87,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 .find(|g| g.id == *group_id)
                 .and_then(|g| g.name.as_deref())
                 .unwrap_or("unknown");
-            render_confirmation_overlay(frame, area, &format!(" Clear all profiles in \"{group_name}\"? (y/N) "));
+            render_confirmation_overlay(
+                frame,
+                area,
+                &format!(" Clear all profiles in \"{group_name}\"? (y/N) "),
+            );
         }
         _ => {}
     }
@@ -126,10 +143,17 @@ fn render_data_grid(
 
     // Header row
     let mut header_items: Vec<String> = vec![
-        "   ".into(), " #  ".into(), "Type    ".into(), "Remarks                  ".into(),
-        "Address                        ".into(), "Port  ".into(),
+        "   ".into(),
+        " #  ".into(),
+        "Type    ".into(),
+        "Remarks                  ".into(),
+        "Address                        ".into(),
+        "Port  ".into(),
         "│".into(),
-        "Delay ".into(), "Speed ".into(), "IP                   ".into(), "Traffic   ".into(),
+        "Delay ".into(),
+        "Speed ".into(),
+        "IP                   ".into(),
+        "Traffic   ".into(),
     ];
     if show_group {
         header_items.insert(4, "Group       ".into());
@@ -147,14 +171,15 @@ fn render_data_grid(
         SortColumn::Traffic => Some(10 + show_group as usize),
         _ => None, // Core and other non-visible columns
     };
-    if let Some(idx) = sort_idx {
-        if let Some(item) = header_items.get_mut(idx) {
-            let trimmed = item.trim_end();
-            let width = item.len();
-            *item = format!("{:width$}", format!("{} {}", trimmed, arrow), width = width);
-        }
+    if let Some(idx) = sort_idx
+        && let Some(item) = header_items.get_mut(idx)
+    {
+        let trimmed = item.trim_end();
+        let width = item.len();
+        *item = format!("{:width$}", format!("{} {}", trimmed, arrow), width = width);
     }
-    let header_cells = header_items.iter()
+    let header_cells = header_items
+        .iter()
         .map(|h| Cell::from(h.as_str()).style(Theme::TABLE_HEADER));
     let header = Row::new(header_cells);
 
@@ -257,7 +282,10 @@ fn render_data_grid(
                 Cell::from(remarks_str.clone()),
             ];
             if show_group {
-                let group_name = row.profile.group_id.as_deref()
+                let group_name = row
+                    .profile
+                    .group_id
+                    .as_deref()
                     .filter(|gid| *gid != GRAVEYARD_GROUP_ID)
                     .and_then(|gid| state.groups.iter().find(|g| g.id == *gid))
                     .and_then(|g| g.name.as_deref())
@@ -325,7 +353,11 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         let core = state.resolved_core(row);
         let remarks = row.profile.remarks.as_deref().unwrap_or("-");
         let addr = row.profile.address.as_deref().unwrap_or("-");
-        let port = row.profile.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let port = row
+            .profile
+            .port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".into());
         Line::from(vec![
             Span::styled(" Server: ", Theme::FOOTER_LABEL),
             Span::styled(remarks, Theme::FOOTER_VALUE),
@@ -333,7 +365,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(format!("[{}] ", core), Theme::FOOTER_VALUE),
         ])
     } else {
-        Line::from(Span::styled(" Server: (none selected)", Theme::FOOTER_LABEL))
+        Line::from(Span::styled(
+            " Server: (none selected)",
+            Theme::FOOTER_LABEL,
+        ))
     };
     let footer = Paragraph::new(line).style(Theme::STATUS_FOOTER);
     frame.render_widget(footer, area);
