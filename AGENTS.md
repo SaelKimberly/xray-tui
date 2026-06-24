@@ -118,6 +118,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 9. Use `BEGIN IMMEDIATE` on dedicated connection (not main connection) with `busy_timeout(500ms)` to avoid lock contention
 10. All connections to the same DB must use the same `PRAGMA journal_mode` (`'wal'` recommended for bulk insert performance)
 
+11. Error handling in `LogStorageWorker` must use `tracing::error!(target: "log_worker", ...)` — never `eprintln!` which writes to stderr and corrupts the TUI in raw mode. Target `"log_worker"` bypasses the `EnvFilter("xray_tui=info")` on the fmt layer (no stderr output) while `TuiLogLayer` (no filter) still captures the event for the Logs tab. Add a `consecutive_failures` counter with rate-limited logging (log on first, then every 10th) to avoid flooding during extended DB lock contention.
 ### Adding batch import for share URLs
 1. Parse each URL with `parse_share_url(url, &config.validation)` from `xray_tui_config::import_export`
 2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }`
@@ -171,10 +172,11 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Use `serde` for JSON serialization
 - Use `tokio` for async runtime
 - gRPC via `tonic` crate
-- HTTP via `reqwest` crate
+:- `reqwest` for HTTP client (subscription fetch)
 - SQLite via `turso` crate (async)
-- Use `reqwest` for HTTP client (subscription fetch)
-- Use `escape8259` for JSON string unescaping
+:- `tracing` for diagnostic event system (subscriber in bin crate, macros in lib crates)
+:- `tracing-subscriber` for event filtering, formatting, and TuiLogLayer routing
+:- `escape8259` for JSON string unescaping
 - Use `memchr` for vectorized byte search
 :- `tokio` for async runtime (also direct dep in xray-tui-db for retry backoff sleep)
 - Use `urlencoding` for percent-decoding

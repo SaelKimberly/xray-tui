@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
                 .delete_older_than(cutoff)
                 .await
             {
-                eprintln!("Log TTL cleanup error: {e}");
+                tracing::error!(target: "log_worker", "TTL cleanup error: {e}");
             }
         }
     });

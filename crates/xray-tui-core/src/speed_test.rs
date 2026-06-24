@@ -1,10 +1,10 @@
+use futures_util::StreamExt;
 use std::io;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Kinds of speed tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,12 @@ pub async fn tcp_ping(
 }
 
 /// Create a reqwest::Client with SOCKS5 proxy configured.
-fn create_socks5_client(proxy: &str, port: u16, socks5h: bool, timeout: Duration) -> Result<reqwest::Client, SpeedTestError> {
+fn create_socks5_client(
+    proxy: &str,
+    port: u16,
+    socks5h: bool,
+    timeout: Duration,
+) -> Result<reqwest::Client, SpeedTestError> {
     let scheme = if socks5h { "socks5h" } else { "socks5" };
     let proxy_url = format!("{scheme}://{proxy}:{port}");
     reqwest::Client::builder()
@@ -186,7 +191,6 @@ pub async fn udp_test(
     port: u16,
     test_timeout: Duration,
 ) -> Result<Duration, SpeedTestError> {
-
     // 1. Establish UDP ASSOCIATE via TCP to SOCKS5 proxy
     let proxy_addr = format!("{proxy}:{port}");
     let tcp = timeout(test_timeout, TcpStream::connect(&proxy_addr))

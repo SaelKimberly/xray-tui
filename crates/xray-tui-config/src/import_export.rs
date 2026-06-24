@@ -1,4 +1,3 @@
-
 use serde::Deserialize;
 use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;

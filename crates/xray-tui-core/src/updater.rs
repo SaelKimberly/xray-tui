@@ -3,7 +3,6 @@ use semver::Version;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("Unsupported platform: {0} {1}")]
@@ -125,7 +124,6 @@ pub async fn download_release(
 
     std::fs::create_dir_all(dest_dir)?;
 
-
     // Stream download
     let resp = client
         .get(&url)
@@ -207,12 +205,16 @@ pub async fn install_binary(
 
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err(UpdateError::Install("extracted binary returned non-zero exit code".into()));
+        return Err(UpdateError::Install(
+            "extracted binary returned non-zero exit code".into(),
+        ));
     }
 
     let version_output = String::from_utf8_lossy(&output.stdout);
     if version_output.is_empty() {
-        return Err(UpdateError::Install("extracted binary produced no version output".into()));
+        return Err(UpdateError::Install(
+            "extracted binary produced no version output".into(),
+        ));
     }
 
     // 3. Install to bin_dir
@@ -270,10 +272,12 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, U
             CoreType::SingBox => "arm64",
             CoreType::Auto => return Err(UpdateError::AutoCore),
         },
-        _ => return Err(UpdateError::UnsupportedPlatform(
-            std::env::consts::ARCH,
-            std::env::consts::OS,
-        )),
+        _ => {
+            return Err(UpdateError::UnsupportedPlatform(
+                std::env::consts::ARCH,
+                std::env::consts::OS,
+            ));
+        }
     };
 
     let os = std::env::consts::OS;

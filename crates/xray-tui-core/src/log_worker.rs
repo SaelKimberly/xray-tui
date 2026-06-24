@@ -39,6 +39,8 @@ pub struct LogStorageWorker {
     log_conn: DbConnection,
     batch_size: usize,
     flush_interval: Duration,
+    /// Count of consecutive flush failures; used to rate-limit error logging.
+    consecutive_failures: u32,
 }
 impl LogStorageWorker {
     pub fn new(
@@ -51,6 +53,7 @@ impl LogStorageWorker {
             log_conn,
             batch_size,
             flush_interval: Duration::from_millis(100),
+            consecutive_failures: 0,
         }
     }
 
@@ -90,15 +93,22 @@ impl LogStorageWorker {
     }
 
     /// Flush the current batch to the database.
-    async fn flush(&self, batch: &mut Vec<LogEntry>) {
+    async fn flush(&mut self, batch: &mut Vec<LogEntry>) {
         if batch.is_empty() {
             return;
         }
         if let Err(e) = LogRepository::new(&self.log_conn).insert_batch(batch).await {
-            eprintln!("LogStorageWorker flush error: {e}");
+            self.consecutive_failures += 1;
+            // Rate-limit: log on first failure, then every 10th.
+            if self.consecutive_failures == 1 || self.consecutive_failures.is_multiple_of(10) {
+                tracing::error!(target: "log_worker", "Flush error ({} consecutive failures): {e}", self.consecutive_failures);
+            } else {
+                tracing::debug!(target: "log_worker", "Flush error (suppressed): {e}");
+            }
             // Entries remain in the batch for retry on the next flush.
             return;
         }
+        self.consecutive_failures = 0;
         batch.clear();
     }
 

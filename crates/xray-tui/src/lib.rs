@@ -635,8 +635,7 @@ impl AppState {
             self.log_buffer.pop_front();
             // If we popped a core log, try to also pop one non-core to keep core logs visible
             if source == "core" {
-                let non_core_idx = self.log_buffer.iter()
-                    .position(|l| l.source != "core");
+                let non_core_idx = self.log_buffer.iter().position(|l| l.source != "core");
                 if let Some(idx) = non_core_idx {
                     self.log_buffer.remove(idx);
                 }
@@ -717,11 +716,15 @@ impl AppState {
 
     #[allow(dead_code)]
     fn selected_profile(&self) -> Option<&Profile> {
-        self.filtered_profiles().nth(self.selected_index).map(|r| &r.profile)
+        self.filtered_profiles()
+            .nth(self.selected_index)
+            .map(|r| &r.profile)
     }
 
     fn selected_profile_id(&self) -> Option<String> {
-        self.filtered_profiles().nth(self.selected_index).map(|r| r.profile.id.clone())
+        self.filtered_profiles()
+            .nth(self.selected_index)
+            .map(|r| r.profile.id.clone())
     }
 
     fn fields_to_profile(&self, protocol: Protocol, fields: &[(String, String)]) -> Profile {
@@ -1785,8 +1788,8 @@ impl AppState {
                 let provider = match grpc_client::create_stats_provider(CoreType::Xray).await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        let _ =
-                            tx.try_send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
+                        let _ = tx
+                            .try_send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
                         None
                     }
                 };
@@ -1953,7 +1956,8 @@ impl AppState {
 
         let pid = profile_id.to_string();
         self.testing_profiles.insert(pid.clone());
-        self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
+        self.testing_details
+            .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
         let timeout_dur = std::time::Duration::from_secs(5);
 
         tokio::spawn(async move {
@@ -2002,7 +2006,8 @@ impl AppState {
             None => return,
         };
         let pid = profile_id.to_string();
-        self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::RealPing);
+        self.testing_details
+            .insert(pid.parse().expect("valid UUID"), TestType::RealPing);
         self.testing_profiles.insert(pid.clone());
 
         // Build params for the temp core
@@ -2211,7 +2216,8 @@ impl AppState {
         };
         let pid = profile_id.to_string();
         self.testing_profiles.insert(pid.clone());
-        self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::UdpTest);
+        self.testing_details
+            .insert(pid.parse().expect("valid UUID"), TestType::UdpTest);
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
         let timeout_dur = std::time::Duration::from_secs(5);
@@ -2273,7 +2279,8 @@ impl AppState {
         for target in &unique_targets {
             for pid in &target.profile_ids {
                 self.testing_profiles.insert(pid.clone());
-                self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
+                self.testing_details
+                    .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
             }
         }
 
@@ -2377,7 +2384,8 @@ impl AppState {
         for (target, _) in &batch_targets {
             for pid in &target.profile_ids {
                 self.testing_profiles.insert(pid.clone());
-                self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
+                self.testing_details
+                    .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
             }
         }
 
@@ -2686,6 +2694,8 @@ impl AppState {
                     self.last_tui_log = Some((target.clone(), level.clone(), message.clone()));
                     if target == "validation" {
                         self.add_log(&level, &message, "validation");
+                    } else if target == "log_worker" {
+                        self.add_log(&level, &message, "tui");
                     }
                 }
                 CoreEvent::SubscriptionsUpdated {
@@ -2719,7 +2729,8 @@ impl AppState {
                     profile_id,
                     test_type,
                 } => {
-                    self.testing_details.insert(profile_id.parse().expect("valid UUID"), test_type);
+                    self.testing_details
+                        .insert(profile_id.parse().expect("valid UUID"), test_type);
                 }
                 CoreEvent::SpeedTestResult {
                     profile_id,
@@ -2730,7 +2741,8 @@ impl AppState {
                     error,
                 } => {
                     self.testing_profiles.remove(&profile_id);
-                    self.testing_details.remove(&profile_id.parse().expect("valid UUID"));
+                    self.testing_details
+                        .remove(&profile_id.parse().expect("valid UUID"));
 
                     // Update profile extension and extract name in a scoped block
                     // to drop the mutable borrow before further self-method calls.

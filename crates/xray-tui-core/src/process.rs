@@ -14,11 +14,7 @@ pub struct CoreProcess {
 }
 
 impl CoreProcess {
-    fn new(
-        child: Child,
-        config_path: PathBuf,
-        core_type: CoreType,
-    ) -> Self {
+    fn new(child: Child, config_path: PathBuf, core_type: CoreType) -> Self {
         Self {
             child: Some(child),
             config_path,
@@ -238,5 +234,4 @@ mod tests {
         assert!(!mgr.is_running());
         assert!(mgr.running_core_type().is_none());
     }
-
 }
