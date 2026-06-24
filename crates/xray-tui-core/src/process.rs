@@ -4,16 +4,13 @@ use crate::core_type::CoreType;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 /// Status of a running core process.
 pub struct CoreProcess {
     child: Option<Child>,
     config_path: PathBuf,
     pub core_type: CoreType,
-    /// The original sender stored for potential future use.
-    #[allow(dead_code)]
-    log_tx: UnboundedSender<String>,
 }
 
 impl CoreProcess {
@@ -21,13 +18,11 @@ impl CoreProcess {
         child: Child,
         config_path: PathBuf,
         core_type: CoreType,
-        log_tx: UnboundedSender<String>,
     ) -> Self {
         Self {
             child: Some(child),
             config_path,
             core_type,
-            log_tx,
         }
     }
 
@@ -46,9 +41,11 @@ impl CoreProcess {
 impl Drop for CoreProcess {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // In Drop we can't use async, but the child's kill_on_drop is set
-            // We just let it go out of scope and the runtime handles it
-            let _ = child.start_kill();
+            // Spawn a fire-and-forget task to reap the child properly.
+            tokio::spawn(async move {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            });
         }
     }
 }
@@ -57,26 +54,24 @@ impl Drop for CoreProcess {
 pub struct CoreManager {
     config_dir: PathBuf,
     current: Option<CoreProcess>,
-    log_tx: UnboundedSender<String>,
+    log_tx: Option<Sender<String>>,
 }
 
 impl CoreManager {
     /// Create a new CoreManager with the given config directory.
     pub fn new(config_dir: PathBuf) -> Self {
-        let (log_tx, _) = tokio::sync::mpsc::unbounded_channel();
         Self {
             config_dir,
             current: None,
-            log_tx,
+            log_tx: None,
         }
     }
 
-    /// Create a CoreManager that forwards log lines to the given sender.
-    pub fn with_log_channel(config_dir: PathBuf, log_tx: UnboundedSender<String>) -> Self {
+    pub fn with_log_channel(config_dir: PathBuf, log_tx: Sender<String>) -> Self {
         Self {
             config_dir,
             current: None,
-            log_tx,
+            log_tx: Some(log_tx),
         }
     }
 
@@ -132,12 +127,12 @@ impl CoreManager {
             .stderr
             .take()
             .ok_or_else(|| ProcessError::Startup("Failed to capture stderr".to_string()))?;
-        let log_tx = self.log_tx.clone();
+        let log_tx = self.log_tx.clone().unwrap();
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if log_tx.send(line).is_err() {
+                if log_tx.try_send(line).is_err() {
                     break;
                 }
             }
@@ -148,12 +143,12 @@ impl CoreManager {
             .stdout
             .take()
             .ok_or_else(|| ProcessError::Startup("Failed to capture stdout".to_string()))?;
-        let log_tx = self.log_tx.clone();
+        let log_tx = self.log_tx.clone().unwrap();
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if log_tx.send(line).is_err() {
+                if log_tx.try_send(line).is_err() {
                     break;
                 }
             }
@@ -185,12 +180,7 @@ impl CoreManager {
             )));
         }
 
-        self.current = Some(CoreProcess::new(
-            child,
-            config_path,
-            core_type,
-            self.log_tx.clone(),
-        ));
+        self.current = Some(CoreProcess::new(child, config_path, core_type));
 
         Ok(())
     }
@@ -213,8 +203,8 @@ impl CoreManager {
         self.current.as_ref().map(|p| p.core_type)
     }
 
-    /// Get a reference to the log sender.
-    pub fn log_tx(&self) -> UnboundedSender<String> {
+    /// Get a reference to the log sender, if set.
+    pub fn log_tx(&self) -> Option<Sender<String>> {
         self.log_tx.clone()
     }
 }
@@ -249,13 +239,4 @@ mod tests {
         assert!(mgr.running_core_type().is_none());
     }
 
-    #[test]
-    fn stop_when_not_running_is_ok() {
-        let mut mgr = CoreManager::new(PathBuf::from("/tmp"));
-        // Should not panic or error
-        let result = mgr.stop();
-        // stop() is async, so we need a runtime for a real test
-        // Just verify the method signature works
-        drop(result);
-    }
 }

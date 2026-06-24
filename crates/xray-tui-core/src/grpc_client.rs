@@ -197,12 +197,11 @@ pub fn format_uptime(secs: u32) -> String {
     let hours = secs / 3600;
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
-    if hours > 0 {
-        format!("{}h {}m {}s", hours, minutes, seconds)
-    } else if minutes > 0 {
-        format!("{}m {}s", minutes, seconds)
-    } else {
-        format!("{}s", seconds)
+    match (hours, minutes, seconds) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, 0, 0) => format!("{h}h"),
+        (h, m, s) => format!("{h}h {m}m {s}s"),
     }
 }
 
@@ -224,6 +223,7 @@ mod tests {
         assert_eq!(format_uptime(0), "0s");
         assert_eq!(format_uptime(45), "45s");
         assert_eq!(format_uptime(120), "2m 0s");
+        assert_eq!(format_uptime(3600), "1h");
         assert_eq!(format_uptime(3661), "1h 1m 1s");
     }
 }

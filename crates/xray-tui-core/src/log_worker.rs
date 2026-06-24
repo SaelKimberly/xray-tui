@@ -33,7 +33,7 @@ pub enum LogWorkerMessage {
 /// - Serves filtered queries by merging the pending (not-yet-flushed) batch
 ///   with DB results, making it the unified source of truth for log queries.
 pub struct LogStorageWorker {
-    rx: mpsc::UnboundedReceiver<LogWorkerMessage>,
+    rx: mpsc::Receiver<LogWorkerMessage>,
     /// Dedicated Turso connection for log writes, avoiding lock contention
     /// with the main application connection (allows BEGIN CONCURRENT).
     log_conn: DbConnection,
@@ -42,7 +42,7 @@ pub struct LogStorageWorker {
 }
 impl LogStorageWorker {
     pub fn new(
-        rx: mpsc::UnboundedReceiver<LogWorkerMessage>,
+        rx: mpsc::Receiver<LogWorkerMessage>,
         log_conn: DbConnection,
         batch_size: usize,
     ) -> Self {

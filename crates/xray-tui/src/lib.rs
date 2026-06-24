@@ -3,10 +3,11 @@ use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
 use futures_util::StreamExt;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use xray_tui_config::{AppConfig, ValidationSettings};
@@ -317,13 +318,13 @@ pub struct AppState {
     pub sort_ascending: bool,
     pub search_query: String,
     pub search_focused: bool,
-    pub log_buffer: Vec<LogLine>,
+    pub log_buffer: VecDeque<LogLine>,
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
     pub connection_error: Option<String>,
-    pub core_event_rx: Option<mpsc::UnboundedReceiver<CoreEvent>>,
-    pub core_event_tx: Option<mpsc::UnboundedSender<CoreEvent>>,
+    pub core_event_rx: Option<mpsc::Receiver<CoreEvent>>,
+    pub core_event_tx: Option<mpsc::Sender<CoreEvent>>,
     pub disconnect_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub should_quit: bool,
     pub mode: AppMode,
@@ -336,7 +337,7 @@ pub struct AppState {
     /// Profile IDs currently being tested
     pub testing_profiles: HashSet<String>,
     /// Which test type is currently running per profile (for display).
-    pub testing_details: HashMap<String, TestType>,
+    pub testing_details: HashMap<uuid::Uuid, TestType>,
     /// Progress for batch tests: (completed, total)
     pub test_progress: Option<(usize, usize)>,
     /// Cached update status for both backends.
@@ -353,7 +354,8 @@ pub struct AppState {
     pub current_memory: u64,
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
-    pub log_worker_tx: Option<mpsc::UnboundedSender<LogWorkerMessage>>,
+    pub log_worker_tx: Option<mpsc::Sender<LogWorkerMessage>>,
+    pub shutdown_token: Arc<AtomicBool>,
 }
 
 /// Internal helper for batch ping deduplication.
@@ -364,7 +366,7 @@ struct UniqueTarget {
 
 impl AppState {
     pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
-        let (core_tx, core_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (core_tx, core_rx) = tokio::sync::mpsc::channel(256);
         let mut state = Self {
             db,
             config,
@@ -381,7 +383,7 @@ impl AppState {
             sort_ascending: true,
             search_query: String::new(),
             search_focused: false,
-            log_buffer: Vec::new(),
+            log_buffer: VecDeque::new(),
             log_scroll: 0,
             logs_show_core: true,
             logs_show_tui: true,
@@ -415,6 +417,7 @@ impl AppState {
             current_memory: 0,
             log_worker_tx: None,
             routing_rules: Vec::new(),
+            shutdown_token: Arc::new(AtomicBool::new(false)),
             term_height: Cell::new(80),
         };
         state.reload_profiles().await;
@@ -457,14 +460,16 @@ impl AppState {
         self.routing_rules = self.db.get_all_routing_rules().await.unwrap_or_default();
     }
 
-    pub fn filtered_profiles(&self) -> Vec<&ProfileRow> {
+    pub fn filtered_profiles(&self) -> impl Iterator<Item = &ProfileRow> {
         if !self.filter_cache_valid.get() {
             let indices = self.compute_filtered_indices();
             *self.cached_filtered_indices.borrow_mut() = indices;
             self.filter_cache_valid.set(true);
         }
         let indices = self.cached_filtered_indices.borrow();
-        indices.iter().map(|&i| &self.profiles[i]).collect()
+        // Collect into Vec to release the borrow on indices, then return an iterator
+        let result: Vec<&ProfileRow> = indices.iter().map(|&i| &self.profiles[i]).collect();
+        result.into_iter()
     }
 
     fn compute_filtered_indices(&self) -> Vec<usize> {
@@ -619,19 +624,23 @@ impl AppState {
         if level == "trace" || level == "debug" {
             return;
         }
-        self.log_buffer.push(LogLine {
+        self.log_buffer.push_back(LogLine {
             level: level.to_owned(),
             message: message.to_owned(),
             source: source.to_owned(),
         });
         if self.log_buffer.len() > 1000 {
-            // Evict oldest non-core entry first, so core logs aren't drowned out
-            let evict = self
-                .log_buffer
-                .iter()
-                .position(|l| l.source != "core")
-                .unwrap_or(0);
-            self.log_buffer.remove(evict);
+            let front = self.log_buffer.front().unwrap();
+            let source = front.source.clone();
+            self.log_buffer.pop_front();
+            // If we popped a core log, try to also pop one non-core to keep core logs visible
+            if source == "core" {
+                let non_core_idx = self.log_buffer.iter()
+                    .position(|l| l.source != "core");
+                if let Some(idx) = non_core_idx {
+                    self.log_buffer.remove(idx);
+                }
+            }
         }
 
         // Forward non-tui logs to the storage worker (tui logs are already
@@ -651,7 +660,7 @@ impl AppState {
                 metadata_json: None,
                 source: source.to_owned(),
             };
-            let _ = tx.send(LogWorkerMessage::Entry(entry));
+            let _ = tx.try_send(LogWorkerMessage::Entry(entry));
         }
     }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
@@ -708,15 +717,11 @@ impl AppState {
 
     #[allow(dead_code)]
     fn selected_profile(&self) -> Option<&Profile> {
-        let filtered = self.filtered_profiles();
-        filtered.get(self.selected_index).map(|r| &r.profile)
+        self.filtered_profiles().nth(self.selected_index).map(|r| &r.profile)
     }
 
     fn selected_profile_id(&self) -> Option<String> {
-        let filtered = self.filtered_profiles();
-        filtered
-            .get(self.selected_index)
-            .map(|r| r.profile.id.clone())
+        self.filtered_profiles().nth(self.selected_index).map(|r| r.profile.id.clone())
     }
 
     fn fields_to_profile(&self, protocol: Protocol, fields: &[(String, String)]) -> Profile {
@@ -1595,7 +1600,7 @@ impl AppState {
             Some(id) => id,
             None => return,
         };
-        let filtered = self.filtered_profiles();
+        let filtered: Vec<&ProfileRow> = self.filtered_profiles().collect();
         let idx = filtered.iter().position(|r| r.profile.id == id);
         let idx = match idx {
             Some(i) if i > 0 => i,
@@ -1619,7 +1624,7 @@ impl AppState {
             Some(id) => id,
             None => return,
         };
-        let filtered = self.filtered_profiles();
+        let filtered: Vec<&ProfileRow> = self.filtered_profiles().collect();
         let idx = match filtered.iter().position(|r| r.profile.id == id) {
             Some(i) if i < filtered.len() - 1 => i,
             _ => return,
@@ -1729,7 +1734,7 @@ impl AppState {
         // Need to move params into the async block
 
         // Create log forwarding channel
-        let (log_line_tx, mut log_line_rx) = mpsc::unbounded_channel::<String>();
+        let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
 
         tokio::spawn(async move {
             // 1. Build config
@@ -1737,7 +1742,7 @@ impl AppState {
                 match ConfigBuilder::build(&profile, core_type, &params, &routing, &dns) {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(CoreEvent::Error(format!("Config build failed: {e}")));
+                        let _ = tx.try_send(CoreEvent::Error(format!("Config build failed: {e}")));
                         return;
                     }
                 };
@@ -1746,7 +1751,7 @@ impl AppState {
             let bin_path = match find_binary(core_type, &bin_dir) {
                 Some(p) => p,
                 None => {
-                    let _ = tx.send(CoreEvent::Error(
+                    let _ = tx.try_send(CoreEvent::Error(
                         "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
                             .to_string(),
                     ));
@@ -1757,19 +1762,19 @@ impl AppState {
             // 3. Start core
             let mut manager = CoreManager::with_log_channel(bin_configs_dir, log_line_tx);
             if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
-                let _ = tx.send(CoreEvent::Error(format!("Failed to start core: {e}")));
+                let _ = tx.try_send(CoreEvent::Error(format!("Failed to start core: {e}")));
                 return;
             }
 
             // 4. Signal connected
-            let _ = tx.send(CoreEvent::Connected(core_type));
+            let _ = tx.try_send(CoreEvent::Connected(core_type));
 
             // Forward stderr log lines as CoreEvent::LogLine
             let log_tx = tx.clone();
             tokio::spawn(async move {
                 while let Some(line) = log_line_rx.recv().await {
                     let (level, message) = parse_log_level(&line);
-                    let _ = log_tx.send(CoreEvent::LogLine { level, message });
+                    let _ = log_tx.try_send(CoreEvent::LogLine { level, message });
                 }
             });
 
@@ -1781,7 +1786,7 @@ impl AppState {
                     Ok(p) => Some(p),
                     Err(e) => {
                         let _ =
-                            tx.send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
+                            tx.try_send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
                         None
                     }
                 };
@@ -1880,7 +1885,7 @@ impl AppState {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(CoreEvent::StatsError(format!(
+                        let _ = tx.try_send(CoreEvent::StatsError(format!(
                             "Clash API unavailable (is sing-box running?): {e}"
                         )));
                     }
@@ -1891,7 +1896,7 @@ impl AppState {
             let _ = manager.stop().await;
 
             // 7. Signal disconnected
-            let _ = tx.send(CoreEvent::Disconnected);
+            let _ = tx.try_send(CoreEvent::Disconnected);
         });
     }
 
@@ -1948,7 +1953,7 @@ impl AppState {
 
         let pid = profile_id.to_string();
         self.testing_profiles.insert(pid.clone());
-        self.testing_details.insert(pid.clone(), TestType::TcpPing);
+        self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
         let timeout_dur = std::time::Duration::from_secs(5);
 
         tokio::spawn(async move {
@@ -1957,7 +1962,7 @@ impl AppState {
                 Ok(dur) => (Some(dur.as_millis() as u64), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            let _ = tx.send(CoreEvent::SpeedTestResult {
+            let _ = tx.try_send(CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::TcpPing,
                 latency_ms,
@@ -1997,7 +2002,7 @@ impl AppState {
             None => return,
         };
         let pid = profile_id.to_string();
-        self.testing_details.insert(pid.clone(), TestType::RealPing);
+        self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::RealPing);
         self.testing_profiles.insert(pid.clone());
 
         // Build params for the temp core
@@ -2040,7 +2045,7 @@ impl AppState {
             let temp_id = uuid::Uuid::new_v4().to_string();
             let temp_dir = bin_configs_dir.join(&temp_id);
             if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-                let _ = tx.send(CoreEvent::SpeedTestResult {
+                let _ = tx.try_send(CoreEvent::SpeedTestResult {
                     profile_id: pid,
                     test_type: TestType::RealPing,
                     latency_ms: None,
@@ -2056,7 +2061,7 @@ impl AppState {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(CoreEvent::SpeedTestResult {
+                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
                         profile_id: pid,
                         test_type: TestType::RealPing,
                         latency_ms: None,
@@ -2073,7 +2078,7 @@ impl AppState {
             let bin_path = match find_binary(core_type, &bin_dir) {
                 Some(p) => p,
                 None => {
-                    let _ = tx.send(CoreEvent::SpeedTestResult {
+                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
                         profile_id: pid,
                         test_type: TestType::RealPing,
                         latency_ms: None,
@@ -2087,10 +2092,10 @@ impl AppState {
             };
 
             // 4. Start core (discard log lines from temp core)
-            let (log_line_tx, mut _log_line_rx) = mpsc::unbounded_channel::<String>();
+            let (log_line_tx, mut _log_line_rx) = mpsc::channel::<String>(512);
             let mut manager = CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
             if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
-                let _ = tx.send(CoreEvent::SpeedTestResult {
+                let _ = tx.try_send(CoreEvent::SpeedTestResult {
                     profile_id: pid,
                     test_type: TestType::RealPing,
                     latency_ms: None,
@@ -2121,7 +2126,7 @@ impl AppState {
                 Err(e) => (None, None, Some(e.to_string())),
             };
 
-            let _ = tx.send(CoreEvent::SpeedTestResult {
+            let _ = tx.try_send(CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::RealPing,
                 latency_ms,
@@ -2156,7 +2161,7 @@ impl AppState {
         let pid = profile_id.to_string();
         self.testing_profiles.insert(pid.clone());
         self.testing_details
-            .insert(pid.clone(), TestType::SpeedTest);
+            .insert(pid.parse().expect("valid UUID"), TestType::SpeedTest);
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
         let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
@@ -2176,7 +2181,7 @@ impl AppState {
                 Ok(bps) => (Some(bps), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            let _ = tx.send(CoreEvent::SpeedTestResult {
+            let _ = tx.try_send(CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::SpeedTest,
                 latency_ms: None,
@@ -2206,7 +2211,7 @@ impl AppState {
         };
         let pid = profile_id.to_string();
         self.testing_profiles.insert(pid.clone());
-        self.testing_details.insert(pid.clone(), TestType::UdpTest);
+        self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::UdpTest);
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
         let timeout_dur = std::time::Duration::from_secs(5);
@@ -2218,7 +2223,7 @@ impl AppState {
                 Ok(dur) => (Some(dur.as_millis() as u64), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            let _ = tx.send(CoreEvent::SpeedTestResult {
+            let _ = tx.try_send(CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::UdpTest,
                 latency_ms,
@@ -2231,7 +2236,7 @@ impl AppState {
 
     /// Batch TCP ping all visible (filtered) profiles, deduplicating by address:port.
     pub fn start_batch_ping(&mut self) {
-        let visible = self.filtered_profiles();
+        let visible: Vec<&ProfileRow> = self.filtered_profiles().collect();
         if visible.is_empty() {
             self.add_log("info", "No profiles to ping", "tui");
             return;
@@ -2268,7 +2273,7 @@ impl AppState {
         for target in &unique_targets {
             for pid in &target.profile_ids {
                 self.testing_profiles.insert(pid.clone());
-                self.testing_details.insert(pid.clone(), TestType::TcpPing);
+                self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
             }
         }
 
@@ -2294,7 +2299,7 @@ impl AppState {
                     };
 
                     for pid in &target.profile_ids {
-                        let _ = tx.send(CoreEvent::SpeedTestResult {
+                        let _ = tx.try_send(CoreEvent::SpeedTestResult {
                             profile_id: pid.clone(),
                             test_type: TestType::TcpPing,
                             latency_ms,
@@ -2314,7 +2319,7 @@ impl AppState {
     /// Batch TCP ping all visible profiles, then for TCP-successful targets run real ping
     /// via a temporary core per target.
     pub fn start_batch_then_real_ping(&mut self) {
-        let visible = self.filtered_profiles();
+        let visible: Vec<&ProfileRow> = self.filtered_profiles().collect();
         if visible.is_empty() {
             self.add_log("info", "No profiles to test", "tui");
             return;
@@ -2372,7 +2377,7 @@ impl AppState {
         for (target, _) in &batch_targets {
             for pid in &target.profile_ids {
                 self.testing_profiles.insert(pid.clone());
-                self.testing_details.insert(pid.clone(), TestType::TcpPing);
+                self.testing_details.insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
             }
         }
 
@@ -2428,7 +2433,7 @@ impl AppState {
 
                     let is_ok = latency_ms.is_some();
                     for pid in &target.profile_ids {
-                        let _ = tx.send(CoreEvent::SpeedTestResult {
+                        let _ = tx.try_send(CoreEvent::SpeedTestResult {
                             profile_id: pid.clone(),
                             test_type: TestType::TcpPing,
                             latency_ms,
@@ -2443,7 +2448,7 @@ impl AppState {
                         // If TCP succeeded, prepare for real ping: update emoji to RealPing
                         // before the handler clears it via SpeedTestResult.
                         for pid in &target.profile_ids {
-                            let _ = tx.send(CoreEvent::TestTypeUpdate {
+                            let _ = tx.try_send(CoreEvent::TestTypeUpdate {
                                 profile_id: pid.clone(),
                                 test_type: TestType::RealPing,
                             });
@@ -2523,7 +2528,7 @@ impl AppState {
                                 }
                             };
 
-                            let (log_line_tx, _log_rx) = mpsc::unbounded_channel();
+                            let (log_line_tx, _log_rx) = mpsc::channel(512);
                             let mut manager =
                                 CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
                             if manager
@@ -2553,7 +2558,7 @@ impl AppState {
                             };
 
                             for pid in &target_profile_ids {
-                                let _ = tx.send(CoreEvent::SpeedTestResult {
+                                let _ = tx.try_send(CoreEvent::SpeedTestResult {
                                     profile_id: pid.clone(),
                                     test_type: TestType::RealPing,
                                     latency_ms,
@@ -2714,7 +2719,7 @@ impl AppState {
                     profile_id,
                     test_type,
                 } => {
-                    self.testing_details.insert(profile_id, test_type);
+                    self.testing_details.insert(profile_id.parse().expect("valid UUID"), test_type);
                 }
                 CoreEvent::SpeedTestResult {
                     profile_id,
@@ -2725,7 +2730,7 @@ impl AppState {
                     error,
                 } => {
                     self.testing_profiles.remove(&profile_id);
-                    self.testing_details.remove(&profile_id);
+                    self.testing_details.remove(&profile_id.parse().expect("valid UUID"));
 
                     // Update profile extension and extract name in a scoped block
                     // to drop the mutable borrow before further self-method calls.
@@ -3122,7 +3127,7 @@ impl AppState {
             match result {
                 Ok(inner) => {
                     if let Some(tx) = &tx {
-                        let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                        let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
                             group_id: inner.0,
                             count: inner.1,
                             warnings: inner.2,
@@ -3133,7 +3138,7 @@ impl AppState {
                 Err(_) => {
                     tracing::error!(target: "tui", "Subscription update timed out after 120s");
                     if let Some(tx) = &tx {
-                        let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                        let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
                             group_id: gid.clone(),
                             count: 0,
                             warnings: Vec::new(),
@@ -3269,7 +3274,7 @@ impl AppState {
                 } else {
                     None
                 };
-                let _ = tx.send(CoreEvent::UpdateCheckResult {
+                let _ = tx.try_send(CoreEvent::UpdateCheckResult {
                     core_type,
                     current_version: current,
                     latest_version: latest,
@@ -3332,12 +3337,12 @@ impl AppState {
             {
                 Ok(path) => path,
                 Err(e) => {
-                    let _ = tx.send(CoreEvent::UpdateCompleted {
+                    let _ = tx.try_send(CoreEvent::UpdateCompleted {
                         core_type,
                         old_version: old_version.clone(),
                         new_version: latest,
                         success: false,
-                        error: Some(e),
+                        error: Some(e.to_string()),
                     });
                     return;
                 }
@@ -3347,14 +3352,14 @@ impl AppState {
                 xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
             let (success, error) = match result {
                 Ok(_) => (true, None),
-                Err(e) => (false, Some(e)),
+                Err(e) => (false, Some(e.to_string())),
             };
             // Clean up temp file
             let _ = std::fs::remove_file(&archive);
             let _ = std::fs::remove_dir_all(&temp_dir);
 
             let old_version = old_version.clone();
-            let _ = tx.send(CoreEvent::UpdateCompleted {
+            let _ = tx.try_send(CoreEvent::UpdateCompleted {
                 core_type,
                 old_version,
                 new_version: latest,
@@ -3371,18 +3376,32 @@ impl AppState {
         };
         let db = self.db.clone();
         let validation: ValidationSettings = self.config.parsing.clone().into();
+        let shutdown = self.shutdown_token.clone();
         tokio::spawn(async move {
             use std::time::Duration;
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Check shutdown before first sleep
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                _ = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
+            }
             loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
                 let due_groups = match db.get_groups_due_update().await {
                     Ok(g) => g,
                     Err(_) => {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                            _ = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
+                        }
                         continue;
                     }
                 };
                 for group in &due_groups {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let url = match &group.subscription_url {
                         Some(u) => u.clone(),
                         None => continue,
@@ -3395,14 +3414,17 @@ impl AppState {
                     let result =
                         Self::do_update_subscription(url, ua, gid, db.clone(), validation.clone())
                             .await;
-                    let _ = tx.send(CoreEvent::SubscriptionsUpdated {
+                    let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
                         group_id: result.0,
                         count: result.1,
                         warnings: result.2,
                         error: result.3,
                     });
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                    _ = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
+                }
             }
         });
     }

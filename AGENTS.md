@@ -104,6 +104,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 3. `subscription_upsert_profiles()` in `crates/xray-tui-db/src/lib.rs` handles content-based dedup via `ON CONFLICT(group_id, sub_uid)`
 4. `move_orphans_to_graveyard()` / `purge_graveyard()` handle stale profile cleanup
 5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
+6. `shutdown_token: Arc<AtomicBool>` on `AppState` signals the background loop to stop on quit — checked via `token.load()` in each iteration
 
 ### Adding log storage features
 1. Add `logs` table + indexes in `crates/xray-tui-db/src/schema.rs` (`create_tables()`)
@@ -132,6 +133,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 4. Wire the result into `CoreEvent::SpeedTestResult` handler in `poll_core_events()`
 5. Add menu item in `render_speed_test_menu()` in `crates/xray-tui/src/ui/mod.rs`
 6. Add key handler entry in `handle_key()` menu navigation
+7. Use `create_socks5_client(proxy, port, socks5h, timeout)` helper from `speed_test.rs` to build the reqwest::Client with SOCKS5 proxy — reuses connection pool and avoids per-call construction overhead
 
 ### Adding a backend auto-update feature
 1. Create functions in `crates/xray-tui-core/src/updater.rs`: `get_current_version` (runs subprocess), `get_latest_version` (GitHub releases API), `download_release` (streaming download to temp dir), `install_binary` (extract to temp → verify → .bak → copy all → remove .bak on success/restore from .bak on failure)

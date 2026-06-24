@@ -3,6 +3,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use futures_util::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Kinds of speed tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,17 @@ pub async fn tcp_ping(
     }
 }
 
+/// Create a reqwest::Client with SOCKS5 proxy configured.
+fn create_socks5_client(proxy: &str, port: u16, socks5h: bool, timeout: Duration) -> Result<reqwest::Client, SpeedTestError> {
+    let scheme = if socks5h { "socks5h" } else { "socks5" };
+    let proxy_url = format!("{scheme}://{proxy}:{port}");
+    reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
+        .timeout(timeout)
+        .build()
+        .map_err(SpeedTestError::Http)
+}
+
 /// Real ping: send HTTP GET requests through SOCKS5 proxy to `url`, measure fastest response time.
 /// Uses `socks5://` (NOT `socks5h://`) — the proxy resolves DNS locally.
 /// Up to `retries` requests are sent; the fastest 2xx response wins.
@@ -61,11 +74,7 @@ pub async fn real_ping(
     test_timeout: Duration,
     retries: u32,
 ) -> Result<RealPingResult, SpeedTestError> {
-    let proxy_url = format!("socks5://{proxy}:{port}");
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
-        .timeout(test_timeout)
-        .build()?;
+    let client = create_socks5_client(proxy, port, false, test_timeout)?;
 
     let mut best_latency = None;
     let mut last_error = None;
@@ -132,11 +141,7 @@ pub async fn speed_test(
     min_duration: Duration,
     max_duration: Duration,
 ) -> Result<u64, SpeedTestError> {
-    let proxy_url = format!("socks5h://{proxy}:{port}");
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
-        .timeout(max_duration + Duration::from_secs(5))
-        .build()?;
+    let client = create_socks5_client(proxy, port, true, max_duration + Duration::from_secs(5))?;
 
     let start = std::time::Instant::now();
     let resp = client.get(url).send().await?;
@@ -149,7 +154,6 @@ pub async fn speed_test(
     let stream = resp.bytes_stream();
     tokio::pin!(stream);
 
-    use futures_util::StreamExt;
     while std::time::Instant::now() < deadline {
         match timeout(Duration::from_secs(10), stream.as_mut().next()).await {
             Ok(Some(Ok(chunk))) => {
@@ -182,7 +186,6 @@ pub async fn udp_test(
     port: u16,
     test_timeout: Duration,
 ) -> Result<Duration, SpeedTestError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 1. Establish UDP ASSOCIATE via TCP to SOCKS5 proxy
     let proxy_addr = format!("{proxy}:{port}");

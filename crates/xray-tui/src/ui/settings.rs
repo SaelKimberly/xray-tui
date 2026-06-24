@@ -72,10 +72,10 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::DnsForm { .. }
         | SettingsMode::ProtocolCoreForm { .. }
         | SettingsMode::LoggingForm { .. }
-        | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key),
+        | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key).await,
         SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key).await,
         SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key).await,
-        SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key),
+        SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key).await,
     }
 }
 
@@ -444,7 +444,7 @@ fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
     }
 }
 
-fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     // Clone mode to extract data, then work through mutable state
     let mode_snapshot = match &state.mode {
         AppMode::Settings { mode } => mode.clone(),
@@ -727,7 +727,7 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, inner);
 }
 
-fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
     match key.code {
         KeyCode::Char('c') | KeyCode::Char('C')
             if !key.modifiers.contains(KeyModifiers::CONTROL) =>

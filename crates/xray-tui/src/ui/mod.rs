@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use std::io;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use xray_tui_config::subscription::subscription_url_split;
 
@@ -49,10 +50,10 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let ts = terminal.size().unwrap_or_default();
     state.actions_compact = ts.height < 20;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
     tokio::task::spawn_blocking(move || {
         while let Ok(ev) = event::read() {
-            if tx.send(ev).is_err() {
+            if tx.try_send(ev).is_err() {
                 break;
             }
         }
@@ -89,6 +90,9 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         terminal.draw(|f| render(f, &*state))?;
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
+
+    // Signal background tasks to stop
+    state.shutdown_token.store(true, Ordering::Relaxed);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -449,8 +453,8 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.filter_cache_valid.set(false);
             // Restore selection by profile ID
             if let Some(pid) = selected_id {
-                let filtered = state.filtered_profiles();
-                if let Some(pos) = filtered.iter().position(|r| r.profile.id == pid) {
+                let pos = state.filtered_profiles().position(|r| r.profile.id == pid);
+                if let Some(pos) = pos {
                     state.selected_index = pos;
                 }
             }
@@ -525,13 +529,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && key.modifiers.contains(KeyModifiers::SHIFT)
                 && state.current_tab == Tab::Profiles =>
         {
-            if let Some(id) = state.selected_profile_id()
-                && let Some(profile) = state
-                    .filtered_profiles()
-                    .iter()
-                    .find(|r| r.profile.id == id)
-                && let Ok(url) = xray_tui_config::import_export::format_share_url(&profile.profile)
-            {
+            let url = state.selected_profile_id().and_then(|id| {
+                let row = state.filtered_profiles().find(|r| r.profile.id == id)?;
+                xray_tui_config::import_export::format_share_url(&row.profile).ok()
+            });
+            if let Some(url) = url {
                 state.clipboard = Some(url);
                 state.add_log("info", "Share URL copied to clipboard", "tui");
             }

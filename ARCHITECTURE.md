@@ -40,7 +40,7 @@ pub struct AppState {
     pub testing_profiles: HashSet<String>,
     pub test_progress: Option<(usize, usize)>,
     pub search_focused: bool,
-    pub log_buffer: Vec<LogLine>,
+    pub log_buffer: VecDeque<LogLine>,
     pub logs_show_core: bool,
     pub logs_show_tui: bool,
     pub connected_core: Option<CoreType>,
@@ -56,14 +56,14 @@ pub struct AppState {
     pub last_core_log: Option<(String, String)>,
     pub last_tui_log: Option<(String, String, String)>,
     pub last_test_tcp: Option<u64>,
-    pub testing_details: HashMap<String, TestType>,
+    pub testing_details: HashMap<uuid::Uuid, TestType>,
     pub logs_show_validation: bool,
     pub last_test_real: Option<u64>,
     /// terminal height (Atomics for interior mutability across render thread)
     pub term_height: AtomicU16,
-    pub core_event_tx: Option<UnboundedSender<CoreEvent>>,
-    pub log_worker_tx: Option<UnboundedSender<LogWorkerMessage>>,
-    pub core_event_rx: Option<UnboundedReceiver<CoreEvent>>,
+    pub core_event_tx: Option<Sender<CoreEvent>>,
+    pub log_worker_tx: Option<Sender<LogWorkerMessage>>,
+    pub core_event_rx: Option<Receiver<CoreEvent>>,
 }
 
 ### CoreEvent Channel

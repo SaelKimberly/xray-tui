@@ -45,7 +45,7 @@ xray-tui/
 | **ALL_GROUP_ID** | Fixed UUID (`00000000-0000-0000-0000-000000000000`) identifying the system "All" group for showing every profile across groups |
 | **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update |
 | **Graveyard** | Destination group (`sub-graveyard`) for orphaned subscription profiles; purged after 24h |
-|- **testing_details** | `HashMap<String, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
+|- **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
 | **Transport** | The network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around the transport |
 | **Config Type** | The proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |

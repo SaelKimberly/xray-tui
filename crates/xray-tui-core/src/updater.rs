@@ -1,6 +1,28 @@
 use crate::core_type::CoreType;
 use semver::Version;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+
+#[derive(Debug, Error)]
+pub enum UpdateError {
+    #[error("Unsupported platform: {0} {1}")]
+    UnsupportedPlatform(&'static str, &'static str),
+    #[error("HTTP error: {0}")]
+    Http(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Download failed: {0}")]
+    Download(String),
+    #[error("Archive error: {0}")]
+    Archive(String),
+    #[error("Binary not found in archive: {0}")]
+    BinaryNotFound(String),
+    #[error("Installation failed: {0}")]
+    Install(String),
+    #[error("Cannot install for Auto core type")]
+    AutoCore,
+}
 
 /// Parse a version tag (strip leading 'v') as semver::Version.
 pub fn parse_version(tag: &str) -> Option<Version> {
@@ -95,19 +117,14 @@ pub async fn download_release(
     core_type: CoreType,
     version: &str,
     dest_dir: &Path,
-) -> Result<PathBuf, String> {
-    let url = release_asset_url(core_type, version).ok_or_else(|| {
-        format!(
-            "unsupported platform: {}-{}",
-            std::env::consts::ARCH,
-            std::env::consts::OS
-        )
-    })?;
+) -> Result<PathBuf, UpdateError> {
+    let url = release_asset_url(core_type, version)?;
 
     let filename = url.rsplit('/').next().unwrap_or("archive.tar.gz");
     let dest = dest_dir.join(filename);
 
-    std::fs::create_dir_all(dest_dir).map_err(|e| format!("failed to create temp dir: {e}"))?;
+    std::fs::create_dir_all(dest_dir)?;
+
 
     // Stream download
     let resp = client
@@ -116,31 +133,27 @@ pub async fn download_release(
         .header("Accept", "application/octet-stream")
         .send()
         .await
-        .map_err(|e| format!("download failed: {e}"))?;
+        .map_err(|e| UpdateError::Http(e.to_string()))?;
 
     if !resp.status().is_success() {
-        return Err(format!("download returned HTTP {}", resp.status()));
+        return Err(UpdateError::Download(format!("HTTP {}", resp.status())));
     }
 
     let total_size = resp.content_length();
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| format!("failed to create file: {e}"))?;
+    let mut file = tokio::fs::File::create(&dest).await?;
 
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     let mut downloaded: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("download stream error: {e}"))?;
+        let chunk = chunk.map_err(|e| UpdateError::Download(e.to_string()))?;
         downloaded += chunk.len() as u64;
         if let Some(total) = total_size {
             // Progress could be reported via callback; for now we keep simple
             let _ = (downloaded, total);
         }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| format!("file write error: {e}"))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
     }
 
     Ok(dest)
@@ -151,25 +164,25 @@ pub async fn install_binary(
     archive: &Path,
     core_type: CoreType,
     bin_dir: &Path,
-) -> Result<(), String> {
+) -> Result<(), UpdateError> {
     let suffix = match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
-        CoreType::Auto => return Err("cannot install for Auto core type".into()),
+        CoreType::Auto => return Err(UpdateError::AutoCore),
     };
     let temp_dir = std::env::temp_dir().join(format!("xray-tui-install-{suffix}"));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).map_err(|e| format!("failed to create temp dir: {e}"))?;
+    std::fs::create_dir_all(&temp_dir)?;
 
     // 1. Extract archive to temp dir
     crate::bin_manager::extract_archive(archive, core_type, &temp_dir)
-        .map_err(|e| format!("extraction failed: {e}"))?;
+        .map_err(|e| UpdateError::Archive(e.to_string()))?;
 
     // 2. Find extracted binary and verify it runs
     let exe_name = match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
-        CoreType::Auto => return Err("cannot install for Auto core type".into()),
+        CoreType::Auto => return Err(UpdateError::AutoCore),
     };
 
     // The binary may be in a subdirectory (e.g., sing-box-1.9.0-linux-amd64/)
@@ -179,11 +192,10 @@ pub async fn install_binary(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&binary).map_err(|e| format!("cannot stat binary: {e}"))?;
+        let meta = std::fs::metadata(&binary)?;
         let mut perms = meta.permissions();
         perms.set_mode(perms.mode() | 0o111);
-        std::fs::set_permissions(&binary, perms)
-            .map_err(|e| format!("cannot set executable bit: {e}"))?;
+        std::fs::set_permissions(&binary, perms)?;
     }
 
     // Verify binary runs
@@ -191,24 +203,23 @@ pub async fn install_binary(
         .arg("version")
         .output()
         .await
-        .map_err(|e| format!("failed to execute extracted binary: {e}"))?;
+        .map_err(|e| UpdateError::Install(e.to_string()))?;
 
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err("extracted binary returned non-zero exit code".into());
+        return Err(UpdateError::Install("extracted binary returned non-zero exit code".into()));
     }
 
     let version_output = String::from_utf8_lossy(&output.stdout);
     if version_output.is_empty() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err("extracted binary produced no version output".into());
+        return Err(UpdateError::Install("extracted binary produced no version output".into()));
     }
 
     // 3. Install to bin_dir
     let core_bin_dir = bin_dir.join(match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
-        CoreType::Auto => return Err("cannot install for Auto core type".into()),
+        CoreType::Auto => return Err(UpdateError::AutoCore),
     });
 
     // Remove old .bak if present
@@ -223,12 +234,11 @@ pub async fn install_binary(
 
     // Rename existing directory to .bak
     if core_bin_dir.exists() {
-        std::fs::rename(&core_bin_dir, &bak_dir)
-            .map_err(|e| format!("failed to back up existing binary: {e}"))?;
+        std::fs::rename(&core_bin_dir, &bak_dir)?;
     }
 
     // Copy all extracted files
-    std::fs::create_dir_all(&core_bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
+    std::fs::create_dir_all(&core_bin_dir)?;
 
     if let Err(e) = copy_recursively(&temp_dir, &core_bin_dir) {
         // Restore from backup
@@ -237,7 +247,7 @@ pub async fn install_binary(
             let _ = std::fs::rename(&bak_dir, &core_bin_dir);
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err(format!("failed to copy files: {e}"));
+        return Err(UpdateError::Install(format!("failed to copy files: {e}")));
     }
 
     // Remove .bak on success
@@ -248,24 +258,30 @@ pub async fn install_binary(
 }
 
 /// Build the GitHub release asset URL for the current OS/arch.
-pub fn release_asset_url(core_type: CoreType, version: &str) -> Option<String> {
+pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, UpdateError> {
     let arch = match std::env::consts::ARCH {
         "x86_64" => match core_type {
             CoreType::Xray => "64",
             CoreType::SingBox => "amd64",
-            CoreType::Auto => return None,
+            CoreType::Auto => return Err(UpdateError::AutoCore),
         },
         "aarch64" => match core_type {
             CoreType::Xray => "arm64",
             CoreType::SingBox => "arm64",
-            CoreType::Auto => return None,
+            CoreType::Auto => return Err(UpdateError::AutoCore),
         },
-        _ => return None,
+        _ => return Err(UpdateError::UnsupportedPlatform(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+        )),
     };
 
     let os = std::env::consts::OS;
     if os != "linux" {
-        return None;
+        return Err(UpdateError::UnsupportedPlatform(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+        ));
     }
 
     let url = match core_type {
@@ -277,10 +293,10 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Option<String> {
             "https://github.com/SagerNet/sing-box/releases/download/v{version}/sing-box-{version}-linux-{arch}.tar.gz",
             version = version.strip_prefix('v').unwrap_or(version),
         ),
-        CoreType::Auto => return None,
+        CoreType::Auto => return Err(UpdateError::AutoCore),
     };
 
-    Some(url)
+    Ok(url)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
@@ -305,7 +321,7 @@ fn copy_recursively(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
 }
 
 /// Find a binary in a directory tree (searching recursively).
-fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, String> {
+fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, UpdateError> {
     let mut found = None;
     let mut entries: Vec<_> = vec![dir.to_path_buf()];
 
@@ -326,7 +342,7 @@ fn find_binary_in_dir(dir: &Path, exe_name: &str) -> Result<PathBuf, String> {
         }
     }
 
-    found.ok_or_else(|| format!("{exe_name} not found in extracted archive"))
+    found.ok_or_else(|| UpdateError::BinaryNotFound(exe_name.to_string()))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

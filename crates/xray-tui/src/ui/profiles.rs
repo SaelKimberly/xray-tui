@@ -10,10 +10,10 @@ use xray_tui_db::models::GRAVEYARD_GROUP_ID;
 use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
 use crate::ui::theme::Theme;
-use crate::{AppState, ConfirmAction};
+use crate::{AppState, ConfirmAction, ProfileRow};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    let rows = state.filtered_profiles();
+    let rows: Vec<&ProfileRow> = state.filtered_profiles().collect();
     let selected = state.selected_index;
     let gauge_height = state.test_progress.map_or(0, |_| 1u16);
     let chunks = Layout::default()
@@ -218,12 +218,13 @@ fn render_data_grid(
 
             let indicator = if is_connected {
                 String::from(" ●")
-            } else if let Some(test_type) = state.testing_details.get(&row.profile.id) {
-                match test_type {
-                    TestType::TcpPing => String::from("↔ "),
-                    TestType::RealPing => String::from("◎ "),
-                    TestType::SpeedTest => String::from("⇩ "),
-                    TestType::UdpTest => String::from("↗ "),
+            } else if let Ok(pid) = row.profile.id.parse::<uuid::Uuid>() {
+                match state.testing_details.get(&pid) {
+                    Some(TestType::TcpPing) => String::from("↔ "),
+                    Some(TestType::RealPing) => String::from("◎ "),
+                    Some(TestType::SpeedTest) => String::from("⇩ "),
+                    Some(TestType::UdpTest) => String::from("↗ "),
+                    None => String::new(),
                 }
             } else {
                 String::from("  ")

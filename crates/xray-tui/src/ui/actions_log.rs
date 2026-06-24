@@ -36,7 +36,7 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
             return None;
         }
         let idx = state.selected_index.min(state.filtered_len() - 1);
-        state.filtered_profiles().get(idx).copied()
+        state.filtered_profiles().nth(idx)
     });
 
     match row {

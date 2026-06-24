@@ -12,8 +12,8 @@ use xray_tui_db::Database;
 // ── Custom tracing layer that forwards events to the TUI event loop and storage ──
 
 struct TuiLogLayer {
-    core_event_tx: tokio::sync::mpsc::UnboundedSender<xray_tui::CoreEvent>,
-    log_worker_tx: tokio::sync::mpsc::UnboundedSender<xray_tui_core::log_worker::LogWorkerMessage>,
+    core_event_tx: tokio::sync::mpsc::Sender<xray_tui::CoreEvent>,
+    log_worker_tx: tokio::sync::mpsc::Sender<xray_tui_core::log_worker::LogWorkerMessage>,
 }
 
 /// A field visitor that captures the `message` field.
@@ -64,7 +64,7 @@ where
         };
 
         // Send to TUI display (non-blocking, unbounded)
-        let _ = self.core_event_tx.send(xray_tui::CoreEvent::TuiLog {
+        let _ = self.core_event_tx.try_send(xray_tui::CoreEvent::TuiLog {
             target: target.clone(),
             level: level.clone(),
             message: message.clone(),
@@ -84,7 +84,7 @@ where
             metadata_json: None,
             source: source.to_owned(),
         };
-        let _ = self.log_worker_tx.send(LogWorkerMessage::Entry(entry));
+        let _ = self.log_worker_tx.try_send(LogWorkerMessage::Entry(entry));
     }
 }
 
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     let mut state = AppState::new(Arc::new(db), config).await;
 
     // 4. Create channel for log storage worker
-    let (log_worker_tx, log_worker_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (log_worker_tx, log_worker_rx) = tokio::sync::mpsc::channel(1024);
 
     // 5. Install tracing subscriber with TuiLogLayer
     // Do not crash if global subscriber was already set (e.g., in tests)
