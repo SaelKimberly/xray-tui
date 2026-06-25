@@ -4,6 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::collections::HashMap;
 
 use crate::ui::theme::Theme;
 use crate::{AppMode, AppState, SettingsMode, SettingsSection};
@@ -80,6 +81,9 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
 }
 
 // ── Menu ────────────────────────────────────────────────────────────────
+// TODO 4.5: Add configured-indicator to settings menu items showing
+// ● for sections with non-default values. Requires tracking which
+// settings differ from AppConfig::default().
 
 fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let selected = match &state.mode {
@@ -302,56 +306,70 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
     }
 }
 
+// TODO 3.3: Add scroll_offset: usize to each *Form variant + scroll indicators
+// (↑ N more / ↓ N more) when fields exceed visible height. Render clipped
+// window around focused field.
 fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode = match &state.mode {
         AppMode::Settings { mode } => mode,
         _ => return,
     };
-    let (fields, focus_index) = match mode {
+    let (fields, focus_index, form_errors) = match mode {
         SettingsMode::CoreForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::GuiForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::InboundForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::DnsForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::SystemProxyForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::TunForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::MuxForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::StatsForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::ProtocolCoreForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::SpeedTestForm {
             fields,
             focus_index,
+            form_errors,
         }
         | SettingsMode::LoggingForm {
             fields,
             focus_index,
-        } => (fields, *focus_index),
+            form_errors,
+        } => (fields, *focus_index, form_errors),
         _ => return,
     };
 
@@ -380,15 +398,13 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
         let is_focused = i == focus_index;
         let val = fields.get(i).map(|(_, v)| v.as_str()).unwrap_or("");
 
-        let display_val = if let Some(options_csv) = field_type.strip_prefix("Select:") {
-            let options: Vec<&str> = options_csv.split(',').collect();
-            let idx = options.iter().position(|o| *o == val).unwrap_or(0);
-            format!("{}/{} {}  ←→ change", idx + 1, options.len(), val)
+        let display_val = if let Some(_options_csv) = field_type.strip_prefix("Select:") {
+            format!("< {} >", val)
         } else if *field_type == "Boolean" {
             if val == "true" {
-                "[✓] Yes".into()
+                "[X]".into()
             } else {
-                "[✗] No".into()
+                "[ ]".into()
             }
         } else {
             if val.is_empty() {
@@ -397,7 +413,6 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
                 val.to_string()
             }
         };
-
         let prefix = if is_focused { "> " } else { "  " };
         let label_text = format!("{prefix}{label}: ");
         let value_text = format!("[{}]", display_val);
@@ -417,6 +432,12 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
             ),
         ];
         lines.push(Line::from(spans));
+        if let Some(error) = form_errors.get(*_key) {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {error}"),
+                Theme::ERROR,
+            )));
+        }
     }
 
     lines.push(Line::from(""));
@@ -461,56 +482,66 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         return;
     }
     let max_idx = field_defs.len().saturating_sub(1);
-
-    // Extract current fields and focus_index from mutable state
-    let (fields, focus_index) = match &mut state.mode {
+    // Extract current fields, focus_index, and form_errors from mutable state
+    let (fields, focus_index, form_errors) = match &mut state.mode {
         AppMode::Settings {
             mode:
                 SettingsMode::CoreForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::GuiForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::InboundForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::DnsForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::SystemProxyForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::TunForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::MuxForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::StatsForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::ProtocolCoreForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::SpeedTestForm {
                     fields,
                     focus_index,
+                    form_errors,
                 }
                 | SettingsMode::LoggingForm {
                     fields,
                     focus_index,
+                    form_errors,
                 },
-        } => (fields, focus_index),
+        } => (fields, focus_index, form_errors),
         _ => return,
     };
 
@@ -569,6 +600,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Enter => {
+            form_errors.clear();
             let saved_fields = fields.clone();
             state.save_settings_form(section, &saved_fields);
         }
@@ -1014,6 +1046,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                     rule_id: None,
                     fields,
                     focus_index: 0,
+                    form_errors: HashMap::new(),
                 },
             };
         }
@@ -1025,6 +1058,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                         rule_id: Some(rules[selected].id.clone()),
                         fields,
                         focus_index: 0,
+                        form_errors: HashMap::new(),
                     },
                 };
             }
@@ -1123,15 +1157,16 @@ const ROUTING_FIELD_DEFS: &[(&str, &str, &str)] = &[
 ];
 
 fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
-    let (fields, focus_index) = match &state.mode {
+    let (fields, focus_index, form_errors) = match &state.mode {
         AppMode::Settings {
             mode:
                 SettingsMode::RoutingForm {
                     fields,
                     focus_index,
+                    form_errors,
                     ..
                 },
-        } => (fields, *focus_index),
+        } => (fields, *focus_index, form_errors),
         _ => return,
     };
 
@@ -1172,9 +1207,9 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let display_val = if *field_type == "Boolean" {
             if val == "true" {
-                "[✓] Yes".into()
+                "[X]".into()
             } else {
-                "[✗] No".into()
+                "[ ]".into()
             }
         } else {
             if val.is_empty() {
@@ -1203,6 +1238,12 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
             ),
         ];
         lines.push(Line::from(spans));
+        if let Some(error) = form_errors.get(*_key) {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {error}"),
+                Theme::ERROR,
+            )));
+        }
     }
 
     lines.push(Line::from(""));
@@ -1214,15 +1255,16 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
-    let (rule_id, fields, focus_index) = match &mut state.mode {
+    let (rule_id, fields, focus_index, _form_errors) = match &mut state.mode {
         AppMode::Settings {
             mode:
                 SettingsMode::RoutingForm {
                     rule_id,
                     fields,
                     focus_index,
+                    form_errors,
                 },
-        } => (rule_id.clone(), fields, focus_index),
+        } => (rule_id.clone(), fields, focus_index, form_errors),
         _ => return,
     };
 
@@ -1301,5 +1343,144 @@ fn truncate_to(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
+/// Extract (fields, focus_index, form_errors) from any settings form variant.
+pub fn extract_form_fields(
+    state: &AppState,
+) -> Option<(&Vec<(String, String)>, &usize, &HashMap<String, String>)> {
+    let mode = match &state.mode {
+        AppMode::Settings { mode } => mode,
+        _ => return None,
+    };
+    match mode {
+        SettingsMode::CoreForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::GuiForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::InboundForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::DnsForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::SystemProxyForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::TunForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::MuxForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::StatsForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::ProtocolCoreForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::SpeedTestForm {
+            fields,
+            focus_index,
+            form_errors,
+        }
+        | SettingsMode::LoggingForm {
+            fields,
+            focus_index,
+            form_errors,
+        } => Some((fields, focus_index, form_errors)),
+        _ => None,
+    }
+}
+
+/// Mutable version of extract_form_fields.
+pub fn extract_form_fields_mut(
+    state: &mut AppState,
+) -> Option<(
+    &mut Vec<(String, String)>,
+    &mut usize,
+    &mut HashMap<String, String>,
+)> {
+    match &mut state.mode {
+        AppMode::Settings {
+            mode:
+                SettingsMode::CoreForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::GuiForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::InboundForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::DnsForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::SystemProxyForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::TunForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::MuxForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::StatsForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::ProtocolCoreForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::SpeedTestForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                }
+                | SettingsMode::LoggingForm {
+                    fields,
+                    focus_index,
+                    form_errors,
+                },
+        } => Some((fields, focus_index, form_errors)),
+        _ => None,
     }
 }

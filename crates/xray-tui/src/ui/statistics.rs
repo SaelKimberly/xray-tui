@@ -1,8 +1,8 @@
 use crate::AppState;
 use crate::ui::theme::Theme;
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
@@ -22,106 +22,105 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|c| c.to_string())
         .unwrap_or_default();
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    // ── Title ──────────────────────────────────────────────────────
-    lines.push(Line::from(vec![
-        Span::styled("Statistics ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!("— {profile_name} [{core_type}]")),
-    ]));
-    lines.push(Line::from("───"));
+    // Split area into 3 sections
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // Traffic
+            Constraint::Length(5), // System
+            Constraint::Min(3),    // Connection
+        ])
+        .split(area);
 
     // ── Traffic section ────────────────────────────────────────────
+    let mut traffic_lines: Vec<Line> = Vec::new();
     if let Some(ref stats) = profile.stats {
-        lines.push(Line::from(Span::styled(
-            "Traffic",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )));
-
         let today_up = stats.today_up.unwrap_or(0) as i64;
         let today_down = stats.today_down.unwrap_or(0) as i64;
         let total_up = stats.total_up.unwrap_or(0) as i64;
         let total_down = stats.total_down.unwrap_or(0) as i64;
 
-        lines.push(Line::from(vec![
+        traffic_lines.push(Line::from(vec![
             Span::raw("  Today:  "),
             Span::styled("↑", Style::default().fg(Color::Green)),
             Span::raw(format!(" {}  ", format_bytes(today_up))),
             Span::styled("↓", Style::default().fg(Color::Red)),
             Span::raw(format!(" {}", format_bytes(today_down))),
         ]));
-        lines.push(Line::from(vec![
+        traffic_lines.push(Line::from(vec![
             Span::raw("  Total:  "),
             Span::styled("↑", Style::default().fg(Color::Green)),
             Span::raw(format!(" {}  ", format_bytes(total_up))),
             Span::styled("↓", Style::default().fg(Color::Red)),
             Span::raw(format!(" {}", format_bytes(total_down))),
         ]));
-        lines.push(Line::from(""));
     } else {
-        lines.push(Line::from(Span::styled(
-            "Traffic",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )));
-        lines.push(Line::from("  No traffic data yet"));
-        lines.push(Line::from(""));
+        traffic_lines.push(Line::from("  No traffic data yet"));
     }
+    let traffic_block = Block::default()
+        .title(format!(" Traffic — {profile_name} [{core_type}] "))
+        .borders(Borders::ALL)
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
+    let traffic_para = Paragraph::new(traffic_lines).block(traffic_block);
+    frame.render_widget(traffic_para, chunks[0]);
 
     // ── System section ─────────────────────────────────────────────
-    lines.push(Line::from(Span::styled(
-        "System",
-        Style::default().add_modifier(Modifier::UNDERLINED),
-    )));
-
+    let mut sys_lines: Vec<Line> = Vec::new();
     if let Some(ref sys) = state.system_stats {
-        lines.push(Line::from(format!(
+        sys_lines.push(Line::from(format!(
             "  Memory:    {} / {}",
             format_bytes(sys.alloc as i64),
             format_bytes(sys.sys as i64),
         )));
-        lines.push(Line::from(format!("  Routines:  {}", sys.num_goroutine,)));
-        lines.push(Line::from(format!(
+        sys_lines.push(Line::from(format!("  Routines:  {}", sys.num_goroutine)));
+        sys_lines.push(Line::from(format!(
             "  Uptime:    {}",
             format_uptime(sys.uptime),
         )));
     } else {
-        lines.push(Line::from("  No system data yet"));
+        sys_lines.push(Line::from("  No system data yet"));
     }
-    lines.push(Line::from(""));
+    let sys_block = Block::default()
+        .title(" System ")
+        .borders(Borders::ALL)
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
+    let sys_para = Paragraph::new(sys_lines).block(sys_block);
+    frame.render_widget(sys_para, chunks[1]);
 
-    // ── Connection info ────────────────────────────────────────────
-    lines.push(Line::from(Span::styled(
-        "Connection",
-        Style::default().add_modifier(Modifier::UNDERLINED),
-    )));
-    lines.push(Line::from(format!("  API endpoint:  {API_ENDPOINT}")));
-
+    // ── Connection section ─────────────────────────────────────────
     let status_style = if connected {
         Theme::SUCCESS
     } else {
         Theme::ERROR
     };
-    lines.push(Line::from(vec![
-        Span::raw("  Status:       "),
-        Span::styled("Connected", status_style),
-    ]));
+    let conn_lines = vec![
+        Line::from(format!("  API endpoint:  {API_ENDPOINT}")),
+        Line::from(vec![
+            Span::raw("  Status:       "),
+            Span::styled("Connected", status_style),
+        ]),
+    ];
+    let conn_block = Block::default()
+        .title(" Connection ")
+        .borders(Borders::ALL)
+        .border_style(Theme::CONTAINER_BORDER)
+        .title_style(Theme::CONTAINER_TITLE);
+    let conn_para = Paragraph::new(conn_lines).block(conn_block);
+    frame.render_widget(conn_para, chunks[2]);
+}
 
+fn render_placeholder(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .title(" Statistics ")
         .borders(Borders::ALL)
         .border_style(Theme::CONTAINER_BORDER)
         .title_style(Theme::CONTAINER_TITLE);
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: false });
-    frame.render_widget(paragraph, area);
-}
-
-fn render_placeholder(frame: &mut Frame, area: Rect) {
-    let block = Block::default().title(" Statistics ").borders(Borders::ALL);
-    let paragraph = Paragraph::new("No data — connect to a server")
-        .block(block)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(ratatui::layout::Alignment::Center);
+    let paragraph =
+        Paragraph::new(" Not connected — select a profile and press Ctrl+Enter to connect ")
+            .style(Theme::HINT)
+            .block(block)
+            .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(paragraph, area);
 }

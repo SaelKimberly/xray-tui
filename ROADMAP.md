@@ -99,6 +99,8 @@
 - ✅ Turso-backed log storage — `logs` table, `LogEntry` model, `LogRepository` (insert_batch, get_filtered, delete_older_than), `LogStorageWorker` background task with dedicated connection, `TuiLogLayer` dual-send architecture, configurable TTL (72h default), Settings→Logging form, `BEGIN IMMEDIATE` + `busy_timeout(500ms)` for lock-free writes
 
 ## Phase 8 — Polish & Release
+-
+- ✅ UI/UX fixes — 25+ items across 9 files: centered confirmation overlay with quit safety; inline form validation with error display; empty-state guidance when no profiles; blinking terminal cursor in search mode; actions panel collapses in non-profile tabs; consistent boolean `[X]`/`[ ]` and select `< value >` display; Home/End in group overlay; PgUp/PgDn in profiles list; inverted log scroll (Up=newer); Ctrl+A select-all/deselect-all; connection status indicator in tab bar; update indicator with yellow background; statistics screen refactored into 3 bordered sections; extract_form_fields helpers for form mode dedup
 
 - ☐ i18n (en, zh, ru, fa)
 - ☐ Theme system (dark/light/custom)

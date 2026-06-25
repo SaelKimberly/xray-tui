@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     // Append update indicator if any backend has an update available
-    let update_indicator = if state.update_status.values().any(|s| s.update_available) {
+    let update_indicator_span = if state.update_status.values().any(|s| s.update_available) {
         let cores: Vec<&str> = state
             .update_status
             .iter()
@@ -52,12 +52,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             .filter(|s| !s.is_empty())
             .collect();
         if cores.is_empty() {
-            String::new()
+            Span::raw("")
         } else {
-            format!(" [Update: {}]", cores.join(", "))
+            Span::styled(
+                format!(" ⇧Update:{} ", cores.join(",")),
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         }
     } else {
-        String::new()
+        Span::raw("")
     };
     // Mode indicator prefix
     let mode_prefix = match &state.mode {
@@ -80,13 +86,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         },
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",
-        crate::AppMode::SpeedTestMenu { .. } => " Speed Test",
+        crate::AppMode::SpeedTestMenu { .. } => " Server Tools",
         crate::AppMode::BatchImport { .. } => " Batch Import",
         crate::AppMode::Help => " Help",
         _ => "",
     };
 
-    let left_text = format!("{mode_prefix}{left_text}{update_indicator}");
+    let left_text = format!("{mode_prefix}{left_text}");
 
     // Dynamic right-side hints
     let right_text = build_hints(state);
@@ -97,11 +103,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let left_len = left_text.len();
     let padding = width.saturating_sub(left_len + right_text.len());
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(left_text.clone(), left_style),
         Span::raw(" ".repeat(padding)),
         Span::styled(right_text, right_style),
-    ]);
+    ];
+    // Insert update indicator between left text and padding if non-empty
+    if !update_indicator_span.content.is_empty() {
+        spans.insert(1, Span::raw(" "));
+        spans.insert(2, update_indicator_span);
+    }
+
+    let line = Line::from(spans);
 
     let bg = Theme::STATUS_BAR_BG;
 
@@ -132,8 +145,8 @@ fn build_hints(state: &AppState) -> &'static str {
                         " [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
                     }
                 }
-                crate::Tab::Settings => " [Enter] Open  [?] Help  [Ctrl+Q] Quit ",
-                crate::Tab::Logs | crate::Tab::Statistics => " [?] Help  [Ctrl+Q] Quit ",
+                crate::Tab::Settings => " [Enter] Open  [Ctrl+Q] Quit ",
+                crate::Tab::Logs | crate::Tab::Statistics => " [Ctrl+Q] Quit ",
             }
         }
     }

@@ -4,6 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::collections::HashMap;
 use xray_tui_config::forms::{FieldSection, FormFieldType, form_fields_for};
 use xray_tui_core::SINGBOX_ONLY_PROTOCOLS;
 use xray_tui_core::protocol::Protocol;
@@ -77,19 +78,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             protocol: Some(p),
             fields,
             focus_index,
+            form_errors,
         } => {
-            render_form(frame, area, *p, fields, *focus_index, false);
+            render_form(frame, area, *p, fields, *focus_index, form_errors, false);
         }
         AppMode::EditServer {
             profile_id: _,
             fields,
             focus_index,
+            form_errors,
         } => {
             let proto = crate::get_field(fields, "config_type")
                 .and_then(|v| v.parse::<i32>().ok())
                 .and_then(Protocol::try_from_i32)
                 .unwrap_or(Protocol::Custom);
-            render_form(frame, area, proto, fields, *focus_index, true);
+            render_form(frame, area, proto, fields, *focus_index, form_errors, true);
         }
         _ => {}
     }
@@ -192,12 +195,15 @@ fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
 
 // ── Form render ──────────────────────────────────────────────────────────
 
+// TODO 3.3: Add scroll_offset: usize to AddServer/EditServer variants + scroll
+// indicators when fields exceed visible height.
 fn render_form(
     frame: &mut Frame,
     area: Rect,
     protocol: Protocol,
     fields: &[(String, String)],
     focus_index: usize,
+    form_errors: &HashMap<String, String>,
     _is_edit: bool,
 ) {
     let title = format!(" {protocol} ");
@@ -234,14 +240,13 @@ fn render_form(
             }
             FormFieldType::Boolean => {
                 if val == "true" {
-                    "✓ true".into()
+                    "[X]".into()
                 } else {
-                    "✗ false".into()
+                    "[ ]".into()
                 }
             }
-            FormFieldType::Select(options) => {
-                let idx = options.iter().position(|o| *o == val).unwrap_or(0);
-                format!("{}/{} {}  ←→ change", idx + 1, options.len(), val)
+            FormFieldType::Select(_) => {
+                format!("< {} >", val)
             }
             _ => {
                 if val.is_empty() {
@@ -281,6 +286,12 @@ fn render_form(
             Span::styled(section_hint, hint_style),
         ];
         lines.push(Line::from(spans));
+        if let Some(error) = form_errors.get(ff.key) {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {error}"),
+                Theme::ERROR,
+            )));
+        }
     }
 
     lines.push(Line::from(""));
@@ -346,6 +357,7 @@ fn handle_picker_key(state: &mut AppState, key: &KeyEvent) {
                     protocol: Some(proto),
                     fields,
                     focus_index: 0,
+                    form_errors: HashMap::new(),
                 };
             }
         }
@@ -406,6 +418,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             protocol: Some(_),
             fields,
             focus_index,
+            ..
         } => Some((protocol, fields, focus_index, false)),
         AppMode::EditServer {
             fields,

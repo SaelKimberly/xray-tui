@@ -69,14 +69,17 @@ pub enum SettingsMode {
     CoreForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     GuiForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     InboundForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     RoutingList {
         selected: usize,
@@ -85,26 +88,32 @@ pub enum SettingsMode {
         rule_id: Option<String>,
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     DnsForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     SystemProxyForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     TunForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     MuxForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     StatsForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     UpdateForm {
         status_xray: BackendUpdateStatus,
@@ -113,14 +122,17 @@ pub enum SettingsMode {
     ProtocolCoreForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     SpeedTestForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
     LoggingForm {
         fields: Vec<(String, String)>,
         focus_index: usize,
+        form_errors: HashMap<String, String>,
     },
 }
 
@@ -159,12 +171,16 @@ pub enum AppMode {
         fields: Vec<(String, String)>,
         /// Index of the focused field
         focus_index: usize,
+        /// Per-field validation errors
+        form_errors: HashMap<String, String>,
     },
     /// Editing an existing server
     EditServer {
         profile_id: String,
         fields: Vec<(String, String)>,
         focus_index: usize,
+        /// Per-field validation errors
+        form_errors: HashMap<String, String>,
     },
     /// Import URL from paste
     ImportUrl {
@@ -281,11 +297,11 @@ pub enum CoreEvent {
     },
 }
 
-#[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DeleteProfile(String),
     DeleteGroup(String),
     ClearGroup(String),
+    Quit,
 }
 #[derive(Debug, Clone, Default)]
 pub struct BackendUpdateStatus {
@@ -696,9 +712,9 @@ impl AppState {
             protocol: None,
             fields,
             focus_index: 0,
+            form_errors: HashMap::new(),
         };
     }
-
     pub async fn start_edit_profile(&mut self, id: &str) {
         match self.db.get_profile(id).await {
             Ok(Some(profile)) => {
@@ -707,6 +723,7 @@ impl AppState {
                     profile_id: id.to_string(),
                     fields,
                     focus_index: 0,
+                    form_errors: HashMap::new(),
                 };
             }
             Ok(None) => self.add_log("error", &format!("Profile {id} not found"), "tui"),
@@ -817,17 +834,61 @@ impl AppState {
     }
 
     pub async fn confirm_add_server(&mut self) {
-        let (protocol, fields) = match &self.mode {
+        let (protocol, fields, _form_errors) = match &self.mode {
             AppMode::AddServer {
                 protocol: Some(p),
                 fields,
+                form_errors,
                 ..
-            } => (*p, fields.clone()),
+            } => (*p, fields.clone(), form_errors.clone()),
             _ => {
                 self.log_trace("error", "tui", "Cannot confirm: no protocol selected");
                 return;
             }
         };
+
+        // Validate fields
+        let mut errors: HashMap<String, String> = HashMap::new();
+        let address = fields
+            .iter()
+            .find(|(k, _)| k == "address")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let port = fields
+            .iter()
+            .find(|(k, _)| k == "port")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let user_id = fields
+            .iter()
+            .find(|(k, _)| k == "user_id")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+
+        if address.is_empty() {
+            errors.insert("address".into(), "Address is required".into());
+        }
+        if port.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
+            errors.insert("port".into(), "Port must be 1-65535".into());
+        }
+        match protocol {
+            Protocol::Vmess | Protocol::Vless | Protocol::Trojan if user_id.is_empty() => {
+                errors.insert("user_id".into(), "ID/Password required".into());
+            }
+            _ => {}
+        }
+
+        if !errors.is_empty() {
+            if let AppMode::AddServer {
+                ref mut form_errors,
+                ..
+            } = self.mode
+            {
+                *form_errors = errors;
+            }
+            return;
+        }
+
         let mut profile = self.fields_to_profile(protocol, &fields);
         // Assign to currently selected real group (not All or Graveyard)
         if let Some(gid) = &self.selected_group_id
@@ -853,12 +914,69 @@ impl AppState {
     }
 
     pub async fn confirm_edit_server(&mut self) {
-        let (profile_id, fields) = match &self.mode {
+        let (profile_id, fields, _form_errors) = match &self.mode {
             AppMode::EditServer {
-                profile_id, fields, ..
-            } => (profile_id.clone(), fields.clone()),
+                profile_id,
+                fields,
+                form_errors,
+                ..
+            } => (profile_id.clone(), fields.clone(), form_errors.clone()),
             _ => return,
         };
+
+        // Validate fields
+        let mut errors: HashMap<String, String> = HashMap::new();
+        let address = fields
+            .iter()
+            .find(|(k, _)| k == "address")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let port = fields
+            .iter()
+            .find(|(k, _)| k == "port")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let user_id = fields
+            .iter()
+            .find(|(k, _)| k == "user_id")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+
+        if address.is_empty() {
+            errors.insert("address".into(), "Address is required".into());
+        }
+        if port.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
+            errors.insert("port".into(), "Port must be 1-65535".into());
+        }
+        // Infer protocol from existing profile
+        let protocol = Protocol::try_from_i32(
+            self.db
+                .get_profile(&profile_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.config_type)
+                .unwrap_or(0),
+        )
+        .unwrap_or(Protocol::Custom);
+        match protocol {
+            Protocol::Vmess | Protocol::Vless | Protocol::Trojan if user_id.is_empty() => {
+                errors.insert("user_id".into(), "ID/Password required".into());
+            }
+            _ => {}
+        }
+
+        if !errors.is_empty() {
+            if let AppMode::EditServer {
+                ref mut form_errors,
+                ..
+            } = self.mode
+            {
+                *form_errors = errors;
+            }
+            return;
+        }
+
         let mut profile = match self.db.get_profile(&profile_id).await {
             Ok(Some(p)) => p,
             _ => {
@@ -866,8 +984,6 @@ impl AppState {
                 return;
             }
         };
-        // Infer protocol from existing profile
-        let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
         // Rebuild from form fields
         let new_profile = self.fields_to_profile(protocol, &fields);
         profile.remarks = new_profile.remarks;
@@ -1311,20 +1427,24 @@ impl AppState {
             }
         }
     }
+
     pub async fn enter_settings_form(&mut self, section: SettingsSection) {
         let fields = self.build_settings_fields(section).await;
         let mode = match section {
             SettingsSection::Core => SettingsMode::CoreForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Gui => SettingsMode::GuiForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Inbound => SettingsMode::InboundForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Routing => {
                 self.reload_routing_rules().await;
@@ -1333,26 +1453,32 @@ impl AppState {
             SettingsSection::Dns => SettingsMode::DnsForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::SystemProxy => SettingsMode::SystemProxyForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Tun => SettingsMode::TunForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Mux => SettingsMode::MuxForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Stats => SettingsMode::StatsForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::ProtocolCore => SettingsMode::ProtocolCoreForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Updates => {
                 let status_xray = self
@@ -1373,10 +1499,12 @@ impl AppState {
             SettingsSection::SpeedTest => SettingsMode::SpeedTestForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
             SettingsSection::Logging => SettingsMode::LoggingForm {
                 fields,
                 focus_index: 0,
+                form_errors: HashMap::new(),
             },
         };
         self.mode = AppMode::Settings { mode };
@@ -1522,6 +1650,7 @@ impl AppState {
                     protocol: Some(protocol),
                     fields,
                     focus_index: 0,
+                    form_errors: HashMap::new(),
                 };
                 self.add_log("info", "URL imported successfully", "tui");
             }

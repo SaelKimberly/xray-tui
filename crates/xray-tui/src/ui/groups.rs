@@ -280,6 +280,13 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     }
                     state.mode = AppMode::ManageGroups { selected: sel };
                 }
+                KeyCode::Home => {
+                    state.mode = AppMode::ManageGroups { selected: 0 };
+                }
+                KeyCode::End => {
+                    let last = state.groups.len().saturating_sub(1);
+                    state.mode = AppMode::ManageGroups { selected: last };
+                }
                 KeyCode::Char('e' | 'E') => {
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
                     sorted.sort_by_key(|g| {
@@ -363,7 +370,6 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     state.update_all_subscriptions();
                 }
                 KeyCode::Enter => {
-                    // Build sorted list matching render order
                     let mut sorted: Vec<&Group> = state.groups.iter().collect();
                     sorted.sort_by_key(|g| {
                         (

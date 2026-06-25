@@ -23,7 +23,7 @@ impl Theme {
         .fg(Color::White)
         .bg(Color::Rgb(50, 60, 90))
         .add_modifier(Modifier::BOLD);
-    pub const TABLE_ROW_ALT: Style = Style::new().fg(Color::White).bg(Color::Rgb(25, 25, 35));
+    pub const TABLE_ROW_ALT: Style = Style::new().fg(Color::White).bg(Color::Rgb(35, 35, 50));
     pub const TABLE_ROW_NORMAL: Style = Style::new().fg(Color::White);
     pub const TABLE_ROW_CONNECTED: Style = Style::new()
         .fg(Color::White)

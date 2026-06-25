@@ -38,6 +38,23 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         frame.render_widget(gauge, chunks[1]);
     }
 
+    // Empty state guidance
+    if rows.is_empty() {
+        let msg = if state.filtered_len() == 0 && state.profiles.is_empty() {
+            " No profiles — press 'a' to add one "
+        } else if state.filtered_len() == 0 {
+            " No profiles match the current filter "
+        } else {
+            unreachable!()
+        };
+        let paragraph = Paragraph::new(msg)
+            .style(Theme::HINT)
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(paragraph, chunks[2]);
+        render_footer(frame, chunks[3], state);
+        return;
+    }
+
     // Window: only build Row widgets for rows within the visible area
     let inner_height = chunks[2].height.saturating_sub(3) as usize;
     let total = rows.len();
@@ -112,7 +129,7 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
     let group_span = Span::styled(group_text, Theme::CONTAINER_TITLE);
 
     let search_text = if state.search_focused {
-        format!("/ {}_", state.search_query)
+        format!("/ {}▉", state.search_query)
     } else if state.search_query.is_empty() {
         " /  (press / to search)".to_string()
     } else {

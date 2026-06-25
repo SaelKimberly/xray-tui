@@ -90,7 +90,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
-**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Turso-backed log storage** (LogStorageWorker, LogRepository, logs table, TTL, Settings→Logging form). Phase 8 (Polish & Release) planned. Phase 9 (v2rayN Parity) captures remaining feature gaps.
+**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Turso-backed log storage** (LogStorageWorker, LogRepository, logs table, TTL, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. Phase 9 (v2rayN Parity) captures remaining feature gaps.
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`

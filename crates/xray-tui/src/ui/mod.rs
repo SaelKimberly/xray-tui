@@ -8,13 +8,14 @@ pub mod statistics;
 pub mod status_bar;
 pub mod theme;
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
@@ -25,20 +26,38 @@ use std::time::Duration;
 use xray_tui_config::subscription::subscription_url_split;
 
 pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
-    let overlay_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Red)
-        .add_modifier(Modifier::BOLD);
-    let overlay_para = Paragraph::new(text.to_string()).style(overlay_style);
-    let overlay_area = Rect::new(
-        area.width
-            .saturating_sub(text.len() as u16 + 4)
-            .min(area.width),
-        area.height.saturating_sub(2),
-        text.len() as u16 + 4,
-        1,
-    );
-    frame.render_widget(overlay_para, overlay_area);
+    use unicode_width::UnicodeWidthStr;
+    let width = text.width() + 4;
+    let popup_width = width as u16;
+    let popup_height = 3u16; // border(1) + text(1) + border(1)
+
+    // Return early if terminal too narrow for the popup
+    if area.width < popup_width {
+        return;
+    }
+
+    let h_pad = area.width.saturating_sub(popup_width) / 2;
+    let v_pad = area.height.saturating_sub(popup_height + 2);
+
+    let overlay_area = Rect::new(h_pad, v_pad, popup_width.min(area.width), popup_height);
+
+    let block = Block::default()
+        .title(" Confirm ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .style(Style::new().bg(Color::Rgb(40, 20, 20)));
+    let paragraph = Paragraph::new(text.to_string())
+        .style(
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Rgb(40, 20, 20))
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center);
+    let inner = block.inner(overlay_area);
+    frame.render_widget(block, overlay_area);
+    frame.render_widget(paragraph, inner);
 }
 // ── Entry point ───────────────────────────────────────────────────────
 
@@ -117,6 +136,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id).await,
                 Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
                 Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
+                Some(ConfirmAction::Quit) => state.should_quit = true,
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -200,6 +220,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.search_focused = false;
                 state.search_query.clear();
                 state.filter_cache_valid.set(false);
+                let _ = execute!(std::io::stdout(), SetCursorStyle::DefaultUserShape);
             }
             _ => {}
         }
@@ -283,7 +304,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.mode = crate::AppMode::Help;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.should_quit = true;
+                if state.connected_core.is_some() && state.confirmation.is_none() {
+                    state.confirmation = Some(ConfirmAction::Quit);
+                } else {
+                    state.should_quit = true;
+                }
             }
             _ => {}
         }
@@ -304,7 +329,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.mode = crate::AppMode::Help;
         }
         KeyCode::Char('q' | 'Q') => {
-            state.should_quit = true;
+            if state.connected_core.is_some() && state.confirmation.is_none() {
+                state.confirmation = Some(ConfirmAction::Quit);
+            } else {
+                state.should_quit = true;
+            }
         }
         KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL) && state.connected_core.is_some() =>
@@ -313,7 +342,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
 
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.should_quit = true;
+            if state.connected_core.is_some() && state.confirmation.is_none() {
+                state.confirmation = Some(ConfirmAction::Quit);
+            } else {
+                state.should_quit = true;
+            }
         }
         KeyCode::Tab => {
             let idx = Tab::ALL
@@ -348,36 +381,36 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::End if state.current_tab == Tab::Profiles => {
             state.selected_index = state.filtered_len().saturating_sub(1);
         }
-        // Logs tab scrolling
+        KeyCode::PageUp if state.current_tab == Tab::Profiles => {
+            let page = state.term_height.get().saturating_sub(5) as usize;
+            state.selected_index = state.selected_index.saturating_sub(page);
+        }
+        KeyCode::PageDown if state.current_tab == Tab::Profiles => {
+            let page = state.term_height.get().saturating_sub(5) as usize;
+            let max = state.filtered_len().saturating_sub(1);
+            state.selected_index = (state.selected_index + page).min(max);
+        }
+        // Logs tab scrolling — inverted: Up→newer, Down→older
         KeyCode::Up if state.current_tab == Tab::Logs => {
-            let max_scroll = state.log_buffer.len().saturating_sub(1);
-            if state.log_scroll < max_scroll {
+            state.log_scroll = state.log_scroll.saturating_sub(1);
+        }
+        KeyCode::Down if state.current_tab == Tab::Logs => {
+            let max = state.log_buffer.len().saturating_sub(1);
+            if state.log_scroll < max {
                 state.log_scroll += 1;
             }
         }
-        KeyCode::Down if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_scroll.saturating_sub(1);
-        }
         KeyCode::PageUp if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_scroll.saturating_add(20);
+            state.log_scroll = state.log_scroll.saturating_sub(20);
         }
         KeyCode::PageDown if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_scroll.saturating_sub(20);
+            state.log_scroll = state.log_scroll.saturating_add(20);
         }
         KeyCode::Home if state.current_tab == Tab::Logs => {
             state.log_scroll = state.log_buffer.len().saturating_sub(1);
         }
         KeyCode::End if state.current_tab == Tab::Logs => {
             state.log_scroll = 0;
-        }
-        KeyCode::Char('c') if state.current_tab == Tab::Logs => {
-            state.logs_show_core = !state.logs_show_core;
-        }
-        KeyCode::Char('t') if state.current_tab == Tab::Logs => {
-            state.logs_show_tui = !state.logs_show_tui;
-        }
-        KeyCode::Char('v') if state.current_tab == Tab::Logs => {
-            state.logs_show_validation = !state.logs_show_validation;
         }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -421,10 +454,32 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.toggle_multi_select(&id);
             }
         }
+        // Ctrl+A: select all filtered profiles
+        KeyCode::Char('a')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
+            let ids: Vec<String> = state
+                .filtered_profiles()
+                .map(|r| r.profile.id.clone())
+                .collect();
+            for id in ids {
+                state.multi_select.insert(id);
+            }
+        }
+        // Ctrl+Shift+A: deselect all
+        KeyCode::Char('A')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT)
+                && state.current_tab == Tab::Profiles =>
+        {
+            state.multi_select.clear();
+        }
         KeyCode::Char('/') if state.current_tab == Tab::Profiles => {
             state.search_focused = true;
             state.search_query.clear();
             state.filter_cache_valid.set(false);
+            let _ = execute!(std::io::stdout(), SetCursorStyle::BlinkingBlock);
         }
         // Speed test menu
         KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
@@ -558,7 +613,11 @@ fn render(frame: &mut Frame, state: &AppState) {
 
     let is_small = frame.area().height < SMALL_THRESH;
     let overlay = !state.actions_compact && is_small;
-    let ph = if overlay {
+    let ph = if state.current_tab != Tab::Profiles
+        && !matches!(state.mode, AppMode::SpeedTestMenu { .. } | AppMode::Help)
+    {
+        0 // actions panel only useful on Profiles tab
+    } else if overlay {
         0
     } else if state.actions_compact {
         1
@@ -838,7 +897,7 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(popup_area)[1];
 
     let block = Block::default()
-        .title(" Speed Test ")
+        .title(" Server Tools ")
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .style(Style::default().bg(Color::Rgb(30, 30, 40)));
@@ -849,6 +908,22 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, popup_area);
 }
 fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
+    // Split area into [indicator(3) | tabs]
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    // Connection indicator
+    let indicator = if state.connecting {
+        Span::styled(" ⟳", crate::ui::theme::Theme::SPINNER)
+    } else if state.connected_core.is_some() {
+        Span::styled(" ●", crate::ui::theme::Theme::SUCCESS)
+    } else {
+        Span::styled(" ○", crate::ui::theme::Theme::HINT)
+    };
+    let indicator_para = Paragraph::new(Line::from(indicator));
+    frame.render_widget(indicator_para, chunks[0]);
+
     let titles: Vec<Line> = Tab::ALL
         .iter()
         .map(|tab| {
@@ -871,7 +946,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
         )
         .highlight_style(crate::ui::theme::Theme::TAB_SELECTED)
         .divider(Span::raw(""));
-    frame.render_widget(tabs, area);
+    frame.render_widget(tabs, chunks[1]);
 }
 
 pub fn render_placeholder_screen(frame: &mut Frame, area: Rect, name: &str) {
