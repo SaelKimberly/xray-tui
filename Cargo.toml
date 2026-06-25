@@ -23,24 +23,24 @@ too_many_lines = "allow"
 
 [workspace.dependencies]
 # ============ Async Runtime & I/O ============
-tokio = { version = "*" }
-futures-util = { version = "*", default-features = false, features = ["std"] }
+tokio = { version = "1.52" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # ============ Serialization ============
-serde = { version = "*", features = ["derive"] }
-serde_json = { version = "*" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
 
 # ============ Error Handling ============
 thiserror = { version = "^2.0.18" }
 
 # ============ Networking ============
-reqwest = { version = "^0.12.28", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "^0.13.4", default-features = false, features = ["rustls"] }
 
 # ============ Config & Filesystem ============
 dirs = { version = "^6.0.0" }
 
 # ============ Text / Search / Hash ============
-uuid = { version = "^1.23.3", features = ["v4"] }
+uuid = { version = "^1.23.4", features = ["v4"] }
 
 # ============ Logging ============
-tracing = { version = "*" }
+tracing = { version = "0.1" }

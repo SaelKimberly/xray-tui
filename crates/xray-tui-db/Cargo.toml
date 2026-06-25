@@ -15,7 +15,7 @@ thiserror.workspace = true
 
 # ============ Text / Search / Hash ============
 uuid.workspace = true
-rapidhash = "4"
+rapidhash = "4.4"
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true

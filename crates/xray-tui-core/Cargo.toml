@@ -24,14 +24,15 @@ tokio.features = ["process", "signal", "sync", "fs", "time", "io-util", "rt", "r
 futures-util.workspace = true
 
 # ============ Protocol ============
-tonic = "0.12"
-prost = "0.13"
-semver = { version = "1", features = ["std"] }
+tonic = "0.14"
+prost = "0.14"
+semver = { version = "1.0", features = ["std"] }
 async-trait = "0.1"
+tonic-prost = "0.14"
 
 # ============ Build & Archiving ============
-zip = "2"
-flate2 = "1"
+zip = "8.6"
+flate2 = "1.1"
 tar = "0.4"
 
 # ============ Internal ============
@@ -41,7 +42,7 @@ xray-tui-db = { path = "../xray-tui-db" }
 tracing.workspace = true
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [lints]
 workspace = true
