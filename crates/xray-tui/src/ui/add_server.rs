@@ -229,11 +229,11 @@ fn render_form(
 
     for (i, ff) in form_fields.iter().enumerate() {
         let is_focused = i == focus_index;
-        let val = fields.get(i).map(|(_, v)| v.as_str()).unwrap_or("");
+        let val = fields.get(i).map_or("", |(_, v)| v.as_str());
         let display_val = match ff.field_type {
             FormFieldType::Password => {
                 if val.is_empty() {
-                    "".into()
+                    String::new()
                 } else {
                     "••••••".into()
                 }
@@ -246,7 +246,7 @@ fn render_form(
                 }
             }
             FormFieldType::Select(_) => {
-                format!("< {} >", val)
+                format!("< {val} >")
             }
             _ => {
                 if val.is_empty() {
@@ -259,7 +259,7 @@ fn render_form(
 
         let req_mark = if ff.required { "*" } else { " " };
         let label_text = format!("{}{}: ", req_mark, ff.label);
-        let value_text = format!("[{}]", display_val);
+        let value_text = format!("[{display_val}]");
         let section_hint = match ff.section {
             FieldSection::Common => "",
             FieldSection::StreamSetting => " [stream]",

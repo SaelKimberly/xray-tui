@@ -1,4 +1,4 @@
-//! gRPC client for the StatsService API shared by xray-core and sing-box.
+//! gRPC client for the `StatsService` API shared by xray-core and sing-box.
 //!
 //! Both backends expose a `v2ray.core.app.stats.command.StatsService` gRPC API on
 //! `127.0.0.1:62789`. This module provides a unified [`StatsProvider`] trait with
@@ -42,7 +42,7 @@ pub struct SysStats {
 // ── StatsProvider trait ─────────────────────────────────────────────
 
 /// Unified interface for querying traffic and system stats from either
-/// xray-core or sing-box via their shared V2Ray Stats gRPC API.
+/// xray-core or sing-box via their shared `V2Ray` Stats gRPC API.
 #[async_trait]
 pub trait StatsProvider: Send + Sync {
     /// Query traffic stats matching the given pattern.
@@ -58,7 +58,7 @@ pub trait StatsProvider: Send + Sync {
 
 // ── XrayGrpcClient ──────────────────────────────────────────────────
 
-/// gRPC client for xray-core's StatsService.
+/// gRPC client for xray-core's `StatsService`.
 pub struct XrayGrpcClient {
     channel: tonic::transport::Channel,
 }
@@ -110,7 +110,7 @@ impl StatsProvider for XrayGrpcClient {
 
 // ── SingBoxGrpcClient ───────────────────────────────────────────────
 
-/// gRPC client for sing-box's V2Ray API StatsService.
+/// gRPC client for sing-box's `V2Ray` API `StatsService`.
 pub struct SingBoxGrpcClient {
     channel: tonic::transport::Channel,
 }
@@ -180,19 +180,21 @@ pub async fn create_stats_provider(
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Format bytes to human-readable string (B/KB/MB/GB/TB/PB).
+#[must_use]
 pub fn format_bytes(bytes: i64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut b = bytes as f64;
     for unit in UNITS {
         if b < 1024.0 {
-            return format!("{:.1} {}", b, unit);
+            return format!("{b:.1} {unit}");
         }
         b /= 1024.0;
     }
-    format!("{:.1} PB", b)
+    format!("{b:.1} PB")
 }
 
 /// Format uptime seconds to human-readable string.
+#[must_use]
 pub fn format_uptime(secs: u32) -> String {
     let hours = secs / 3600;
     let minutes = (secs % 3600) / 60;

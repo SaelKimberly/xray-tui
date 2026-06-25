@@ -51,7 +51,7 @@ pub async fn tcp_ping(
     }
 }
 
-/// Create a reqwest::Client with SOCKS5 proxy configured.
+/// Create a `reqwest::Client` with SOCKS5 proxy configured.
 fn create_socks5_client(
     proxy: &str,
     port: u16,
@@ -68,6 +68,7 @@ fn create_socks5_client(
 }
 
 /// Real ping: send HTTP GET requests through SOCKS5 proxy to `url`, measure fastest response time.
+///
 /// Uses `socks5://` (NOT `socks5h://`) — the proxy resolves DNS locally.
 /// Up to `retries` requests are sent; the fastest 2xx response wins.
 /// On success, optionally fetches IP info from `ip_api_url` through the same proxy.

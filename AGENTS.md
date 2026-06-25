@@ -163,7 +163,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 ## Style Guide
 
 - Rust 2024 edition
-- Follow clippy with default settings
+- Follow clippy with workspace-level lints (`pedantic` + `nursery` at `warn`, config in root `Cargo.toml` under `[workspace.lints.clippy]`, per-crate opt-in via `[lints] workspace = true`)
 - Format with `rustfmt` (use `cargo fmt`)
 - Tests go next to code in same file (unit) or `tests/` (integration)
 - Use `thiserror` for error types

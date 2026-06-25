@@ -35,10 +35,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     // ── Traffic section ────────────────────────────────────────────
     let mut traffic_lines: Vec<Line> = Vec::new();
     if let Some(ref stats) = profile.stats {
-        let today_up = stats.today_up.unwrap_or(0) as i64;
-        let today_down = stats.today_down.unwrap_or(0) as i64;
-        let total_up = stats.total_up.unwrap_or(0) as i64;
-        let total_down = stats.total_down.unwrap_or(0) as i64;
+        let today_up = i64::from(stats.today_up.unwrap_or(0));
+        let today_down = i64::from(stats.today_down.unwrap_or(0));
+        let total_up = i64::from(stats.total_up.unwrap_or(0));
+        let total_down = i64::from(stats.total_down.unwrap_or(0));
 
         traffic_lines.push(Line::from(vec![
             Span::raw("  Today:  "),

@@ -25,7 +25,7 @@ pub struct Profile {
 }
 
 /// Deduplicated core profile data — one row per unique server config.
-/// Keyed by sub_uid hash. Referenced by group_profiles table.
+/// Keyed by `sub_uid` hash. Referenced by `group_profiles` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileCore {
     pub sub_uid: i64,
@@ -57,6 +57,7 @@ pub struct GroupProfile {
 }
 
 impl Profile {
+    #[must_use]
     pub fn compute_sub_uid(&self) -> u64 {
         let mut h = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
         h.write(&self.config_type.to_le_bytes());

@@ -227,8 +227,7 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
         let value = fields
             .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         let is_focused = i == focus_index;
 
         let label_style = if is_focused {
@@ -244,8 +243,8 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
             Style::default().fg(Color::White)
         };
 
-        let label = format!(" {:<width$}", key, width = max_label_len);
-        let display = format!("{} ", value);
+        let label = format!(" {key:<max_label_len$}");
+        let display = format!("{value} ");
         let line = Line::from(vec![
             Span::styled(label, label_style),
             Span::styled(display, value_style),
@@ -295,10 +294,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                             g.name.as_deref().unwrap_or(""),
                         )
                     });
-                    let is_system = sorted
-                        .get(sel)
-                        .map(|g| g.is_system == Some(1))
-                        .unwrap_or(false);
+                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -317,10 +313,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                             g.name.as_deref().unwrap_or(""),
                         )
                     });
-                    let is_system = sorted
-                        .get(sel)
-                        .map(|g| g.is_system == Some(1))
-                        .unwrap_or(false);
+                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -336,10 +329,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                             g.name.as_deref().unwrap_or(""),
                         )
                     });
-                    let is_system = sorted
-                        .get(sel)
-                        .map(|g| g.is_system == Some(1))
-                        .unwrap_or(false);
+                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {
@@ -355,10 +345,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                             g.name.as_deref().unwrap_or(""),
                         )
                     });
-                    let is_system = sorted
-                        .get(sel)
-                        .map(|g| g.is_system == Some(1))
-                        .unwrap_or(false);
+                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
                     if !is_system {
                         let gid = sorted.get(sel).map(|g| g.id.clone());
                         if let Some(id) = gid {

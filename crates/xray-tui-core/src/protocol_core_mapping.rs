@@ -5,6 +5,7 @@ use crate::protocol::{Protocol, SINGBOX_ONLY_PROTOCOLS};
 ///
 /// - `Some(CoreType::Auto)` or `None` → auto-detect from protocol
 /// - `Some(core_type)` → forced override (user chose explicitly)
+#[must_use]
 pub fn resolve_core(protocol: Protocol, profile_override: Option<CoreType>) -> CoreType {
     match profile_override {
         Some(CoreType::Auto) | None => core_for_protocol(protocol),

@@ -24,13 +24,14 @@ pub struct FormField {
 pub enum FieldSection {
     /// Stored directly as Profile fields (remarks, address, port, etc.)
     Common,
-    /// Serialized to Profile.stream_settings JSON blob
+    /// Serialized to `Profile.stream_settings` JSON blob
     StreamSetting,
-    /// Serialized to Profile.protocol_settings JSON blob
+    /// Serialized to `Profile.protocol_settings` JSON blob
     ProtocolSetting,
 }
 
 /// Returns the form fields for a given protocol.
+#[must_use]
 pub fn form_fields_for(protocol: Protocol) -> Vec<FormField> {
     let mut fields = common_fields();
     fields.extend(protocol_specific_fields(protocol));
@@ -959,7 +960,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
     }
 }
 
-fn field(
+const fn field(
     key: &'static str,
     label: &'static str,
     field_type: FormFieldType,
@@ -978,7 +979,8 @@ fn field(
 }
 
 /// URL scheme prefix for each protocol's share link.
-pub fn url_scheme_for(protocol: Protocol) -> &'static str {
+#[must_use]
+pub const fn url_scheme_for(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Vmess => "vmess://",
         Protocol::Vless => "vless://",

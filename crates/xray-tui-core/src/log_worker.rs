@@ -14,7 +14,7 @@ pub struct QueryParams {
     pub offset: i64,
 }
 
-/// Messages sent to the LogStorageWorker.
+/// Messages sent to the `LogStorageWorker`.
 pub enum LogWorkerMessage {
     /// Persist a log entry (batched before DB write).
     Entry(LogEntry),
@@ -29,7 +29,7 @@ pub enum LogWorkerMessage {
 ///
 /// Architecture:
 /// - Receives `LogWorkerMessage` entries via an unbounded mpsc channel.
-/// - Batches entries and flushes to the DB every 100ms or when batch_size is reached.
+/// - Batches entries and flushes to the DB every 100ms or when `batch_size` is reached.
 /// - Serves filtered queries by merging the pending (not-yet-flushed) batch
 ///   with DB results, making it the unified source of truth for log queries.
 pub struct LogStorageWorker {
@@ -43,7 +43,7 @@ pub struct LogStorageWorker {
     consecutive_failures: u32,
 }
 impl LogStorageWorker {
-    pub fn new(
+    pub const fn new(
         rx: mpsc::Receiver<LogWorkerMessage>,
         log_conn: DbConnection,
         batch_size: usize,

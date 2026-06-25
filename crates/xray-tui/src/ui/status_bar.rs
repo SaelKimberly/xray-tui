@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         (format!(" Error: {err}"), Theme::ERROR)
     } else {
         match &state.connected_core {
-            Some(core) => (format!(" Connected [{}]", core), Theme::SUCCESS),
+            Some(core) => (format!(" Connected [{core}]"), Theme::SUCCESS),
             None => (" Disconnected".to_string(), Theme::ERROR),
         }
     };
@@ -104,7 +104,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let padding = width.saturating_sub(left_len + right_text.len());
 
     let mut spans = vec![
-        Span::styled(left_text.clone(), left_style),
+        Span::styled(left_text, left_style),
         Span::raw(" ".repeat(padding)),
         Span::styled(right_text, right_style),
     ];
@@ -123,7 +123,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 /// Build context-sensitive keyboard hints for the right side of the status bar.
-fn build_hints(state: &AppState) -> &'static str {
+const fn build_hints(state: &AppState) -> &'static str {
     if matches!(&state.mode, crate::AppMode::Help) {
         return " [Esc] Close help ";
     }

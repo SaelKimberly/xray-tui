@@ -7,7 +7,8 @@ pub struct CoreBinInfo {
     pub args_template: &'static str,
 }
 
-pub fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo> {
+#[must_use]
+pub const fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo> {
     match core_type {
         CoreType::Xray => Some(CoreBinInfo {
             exe_names: &["xray"],
@@ -22,6 +23,7 @@ pub fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo> {
 }
 
 /// Find a core binary by checking the managed directory first, then PATH.
+#[must_use]
 pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf> {
     let info = get_core_info(core_type)?;
 
@@ -122,7 +124,7 @@ pub fn extract_archive(
     match ext {
         "zip" => extract_zip(archive, target_dir)?,
         "gz" | "tgz" if stem.ends_with(".tar") || ext == "tgz" => {
-            extract_tar_gz(archive, target_dir)?
+            extract_tar_gz(archive, target_dir)?;
         }
         _ => {
             return Err(BinError::ExtractionFailed(format!(
@@ -181,14 +183,14 @@ fn extract_tar_gz(archive: &Path, target_dir: &Path) -> Result<(), BinError> {
 /// (e.g., `sing-box-X.Y.Z-linux-amd64/sing-box`).
 pub(crate) fn flatten_single_top_dir(dir: &Path) {
     let entries: Vec<_> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Ok(rd) => rd.filter_map(std::result::Result::ok).collect(),
         Err(_) => return,
     };
 
     let mut subdirs = Vec::new();
     let mut have_file = false;
     for entry in &entries {
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
             subdirs.push(entry.path());
         } else {
             have_file = true;
@@ -209,9 +211,9 @@ pub(crate) fn flatten_single_top_dir(dir: &Path) {
             if let Err(e) = std::fs::rename(&src, &dst)
                 && e.kind() == std::io::ErrorKind::CrossesDevices
             {
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
                 if is_dir {
-                    let _ = copy_dir_contents(&src, &dst).map(|_| {
+                    let _ = copy_dir_contents(&src, &dst).map(|()| {
                         let _ = std::fs::remove_dir_all(&src);
                     });
                 } else if std::fs::copy(&src, &dst).is_ok() {

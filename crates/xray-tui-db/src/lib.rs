@@ -4,7 +4,7 @@ pub mod schema;
 
 pub use log_repo::LogRepository;
 pub use models::LogEntry;
-/// Re-export for consumer crates (log_worker) that need the connection type
+/// Re-export for consumer crates (`log_worker`) that need the connection type
 /// without depending on `turso` directly.
 pub use turso::Connection as DbConnection;
 
@@ -85,7 +85,7 @@ enum SubscriptionCol {
     ErrorMessage,
 }
 
-/// Column indices for profile_extensions table (SELECT * order).
+/// Column indices for `profile_extensions` table (SELECT * order).
 #[repr(usize)]
 enum ProfileExtCol {
     ProfileId = 0,
@@ -95,7 +95,7 @@ enum ProfileExtCol {
     IpInfo,
 }
 
-/// Column indices for server_stats table (SELECT * order).
+/// Column indices for `server_stats` table (SELECT * order).
 #[repr(usize)]
 enum ServerStatCol {
     ProfileId = 0,
@@ -106,7 +106,7 @@ enum ServerStatCol {
     LastUpdated,
 }
 
-/// Column indices for routing_rules table (SELECT * order).
+/// Column indices for `routing_rules` table (SELECT * order).
 #[repr(usize)]
 enum RoutingRuleCol {
     Id = 0,
@@ -128,7 +128,7 @@ enum RoutingRuleCol {
     SortOrder,
 }
 
-/// Column indices for dns_settings table (SELECT * order).
+/// Column indices for `dns_settings` table (SELECT * order).
 #[repr(usize)]
 enum DnsSettingCol {
     Id = 0,
@@ -357,7 +357,7 @@ impl Database {
     }
 
     /// Get a reference to the underlying database connection.
-    pub fn connection(&self) -> &turso::Connection {
+    pub const fn connection(&self) -> &turso::Connection {
         &self.conn
     }
 
@@ -397,7 +397,7 @@ impl Database {
     }
 
     /// One-time backfill: normalize all existing profile remarks.
-    /// Uses user_version pragma to run exactly once.
+    /// Uses `user_version` pragma to run exactly once.
     pub async fn normalize_all_remarks(&self) -> Result<()> {
         // Query user_version via PRAGMA
         let mut stmt = self.conn.prepare_cached("PRAGMA user_version").await?;
@@ -469,7 +469,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 #[inline]
-fn hex_val(b: u8) -> Option<u8> {
+const fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -1233,7 +1233,7 @@ impl Database {
             .conn
             .execute(
                 "DELETE FROM group_profiles WHERE group_id = ?1 AND updated_at < datetime('now', ?2)",
-                turso::params![graveyard_id, format!("-{} hours", ttl_hours).as_str()],
+                turso::params![graveyard_id, format!("-{ttl_hours} hours").as_str()],
             )
             .await
             .map_err(DatabaseError::Turso)? as usize;

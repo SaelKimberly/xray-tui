@@ -33,7 +33,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::Profiles, Tab::Settings, Tab::Logs, Tab::Statistics];
+    pub const ALL: &[Self] = &[Self::Profiles, Self::Settings, Self::Logs, Self::Statistics];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +237,7 @@ pub enum CoreEvent {
     Connected(CoreType),
     Disconnected,
     Error(String),
-    /// Non-fatal stats error — keeps connected_core intact
+    /// Non-fatal stats error — keeps `connected_core` intact
     StatsError(String),
     StatsUpdate {
         profile_id: String,
@@ -289,7 +289,7 @@ pub enum CoreEvent {
         error: Option<String>,
     },
     /// Update the displayed test type for a profile without triggering cleanup.
-    /// Used by batch_then_real_ping to switch from TcpPing→RealPing emoji
+    /// Used by `batch_then_real_ping` to switch from TcpPing→RealPing emoji
     /// after TCP completes but before real ping starts.
     TestTypeUpdate {
         profile_id: String,
@@ -560,13 +560,11 @@ impl AppState {
                     let ta = a_row
                         .stats
                         .as_ref()
-                        .map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0))
-                        .unwrap_or(0);
+                        .map_or(0, |s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0));
                     let tb = b_row
                         .stats
                         .as_ref()
-                        .map(|s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0))
-                        .unwrap_or(0);
+                        .map_or(0, |s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0));
                     ta.cmp(&tb)
                 }
                 SortColumn::Core => {
@@ -611,8 +609,7 @@ impl AppState {
         let skip_graveyard = |idx: usize| -> bool {
             self.groups
                 .get(idx)
-                .map(|g| g.id == *GRAVEYARD_GROUP_ID)
-                .unwrap_or(false)
+                .is_some_and(|g| g.id == *GRAVEYARD_GROUP_ID)
         };
         let new_idx = if let Some(idx) = current_idx {
             let mut next = (idx as isize + dir as isize).rem_euclid(len as isize) as usize;
@@ -690,9 +687,9 @@ impl AppState {
     }
 
     /// Resolve which core a profile row should use, considering (in order):
-    /// 1. Per-profile override (row.profile.core_type)
-    /// 2. Per-protocol config override (config.core.protocol_core_overrides)
-    /// 3. Hardcoded auto-detection (core_for_protocol via resolve_core)
+    /// 1. Per-profile override (`row.profile.core_type`)
+    /// 2. Per-protocol config override (`config.core.protocol_core_overrides`)
+    /// 3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
     pub fn resolved_core(&self, row: &ProfileRow) -> CoreType {
         let protocol = Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
         let profile_override = row.profile.core_type.parse::<CoreType>().ok();
@@ -777,7 +774,7 @@ impl AppState {
             }
             match key.as_str() {
                 "remarks" => {
-                    profile.remarks = Some(xray_tui_config::import_export::normalize_remark(value))
+                    profile.remarks = Some(xray_tui_config::import_export::normalize_remark(value));
                 }
                 "address" => profile.address = Some(value.clone()),
                 "port" => profile.port = value.parse::<i32>().ok(),
@@ -834,17 +831,17 @@ impl AppState {
     }
 
     pub async fn confirm_add_server(&mut self) {
-        let (protocol, fields, _form_errors) = match &self.mode {
-            AppMode::AddServer {
-                protocol: Some(p),
-                fields,
-                form_errors,
-                ..
-            } => (*p, fields.clone(), form_errors.clone()),
-            _ => {
-                self.log_trace("error", "tui", "Cannot confirm: no protocol selected");
-                return;
-            }
+        let (protocol, fields, _form_errors) = if let AppMode::AddServer {
+            protocol: Some(p),
+            fields,
+            form_errors,
+            ..
+        } = &self.mode
+        {
+            (*p, fields.clone(), form_errors.clone())
+        } else {
+            self.log_trace("error", "tui", "Cannot confirm: no protocol selected");
+            return;
         };
 
         // Validate fields
@@ -852,18 +849,15 @@ impl AppState {
         let address = fields
             .iter()
             .find(|(k, _)| k == "address")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         let port = fields
             .iter()
             .find(|(k, _)| k == "port")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         let user_id = fields
             .iter()
             .find(|(k, _)| k == "user_id")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
 
         if address.is_empty() {
             errors.insert("address".into(), "Address is required".into());
@@ -929,18 +923,15 @@ impl AppState {
         let address = fields
             .iter()
             .find(|(k, _)| k == "address")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         let port = fields
             .iter()
             .find(|(k, _)| k == "port")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
         let user_id = fields
             .iter()
             .find(|(k, _)| k == "user_id")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, v)| v.as_str());
 
         if address.is_empty() {
             errors.insert("address".into(), "Address is required".into());
@@ -955,8 +946,7 @@ impl AppState {
                 .await
                 .ok()
                 .flatten()
-                .map(|p| p.config_type)
-                .unwrap_or(0),
+                .map_or(0, |p| p.config_type),
         )
         .unwrap_or(Protocol::Custom);
         match protocol {
@@ -977,12 +967,11 @@ impl AppState {
             return;
         }
 
-        let mut profile = match self.db.get_profile(&profile_id).await {
-            Ok(Some(p)) => p,
-            _ => {
-                self.add_log("error", "Profile not found for edit", "tui");
-                return;
-            }
+        let mut profile = if let Ok(Some(p)) = self.db.get_profile(&profile_id).await {
+            p
+        } else {
+            self.add_log("error", "Profile not found for edit", "tui");
+            return;
         };
         // Rebuild from form fields
         let new_profile = self.fields_to_profile(protocol, &fields);
@@ -1020,7 +1009,10 @@ impl AppState {
     }
 
     async fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
-        use crate::SettingsSection::*;
+        use crate::SettingsSection::{
+            Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
+            SystemProxy, Tun, Updates,
+        };
         match section {
             Core => {
                 vec![
@@ -1307,13 +1299,15 @@ impl AppState {
     }
 
     fn apply_settings_fields(&mut self, section: SettingsSection, fields: &[(String, String)]) {
-        use crate::SettingsSection::*;
+        use crate::SettingsSection::{
+            Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
+            SystemProxy, Tun, Updates,
+        };
         let get = |key: &str| {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("")
+                .map_or("", |(_, v)| v.as_str())
                 .to_owned()
         };
         let get_opt = |key: &str| {
@@ -1532,8 +1526,7 @@ impl AppState {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("")
+                .map_or("", |(_, v)| v.as_str())
                 .to_owned()
         };
         let get_opt = |key: &str| {
@@ -1578,14 +1571,12 @@ impl AppState {
             .await
             .ok()
             .flatten()
-            .map(|d| d.id)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), |d| d.id);
         let get = |key: &str| {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("")
+                .map_or("", |(_, v)| v.as_str())
                 .to_owned()
         };
         let get_opt = |key: &str| {
@@ -1598,12 +1589,8 @@ impl AppState {
             servers: get_opt("servers"),
             hosts: get_opt("hosts"),
             query_strategy: get_opt("query_strategy"),
-            disable_cache: Some(if get("disable_cache") == "true" { 1 } else { 0 }),
-            disable_fallback: Some(if get("disable_fallback") == "true" {
-                1
-            } else {
-                0
-            }),
+            disable_cache: Some(i32::from(get("disable_cache") == "true")),
+            disable_fallback: Some(i32::from(get("disable_fallback") == "true")),
             client_ip: get_opt("client_ip"),
         };
         match self.db.upsert_dns_settings(&dns).await {
@@ -1790,24 +1777,22 @@ impl AppState {
             return;
         }
 
-        let profile = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
-            Some(r) => r.profile.clone(),
-            None => {
-                self.add_log("error", "Profile not found for connection", "tui");
-                return;
-            }
+        let profile = if let Some(r) = self.profiles.iter().find(|r| r.profile.id == profile_id) {
+            r.profile.clone()
+        } else {
+            self.add_log("error", "Profile not found for connection", "tui");
+            return;
         };
 
-        let protocol = match Protocol::try_from_i32(profile.config_type) {
-            Some(p) => p,
-            None => {
-                self.add_log(
-                    "error",
-                    &format!("Unknown protocol: {}", profile.config_type),
-                    "tui",
-                );
-                return;
-            }
+        let protocol = if let Some(p) = Protocol::try_from_i32(profile.config_type) {
+            p
+        } else {
+            self.add_log(
+                "error",
+                &format!("Unknown protocol: {}", profile.config_type),
+                "tui",
+            );
+            return;
         };
 
         let profile_override = profile.core_type.parse::<CoreType>().ok();
@@ -1825,13 +1810,12 @@ impl AppState {
         self.connected_profile_id = Some(profile_id.to_string());
         self.connection_error = None;
 
-        let tx = match &self.core_event_tx {
-            Some(tx) => tx.clone(),
-            None => {
-                self.connecting = false;
-                self.add_log("error", "Core event channel not initialized", "tui");
-                return;
-            }
+        let tx = if let Some(tx) = &self.core_event_tx {
+            tx.clone()
+        } else {
+            self.connecting = false;
+            self.add_log("error", "Core event channel not initialized", "tui");
+            return;
         };
 
         let params = BuildParams {
@@ -1880,15 +1864,14 @@ impl AppState {
                 };
 
             // 2. Find binary
-            let bin_path = match find_binary(core_type, &bin_dir) {
-                Some(p) => p,
-                None => {
-                    let _ = tx.try_send(CoreEvent::Error(
-                        "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
-                            .to_string(),
-                    ));
-                    return;
-                }
+            let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
+                p
+            } else {
+                let _ = tx.try_send(CoreEvent::Error(
+                    "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
+                        .to_string(),
+                ));
+                return;
             };
 
             // 3. Start core
@@ -1973,7 +1956,7 @@ impl AppState {
                 }
             } else {
                 // === Sing-box Clash API /traffic streaming ===
-                let url = format!("http://127.0.0.1:{}/traffic", CLASH_API_PORT);
+                let url = format!("http://127.0.0.1:{CLASH_API_PORT}/traffic");
 
                 match reqwest::Client::new().get(&url).send().await {
                     Ok(resp) => {
@@ -2045,7 +2028,7 @@ impl AppState {
 
     // ── Speed test methods ────────────────────────────────────────
 
-    /// Start TCP ping on the given profile. Returns immediately; result arrives via CoreEvent.
+    /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
     pub fn start_tcp_ping(&mut self, profile_id: &str) {
         if self.testing_profiles.contains(profile_id) {
             self.add_log("warn", "Test already in progress for this profile", "tui");
@@ -2053,19 +2036,17 @@ impl AppState {
         }
 
         // Find the profile and extract address:port
-        let row = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
-            Some(r) => r,
-            None => {
-                self.add_log("error", "Profile not found for TCP ping", "tui");
-                return;
-            }
+        let row = if let Some(r) = self.profiles.iter().find(|r| r.profile.id == profile_id) {
+            r
+        } else {
+            self.add_log("error", "Profile not found for TCP ping", "tui");
+            return;
         };
-        let addr = match &row.profile.address {
-            Some(a) => a.clone(),
-            None => {
-                self.add_log("error", "Profile has no address", "tui");
-                return;
-            }
+        let addr = if let Some(a) = &row.profile.address {
+            a.clone()
+        } else {
+            self.add_log("error", "Profile has no address", "tui");
+            return;
         };
         let port = match row.profile.port {
             Some(p) if p > 0 && p <= 65535 => p as u16,
@@ -2075,12 +2056,11 @@ impl AppState {
             }
         };
 
-        let tx = match &self.core_event_tx {
-            Some(tx) => tx.clone(),
-            None => {
-                self.add_log("error", "Core event channel not initialized", "tui");
-                return;
-            }
+        let tx = if let Some(tx) = &self.core_event_tx {
+            tx.clone()
+        } else {
+            self.add_log("error", "Core event channel not initialized", "tui");
+            return;
         };
 
         let pid = profile_id.to_string();
@@ -2113,12 +2093,11 @@ impl AppState {
         }
 
         // Find profile row and resolve core
-        let row = match self.profiles.iter().find(|r| r.profile.id == profile_id) {
-            Some(r) => r,
-            None => {
-                self.add_log("error", "Profile not found for real ping", "tui");
-                return;
-            }
+        let row = if let Some(r) = self.profiles.iter().find(|r| r.profile.id == profile_id) {
+            r
+        } else {
+            self.add_log("error", "Profile not found for real ping", "tui");
+            return;
         };
         let profile = row.profile.clone();
         let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
@@ -2209,20 +2188,19 @@ impl AppState {
             };
 
             // 3. Find binary
-            let bin_path = match find_binary(core_type, &bin_dir) {
-                Some(p) => p,
-                None => {
-                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                        profile_id: pid,
-                        test_type: TestType::RealPing,
-                        latency_ms: None,
-                        speed_bps: None,
-                        ip_info: None,
-                        error: Some("Core binary not found".to_string()),
-                    });
-                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                    return;
-                }
+            let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
+                p
+            } else {
+                let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                    profile_id: pid,
+                    test_type: TestType::RealPing,
+                    latency_ms: None,
+                    speed_bps: None,
+                    ip_info: None,
+                    error: Some("Core binary not found".to_string()),
+                });
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                return;
             };
 
             // 4. Start core (discard log lines from temp core)
@@ -2643,26 +2621,20 @@ impl AppState {
                                 .unwrap_or(Protocol::Custom);
                             let resolved_core = resolve_core(protocol, None);
 
-                            let backend_config = match ConfigBuilder::build(
-                                &profile,
-                                resolved_core,
-                                &params,
-                                &[],
-                                &dns,
-                            ) {
-                                Ok(c) => c,
-                                Err(_) => {
-                                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                                    return;
-                                }
+                            let backend_config = if let Ok(c) =
+                                ConfigBuilder::build(&profile, resolved_core, &params, &[], &dns)
+                            {
+                                c
+                            } else {
+                                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                                return;
                             };
 
-                            let bin_path = match find_binary(resolved_core, &bin_dir) {
-                                Some(p) => p,
-                                None => {
-                                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                                    return;
-                                }
+                            let bin_path = if let Some(p) = find_binary(resolved_core, &bin_dir) {
+                                p
+                            } else {
+                                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                                return;
                             };
 
                             let (log_line_tx, _log_rx) = mpsc::channel(512);
@@ -2727,12 +2699,7 @@ impl AppState {
         let to_remove: Vec<String> = self
             .profiles
             .iter()
-            .filter(|r| {
-                r.extension
-                    .as_ref()
-                    .map(|e| e.delay == Some(-1))
-                    .unwrap_or(false)
-            })
+            .filter(|r| r.extension.as_ref().is_some_and(|e| e.delay == Some(-1)))
             .map(|r| r.profile.id.clone())
             .collect();
         let count = to_remove.len();
@@ -2909,32 +2876,29 @@ impl AppState {
                         }
                     };
 
-                    match error {
-                        Some(ref err) => {
-                            self.log_trace(
-                                "warn",
-                                "speedtest",
-                                &format!("{test_type:?} failed for {name}: {err}"),
-                            );
-                        }
-                        None => {
-                            let latency_str =
-                                latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default();
-                            let speed_str =
-                                speed_bps.map(|bps| format!("{bps}bps")).unwrap_or_default();
-                            let detail = if !speed_str.is_empty() {
-                                speed_str
-                            } else if !latency_str.is_empty() {
-                                latency_str
-                            } else {
-                                "success".to_string()
-                            };
-                            self.log_trace(
-                                "info",
-                                "speedtest",
-                                &format!("{test_type:?} {name}: {detail}"),
-                            );
-                        }
+                    if let Some(ref err) = error {
+                        self.log_trace(
+                            "warn",
+                            "speedtest",
+                            &format!("{test_type:?} failed for {name}: {err}"),
+                        );
+                    } else {
+                        let latency_str =
+                            latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default();
+                        let speed_str =
+                            speed_bps.map(|bps| format!("{bps}bps")).unwrap_or_default();
+                        let detail = if !speed_str.is_empty() {
+                            speed_str
+                        } else if !latency_str.is_empty() {
+                            latency_str
+                        } else {
+                            "success".to_string()
+                        };
+                        self.log_trace(
+                            "info",
+                            "speedtest",
+                            &format!("{test_type:?} {name}: {detail}"),
+                        );
                     }
 
                     // Update tracking fields for actions log
@@ -2988,10 +2952,10 @@ impl AppState {
                     if let Some(ref ver) = latest_version {
                         match core_type {
                             CoreType::Xray => {
-                                self.config.updates.xray_latest_known = Some(ver.clone())
+                                self.config.updates.xray_latest_known = Some(ver.clone());
                             }
                             CoreType::SingBox => {
-                                self.config.updates.sing_box_latest_known = Some(ver.clone())
+                                self.config.updates.sing_box_latest_known = Some(ver.clone());
                             }
                             CoreType::Auto => {}
                         }
@@ -3043,7 +3007,7 @@ impl AppState {
                         status.error = error.clone();
                         self.add_log(
                             "error",
-                            &format!("{core_type} update failed: {:?}", error),
+                            &format!("{core_type} update failed: {error:?}"),
                             "tui",
                         );
                     }
@@ -3088,12 +3052,11 @@ impl AppState {
     }
 
     pub fn start_edit_group(&mut self, group_id: &str) {
-        let group = match self.groups.iter().find(|g| g.id == group_id) {
-            Some(g) => g.clone(),
-            None => {
-                self.add_log("error", "Group not found", "tui");
-                return;
-            }
+        let group = if let Some(g) = self.groups.iter().find(|g| g.id == group_id) {
+            g.clone()
+        } else {
+            self.add_log("error", "Group not found", "tui");
+            return;
         };
         let fields = vec![
             ("name".into(), group.name.unwrap_or_default()),
@@ -3169,12 +3132,11 @@ impl AppState {
             } => (group_id.clone(), fields.clone()),
             _ => return,
         };
-        let mut group = match self.groups.iter().find(|g| g.id == group_id) {
-            Some(g) => g.clone(),
-            None => {
-                self.add_log("error", "Group not found", "tui");
-                return;
-            }
+        let mut group = if let Some(g) = self.groups.iter().find(|g| g.id == group_id) {
+            g.clone()
+        } else {
+            self.add_log("error", "Group not found", "tui");
+            return;
         };
         group.name = get_field(&fields, "name");
         group.subscription_url = get_field(&fields, "subscription_url");
@@ -3235,12 +3197,11 @@ impl AppState {
         if self.updating_groups.contains(group_id) {
             return;
         }
-        let group = match self.groups.iter().find(|g| g.id == group_id) {
-            Some(g) => g.clone(),
-            None => {
-                self.add_log("error", "Group not found", "tui");
-                return;
-            }
+        let group = if let Some(g) = self.groups.iter().find(|g| g.id == group_id) {
+            g.clone()
+        } else {
+            self.add_log("error", "Group not found", "tui");
+            return;
         };
         let url = match &group.subscription_url {
             Some(u) if !u.is_empty() => u.clone(),
@@ -3253,39 +3214,33 @@ impl AppState {
         self.updating_groups.insert(group_id.to_string());
         let gid = group_id.to_string();
         let tx = self.core_event_tx.clone();
-        let user_agent = group
-            .user_agent
-            .clone()
-            .unwrap_or_else(|| "xray-tui/0.1".into());
+        let user_agent = group.user_agent.unwrap_or_else(|| "xray-tui/0.1".into());
         let db = self.db.clone();
         let validation: ValidationSettings = self.config.parsing.clone().into();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(120),
+                std::time::Duration::from_mins(2),
                 Self::do_update_subscription(url, user_agent, gid.clone(), db, validation),
             )
             .await;
-            match result {
-                Ok(inner) => {
-                    if let Some(tx) = &tx {
-                        let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
-                            group_id: inner.0,
-                            count: inner.1,
-                            warnings: inner.2,
-                            error: inner.3,
-                        });
-                    }
+            if let Ok(inner) = result {
+                if let Some(tx) = &tx {
+                    let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
+                        group_id: inner.0,
+                        count: inner.1,
+                        warnings: inner.2,
+                        error: inner.3,
+                    });
                 }
-                Err(_) => {
-                    tracing::error!(target: "tui", "Subscription update timed out after 120s");
-                    if let Some(tx) = &tx {
-                        let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
-                            group_id: gid.clone(),
-                            count: 0,
-                            warnings: Vec::new(),
-                            error: Some("Subscription update timed out after 120s".into()),
-                        });
-                    }
+            } else {
+                tracing::error!(target: "tui", "Subscription update timed out after 120s");
+                if let Some(tx) = &tx {
+                    let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
+                        group_id: gid.clone(),
+                        count: 0,
+                        warnings: Vec::new(),
+                        error: Some("Subscription update timed out after 120s".into()),
+                    });
                 }
             }
         });
@@ -3431,8 +3386,7 @@ impl AppState {
         if self
             .update_status
             .get(&core_type)
-            .map(|s| s.downloading)
-            .unwrap_or(false)
+            .is_some_and(|s| s.downloading)
         {
             return;
         }
@@ -3492,7 +3446,7 @@ impl AppState {
             let result =
                 xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
             let (success, error) = match result {
-                Ok(_) => (true, None),
+                Ok(()) => (true, None),
                 Err(e) => (false, Some(e.to_string())),
             };
             // Clean up temp file
@@ -3522,22 +3476,21 @@ impl AppState {
             use std::time::Duration;
             // Check shutdown before first sleep
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {},
-                _ = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
+                () = tokio::time::sleep(Duration::from_secs(10)) => {},
+                () = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
             }
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                let due_groups = match db.get_groups_due_update().await {
-                    Ok(g) => g,
-                    Err(_) => {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(60)) => {},
-                            _ = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
-                        }
-                        continue;
+                let due_groups = if let Ok(g) = db.get_groups_due_update().await {
+                    g
+                } else {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_mins(1)) => {},
+                        () = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
                     }
+                    continue;
                 };
                 for group in &due_groups {
                     if shutdown.load(Ordering::Relaxed) {
@@ -3563,8 +3516,8 @@ impl AppState {
                     });
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
-                    _ = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {},
+                    () = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
                 }
             }
         });
@@ -3647,6 +3600,7 @@ fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
 }
 
 /// Get a value from a form field list, returning None if empty or missing.
+#[must_use]
 pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
     fields
         .iter()
@@ -3696,7 +3650,7 @@ fn format_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
-fn is_leap(year: i64) -> bool {
+const fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 

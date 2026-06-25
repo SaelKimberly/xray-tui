@@ -21,7 +21,7 @@ pub enum ImportError {
 
 pub type Result<T> = std::result::Result<T, ImportError>;
 
-/// VmessQRCode JSON structure used in vmess:// share links.
+/// `VmessQRCode` JSON structure used in vmess:// share links.
 #[derive(Deserialize)]
 struct VmessQRCode {
     #[serde(default)]
@@ -282,7 +282,7 @@ fn parse_vless(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Vless,
         &parsed.host,
-        parsed.port.unwrap_or(0) as i32,
+        i32::from(parsed.port.unwrap_or(0)),
     );
     profile.remarks = parsed.fragment.clone();
     if !parsed.username.is_empty() {
@@ -292,7 +292,7 @@ fn parse_vless(url: &str) -> Result<Profile> {
         match k.as_str() {
             "flow" => {
                 let mut ps = serde_json::Map::new();
-                ps.insert("flow".into(), serde_json::Value::String(v.to_string()));
+                ps.insert("flow".into(), serde_json::Value::String(v.clone()));
                 profile.protocol_settings = Some(serde_json::to_string(&ps)?);
             }
             "security" => {
@@ -307,20 +307,17 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "sni" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("sni".into(), serde_json::Value::String(v.to_string()));
+                ss.insert("sni".into(), serde_json::Value::String(v.clone()));
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "fp" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert(
-                    "fingerprint".into(),
-                    serde_json::Value::String(v.to_string()),
-                );
+                ss.insert("fingerprint".into(), serde_json::Value::String(v.clone()));
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "alpn" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("alpn".into(), serde_json::Value::String(v.to_string()));
+                ss.insert("alpn".into(), serde_json::Value::String(v.clone()));
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "allowInsecure" | "allow_insecure" => {
@@ -333,24 +330,24 @@ fn parse_vless(url: &str) -> Result<Profile> {
             }
             "type" => {
                 if v == "tcp" || v == "ws" || v == "grpc" {
-                    profile.network = Some(v.to_string());
+                    profile.network = Some(v.clone());
                 }
             }
             "path" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("ws.path".into(), serde_json::Value::String(v.to_string()));
+                ss.insert("ws.path".into(), serde_json::Value::String(v.clone()));
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "host" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
-                ss.insert("ws.host".into(), serde_json::Value::String(v.to_string()));
+                ss.insert("ws.host".into(), serde_json::Value::String(v.clone()));
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
             "serviceName" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
                 ss.insert(
                     "grpc.serviceName".into(),
-                    serde_json::Value::String(v.to_string()),
+                    serde_json::Value::String(v.clone()),
                 );
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
@@ -361,7 +358,7 @@ fn parse_vless(url: &str) -> Result<Profile> {
                     .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
-                    obj.insert("publicKey".into(), serde_json::Value::String(v.to_string()));
+                    obj.insert("publicKey".into(), serde_json::Value::String(v.clone()));
                 }
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
@@ -371,7 +368,7 @@ fn parse_vless(url: &str) -> Result<Profile> {
                     .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
-                    obj.insert("shortId".into(), serde_json::Value::String(v.to_string()));
+                    obj.insert("shortId".into(), serde_json::Value::String(v.clone()));
                 }
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
@@ -381,7 +378,7 @@ fn parse_vless(url: &str) -> Result<Profile> {
                     .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
-                    obj.insert("spiderX".into(), serde_json::Value::String(v.to_string()));
+                    obj.insert("spiderX".into(), serde_json::Value::String(v.clone()));
                 }
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
@@ -572,7 +569,7 @@ fn parse_trojan(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Trojan,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
 
@@ -649,7 +646,7 @@ fn parse_socks(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Socks,
         &parsed.host,
-        parsed.port.unwrap_or(1080) as i32,
+        i32::from(parsed.port.unwrap_or(1080)),
     );
     profile.remarks = parsed.fragment.clone();
     if !parsed.username.is_empty() {
@@ -684,7 +681,7 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Hysteria2,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
 
@@ -772,7 +769,7 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Hysteria,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
 
@@ -845,10 +842,10 @@ fn format_hysteria(profile: &Profile) -> Result<String> {
         {
             query.push(("auth".into(), auth.to_string()));
         }
-        if let Some(up) = v.get("up_mbps").and_then(|u| u.as_i64()) {
+        if let Some(up) = v.get("up_mbps").and_then(serde_json::Value::as_i64) {
             query.push(("upmbps".into(), up.to_string()));
         }
-        if let Some(down) = v.get("down_mbps").and_then(|d| d.as_i64()) {
+        if let Some(down) = v.get("down_mbps").and_then(serde_json::Value::as_i64) {
             query.push(("downmbps".into(), down.to_string()));
         }
     }
@@ -880,7 +877,7 @@ fn parse_tuic(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Tuic,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
 
@@ -983,7 +980,7 @@ fn parse_naive(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::Naive,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
     if !parsed.username.is_empty() {
@@ -1035,7 +1032,7 @@ fn parse_anytls(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::AnyTls,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
 
@@ -1119,7 +1116,7 @@ fn parse_shadowtls(url: &str) -> Result<Profile> {
     let mut profile = base_profile(
         Protocol::ShadowTls,
         &parsed.host,
-        parsed.port.unwrap_or(443) as i32,
+        i32::from(parsed.port.unwrap_or(443)),
     );
     profile.remarks = parsed.fragment.clone();
 
@@ -1328,7 +1325,7 @@ fn split_share_url(url: &str) -> Result<UrlComponents> {
     // Handle the case where userinfo was not present (unparsed is still the full body)
     let hostport = if unparsed.contains('@') {
         // Multiple @ signs — take the part after the last @
-        unparsed.split_once('@').map(|(_, r)| r).unwrap_or(unparsed)
+        unparsed.split_once('@').map_or(unparsed, |(_, r)| r)
     } else {
         unparsed
     };
@@ -1402,7 +1399,7 @@ fn parse_hostport(s: &str) -> (String, Option<u16>) {
     if let Some(inner) = s.strip_prefix('[') {
         if let Some((host, port_part)) = inner.split_once("]:") {
             let port = port_part.parse::<u16>().ok();
-            return (format!("[{}]", host), port);
+            return (format!("[{host}]"), port);
         }
         let trimmed = s.trim_end_matches(']');
         return (format!("[{}]", &trimmed[1..]), None);
@@ -1458,7 +1455,7 @@ fn fix_percent_encoding(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn is_hex_char(b: u8) -> bool {
+const fn is_hex_char(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
@@ -1487,6 +1484,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Normalize a remark string: percent-decode, trim, collapse inner whitespace.
+#[must_use]
 pub fn normalize_remark(s: &str) -> String {
     let decoded = percent_decode(s);
     let mut out = String::with_capacity(decoded.len());
@@ -1511,7 +1509,7 @@ pub fn normalize_remark(s: &str) -> String {
 }
 
 #[inline]
-fn hex_val_sub(b: u8) -> Option<u8> {
+const fn hex_val_sub(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'A'..=b'F' => Some(b - b'A' + 10),
@@ -1520,7 +1518,7 @@ fn hex_val_sub(b: u8) -> Option<u8> {
     }
 }
 
-/// Parse query string into `Vec<(String, String)>` — linear scan, no HashMap.
+/// Parse query string into `Vec<(String, String)>` — linear scan, no `HashMap`.
 fn parse_query_params(query: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
     for pair in query.split('&') {
@@ -1687,19 +1685,21 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
         .protocol_settings
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .map(|v| {
-            let m = v
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("rc4-md5");
-            let p = v
-                .get("protocol")
-                .and_then(|p| p.as_str())
-                .unwrap_or("origin");
-            let o = v.get("obfs").and_then(|o| o.as_str()).unwrap_or("plain");
-            (m.to_string(), p.to_string(), o.to_string())
-        })
-        .unwrap_or_else(|| ("rc4-md5".into(), "origin".into(), "plain".into()));
+        .map_or_else(
+            || ("rc4-md5".into(), "origin".into(), "plain".into()),
+            |v| {
+                let m = v
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("rc4-md5");
+                let p = v
+                    .get("protocol")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("origin");
+                let o = v.get("obfs").and_then(|o| o.as_str()).unwrap_or("plain");
+                (m.to_string(), p.to_string(), o.to_string())
+            },
+        );
 
     let mut query_str = String::new();
     if let Some(ps) = &profile.protocol_settings
@@ -1710,11 +1710,11 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
             .filter(|s| !s.is_empty())
     {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(obfsparam);
-        query_str.push_str(&format!("obfsparam={}&", encoded));
+        query_str.push_str(&format!("obfsparam={encoded}&"));
     }
     if let Some(remarks) = &profile.remarks {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(remarks);
-        query_str.push_str(&format!("remarks={}", encoded));
+        query_str.push_str(&format!("remarks={encoded}"));
     }
 
     let raw = format!("{add}:{port}:{protocol}:{method}:{obfs}:{password}");
@@ -2009,7 +2009,7 @@ fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()>
 fn validate_security(profile: &Profile) -> Result<()> {
     if let Some(ss) = &profile.stream_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
-        && (v.get("allow_insecure").and_then(|s| s.as_bool()) == Some(true)
+        && (v.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
             || v.get("insecure").and_then(|s| s.as_str()) == Some("1"))
     {
         tracing::warn!(target: "validation",

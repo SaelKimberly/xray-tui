@@ -166,7 +166,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     ) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.should_quit = true
+                state.should_quit = true;
             }
             _ => groups::handle_key(state, key).await,
         }
@@ -791,7 +791,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         .iter()
         .map(|(key, desc)| {
             Line::from(vec![
-                Span::styled(format!(" {:<20}", key), crate::ui::theme::Theme::HINT),
+                Span::styled(format!(" {key:<20}"), crate::ui::theme::Theme::HINT),
                 Span::raw("  "),
                 Span::styled(*desc, Style::default().fg(Color::White)),
             ])

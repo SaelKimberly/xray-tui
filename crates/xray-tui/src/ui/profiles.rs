@@ -125,7 +125,7 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
         None => "All",
     };
 
-    let group_text = format!(" Group: {}", group_name);
+    let group_text = format!(" Group: {group_name}");
     let group_span = Span::styled(group_text, Theme::CONTAINER_TITLE);
 
     let search_text = if state.search_focused {
@@ -181,11 +181,11 @@ fn render_data_grid(
     let sort_idx: Option<usize> = match state.sort_column {
         SortColumn::ConfigType => Some(2),
         SortColumn::Remarks => Some(3),
-        SortColumn::Address => Some(4 + show_group as usize),
-        SortColumn::Port => Some(5 + show_group as usize),
-        SortColumn::Delay => Some(7 + show_group as usize),
-        SortColumn::Speed => Some(8 + show_group as usize),
-        SortColumn::Traffic => Some(10 + show_group as usize),
+        SortColumn::Address => Some(4 + usize::from(show_group)),
+        SortColumn::Port => Some(5 + usize::from(show_group)),
+        SortColumn::Delay => Some(7 + usize::from(show_group)),
+        SortColumn::Speed => Some(8 + usize::from(show_group)),
+        SortColumn::Traffic => Some(10 + usize::from(show_group)),
         _ => None, // Core and other non-visible columns
     };
     if let Some(idx) = sort_idx
@@ -264,40 +264,35 @@ fn render_data_grid(
             let port_str = row
                 .profile
                 .port
-                .map(|p| format!("{:>6}", p))
-                .unwrap_or_else(|| "     -".to_string());
+                .map_or_else(|| "     -".to_string(), |p| format!("{p:>6}"));
             let delay_str = row
                 .extension
                 .as_ref()
                 .and_then(|e| e.delay)
-                .map(|d| format!("{:>6}", d))
-                .unwrap_or_else(|| "     -".to_string());
+                .map_or_else(|| "     -".to_string(), |d| format!("{d:>6}"));
             let speed_str = row
                 .extension
                 .as_ref()
                 .and_then(|e| e.speed)
-                .map(|s| format!("{:>6}", s))
-                .unwrap_or_else(|| "     -".to_string());
+                .map_or_else(|| "     -".to_string(), |s| format!("{s:>6}"));
             let ip_info_str = row
                 .extension
                 .as_ref()
                 .and_then(|e| e.ip_info.as_deref())
-                .map(|ip| truncate_pad(ip, 19))
-                .unwrap_or_else(|| "     -".to_string());
+                .map_or_else(|| "     -".to_string(), |ip| truncate_pad(ip, 19));
 
-            let traffic = row
-                .stats
-                .as_ref()
-                .map(|s| {
+            let traffic = row.stats.as_ref().map_or_else(
+                || "        -".to_string(),
+                |s| {
                     let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
                     format_traffic(total as u64)
-                })
-                .unwrap_or_else(|| "        -".to_string());
+                },
+            );
             let mut cells = vec![
                 Cell::from(indicator),
                 Cell::from(idx_str),
                 Cell::from(type_str),
-                Cell::from(remarks_str.clone()),
+                Cell::from(remarks_str),
             ];
             if show_group {
                 let group_name = row
@@ -343,7 +338,7 @@ pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
         }
         format!("{:width$}", &s[..end], width = width)
     } else {
-        format!("{:width$}", s, width = width)
+        format!("{s:width$}")
     }
 }
 
@@ -355,7 +350,7 @@ fn format_traffic(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:>4.1}KB", bytes as f64 / 1024.0)
     } else {
-        format!("{:>4}B ", bytes)
+        format!("{bytes:>4}B ")
     }
 }
 
@@ -374,13 +369,12 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         let port = row
             .profile
             .port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
+            .map_or_else(|| "-".into(), |p| p.to_string());
         Line::from(vec![
             Span::styled(" Server: ", Theme::FOOTER_LABEL),
             Span::styled(remarks, Theme::FOOTER_VALUE),
-            Span::styled(format!("  {}:{}  ", addr, port), Theme::FOOTER_VALUE),
-            Span::styled(format!("[{}] ", core), Theme::FOOTER_VALUE),
+            Span::styled(format!("  {addr}:{port}  "), Theme::FOOTER_VALUE),
+            Span::styled(format!("[{core}] "), Theme::FOOTER_VALUE),
         ])
     } else {
         Line::from(Span::styled(

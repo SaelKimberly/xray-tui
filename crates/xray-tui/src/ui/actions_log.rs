@@ -9,7 +9,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-fn connection_icon(state: &AppState) -> (&'static str, Style) {
+const fn connection_icon(state: &AppState) -> (&'static str, Style) {
     if state.connecting {
         ("⠋", Theme::SPINNER)
     } else if state.connected_core.is_some() {
@@ -66,18 +66,18 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Server info segment
     let server_str = if addr.is_empty() {
-        remarks.clone()
+        remarks
     } else {
-        format!("{}/{} {}:{} [{}]", proto, remarks, addr, port, core)
+        format!("{proto}/{remarks} {addr}:{port} [{core}]")
     };
 
     // Test results segment
     let mut test_parts = Vec::new();
     if let Some(tcp) = state.last_test_tcp {
-        test_parts.push(format!("TCP:{}ms", tcp));
+        test_parts.push(format!("TCP:{tcp}ms"));
     }
     if let Some(rp) = state.last_test_real {
-        test_parts.push(format!("RP:{}ms", rp));
+        test_parts.push(format!("RP:{rp}ms"));
     }
     if let Some(spd) = state.last_test_speed {
         let speed_str = if spd >= 1_000_000 {
@@ -85,9 +85,9 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
         } else if spd >= 1_000 {
             format!("{}Kbps", spd / 1_000)
         } else {
-            format!("{}bps", spd)
+            format!("{spd}bps")
         };
-        test_parts.push(format!("SPD:{}", speed_str));
+        test_parts.push(format!("SPD:{speed_str}"));
     }
     let test_str = if test_parts.is_empty() {
         String::new()
@@ -98,18 +98,17 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
     // Traffic segment
     let traffic_up = format_bytes(state.current_traffic_up);
     let traffic_down = format_bytes(state.current_traffic_down);
-    let traffic_str = format!("⬆{} ⬇{}", traffic_up, traffic_down);
+    let traffic_str = format!("⬆{traffic_up} ⬇{traffic_down}");
 
     // Last core log segment
     let log_snippet = state
         .last_core_log
         .as_ref()
-        .map(|(_, msg)| msg.as_str())
-        .unwrap_or("");
+        .map_or("", |(_, msg)| msg.as_str());
 
     // Build the line
     let mut spans = Vec::new();
-    spans.push(Span::styled(format!("{} ", icon), icon_style));
+    spans.push(Span::styled(format!("{icon} "), icon_style));
     spans.push(Span::styled(server_str, Theme::FOOTER_VALUE));
 
     if !test_str.is_empty() {
@@ -139,27 +138,27 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Row 1: Connection status
     let status_text = if state.connecting {
-        format!("{} Connecting...", icon)
+        format!("{icon} Connecting...")
     } else if let Some(core) = &state.connected_core {
-        format!("{} Connected [{}]", icon, core)
+        format!("{icon} Connected [{core}]")
     } else if let Some(err) = &state.connection_error {
-        format!("{} Error: {}", icon, err)
+        format!("{icon} Error: {err}")
     } else {
-        format!("{} Disconnected", icon)
+        format!("{icon} Disconnected")
     };
     let row1 = Line::from(Span::styled(status_text, icon_style));
 
     // Row 2: Server info
     let server_info = if addr.is_empty() {
-        remarks.clone()
+        remarks
     } else {
-        format!("{} {} {}:{} [{}]", proto, remarks, addr, port, core)
+        format!("{proto} {remarks} {addr}:{port} [{core}]")
     };
     let row2 = Line::from(Span::styled(
         if server_info == "No server" || server_info == "- No server" {
             "- No server -".to_string()
         } else {
-            format!("🖥 {}", server_info)
+            format!("🖥 {server_info}")
         },
         Theme::FOOTER_VALUE,
     ));
@@ -167,26 +166,24 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     // Row 3: Test results
     let tcp_str = state
         .last_test_tcp
-        .map(|v| format!("{}ms", v))
-        .unwrap_or_else(|| "-".to_string());
+        .map_or_else(|| "-".to_string(), |v| format!("{v}ms"));
     let rp_str = state
         .last_test_real
-        .map(|v| format!("{}ms", v))
-        .unwrap_or_else(|| "-".to_string());
-    let spd_str = state
-        .last_test_speed
-        .map(|v| {
+        .map_or_else(|| "-".to_string(), |v| format!("{v}ms"));
+    let spd_str = state.last_test_speed.map_or_else(
+        || "-".to_string(),
+        |v| {
             if v >= 1_000_000 {
                 format!("{}Mbps", v / 1_000_000)
             } else if v >= 1_000 {
                 format!("{}Kbps", v / 1_000)
             } else {
-                format!("{}bps", v)
+                format!("{v}bps")
             }
-        })
-        .unwrap_or_else(|| "-".to_string());
+        },
+    );
     let row3 = Line::from(Span::styled(
-        format!("⏱ TCP:{}  RP:{}  SPD:{}", tcp_str, rp_str, spd_str),
+        format!("⏱ TCP:{tcp_str}  RP:{rp_str}  SPD:{spd_str}"),
         Theme::FOOTER_LABEL,
     ));
 
@@ -199,7 +196,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         "-".to_string()
     };
     let row4 = Line::from(Span::styled(
-        format!("📊 ⬆{}  ⬇{}    💾 {}", traffic_up, traffic_down, mem_mb),
+        format!("📊 ⬆{traffic_up}  ⬇{traffic_down}    💾 {mem_mb}"),
         Theme::FOOTER_VALUE,
     ));
 
@@ -207,7 +204,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     let core_log = state
         .last_core_log
         .as_ref()
-        .map(|(lvl, msg)| format!("📋 Core: [{}] {}", lvl, msg))
+        .map(|(lvl, msg)| format!("📋 Core: [{lvl}] {msg}"))
         .unwrap_or_default();
     let row5 = Line::from(Span::styled(core_log, Theme::FOOTER_LABEL));
 
@@ -215,7 +212,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     let tui_log = state
         .last_tui_log
         .as_ref()
-        .map(|(target, lvl, msg)| format!("📋 TUI:  [{}] {} ({})", lvl, msg, target))
+        .map(|(target, lvl, msg)| format!("📋 TUI:  [{lvl}] {msg} ({target})"))
         .unwrap_or_default();
     let row6 = Line::from(Span::styled(tui_log, Theme::FOOTER_LABEL));
 

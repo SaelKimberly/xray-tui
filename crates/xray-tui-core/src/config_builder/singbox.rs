@@ -170,11 +170,11 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 .unwrap_or(user_id);
             let up_mbps = p_settings
                 .get("up_mbps")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(100);
             let down_mbps = p_settings
                 .get("down_mbps")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(100);
             Ok(json!({
                 "tag": "proxy",
@@ -279,11 +279,11 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 .unwrap_or("");
             let up = p_settings
                 .get("up_mbps")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(100);
             let down = p_settings
                 .get("down_mbps")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(100);
             let mut out = json!({
                 "tag": "proxy",
@@ -313,7 +313,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             tls.insert("server_name".into(), json!(sni));
             if p_settings
                 .get("insecure")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
             {
                 tls.insert("insecure".into(), json!(true));
@@ -369,7 +369,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 .unwrap_or("");
             let version = p_settings
                 .get("version")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .or_else(|| {
                     p_settings
                         .get("version")
@@ -411,8 +411,8 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 .unwrap_or(address);
             let ssh_port = p_settings
                 .get("ssh_port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(port as u64);
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::from(port));
             let username = p_settings
                 .get("username")
                 .and_then(|v| v.as_str())
@@ -461,7 +461,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             }
             if p_settings
                 .get("ephemeral")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
             {
                 out["ephemeral"] = json!(true);
@@ -537,7 +537,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 .unwrap_or("0.0.0.0/0");
             let mtu = p_settings
                 .get("mtu")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1420);
 
             // Peer endpoint: URL import sets profile.address:port; form stores in protocol_settings["endpoint"]
@@ -661,7 +661,7 @@ fn build_dns(dns: &DnsSetting) -> SingBoxDnsConfig {
 
 fn parse_comma_list(s: &str) -> Vec<&str> {
     s.split(',')
-        .map(|part| part.trim())
+        .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect()
 }
@@ -681,23 +681,23 @@ fn parse_settings(profile: &Profile) -> (Value, Value) {
 }
 
 /// Build the TLS sub-object for sing-box outbound.
-/// Checks both protocol_settings (URL imports) and stream_settings (forms).
+/// Checks both `protocol_settings` (URL imports) and `stream_settings` (forms).
 fn build_tls(profile: &Profile) -> Option<Value> {
     let (p_settings, s_settings) = parse_settings(profile);
 
     let enabled = p_settings
         .get("sni")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some()
+        .as_ref()
+        .is_some_and(|s| !s.is_empty())
         || s_settings
             .get("tls.enable")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         || s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
         || s_settings
             .get("reality.show")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
     if !enabled {
@@ -721,15 +721,15 @@ fn build_tls(profile: &Profile) -> Option<Value> {
     // insecure: protocol.insecure > protocol.allow_insecure > stream.allow_insecure
     let insecure = p_settings
         .get("insecure")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
         || p_settings
             .get("allow_insecure")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         || s_settings
             .get("allow_insecure")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
     if insecure {
         tls.insert("insecure".into(), json!(true));
@@ -744,7 +744,7 @@ fn build_tls(profile: &Profile) -> Option<Value> {
     if let Some(a) = alpn {
         let parts: Vec<&str> = a
             .split(',')
-            .map(|s| s.trim())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
         if !parts.is_empty() {
@@ -768,7 +768,7 @@ fn build_tls(profile: &Profile) -> Option<Value> {
     let is_reality = s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
         || s_settings
             .get("reality.show")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
     if is_reality {
         let mut reality = serde_json::Map::new();

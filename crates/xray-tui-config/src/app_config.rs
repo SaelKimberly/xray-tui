@@ -78,7 +78,7 @@ fn default_language() -> String {
     "en".to_owned()
 }
 
-fn default_refresh_interval() -> u64 {
+const fn default_refresh_interval() -> u64 {
     5
 }
 
@@ -135,7 +135,7 @@ pub struct SystemProxyConfig {
     pub bypass: Option<String>,
 }
 
-fn default_clash_api_port() -> u16 {
+const fn default_clash_api_port() -> u16 {
     9090
 }
 
@@ -147,7 +147,7 @@ pub struct StatisticsConfig {
     pub clash_api_port: u16,
 }
 
-fn default_stats_enabled() -> bool {
+const fn default_stats_enabled() -> bool {
     true
 }
 
@@ -160,7 +160,7 @@ impl Default for StatisticsConfig {
     }
 }
 
-fn default_socks_port() -> u16 {
+const fn default_socks_port() -> u16 {
     10808
 }
 
@@ -185,7 +185,7 @@ impl AppConfig {
             let content = std::fs::read_to_string(&path)?;
             Ok(serde_json::from_str(&content)?)
         } else {
-            let config = AppConfig::default();
+            let config = Self::default();
             config.save()?;
             Ok(config)
         }
@@ -253,7 +253,7 @@ pub struct UpdateConfig {
     pub sing_box_latest_known: Option<String>,
 }
 
-fn default_update_check_enabled() -> bool {
+const fn default_update_check_enabled() -> bool {
     true
 }
 
@@ -296,27 +296,27 @@ fn default_ip_api_url() -> String {
     "http://ip-api.com/json/".to_string()
 }
 
-fn default_tcp_timeout_secs() -> u64 {
+const fn default_tcp_timeout_secs() -> u64 {
     5
 }
 
-fn default_real_ping_timeout_secs() -> u64 {
+const fn default_real_ping_timeout_secs() -> u64 {
     5
 }
 
-fn default_batch_page_size() -> usize {
+const fn default_batch_page_size() -> usize {
     1000
 }
 
-fn default_batch_delay_ms() -> u64 {
+const fn default_batch_delay_ms() -> u64 {
     1000
 }
 
-fn default_real_ping_retries() -> u32 {
+const fn default_real_ping_retries() -> u32 {
     2
 }
 
-fn default_real_ping_concurrency() -> usize {
+const fn default_real_ping_concurrency() -> usize {
     5
 }
 
@@ -360,9 +360,9 @@ impl Default for LogConfig {
     }
 }
 
-fn default_log_ttl_hours() -> u64 {
+const fn default_log_ttl_hours() -> u64 {
     72
 }
-fn default_log_batch_size() -> usize {
+const fn default_log_batch_size() -> usize {
     500
 }

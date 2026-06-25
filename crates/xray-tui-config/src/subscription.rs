@@ -199,8 +199,8 @@ impl StreamingDecoder {
         }
     }
 
-    /// Process decoded bytes: lossy UTF-8, prepend carry_over, split on last
-    /// `\n`, extract URLs from complete portion, save remainder as carry_over.
+    /// Process decoded bytes: lossy UTF-8, prepend `carry_over`, split on last
+    /// `\n`, extract URLs from complete portion, save remainder as `carry_over`.
     fn process_decoded(&mut self, decoded: &[u8]) -> Vec<String> {
         if decoded.is_empty() && self.carry_over_len == 0 {
             return Vec::new();
@@ -228,7 +228,7 @@ impl StreamingDecoder {
         }
     }
 
-    /// Helper: split on last \n, extract URLs, save carry_over.
+    /// Helper: split on last \n, extract URLs, save `carry_over`.
     /// Takes ownership of the string for splitting.
     fn process_text_owned(&mut self, full_text: &str) -> Vec<String> {
         if full_text.is_empty() {
@@ -249,8 +249,8 @@ impl StreamingDecoder {
         }
     }
 
-    /// Process a &str (no carry_over involved): split on last \n, extract URLs,
-    /// save carry_over.
+    /// Process a &str (no `carry_over` involved): split on last \n, extract URLs,
+    /// save `carry_over`.
     fn process_str(&mut self, text: &str) -> Vec<String> {
         if text.is_empty() {
             return Vec::new();
@@ -300,7 +300,7 @@ impl Default for StreamingDecoder {
     }
 }
 
-/// Standard process_text that splits text by newlines and extracts URLs via
+/// Standard `process_text` that splits text by newlines and extracts URLs via
 /// `subscription_url_split`.
 fn process_text_std(data: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(data);
@@ -321,7 +321,7 @@ fn process_text_std(data: &[u8]) -> Vec<String> {
 /// (e.g., `vmess://...vless://...trojan://...`).
 #[must_use]
 pub fn subscription_url_split(text: &str) -> Vec<String> {
-    static SCHEMA_AC: once_cell::sync::Lazy<AhoCorasick> = once_cell::sync::Lazy::new(|| {
+    static SCHEMA_AC: std::sync::LazyLock<AhoCorasick> = std::sync::LazyLock::new(|| {
         AhoCorasick::builder()
             .ascii_case_insensitive(true)
             .match_kind(aho_corasick::MatchKind::LeftmostFirst)

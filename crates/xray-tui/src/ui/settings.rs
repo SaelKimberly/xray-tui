@@ -189,7 +189,7 @@ async fn handle_menu_key(state: &mut AppState, key: &KeyEvent) {
         _ => {}
     }
 }
-fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
+const fn form_title_from_mode(mode: &SettingsMode) -> &'static str {
     match mode {
         SettingsMode::CoreForm { .. } => " Core Settings ",
         SettingsMode::GuiForm { .. } => " GUI Settings ",
@@ -396,10 +396,10 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
     for (i, (_key, label, field_type)) in field_defs.iter().enumerate() {
         let is_focused = i == focus_index;
-        let val = fields.get(i).map(|(_, v)| v.as_str()).unwrap_or("");
+        let val = fields.get(i).map_or("", |(_, v)| v.as_str());
 
         let display_val = if let Some(_options_csv) = field_type.strip_prefix("Select:") {
-            format!("< {} >", val)
+            format!("< {val} >")
         } else if *field_type == "Boolean" {
             if val == "true" {
                 "[X]".into()
@@ -415,7 +415,7 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
         };
         let prefix = if is_focused { "> " } else { "  " };
         let label_text = format!("{prefix}{label}: ");
-        let value_text = format!("[{}]", display_val);
+        let value_text = format!("[{display_val}]");
 
         let spans = vec![
             Span::styled(
@@ -448,7 +448,7 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, inner);
 }
 
-fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
+const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
     match mode {
         SettingsMode::CoreForm { .. } => Some(SettingsSection::Core),
         SettingsMode::GuiForm { .. } => Some(SettingsSection::Gui),
@@ -761,9 +761,7 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
 async fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
     match key.code {
-        KeyCode::Char('c') | KeyCode::Char('C')
-            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
+        KeyCode::Char('c' | 'C') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.spawn_update_check();
             // Refresh the form with current status
             let status_xray = state
@@ -783,7 +781,7 @@ async fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
                 },
             };
         }
-        KeyCode::Char('d') | KeyCode::Char('D') => {
+        KeyCode::Char('d' | 'D') => {
             // Download updates for all cores that have them available
             let any_updates = state.update_status.values().any(|s| s.update_available);
             if !any_updates {
@@ -793,13 +791,11 @@ async fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
             let xray_avail = state
                 .update_status
                 .get(&CoreType::Xray)
-                .map(|s| s.update_available)
-                .unwrap_or(false);
+                .is_some_and(|s| s.update_available);
             let singbox_avail = state
                 .update_status
                 .get(&CoreType::SingBox)
-                .map(|s| s.update_available)
-                .unwrap_or(false);
+                .is_some_and(|s| s.update_available);
 
             if xray_avail {
                 state.spawn_update_download(CoreType::Xray);
@@ -1203,7 +1199,7 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
     for (i, (_key, label, field_type)) in ROUTING_FIELD_DEFS.iter().enumerate() {
         let is_focused = i == focus_index;
-        let val = fields.get(i).map(|(_, v)| v.as_str()).unwrap_or("");
+        let val = fields.get(i).map_or("", |(_, v)| v.as_str());
 
         let display_val = if *field_type == "Boolean" {
             if val == "true" {
@@ -1221,7 +1217,7 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let prefix = if is_focused { "> " } else { "  " };
         let label_text = format!("{prefix}{label}: ");
-        let value_text = format!("[{}]", display_val);
+        let value_text = format!("[{display_val}]");
 
         let spans = vec![
             Span::styled(
@@ -1346,8 +1342,8 @@ fn truncate_to(s: &str, max: usize) -> String {
     }
 }
 
-/// Extract (fields, focus_index, form_errors) from any settings form variant.
-pub fn extract_form_fields(
+/// Extract (fields, `focus_index`, `form_errors`) from any settings form variant.
+pub const fn extract_form_fields(
     state: &AppState,
 ) -> Option<(&Vec<(String, String)>, &usize, &HashMap<String, String>)> {
     let mode = match &state.mode {
@@ -1414,8 +1410,8 @@ pub fn extract_form_fields(
     }
 }
 
-/// Mutable version of extract_form_fields.
-pub fn extract_form_fields_mut(
+/// Mutable version of `extract_form_fields`.
+pub const fn extract_form_fields_mut(
     state: &mut AppState,
 ) -> Option<(
     &mut Vec<(String, String)>,

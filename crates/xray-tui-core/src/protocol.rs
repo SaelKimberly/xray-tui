@@ -38,12 +38,14 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    #[must_use]
     pub fn is_singbox_only(&self) -> bool {
         SINGBOX_ONLY_PROTOCOLS.contains(self)
     }
 
     /// Maps v2rayN `EConfigType` integer values to Protocol variants.
-    pub fn try_from_i32(value: i32) -> Option<Self> {
+    #[must_use]
+    pub const fn try_from_i32(value: i32) -> Option<Self> {
         match value {
             1 => Some(Self::Vmess),
             2 => Some(Self::Custom),
@@ -76,7 +78,8 @@ impl Protocol {
         }
     }
 
-    pub fn to_i32(self) -> i32 {
+    #[must_use]
+    pub const fn to_i32(self) -> i32 {
         match self {
             Self::Vmess => 1,
             Self::Custom => 2,

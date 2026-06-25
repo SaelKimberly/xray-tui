@@ -102,7 +102,7 @@ const fn next_char_impl(char_iter: &mut AutoChars) -> PResult<char> {
 
 /// Main cursor method
 impl JsonReader<'_> {
-    /// Try to read next character from data, and save it to last_char.
+    /// Try to read next character from data, and save it to `last_char`.
     const fn next_char(&mut self) -> PResult<char> {
         let r = next_char_impl(&mut self.char_iter);
         if let Ok(c) = r {
@@ -114,8 +114,8 @@ impl JsonReader<'_> {
 
 /// Deal with whitespaces
 impl JsonReader<'_> {
-    /// When last_char is whitespace character, returns it, and read next char
-    /// When last_char is not whitespace, returns Ok(None)
+    /// When `last_char` is whitespace character, returns it, and read next char
+    /// When `last_char` is not whitespace, returns Ok(None)
     const fn next_if_whitespace(&mut self) -> PResult<Option<char>> {
         if self.last_char.is_whitespace() || matches!(self.last_char, '+') {
             let result = Some(self.last_char);

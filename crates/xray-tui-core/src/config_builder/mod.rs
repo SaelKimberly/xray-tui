@@ -6,7 +6,7 @@ use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
 
 /// Port for the gRPC Stats API (shared by xray-core and sing-box).
 pub const API_PORT: u16 = 62789;
-/// Port for the sing-box Clash API (experimental.clash_api).
+/// Port for the sing-box Clash API (`experimental.clash_api`).
 pub const CLASH_API_PORT: u16 = 9090;
 /// Parameters extracted from app config for building backend configs.
 /// Avoids a circular dependency on `xray-tui-config`.
@@ -30,10 +30,11 @@ pub enum BackendConfig {
 }
 
 impl BackendConfig {
-    pub fn core_type(&self) -> CoreType {
+    #[must_use]
+    pub const fn core_type(&self) -> CoreType {
         match self {
-            BackendConfig::Xray(_) => CoreType::Xray,
-            BackendConfig::SingBox(_) => CoreType::SingBox,
+            Self::Xray(_) => CoreType::Xray,
+            Self::SingBox(_) => CoreType::SingBox,
         }
     }
 }

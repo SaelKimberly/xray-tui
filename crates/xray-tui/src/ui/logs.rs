@@ -35,10 +35,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         "OFF"
     };
     let bar = Line::from(Span::styled(
-        format!(
-            " [C]ore: {}  [T]UI: {}  [V]alidation: {}",
-            core_label, tui_label, val_label
-        ),
+        format!(" [C]ore: {core_label}  [T]UI: {tui_label}  [V]alidation: {val_label}"),
         Theme::HINT,
     ));
     frame.render_widget(Paragraph::new(bar), filter_area);

@@ -23,13 +23,15 @@ pub enum UpdateError {
     AutoCore,
 }
 
-/// Parse a version tag (strip leading 'v') as semver::Version.
+/// Parse a version tag (strip leading 'v') as `semver::Version`.
+#[must_use]
 pub fn parse_version(tag: &str) -> Option<Version> {
     let stripped = tag.strip_prefix('v').unwrap_or(tag);
     Version::parse(stripped).ok()
 }
 
 /// Compare two versions. Returns true if `latest > current` per semver precedence.
+#[must_use]
 pub fn is_newer(current: &Version, latest: &Version) -> bool {
     *latest > *current
 }
@@ -82,7 +84,7 @@ const XRAY_REPO: &str = "Xray-core";
 const SINGBOX_OWNER: &str = "SagerNet";
 const SINGBOX_REPO: &str = "sing-box";
 
-/// GET latest release from GitHub API and return the tag_name.
+/// GET latest release from GitHub API and return the `tag_name`.
 pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
     let (owner, repo) = match core_type {
         CoreType::Xray => (XRAY_OWNER, XRAY_REPO),
@@ -157,7 +159,7 @@ pub async fn download_release(
     Ok(dest)
 }
 
-/// Extract archive, verify binary, install all files to bin_dir.
+/// Extract archive, verify binary, install all files to `bin_dir`.
 pub async fn install_binary(
     archive: &Path,
     core_type: CoreType,

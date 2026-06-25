@@ -435,7 +435,7 @@ fn build_dns(dns: &DnsSetting) -> DnsConfig {
 
 fn parse_comma_list(s: &str) -> Vec<&str> {
     s.split(',')
-        .map(|part| part.trim())
+        .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect()
 }

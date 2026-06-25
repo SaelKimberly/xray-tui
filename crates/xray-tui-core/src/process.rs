@@ -14,7 +14,7 @@ pub struct CoreProcess {
 }
 
 impl CoreProcess {
-    fn new(child: Child, config_path: PathBuf, core_type: CoreType) -> Self {
+    const fn new(child: Child, config_path: PathBuf, core_type: CoreType) -> Self {
         Self {
             child: Some(child),
             config_path,
@@ -54,8 +54,9 @@ pub struct CoreManager {
 }
 
 impl CoreManager {
-    /// Create a new CoreManager with the given config directory.
-    pub fn new(config_dir: PathBuf) -> Self {
+    /// Create a new `CoreManager` with the given config directory.
+    #[must_use]
+    pub const fn new(config_dir: PathBuf) -> Self {
         Self {
             config_dir,
             current: None,
@@ -63,7 +64,8 @@ impl CoreManager {
         }
     }
 
-    pub fn with_log_channel(config_dir: PathBuf, log_tx: Sender<String>) -> Self {
+    #[must_use]
+    pub const fn with_log_channel(config_dir: PathBuf, log_tx: Sender<String>) -> Self {
         Self {
             config_dir,
             current: None,
@@ -190,16 +192,19 @@ impl CoreManager {
     }
 
     /// Check if a core process is running.
-    pub fn is_running(&self) -> bool {
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
         self.current.is_some()
     }
 
     /// Get the type of the running core, if any.
+    #[must_use]
     pub fn running_core_type(&self) -> Option<CoreType> {
         self.current.as_ref().map(|p| p.core_type)
     }
 
     /// Get a reference to the log sender, if set.
+    #[must_use]
     pub fn log_tx(&self) -> Option<Sender<String>> {
         self.log_tx.clone()
     }

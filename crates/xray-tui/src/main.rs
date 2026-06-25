@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
     let db_ttl = state.db.clone();
     let ttl_hours = state.config.logging.ttl_hours;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
         interval.tick().await; // skip first tick
         loop {
             interval.tick().await;

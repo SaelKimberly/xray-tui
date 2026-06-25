@@ -6,7 +6,7 @@ pub struct LogRepository<'a> {
 }
 
 impl<'a> LogRepository<'a> {
-    pub fn new(conn: &'a turso::Connection) -> Self {
+    pub const fn new(conn: &'a turso::Connection) -> Self {
         Self { conn }
     }
 
@@ -132,7 +132,7 @@ impl<'a> LogRepository<'a> {
         }
         if let Some(target) = target_contains {
             sql.push_str(&format!(" AND target LIKE ?{}", params.len() + 1));
-            params.push(Value::Text(format!("%{}%", target)));
+            params.push(Value::Text(format!("%{target}%")));
         }
         if let Some(src) = source {
             sql.push_str(&format!(" AND source = ?{}", params.len() + 1));
@@ -181,7 +181,7 @@ impl<'a> LogRepository<'a> {
 }
 
 /// Exponential backoff delay: 5ms, 10ms, 20ms, 40ms, 80ms
-fn backoff_ms(attempt: usize) -> u64 {
+const fn backoff_ms(attempt: usize) -> u64 {
     5u64 * 2u64.pow(attempt as u32 - 1)
 }
 
@@ -191,7 +191,11 @@ fn level_hierarchy(level: &str) -> Vec<String> {
     let all = ["error", "warning", "info", "debug", "trace"];
     let pos = all.iter().position(|l| *l == level);
     match pos {
-        Some(p) => all[..=p].iter().map(|l| l.to_string()).rev().collect(),
+        Some(p) => all[..=p]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .rev()
+            .collect(),
         None => Vec::new(),
     }
 }
