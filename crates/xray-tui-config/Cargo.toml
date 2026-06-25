@@ -4,23 +4,38 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# ============ Serialization ============
+serde.workspace = true
+serde_json.workspace = true
+
+# ============ Error Handling ============
+thiserror.workspace = true
+
+# ============ Config & Filesystem ============
+dirs.workspace = true
+
+# ============ Encoding ============
 base64-simd = "0.8"
 escape8259 = "0.5"
-memchr = "1"
-simdutf8 = "0.1"
 urlencoding = "2"
-thiserror = "2"
-dirs = "6"
-aho-corasick = "1"
+simdutf8 = "0.1"
 url = "2"
-xray-tui-core = { path = "../xray-tui-core" }
-xray-tui-db = { path = "../xray-tui-db" }
-uuid = { version = "1", features = ["v4"] }
+
+# ============ Text / Search / Hash ============
+uuid.workspace = true
+aho-corasick = "1"
+memchr = "^1"   # pinned to v1; v2 exists but API differs
+
+# ============ Memory ============
 smallvec = { version = "1", features = ["const_new"] }
 once_cell = "1"
-tracing = "0.1"
+
+# ============ Internal ============
+xray-tui-core = { path = "../xray-tui-core" }
+xray-tui-db = { path = "../xray-tui-db" }
+
+# ============ Logging ============
+tracing.workspace = true
 
 [lints]
 workspace = true

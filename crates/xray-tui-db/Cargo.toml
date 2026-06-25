@@ -4,12 +4,22 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# ============ Database ============
 turso = "0.6.1"
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
+
+# ============ Serialization ============
+serde.workspace = true
+
+# ============ Error Handling ============
+thiserror.workspace = true
+
+# ============ Text / Search / Hash ============
+uuid.workspace = true
 rapidhash = "4"
-tokio = { version = "1", features = ["time"] }
+
+# ============ Async Runtime & I/O ============
+tokio.workspace = true
+tokio.features = ["time"]
 
 [lints]
 workspace = true

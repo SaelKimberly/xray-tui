@@ -7,20 +7,40 @@ edition.workspace = true
 xray-tui-core = { path = "../xray-tui-core" }
 xray-tui-db = { path = "../xray-tui-db" }
 xray-tui-config = { path = "../xray-tui-config" }
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+
+# ============ Async Runtime & I/O ============
+tokio.workspace = true
+tokio.features = ["rt-multi-thread", "macros", "signal", "sync"]
+futures-util.workspace = true
+
+# ============ Serialization ============
+serde.workspace = true
+serde_json.workspace = true
+
+# ============ Networking ============
+reqwest.workspace = true
+reqwest.features = ["gzip"]
+
+# ============ Config & Filesystem ============
+dirs.workspace = true
+
+# ============ TUI Framework ============
 ratatui = "0.29"
 crossterm = "0.28"
-dirs = "6"
-uuid = { version = "1", features = ["v4"] }
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
-arboard = "3"
 unicode-width = "0.2"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tracing = "0.1"
+arboard = "3"
+
+# ============ CLI ============
+clap = { version = "4", features = ["derive"] }
+
+# ============ Error Handling ============
+anyhow = "1"
+
+# ============ Text / Search / Hash ============
+uuid.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "json"] }
 
 [lints]
