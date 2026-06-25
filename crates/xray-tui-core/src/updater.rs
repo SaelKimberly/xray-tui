@@ -1,4 +1,5 @@
 use crate::core_type::CoreType;
+use futures_util::StreamExt;
 use semver::Version;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -143,7 +144,6 @@ pub async fn download_release(
     let mut file = tokio::fs::File::create(&dest).await?;
 
     let mut stream = resp.bytes_stream();
-    use futures_util::StreamExt;
     let mut downloaded: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
@@ -270,8 +270,7 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, U
             CoreType::Auto => return Err(UpdateError::AutoCore),
         },
         "aarch64" => match core_type {
-            CoreType::Xray => "arm64",
-            CoreType::SingBox => "arm64",
+            CoreType::Xray | CoreType::SingBox => "arm64",
             CoreType::Auto => return Err(UpdateError::AutoCore),
         },
         _ => {

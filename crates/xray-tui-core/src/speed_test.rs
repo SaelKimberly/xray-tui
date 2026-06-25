@@ -124,15 +124,11 @@ pub async fn real_ping(
 /// Fetch IP address and location info through the same SOCKS5 proxy.
 async fn fetch_ip_info(client: &reqwest::Client, ip_api_url: &str) -> Option<String> {
     match client.get(ip_api_url).send().await {
-        Ok(resp) => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
-                let country = json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
-                Some(format!("{ip} | {country}"))
-            } else {
-                None
-            }
-        }
+        Ok(resp) => resp.json::<serde_json::Value>().await.map_or(None, |json| {
+            let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
+            let country = json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
+            Some(format!("{ip} | {country}"))
+        }),
         Err(_) => None,
     }
 }
@@ -170,8 +166,7 @@ pub async fn speed_test(
                 }
             }
             Ok(Some(Err(e))) => return Err(SpeedTestError::Http(e)),
-            Ok(None) => break, // stream ended
-            Err(_) => break,   // read timeout
+            Ok(None) | Err(_) => break,
         }
     }
 

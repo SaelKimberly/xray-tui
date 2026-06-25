@@ -1,3 +1,15 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "known-safe casts on port/len/display"
+)]
+#![allow(
+    clippy::future_not_send,
+    clippy::manual_let_else,
+    reason = "single-threaded TUI, futures never sent across threads; manual let-else where match is clearer"
+)]
 pub mod ui;
 use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
@@ -313,6 +325,7 @@ pub struct BackendUpdateStatus {
     pub error: Option<String>,
 }
 
+#[allow(clippy::struct_excessive_bools, reason = "AppState aggregates many UI state flags")]
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
@@ -741,7 +754,7 @@ impl AppState {
             .map(|r| r.profile.id.clone())
     }
 
-    fn fields_to_profile(&self, protocol: Protocol, fields: &[(String, String)]) -> Profile {
+    fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
         let id = uuid::Uuid::new_v4().to_string();
         let now = format_now();
         let mut profile = Profile {
@@ -778,7 +791,7 @@ impl AppState {
                 }
                 "address" => profile.address = Some(value.clone()),
                 "port" => profile.port = value.parse::<i32>().ok(),
-                "core_type" => profile.core_type = value.clone(),
+                "core_type" => profile.core_type.clone_from(value),
                 "user_id" | "password" | "uuid" => profile.user_id = Some(value.clone()),
                 "security" => profile.security = Some(value.clone()),
                 "network" => profile.network = Some(value.clone()),
@@ -883,7 +896,7 @@ impl AppState {
             return;
         }
 
-        let mut profile = self.fields_to_profile(protocol, &fields);
+        let mut profile = Self::fields_to_profile(protocol, &fields);
         // Assign to currently selected real group (not All or Graveyard)
         if let Some(gid) = &self.selected_group_id
             && gid != ALL_GROUP_ID
@@ -974,7 +987,7 @@ impl AppState {
             return;
         };
         // Rebuild from form fields
-        let new_profile = self.fields_to_profile(protocol, &fields);
+        let new_profile = Self::fields_to_profile(protocol, &fields);
         profile.remarks = new_profile.remarks;
         profile.address = new_profile.address;
         profile.port = new_profile.port;
@@ -1231,7 +1244,7 @@ impl AppState {
                     },
                 )]
             }
-            Routing => {
+            Routing | Updates => {
                 vec![]
             }
             ProtocolCore => PROTOCOL_CORE_DEFS
@@ -1247,9 +1260,6 @@ impl AppState {
                     (key.to_string(), val)
                 })
                 .collect(),
-            Updates => {
-                vec![]
-            }
             SpeedTest => {
                 vec![
                     ("ping_url".into(), self.config.speed_test.ping_url.clone()),
@@ -1925,7 +1935,7 @@ impl AppState {
                                                 today_down += stat.value;
                                             }
                                         }
-                                        let _ = tx.send(CoreEvent::StatsUpdate {
+                                        let _ = tx.try_send(CoreEvent::StatsUpdate {
                                             profile_id: profile_id.clone(),
                                             today_up,
                                             today_down,
@@ -1934,7 +1944,7 @@ impl AppState {
                                         });
                                     }
                                     Err(e) => {
-                                    let _ = tx.send(CoreEvent::StatsError(format!("Stats query failed: {e}")));
+                                    let _ = tx.try_send(CoreEvent::StatsError(format!("Stats query failed: {e}")));
                                     }
                                 }
                                 // sys stats every 3rd tick (~9s)
@@ -1942,11 +1952,9 @@ impl AppState {
                                 if sys_tick_counter >= 3 {
                                     sys_tick_counter = 0;
                                     match provider.get_sys_stats().await {
-                                        Ok(sys) => { let _ = tx.send(CoreEvent::SysStatsUpdate(sys)); }
+                                        Ok(sys) => { let _ = tx.try_send(CoreEvent::SysStatsUpdate(sys)); }
                                         Err(e) => {
-                                            let _ = tx.send(CoreEvent::StatsError(
-                                                format!("Sys stats query failed: {e}"),
-                                            ));
+                                            let _ = tx.try_send(CoreEvent::StatsError(format!("Sys stats query failed: {e}")));
                                         }
                                     }
                                 }
@@ -1977,7 +1985,7 @@ impl AppState {
                                                 if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
                                                     session_up += t.up;
                                                     session_down += t.down;
-                                                    let _ = tx.send(CoreEvent::StatsUpdate {
+                                                    let _ = tx.try_send(CoreEvent::StatsUpdate {
                                                         profile_id: profile_id.clone(),
                                                         today_up: session_up,
                                                         today_down: session_down,
@@ -1988,7 +1996,7 @@ impl AppState {
                                             }
                                         }
                                         Some(Err(e)) => {
-                                            let _ = tx.send(CoreEvent::StatsError(
+                                            let _ = tx.try_send(CoreEvent::StatsError(
                                                 format!("Clash API stream error: {e}")
                                             ));
                                             break;
@@ -2715,8 +2723,8 @@ impl AppState {
         while let Some(rx) = self.core_event_rx.as_mut() {
             let event = match rx.try_recv() {
                 Ok(event) => event,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty |
+tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             };
             match event {
                 CoreEvent::Connected(core_type) => {
@@ -2870,7 +2878,7 @@ impl AppState {
                                     }
                                 }
                                 let _ = self.db.upsert_profile_extension(ext).await;
-                                row.profile.remarks.clone().unwrap_or(profile_id.clone())
+                                row.profile.remarks.clone().unwrap_or_else(|| profile_id.clone())
                             }
                             None => profile_id.clone(),
                         }
@@ -2930,23 +2938,26 @@ impl AppState {
                     error,
                 } => {
                     let status = self.update_status.entry(core_type).or_default();
-                    status.current_version = current_version.clone();
-                    status.latest_version = latest_version.clone();
-                    status.update_available = match &current_version {
-                        // Not installed but latest known → install available
-                        None => latest_version.is_some(),
-                        // Both known → compare versions
-                        Some(cur_str) => match &latest_version {
-                            Some(latest_str) => {
-                                let cur = xray_tui_core::updater::parse_version(cur_str);
-                                let latest = xray_tui_core::updater::parse_version(latest_str);
-                                match (cur, latest) {
-                                    (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
-                                    _ => false,
+                    status.current_version.clone_from(&current_version);
+                    status.latest_version.clone_from(&latest_version);
+                    status.update_available = {
+                        #[allow(clippy::option_if_let_else, reason = "business logic with nested version comparison clearer as match")]
+                        match &current_version {
+                            // Not installed but latest known → install available
+                            None => latest_version.is_some(),
+                            // Both known → compare versions
+                            Some(cur_str) => match &latest_version {
+                                Some(latest_str) => {
+                                    let cur = xray_tui_core::updater::parse_version(cur_str);
+                                    let latest = xray_tui_core::updater::parse_version(latest_str);
+                                    match (cur, latest) {
+                                        (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
+                                        _ => false,
+                                    }
                                 }
-                            }
-                            None => false,
-                        },
+                                None => false,
+                            },
+                        }
                     };
                     status.error = error;
                     if let Some(ref ver) = latest_version {
@@ -3004,7 +3015,7 @@ impl AppState {
                             "tui",
                         );
                     } else {
-                        status.error = error.clone();
+                        status.error.clone_from(&error);
                         self.add_log(
                             "error",
                             &format!("{core_type} update failed: {error:?}"),

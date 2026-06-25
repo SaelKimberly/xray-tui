@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_db::models::Profile;
@@ -24,8 +25,8 @@ pub type Result<T> = std::result::Result<T, ImportError>;
 /// `VmessQRCode` JSON structure used in vmess:// share links.
 #[derive(Deserialize)]
 struct VmessQRCode {
-    #[serde(default)]
-    v: i32,
+    #[serde(rename = "v", default)]
+    _v: i32,
     #[serde(default)]
     ps: String,
     #[serde(default)]
@@ -34,8 +35,8 @@ struct VmessQRCode {
     port: i32,
     #[serde(default)]
     id: String,
-    #[serde(default)]
-    aid: i32,
+    #[serde(rename = "aid", default)]
+    _aid: i32,
     #[serde(default)]
     scy: String,
     #[serde(default)]
@@ -151,11 +152,7 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
 
     // If any parser matched but validation rejected, return that error.
     // Otherwise return the last parse error (or UnsupportedScheme if none matched).
-    if let Some(ve) = validation_error {
-        Err(ve)
-    } else {
-        Err(last_error)
-    }
+    validation_error.map_or(Err(last_error), Err)
 }
 
 /// Apply remark normalization and all validation checks to a parsed profile.
@@ -165,7 +162,7 @@ fn normalize_and_validate(mut profile: Profile, settings: &ValidationSettings) -
     }
     validate_required_fields(&profile)?;
     validate_host(&profile, settings)?;
-    validate_security(&profile)?;
+    validate_security(&profile);
     Ok(profile)
 }
 
@@ -175,19 +172,19 @@ pub fn format_share_url(profile: &Profile) -> Result<String> {
         .ok_or_else(|| ImportError::Parse("unknown config type".into()))?;
     match protocol {
         Protocol::Vmess => format_vmess(profile),
-        Protocol::Vless => format_vless(profile),
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => format_shadowsocks(profile),
-        Protocol::Trojan => format_trojan(profile),
-        Protocol::Socks => format_socks(profile),
-        Protocol::Hysteria2 => format_hysteria2(profile),
-        Protocol::Hysteria => format_hysteria(profile),
-        Protocol::Tuic => format_tuic(profile),
-        Protocol::Naive => format_naive(profile),
-        Protocol::AnyTls => format_anytls(profile),
-        Protocol::ShadowTls => format_shadowtls(profile),
-        Protocol::WireGuard => format_wireguard(profile),
-        Protocol::ShadowsocksR => format_shadowsocksr(profile),
-        Protocol::Http => format_http(profile),
+        Protocol::Vless => Ok(format_vless(profile)),
+        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => Ok(format_shadowsocks(profile)),
+        Protocol::Trojan => Ok(format_trojan(profile)),
+        Protocol::Socks => Ok(format_socks(profile)),
+        Protocol::Hysteria2 => Ok(format_hysteria2(profile)),
+        Protocol::Hysteria => Ok(format_hysteria(profile)),
+        Protocol::Tuic => Ok(format_tuic(profile)),
+        Protocol::Naive => Ok(format_naive(profile)),
+        Protocol::AnyTls => Ok(format_anytls(profile)),
+        Protocol::ShadowTls => Ok(format_shadowtls(profile)),
+        Protocol::WireGuard => Ok(format_wireguard(profile)),
+        Protocol::ShadowsocksR => Ok(format_shadowsocksr(profile)),
+        Protocol::Http => Ok(format_http(profile)),
         _ => Err(ImportError::UnsupportedScheme),
     }
 }
@@ -200,15 +197,13 @@ fn parse_vmess(url: &str) -> Result<Profile> {
         .map_err(|e| ImportError::Parse(format!("invalid base64 in vmess URL: {e}")))?;
 
     // Trailing-garbage recovery: some providers append extra text after the JSON object
-    let cleaned = if let Some(last_brace) = raw.iter().rposition(|&b| b == b'}') {
+    let cleaned = raw.iter().rposition(|&b| b == b'}').map_or(raw.as_slice(), |last_brace| {
         if last_brace + 1 < raw.len() {
             &raw[..=last_brace]
         } else {
             &raw
         }
-    } else {
-        &raw
-    };
+    });
 
     // Use permissive JSON parser to handle single quotes, trailing commas, etc.
     let value = crate::permissive_json::permissive_json(cleaned)
@@ -284,7 +279,7 @@ fn parse_vless(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(0)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
     if !parsed.username.is_empty() {
         profile.user_id = Some(parsed.username.clone());
     }
@@ -351,7 +346,6 @@ fn parse_vless(url: &str) -> Result<Profile> {
                 );
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
-            "encryption" => { /* ignored */ }
             "pbk" | "publicKey" => {
                 let mut ss = stream_settings(profile.stream_settings.as_deref());
                 let rs = ss
@@ -382,14 +376,13 @@ fn parse_vless(url: &str) -> Result<Profile> {
                 }
                 profile.stream_settings = Some(serde_json::to_string(&ss)?);
             }
-            "headerType" => { /* transport header type — defaults to "none" */ }
             _ => {}
         }
     }
     Ok(profile)
 }
 
-fn format_vless(profile: &Profile) -> Result<String> {
+fn format_vless(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let userinfo = profile.user_id.as_deref().unwrap_or("");
     let mut query: Vec<(String, String)> = Vec::new();
@@ -440,7 +433,7 @@ fn format_vless(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("vless://{userinfo}@{add}:{port}?{qs}{fragment}"))
+    format!("vless://{userinfo}@{add}:{port}?{qs}{fragment}")
 }
 
 // ── Shadowsocks (SIP002) ────────────────────────────────────────────────
@@ -543,7 +536,7 @@ fn parse_shadowsocks_sip002(userinfo_b64: &str, rest2: &str) -> Result<Profile> 
     Ok(profile)
 }
 
-fn format_shadowsocks(profile: &Profile) -> Result<String> {
+fn format_shadowsocks(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let method = profile
         .protocol_settings
@@ -559,7 +552,7 @@ fn format_shadowsocks(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("ss://{userinfo}@{add}:{port}{fragment}"))
+    format!("ss://{userinfo}@{add}:{port}{fragment}")
 }
 
 // ── Trojan ──────────────────────────────────────────────────────────────
@@ -571,7 +564,7 @@ fn parse_trojan(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     if !parsed.username.is_empty() {
         profile.user_id = Some(parsed.username.clone());
@@ -608,7 +601,7 @@ fn parse_trojan(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_trojan(profile: &Profile) -> Result<String> {
+fn format_trojan(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let pw = profile.user_id.as_deref().unwrap_or("");
     let mut query: Vec<(String, String)> = Vec::new();
@@ -636,7 +629,7 @@ fn format_trojan(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("trojan://{pw}@{add}:{port}{qs}{fragment}"))
+    format!("trojan://{pw}@{add}:{port}{qs}{fragment}")
 }
 
 // ── SOCKS ───────────────────────────────────────────────────────────────
@@ -648,7 +641,7 @@ fn parse_socks(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(1080)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
         ps.insert(
@@ -663,7 +656,7 @@ fn parse_socks(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_socks(profile: &Profile) -> Result<String> {
+fn format_socks(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let remark = profile.remarks.as_deref().unwrap_or("");
     let fragment = if remark.is_empty() {
@@ -671,7 +664,7 @@ fn format_socks(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("socks://@{add}:{port}{fragment}"))
+    format!("socks://@{add}:{port}{fragment}")
 }
 
 // ── Hysteria2 ───────────────────────────────────────────────────────────
@@ -683,7 +676,7 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
@@ -717,7 +710,7 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_hysteria2(profile: &Profile) -> Result<String> {
+fn format_hysteria2(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(auth) = &profile.user_id {
@@ -759,7 +752,7 @@ fn format_hysteria2(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("hysteria2://{add}:{port}{qs}{fragment}"))
+    format!("hysteria2://{add}:{port}{qs}{fragment}")
 }
 
 // ── Hysteria v1 ─────────────────────────────────────────────────────────
@@ -771,7 +764,7 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
@@ -829,7 +822,7 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_hysteria(profile: &Profile) -> Result<String> {
+fn format_hysteria(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
@@ -867,7 +860,7 @@ fn format_hysteria(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("hysteria://{add}:{port}{qs}{fragment}"))
+    format!("hysteria://{add}:{port}{qs}{fragment}")
 }
 
 // ── TUIC ────────────────────────────────────────────────────────────────
@@ -879,7 +872,7 @@ fn parse_tuic(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -929,7 +922,7 @@ fn parse_tuic(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_tuic(profile: &Profile) -> Result<String> {
+fn format_tuic(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let uuid = profile.user_id.as_deref().unwrap_or("");
     let mut query: Vec<(String, String)> = Vec::new();
@@ -970,7 +963,7 @@ fn format_tuic(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("tuic://{add}:{port}?{qs}{fragment}"))
+    format!("tuic://{add}:{port}?{qs}{fragment}")
 }
 
 // ── Naïve ───────────────────────────────────────────────────────────────
@@ -982,7 +975,7 @@ fn parse_naive(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
         ps.insert(
@@ -997,7 +990,7 @@ fn parse_naive(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_naive(profile: &Profile) -> Result<String> {
+fn format_naive(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let user = profile
         .protocol_settings
@@ -1022,7 +1015,7 @@ fn format_naive(profile: &Profile) -> Result<String> {
     } else {
         format!("{user}:{password}@")
     };
-    Ok(format!("naive+https://{userinfo}{add}:{port}{fragment}"))
+    format!("naive+https://{userinfo}{add}:{port}{fragment}")
 }
 
 // ── AnyTLS ──────────────────────────────────────────────────────────────
@@ -1034,7 +1027,7 @@ fn parse_anytls(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -1067,7 +1060,7 @@ fn parse_anytls(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_anytls(profile: &Profile) -> Result<String> {
+fn format_anytls(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
@@ -1106,7 +1099,7 @@ fn format_anytls(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("anytls://{add}:{port}{qs}{fragment}"))
+    format!("anytls://{add}:{port}{qs}{fragment}")
 }
 
 // ── ShadowTLS ───────────────────────────────────────────────────────────
@@ -1118,7 +1111,7 @@ fn parse_shadowtls(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -1143,7 +1136,7 @@ fn parse_shadowtls(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_shadowtls(profile: &Profile) -> Result<String> {
+fn format_shadowtls(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let remark = profile.remarks.as_deref().unwrap_or("");
     let mut query: Vec<(String, String)> = Vec::new();
@@ -1182,7 +1175,7 @@ fn format_shadowtls(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("shadowtls://{add}:{port}{qs}{fragment}"))
+    format!("shadowtls://{add}:{port}{qs}{fragment}")
 }
 
 // ── WireGuard ───────────────────────────────────────────────────────────
@@ -1191,7 +1184,7 @@ fn parse_wireguard(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
     // WireGuard URLs may not have a host:port authority; use query params
     let mut profile = base_profile(Protocol::WireGuard, "", 0);
-    profile.remarks = parsed.fragment.clone();
+    profile.remarks.clone_from(&parsed.fragment);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -1232,7 +1225,7 @@ fn parse_wireguard(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_wireguard(profile: &Profile) -> Result<String> {
+fn format_wireguard(profile: &Profile) -> String {
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(ps) = &profile.protocol_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
@@ -1268,7 +1261,7 @@ fn format_wireguard(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("wireguard://?{qs}{fragment}"))
+    format!("wireguard://?{qs}{fragment}")
 }
 
 // ── URL splitter ───────────────────────────────────────────────────────
@@ -1276,12 +1269,12 @@ fn format_wireguard(profile: &Profile) -> Result<String> {
 /// Parsed URL components that avoid the edge-case failures of `url::Url::parse`
 /// (Trojan `#` in password, `@` in query values, etc.).
 struct UrlComponents {
-    scheme: String,
+    _scheme: String,
     username: String,
     password: Option<String>,
     host: String,
     port: Option<u16>,
-    path: Option<String>,
+    _path: Option<String>,
     query_pairs: Vec<(String, String)>,
     fragment: Option<String>,
 }
@@ -1334,12 +1327,12 @@ fn split_share_url(url: &str) -> Result<UrlComponents> {
     host = fix_percent_encoding(&host);
 
     Ok(UrlComponents {
-        scheme,
+        _scheme: scheme,
         username,
         password,
         host,
         port,
-        path,
+        _path: path,
         query_pairs,
         fragment,
     })
@@ -1378,17 +1371,14 @@ fn find_userinfo<'a>(s: &'a str, scheme: &str) -> (String, Option<String>, &'a s
         }
     });
 
-    match at_pos {
-        Some(pos) => {
-            let userinfo = &s[..pos];
-            let rest = &s[pos + 1..];
-            match userinfo.split_once(':') {
-                Some((u, p)) => (percent_decode(u), Some(percent_decode(p)), rest),
-                None => (percent_decode(userinfo), None, rest),
-            }
+    at_pos.map_or_else(|| (String::new(), None, s), |pos| {
+        let userinfo = &s[..pos];
+        let rest = &s[pos + 1..];
+        match userinfo.split_once(':') {
+            Some((u, p)) => (percent_decode(u), Some(percent_decode(p)), rest),
+            None => (percent_decode(userinfo), None, rest),
         }
-        None => (String::new(), None, s),
-    }
+    })
 }
 
 /// Parse `host:port` string with recovery for:
@@ -1441,16 +1431,14 @@ fn fix_percent_encoding(s: &str) -> String {
         if bytes[i] == b'%' {
             if i + 2 < bytes.len() && is_hex_char(bytes[i + 1]) && is_hex_char(bytes[i + 2]) {
                 out.push(b'%');
-                i += 1;
             } else {
                 // Bare % — encode it
                 out.extend_from_slice(b"%25");
-                i += 1;
             }
         } else {
             out.push(bytes[i]);
-            i += 1;
         }
+        i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
 }
@@ -1677,7 +1665,7 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_shadowsocksr(profile: &Profile) -> Result<String> {
+fn format_shadowsocksr(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let password = profile.user_id.as_deref().unwrap_or("");
 
@@ -1710,11 +1698,11 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
             .filter(|s| !s.is_empty())
     {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(obfsparam);
-        query_str.push_str(&format!("obfsparam={encoded}&"));
+        let _ = write!(query_str, "obfsparam={encoded}&");
     }
     if let Some(remarks) = &profile.remarks {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(remarks);
-        query_str.push_str(&format!("remarks={encoded}"));
+        let _ = write!(query_str, "remarks={encoded}");
     }
 
     let raw = format!("{add}:{port}:{protocol}:{method}:{obfs}:{password}");
@@ -1724,7 +1712,7 @@ fn format_shadowsocksr(profile: &Profile) -> Result<String> {
         format!("{raw}/?{query_str}")
     };
     let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(full.as_bytes());
-    Ok(format!("ssr://{encoded}"))
+    format!("ssr://{encoded}")
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
@@ -1738,12 +1726,12 @@ fn parse_http(url: &str) -> Result<Profile> {
     // Split @ for userinfo
     let (userinfo, hostpart) = rest.split_once('@').unwrap_or(("", rest));
     // Split # for fragment (remark)
-    let (hostport, fragment) = hostpart
+    let (host_and_port, fragment) = hostpart
         .split_once('#')
         .map(|(h, f)| (h, Some(f.to_string())))
         .unwrap_or((hostpart, None));
 
-    let (host, port_str) = hostport
+    let (host, port_str) = host_and_port
         .rsplit_once(':')
         .ok_or_else(|| ImportError::Parse("http: missing port".into()))?;
     let port: i32 = port_str
@@ -1776,7 +1764,7 @@ fn parse_http(url: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-fn format_http(profile: &Profile) -> Result<String> {
+fn format_http(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let (user, pass) = profile
         .protocol_settings
@@ -1810,7 +1798,7 @@ fn format_http(profile: &Profile) -> Result<String> {
     } else {
         format!("#{remark}")
     };
-    Ok(format!("http://{userinfo}{add}:{port}{fragment}"))
+    format!("http://{userinfo}{add}:{port}{fragment}")
 }
 // ── Validation Layer ─────────────────────────────────────────────────────
 
@@ -1840,40 +1828,16 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
     let missing = |field: &str| ImportError::Validation(format!("missing field: {field}"));
 
     match protocol {
-        Protocol::Vmess | Protocol::Vless => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.port.is_none() || profile.port == Some(0) {
-                return Err(missing("port"));
-            }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
-                return Err(missing("user_id"));
-            }
-        }
-        Protocol::Trojan => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.port.is_none() || profile.port == Some(0) {
-                return Err(missing("port"));
-            }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
-                return Err(missing("user_id"));
-            }
-        }
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.port.is_none() || profile.port == Some(0) {
-                return Err(missing("port"));
-            }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
-                return Err(missing("user_id"));
-            }
-        }
-        Protocol::ShadowsocksR => {
+        Protocol::Vmess
+        | Protocol::Vless
+        | Protocol::Trojan
+        | Protocol::Shadowsocks
+        | Protocol::Shadowsocks2022
+        | Protocol::ShadowsocksR
+        | Protocol::Tuic
+        | Protocol::Naive
+        | Protocol::AnyTls
+        | Protocol::ShadowTls => {
             if profile.address.is_none() || profile.address.as_deref() == Some("") {
                 return Err(missing("address"));
             }
@@ -1893,42 +1857,12 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
             }
             // Port defaults to 443 for Hysteria2
         }
-        Protocol::Hysteria => {
+        Protocol::Hysteria | Protocol::Socks | Protocol::Http => {
             if profile.address.is_none() || profile.address.as_deref() == Some("") {
                 return Err(missing("address"));
             }
             if profile.port.is_none() || profile.port == Some(0) {
                 return Err(missing("port"));
-            }
-        }
-        Protocol::Tuic => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.port.is_none() || profile.port == Some(0) {
-                return Err(missing("port"));
-            }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
-                return Err(missing("user_id"));
-            }
-        }
-        Protocol::Socks | Protocol::Http => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.port.is_none() || profile.port == Some(0) {
-                return Err(missing("port"));
-            }
-        }
-        Protocol::Naive | Protocol::AnyTls | Protocol::ShadowTls => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.port.is_none() || profile.port == Some(0) {
-                return Err(missing("port"));
-            }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
-                return Err(missing("user_id"));
             }
         }
         Protocol::WireGuard => {
@@ -2006,7 +1940,7 @@ fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()>
 }
 
 /// Security validation: check for insecure settings and log warnings.
-fn validate_security(profile: &Profile) -> Result<()> {
+fn validate_security(profile: &Profile) {
     if let Some(ss) = &profile.stream_settings
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
         && (v.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
@@ -2017,7 +1951,6 @@ fn validate_security(profile: &Profile) -> Result<()> {
             profile.remarks.as_deref().unwrap_or("(unnamed)")
         );
     }
-    Ok(())
 }
 
 #[cfg(test)]

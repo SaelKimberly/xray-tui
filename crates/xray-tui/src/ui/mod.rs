@@ -321,7 +321,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.mode = *state
                 .previous_mode
                 .take()
-                .unwrap_or(Box::new(crate::AppMode::List));
+                .unwrap_or_else(|| Box::new(crate::AppMode::List));
         }
         // Open help overlay from List mode
         KeyCode::Char('?') if !matches!(&state.mode, crate::AppMode::Help) => {
@@ -424,15 +424,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         {
             state.move_profile_down().await;
         }
-        KeyCode::Enter
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && state.current_tab == Tab::Profiles =>
-        {
-            if let Some(id) = state.selected_profile_id() {
-                state.connect_to_profile(&id);
-            }
-        }
-        KeyCode::Char('g')
+        KeyCode::Enter | KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
@@ -613,12 +605,11 @@ fn render(frame: &mut Frame, state: &AppState) {
 
     let is_small = frame.area().height < SMALL_THRESH;
     let overlay = !state.actions_compact && is_small;
-    let ph = if state.current_tab != Tab::Profiles
-        && !matches!(state.mode, AppMode::SpeedTestMenu { .. } | AppMode::Help)
+    let ph = if (state.current_tab != Tab::Profiles
+        && !matches!(state.mode, AppMode::SpeedTestMenu { .. } | AppMode::Help))
+        || overlay
     {
         0 // actions panel only useful on Profiles tab
-    } else if overlay {
-        0
     } else if state.actions_compact {
         1
     } else {

@@ -99,10 +99,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
-    let (input, error) = match &state.mode {
-        AppMode::ImportUrl { input, error } => (input, error),
-        _ => return,
-    };
+    let AppMode::ImportUrl { input, error } = &state.mode else { return; };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -407,10 +404,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         _ => None,
     };
 
-    let protocol = match protocol {
-        Some(p) => p,
-        None => return,
-    };
+    let Some(p) = protocol else { return; };
 
     // Now match on mode again to get mutable refs to fields
     let field_data = match &mut state.mode {
@@ -419,19 +413,16 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             fields,
             focus_index,
             ..
-        } => Some((protocol, fields, focus_index, false)),
+        } => Some((p, fields, focus_index, false)),
         AppMode::EditServer {
             fields,
             focus_index,
             ..
-        } => Some((protocol, fields, focus_index, true)),
+        } => Some((p, fields, focus_index, true)),
         _ => None,
     };
 
-    let (protocol, fields, focus_index, is_edit) = match field_data {
-        Some(d) => d,
-        None => return,
-    };
+    let Some((protocol, fields, focus_index, is_edit)) = field_data else { return; };
 
     let form_fields = form_fields_for(protocol);
     if form_fields.is_empty() {
@@ -532,10 +523,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
 }
 
 pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
-    let (results, scroll) = match &state.mode {
-        AppMode::BatchImport { results, scroll } => (results, scroll),
-        _ => return,
-    };
+    let AppMode::BatchImport { results, scroll } = &state.mode else { return; };
 
     let block = Block::default()
         .title(" Batch Import ")

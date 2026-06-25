@@ -73,10 +73,10 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         | SettingsMode::DnsForm { .. }
         | SettingsMode::ProtocolCoreForm { .. }
         | SettingsMode::LoggingForm { .. }
-        | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key).await,
+        | SettingsMode::SpeedTestForm { .. } => handle_form_key(state, key),
         SettingsMode::RoutingList { .. } => handle_routing_list_key(state, key).await,
         SettingsMode::RoutingForm { .. } => handle_routing_form_key(state, key).await,
-        SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key).await,
+        SettingsMode::UpdateForm { .. } => handle_update_form_key(state, key),
     }
 }
 
@@ -309,6 +309,7 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
 // TODO 3.3: Add scroll_offset: usize to each *Form variant + scroll indicators
 // (↑ N more / ↓ N more) when fields exceed visible height. Render clipped
 // window around focused field.
+#[allow(clippy::option_if_let_else, reason = "three-branch if-else more readable than nested map_or_else for display formatting")]
 fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode = match &state.mode {
         AppMode::Settings { mode } => mode,
@@ -394,7 +395,7 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, (_key, label, field_type)) in field_defs.iter().enumerate() {
+    for (i, (key, label, field_type)) in field_defs.iter().enumerate() {
         let is_focused = i == focus_index;
         let val = fields.get(i).map_or("", |(_, v)| v.as_str());
 
@@ -432,7 +433,7 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
             ),
         ];
         lines.push(Line::from(spans));
-        if let Some(error) = form_errors.get(*_key) {
+        if let Some(error) = form_errors.get(*key) {
             lines.push(Line::from(Span::styled(
                 format!("  ⚠ {error}"),
                 Theme::ERROR,
@@ -465,7 +466,7 @@ const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
     }
 }
 
-async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
+fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     // Clone mode to extract data, then work through mutable state
     let mode_snapshot = match &state.mode {
         AppMode::Settings { mode } => mode.clone(),
@@ -759,7 +760,7 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, inner);
 }
 
-async fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
+fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
     match key.code {
         KeyCode::Char('c' | 'C') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.spawn_update_check();
@@ -1110,26 +1111,23 @@ fn routing_rule_fields(rule: Option<&crate::RoutingRule>) -> Vec<(String, String
     ];
     keys.iter()
         .map(|k| {
-            let val = match rule {
-                Some(r) => match *k {
-                    "type" => r.r#type.to_string(),
-                    "domain_matcher" => r.domain_matcher.as_deref().unwrap_or("").to_string(),
-                    "domains" => r.domains.as_deref().unwrap_or("").to_string(),
-                    "ips" => r.ips.as_deref().unwrap_or("").to_string(),
-                    "inbound_tags" => r.inbound_tags.as_deref().unwrap_or("").to_string(),
-                    "port" => r.port.as_deref().unwrap_or("").to_string(),
-                    "source_ports" => r.source_ports.as_deref().unwrap_or("").to_string(),
-                    "network" => r.network.as_deref().unwrap_or("").to_string(),
-                    "protocols" => r.protocols.as_deref().unwrap_or("").to_string(),
-                    "domain_strategy" => r.domain_strategy.as_deref().unwrap_or("").to_string(),
-                    "outbound_tag" => r.outbound_tag.as_deref().unwrap_or("").to_string(),
-                    "balancer_tag" => r.balancer_tag.as_deref().unwrap_or("").to_string(),
-                    "rule_set_file" => r.rule_set_file.as_deref().unwrap_or("").to_string(),
-                    "rule_set_url" => r.rule_set_url.as_deref().unwrap_or("").to_string(),
-                    _ => String::new(),
-                },
-                None => String::new(),
-            };
+            let val = rule.map_or_else(String::new, |r| match *k {
+                "type" => r.r#type.to_string(),
+                "domain_matcher" => r.domain_matcher.as_deref().unwrap_or("").to_string(),
+                "domains" => r.domains.as_deref().unwrap_or("").to_string(),
+                "ips" => r.ips.as_deref().unwrap_or("").to_string(),
+                "inbound_tags" => r.inbound_tags.as_deref().unwrap_or("").to_string(),
+                "port" => r.port.as_deref().unwrap_or("").to_string(),
+                "source_ports" => r.source_ports.as_deref().unwrap_or("").to_string(),
+                "network" => r.network.as_deref().unwrap_or("").to_string(),
+                "protocols" => r.protocols.as_deref().unwrap_or("").to_string(),
+                "domain_strategy" => r.domain_strategy.as_deref().unwrap_or("").to_string(),
+                "outbound_tag" => r.outbound_tag.as_deref().unwrap_or("").to_string(),
+                "balancer_tag" => r.balancer_tag.as_deref().unwrap_or("").to_string(),
+                "rule_set_file" => r.rule_set_file.as_deref().unwrap_or("").to_string(),
+                "rule_set_url" => r.rule_set_url.as_deref().unwrap_or("").to_string(),
+                _ => String::new(),
+            });
             (k.to_string(), val)
         })
         .collect()
@@ -1197,7 +1195,7 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, (_key, label, field_type)) in ROUTING_FIELD_DEFS.iter().enumerate() {
+    for (i, (key, label, field_type)) in ROUTING_FIELD_DEFS.iter().enumerate() {
         let is_focused = i == focus_index;
         let val = fields.get(i).map_or("", |(_, v)| v.as_str());
 
@@ -1234,7 +1232,7 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
             ),
         ];
         lines.push(Line::from(spans));
-        if let Some(error) = form_errors.get(*_key) {
+        if let Some(error) = form_errors.get(*key) {
             lines.push(Line::from(Span::styled(
                 format!("  ⚠ {error}"),
                 Theme::ERROR,
@@ -1343,6 +1341,7 @@ fn truncate_to(s: &str, max: usize) -> String {
 }
 
 /// Extract (fields, `focus_index`, `form_errors`) from any settings form variant.
+#[allow(clippy::type_complexity, reason = "temporary tuple type in form extraction helper")]
 pub const fn extract_form_fields(
     state: &AppState,
 ) -> Option<(&Vec<(String, String)>, &usize, &HashMap<String, String>)> {
@@ -1410,6 +1409,7 @@ pub const fn extract_form_fields(
     }
 }
 
+#[allow(clippy::type_complexity, reason = "temporary tuple type in form extraction helper")]
 /// Mutable version of `extract_form_fields`.
 pub const fn extract_form_fields_mut(
     state: &mut AppState,

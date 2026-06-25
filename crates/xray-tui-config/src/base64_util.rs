@@ -25,7 +25,7 @@ pub fn decode_base64(data: &str) -> Result<Vec<u8>, base64_simd::Error> {
     let end = decoded
         .as_ref()
         .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '/' | '-' | '_' | '='))
-        .unwrap_or(decoded.as_ref().len());
+        .unwrap_or_else(|| decoded.as_ref().len());
     let mut data = &decoded.as_ref()[..end];
 
     // After the last padding marker (`==` or `=`), strip trailing annotation text.
@@ -57,10 +57,7 @@ pub fn decode_base64(data: &str) -> Result<Vec<u8>, base64_simd::Error> {
 
 /// Percent-decode a string, replacing %XX sequences with decoded bytes.
 fn simple_percent_decode(s: &str) -> Cow<'_, str> {
-    match urlencoding::decode(s) {
-        Ok(decoded) => Cow::Owned(decoded.into_owned()),
-        Err(_) => Cow::Borrowed(s),
-    }
+    urlencoding::decode(s).map_or(Cow::Borrowed(s), |d| Cow::Owned(d.into_owned()))
 }
 
 #[cfg(test)]

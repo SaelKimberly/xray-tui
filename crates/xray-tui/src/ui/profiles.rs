@@ -115,15 +115,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState) {
-    let group_name = match &state.selected_group_id {
-        Some(gid) => state
+    let group_name = state.selected_group_id.as_ref().map_or("All", |gid| {
+        state
             .groups
             .iter()
             .find(|g| g.id == *gid)
             .and_then(|g| g.name.as_deref())
-            .unwrap_or("All"),
-        None => "All",
-    };
+            .unwrap_or("All")
+    });
 
     let group_text = format!(" Group: {group_name}");
     let group_span = Span::styled(group_text, Theme::CONTAINER_TITLE);
@@ -186,7 +185,7 @@ fn render_data_grid(
         SortColumn::Delay => Some(7 + usize::from(show_group)),
         SortColumn::Speed => Some(8 + usize::from(show_group)),
         SortColumn::Traffic => Some(10 + usize::from(show_group)),
-        _ => None, // Core and other non-visible columns
+        SortColumn::Core => None, // Non-visible column
     };
     if let Some(idx) = sort_idx
         && let Some(item) = header_items.get_mut(idx)

@@ -1,6 +1,8 @@
 use crate::{LogEntry, Result};
 use std::time::Duration;
+use std::fmt::Write as _;
 use turso::params;
+use turso::Value;
 pub struct LogRepository<'a> {
     conn: &'a turso::Connection,
 }
@@ -105,15 +107,14 @@ impl<'a> LogRepository<'a> {
             "SELECT id, timestamp_nanos, level, target, message, metadata_json, source
              FROM logs WHERE 1=1",
         );
-        use turso::Value;
         let mut params: Vec<Value> = Vec::new();
 
         if let Some(start) = start_nanos {
-            sql.push_str(&format!(" AND timestamp_nanos >= ?{}", params.len() + 1));
+            let _ = write!(sql, " AND timestamp_nanos >= ?{}", params.len() + 1);
             params.push(Value::Integer(start));
         }
         if let Some(end) = end_nanos {
-            sql.push_str(&format!(" AND timestamp_nanos <= ?{}", params.len() + 1));
+            let _ = write!(sql, " AND timestamp_nanos <= ?{}", params.len() + 1);
             params.push(Value::Integer(end));
         }
         if let Some(level) = min_level {
@@ -124,28 +125,28 @@ impl<'a> LogRepository<'a> {
                 let placeholders: Vec<String> = (0..levels.len())
                     .map(|i| format!("?{}", params.len() + 1 + i))
                     .collect();
-                sql.push_str(&format!(" AND level IN ({})", placeholders.join(",")));
+                let _ = write!(sql, " AND level IN ({})", placeholders.join(","));
                 for lvl in &levels {
                     params.push(Value::Text(lvl.clone()));
                 }
             }
         }
         if let Some(target) = target_contains {
-            sql.push_str(&format!(" AND target LIKE ?{}", params.len() + 1));
+            let _ = write!(sql, " AND target LIKE ?{}", params.len() + 1);
             params.push(Value::Text(format!("%{target}%")));
         }
         if let Some(src) = source {
-            sql.push_str(&format!(" AND source = ?{}", params.len() + 1));
+            let _ = write!(sql, " AND source = ?{}", params.len() + 1);
             params.push(Value::Text(src.to_owned()));
         }
 
         sql.push_str(" ORDER BY timestamp_nanos DESC, id DESC");
 
         // LIMIT before OFFSET (SQLite requirement)
-        sql.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+        let _ = write!(sql, " LIMIT ?{}", params.len() + 1);
         params.push(Value::Integer(limit));
         if offset > 0 {
-            sql.push_str(&format!(" OFFSET ?{}", params.len() + 1));
+            let _ = write!(sql, " OFFSET ?{}", params.len() + 1);
             params.push(Value::Integer(offset));
         }
 
@@ -186,18 +187,17 @@ const fn backoff_ms(attempt: usize) -> u64 {
 }
 
 /// Returns the list of levels that match `level` and above (more severe).
-/// Example: "info" → ["info", "warning", "error"]
+/// Example: `"info"` → `["info", "warning", "error"]`
 fn level_hierarchy(level: &str) -> Vec<String> {
     let all = ["error", "warning", "info", "debug", "trace"];
     let pos = all.iter().position(|l| *l == level);
-    match pos {
-        Some(p) => all[..=p]
+    pos.map_or_else(Vec::new, |p| {
+        all[..=p]
             .iter()
             .map(std::string::ToString::to_string)
             .rev()
-            .collect(),
-        None => Vec::new(),
-    }
+            .collect()
+    })
 }
 
 #[cfg(test)]

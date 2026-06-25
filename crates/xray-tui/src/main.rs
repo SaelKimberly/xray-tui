@@ -1,3 +1,10 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "known-safe casts on port/len/display"
+)]
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
@@ -90,6 +97,7 @@ where
 
 // ── Application entry point ──
 
+#[allow(clippy::significant_drop_tightening, reason = "trivial drop timing differences, adding explicit drops adds noise")]
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Load app config (~/.config/xray-tui/config.json) — returns Default on missing

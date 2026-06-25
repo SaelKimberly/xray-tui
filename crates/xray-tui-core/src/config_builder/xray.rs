@@ -186,7 +186,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
         .protocol_settings
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .unwrap_or_else(|| json!({}));
 
     let s_settings: Option<Value> = profile
         .stream_settings
@@ -426,7 +426,7 @@ fn build_dns(dns: &DnsSetting) -> DnsConfig {
         .hosts
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .unwrap_or_else(|| json!({}));
 
     DnsConfig { servers, hosts }
 }

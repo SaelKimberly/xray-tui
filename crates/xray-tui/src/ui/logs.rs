@@ -78,7 +78,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             let style = match log.level.as_str() {
                 "error" | "fatal" | "panic" => Theme::ERROR,
                 "warning" | "warn" => Theme::WARNING,
-                "info" => Style::default(),
                 "debug" | "trace" => Theme::HINT,
                 _ => Style::default(),
             };

@@ -32,10 +32,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     } else if let Some(err) = &state.connection_error {
         (format!(" Error: {err}"), Theme::ERROR)
     } else {
-        match &state.connected_core {
-            Some(core) => (format!(" Connected [{core}]"), Theme::SUCCESS),
-            None => (" Disconnected".to_string(), Theme::ERROR),
-        }
+        state.connected_core.as_ref().map_or_else(
+            || (" Disconnected".to_string(), Theme::ERROR),
+            |core| (format!(" Connected [{core}]"), Theme::SUCCESS),
+        )
     };
 
     // Append update indicator if any backend has an update available
@@ -77,12 +77,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             crate::SettingsMode::MuxForm { .. } => " Settings > Mux",
             crate::SettingsMode::StatsForm { .. } => " Settings > Statistics",
             crate::SettingsMode::DnsForm { .. } => " Settings > DNS",
-            crate::SettingsMode::RoutingList { .. } => " Settings > Routing",
+            crate::SettingsMode::RoutingList { .. } | crate::SettingsMode::RoutingForm { .. } => " Settings > Routing",
             crate::SettingsMode::UpdateForm { .. } => " Settings > Updates",
             crate::SettingsMode::ProtocolCoreForm { .. } => " Settings > Protocol Core",
             crate::SettingsMode::LoggingForm { .. } => " Settings > Logging",
             crate::SettingsMode::SpeedTestForm { .. } => " Settings > Speed Test",
-            crate::SettingsMode::RoutingForm { .. } => " Settings > Routing",
         },
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",

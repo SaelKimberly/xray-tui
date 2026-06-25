@@ -142,7 +142,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
         .protocol_settings
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .unwrap_or_else(|| json!({}));
 
     match protocol {
         Protocol::Tuic => {
@@ -412,7 +412,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             let ssh_port = p_settings
                 .get("ssh_port")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::from(port));
+                .unwrap_or_else(|| u64::from(port));
             let username = p_settings
                 .get("username")
                 .and_then(|v| v.as_str())
@@ -652,7 +652,7 @@ fn build_dns(dns: &DnsSetting) -> SingBoxDnsConfig {
         .hosts
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .unwrap_or_else(|| json!({}));
 
     SingBoxDnsConfig { servers, hosts }
 }
@@ -671,12 +671,12 @@ fn parse_settings(profile: &Profile) -> (Value, Value) {
         .protocol_settings
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .unwrap_or_else(|| json!({}));
     let s = profile
         .stream_settings
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(json!({}));
+        .unwrap_or_else(|| json!({}));
     (p, s)
 }
 

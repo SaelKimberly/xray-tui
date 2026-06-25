@@ -39,23 +39,17 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
         state.filtered_profiles().nth(idx)
     });
 
-    match row {
-        Some(r) => {
+    row.map_or_else(
+        || ("-".to_string(), "No server".to_string(), String::new(), 0u16, String::new()),
+        |r| {
             let proto = Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
             let remarks = r.profile.remarks.clone().unwrap_or_default();
             let addr = r.profile.address.clone().unwrap_or_default();
             let port = r.profile.port.unwrap_or(0) as u16;
             let core = state.resolved_core(r).to_string();
             (proto.to_string(), remarks, addr, port, core)
-        }
-        None => (
-            "-".to_string(),
-            "No server".to_string(),
-            String::new(),
-            0,
-            String::new(),
-        ),
-    }
+        },
+    )
 }
 
 // ── Compact render (1-line bar) ────────────────────────────────────────
@@ -231,10 +225,10 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         height: area.height.saturating_sub(2),
     };
     let available = inner_area.height as usize;
-    let mut rows = vec![row1, row2, row3, row4, row5, row6];
-    rows.truncate(available);
+    let mut all_rows = vec![row1, row2, row3, row4, row5, row6];
+    all_rows.truncate(available);
 
-    for (i, row) in rows.into_iter().enumerate() {
+    for (i, row) in all_rows.into_iter().enumerate() {
         let y = inner_area.y + i as u16;
         if y < inner_area.y + inner_area.height {
             let r = Rect::new(inner_area.x, y, inner_area.width, 1);

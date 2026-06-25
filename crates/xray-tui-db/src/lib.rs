@@ -1,3 +1,12 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::manual_let_else,
+    clippy::option_if_let_else,
+    reason = "known-safe casts on port/len/display; code clarity decisions override style lints"
+)]
 pub mod log_repo;
 pub mod models;
 pub mod schema;
@@ -9,6 +18,7 @@ pub use models::LogEntry;
 pub use turso::Connection as DbConnection;
 
 use std::path::Path;
+use turso::Builder;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
@@ -310,7 +320,6 @@ impl Database {
         let path_str = path
             .to_str()
             .ok_or_else(|| DatabaseError::Generic("invalid db path".into()))?;
-        use turso::Builder;
         let db = Builder::new_local(path_str)
             .build()
             .await
