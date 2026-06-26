@@ -345,6 +345,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     8 => {
                         state.remove_failed_servers().await;
                     }
+                    10 => {
+                        state.stop_speed_test();
+                    }
                     _ => {}
                 }
             }
@@ -523,6 +526,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         // Speed test menu
         KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
             state.mode = crate::AppMode::SpeedTestMenu { selected: 0 };
+        }
+        // Stop current speed test
+        KeyCode::Char('s' | 'S') if state.current_tab == Tab::Profiles && !state.testing_profiles.is_empty() => {
+            state.stop_speed_test();
+            state.log_trace("info", "tui", "Speed test stopped by user");
         }
         // Cycle sort column — preserve selection by profile ID
         KeyCode::Char('o' | 'O') if state.current_tab == Tab::Profiles => {
@@ -885,6 +893,8 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("TCP + Real Ping (All Visible)"),
     SpeedTestMenuItem::Item("Sort by Delay"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
+    SpeedTestMenuItem::Separator,
+    SpeedTestMenuItem::Item("Stop Testing"),
 ];
 
 fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -904,7 +914,11 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
             SpeedTestMenuItem::Separator => unreachable!(),
         };
         let prefix = if i == selected { "► " } else { "  " };
-        let style = if i == selected {
+        let is_stop_item = *label == "Stop Testing";
+        let is_disabled = is_stop_item && state.testing_profiles.is_empty();
+        let style = if is_disabled {
+            Style::default().fg(Color::DarkGray)
+        } else if i == selected {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Gray)

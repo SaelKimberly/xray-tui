@@ -145,7 +145,7 @@
 ### Core Management
 
 - ☐ Automatic server failover — health-check based fallback between profiles in a group
-- ☐ Batch test parameters — configurable concurrency, timeout, test URL per test type (timeouts + URLs done via SpeedTestConfig in Phase 7)
+:- ✅ Batch test parameters — configurable concurrency (tcp_ping_concurrency, real_ping_concurrency via SpeedTestConfig), timeout, test URL per test type (timeouts + URLs done via SpeedTestConfig in Phase 7)
 - ☐ PAC system proxy mode — PAC file generation with GFWList integration (HTTP proxy only currently)
 - ☐ Multi-core simultaneous support — run xray-core and sing-box concurrently for different groups
 

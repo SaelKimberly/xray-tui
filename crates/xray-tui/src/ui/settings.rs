@@ -293,6 +293,7 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
             ("batch_delay_secs", "Batch Delay", "Text"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
+            ("tcp_ping_concurrency", "TCP Ping Concurrency", "Number"),
         ],
         SettingsMode::LoggingForm { .. } => &[("log_ttl_secs", "Log Retention", "Text")],
         _ => &[],

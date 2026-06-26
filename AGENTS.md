@@ -34,7 +34,7 @@ cargo run
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 - `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
-:- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping with IP info, speed test, UDP test, batch ping, batch-then-real-ping) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig.
+:- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping with IP info, speed test, UDP test) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig. Batch versions (start_batch_ping, start_batch_then_real_ping) in `lib.rs` with concurrent TCP (`tcp_ping_concurrency`, default 20 via Semaphore), wave-ordered real pings, and stop-testing support (`speed_test_stop: Arc<AtomicBool>`).
 :- `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
 
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
@@ -140,6 +140,15 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 5. Add menu item in `render_speed_test_menu()` in `crates/xray-tui/src/ui/mod.rs`
 6. Add key handler entry in `handle_key()` menu navigation
 7. Use `create_socks5_client(proxy, port, socks5h, timeout)` helper from `speed_test.rs` to build the reqwest::Client with SOCKS5 proxy — reuses connection pool and avoids per-call construction overhead
+
+### Adding stop-testing support to a batch operation
+1. Add `speed_test_stop: Arc<AtomicBool>` to AppState, initialize `Arc::new(AtomicBool::new(false))`
+2. Add `stop_speed_test()` method: `self.speed_test_stop.store(true, Ordering::Relaxed)`
+3. Clone the flag and pass into the spawned task. Check at iteration boundaries (page, target, profile) with `stop_flag.load(Ordering::Relaxed)`. Break when true.
+4. Track which profile IDs received results via a `HashSet<String>` to prevent double-emission of "Cancelled" — only emit for unprocessed profiles.
+5. Auto-reset flag when `testing_profiles.is_empty()` in `poll_core_events` handler.
+6. Add menu entry in `SPEED_TEST_MENU_ITEMS` with dispatch. Add hotkey `'s'` in key handler.
+7. Update status bar to show "■ Stopping..." indicator when flag is active, overriding testing indicators.
 
 ### Adding a backend auto-update feature
 1. Create functions in `crates/xray-tui-core/src/updater.rs`: `get_current_version` (runs subprocess), `get_latest_version` (GitHub releases API), `download_release` (streaming download to temp dir), `install_binary` (extract to temp → verify → .bak → copy all → remove .bak on success/restore from .bak on failure)

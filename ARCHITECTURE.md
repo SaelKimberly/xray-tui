@@ -154,7 +154,7 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 ...
 - `theme.rs` — Central color palette and Style definitions (Theme struct with 19 constants across 6 groups)
 
-:**`speed_test.rs`** — Async speed test engine:
+::**`speed_test.rs`** — Async speed test engine:
 ```rust
 pub enum TestType { TcpPing, RealPing, SpeedTest, UdpTest }
 pub struct RealPingResult { pub latency_ms: u64, pub ip_info: Option<String> }
@@ -170,9 +170,28 @@ fetches IP info (ISP/location) from a configurable `ip_api_url` through the same
 with both latency and IP metadata.
 Results are sent via CoreEvent::SpeedTestResult (with optional `ip_info` field) and handled in poll_core_events(),
 which updates the ProfileExtension (delay, ip_info) in memory and persists via upsert_profile_extension().
-Batch ping mode deduplicates by (address, port) using the UniqueTarget helper struct.
-`batch_then_real_ping` runs TCP ping on all profiles, selects the fastest N (batch_page_size), then runs real ping
-on those with IP info fetch. Sends `TestTypeUpdate` events mid-flow to update displayed emoji.
+
+**Batch ping (start_batch_ping)**: Deduplicates by (address, port) using the `UniqueTarget` helper struct.
+TCP phase is **concurrent** within each batch page, bounded by a `tokio::sync::Semaphore` with `tcp_ping_concurrency`
+(default 20, configurable in SpeedTestConfig). Supports cancellation via `speed_test_stop: Arc<AtomicBool>` flag
+on AppState — checked at page and target boundaries. Checked profiles receive "Cancelled" error results.
+
+**Batch-then-real-ping (start_batch_then_real_ping)**: Two-phase pipeline:
+1. **Phase 1**: Concurrent TCP ping on all deduplicated targets (same semaphore as batch_ping). Stores
+   **all** profiles per target (`Vec<(UniqueTarget, Vec<Profile>)>`) instead of one representative.
+   Collects TCP successes into `tcp_successes`.
+2. **Phase 2**: Wave-ordered real pings on TCP-successful profiles. **Wave ordering** interleaves profiles
+   from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates.
+   Each profile gets its own **temp core + real ping** (not shared across same-host profiles), bounded by
+   `real_ping_concurrency` semaphore. Supports cancellation with `phase2_tested` tracking.
+
+**Stop testing**: `speed_test_stop: Arc<AtomicBool>` on AppState. Set via menu ("Stop Testing" at index 10)
+or hotkey `'s'`. Auto-resets when `testing_profiles` empties. `tested_pids`/`tcp_completed` sets prevent
+double-emission of "Cancelled" for already-tested profiles. Status bar shows "■ Stopping..." in red while
+stop flag is active.
+
+**Configuration**: SpeedTestConfig in `AppConfig` includes `tcp_ping_concurrency` (default 20) and
+`real_ping_concurrency` (default 5), both editable via Settings > Speed Test form.
 
 ### xray-tui-core (library crate)
 

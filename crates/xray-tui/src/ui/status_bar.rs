@@ -22,6 +22,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             format!(" {} Connecting... ", spinner_char()),
             Theme::SPINNER,
         )
+    } else if state.speed_test_stop.load(Ordering::Relaxed) {
+        (" ■ Stopping...".to_string(), Theme::ERROR)
     } else if let Some((done, total)) = state.test_progress {
         (
             format!(" Testing: {done}/{total} profiles..."),
