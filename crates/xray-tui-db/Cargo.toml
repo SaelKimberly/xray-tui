@@ -13,13 +13,19 @@ serde.workspace = true
 # ============ Error Handling ============
 thiserror.workspace = true
 
+# ============ Logging ============
+tracing.workspace = true
+
 # ============ Text / Search / Hash ============
 uuid.workspace = true
 rapidhash = "4.4"
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
-tokio.features = ["time"]
+tokio.features = ["time", "sync"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
