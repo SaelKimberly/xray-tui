@@ -17,7 +17,14 @@ cargo run
     - `crates/xray-tui/src/main.rs` — binary entry, tokio::main, TuiLogLayer tracing subscriber + subsystem init
 :- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode (incl. SpeedTestForm), SettingsSection (incl. SpeedTest), CoreEvent (incl. TestTypeUpdate), testing_details map
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
-- `crates/xray-tui-db/src/lib.rs` — database layer + query methods
+:- `crates/xray-tui-db/src/lib.rs` — re-export hub; Database, DatabaseError, Result public
+:- `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
+:- `crates/xray-tui-db/src/database.rs` — Database struct + all public query/write methods
+:- `crates/xray-tui-db/src/inner.rs` — private _inner helpers (31 functions, read + write)
+:- `crates/xray-tui-db/src/columns.rs` — private column-index enums for compile-time safe row extraction
+:- `crates/xray-tui-db/src/convert.rs` — private from_row impls for all model types
+:- `crates/xray-tui-db/src/helpers.rs` — private percent_decode / normalize_remark utilities
+:- `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
