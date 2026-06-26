@@ -14,13 +14,14 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use xray_tui::AppState;
 use xray_tui_config::AppConfig;
+use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_db::Database;
 
-// ── Custom tracing layer that forwards events to the TUI event loop and storage ──
+// ── Custom tracing layer that forwards events to the TUI event loop and heed storage ──
 
 struct TuiLogLayer {
     core_event_tx: tokio::sync::mpsc::Sender<xray_tui::CoreEvent>,
-    log_worker_tx: tokio::sync::mpsc::Sender<xray_tui_core::log_worker::LogWorkerMessage>,
+    heed: Arc<HeedLogStorage>,
 }
 
 /// A field visitor that captures the `message` field.
@@ -49,8 +50,6 @@ where
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         use std::time::SystemTime;
-        use xray_tui_core::log_worker::LogWorkerMessage;
-        use xray_tui_db::LogEntry;
 
         let mut visitor = LogVisitor(String::new());
         event.record(&mut visitor);
@@ -58,64 +57,59 @@ where
         let target = event.metadata().target().to_string();
         let level = event.metadata().level().to_string().to_lowercase();
 
-        // Skip trace and debug levels — they are too verbose for both
-        // the TUI log buffer and persistent storage.
+        // Skip trace and debug levels — they are too verbose
         if level == "trace" || level == "debug" {
             return;
         }
-        // Determine source: validation crate logs tagged specially
-        let source = if target.starts_with("xray_tui_config") || target == "validation" {
-            "validation"
-        } else {
-            "tui"
-        };
 
-        // Send to TUI display (non-blocking, unbounded)
-        let _ = self.core_event_tx.try_send(xray_tui::CoreEvent::TuiLog {
-            target: target.clone(),
-            level: level.clone(),
-            message: message.clone(),
-        });
-
-        // Send to persistent storage (non-blocking, unbounded)
         let timestamp_nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as i64;
-        let entry = LogEntry {
-            id: None,
-            timestamp_nanos,
-            level,
+            .as_nanos() as u64;
+
+        // Write to heed storage (swallow errors — UI must keep running)
+        let _ = self
+            .heed
+            .write_log(timestamp_nanos, &level, &target, &message);
+
+        // Send lightweight notification to TUI for the actions panel
+        // The logs tab reads from heed directly via polling.
+        let _ = self.core_event_tx.try_send(xray_tui::CoreEvent::TuiLog {
             target,
+            level,
             message,
-            metadata_json: None,
-            source: source.to_owned(),
-        };
-        let _ = self.log_worker_tx.try_send(LogWorkerMessage::Entry(entry));
+        });
     }
 }
 
 // ── Application entry point ──
 
-#[allow(clippy::significant_drop_tightening, reason = "trivial drop timing differences, adding explicit drops adds noise")]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "trivial drop timing differences, adding explicit drops adds noise"
+)]
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Load app config (~/.config/xray-tui/config.json) — returns Default on missing
     let config = AppConfig::load()?;
 
-    // 2. Open database (~/.config/xray-tui/data.db)
-    let db_path = dirs::config_dir()
+    let config_dir = dirs::config_dir()
         .unwrap_or_else(|| Path::new(".").to_path_buf())
-        .join("xray-tui")
-        .join("data.db");
+        .join("xray-tui");
+
+    // 2. Open database (~/.config/xray-tui/data.db)
+    let db_path = config_dir.join("data.db");
     let db = Database::open(&db_path).await?;
     db.normalize_all_remarks().await?;
+
+    // 3. Open heed log storage (~/.config/xray-tui/logs.lmdb)
+    let log_path = config_dir.join("logs.lmdb");
+    let heed = Arc::new(HeedLogStorage::new(&log_path)?);
+
     let mut state = AppState::new(Arc::new(db), config).await;
+    state.heed_storage = Some(heed.clone());
 
-    // 4. Create channel for log storage worker
-    let (log_worker_tx, log_worker_rx) = tokio::sync::mpsc::channel(1024);
-
-    // 5. Install tracing subscriber with TuiLogLayer
+    // 4. Install tracing subscriber with TuiLogLayer
     // Do not crash if global subscriber was already set (e.g., in tests)
     if tracing_subscriber::registry()
         .with(
@@ -125,7 +119,7 @@ async fn main() -> Result<()> {
         )
         .with(TuiLogLayer {
             core_event_tx: state.core_event_tx.clone().unwrap(),
-            log_worker_tx: log_worker_tx.clone(),
+            heed: heed.clone(),
         })
         .try_init()
         .is_err()
@@ -133,49 +127,37 @@ async fn main() -> Result<()> {
         eprintln!("xray-tui: tracing subscriber already set — skipping TUI log layer");
     }
 
-    // 6. Pass log_worker_tx to AppState (for non-tracing log sources)
-    state.log_worker_tx = Some(log_worker_tx.clone());
-
-    // 7. Spawn LogStorageWorker background task with dedicated connection
-    let log_conn = state
-        .db
-        .new_connection()
-        .await
-        .expect("Failed to create log storage connection");
-    tokio::spawn(
-        xray_tui_core::log_worker::LogStorageWorker::new(
-            log_worker_rx,
-            log_conn,
-            state.config.logging.batch_size,
-        )
-        .run(),
-    );
-    // 8. Spawn TTL maintenance task for old logs
-    let db_ttl = state.db.clone();
-    let ttl_hours = state.config.logging.ttl_hours;
+    // 5. Spawn TTL maintenance task for old logs
+    let ttl_heed = heed.clone();
+    let ttl_dur = state.config.logging.ttl_secs.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
+        let mut interval = tokio::time::interval(std::time::Duration::from_mins(10)); // 10 min
         interval.tick().await; // skip first tick
         loop {
             interval.tick().await;
-            if ttl_hours == 0 {
+            if ttl_dur.is_zero() {
                 continue; // 0 = keep forever
             }
             let cutoff = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64
-                - (ttl_hours as i64 * 3_600_000_000_000);
-            if let Err(e) = xray_tui_db::LogRepository::new(db_ttl.connection())
-                .delete_older_than(cutoff)
-                .await
-            {
+                .as_nanos() as u64
+                - (ttl_dur.as_nanos() as u64);
+            if let Err(e) = ttl_heed.delete_older_than(cutoff) {
                 tracing::error!(target: "log_worker", "TTL cleanup error: {e}");
             }
         }
     });
 
-    // 5. Enter ratatui event loop
+    // Panic hook to restore terminal on unexpected crashes
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        prev_hook(panic_info);
+    }));
+
+    // 6. Enter ratatui event loop
     xray_tui::ui::run(&mut state).await?;
 
     Ok(())

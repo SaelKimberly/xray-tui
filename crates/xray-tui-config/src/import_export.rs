@@ -197,13 +197,16 @@ fn parse_vmess(url: &str) -> Result<Profile> {
         .map_err(|e| ImportError::Parse(format!("invalid base64 in vmess URL: {e}")))?;
 
     // Trailing-garbage recovery: some providers append extra text after the JSON object
-    let cleaned = raw.iter().rposition(|&b| b == b'}').map_or(raw.as_slice(), |last_brace| {
-        if last_brace + 1 < raw.len() {
-            &raw[..=last_brace]
-        } else {
-            &raw
-        }
-    });
+    let cleaned = raw
+        .iter()
+        .rposition(|&b| b == b'}')
+        .map_or(raw.as_slice(), |last_brace| {
+            if last_brace + 1 < raw.len() {
+                &raw[..=last_brace]
+            } else {
+                &raw
+            }
+        });
 
     // Use permissive JSON parser to handle single quotes, trailing commas, etc.
     let value = crate::permissive_json::permissive_json(cleaned)
@@ -1371,14 +1374,17 @@ fn find_userinfo<'a>(s: &'a str, scheme: &str) -> (String, Option<String>, &'a s
         }
     });
 
-    at_pos.map_or_else(|| (String::new(), None, s), |pos| {
-        let userinfo = &s[..pos];
-        let rest = &s[pos + 1..];
-        match userinfo.split_once(':') {
-            Some((u, p)) => (percent_decode(u), Some(percent_decode(p)), rest),
-            None => (percent_decode(userinfo), None, rest),
-        }
-    })
+    at_pos.map_or_else(
+        || (String::new(), None, s),
+        |pos| {
+            let userinfo = &s[..pos];
+            let rest = &s[pos + 1..];
+            match userinfo.split_once(':') {
+                Some((u, p)) => (percent_decode(u), Some(percent_decode(p)), rest),
+                None => (percent_decode(userinfo), None, rest),
+            }
+        },
+    )
 }
 
 /// Parse `host:port` string with recovery for:

@@ -96,7 +96,7 @@
 - ✅ Log source validation toggle — V key on Logs tab toggles validation/subscription source logs visibility
 - ✅ Graveyard orphan promotion — subscription_upsert_profiles promotes re-imported profiles from graveyard
 - ✅ Keybinding harmonization — Ctrl+D disconnect, Ctrl+Shift+S copy share URL, TUI_MANUAL.md updated
-- ✅ Turso-backed log storage — `logs` table, `LogEntry` model, `LogRepository` (insert_batch, get_filtered, delete_older_than), `LogStorageWorker` background task with dedicated connection, `TuiLogLayer` dual-send architecture, configurable TTL (72h default), Settings→Logging form, `BEGIN IMMEDIATE` + `busy_timeout(500ms)` for lock-free writes
+- ✅ Heed-backed log storage — `logs` LMDB database with postcard-encoded LogMessage entries, `HeedLogStorage` in xray-tui-core::log_heed, no background worker, no dedicated connection, no logs SQLite table
 
 ## Phase 8 — Polish & Release
 -

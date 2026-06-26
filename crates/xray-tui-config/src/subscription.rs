@@ -37,7 +37,10 @@ pub struct StreamingDecoder {
 impl StreamingDecoder {
     /// Create a new decoder.
     #[must_use]
-    #[allow(clippy::large_stack_arrays, reason = "carry_over is heap-allocated via Box, stack is just temporary during Box::new")]
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "carry_over is heap-allocated via Box, stack is just temporary during Box::new"
+    )]
     pub fn new() -> Self {
         Self {
             state: EncodingState::Unknown,
@@ -80,8 +83,12 @@ impl StreamingDecoder {
         }
 
         let total_len = self.pending_input_len + chunk.len();
-        #[allow(clippy::large_stack_arrays, reason = "hot-path decoder needs fixed-size work buffer; heap alloc on every feed call too expensive")]
-        let mut work: [MaybeUninit<u8>; INPUT_CHUNK_SIZE + 4] = [MaybeUninit::uninit(); INPUT_CHUNK_SIZE + 4];
+        #[allow(
+            clippy::large_stack_arrays,
+            reason = "hot-path decoder needs fixed-size work buffer; heap alloc on every feed call too expensive"
+        )]
+        let mut work: [MaybeUninit<u8>; INPUT_CHUNK_SIZE + 4] =
+            [MaybeUninit::uninit(); INPUT_CHUNK_SIZE + 4];
         // Prepend pending bytes
         #[allow(clippy::needless_range_loop)]
         for i in 0..self.pending_input_len {

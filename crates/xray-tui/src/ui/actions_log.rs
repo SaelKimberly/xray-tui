@@ -40,7 +40,15 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
     });
 
     row.map_or_else(
-        || ("-".to_string(), "No server".to_string(), String::new(), 0u16, String::new()),
+        || {
+            (
+                "-".to_string(),
+                "No server".to_string(),
+                String::new(),
+                0u16,
+                String::new(),
+            )
+        },
         |r| {
             let proto = Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
             let remarks = r.profile.remarks.clone().unwrap_or_default();

@@ -203,7 +203,7 @@ fn render_data_grid(
     let mut widths = vec![
         Constraint::Length(3),
         Constraint::Length(5),
-        Constraint::Length(8),
+        Constraint::Length(12),
         Constraint::Length(24),
         Constraint::Length(30),
         Constraint::Length(6),
@@ -255,7 +255,7 @@ fn render_data_grid(
                 format!("{:>3}", scroll_offset + i + 1)
             };
 
-            let type_str = format!("{:.8}", protocol.to_string());
+            let type_str = format!("{:.12}", protocol.to_string());
             let remarks = row.profile.remarks.as_deref().unwrap_or("");
             let remarks_str = truncate_pad(remarks, 24);
             let address = row.profile.address.as_deref().unwrap_or("");

@@ -15,16 +15,17 @@ use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
 use futures_util::StreamExt;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use xray_tui_config::{AppConfig, ValidationSettings};
 use xray_tui_core::grpc_client;
-use xray_tui_core::log_worker::LogWorkerMessage;
+use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
@@ -32,10 +33,9 @@ use xray_tui_core::{
 };
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, LogEntry, Profile, ProfileExtension,
-    RoutingRule, ServerStat, Subscription,
+    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule,
+    ServerStat, Subscription,
 };
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Profiles,
@@ -68,8 +68,9 @@ pub struct ProfileRow {
 
 pub struct LogLine {
     pub level: String,
+    pub target: String,
     pub message: String,
-    pub source: String,
+    pub timestamp_nanos: i64,
 }
 
 /// Sub-modes for the Settings panel.
@@ -225,6 +226,10 @@ pub enum AppMode {
         /// Current scroll position
         scroll: usize,
     },
+    /// Target filter picker overlay for the logs tab.
+    TargetPicker {
+        selected: usize,
+    },
 }
 
 /// A single item in a batch import list.
@@ -258,11 +263,14 @@ pub enum CoreEvent {
         total_up: i64,
         total_down: i64,
     },
+    /// System stats update from gRPC.
     SysStatsUpdate(grpc_client::SysStats),
     /// A log line from the core process stderr.
     LogLine {
         level: String,
+        target: String,
         message: String,
+        timestamp_nanos: i64,
     },
     /// A log line from the TUI internals via tracing.
     TuiLog {
@@ -291,6 +299,12 @@ pub enum CoreEvent {
         current_version: Option<String>,
         latest_version: Option<String>,
         error: Option<String>,
+    },
+    /// Progress notification during update download.
+    UpdateDownloadProgress {
+        core_type: CoreType,
+        downloaded: u64,
+        total: u64,
     },
     /// Result of a download+install operation.
     UpdateCompleted {
@@ -325,7 +339,10 @@ pub struct BackendUpdateStatus {
     pub error: Option<String>,
 }
 
-#[allow(clippy::struct_excessive_bools, reason = "AppState aggregates many UI state flags")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "AppState aggregates many UI state flags"
+)]
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
@@ -340,17 +357,19 @@ pub struct AppState {
     pub selected_index: usize,
     /// Scroll offset from the bottom of the log buffer (0 = newest visible).
     pub log_scroll: usize,
-    pub logs_show_core: bool,
-    pub logs_show_tui: bool,
-    pub logs_show_validation: bool,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub search_query: String,
     pub search_focused: bool,
-    pub log_buffer: VecDeque<LogLine>,
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
+    /// Cached log entries for the Logs tab, newest at end.
+    pub log_cache: Vec<LogLine>,
+    /// Whether there may be older entries in the DB to load.
+    pub log_has_older: bool,
+    /// Flag to trigger progressive loading of all logs to top (Home key).
+    pub log_seek_home: bool,
     pub connection_error: Option<String>,
     pub core_event_rx: Option<mpsc::Receiver<CoreEvent>>,
     pub core_event_tx: Option<mpsc::Sender<CoreEvent>>,
@@ -383,8 +402,19 @@ pub struct AppState {
     pub current_memory: u64,
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
-    pub log_worker_tx: Option<mpsc::Sender<LogWorkerMessage>>,
     pub shutdown_token: Arc<AtomicBool>,
+    /// Handle to the core process task, used for clean shutdown.
+    pub core_task_handle: Option<JoinHandle<()>>,
+    /// Heed-backed persistent log storage.
+    pub heed_storage: Option<Arc<HeedLogStorage>>,
+    /// Highest `timestamp_ns` we've seen (for polling new logs).
+    pub last_seen_log_ns: u64,
+    /// Known target names from the heed targets database.
+    pub known_targets: Vec<String>,
+    /// Selected targets for filtering (empty = show all).
+    pub selected_targets: Vec<String>,
+    /// Last time we polled heed for new log entries.
+    pub last_heed_poll: std::time::Instant,
 }
 
 /// Internal helper for batch ping deduplication.
@@ -412,11 +442,10 @@ impl AppState {
             sort_ascending: true,
             search_query: String::new(),
             search_focused: false,
-            log_buffer: VecDeque::new(),
             log_scroll: 0,
-            logs_show_core: true,
-            logs_show_tui: true,
-            logs_show_validation: true,
+            log_cache: Vec::new(),
+            log_has_older: false,
+            log_seek_home: false,
             connected_core: None,
             connecting: false,
             connection_error: None,
@@ -444,16 +473,53 @@ impl AppState {
             current_traffic_up: 0,
             current_traffic_down: 0,
             current_memory: 0,
-            log_worker_tx: None,
             routing_rules: Vec::new(),
+            core_task_handle: None,
             shutdown_token: Arc::new(AtomicBool::new(false)),
             term_height: Cell::new(80),
+            heed_storage: None,
+            last_seen_log_ns: 0,
+            known_targets: Vec::new(),
+            selected_targets: Vec::new(),
+            last_heed_poll: std::time::Instant::now(),
         };
         state.reload_profiles().await;
         state.reload_groups().await;
         state.subscriptions = state.db.get_all_subscriptions().await.unwrap_or_default();
         state.spawn_auto_update();
         state
+    }
+
+    /// Load the most recent log entries from heed into [`log_cache`].
+    pub fn load_initial_logs(&mut self) {
+        let heed = match &self.heed_storage {
+            Some(h) => h,
+            None => return,
+        };
+        match heed.read_recent(500) {
+            Ok(entries) => {
+                self.log_has_older = entries.len() >= 500;
+                self.log_cache = entries
+                    .into_iter()
+                    .rev()
+                    .map(|e| LogLine {
+                        level: e.level,
+                        target: e.target,
+                        message: e.message,
+                        timestamp_nanos: e.timestamp_nanos as i64,
+                    })
+                    .collect();
+                // Update last_seen_log_ns from the newest entry
+                if let Some(newest) = self.log_cache.last() {
+                    self.last_seen_log_ns = newest.timestamp_nanos as u64;
+                }
+                // Load known targets
+                if let Ok(targets) = heed.get_targets() {
+                    self.known_targets = targets;
+                }
+            }
+            Err(e) => tracing::error!(target: "log_worker", "Failed to load initial logs: {e}"),
+        }
     }
 
     pub async fn reload_profiles(&mut self) {
@@ -469,7 +535,7 @@ impl AppState {
                     .collect();
             }
             Err(e) => {
-                self.add_log("error", &format!("Failed to load profiles: {e}"), "tui");
+                self.log_trace("error", "tui", &format!("Failed to load profiles: {e}"));
                 self.profiles.clear();
             }
         }
@@ -480,7 +546,7 @@ impl AppState {
         match self.db.get_all_groups().await {
             Ok(groups) => self.groups = groups,
             Err(e) => {
-                self.add_log("error", &format!("Failed to load groups: {e}"), "tui");
+                self.log_trace("error", "tui", &format!("Failed to load groups: {e}"));
                 self.groups.clear();
             }
         }
@@ -644,48 +710,15 @@ impl AppState {
         self.selected_group_id = Some(self.groups[new_idx].id.clone());
         self.filter_cache_valid.set(false);
     }
-    pub fn add_log(&mut self, level: &str, message: &str, source: &str) {
-        // Skip trace and debug levels — too verbose for both the TUI buffer
-        // and persistent storage.
-        if level == "trace" || level == "debug" {
-            return;
-        }
-        self.log_buffer.push_back(LogLine {
+    pub fn add_log(&mut self, level: &str, target: &str, message: &str, timestamp_nanos: i64) {
+        self.log_cache.push(LogLine {
             level: level.to_owned(),
+            target: target.to_owned(),
             message: message.to_owned(),
-            source: source.to_owned(),
+            timestamp_nanos,
         });
-        if self.log_buffer.len() > 1000 {
-            let front = self.log_buffer.front().unwrap();
-            let source = front.source.clone();
-            self.log_buffer.pop_front();
-            // If we popped a core log, try to also pop one non-core to keep core logs visible
-            if source == "core" {
-                let non_core_idx = self.log_buffer.iter().position(|l| l.source != "core");
-                if let Some(idx) = non_core_idx {
-                    self.log_buffer.remove(idx);
-                }
-            }
-        }
-
-        // Forward non-tui logs to the storage worker (tui logs are already
-        // sent by TuiLogLayer to avoid duplication).
-        if source != "tui"
-            && let Some(ref tx) = self.log_worker_tx
-        {
-            let entry = LogEntry {
-                id: None,
-                timestamp_nanos: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as i64,
-                level: level.to_owned(),
-                target: String::new(),
-                message: message.to_owned(),
-                metadata_json: None,
-                source: source.to_owned(),
-            };
-            let _ = tx.try_send(LogWorkerMessage::Entry(entry));
+        if self.log_cache.len() > 10000 {
+            self.log_cache.drain(0..self.log_cache.len() - 10000);
         }
     }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
@@ -696,9 +729,16 @@ impl AppState {
             "warn" | "warning" => tracing::warn!(target: "tui", "{message}"),
             _ => tracing::info!(target: "tui", "{message}"),
         }
-        self.add_log(level, message, "tui");
+        self.add_log(
+            level,
+            "tui",
+            message,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+        );
     }
-
     /// Resolve which core a profile row should use, considering (in order):
     /// 1. Per-profile override (`row.profile.core_type`)
     /// 2. Per-protocol config override (`config.core.protocol_core_overrides`)
@@ -736,8 +776,8 @@ impl AppState {
                     form_errors: HashMap::new(),
                 };
             }
-            Ok(None) => self.add_log("error", &format!("Profile {id} not found"), "tui"),
-            Err(e) => self.add_log("error", &format!("Failed to load profile: {e}"), "tui"),
+            Ok(None) => self.log_trace("error", "tui", &format!("Profile {id} not found")),
+            Err(e) => self.log_trace("error", "tui", &format!("Failed to load profile: {e}")),
         }
     }
 
@@ -983,7 +1023,7 @@ impl AppState {
         let mut profile = if let Ok(Some(p)) = self.db.get_profile(&profile_id).await {
             p
         } else {
-            self.add_log("error", "Profile not found for edit", "tui");
+            self.log_trace("error", "tui", "Profile not found for edit");
             return;
         };
         // Rebuild from form fields
@@ -1001,10 +1041,10 @@ impl AppState {
         profile.updated_at = Some(format_now());
 
         if let Err(e) = self.db.update_profile(&profile).await {
-            self.add_log("error", &format!("Failed to update server: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to update server: {e}"));
             return;
         }
-        self.add_log("info", "Server updated", "tui");
+        self.log_trace("info", "tui", "Server updated");
         self.mode = AppMode::List;
         self.reload_profiles().await;
     }
@@ -1059,7 +1099,8 @@ impl AppState {
                     ),
                     (
                         "refresh_interval".into(),
-                        self.config.gui.refresh_interval_secs.to_string(),
+                        humantime::format_duration(*self.config.gui.refresh_interval_secs)
+                            .to_string(),
                     ),
                 ]
             }
@@ -1269,19 +1310,22 @@ impl AppState {
                     ),
                     (
                         "tcp_timeout_secs".into(),
-                        self.config.speed_test.tcp_timeout_secs.to_string(),
+                        humantime::format_duration(*self.config.speed_test.tcp_timeout_secs)
+                            .to_string(),
                     ),
                     (
                         "real_ping_timeout_secs".into(),
-                        self.config.speed_test.real_ping_timeout_secs.to_string(),
+                        humantime::format_duration(*self.config.speed_test.real_ping_timeout_secs)
+                            .to_string(),
                     ),
                     (
                         "batch_page_size".into(),
                         self.config.speed_test.batch_page_size.to_string(),
                     ),
                     (
-                        "batch_delay_ms".into(),
-                        self.config.speed_test.batch_delay_ms.to_string(),
+                        "batch_delay_secs".into(),
+                        humantime::format_duration(*self.config.speed_test.batch_delay_secs)
+                            .to_string(),
                     ),
                     (
                         "real_ping_retries".into(),
@@ -1294,16 +1338,10 @@ impl AppState {
                 ]
             }
             Logging => {
-                vec![
-                    (
-                        "log_ttl_hours".into(),
-                        self.config.logging.ttl_hours.to_string(),
-                    ),
-                    (
-                        "log_batch_size".into(),
-                        self.config.logging.batch_size.to_string(),
-                    ),
-                ]
+                vec![(
+                    "log_ttl_secs".into(),
+                    humantime::format_duration(*self.config.logging.ttl_secs).to_string(),
+                )]
             }
         }
     }
@@ -1341,8 +1379,8 @@ impl AppState {
             Gui => {
                 self.config.gui.language = get("language");
                 self.config.gui.theme = get_opt("theme");
-                if let Ok(v) = get("refresh_interval").parse::<u64>() {
-                    self.config.gui.refresh_interval_secs = v;
+                if let Ok(d) = humantime::parse_duration(&get("refresh_interval")) {
+                    *self.config.gui.refresh_interval_secs = d;
                 }
             }
             Inbound => {
@@ -1400,17 +1438,17 @@ impl AppState {
                 if !get("ip_api_url").is_empty() {
                     self.config.speed_test.ip_api_url = get("ip_api_url");
                 }
-                if let Ok(v) = get("tcp_timeout_secs").parse::<u64>() {
-                    self.config.speed_test.tcp_timeout_secs = v;
+                if let Ok(d) = humantime::parse_duration(&get("tcp_timeout_secs")) {
+                    *self.config.speed_test.tcp_timeout_secs = d;
                 }
-                if let Ok(v) = get("real_ping_timeout_secs").parse::<u64>() {
-                    self.config.speed_test.real_ping_timeout_secs = v;
+                if let Ok(d) = humantime::parse_duration(&get("real_ping_timeout_secs")) {
+                    *self.config.speed_test.real_ping_timeout_secs = d;
                 }
                 if let Ok(v) = get("batch_page_size").parse::<usize>() {
                     self.config.speed_test.batch_page_size = v;
                 }
-                if let Ok(v) = get("batch_delay_ms").parse::<u64>() {
-                    self.config.speed_test.batch_delay_ms = v;
+                if let Ok(d) = humantime::parse_duration(&get("batch_delay_secs")) {
+                    *self.config.speed_test.batch_delay_secs = d;
                 }
                 if let Ok(v) = get("real_ping_retries").parse::<u32>() {
                     self.config.speed_test.real_ping_retries = v;
@@ -1422,11 +1460,8 @@ impl AppState {
             // Dns and Routing are handled separately (DB-backed)
             Dns | Routing | Updates => {}
             Logging => {
-                if let Ok(v) = get("log_ttl_hours").parse::<u64>() {
-                    self.config.logging.ttl_hours = v;
-                }
-                if let Ok(v) = get("log_batch_size").parse::<usize>() {
-                    self.config.logging.batch_size = v;
+                if let Ok(d) = humantime::parse_duration(&get("log_ttl_secs")) {
+                    *self.config.logging.ttl_secs = d;
                 }
             }
         }
@@ -1517,9 +1552,9 @@ impl AppState {
     pub fn save_settings_form(&mut self, section: SettingsSection, fields: &[(String, String)]) {
         self.apply_settings_fields(section, fields);
         if let Err(e) = self.config.save() {
-            self.add_log("error", &format!("Failed to save config: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to save config: {e}"));
         } else {
-            self.add_log("info", "Settings saved", "tui");
+            self.log_trace("info", "tui", "Settings saved");
         }
         self.enter_settings();
     }
@@ -1568,8 +1603,8 @@ impl AppState {
             self.db.insert_routing_rule(&rule).await
         };
         match result {
-            Ok(()) => self.add_log("info", "Routing rule saved", "tui"),
-            Err(e) => self.add_log("error", &format!("Failed to save routing rule: {e}"), "tui"),
+            Ok(()) => self.log_trace("info", "tui", "Routing rule saved"),
+            Err(e) => self.log_trace("error", "tui", &format!("Failed to save routing rule: {e}")),
         }
         self.reload_routing_rules().await;
     }
@@ -1604,17 +1639,17 @@ impl AppState {
             client_ip: get_opt("client_ip"),
         };
         match self.db.upsert_dns_settings(&dns).await {
-            Ok(()) => self.add_log("info", "DNS settings saved", "tui"),
-            Err(e) => self.add_log("error", &format!("Failed to save DNS settings: {e}"), "tui"),
+            Ok(()) => self.log_trace("info", "tui", "DNS settings saved"),
+            Err(e) => self.log_trace("error", "tui", &format!("Failed to save DNS settings: {e}")),
         }
     }
 
     pub async fn delete_profile(&mut self, id: &str) {
         if let Err(e) = self.db.delete_profile(id).await {
-            self.add_log("error", &format!("Failed to delete profile: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to delete profile: {e}"));
             return;
         }
-        self.add_log("info", "Profile deleted", "tui");
+        self.log_trace("info", "tui", "Profile deleted");
         self.confirmation = None;
         self.multi_select.remove(id);
         self.reload_profiles().await;
@@ -1623,10 +1658,10 @@ impl AppState {
     pub async fn clone_profile(&mut self, id: &str) {
         let new_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = self.db.clone_profile(id, &new_id).await {
-            self.add_log("error", &format!("Failed to clone profile: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to clone profile: {e}"));
             return;
         }
-        self.add_log("info", "Profile cloned", "tui");
+        self.log_trace("info", "tui", "Profile cloned");
         self.reload_profiles().await;
     }
 
@@ -1649,7 +1684,7 @@ impl AppState {
                     focus_index: 0,
                     form_errors: HashMap::new(),
                 };
-                self.add_log("info", "URL imported successfully", "tui");
+                self.log_trace("info", "tui", "URL imported successfully");
             }
             Err(e) => {
                 self.mode = AppMode::ImportUrl {
@@ -1715,10 +1750,10 @@ impl AppState {
                 }
             }
         }
-        self.add_log(
+        self.log_trace(
             "info",
-            &format!("Batch import: {imported} imported, {errors} errors"),
             "tui",
+            &format!("Batch import: {imported} imported, {errors} errors"),
         );
         self.mode = AppMode::List;
         self.reload_profiles().await;
@@ -1743,7 +1778,7 @@ impl AppState {
             .reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)])
             .await
         {
-            self.add_log("error", &format!("Failed to reorder: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to reorder: {e}"));
         }
         self.reload_profiles().await;
     }
@@ -1766,14 +1801,14 @@ impl AppState {
             .reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)])
             .await
         {
-            self.add_log("error", &format!("Failed to reorder: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to reorder: {e}"));
         }
         self.reload_profiles().await;
     }
 
     pub async fn set_active(&mut self, id: &str) {
         if let Err(e) = self.db.update_profile_active(id).await {
-            self.add_log("error", &format!("Failed to set active: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to set active: {e}"));
             return;
         }
         self.reload_profiles().await;
@@ -1790,17 +1825,17 @@ impl AppState {
         let profile = if let Some(r) = self.profiles.iter().find(|r| r.profile.id == profile_id) {
             r.profile.clone()
         } else {
-            self.add_log("error", "Profile not found for connection", "tui");
+            self.log_trace("error", "tui", "Profile not found for connection");
             return;
         };
 
         let protocol = if let Some(p) = Protocol::try_from_i32(profile.config_type) {
             p
         } else {
-            self.add_log(
+            self.log_trace(
                 "error",
-                &format!("Unknown protocol: {}", profile.config_type),
                 "tui",
+                &format!("Unknown protocol: {}", profile.config_type),
             );
             return;
         };
@@ -1824,7 +1859,7 @@ impl AppState {
             tx.clone()
         } else {
             self.connecting = false;
-            self.add_log("error", "Core event channel not initialized", "tui");
+            self.log_trace("error", "tui", "Core event channel not initialized");
             return;
         };
 
@@ -1862,7 +1897,8 @@ impl AppState {
         // Create log forwarding channel
         let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
 
-        tokio::spawn(async move {
+        let state_heed = self.heed_storage.clone();
+        let handle = tokio::spawn(async move {
             // 1. Build config
             let backend_config =
                 match ConfigBuilder::build(&profile, core_type, &params, &routing, &dns) {
@@ -1896,10 +1932,27 @@ impl AppState {
 
             // Forward stderr log lines as CoreEvent::LogLine
             let log_tx = tx.clone();
+            let heed = state_heed.clone();
             tokio::spawn(async move {
                 while let Some(line) = log_line_rx.recv().await {
-                    let (level, message) = parse_log_level(&line);
-                    let _ = log_tx.try_send(CoreEvent::LogLine { level, message });
+                    let (level, target, message, ts_nanos) = parse_core_log_line(&line, core_type);
+                    let timestamp_nanos = ts_nanos.unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as i64
+                    });
+                    // Write to heed storage (non-blocking)
+                    if let Some(ref heed) = heed {
+                        let _ = heed.write_log(timestamp_nanos as u64, &level, &target, &message);
+                    }
+                    // Forward to TUI
+                    let _ = log_tx.try_send(CoreEvent::LogLine {
+                        level,
+                        target,
+                        message,
+                        timestamp_nanos,
+                    });
                 }
             });
 
@@ -2021,12 +2074,16 @@ impl AppState {
             // 7. Signal disconnected
             let _ = tx.try_send(CoreEvent::Disconnected);
         });
+        self.core_task_handle = Some(handle);
     }
 
     /// Disconnect the currently running core.
     pub fn disconnect(&mut self) {
         if let Some(tx) = self.disconnect_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(handle) = self.core_task_handle.take() {
+            handle.abort();
         }
         self.connected_core = None;
         self.connected_profile_id = None;
@@ -2039,7 +2096,7 @@ impl AppState {
     /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
     pub fn start_tcp_ping(&mut self, profile_id: &str) {
         if self.testing_profiles.contains(profile_id) {
-            self.add_log("warn", "Test already in progress for this profile", "tui");
+            self.log_trace("warn", "tui", "Test already in progress for this profile");
             return;
         }
 
@@ -2047,19 +2104,19 @@ impl AppState {
         let row = if let Some(r) = self.profiles.iter().find(|r| r.profile.id == profile_id) {
             r
         } else {
-            self.add_log("error", "Profile not found for TCP ping", "tui");
+            self.log_trace("error", "tui", "Profile not found for TCP ping");
             return;
         };
         let addr = if let Some(a) = &row.profile.address {
             a.clone()
         } else {
-            self.add_log("error", "Profile has no address", "tui");
+            self.log_trace("error", "tui", "Profile has no address");
             return;
         };
         let port = match row.profile.port {
             Some(p) if p > 0 && p <= 65535 => p as u16,
             _ => {
-                self.add_log("error", "Profile has invalid port", "tui");
+                self.log_trace("error", "tui", "Profile has invalid port");
                 return;
             }
         };
@@ -2067,7 +2124,7 @@ impl AppState {
         let tx = if let Some(tx) = &self.core_event_tx {
             tx.clone()
         } else {
-            self.add_log("error", "Core event channel not initialized", "tui");
+            self.log_trace("error", "tui", "Core event channel not initialized");
             return;
         };
 
@@ -2104,7 +2161,7 @@ impl AppState {
         let row = if let Some(r) = self.profiles.iter().find(|r| r.profile.id == profile_id) {
             r
         } else {
-            self.add_log("error", "Profile not found for real ping", "tui");
+            self.log_trace("error", "tui", "Profile not found for real ping");
             return;
         };
         let profile = row.profile.clone();
@@ -2157,8 +2214,7 @@ impl AppState {
         let proxy_port = self.config.inbound.socks_port;
         let ping_url = self.config.speed_test.ping_url.clone();
         let ip_api_url = self.config.speed_test.ip_api_url.clone();
-        let timeout_dur =
-            std::time::Duration::from_secs(self.config.speed_test.real_ping_timeout_secs);
+        let timeout_dur = *self.config.speed_test.real_ping_timeout_secs;
         let retries = self.config.speed_test.real_ping_retries;
 
         tokio::spawn(async move {
@@ -2267,10 +2323,10 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log(
+            self.log_trace(
                 "warn",
-                "Core not connected — proxy required for speed test",
                 "tui",
+                "Core not connected — proxy required for speed test",
             );
             return;
         }
@@ -2318,10 +2374,10 @@ impl AppState {
             return;
         }
         if self.connected_core.is_none() {
-            self.add_log(
+            self.log_trace(
                 "warn",
-                "Core not connected — proxy required for UDP test",
                 "tui",
+                "Core not connected — proxy required for UDP test",
             );
             return;
         }
@@ -2359,7 +2415,7 @@ impl AppState {
     pub fn start_batch_ping(&mut self) {
         let visible: Vec<&ProfileRow> = self.filtered_profiles().collect();
         if visible.is_empty() {
-            self.add_log("info", "No profiles to ping", "tui");
+            self.log_trace("info", "tui", "No profiles to ping");
             return;
         }
 
@@ -2401,9 +2457,9 @@ impl AppState {
 
         let total = unique_targets.iter().map(|t| t.profile_ids.len()).sum();
         self.test_progress = Some((0, total));
-        let timeout_dur = std::time::Duration::from_secs(self.config.speed_test.tcp_timeout_secs);
+        let timeout_dur = *self.config.speed_test.tcp_timeout_secs;
         let batch_page_size = self.config.speed_test.batch_page_size;
-        let batch_delay = std::time::Duration::from_millis(self.config.speed_test.batch_delay_ms);
+        let batch_delay = *self.config.speed_test.batch_delay_secs;
 
         tokio::spawn(async move {
             // Split into pages of batch_page_size
@@ -2443,7 +2499,7 @@ impl AppState {
     pub fn start_batch_then_real_ping(&mut self) {
         let visible: Vec<&ProfileRow> = self.filtered_profiles().collect();
         if visible.is_empty() {
-            self.add_log("info", "No profiles to test", "tui");
+            self.log_trace("info", "tui", "No profiles to test");
             return;
         }
 
@@ -2491,7 +2547,7 @@ impl AppState {
         }
 
         if batch_targets.is_empty() {
-            self.add_log("info", "No valid targets found", "tui");
+            self.log_trace("info", "tui", "No valid targets found");
             return;
         }
 
@@ -2509,11 +2565,10 @@ impl AppState {
         let total_steps = total_profiles + total_profiles; // each profile appears in both phases
         self.test_progress = Some((0, total_steps));
 
-        let tcp_timeout = std::time::Duration::from_secs(self.config.speed_test.tcp_timeout_secs);
-        let real_ping_timeout =
-            std::time::Duration::from_secs(self.config.speed_test.real_ping_timeout_secs);
+        let tcp_timeout = *self.config.speed_test.tcp_timeout_secs;
+        let real_ping_timeout = *self.config.speed_test.real_ping_timeout_secs;
         let batch_page_size = self.config.speed_test.batch_page_size;
-        let batch_delay = std::time::Duration::from_millis(self.config.speed_test.batch_delay_ms);
+        let batch_delay = *self.config.speed_test.batch_delay_secs;
         let retries = self.config.speed_test.real_ping_retries;
         let concurrency = self.config.speed_test.real_ping_concurrency;
         let ping_url = self.config.speed_test.ping_url.clone();
@@ -2715,7 +2770,7 @@ impl AppState {
             self.delete_profile(&id).await;
         }
         self.multi_select.clear();
-        self.add_log("info", &format!("Removed {count} failed server(s)"), "tui");
+        self.log_trace("info", "tui", &format!("Removed {count} failed server(s)"));
     }
 
     /// Poll core event channel and update state accordingly.
@@ -2723,8 +2778,10 @@ impl AppState {
         while let Some(rx) = self.core_event_rx.as_mut() {
             let event = match rx.try_recv() {
                 Ok(event) => event,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty |
-tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(
+                    tokio::sync::mpsc::error::TryRecvError::Empty
+                    | tokio::sync::mpsc::error::TryRecvError::Disconnected,
+                ) => break,
             };
             match event {
                 CoreEvent::Connected(core_type) => {
@@ -2769,7 +2826,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                         last_updated: Some(crate::format_now()),
                     };
                     if let Err(e) = self.db.upsert_server_stats(&stats).await {
-                        self.add_log("error", &format!("Failed to save stats: {e}"), "tui");
+                        self.log_trace("error", "tui", &format!("Failed to save stats: {e}"));
                     }
                     // Update in-memory ProfileRow to avoid full reload
                     if let Some(row) = self
@@ -2786,9 +2843,14 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                     self.current_memory = stats.alloc;
                     self.system_stats = Some(stats);
                 }
-                CoreEvent::LogLine { level, message } => {
+                CoreEvent::LogLine {
+                    level,
+                    target,
+                    message,
+                    timestamp_nanos,
+                } => {
                     self.last_core_log = Some((level.clone(), message.clone()));
-                    self.add_log(&level, &message, "core");
+                    self.add_log(&level, &target, &message, timestamp_nanos);
                 }
                 CoreEvent::TuiLog {
                     target,
@@ -2796,11 +2858,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                     message,
                 } => {
                     self.last_tui_log = Some((target.clone(), level.clone(), message.clone()));
-                    if target == "validation" {
-                        self.add_log(&level, &message, "validation");
-                    } else if target == "log_worker" {
-                        self.add_log(&level, &message, "tui");
-                    }
+                    // Note: TuiLog is already persisted to heed by TuiLogLayer
                 }
                 CoreEvent::SubscriptionsUpdated {
                     group_id,
@@ -2810,7 +2868,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                 } => {
                     self.updating_groups.remove(&group_id);
                     for w in &warnings {
-                        self.add_log("warn", w, "subscription");
+                        self.log_trace("warn", "subscription", w);
                     }
                     if let Some(err) = error {
                         self.log_trace(
@@ -2878,7 +2936,10 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                                     }
                                 }
                                 let _ = self.db.upsert_profile_extension(ext).await;
-                                row.profile.remarks.clone().unwrap_or_else(|| profile_id.clone())
+                                row.profile
+                                    .remarks
+                                    .clone()
+                                    .unwrap_or_else(|| profile_id.clone())
                             }
                             None => profile_id.clone(),
                         }
@@ -2941,7 +3002,10 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                     status.current_version.clone_from(&current_version);
                     status.latest_version.clone_from(&latest_version);
                     status.update_available = {
-                        #[allow(clippy::option_if_let_else, reason = "business logic with nested version comparison clearer as match")]
+                        #[allow(
+                            clippy::option_if_let_else,
+                            reason = "business logic with nested version comparison clearer as match"
+                        )]
                         match &current_version {
                             // Not installed but latest known → install available
                             None => latest_version.is_some(),
@@ -2951,7 +3015,9 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                                     let cur = xray_tui_core::updater::parse_version(cur_str);
                                     let latest = xray_tui_core::updater::parse_version(latest_str);
                                     match (cur, latest) {
-                                        (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
+                                        (Some(c), Some(l)) => {
+                                            xray_tui_core::updater::is_newer(&c, &l)
+                                        }
                                         _ => false,
                                     }
                                 }
@@ -2992,6 +3058,15 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                             .unwrap_or_default();
                     }
                 }
+                CoreEvent::UpdateDownloadProgress {
+                    core_type,
+                    downloaded,
+                    total,
+                } => {
+                    if let Some(status) = self.update_status.get_mut(&core_type) {
+                        status.download_progress = Some((downloaded, total));
+                    }
+                }
                 CoreEvent::UpdateCompleted {
                     core_type,
                     old_version,
@@ -3005,21 +3080,21 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                     if success {
                         status.current_version = Some(new_version.clone());
                         status.update_available = false;
-                        self.add_log(
+                        self.log_trace(
                             "info",
+                            "tui",
                             &format!(
                                 "{core_type} updated: {} → {}",
                                 old_version.as_deref().unwrap_or("none"),
-                                new_version
+                                new_version,
                             ),
-                            "tui",
                         );
                     } else {
                         status.error.clone_from(&error);
-                        self.add_log(
+                        self.log_trace(
                             "error",
-                            &format!("{core_type} update failed: {error:?}"),
                             "tui",
+                            &format!("{core_type} update failed: {error:?}"),
                         );
                     }
                     // Refresh form snapshots if currently viewing the updates form
@@ -3066,7 +3141,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         let group = if let Some(g) = self.groups.iter().find(|g| g.id == group_id) {
             g.clone()
         } else {
-            self.add_log("error", "Group not found", "tui");
+            self.log_trace("error", "tui", "Group not found");
             return;
         };
         let fields = vec![
@@ -3106,7 +3181,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             is_system: None,
         };
         if let Err(e) = self.db.insert_group(&group).await {
-            self.add_log("error", &format!("Failed to add group: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to add group: {e}"));
             return;
         }
         // Create subscription tracking row
@@ -3124,13 +3199,13 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             error_message: None,
         };
         let _ = self.db.upsert_subscription(&sub).await;
-        self.add_log(
+        self.log_trace(
             "info",
+            "tui",
             &format!(
                 "Group '{}' added",
                 group.name.as_deref().unwrap_or("unnamed")
             ),
-            "tui",
         );
         self.mode = AppMode::List;
         self.reload_groups().await;
@@ -3146,7 +3221,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         let mut group = if let Some(g) = self.groups.iter().find(|g| g.id == group_id) {
             g.clone()
         } else {
-            self.add_log("error", "Group not found", "tui");
+            self.log_trace("error", "tui", "Group not found");
             return;
         };
         group.name = get_field(&fields, "name");
@@ -3154,7 +3229,7 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         group.user_agent = get_field(&fields, "user_agent");
         group.core_type = get_field(&fields, "core_type");
         if let Err(e) = self.db.update_group(&group).await {
-            self.add_log("error", &format!("Failed to update group: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to update group: {e}"));
             return;
         }
         // Update subscription tracking row
@@ -3167,18 +3242,18 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             sub.user_agent = group.user_agent.clone();
             let _ = self.db.upsert_subscription(&sub).await;
         }
-        self.add_log("info", "Group updated", "tui");
+        self.log_trace("info", "tui", "Group updated");
         self.mode = AppMode::List;
         self.reload_groups().await;
     }
 
     pub async fn delete_group(&mut self, group_id: &str) {
         if let Err(e) = self.db.delete_group(group_id).await {
-            self.add_log("error", &format!("Failed to delete group: {e}"), "tui");
+            self.log_trace("error", "tui", &format!("Failed to delete group: {e}"));
             return;
         }
         let _ = self.db.delete_subscriptions_by_group(group_id).await;
-        self.add_log("info", "Group deleted", "tui");
+        self.log_trace("info", "tui", "Group deleted");
         self.selected_group_id = None;
         self.confirmation = None;
         self.reload_groups().await;
@@ -3188,14 +3263,14 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
     pub async fn clear_group(&mut self, group_id: &str) {
         match self.db.clear_group(group_id).await {
             Ok(count) => {
-                self.add_log(
+                self.log_trace(
                     "info",
-                    &format!("Cleared {count} profiles from group"),
                     "tui",
+                    &format!("Cleared {count} profiles from group"),
                 );
             }
             Err(e) => {
-                self.add_log("error", &format!("Failed to clear group: {e}"), "tui");
+                self.log_trace("error", "tui", &format!("Failed to clear group: {e}"));
             }
         }
         self.confirmation = None;
@@ -3211,13 +3286,13 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         let group = if let Some(g) = self.groups.iter().find(|g| g.id == group_id) {
             g.clone()
         } else {
-            self.add_log("error", "Group not found", "tui");
+            self.log_trace("error", "tui", "Group not found");
             return;
         };
         let url = match &group.subscription_url {
             Some(u) if !u.is_empty() => u.clone(),
             _ => {
-                self.add_log("warn", "Group has no subscription URL", "tui");
+                self.log_trace("warn", "tui", "Group has no subscription URL");
                 return;
             }
         };
@@ -3403,10 +3478,10 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         }
         // Guard: don't download if core is currently running
         if self.connected_core == Some(core_type) {
-            self.add_log(
+            self.log_trace(
                 "warn",
-                &format!("Cannot update {core_type} while it's running. Disconnect first."),
                 "tui",
+                &format!("Cannot update {core_type} while it's running. Disconnect first."),
             );
             return;
         }
@@ -3434,10 +3509,39 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
 
         self.update_status.entry(core_type).or_default().downloading = true;
 
+        let last_report = Arc::new(Mutex::new(std::time::Instant::now()));
+        let core_type_progress = core_type;
+
+        let progress_cb = {
+            let tx_progress = tx.clone();
+            move |downloaded: u64, total: u64| {
+                let should_send = {
+                    let mut last = last_report.lock().unwrap();
+                    if last.elapsed() >= std::time::Duration::from_millis(100) {
+                        *last = std::time::Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_send {
+                    let _ = tx_progress.try_send(CoreEvent::UpdateDownloadProgress {
+                        core_type: core_type_progress,
+                        downloaded,
+                        total,
+                    });
+                }
+            }
+        };
+
         tokio::spawn(async move {
             // Download
             let archive = match xray_tui_core::updater::download_release(
-                &client, core_type, &latest, &temp_dir,
+                &client,
+                core_type,
+                &latest,
+                &temp_dir,
+                Some(progress_cb),
             )
             .await
             {
@@ -3464,7 +3568,6 @@ tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             let _ = std::fs::remove_file(&archive);
             let _ = std::fs::remove_dir_all(&temp_dir);
 
-            let old_version = old_version.clone();
             let _ = tx.try_send(CoreEvent::UpdateCompleted {
                 core_type,
                 old_version,
@@ -3665,8 +3768,16 @@ const fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
-fn parse_log_level(line: &str) -> (String, String) {
+fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, String, Option<i64>) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static XRAY_TS_RE: OnceLock<Regex> = OnceLock::new();
+    static LEVEL_RE: OnceLock<Regex> = OnceLock::new();
+
     let trimmed = line.trim();
+    let mut ts_nanos: Option<i64> = None;
+
     // Sing-box JSON format: {"level":"info","time":"...","msg":"..."}
     if trimmed.starts_with('{')
         && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed)
@@ -3684,52 +3795,139 @@ fn parse_log_level(line: &str) -> (String, String) {
             .get("msg")
             .and_then(|v| v.as_str())
             .unwrap_or(trimmed);
-        return (level, msg.to_string());
-    }
-    // Xray-core bracket format: "2024/01/01 12:00:00 [Info] message"
-    if let Some(bracket_start) = trimmed.find('[')
-        && let Some(bracket_end) = trimmed[bracket_start..].find(']')
-    {
-        let raw = &trimmed[bracket_start + 1..bracket_start + bracket_end];
-        let lower = raw.to_lowercase();
-        if matches!(
-            lower.as_str(),
-            "info" | "warning" | "warn" | "error" | "debug" | "fatal" | "panic"
-        ) {
-            let msg = trimmed[bracket_start + bracket_end + 1..]
-                .trim()
-                .to_string();
-            let level = if lower == "warn" {
-                "warning".to_string()
-            } else {
-                lower
-            };
-            return (level, msg);
-        }
-    }
-    // Fallback
-    ("info".to_string(), trimmed.to_string())
-}
 
+        // Parse timestamp
+        if let Some(ts_str) = parsed.get("time").and_then(|v| v.as_str()) {
+            ts_nanos = chrono::DateTime::parse_from_rfc3339(ts_str)
+                .ok()
+                .or_else(|| chrono::DateTime::parse_from_str(ts_str, "%+").ok())
+                .and_then(|dt| dt.timestamp_nanos_opt());
+        }
+
+        // Extract target from msg if it has a "tag: message" pattern
+        let target = if let Some(pos) = msg.find(": ") {
+            format!("sing::{}", &msg[..pos])
+        } else {
+            "sing".to_string()
+        };
+
+        return (level, target, msg.to_string(), ts_nanos);
+    }
+
+    // Xray-core format: "2026/06/25 15:18:54.387241 [Info] message"
+    let xray_ts_re = XRAY_TS_RE
+        .get_or_init(|| Regex::new(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?) ?").unwrap());
+    let level_re = LEVEL_RE.get_or_init(|| Regex::new(r"\[(Debug|Info|Warning|Error)\]").unwrap());
+
+    let remaining = if let Some(caps) = xray_ts_re.captures(trimmed) {
+        let ts_str = caps.get(1).unwrap().as_str();
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y/%m/%d %H:%M:%S%.f") {
+            ts_nanos = Some(naive.and_utc().timestamp_nanos_opt().unwrap_or(0));
+        }
+        trimmed[caps.get(0).unwrap().len()..].trim()
+    } else {
+        trimmed
+    };
+
+    let (level_str, msg_after_level) = if let Some(caps) = level_re.captures(remaining) {
+        let raw = caps.get(1).unwrap().as_str().to_lowercase();
+        let lvl = if raw == "warn" {
+            "warning".to_string()
+        } else {
+            raw
+        };
+        let after = remaining[caps.get(0).unwrap().len()..].trim();
+        (lvl, after)
+    } else {
+        ("info".to_string(), remaining)
+    };
+
+    // Extract target from message
+    let core_prefix = match core_type {
+        CoreType::Xray => "xray",
+        CoreType::SingBox => "sing",
+        _ => "xray",
+    };
+    let (target, message) = if let Some(pos) = msg_after_level.find(": ") {
+        let tag = &msg_after_level[..pos];
+        // For xray format: "infra/conf/serial: message" → replace / with ::
+        let target = if core_type == CoreType::Xray {
+            format!("xray::{}", tag.replace('/', "::"))
+        } else {
+            format!("sing::{tag}")
+        };
+        let rest = msg_after_level[pos + 2..].trim();
+        (target, rest.to_string())
+    } else {
+        (core_prefix.to_string(), msg_after_level.to_string())
+    };
+
+    (level_str, target, message, ts_nanos)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn parse_xray_log() {
-        let (level, msg) = parse_log_level("2024/01/01 [Info] Server started");
+        let (level, target, msg, ts) = parse_core_log_line(
+            "2026/06/25 15:18:54.387241 [Info] Server started",
+            CoreType::Xray,
+        );
         assert_eq!(level, "info");
+        assert_eq!(target, "xray");
         assert!(msg.contains("Server started"));
+        assert!(
+            !msg.contains("2026/06/25"),
+            "timestamp stripped from message"
+        );
+        assert!(ts.is_some(), "xray timestamp should parse");
+    }
+    #[test]
+    fn parse_xray_log_with_path() {
+        let (level, target, msg, ts) = parse_core_log_line(
+            "2026/06/25 15:18:54.387241 [Info] infra/conf/serial: Reading config",
+            CoreType::Xray,
+        );
+        assert_eq!(level, "info");
+        assert_eq!(target, "xray::infra::conf::serial");
+        assert_eq!(msg, "Reading config");
+        assert!(ts.is_some());
     }
     #[test]
     fn parse_singbox_json() {
-        let (level, msg) = parse_log_level(r#"{"level":"warn","time":"...","msg":"timeout"}"#);
+        let json = r#"{"level":"warn","time":"2024-01-01T12:00:00Z","msg":"timeout"}"#;
+        let (level, target, msg, ts) = parse_core_log_line(json, CoreType::SingBox);
         assert_eq!(level, "warning");
+        assert_eq!(target, "sing");
         assert_eq!(msg, "timeout");
+        assert!(ts.is_some());
+    }
+    #[test]
+    fn parse_singbox_json_with_tag() {
+        let json = r#"{"level":"info","time":"2024-01-01T12:00:00Z","msg":"dns: resolved"}"#;
+        let (level, target, msg, ts) = parse_core_log_line(json, CoreType::SingBox);
+        assert_eq!(level, "info");
+        assert_eq!(target, "sing::dns");
+        assert_eq!(msg, "dns: resolved");
+        assert!(ts.is_some());
     }
     #[test]
     fn parse_fallback() {
-        let (level, msg) = parse_log_level("raw output");
+        let (level, target, msg, ts) = parse_core_log_line("Xray 26.3.27 started", CoreType::Xray);
         assert_eq!(level, "info");
-        assert_eq!(msg, "raw output");
+        assert_eq!(target, "xray");
+        assert_eq!(msg, "Xray 26.3.27 started");
+        assert!(ts.is_none(), "no timestamp in header line");
+    }
+    #[test]
+    fn parse_connection_log() {
+        let (level, target, msg, ts) = parse_core_log_line(
+            "2026/06/25 15:18:54.387241 from 127.0.0.1:60868 accepted //host:443 [socks -> proxy]",
+            CoreType::Xray,
+        );
+        assert_eq!(level, "info", "connection logs default to info");
+        assert_eq!(target, "xray");
+        assert!(ts.is_some(), "connection logs have timestamps");
+        assert!(!msg.contains("2026/06/25"), "timestamp stripped");
     }
 }

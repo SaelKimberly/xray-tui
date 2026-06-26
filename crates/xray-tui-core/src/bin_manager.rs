@@ -123,7 +123,12 @@ pub fn extract_archive(
 
     match ext {
         "zip" => extract_zip(archive, target_dir)?,
-        "gz" | "tgz" if std::path::Path::new(stem).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("tar")) || ext == "tgz" => {
+        "gz" | "tgz"
+            if std::path::Path::new(stem)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+                || ext == "tgz" =>
+        {
             extract_tar_gz(archive, target_dir)?;
         }
         _ => {
@@ -257,7 +262,11 @@ pub fn find_and_extract_archives(bin_dir: &Path) -> Result<(), BinError> {
             .unwrap_or("")
             .to_lowercase();
 
-        if name.starts_with("xray") && std::path::Path::new(&name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+        if name.starts_with("xray")
+            && std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
             let xray_dir = bin_dir.join("xray");
             extract_archive(&path, CoreType::Xray, &xray_dir)?;
         }

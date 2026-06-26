@@ -110,19 +110,6 @@ pub async fn create_tables(conn: &turso::Connection) -> turso::Result<()> {
             last_updated        TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS logs (
-            id              INTEGER PRIMARY KEY,
-            timestamp_nanos BIGINT NOT NULL,
-            level           TEXT NOT NULL DEFAULT 'info',
-            target          TEXT NOT NULL DEFAULT '',
-            message         TEXT NOT NULL,
-            metadata_json   TEXT,
-            source          TEXT NOT NULL DEFAULT 'tui'
-        );
-        CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp_nanos);
-        CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-        CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
-        CREATE INDEX IF NOT EXISTS idx_logs_source ON logs(source);
         ",
     )
     .await?;

@@ -114,11 +114,14 @@ pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
 }
 
 /// Download the release asset for the current platform.
-pub async fn download_release(
+/// Download the release asset for the current platform.
+/// `progress` is an optional callback invoked with (downloaded_bytes, total_bytes).
+pub async fn download_release<F: Fn(u64, u64) + Send + 'static>(
     client: &reqwest::Client,
     core_type: CoreType,
     version: &str,
     dest_dir: &Path,
+    progress: Option<F>,
 ) -> Result<PathBuf, UpdateError> {
     let url = release_asset_url(core_type, version)?;
 
@@ -140,7 +143,7 @@ pub async fn download_release(
         return Err(UpdateError::Download(format!("HTTP {}", resp.status())));
     }
 
-    let total_size = resp.content_length();
+    let total_size = resp.content_length().unwrap_or(0);
     let mut file = tokio::fs::File::create(&dest).await?;
 
     let mut stream = resp.bytes_stream();
@@ -149,9 +152,8 @@ pub async fn download_release(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| UpdateError::Download(e.to_string()))?;
         downloaded += chunk.len() as u64;
-        if let Some(total) = total_size {
-            // Progress could be reported via callback; for now we keep simple
-            let _ = (downloaded, total);
+        if let Some(ref cb) = progress {
+            cb(downloaded, total_size);
         }
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
     }

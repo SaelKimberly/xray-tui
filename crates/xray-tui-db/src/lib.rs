@@ -7,17 +7,14 @@
     clippy::option_if_let_else,
     reason = "known-safe casts on port/len/display; code clarity decisions override style lints"
 )]
-pub mod log_repo;
 pub mod models;
 pub mod schema;
-
-pub use log_repo::LogRepository;
-pub use models::LogEntry;
-/// Re-export for consumer crates (`log_worker`) that need the connection type
+/// Re-export so consumer crates can use the connection type
 /// without depending on `turso` directly.
 pub use turso::Connection as DbConnection;
 
 use std::path::Path;
+use tokio::sync::Mutex;
 use turso::Builder;
 
 #[derive(Debug, thiserror::Error)]
@@ -36,10 +33,10 @@ pub type Result<T, E = DatabaseError> = std::result::Result<T, E>;
 
 /// Result tuple returned by `get_all_profiles_with_details`.
 pub type ProfileWithDetails = (Profile, Option<ProfileExtension>, Option<ServerStat>);
-
 pub struct Database {
     db: turso::Database,
     conn: turso::Connection,
+    lock: Mutex<()>,
 }
 
 // ── Column enums ──────────────────────────────────────────────────────
@@ -330,7 +327,11 @@ impl Database {
         // upserts that hold the write lock for extended periods).
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(DatabaseError::Turso)?;
-        let db_ = Self { db, conn };
+        let db_ = Self {
+            db,
+            conn,
+            lock: Mutex::new(()),
+        };
         db_.initialize_schema().await?;
         Ok(db_)
     }
@@ -341,7 +342,11 @@ impl Database {
             .await
             .map_err(DatabaseError::Turso)?;
         let conn = db.connect().map_err(DatabaseError::Turso)?;
-        let db_ = Self { db, conn };
+        let db_ = Self {
+            db,
+            conn,
+            lock: Mutex::new(()),
+        };
         db_.initialize_schema().await?;
         Ok(db_)
     }
@@ -368,6 +373,14 @@ impl Database {
     /// Get a reference to the underlying database connection.
     pub const fn connection(&self) -> &turso::Connection {
         &self.conn
+    }
+
+    /// Lock the underlying connection for exclusive access.
+    /// All public methods that access `self.conn` acquire this lock to prevent
+    /// concurrent operations on the same `turso::Connection` (whose
+    /// `ConcurrentGuard` panics on concurrent use).
+    pub async fn lock_conn(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lock.lock().await
     }
 
     async fn initialize_schema(&self) -> Result<()> {
@@ -408,6 +421,7 @@ impl Database {
     /// One-time backfill: normalize all existing profile remarks.
     /// Uses `user_version` pragma to run exactly once.
     pub async fn normalize_all_remarks(&self) -> Result<()> {
+        let _lock = self.lock.lock().await;
         // Query user_version via PRAGMA
         let mut stmt = self.conn.prepare_cached("PRAGMA user_version").await?;
         let version: i32 = stmt
@@ -421,7 +435,7 @@ impl Database {
             return Ok(());
         }
 
-        let profiles = self.get_all_profiles().await?;
+        let profiles = self.get_all_profiles_unlocked().await?;
         let mut count = 0u32;
 
         // Use Transaction::new_unchecked since unchecked_transaction may not exist
@@ -513,6 +527,11 @@ use models::{DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerSt
 
 impl Database {
     pub async fn get_all_profiles(&self) -> Result<Vec<Profile>> {
+        let _lock = self.lock.lock().await;
+        self.get_all_profiles_unlocked().await
+    }
+
+    async fn get_all_profiles_unlocked(&self) -> Result<Vec<Profile>> {
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -535,6 +554,11 @@ impl Database {
     }
 
     pub async fn get_profiles_by_group(&self, group_id: &str) -> Result<Vec<Profile>> {
+        let _lock = self.lock.lock().await;
+        self.get_profiles_by_group_unlocked(group_id).await
+    }
+
+    async fn get_profiles_by_group_unlocked(&self, group_id: &str) -> Result<Vec<Profile>> {
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -558,6 +582,7 @@ impl Database {
     }
 
     pub async fn get_all_groups(&self) -> Result<Vec<Group>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM groups ORDER BY sort_order")
@@ -574,6 +599,14 @@ impl Database {
         &self,
         profile_id: &str,
     ) -> Result<Option<ProfileExtension>> {
+        let _lock = self.lock.lock().await;
+        self.get_profile_extension_unlocked(profile_id).await
+    }
+
+    async fn get_profile_extension_unlocked(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<ProfileExtension>> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM profile_extensions WHERE profile_id = ?1")
@@ -586,6 +619,7 @@ impl Database {
     }
 
     pub async fn get_server_stats(&self, profile_id: &str) -> Result<Option<ServerStat>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM server_stats WHERE profile_id = ?1")
@@ -598,6 +632,7 @@ impl Database {
     }
 
     pub async fn get_all_profiles_with_details(&self) -> Result<Vec<ProfileWithDetails>> {
+        let _lock = self.lock.lock().await;
         let query = "
             SELECT
                 gp.id, gp.sub_uid, gp.group_id, gp.remarks, gp.is_sub, gp.sub_id,
@@ -666,6 +701,11 @@ impl Database {
     // ── Write methods ─────────────────────────────────────────────────
 
     pub async fn insert_profile(&self, p: &Profile) -> Result<()> {
+        let _lock = self.lock.lock().await;
+        self.insert_profile_unlocked(p).await
+    }
+
+    async fn insert_profile_unlocked(&self, p: &Profile) -> Result<()> {
         let sub_uid = p.sub_uid.unwrap_or(0);
         if sub_uid == 0 {
             return Err(DatabaseError::Generic(
@@ -717,6 +757,7 @@ impl Database {
     }
 
     pub async fn update_profile(&self, p: &Profile) -> Result<()> {
+        let _lock = self.lock.lock().await;
         let sub_uid = p.sub_uid.unwrap_or(0);
         if sub_uid == 0 {
             return Err(DatabaseError::Generic(
@@ -748,6 +789,11 @@ impl Database {
     }
 
     pub async fn delete_profile(&self, id: &str) -> Result<()> {
+        let _lock = self.lock.lock().await;
+        self.delete_profile_unlocked(id).await
+    }
+
+    async fn delete_profile_unlocked(&self, id: &str) -> Result<()> {
         let sub_uid: Option<i64> = {
             let mut stmt = self
                 .conn
@@ -812,6 +858,11 @@ impl Database {
     }
 
     pub async fn get_profile(&self, id: &str) -> Result<Option<Profile>> {
+        let _lock = self.lock.lock().await;
+        self.get_profile_unlocked(id).await
+    }
+
+    async fn get_profile_unlocked(&self, id: &str) -> Result<Option<Profile>> {
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -833,23 +884,25 @@ impl Database {
     }
 
     pub async fn clone_profile(&self, id: &str, new_id: &str) -> Result<()> {
+        let _lock = self.lock.lock().await;
         let original = self
-            .get_profile(id)
+            .get_profile_unlocked(id)
             .await?
             .ok_or_else(|| DatabaseError::Generic(format!("profile not found: {id}")))?;
         let mut clone = original.clone();
         clone.id = new_id.to_string();
-        self.insert_profile(&clone).await?;
+        self.insert_profile_unlocked(&clone).await?;
         // Also copy profile_extension if exists
-        if let Some(ext) = self.get_profile_extension(id).await? {
+        if let Some(ext) = self.get_profile_extension_unlocked(id).await? {
             let mut new_ext = ext.clone();
             new_ext.profile_id = new_id.to_string();
-            self.upsert_profile_extension(&new_ext).await?;
+            self.upsert_profile_extension_unlocked(&new_ext).await?;
         }
         Ok(())
     }
 
     pub async fn reorder_profiles(&self, ids: &[(String, i32)]) -> Result<()> {
+        let _lock = self.lock.lock().await;
         let tx = self.conn.unchecked_transaction().await?;
         let mut stmt = tx
             .prepare("UPDATE group_profiles SET sort_order = ?1 WHERE id = ?2")
@@ -865,6 +918,11 @@ impl Database {
     }
 
     pub async fn upsert_profile_extension(&self, ext: &ProfileExtension) -> Result<()> {
+        let _lock = self.lock.lock().await;
+        self.upsert_profile_extension_unlocked(ext).await
+    }
+
+    async fn upsert_profile_extension_unlocked(&self, ext: &ProfileExtension) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO profile_extensions (profile_id, delay, speed, sort_order, ip_info) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -875,6 +933,7 @@ impl Database {
     }
 
     pub async fn upsert_server_stats(&self, stats: &ServerStat) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO server_stats (profile_id, today_up, today_down, total_up, total_down, last_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -888,6 +947,7 @@ impl Database {
     }
 
     pub async fn insert_group(&self, g: &Group) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO groups (id, name, subscription_url, subscription_enabled, user_agent, convert_target, core_type, sort_order, is_system) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -901,6 +961,7 @@ impl Database {
     }
 
     pub async fn update_group(&self, g: &Group) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "UPDATE groups SET name=?1, subscription_url=?2, subscription_enabled=?3, user_agent=?4, convert_target=?5, core_type=?6, sort_order=?7, is_system=?8 WHERE id=?9",
@@ -914,6 +975,7 @@ impl Database {
     }
 
     pub async fn update_profile_active(&self, id: &str) -> Result<()> {
+        let _lock = self.lock.lock().await;
         let tx = self.conn.unchecked_transaction().await?;
         tx.execute(
             "UPDATE group_profiles SET is_active = 0 WHERE is_active = 1",
@@ -931,6 +993,7 @@ impl Database {
         Ok(())
     }
     pub async fn delete_group(&self, id: &str) -> Result<()> {
+        let _lock = self.lock.lock().await;
         // Prevent deletion of system groups
         let is_system: Option<i32> = {
             let mut stmt = match self
@@ -952,9 +1015,9 @@ impl Database {
             ));
         }
         // Delete all profiles in this group first
-        let profiles = self.get_profiles_by_group(id).await?;
+        let profiles = self.get_profiles_by_group_unlocked(id).await?;
         for p in &profiles {
-            self.delete_profile(&p.id).await?;
+            self.delete_profile_unlocked(&p.id).await?;
         }
         self.conn
             .execute("DELETE FROM groups WHERE id = ?1", turso::params![id])
@@ -965,6 +1028,7 @@ impl Database {
     /// Delete all profiles in a group but keep the group itself.
     /// Subscriptions linked to the group are preserved.
     pub async fn clear_group(&self, group_id: &str) -> Result<usize> {
+        let _lock = self.lock.lock().await;
         // Prevent clearing system groups
         let is_system: Option<i32> = {
             let mut stmt = match self
@@ -986,14 +1050,15 @@ impl Database {
             ));
         }
         // Delete all profiles in this group (cascade: extensions + stats)
-        let profiles = self.get_profiles_by_group(group_id).await?;
+        let profiles = self.get_profiles_by_group_unlocked(group_id).await?;
         for p in &profiles {
-            self.delete_profile(&p.id).await?;
+            self.delete_profile_unlocked(&p.id).await?;
         }
         Ok(profiles.len())
     }
 
     pub async fn get_subscription_by_group(&self, group_id: &str) -> Result<Option<Subscription>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM subscriptions WHERE group_id = ?1 LIMIT 1")
@@ -1006,6 +1071,7 @@ impl Database {
     }
 
     pub async fn get_all_subscriptions(&self) -> Result<Vec<Subscription>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM subscriptions ORDER BY group_id")
@@ -1019,6 +1085,7 @@ impl Database {
     }
 
     pub async fn upsert_subscription(&self, sub: &Subscription) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO subscriptions (id, group_id, url, last_updated, update_interval, user_agent, status, error_message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1032,6 +1099,7 @@ impl Database {
     }
 
     pub async fn delete_subscriptions_by_group(&self, group_id: &str) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "DELETE FROM subscriptions WHERE group_id = ?1",
@@ -1042,6 +1110,7 @@ impl Database {
     }
 
     pub async fn get_groups_due_update(&self) -> Result<Vec<Group>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -1067,6 +1136,7 @@ impl Database {
         group_id: &str,
         profiles: &[Profile],
     ) -> Result<()> {
+        let _lock = self.lock.lock().await;
         let tx = self.conn.unchecked_transaction().await?;
 
         // 1. Upsert cores
@@ -1191,6 +1261,7 @@ impl Database {
         active_sub_uids: &[u64],
         graveyard_id: &str,
     ) -> Result<usize> {
+        let _lock = self.lock.lock().await;
         if active_sub_uids.is_empty() {
             return Ok(self
                 .conn
@@ -1238,6 +1309,7 @@ impl Database {
     }
 
     pub async fn purge_graveyard(&self, graveyard_id: &str, ttl_hours: i64) -> Result<usize> {
+        let _lock = self.lock.lock().await;
         let count = self
             .conn
             .execute(
@@ -1252,6 +1324,7 @@ impl Database {
     // ── Routing rules ────────────────────────────────────────────────
 
     pub async fn get_all_routing_rules(&self) -> Result<Vec<RoutingRule>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM routing_rules ORDER BY sort_order")
@@ -1265,6 +1338,7 @@ impl Database {
     }
 
     pub async fn insert_routing_rule(&self, r: &RoutingRule) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO routing_rules (id, group_id, type, domain_matcher, domains, ips, inbound_tags, port, source_ports, network, protocols, domain_strategy, outbound_tag, balancer_tag, rule_set_file, rule_set_url, sort_order) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
@@ -1280,6 +1354,7 @@ impl Database {
     }
 
     pub async fn update_routing_rule(&self, r: &RoutingRule) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "UPDATE routing_rules SET group_id=?1, type=?2, domain_matcher=?3, domains=?4, ips=?5, inbound_tags=?6, port=?7, source_ports=?8, network=?9, protocols=?10, domain_strategy=?11, outbound_tag=?12, balancer_tag=?13, rule_set_file=?14, rule_set_url=?15, sort_order=?16 WHERE id=?17",
@@ -1295,6 +1370,7 @@ impl Database {
     }
 
     pub async fn delete_routing_rule(&self, id: &str) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "DELETE FROM routing_rules WHERE id = ?1",
@@ -1305,6 +1381,7 @@ impl Database {
     }
 
     pub async fn reorder_routing_rules(&self, ids: &[(String, i32)]) -> Result<()> {
+        let _lock = self.lock.lock().await;
         let tx = self.conn.unchecked_transaction().await?;
         let mut stmt = tx
             .prepare("UPDATE routing_rules SET sort_order = ?1 WHERE id = ?2")
@@ -1322,6 +1399,7 @@ impl Database {
     // ── DNS settings ─────────────────────────────────────────────────
 
     pub async fn get_dns_settings(&self) -> Result<Option<DnsSetting>> {
+        let _lock = self.lock.lock().await;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT * FROM dns_settings LIMIT 1")
@@ -1334,6 +1412,7 @@ impl Database {
     }
 
     pub async fn upsert_dns_settings(&self, dns: &DnsSetting) -> Result<()> {
+        let _lock = self.lock.lock().await;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO dns_settings (id, name, servers, hosts, query_strategy, disable_cache, disable_fallback, client_ip) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",

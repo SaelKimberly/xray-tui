@@ -65,6 +65,36 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         Span::raw("")
     };
+    // Download progress indicator while updating backends
+    let download_span = {
+        let parts: Vec<String> = state
+            .update_status
+            .iter()
+            .filter(|(_, s)| s.downloading)
+            .map(|(ct, s)| {
+                let name = match ct {
+                    xray_tui_core::CoreType::Xray => "x",
+                    xray_tui_core::CoreType::SingBox => "sb",
+                    xray_tui_core::CoreType::Auto => "",
+                };
+                if let Some((done, total)) = s.download_progress {
+                    let pct = if total > 0 {
+                        format!("{}%", (done as f64 / total as f64 * 100.0) as u64)
+                    } else {
+                        "??".to_string()
+                    };
+                    format!(" ⇩{name} {pct}")
+                } else {
+                    format!(" ⇩{name}")
+                }
+            })
+            .collect();
+        if parts.is_empty() {
+            Span::raw("")
+        } else {
+            Span::styled(parts.join(" "), Theme::SPINNER)
+        }
+    };
     // Mode indicator prefix
     let mode_prefix = match &state.mode {
         crate::AppMode::Settings { mode } => match mode {
@@ -77,7 +107,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             crate::SettingsMode::MuxForm { .. } => " Settings > Mux",
             crate::SettingsMode::StatsForm { .. } => " Settings > Statistics",
             crate::SettingsMode::DnsForm { .. } => " Settings > DNS",
-            crate::SettingsMode::RoutingList { .. } | crate::SettingsMode::RoutingForm { .. } => " Settings > Routing",
+            crate::SettingsMode::RoutingList { .. } | crate::SettingsMode::RoutingForm { .. } => {
+                " Settings > Routing"
+            }
             crate::SettingsMode::UpdateForm { .. } => " Settings > Updates",
             crate::SettingsMode::ProtocolCoreForm { .. } => " Settings > Protocol Core",
             crate::SettingsMode::LoggingForm { .. } => " Settings > Logging",
@@ -97,7 +129,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let right_text = build_hints(state);
     let right_style = Style::default().fg(Color::Gray);
 
-    // Pad left to fill area, right-align the hint
     let width = area.width as usize;
     let left_len = left_text.len();
     let padding = width.saturating_sub(left_len + right_text.len());
@@ -107,10 +138,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::raw(" ".repeat(padding)),
         Span::styled(right_text, right_style),
     ];
-    // Insert update indicator between left text and padding if non-empty
+    // Insert indicators between left text and padding
+    let mut insert_pos = 1;
+    if !download_span.content.is_empty() {
+        spans.insert(insert_pos, Span::raw(" "));
+        insert_pos += 1;
+        spans.insert(insert_pos, download_span);
+        insert_pos += 1;
+    }
     if !update_indicator_span.content.is_empty() {
-        spans.insert(1, Span::raw(" "));
-        spans.insert(2, update_indicator_span);
+        spans.insert(insert_pos, Span::raw(" "));
+        insert_pos += 1;
+        spans.insert(insert_pos, update_indicator_span);
     }
 
     let line = Line::from(spans);
@@ -136,12 +175,14 @@ const fn build_hints(state: &AppState) -> &'static str {
             // Default tab-based hints
             match state.current_tab {
                 crate::Tab::Profiles => {
-                    if state.connected_core.is_some() {
-                        " [Ctrl+Shift+C] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
-                    } else if state.connecting {
+                    if matches!(state.mode, crate::AppMode::ManageGroups { .. }) {
                         " [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                    } else if state.connected_core.is_some() {
+                        " [g] Groups  [Ctrl+Shift+C] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                    } else if state.connecting {
+                        " [g] Groups  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
                     } else {
-                        " [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                        " [g] Groups  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
                     }
                 }
                 crate::Tab::Settings => " [Enter] Open  [Ctrl+Q] Quit ",

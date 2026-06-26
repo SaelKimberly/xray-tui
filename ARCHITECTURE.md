@@ -28,42 +28,59 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
     pub current_tab: Tab,
-    pub mode: AppMode,
     pub profiles: Vec<ProfileRow>,
+    pub cached_filtered_indices: RefCell<Vec<usize>>,
+    pub filter_cache_valid: Cell<bool>,
     pub groups: Vec<Group>,
+    pub subscriptions: Vec<Subscription>,
     pub selected_group_id: Option<String>,
     pub selected_index: usize,
+    pub log_scroll: usize,
+    pub sort_column: SortColumn,
+    pub sort_ascending: bool,
+    pub search_query: String,
+    pub search_focused: bool,
+    pub connected_core: Option<CoreType>,
+    pub connecting: bool,
+    pub system_stats: Option<grpc_client::SysStats>,
+    pub log_cache: Vec<LogLine>,
+    pub log_has_older: bool,
+    pub log_seek_home: bool,
+    pub connection_error: Option<String>,
+    pub core_event_rx: Option<mpsc::Receiver<CoreEvent>>,
+    pub core_event_tx: Option<mpsc::Sender<CoreEvent>>,
+    pub disconnect_tx: Option<oneshot::Sender<()>>,
+    pub should_quit: bool,
+    pub mode: AppMode,
+    pub previous_mode: Option<Box<AppMode>>,
     pub multi_select: HashSet<String>,
     pub clipboard: Option<String>,
     pub confirmation: Option<ConfirmAction>,
     pub updating_groups: HashSet<String>,
     pub testing_profiles: HashSet<String>,
+    pub testing_details: HashMap<uuid::Uuid, TestType>,
     pub test_progress: Option<(usize, usize)>,
-    pub search_focused: bool,
-    pub log_buffer: VecDeque<LogLine>,
-    pub logs_show_core: bool,
-    pub logs_show_tui: bool,
-    pub connected_core: Option<CoreType>,
-    pub connecting: bool,
-    pub connection_error: Option<String>,
-    pub disconnect_tx: Option<oneshot::Sender<()>>,
-    pub system_stats: Option<SysStats>,
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
-    pub previous_mode: Option<Box<AppMode>>,
-    pub routing_rules: Vec<RoutingRule>,
     pub actions_compact: bool,
     pub connected_profile_id: Option<String>,
     pub last_core_log: Option<(String, String)>,
     pub last_tui_log: Option<(String, String, String)>,
     pub last_test_tcp: Option<u64>,
-    pub testing_details: HashMap<uuid::Uuid, TestType>,
-    pub logs_show_validation: bool,
     pub last_test_real: Option<u64>,
-    /// terminal height (Atomics for interior mutability across render thread)
-    pub term_height: AtomicU16,
-    pub core_event_tx: Option<Sender<CoreEvent>>,
-    pub log_worker_tx: Option<Sender<LogWorkerMessage>>,
-    pub core_event_rx: Option<Receiver<CoreEvent>>,
+    pub last_test_speed: Option<u64>,
+    pub current_traffic_up: i64,
+    pub current_traffic_down: i64,
+    pub current_memory: u64,
+    pub term_height: Cell<u16>,
+    pub routing_rules: Vec<RoutingRule>,
+    pub shutdown_token: Arc<AtomicBool>,
+    pub core_task_handle: Option<JoinHandle<()>>,
+    /// Heed-backed persistent log storage.
+    pub heed_storage: Option<Arc<HeedLogStorage>>,
+    pub last_seen_log_ns: u64,
+    pub known_targets: Vec<String>,
+    pub selected_targets: Vec<String>,
+    pub last_heed_poll: Instant,
 }
 
 ### CoreEvent Channel
@@ -113,7 +130,7 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `import_url()` / `start_batch_import()` — parse share URL(s) and add profile(s)
 - `filtered_profiles()` — group filter + search filter + sort by column
 - `reload_profiles()` / `reload_groups()` — DB reload
-- `add_log()` — capped circular log buffer (1000 entries) + forwards non-TUI entries to LogStorageWorker for DB persistence; takes level, message, and source
+- `add_log()` — appends to in-memory log_cache (Vec<LogLine>, newest at end) and persists to HeedLogStorage via heed_storage.store_entry()
 - `start_add_server()` / `start_edit_profile()` — enter form mode
 - `confirm_add_server()` / `confirm_edit_server()` / `cancel_form()` — form lifecycle
 - `delete_profile()` / `clone_profile()` — CRUD operations
@@ -489,7 +506,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_source ON logs(source);
 **Repository pattern** — Each table gets a typed repo (same as single-core design).
 
 
-**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and dual-sends to (a) `core_event_tx` for in-memory `log_buffer` display and (b) `LogWorkerMessage::Entry` via `log_worker_tx` for persistence. The `LogStorageWorker` (in `log_worker.rs`) runs a `tokio::select!` loop accepting entries and queries. Entries are batched (500 or 100ms) and flushed via `LogRepository::insert_batch()` on a **dedicated connection** using `BEGIN IMMEDIATE` + `busy_timeout(500ms)`. Filtered queries merge the pending batch with DB results (newest-first ordering). TTL cleanup runs hourly via a background tokio task (deletes logs older than `ttl_hours`, defaults 72h).
+**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage::store_entry()` via a synchronous call on the heed (LMDB) environment. The `HeedLogStorage` (in `log_heed.rs`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp and value as postcard-encoded `LogMessage`. A separate `targets` database tracks seen target strings. All reads/writes are synchronous (heed uses mmap); callers wrap in `Arc` for shared async access. Filtered queries read directly from LMDB — no background worker, no dedicated connection, no SQLite table.
 **Migration approach**: migratus-like version numbering in a `schema_version` table.
 
 ### xray-tui-config (library crate)
@@ -611,5 +628,5 @@ Single tokio async runtime on the main thread for I/O. Ratatui rendering in a sy
 - Process monitor task → TUI: `process_event_tx` (Started, Stopped, Crashed(error))
 - Stats poll task → TUI: `stats_update_tx` (IndexId, TodayUp, TodayDown, etc.)
 - Log reader task → TUI: `log_line_tx` (timestamp, level, message)
-- Log storage worker → DB: `LogStorageWorker` receives entries via `log_worker_tx`, batches every 100ms, flushes to `logs` table on a dedicated connection
+- Log persistence → heed (LMDB): `HeedLogStorage` stores entries synchronously via heed; no background worker or dedicated connection
 - TUI event loop: polls all channels + terminal events + renders frame

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
 use xray_tui_core::CoreType;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,7 +62,7 @@ pub struct GuiConfig {
     pub language: String,
     pub theme: Option<String>,
     #[serde(default = "default_refresh_interval")]
-    pub refresh_interval_secs: u64,
+    pub refresh_interval_secs: crate::DurationOrSecs,
 }
 
 impl Default for GuiConfig {
@@ -78,8 +79,8 @@ fn default_language() -> String {
     "en".to_owned()
 }
 
-const fn default_refresh_interval() -> u64 {
-    5
+fn default_refresh_interval() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_secs(5))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +184,18 @@ impl AppConfig {
         let path = default_config_path();
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&content)?)
+            let mut config: Self = serde_json::from_str(&content)?;
+            // Normalize old protocol Display strings in protocol_core_overrides keys.
+            // The Display impl was changed to short forms ("ss", "hy", etc.)
+            // which broke backward-compat with configs saved using the old
+            // kebab-case Debug forms ("shadowsocks", "hysteria", etc.).
+            config.core.protocol_core_overrides = config
+                .core
+                .protocol_core_overrides
+                .into_iter()
+                .map(|(k, v)| (normalize_protocol_key(&k), v))
+                .collect();
+            Ok(config)
         } else {
             let config = Self::default();
             config.save()?;
@@ -209,6 +221,24 @@ fn default_config_path() -> PathBuf {
         .join("config.json")
 }
 
+/// Normalize old protocol (Display) key names to current short forms.
+/// The `Protocol::Display` impl was changed from kebab-case Debug-derived
+/// names to short forms (e.g. "shadowsocks" → "ss", "hysteria" → "hy").
+/// This maps old config-file keys to their current equivalents.
+fn normalize_protocol_key(key: &str) -> String {
+    match key {
+        "shadowsocks" => "ss",
+        "shadowsocks-2022" => "ss-2022",
+        "shadowsocks-r" => "ssr",
+        "hysteria" => "hy",
+        "hysteria-2" => "hy2",
+        "dokodemo-door" => "dokodemo",
+        "wire-guard" => "wireguard",
+        other => other,
+    }
+    .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,7 +251,10 @@ mod tests {
 
         assert_eq!(restored.core.log_level, "warning");
         assert_eq!(restored.gui.language, "en");
-        assert_eq!(restored.gui.refresh_interval_secs, 5);
+        assert_eq!(
+            *restored.gui.refresh_interval_secs,
+            std::time::Duration::from_secs(5)
+        );
         assert_eq!(restored.inbound.socks_port, 10808);
         assert_eq!(restored.inbound.listen, "127.0.0.1");
         assert!(!restored.inbound.sniffing);
@@ -238,6 +271,95 @@ mod tests {
         let json = r#"{"core":{"core_type":"xray"},"gui":{},"inbound":{}}"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.core.core_type, Some(CoreType::Xray));
+    }
+
+    #[test]
+    fn normalize_protocol_key_known_pairs() {
+        // Each known old Display string → current short form
+        let cases = [
+            ("shadowsocks", "ss"),
+            ("shadowsocks-2022", "ss-2022"),
+            ("shadowsocks-r", "ssr"),
+            ("hysteria", "hy"),
+            ("hysteria-2", "hy2"),
+            ("dokodemo-door", "dokodemo"),
+            ("wire-guard", "wireguard"),
+        ];
+        for (old, expected) in &cases {
+            assert_eq!(normalize_protocol_key(old), *expected, "failed for {old}");
+        }
+    }
+
+    #[test]
+    fn normalize_protocol_key_passes_through_unknown() {
+        // Already-short or unknown keys pass through unchanged
+        let passthrough = [
+            "vmess",
+            "vless",
+            "ss",
+            "ss-2022",
+            "ssr",
+            "hy",
+            "hy2",
+            "trojan",
+            "socks",
+            "http",
+            "dokodemo",
+            "wireguard",
+            "tuic",
+            "naive",
+            "any-tls",
+            "shadow-tls",
+            "tor",
+            "ssh",
+            "redirect",
+            "t-proxy",
+            "mixed",
+            "tailscale",
+        ];
+        for key in &passthrough {
+            assert_eq!(
+                normalize_protocol_key(key),
+                *key,
+                "passthrough failed for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalise_protocol_key_round_trips_config() {
+        // Simulate loading a config with old keys — they should survive
+        // normalization and be usable at runtime.
+        let old_config_json = r#"{
+            "core": {
+                "protocol_core_overrides": {
+                    "shadowsocks-2022": "xray",
+                    "wire-guard": "sing-box",
+                    "dokodemo-door": "xray"
+                }
+            },
+            "gui": {},
+            "inbound": {}
+        }"#;
+        let mut config: AppConfig = serde_json::from_str(old_config_json).unwrap();
+        // Apply normalization (same as AppConfig::load() does)
+        config.core.protocol_core_overrides = config
+            .core
+            .protocol_core_overrides
+            .into_iter()
+            .map(|(k, v)| (normalize_protocol_key(&k), v))
+            .collect();
+        let overrides = &config.core.protocol_core_overrides;
+        assert_eq!(overrides.get("ss-2022").map(String::as_str), Some("xray"));
+        assert_eq!(
+            overrides.get("wireguard").map(String::as_str),
+            Some("sing-box")
+        );
+        assert_eq!(overrides.get("dokodemo").map(String::as_str), Some("xray"));
+        // Old keys should no longer exist
+        assert!(overrides.get("shadowsocks-2022").is_none());
+        assert!(overrides.get("wire-guard").is_none());
+        assert!(overrides.get("dokodemo-door").is_none());
     }
 }
 
@@ -275,13 +397,13 @@ pub struct SpeedTestConfig {
     #[serde(default = "default_ip_api_url")]
     pub ip_api_url: String,
     #[serde(default = "default_tcp_timeout_secs")]
-    pub tcp_timeout_secs: u64,
+    pub tcp_timeout_secs: crate::DurationOrSecs,
     #[serde(default = "default_real_ping_timeout_secs")]
-    pub real_ping_timeout_secs: u64,
+    pub real_ping_timeout_secs: crate::DurationOrSecs,
     #[serde(default = "default_batch_page_size")]
     pub batch_page_size: usize,
-    #[serde(default = "default_batch_delay_ms")]
-    pub batch_delay_ms: u64,
+    #[serde(default = "default_batch_delay_secs")]
+    pub batch_delay_secs: crate::DurationOrSecs,
     #[serde(default = "default_real_ping_retries")]
     pub real_ping_retries: u32,
     #[serde(default = "default_real_ping_concurrency")]
@@ -296,20 +418,20 @@ fn default_ip_api_url() -> String {
     "http://ip-api.com/json/".to_string()
 }
 
-const fn default_tcp_timeout_secs() -> u64 {
-    5
+fn default_tcp_timeout_secs() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_secs(5))
 }
 
-const fn default_real_ping_timeout_secs() -> u64 {
-    5
+fn default_real_ping_timeout_secs() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_secs(5))
 }
 
 const fn default_batch_page_size() -> usize {
     1000
 }
 
-const fn default_batch_delay_ms() -> u64 {
-    1000
+fn default_batch_delay_secs() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_secs(1))
 }
 
 const fn default_real_ping_retries() -> u32 {
@@ -328,7 +450,7 @@ impl Default for SpeedTestConfig {
             tcp_timeout_secs: default_tcp_timeout_secs(),
             real_ping_timeout_secs: default_real_ping_timeout_secs(),
             batch_page_size: default_batch_page_size(),
-            batch_delay_ms: default_batch_delay_ms(),
+            batch_delay_secs: default_batch_delay_secs(),
             real_ping_retries: default_real_ping_retries(),
             real_ping_concurrency: default_real_ping_concurrency(),
         }
@@ -345,24 +467,18 @@ pub struct ParsingSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogConfig {
-    #[serde(default = "default_log_ttl_hours")]
-    pub ttl_hours: u64,
-    #[serde(default = "default_log_batch_size")]
-    pub batch_size: usize,
+    #[serde(default = "default_log_ttl_secs")]
+    pub ttl_secs: crate::DurationOrSecs,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
-            ttl_hours: default_log_ttl_hours(),
-            batch_size: default_log_batch_size(),
+            ttl_secs: default_log_ttl_secs(),
         }
     }
 }
 
-const fn default_log_ttl_hours() -> u64 {
-    72
-}
-const fn default_log_batch_size() -> usize {
-    500
+fn default_log_ttl_secs() -> crate::DurationOrSecs {
+    crate::DurationOrSecs::from(std::time::Duration::from_hours(72))
 }

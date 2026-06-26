@@ -41,8 +41,10 @@ xray-tui-db = { path = "../xray-tui-db" }
 # ============ Logging ============
 tracing.workspace = true
 
+# ============ Persistent Log Storage ============
+heed = { version = "0.22" }
+postcard = { version = "1", features = ["alloc"] }
+byteorder = "1"
+
 [build-dependencies]
 tonic-prost-build = "0.14"
-
-[lints]
-workspace = true

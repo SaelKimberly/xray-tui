@@ -28,8 +28,7 @@ cargo run
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 - `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
 :- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping with IP info, speed test, UDP test, batch ping, batch-then-real-ping) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig.
-- `crates/xray-tui-db/src/log_repo.rs` — LogRepository for DB-backed log persistence (insert_batch, get_filtered, delete_older_than)
-- `crates/xray-tui-core/src/log_worker.rs` — LogStorageWorker background task: batch writes + filtered queries via dedicated connection
+:- `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
 
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
 ### TUI screens (crates/xray-tui/src/ui/)
@@ -90,7 +89,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
-**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Turso-backed log storage** (LogStorageWorker, LogRepository, logs table, TTL, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. Phase 9 (v2rayN Parity) captures remaining feature gaps.
+**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Heed-backed log storage** (HeedLogStorage, LMDB, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A sele…
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
@@ -107,18 +106,14 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 6. `shutdown_token: Arc<AtomicBool>` on `AppState` signals the background loop to stop on quit — checked via `token.load()` in each iteration
 
 ### Adding log storage features
-1. Add `logs` table + indexes in `crates/xray-tui-db/src/schema.rs` (`create_tables()`)
-2. Define `LogEntry` struct in `crates/xray-tui-db/src/models.rs`
-3. Create `LogRepository` in `crates/xray-tui-db/src/log_repo.rs` with `insert_batch()`, `get_filtered()`, `delete_older_than()`
-4. Create `LogStorageWorker` in `crates/xray-tui-core/src/log_worker.rs` — unified write+query loop with pending batch merging
-5. Modify `TuiLogLayer` in `main.rs` to dual-send: `core_event_tx` (TUI display) + `log_worker_tx` (persistence)
-6. Wire `log_worker_tx` through `AppState`, forward non-tui logs in `add_log()`
-7. Add `LogConfig` to `AppConfig` (ttl_hours, batch_size)
-8. Add `Logging` section to Settings (SettingsMode, SettingsSection, form fields)
-9. Use `BEGIN IMMEDIATE` on dedicated connection (not main connection) with `busy_timeout(500ms)` to avoid lock contention
-10. All connections to the same DB must use the same `PRAGMA journal_mode` (`'wal'` recommended for bulk insert performance)
-
-11. Error handling in `LogStorageWorker` must use `tracing::error!(target: "log_worker", ...)` — never `eprintln!` which writes to stderr and corrupts the TUI in raw mode. Target `"log_worker"` bypasses the `EnvFilter("xray_tui=info")` on the fmt layer (no stderr output) while `TuiLogLayer` (no filter) still captures the event for the Logs tab. Add a `consecutive_failures` counter with rate-limited logging (log on first, then every 10th) to avoid flooding during extended DB lock contention.
+1. Define `LogMessage` struct in `crates/xray-tui-core/src/log_heed.rs` with fields: `timestamp_nanos`, `level`, `target`, `message`, `source`
+2. Create `HeedLogStorage` in same file — wraps two heed (LMDB) databases: `logs` (u64 BE timestamp → postcard-encoded LogMessage) and `targets` (set of seen target strings)
+3. Provide methods: `store_entry()`, `get_filtered()`, `get_targets()`, `delete_older_than()`, `count_entries()`, `clear_all()`
+4. Open LMDB environment with `heed::Env::open()` in the TUI binary (`main.rs`), pass to `AppState`, then wrap in `Arc<HeedLogStorage>` for shared access
+5. Wire `TuiLogLayer` in `main.rs` to forward log entries to `HeedLogStorage::store_entry()` via `log_storage_tx` channel (mpsc::unbounded)
+6. Query log storage directly from `TuiLogLayer` for filtered queries — no separate background worker required; heed reads are synchronous (mmap)
+7. Use `postcard` crate (included in heed's deps) for zero-copy binary serialization of LogMessage. No TOML config needed for log storage — heed env size is fixed at compile time (256MB virtual address reservation)
+8. Error handling in `HeedLogStorage` uses `tracing::error!()` — never `eprintln!()` which writes to stderr and corrupts the TUI in raw mode
 ### Adding batch import for share URLs
 1. Parse each URL with `parse_share_url(url, &config.validation)` from `xray_tui_config::import_export`
 2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }`

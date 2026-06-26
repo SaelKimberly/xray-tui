@@ -99,7 +99,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
-    let AppMode::ImportUrl { input, error } = &state.mode else { return; };
+    let AppMode::ImportUrl { input, error } = &state.mode else {
+        return;
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -404,7 +406,9 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         _ => None,
     };
 
-    let Some(p) = protocol else { return; };
+    let Some(p) = protocol else {
+        return;
+    };
 
     // Now match on mode again to get mutable refs to fields
     let field_data = match &mut state.mode {
@@ -422,7 +426,9 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         _ => None,
     };
 
-    let Some((protocol, fields, focus_index, is_edit)) = field_data else { return; };
+    let Some((protocol, fields, focus_index, is_edit)) = field_data else {
+        return;
+    };
 
     let form_fields = form_fields_for(protocol);
     if form_fields.is_empty() {
@@ -523,7 +529,9 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
 }
 
 pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
-    let AppMode::BatchImport { results, scroll } = &state.mode else { return; };
+    let AppMode::BatchImport { results, scroll } = &state.mode else {
+        return;
+    };
 
     let block = Block::default()
         .title(" Batch Import ")

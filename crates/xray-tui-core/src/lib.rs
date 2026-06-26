@@ -15,7 +15,7 @@ pub mod bin_manager;
 pub mod config_builder;
 pub mod core_type;
 pub mod grpc_client;
-pub mod log_worker;
+pub mod log_heed;
 pub mod process;
 pub mod protocol;
 pub mod protocol_core_mapping;
@@ -29,6 +29,7 @@ pub use grpc_client::{
     API_ENDPOINT, GrpcError, StatsProvider, SysStats, create_stats_provider, format_bytes,
     format_uptime,
 };
+pub use log_heed::HeedLogStorage;
 pub use process::CoreManager;
 pub use protocol::Protocol;
 pub use protocol::SINGBOX_ONLY_PROTOCOLS;

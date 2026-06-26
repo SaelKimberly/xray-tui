@@ -210,11 +210,11 @@ pub static PROTOCOL_CORE_DEFS: &[(&str, &str, &str)] = &[
     ("vmess", "VMess", "Select:Auto,Xray,SingBox"),
     ("vless", "VLESS", "Select:Auto,Xray,SingBox"),
     ("ss", "Shadowsocks", "Select:Auto,Xray,SingBox"),
-    ("shadowsocks-2022", "SS-2022", "Select:Auto,Xray,SingBox"),
+    ("ss-2022", "SS-2022", "Select:Auto,Xray,SingBox"),
     ("socks", "SOCKS", "Select:Auto,Xray,SingBox"),
     ("http", "HTTP", "Select:Auto,Xray,SingBox"),
     ("trojan", "Trojan", "Select:Auto,Xray,SingBox"),
-    ("wire-guard", "WireGuard", "Select:Auto,Xray,SingBox"),
+    ("wireguard", "WireGuard", "Select:Auto,Xray,SingBox"),
     ("hy2", "Hysteria2", "Select:Auto,Xray,SingBox"),
     ("hy", "Hysteria", "Select:Auto,Xray,SingBox"),
     ("tuic", "TUIC", "Select:Auto,Xray,SingBox"),
@@ -225,7 +225,7 @@ pub static PROTOCOL_CORE_DEFS: &[(&str, &str, &str)] = &[
     ("ssh", "SSH", "Select:Auto,Xray,SingBox"),
     ("ssr", "ShadowsocksR", "Select:Auto,Xray,SingBox"),
     ("redirect", "Redirect", "Select:Auto,Xray,SingBox"),
-    ("dokodemo-door", "Dokodemo-door", "Select:Auto,Xray,SingBox"),
+    ("dokodemo", "Dokodemo-door", "Select:Auto,Xray,SingBox"),
     ("t-proxy", "TProxy", "Select:Auto,Xray,SingBox"),
     ("mixed", "Mixed", "Select:Auto,Xray,SingBox"),
     ("tailscale", "Tailscale", "Select:Auto,Xray,SingBox"),
@@ -243,7 +243,7 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
         SettingsMode::GuiForm { .. } => &[
             ("language", "Language", "Select:en,zh"),
             ("theme", "Theme", "Text"),
-            ("refresh_interval", "Refresh Interval (s)", "Number"),
+            ("refresh_interval", "Refresh Interval", "Text"),
         ],
         SettingsMode::InboundForm { .. } => &[
             ("socks_port", "SOCKS Port", "Number"),
@@ -287,21 +287,14 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
         SettingsMode::SpeedTestForm { .. } => &[
             ("ping_url", "Ping Test URL", "Text"),
             ("ip_api_url", "IP API URL", "Text"),
-            ("tcp_timeout_secs", "TCP Timeout (sec)", "Number"),
-            (
-                "real_ping_timeout_secs",
-                "Real Ping Timeout (sec)",
-                "Number",
-            ),
+            ("tcp_timeout_secs", "TCP Timeout", "Text"),
+            ("real_ping_timeout_secs", "Real Ping Timeout", "Text"),
             ("batch_page_size", "Batch Page Size", "Number"),
-            ("batch_delay_ms", "Batch Delay (ms)", "Number"),
+            ("batch_delay_secs", "Batch Delay", "Text"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
         ],
-        SettingsMode::LoggingForm { .. } => &[
-            ("log_ttl_hours", "Log Retention (hours)", "Number"),
-            ("log_batch_size", "Log Batch Size", "Number"),
-        ],
+        SettingsMode::LoggingForm { .. } => &[("log_ttl_secs", "Log Retention", "Text")],
         _ => &[],
     }
 }
@@ -309,7 +302,10 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
 // TODO 3.3: Add scroll_offset: usize to each *Form variant + scroll indicators
 // (↑ N more / ↓ N more) when fields exceed visible height. Render clipped
 // window around focused field.
-#[allow(clippy::option_if_let_else, reason = "three-branch if-else more readable than nested map_or_else for display formatting")]
+#[allow(
+    clippy::option_if_let_else,
+    reason = "three-branch if-else more readable than nested map_or_else for display formatting"
+)]
 fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode = match &state.mode {
         AppMode::Settings { mode } => mode,
@@ -697,7 +693,9 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
             avail_style,
         )));
     }
-    if status_xray.downloading {
+    if let Some((downloaded, total)) = status_xray.download_progress {
+        lines.push(progress_bar_line(downloaded, total, &hint_style));
+    } else if status_xray.downloading {
         lines.push(Line::from(Span::styled("    Downloading...", hint_style)));
     }
     if let Some(err) = &status_xray.error {
@@ -736,7 +734,9 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
             avail_style,
         )));
     }
-    if status_singbox.downloading {
+    if let Some((downloaded, total)) = status_singbox.download_progress {
+        lines.push(progress_bar_line(downloaded, total, &hint_style));
+    } else if status_singbox.downloading {
         lines.push(Line::from(Span::styled("    Downloading...", hint_style)));
     }
     if let Some(err) = &status_singbox.error {
@@ -1341,7 +1341,10 @@ fn truncate_to(s: &str, max: usize) -> String {
 }
 
 /// Extract (fields, `focus_index`, `form_errors`) from any settings form variant.
-#[allow(clippy::type_complexity, reason = "temporary tuple type in form extraction helper")]
+#[allow(
+    clippy::type_complexity,
+    reason = "temporary tuple type in form extraction helper"
+)]
 pub const fn extract_form_fields(
     state: &AppState,
 ) -> Option<(&Vec<(String, String)>, &usize, &HashMap<String, String>)> {
@@ -1409,7 +1412,10 @@ pub const fn extract_form_fields(
     }
 }
 
-#[allow(clippy::type_complexity, reason = "temporary tuple type in form extraction helper")]
+#[allow(
+    clippy::type_complexity,
+    reason = "temporary tuple type in form extraction helper"
+)]
 /// Mutable version of `extract_form_fields`.
 pub const fn extract_form_fields_mut(
     state: &mut AppState,
@@ -1479,4 +1485,46 @@ pub const fn extract_form_fields_mut(
         } => Some((fields, focus_index, form_errors)),
         _ => None,
     }
+}
+// ── Progress bar helpers ─────────────────────────────────────────────────
+
+/// Format byte count to a human-readable string (KB/MB).
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if n >= MB {
+        format!("{:.1}MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1}KB", n as f64 / KB as f64)
+    } else {
+        format!("{n}B")
+    }
+}
+
+/// Build a text-based progress bar line for download progress.
+fn progress_bar_line(downloaded: u64, total: u64, _style: &Style) -> Line<'static> {
+    const BAR_WIDTH: usize = 20;
+    let filled = if total > 0 {
+        let ratio = downloaded as f64 / total as f64;
+        (ratio * BAR_WIDTH as f64).min(BAR_WIDTH as f64) as usize
+    } else {
+        0
+    };
+    let empty = BAR_WIDTH - filled;
+    let bar: String = format!("    [{}>{}]", "█".repeat(filled), "░".repeat(empty),);
+    let pct = if total > 0 {
+        format!(" {}%", (downloaded as f64 / total as f64 * 100.0) as u64)
+    } else {
+        String::new()
+    };
+    let sizes = format!(
+        " ({}/{})",
+        format_bytes(downloaded),
+        if total > 0 {
+            format_bytes(total)
+        } else {
+            "?".to_string()
+        }
+    );
+    Line::from(Span::styled(format!("{bar}{pct}{sizes}"), *_style))
 }

@@ -77,7 +77,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
     });
-    let refresh_interval = Duration::from_secs(state.config.gui.refresh_interval_secs);
+    let refresh_interval = *state.config.gui.refresh_interval_secs;
     let mut last_tick = std::time::Instant::now();
 
     // (channels already created in AppState::new)
@@ -86,6 +86,9 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     if state.config.updates.check_on_startup {
         state.spawn_update_check();
     }
+
+    // 9. Load initial logs from DB into cache
+    state.load_initial_logs();
     while !state.should_quit {
         loop {
             match rx.try_recv() {
@@ -101,6 +104,24 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         // Process core process events (connect/disconnect/error)
         state.poll_core_events().await;
 
+        // Progressive log loading: one batch per frame for Home key
+        if state.log_seek_home {
+            crate::ui::logs::try_load_older(state);
+            if !state.log_has_older {
+                let filtered = crate::ui::logs::count_filtered(state);
+                state.log_scroll = filtered.saturating_sub(1);
+                state.log_seek_home = false;
+            }
+        }
+
+        if state.current_tab == Tab::Logs && state.log_scroll == 0 {
+            let now = std::time::Instant::now();
+            if now.duration_since(state.last_heed_poll) >= std::time::Duration::from_millis(100) {
+                state.last_heed_poll = now;
+                crate::ui::logs::poll_new_logs(state);
+            }
+        }
+
         if last_tick.elapsed() >= refresh_interval {
             last_tick = std::time::Instant::now();
         }
@@ -110,7 +131,8 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
-    // Signal background tasks to stop
+    // Signal background tasks to stop and disconnect core
+    state.disconnect();
     state.shutdown_token.store(true, Ordering::Relaxed);
 
     disable_raw_mode()?;
@@ -136,7 +158,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id).await,
                 Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
                 Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
-                Some(ConfirmAction::Quit) => state.should_quit = true,
+                Some(ConfirmAction::Quit) => {
+                    state.disconnect();
+                    state.should_quit = true;
+                }
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -166,6 +191,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     ) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.disconnect();
                 state.should_quit = true;
             }
             _ => groups::handle_key(state, key).await,
@@ -177,6 +203,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     if matches!(&state.mode, crate::AppMode::Settings { .. }) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.disconnect();
                 state.should_quit = true;
             }
             _ => settings::handle_key(state, key).await,
@@ -315,6 +342,31 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
+    // Logs tab: route only scroll and filter keys to logs handler
+    if state.current_tab == crate::Tab::Logs && matches!(state.mode, crate::AppMode::List) {
+        let is_logs_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char('t' | 'T')
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_logs_key {
+            logs::handle_key(state, key);
+            return;
+        }
+        // else: fall through to main handler for quit/tab/help/etc.
+    }
+
+    // TargetPicker mode: route to target picker handler
+    if matches!(&state.mode, crate::AppMode::TargetPicker { .. }) {
+        logs::handle_target_picker_key(state, key);
+        return;
+    }
+
     match key.code {
         // Help mode: Esc or ? to close, ignore other keys
         KeyCode::Char('?') | KeyCode::Esc if matches!(&state.mode, crate::AppMode::Help) => {
@@ -390,28 +442,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             let max = state.filtered_len().saturating_sub(1);
             state.selected_index = (state.selected_index + page).min(max);
         }
-        // Logs tab scrolling — inverted: Up→newer, Down→older
-        KeyCode::Up if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_scroll.saturating_sub(1);
-        }
-        KeyCode::Down if state.current_tab == Tab::Logs => {
-            let max = state.log_buffer.len().saturating_sub(1);
-            if state.log_scroll < max {
-                state.log_scroll += 1;
-            }
-        }
-        KeyCode::PageUp if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_scroll.saturating_sub(20);
-        }
-        KeyCode::PageDown if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_scroll.saturating_add(20);
-        }
-        KeyCode::Home if state.current_tab == Tab::Logs => {
-            state.log_scroll = state.log_buffer.len().saturating_sub(1);
-        }
-        KeyCode::End if state.current_tab == Tab::Logs => {
-            state.log_scroll = 0;
-        }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
@@ -459,10 +489,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.multi_select.insert(id);
             }
         }
-        // Ctrl+Shift+A: deselect all
-        KeyCode::Char('A')
+        // Ctrl+G: deselect all (Ctrl+Shift+A is the same as Ctrl+A on most terminals)
+        KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.modifiers.contains(KeyModifiers::SHIFT)
                 && state.current_tab == Tab::Profiles =>
         {
             state.multi_select.clear();
@@ -582,7 +611,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             });
             if let Some(url) = url {
                 state.clipboard = Some(url);
-                state.add_log("info", "Share URL copied to clipboard", "tui");
+                state.log_trace("info", "tui", "Share URL copied to clipboard");
             }
         }
         KeyCode::Esc => {
@@ -605,10 +634,7 @@ fn render(frame: &mut Frame, state: &AppState) {
 
     let is_small = frame.area().height < SMALL_THRESH;
     let overlay = !state.actions_compact && is_small;
-    let ph = if (state.current_tab != Tab::Profiles
-        && !matches!(state.mode, AppMode::SpeedTestMenu { .. } | AppMode::Help))
-        || overlay
-    {
+    let ph = if overlay {
         0 // actions panel only useful on Profiles tab
     } else if state.actions_compact {
         1
