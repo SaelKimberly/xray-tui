@@ -210,7 +210,7 @@ pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editi
             fields,
             focus_index,
             ..
-        } => (fields.clone(), *focus_index),
+        } => (fields, *focus_index),
         _ => return,
     };
 
@@ -376,44 +376,9 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 _ => {}
             }
         }
-        AppMode::AddGroup {
-            fields,
-            focus_index,
-        }
-        | AppMode::EditGroup {
-            fields,
-            focus_index,
-            ..
-        } => {
-            let mut flds = fields.clone();
-            let mut fi = *focus_index;
-            let keys = [
-                "name",
-                "subscription_url",
-                "user_agent",
-                "update_interval",
-                "core_type",
-            ];
-
+        AppMode::AddGroup { .. } | AppMode::EditGroup { .. } => {
+            // Enter/Esc handled first — need &state before any &mut borrow
             match key.code {
-                KeyCode::Tab => {
-                    fi = (fi + 1) % keys.len();
-                }
-                KeyCode::BackTab => {
-                    fi = if fi == 0 { keys.len() - 1 } else { fi - 1 };
-                }
-                KeyCode::Char(c) => {
-                    let key = keys[fi];
-                    if let Some((_, val)) = flds.iter_mut().find(|(k, _)| k == key) {
-                        val.push(c);
-                    }
-                }
-                KeyCode::Backspace => {
-                    let key = keys[fi];
-                    if let Some((_, val)) = flds.iter_mut().find(|(k, _)| k == key) {
-                        val.pop();
-                    }
-                }
                 KeyCode::Enter => {
                     match &state.mode {
                         AppMode::AddGroup { .. } => state.confirm_add_group().await,
@@ -429,23 +394,43 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 _ => {}
             }
 
-            // Update focus index and fields in mode
-            match &state.mode {
-                AppMode::AddGroup { .. } => {
-                    state.mode = AppMode::AddGroup {
-                        fields: flds,
-                        focus_index: fi,
-                    };
+            // Now safe to &mut borrow state.mode for in-place edits
+            let (fields, focus_index) = match &mut state.mode {
+                AppMode::AddGroup { fields, focus_index }
+                | AppMode::EditGroup { fields, focus_index, .. } => (fields, focus_index),
+                _ => return,
+            };
+
+            let keys = [
+                "name",
+                "subscription_url",
+                "user_agent",
+                "update_interval",
+                "core_type",
+            ];
+
+            match key.code {
+                KeyCode::Tab => {
+                    *focus_index = (*focus_index + 1) % keys.len();
                 }
-                AppMode::EditGroup { group_id, .. } => {
-                    state.mode = AppMode::EditGroup {
-                        group_id: group_id.clone(),
-                        fields: flds,
-                        focus_index: fi,
-                    };
+                KeyCode::BackTab => {
+                    *focus_index = if *focus_index == 0 { keys.len() - 1 } else { *focus_index - 1 };
+                }
+                KeyCode::Char(c) => {
+                    let key = keys[*focus_index];
+                    if let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == key) {
+                        val.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    let key = keys[*focus_index];
+                    if let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == key) {
+                        val.pop();
+                    }
                 }
                 _ => {}
             }
+            // No reassignment needed — fields and focus_index mutated in-place
         }
         _ => {}
     }

@@ -110,12 +110,11 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let title = "Import URL — Ctrl+V paste, Enter parse, Esc cancel";
     let block = Block::default().title(title).borders(Borders::ALL);
-    let input_text = if input.is_empty() {
-        " (paste URL here) ".to_string()
+    let input_para = if input.is_empty() {
+        Paragraph::new(" (paste URL here) ").block(block)
     } else {
-        input.clone()
+        Paragraph::new(input.as_str()).block(block)
     };
-    let input_para = Paragraph::new(input_text).block(block);
     frame.render_widget(input_para, chunks[0]);
 
     if let Some(err) = error {

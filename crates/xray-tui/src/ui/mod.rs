@@ -72,7 +72,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
     tokio::task::spawn_blocking(move || {
         while let Ok(ev) = event::read() {
-            if tx.try_send(ev).is_err() {
+            if tx.blocking_send(ev).is_err() {
                 break;
             }
         }
@@ -90,7 +90,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // Initial logs no longer loaded here — deferred to first Logs tab access (lazy loading).
     while !state.should_quit {
         // Process up to N events per frame to prevent input lag under held keys
-        const MAX_EVENTS_PER_FRAME: usize = 5;
+        const MAX_EVENTS_PER_FRAME: usize = 100;
         for i in 0..MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(ev) => {

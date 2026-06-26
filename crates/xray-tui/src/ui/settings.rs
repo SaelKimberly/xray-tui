@@ -463,18 +463,18 @@ const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
 }
 
 fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
-    // Clone mode to extract data, then work through mutable state
-    let mode_snapshot = match &state.mode {
-        AppMode::Settings { mode } => mode.clone(),
+    // Borrow mode to extract data, then work through mutable state
+    let mode = match &state.mode {
+        AppMode::Settings { mode } => mode,
         _ => return,
     };
-    let section = match section_from_mode(&mode_snapshot) {
+    let section = match section_from_mode(mode) {
         Some(s) => s,
         None => return,
     };
 
     // Get field defs
-    let field_defs = form_field_defs(&mode_snapshot);
+    let field_defs = form_field_defs(mode);
     if field_defs.is_empty() {
         return;
     }
