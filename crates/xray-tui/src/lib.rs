@@ -3,7 +3,7 @@
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
-    reason = "known-safe casts on port/len/display"
+    reason = "TUI display domain: ports validated to u16, timestamps fit i64 for billions of years, list indices < u16 for rendering, display precision loss acceptable"
 )]
 #![allow(
     clippy::future_not_send,
@@ -417,9 +417,9 @@ pub struct AppState {
     /// Last time we polled heed for new log entries.
     pub last_heed_poll: std::time::Instant,
     /// Channel sender for non-blocking log persistence.
-    /// TuiLogLayer and core log forwarder send LogMessage here; background writer batches and writes to heed.
+    /// `TuiLogLayer` and core log forwarder send `LogMessage` here; background writer batches and writes to heed.
     pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
-    /// Whether initial logs have been loaded from heed into log_cache yet.
+    /// Whether initial logs have been loaded from heed into `log_cache` yet.
     pub logs_loaded: bool,
 }
 /// Internal helper for batch ping deduplication.
@@ -3670,7 +3670,7 @@ impl AppState {
     }
 }
 
-/// Helper to send a CoreEvent with a warning on channel full.
+/// Helper to send a `CoreEvent` with a warning on channel full.
 /// Prevents silent event loss.
 fn try_send_or_warn(tx: &tokio::sync::mpsc::Sender<CoreEvent>, event: CoreEvent, label: &'static str) {
     if let Err(_e) = tx.try_send(event) {
@@ -3845,11 +3845,7 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
         }
 
         // Extract target from msg if it has a "tag: message" pattern
-        let target = if let Some(pos) = msg.find(": ") {
-            format!("sing::{}", &msg[..pos])
-        } else {
-            "sing".to_string()
-        };
+        let target = msg.find(": ").map_or_else(|| "sing".to_string(), |pos| format!("sing::{}", &msg[..pos]));
 
         return (level, target, msg.to_string(), ts_nanos);
     }
@@ -3859,6 +3855,7 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
         .get_or_init(|| Regex::new(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?) ?").unwrap());
     let level_re = LEVEL_RE.get_or_init(|| Regex::new(r"\[(Debug|Info|Warning|Error)\]").unwrap());
 
+    #[allow(clippy::option_if_let_else, reason = "side-effect on ts_nanos makes map_or awkward")]
     let remaining = if let Some(caps) = xray_ts_re.captures(trimmed) {
         let ts_str = caps.get(1).unwrap().as_str();
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y/%m/%d %H:%M:%S%.f") {
@@ -3869,25 +3866,23 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
         trimmed
     };
 
-    let (level_str, msg_after_level) = if let Some(caps) = level_re.captures(remaining) {
-        let raw = caps.get(1).unwrap().as_str().to_lowercase();
-        let lvl = if raw == "warn" {
-            "warning".to_string()
-        } else {
-            raw
-        };
-        let after = remaining[caps.get(0).unwrap().len()..].trim();
-        (lvl, after)
-    } else {
-        ("info".to_string(), remaining)
-    };
+    let (level_str, msg_after_level) = level_re.captures(remaining).map_or_else(
+        || ("info".to_string(), remaining),
+        |caps| {
+            let raw = caps.get(1).unwrap().as_str().to_lowercase();
+            let lvl = if raw == "warn" {
+                "warning".to_string()
+            } else {
+                raw
+            };
+            let after = remaining[caps.get(0).unwrap().len()..].trim();
+            (lvl, after)
+        },
+    );
 
     // Extract target from message
-    let core_prefix = match core_type {
-        CoreType::Xray => "xray",
-        CoreType::SingBox => "sing",
-        _ => "xray",
-    };
+    let core_prefix = if core_type == CoreType::SingBox { "sing" } else { "xray" };
+    #[allow(clippy::option_if_let_else, reason = "nested if inside fn arm makes map_or_else less readable")]
     let (target, message) = if let Some(pos) = msg_after_level.find(": ") {
         let tag = &msg_after_level[..pos];
         // For xray format: "infra/conf/serial: message" → replace / with ::
@@ -3901,12 +3896,13 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
     } else {
         (core_prefix.to_string(), msg_after_level.to_string())
     };
-
     (level_str, target, message, ts_nanos)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn parse_xray_log() {
         let (level, target, msg, ts) = parse_core_log_line(

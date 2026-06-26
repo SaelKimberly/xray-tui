@@ -484,7 +484,7 @@ mod tests {
     fn flatten_single_top_dir_moves_contents_up() {
         let tmp = std::env::temp_dir().join("xray-tui-test-flatten");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp.join("version-dir")).unwrap();
+        std::fs::create_dir_all(tmp.join("version-dir")).unwrap();
 
         std::fs::write(tmp.join("version-dir/binary"), "binary_content").unwrap();
         std::fs::write(tmp.join("version-dir/config.json"), r#"{"key":"value"}"#).unwrap();
@@ -512,7 +512,7 @@ mod tests {
     fn flatten_single_top_dir_noop_when_files_present() {
         let tmp = std::env::temp_dir().join("xray-tui-test-flatten-noop");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp.join("subdir")).unwrap();
+        std::fs::create_dir_all(tmp.join("subdir")).unwrap();
         std::fs::write(tmp.join("top_file"), "top").unwrap();
 
         flatten_single_top_dir(&tmp);
@@ -527,8 +527,8 @@ mod tests {
     fn flatten_single_top_dir_noop_multiple_dirs() {
         let tmp = std::env::temp_dir().join("xray-tui-test-flatten-multi");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp.join("dir1")).unwrap();
-        std::fs::create_dir_all(&tmp.join("dir2")).unwrap();
+        std::fs::create_dir_all(tmp.join("dir1")).unwrap();
+        std::fs::create_dir_all(tmp.join("dir2")).unwrap();
 
         flatten_single_top_dir(&tmp);
 

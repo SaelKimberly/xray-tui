@@ -101,7 +101,9 @@ mod tests {
             updated_at: None,
             sub_uid: None,
         };
-        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+        #[allow(clippy::cast_possible_wrap, reason = "u64 bit pattern stored in i64, not arithmetic")]
+        let sub_uid = Some(profile.compute_sub_uid() as i64);
+        profile.sub_uid = sub_uid;
         profile
     }
 

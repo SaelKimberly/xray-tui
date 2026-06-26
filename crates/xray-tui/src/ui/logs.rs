@@ -388,6 +388,7 @@ fn fmt_ts(ts_nanos: i64, now_nanos: i64, hour_ns: i64) -> String {
         (ts_nanos - 999_999_999) / 1_000_000_000
     };
     let sub_nanos = ts_nanos.rem_euclid(1_000_000_000) as u32;
+    #[allow(clippy::option_if_let_else, reason = "complex timestamp formatting with chained fallbacks")]
     if let Some(naive) = chrono::DateTime::from_timestamp(secs, sub_nanos).map(|dt| dt.naive_utc())
     {
         let diff = now_nanos - ts_nanos;

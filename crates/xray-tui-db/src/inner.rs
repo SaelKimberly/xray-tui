@@ -370,10 +370,8 @@ pub(crate) async fn delete_profile_inner(
         let mut stmt = conn
             .prepare_cached("SELECT sub_uid FROM group_profiles WHERE id = ?1")
             .await?;
-        match stmt.query_row(turso::params![id]).await {
-            Ok(row) => row.get::<i64>(0).ok(),
-            Err(_) => None,
-        }
+        stmt.query_row(turso::params![id]).await
+            .map_or(None, |row| row.get::<i64>(0).ok())
     };
     conn.execute(
         "DELETE FROM profile_extensions WHERE profile_id = ?1",
@@ -402,10 +400,8 @@ pub(crate) async fn delete_profile_inner(
             let mut stmt = conn
                 .prepare_cached("SELECT COUNT(*) FROM group_profiles WHERE sub_uid = ?1")
                 .await?;
-            match stmt.query_row(turso::params![su]).await {
-                Ok(row) => row.get::<i64>(0).unwrap_or(0),
-                Err(_) => 0,
-            }
+            stmt.query_row(turso::params![su]).await
+                .map_or(0, |row| row.get::<i64>(0).unwrap_or(0))
         };
         if remaining == 0 {
             conn.execute(
@@ -662,6 +658,7 @@ pub(crate) async fn move_orphans_to_graveyard_inner(
     graveyard_id: &str,
 ) -> Result<usize> {
     if active_sub_uids.is_empty() {
+        #[allow(clippy::cast_possible_truncation, reason = "row count fits in usize on all targets")]
         return Ok(conn
             .execute(
                 "UPDATE group_profiles SET group_id = ?1, updated_at = datetime('now') WHERE group_id = ?2 AND is_sub = 1",
@@ -691,6 +688,7 @@ pub(crate) async fn move_orphans_to_graveyard_inner(
     };
     let mut moved = 0;
     for p in &profiles_in_group {
+        #[allow(clippy::cast_sign_loss, reason = "sub_uid is always non-negative (bit pattern from compute_sub_uid)")]
         if !active_sub_uids.contains(&(p.sub_uid.unwrap_or(0) as u64)) {
             conn.execute(
                 "UPDATE group_profiles SET group_id = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -709,6 +707,7 @@ pub(crate) async fn purge_graveyard_inner(
     graveyard_id: &str,
     ttl_hours: i64,
 ) -> Result<usize> {
+    #[allow(clippy::cast_possible_truncation, reason = "row count fits in usize on all targets")]
     let count = conn
         .execute(
             "DELETE FROM group_profiles WHERE group_id = ?1 AND updated_at < datetime('now', ?2)",

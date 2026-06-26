@@ -1,3 +1,5 @@
+#![allow(clippy::significant_drop_tightening, reason = "test db lifetime is the function scope")]
+
 use xray_tui_db::Database;
 use xray_tui_db::models::{Group, Profile};
 
@@ -146,11 +148,11 @@ async fn test_concurrent_reads() {
     for _ in 0..5 {
         let db_clone = std::sync::Arc::clone(&db);
         handles.push(tokio::spawn(async move {
-            let profiles = db_clone
+            
+            db_clone
                 .get_all_profiles()
                 .await
-                .expect("concurrent read");
-            profiles
+                .expect("concurrent read")
         }));
     }
 

@@ -31,6 +31,7 @@ impl CoreProcess {
             #[cfg(unix)]
             {
                 // Send SIGTERM for graceful shutdown
+                #[allow(clippy::cast_possible_wrap, reason = "PID always fits in i32")]
                 let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             }
             #[cfg(not(unix))]

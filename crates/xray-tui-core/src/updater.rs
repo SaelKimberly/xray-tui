@@ -413,7 +413,7 @@ mod tests {
     fn get_current_version_finds_managed_binary() {
         let tmp = std::env::temp_dir().join("xray-tui-test-updater-managed");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp.join("xray")).unwrap();
+        std::fs::create_dir_all(tmp.join("xray")).unwrap();
 
         // Create a fake xray binary that outputs version info
         let binary = tmp.join("xray").join("xray");
@@ -433,7 +433,7 @@ mod tests {
     fn get_current_version_with_singbox_managed_binary() {
         let tmp = std::env::temp_dir().join("xray-tui-test-updater-singbox");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp.join("sing-box")).unwrap();
+        std::fs::create_dir_all(tmp.join("sing-box")).unwrap();
 
         let binary = tmp.join("sing-box").join("sing-box");
         std::fs::write(&binary, "#!/bin/sh\necho \"sing-box 1.10.3\"\n").unwrap();
@@ -452,7 +452,7 @@ mod tests {
     fn find_binary_and_get_current_version_combined() {
         let tmp = std::env::temp_dir().join("xray-tui-test-updater-combined");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp.join("xray")).unwrap();
+        std::fs::create_dir_all(tmp.join("xray")).unwrap();
 
         let binary = tmp.join("xray").join("xray");
         std::fs::write(&binary, "#!/bin/sh\necho \"xray 2.0.0\"\n").unwrap();

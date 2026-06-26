@@ -136,7 +136,7 @@ impl HeedLogStorage {
                 // already dropped when `try_write_batch` returned the MapFull error).
                 unsafe { self.env.resize(new_size) }.map_err(|e| HeedError::Env(e.to_string()))?;
                 // Retry once after resize
-                if let Err(_) = self.try_write_batch(messages) {
+                if self.try_write_batch(messages).is_err() {
                     self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(())

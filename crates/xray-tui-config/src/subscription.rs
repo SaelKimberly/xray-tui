@@ -461,6 +461,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[test]
     fn test_parse_subscription_data_empty() {
         let settings = crate::import_export::ValidationSettings::default();
         let (profiles, warnings) = parse_subscription_data(b"", &settings).unwrap();

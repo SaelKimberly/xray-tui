@@ -1,8 +1,4 @@
 #![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
     clippy::manual_let_else,
     clippy::redundant_pub_crate,
     clippy::wildcard_imports,

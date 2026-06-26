@@ -1032,27 +1032,23 @@ mod tests {
             Protocol::Custom,
         ] {
             let fields = form_fields_for(*proto);
-            assert!(!fields.is_empty(), "{} should have fields", proto);
+            assert!(!fields.is_empty(), "{proto} should have fields");
             // Common fields always present
             assert!(
                 fields.iter().any(|f| f.key == "remarks"),
-                "{} missing remarks",
-                proto
+                "{proto} missing remarks"
             );
             assert!(
                 fields.iter().any(|f| f.key == "address"),
-                "{} missing address",
-                proto
+                "{proto} missing address"
             );
             assert!(
                 fields.iter().any(|f| f.key == "port"),
-                "{} missing port",
-                proto
+                "{proto} missing port"
             );
             assert!(
                 fields.iter().any(|f| f.key == "core_type"),
-                "{} missing core_type",
-                proto
+                "{proto} missing core_type"
             );
             // No duplicate keys
             let mut keys = std::collections::HashSet::new();
@@ -1062,6 +1058,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn form_fields_inbound_only_have_common() {
         let tproxy = form_fields_for(Protocol::TProxy);
         assert_eq!(tproxy.len(), 4); // only common fields

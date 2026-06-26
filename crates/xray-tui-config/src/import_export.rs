@@ -1814,26 +1814,24 @@ impl From<crate::app_config::ParsingSettings> for ValidationSettings {
 
 /// Per-protocol required-field validation.
 fn validate_required_fields(profile: &Profile) -> Result<()> {
-    let protocol = Protocol::try_from_i32(profile.config_type)
-        .ok_or_else(|| ImportError::Validation("unknown protocol".into()))?;
-
-    let missing = |field: &str| ImportError::Validation(format!("missing field: {field}"));
-
     /// Check if the profile has some form of password/credential.
     fn has_credential(profile: &Profile) -> bool {
         if profile.user_id.is_some() && profile.user_id.as_deref() != Some("") {
             return true;
         }
         // Check protocol_settings for a password field (AnyTLS, Naïve, ShadowTLS, etc.)
-        if let Some(ps) = &profile.protocol_settings {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
-                if let Some(pw) = v.get("password").and_then(|p| p.as_str()) {
+        if let Some(ps) = &profile.protocol_settings
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+                && let Some(pw) = v.get("password").and_then(|p| p.as_str()) {
                     return !pw.is_empty();
                 }
-            }
-        }
         false
     }
+
+    let protocol = Protocol::try_from_i32(profile.config_type)
+        .ok_or_else(|| ImportError::Validation("unknown protocol".into()))?;
+
+    let missing = |field: &str| ImportError::Validation(format!("missing field: {field}"));
 
     match protocol {
         Protocol::Vmess
@@ -2300,7 +2298,7 @@ mod tests {
         // VMess base64 with extra text after the JSON object
         let qr = serde_json::json!({ "v": 2, "ps": "clean", "add": "5.6.7.8", "port": 8443, "id": "uuid2" });
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
-        let url = format!("vmess://{}extra-garbage-here", b64);
+        let url = format!("vmess://{b64}extra-garbage-here");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p.address.as_deref(), Some("5.6.7.8"));
         assert_eq!(p.port, Some(8443));

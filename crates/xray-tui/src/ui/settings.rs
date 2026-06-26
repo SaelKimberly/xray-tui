@@ -1502,7 +1502,7 @@ fn format_bytes(n: u64) -> String {
 }
 
 /// Build a text-based progress bar line for download progress.
-fn progress_bar_line(downloaded: u64, total: u64, _style: &Style) -> Line<'static> {
+fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static> {
     const BAR_WIDTH: usize = 20;
     let filled = if total > 0 {
         let ratio = downloaded as f64 / total as f64;
@@ -1511,7 +1511,7 @@ fn progress_bar_line(downloaded: u64, total: u64, _style: &Style) -> Line<'stati
         0
     };
     let empty = BAR_WIDTH - filled;
-    let bar: String = format!("    [{}>{}]", "█".repeat(filled), "░".repeat(empty),);
+    let bar: String = format!("    [{}>{}]", "█".repeat(filled), "░".repeat(empty));
     let pct = if total > 0 {
         format!(" {}%", (downloaded as f64 / total as f64 * 100.0) as u64)
     } else {
@@ -1526,5 +1526,5 @@ fn progress_bar_line(downloaded: u64, total: u64, _style: &Style) -> Line<'stati
             "?".to_string()
         }
     );
-    Line::from(Span::styled(format!("{bar}{pct}{sizes}"), *_style))
+    Line::from(Span::styled(format!("{bar}{pct}{sizes}"), *style))
 }

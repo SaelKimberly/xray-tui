@@ -67,13 +67,10 @@ impl Database {
         let mut stmt = conn
             .prepare_cached("SELECT COUNT(*) FROM groups WHERE id = ?1")
             .await?;
-        let count: i64 = match stmt
+        let count: i64 = stmt
             .query_row(turso::params![models::GRAVEYARD_GROUP_ID])
             .await
-        {
-            Ok(row) => row.get(0).unwrap_or(0),
-            Err(_) => 0,
-        };
+            .map_or(0, |row| row.get(0).unwrap_or(0));
         if count == 0 {
             conn.execute(
                 "INSERT INTO groups (id, name, subscription_enabled, is_system) VALUES (?1, ?2, 0, 1)",
@@ -311,10 +308,8 @@ impl Database {
             let mut stmt = conn
                 .prepare_cached("SELECT is_system FROM groups WHERE id = ?1")
                 .await?;
-            match stmt.query_row(turso::params![id]).await {
-                Ok(row) => row.get::<i32>(0).ok(),
-                Err(_) => None,
-            }
+            stmt.query_row(turso::params![id]).await
+                .map_or(None, |row| row.get::<i32>(0).ok())
         };
         if is_system == Some(1) {
             return Err(DatabaseError::Generic(
@@ -340,10 +335,8 @@ impl Database {
             let mut stmt = conn
                 .prepare_cached("SELECT is_system FROM groups WHERE id = ?1")
                 .await?;
-            match stmt.query_row(turso::params![group_id]).await {
-                Ok(row) => row.get::<i32>(0).ok(),
-                Err(_) => None,
-            }
+            stmt.query_row(turso::params![group_id]).await
+                .map_or(None, |row| row.get::<i32>(0).ok())
         };
         if is_system == Some(1) {
             return Err(DatabaseError::Generic(

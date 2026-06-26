@@ -62,6 +62,7 @@ impl<'de> Deserialize<'de> for DurationOrSecs {
                 if secs < 0 {
                     return Err(de::Error::custom("negative duration not supported"));
                 }
+                #[allow(clippy::cast_sign_loss, reason = "secs >= 0 enforced by check on line 62-64")]
                 Ok(DurationOrSecs(Duration::from_secs(secs as u64)))
             }
 
@@ -92,7 +93,7 @@ mod tests {
         assert_eq!(result.0, Duration::from_secs(5));
 
         let result: DurationOrSecs = serde_json::from_str(r#""1h""#).unwrap();
-        assert_eq!(result.0, Duration::from_secs(3600));
+        assert_eq!(result.0, Duration::from_hours(1));
     }
 
     #[test]

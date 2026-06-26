@@ -179,6 +179,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
     })?;
 
     let address = profile.address.as_deref().unwrap_or("127.0.0.1");
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "port validated to u16 range before storage")]
     let port = profile.port.unwrap_or(0) as u16;
     let user_id = profile.user_id.as_deref().unwrap_or("");
 
@@ -469,7 +470,9 @@ mod tests {
             updated_at: None,
             sub_uid: None,
         };
-        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+        #[allow(clippy::cast_possible_wrap, reason = "u64 bit pattern stored in i64, not arithmetic")]
+        let sub_uid = Some(profile.compute_sub_uid() as i64);
+        profile.sub_uid = sub_uid;
         profile
     }
 

@@ -56,8 +56,8 @@ use std::collections::HashMap;
 
 /// Cache of `Client` instances keyed by (proxy, port, socks5h).
 /// Avoids per-call connection pool creation overhead.
-static CLIENT_CACHE: LazyLock<Mutex<HashMap<(String, u16, bool), reqwest::Client>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type ClientCache = LazyLock<Mutex<HashMap<(String, u16, bool), reqwest::Client>>>;
+static CLIENT_CACHE: ClientCache = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Create a `reqwest::Client` with SOCKS5 proxy configured, using a cache to
 /// avoid per-call connection pool creation overhead.
@@ -105,6 +105,7 @@ pub async fn real_ping(
         match client.get(url).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
+                    #[allow(clippy::cast_possible_truncation, reason = "elapsed ms fits in u64 (max ~584M years)")]
                     let elapsed = start.elapsed().as_millis() as u64;
                     match best_latency {
                         None => best_latency = Some(elapsed),

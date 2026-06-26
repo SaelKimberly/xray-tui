@@ -1,10 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
-    reason = "known-safe casts on port/len/display"
-)]
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
@@ -63,6 +56,7 @@ where
             return;
         }
 
+        #[allow(clippy::cast_possible_truncation, reason = "nanos since epoch fits u64 (584yr range)")]
         let timestamp_nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -120,16 +114,13 @@ async fn main() -> Result<()> {
         let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
         loop {
             // Wait for at least one message
-            match log_rx.recv() {
-                Ok(msg) => batch.push(msg),
-                Err(_) => {
-                    // Channel closed (sender dropped) — flush and exit
-                    if !batch.is_empty() {
-                        let _ = writer_heed.write_log_batch(&batch);
-                        batch.clear();
-                    }
-                    return;
+            if let Ok(msg) = log_rx.recv() { batch.push(msg) } else {
+                // Channel closed (sender dropped) — flush and exit
+                if !batch.is_empty() {
+                    let _ = writer_heed.write_log_batch(&batch);
+                    batch.clear();
                 }
+                return;
             }
             // Non-blocking drain to batch up to 100
             while batch.len() < 100 {
@@ -190,6 +181,7 @@ async fn main() -> Result<()> {
             if ttl_dur.is_zero() {
                 continue; // 0 = keep forever
             }
+            #[allow(clippy::cast_possible_truncation, reason = "nanos since epoch fits u64 (584yr range)")]
             let cutoff = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

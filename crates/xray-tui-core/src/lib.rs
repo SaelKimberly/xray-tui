@@ -1,10 +1,6 @@
 #![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
     clippy::option_if_let_else,
-    reason = "known-safe casts on port/len/display; code clarity decisions override style lints"
+    reason = "code clarity decisions override style lints"
 )]
 #![allow(
     clippy::derive_partial_eq_without_eq,
