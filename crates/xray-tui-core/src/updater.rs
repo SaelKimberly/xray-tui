@@ -162,6 +162,7 @@ pub async fn download_release<F: Fn(u64, u64) + Send + 'static>(
 }
 
 /// Extract archive, verify binary, install all files to `bin_dir`.
+/// Uses spawn_blocking for synchronous archive extraction and file copy.
 pub async fn install_binary(
     archive: &Path,
     core_type: CoreType,
@@ -172,35 +173,44 @@ pub async fn install_binary(
         CoreType::SingBox => "sing-box",
         CoreType::Auto => return Err(UpdateError::AutoCore),
     };
+    let bin_owned = bin_dir.to_path_buf();
+    let archive_owned = archive.to_path_buf();
     let temp_dir = std::env::temp_dir().join(format!("xray-tui-install-{suffix}"));
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir)?;
+    let temp_dir_clone = temp_dir.clone();
 
-    // 1. Extract archive to temp dir
-    crate::bin_manager::extract_archive(archive, core_type, &temp_dir)
-        .map_err(|e| UpdateError::Archive(e.to_string()))?;
+    // Extract archive to temp dir (sync — wrap in spawn_blocking)
+    let binary = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(&temp_dir_clone);
+        std::fs::create_dir_all(&temp_dir_clone)?;
 
-    // 2. Find extracted binary and verify it runs
-    let exe_name = match core_type {
-        CoreType::Xray => "xray",
-        CoreType::SingBox => "sing-box",
-        CoreType::Auto => return Err(UpdateError::AutoCore),
-    };
+        // 1. Extract archive to temp dir
+        crate::bin_manager::extract_archive(&archive_owned, core_type, &temp_dir_clone)
+            .map_err(|e| UpdateError::Archive(e.to_string()))?;
 
-    // The binary may be in a subdirectory (e.g., sing-box-1.9.0-linux-amd64/)
-    let binary = find_binary_in_dir(&temp_dir, exe_name)?;
+        // 2. Find extracted binary
+        let exe_name = match core_type {
+            CoreType::Xray => "xray",
+            CoreType::SingBox => "sing-box",
+            CoreType::Auto => return Err(UpdateError::AutoCore),
+        };
+        let binary = find_binary_in_dir(&temp_dir_clone, exe_name)?;
 
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&binary)?;
-        let mut perms = meta.permissions();
-        perms.set_mode(perms.mode() | 0o111);
-        std::fs::set_permissions(&binary, perms)?;
-    }
+        // Make executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&binary)?;
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            std::fs::set_permissions(&binary, perms)?;
+        }
 
-    // Verify binary runs
+        Ok::<PathBuf, UpdateError>(binary)
+    })
+    .await
+    .map_err(|e| UpdateError::Install(e.to_string()))??;
+
+    // 3. Verify binary runs (async — tokio::process::Command)
     let output = tokio::process::Command::new(&binary)
         .arg("version")
         .output()
@@ -221,44 +231,50 @@ pub async fn install_binary(
         ));
     }
 
-    // 3. Install to bin_dir
-    let core_bin_dir = bin_dir.join(match core_type {
+    // 4. Install to bin_dir (sync — wrap in spawn_blocking)
+    let core_bin_dir = bin_owned.join(match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
         CoreType::Auto => return Err(UpdateError::AutoCore),
     });
 
-    // Remove old .bak if present
-    let bak_dir = bin_dir.join(format!(
-        "{}.bak",
-        core_bin_dir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
-    let _ = std::fs::remove_dir_all(&bak_dir);
+    tokio::task::spawn_blocking(move || {
+        // Remove old .bak if present
+        let bak_dir = bin_owned.join(format!(
+            "{}.bak",
+            core_bin_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&bak_dir);
 
-    // Rename existing directory to .bak
-    if core_bin_dir.exists() {
-        std::fs::rename(&core_bin_dir, &bak_dir)?;
-    }
-
-    // Copy all extracted files
-    std::fs::create_dir_all(&core_bin_dir)?;
-
-    if let Err(e) = copy_recursively(&temp_dir, &core_bin_dir) {
-        // Restore from backup
-        let _ = std::fs::remove_dir_all(&core_bin_dir);
-        if bak_dir.exists() {
-            let _ = std::fs::rename(&bak_dir, &core_bin_dir);
+        // Rename existing directory to .bak
+        if core_bin_dir.exists() {
+            std::fs::rename(&core_bin_dir, &bak_dir)?;
         }
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err(UpdateError::Install(format!("failed to copy files: {e}")));
-    }
 
-    // Remove .bak on success
-    let _ = std::fs::remove_dir_all(&bak_dir);
-    let _ = std::fs::remove_dir_all(&temp_dir);
+        // Copy all extracted files
+        std::fs::create_dir_all(&core_bin_dir)?;
+
+        if let Err(e) = copy_recursively(&temp_dir, &core_bin_dir) {
+            // Restore from backup
+            let _ = std::fs::remove_dir_all(&core_bin_dir);
+            if bak_dir.exists() {
+                let _ = std::fs::rename(&bak_dir, &core_bin_dir);
+            }
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(UpdateError::Install(format!("failed to copy files: {e}")));
+        }
+
+        // Remove .bak on success
+        let _ = std::fs::remove_dir_all(&bak_dir);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| UpdateError::Install(e.to_string()))??;
 
     Ok(())
 }

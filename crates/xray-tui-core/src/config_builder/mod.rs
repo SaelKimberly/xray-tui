@@ -17,6 +17,7 @@ pub struct BuildParams {
     pub log_level: String,
     pub socks_port: u16,
     pub http_port: Option<u16>,
+    pub clash_api_port: Option<u16>,
     pub listen: String,
     pub sniffing: bool,
 }
@@ -113,6 +114,7 @@ mod tests {
             http_port: None,
             listen: "127.0.0.1".to_string(),
             sniffing: false,
+            clash_api_port: None,
         };
         let rules = vec![];
         let dns = DnsSetting {

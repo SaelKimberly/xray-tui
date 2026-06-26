@@ -96,7 +96,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
-**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Heed-backed log storage** (HeedLogStorage, LMDB, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A sele…
+**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Heed-backed log storage** (HeedLogStorage, LMDB, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. **Log subsystem overhaul** completed: non-blocking TuiLogLayer (std::sync::mpsc channel instead of direct heed writes), background batched heed writer (batch up to 100 messages per transaction, spawn_blocking), MapFull→resize_map with retry (1GB default, doubles up to 8GB, atomic counter instead of tracing events), async heed read wrappers (spawn_blocking for all reads), lazy log loading on first Logs tab access.
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
@@ -113,14 +113,17 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 6. `shutdown_token: Arc<AtomicBool>` on `AppState` signals the background loop to stop on quit — checked via `token.load()` in each iteration
 
 ### Adding log storage features
-1. Define `LogMessage` struct in `crates/xray-tui-core/src/log_heed.rs` with fields: `timestamp_nanos`, `level`, `target`, `message`, `source`
-2. Create `HeedLogStorage` in same file — wraps two heed (LMDB) databases: `logs` (u64 BE timestamp → postcard-encoded LogMessage) and `targets` (set of seen target strings)
-3. Provide methods: `store_entry()`, `get_filtered()`, `get_targets()`, `delete_older_than()`, `count_entries()`, `clear_all()`
-4. Open LMDB environment with `heed::Env::open()` in the TUI binary (`main.rs`), pass to `AppState`, then wrap in `Arc<HeedLogStorage>` for shared access
-5. Wire `TuiLogLayer` in `main.rs` to forward log entries to `HeedLogStorage::store_entry()` via `log_storage_tx` channel (mpsc::unbounded)
-6. Query log storage directly from `TuiLogLayer` for filtered queries — no separate background worker required; heed reads are synchronous (mmap)
-7. Use `postcard` crate (included in heed's deps) for zero-copy binary serialization of LogMessage. No TOML config needed for log storage — heed env size is fixed at compile time (256MB virtual address reservation)
-8. Error handling in `HeedLogStorage` uses `tracing::error!()` — never `eprintln!()` which writes to stderr and corrupts the TUI in raw mode
+1. `LogMessage` struct in `crates/xray-tui-core/src/log_heed.rs` — fields: `timestamp_nanos`, `level`, `target`, `message`
+2. `HeedLogStorage` in same file — wraps two heed (LMDB) databases: `logs` (u64 BE timestamp → postcard-encoded `LogMessage`) and `targets` (set of seen target strings)
+3. Methods: `write_log()` (single entry convenience), `write_log_batch()` (batched transaction with MapFull→resize+retry), `try_write_batch()` (internal single-txn batch with MapFull discrimination), `read_recent()`, `read_newer_than()`, `read_older_than()`, `get_targets()`, `delete_older_than()`. Async variants: `read_recent_async()`, `read_newer_than_async()`, `read_older_than_async()`, `get_targets_async()` — each wraps the sync call in `spawn_blocking`. All methods accept `self: &Arc<Self>` for the async variants (Arc clone for spawn_blocking).
+4. **TuiLogLayer** (`main.rs`) uses `std::sync::mpsc::Sender<LogMessage>` (unbounded channel, never blocks under the tracing lock). `on_event` sends `LogMessage` via the channel; a background `spawn_blocking` task receives, batches up to 100 messages, and calls `heed.write_log_batch()`. MapFull triggers `unsafe { env.resize(new_size * 2) }` with retry and atomic fail counter.
+5. Core process log forwarding (`connect_to_profile` in `lib.rs`) sends to the same `std::sync::mpsc::Sender` channel (clone stored in `AppState.log_sender_tx`), not directly to heed.
+6. Log tab polls heed via async read wrappers (`read_newer_than_async`, `read_older_than_async`) from the event loop (spawn_blocking, non-blocking to the TUI render thread).
+7. TTL cleanup runs in a background tokio task, calls `delete_older_than()` via `spawn_blocking` (infrequent, every 10 min).
+8. Initial log loading is lazy — deferred from startup to first `Tab::Logs` activation (`AppState.logs_loaded` flag).
+9. DEFAULT_MAP_SIZE is 1 GB (was 256 MB) — see `DEFAULT_MAP_SIZE` constant. Runtime resizing doubles up to 8 GB on MapFull.
+10. Error handling: `HeedError::MapFull` variant for discrimination. `mapsize_full_count: AtomicU64` counter tracks MapFull events without emitting `tracing::error!()` (which would re-enter TuiLogLayer).
+
 ### Adding batch import for share URLs
 1. Parse each URL with `parse_share_url(url, &config.validation)` from `xray_tui_config::import_export`
 2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }`

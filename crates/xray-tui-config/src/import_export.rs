@@ -195,22 +195,8 @@ fn parse_vmess(url: &str) -> Result<Profile> {
     let b64 = url.strip_prefix("vmess://").unwrap_or(url);
     let raw = crate::base64_util::decode_base64(b64)
         .map_err(|e| ImportError::Parse(format!("invalid base64 in vmess URL: {e}")))?;
-
-    // Trailing-garbage recovery: some providers append extra text after the JSON object
-    let cleaned = raw
-        .iter()
-        .rposition(|&b| b == b'}')
-        .map_or(raw.as_slice(), |last_brace| {
-            if last_brace + 1 < raw.len() {
-                &raw[..=last_brace]
-            } else {
-                &raw
-            }
-        });
-
-    // Use permissive JSON parser to handle single quotes, trailing commas, etc.
-    let value = crate::permissive_json::permissive_json(cleaned)
-        .map_err(|e| ImportError::Parse(format!("invalid JSON in vmess URL: {e}")))?;
+    let value = crate::permissive_json::permissive_json(&raw)
+        .map_err(|e| ImportError::Parse(format!("invalid/truncated JSON in vmess URL: {e}")))?;
     let qr: VmessQRCode = serde_json::from_value(value)
         .map_err(|e| ImportError::Parse(format!("invalid vmess QR structure: {e}")))?;
 
@@ -1833,6 +1819,22 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
 
     let missing = |field: &str| ImportError::Validation(format!("missing field: {field}"));
 
+    /// Check if the profile has some form of password/credential.
+    fn has_credential(profile: &Profile) -> bool {
+        if profile.user_id.is_some() && profile.user_id.as_deref() != Some("") {
+            return true;
+        }
+        // Check protocol_settings for a password field (AnyTLS, Naïve, ShadowTLS, etc.)
+        if let Some(ps) = &profile.protocol_settings {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
+                if let Some(pw) = v.get("password").and_then(|p| p.as_str()) {
+                    return !pw.is_empty();
+                }
+            }
+        }
+        false
+    }
+
     match protocol {
         Protocol::Vmess
         | Protocol::Vless
@@ -1841,6 +1843,7 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
         | Protocol::Shadowsocks2022
         | Protocol::ShadowsocksR
         | Protocol::Tuic
+        | Protocol::Hysteria2
         | Protocol::Naive
         | Protocol::AnyTls
         | Protocol::ShadowTls => {
@@ -1850,18 +1853,9 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
             if profile.port.is_none() || profile.port == Some(0) {
                 return Err(missing("port"));
             }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
+            if !has_credential(profile) {
                 return Err(missing("user_id"));
             }
-        }
-        Protocol::Hysteria2 => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
-                return Err(missing("address"));
-            }
-            if profile.user_id.is_none() || profile.user_id.as_deref() == Some("") {
-                return Err(missing("user_id"));
-            }
-            // Port defaults to 443 for Hysteria2
         }
         Protocol::Hysteria | Protocol::Socks | Protocol::Http => {
             if profile.address.is_none() || profile.address.as_deref() == Some("") {
@@ -1872,8 +1866,6 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
             }
         }
         Protocol::WireGuard => {
-            // WireGuard may use query params for address; check protocol_settings for keys
-            // at minimum, need public_key in protocol_settings
             if let Some(ps) = &profile.protocol_settings {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
                     let has_pubkey = v
@@ -1890,7 +1882,6 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
                 return Err(missing("protocol_settings"));
             }
         }
-        // Tor, Ssh, Tailscale, Redirect, TProxy, Mixed, etc. — minimal validation
         _ => {}
     }
 
@@ -2348,5 +2339,125 @@ mod tests {
         assert_eq!(p.address.as_deref(), Some("6.6.6.6"));
         assert_eq!(p.port, Some(443));
         // The garbage after port is lost but URL still parses
+    }
+
+    // ── Round-trip tests for all protocols ──
+
+
+    #[test]
+    fn roundtrip_hysteria2() {
+        let mut p = base_profile(Protocol::Hysteria2, "hysteria2.example", 443);
+        p.user_id = Some("password".into());
+        p.remarks = Some("hy2-test".into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("hysteria2://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_hysteria() {
+        let mut p = base_profile(Protocol::Hysteria, "hysteria.example", 443);
+        p.user_id = Some("password".into());
+        p.remarks = Some("hy-test".into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("hysteria://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_tuic() {
+        let mut p = base_profile(Protocol::Tuic, "tuic.example", 443);
+        p.user_id = Some("uuid".into());
+        p.remarks = Some("tuic-test".into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("tuic://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_socks() {
+        let mut p = base_profile(Protocol::Socks, "socks.example", 1080);
+        p.user_id = Some("user:pass".into());
+        p.remarks = Some("socks-test".into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("socks://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_http() {
+        let mut p = base_profile(Protocol::Http, "http.example", 8080);
+        p.user_id = Some("user:pass".into());
+        p.remarks = Some("http-test".into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("http://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_wireguard() {
+        let mut p = base_profile(Protocol::WireGuard, "wg.example", 51820);
+        p.user_id = Some("public-key".into());
+        p.remarks = Some("wg-test".into());
+        p.protocol_settings = Some(r#"{"public_key":"abc123"}"#.into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("wireguard://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_naive() {
+        let mut p = base_profile(Protocol::Naive, "naive.example", 443);
+        p.remarks = Some("naive-test".into());
+        p.protocol_settings = Some(r#"{"user":"user","password":"pass"}"#.into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("naive+https://"));
+        assert!(url.contains("user:pass@")); // userinfo in URL
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+        // password is in protocol_settings, not in root user_id field
+    }
+
+    #[test]
+    fn roundtrip_shadowtls() {
+        let mut p = base_profile(Protocol::ShadowTls, "shadowtls.example", 443);
+        p.user_id = Some("password".into());
+        p.remarks = Some("stls-test".into());
+        p.protocol_settings = Some(r#"{"password":"password"}"#.into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("shadowtls://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+    }
+
+    #[test]
+    fn roundtrip_anytls() {
+        let mut p = base_profile(Protocol::AnyTls, "anytls.example", 443);
+        p.user_id = Some("password".into());
+        p.remarks = Some("anytls-test".into());
+        p.protocol_settings = Some(r#"{"password":"password"}"#.into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("anytls://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
+        // user_id/password is in protocol_settings, not in root user_id field
+        assert_eq!(parsed.address, p.address);
+    }
+
+    #[test]
+    fn roundtrip_shadowsocksr() {
+        let mut p = base_profile(Protocol::ShadowsocksR, "ssr.example", 1234);
+        p.user_id = Some("password".into());
+        p.remarks = Some("ssr-test".into());
+        let url = format_share_url(&p).unwrap();
+        assert!(url.starts_with("ssr://"));
+        let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
+        assert_eq!(parsed.config_type, p.config_type);
     }
 }

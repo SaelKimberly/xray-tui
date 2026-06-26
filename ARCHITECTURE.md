@@ -81,6 +81,8 @@ pub struct AppState {
     pub known_targets: Vec<String>,
     pub selected_targets: Vec<String>,
     pub last_heed_poll: Instant,
+    pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
+    pub logs_loaded: bool,
 }
 
 ### CoreEvent Channel

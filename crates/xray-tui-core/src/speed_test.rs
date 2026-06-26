@@ -51,20 +51,35 @@ pub async fn tcp_ping(
     }
 }
 
-/// Create a `reqwest::Client` with SOCKS5 proxy configured.
+use std::sync::{LazyLock, Mutex};
+use std::collections::HashMap;
+
+/// Cache of `Client` instances keyed by (proxy, port, socks5h).
+/// Avoids per-call connection pool creation overhead.
+static CLIENT_CACHE: LazyLock<Mutex<HashMap<(String, u16, bool), reqwest::Client>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Create a `reqwest::Client` with SOCKS5 proxy configured, using a cache to
+/// avoid per-call connection pool creation overhead.
 fn create_socks5_client(
     proxy: &str,
     port: u16,
     socks5h: bool,
     timeout: Duration,
 ) -> Result<reqwest::Client, SpeedTestError> {
+    let key = (proxy.to_string(), port, socks5h);
+    if let Some(client) = CLIENT_CACHE.lock().unwrap().get(&key) {
+        return Ok(client.clone()); // Client::clone() is cheap (Arc)
+    }
     let scheme = if socks5h { "socks5h" } else { "socks5" };
     let proxy_url = format!("{scheme}://{proxy}:{port}");
-    reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
         .timeout(timeout)
         .build()
-        .map_err(SpeedTestError::Http)
+        .map_err(SpeedTestError::Http)?;
+    CLIENT_CACHE.lock().unwrap().insert(key, client.clone());
+    Ok(client)
 }
 
 /// Real ping: send HTTP GET requests through SOCKS5 proxy to `url`, measure fastest response time.

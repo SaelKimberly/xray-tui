@@ -1,3 +1,5 @@
+use tracing::warn;
+
 use crate::bin_manager::{BinError, get_core_info};
 use crate::config_builder::BackendConfig;
 use crate::core_type::CoreType;
@@ -22,41 +24,67 @@ impl CoreProcess {
         }
     }
 
-    /// Send SIGKILL to the process and clean up config.
-    async fn kill(&mut self) -> Result<(), ProcessError> {
-        if let Some(mut child) = self.child.take() {
-            child.kill().await?;
-            child.wait().await?;
+    /// Gracefully stop the process: SIGTERM, wait 5s, then SIGKILL.
+    async fn graceful_stop(&mut self) -> Result<(), ProcessError> {
+        if let Some(child) = self.child.as_mut() {
+            let pid = child.id().ok_or_else(|| ProcessError::Startup("no child pid".into()))?;
+            #[cfg(unix)]
+            {
+                // Send SIGTERM for graceful shutdown
+                let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows: TerminateProcess (like SIGKILL)
+                let _ = child.kill().await;
+            }
+
+            // Wait up to 5s for graceful exit
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(_exit) = child.try_wait().map_err(ProcessError::Io)? {
+                    break; // Exited gracefully
+                }
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    // Timeout — SIGKILL
+                    child.kill().await?;
+                    child.wait().await?;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
-        // Remove config file (best-effort)
-        let _ = tokio::fs::remove_file(&self.config_path).await;
+        // Clean up config file
+        let _ = std::fs::remove_file(&self.config_path);
         Ok(())
     }
 }
 
 impl Drop for CoreProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            // Spawn a fire-and-forget task to reap the child properly.
-            tokio::spawn(async move {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-            });
+        if let Some(_child) = self.child.take() {
+            // kill_on_drop handles the child process
         }
+        let _ = std::fs::remove_file(&self.config_path);
     }
 }
 
 /// Manages a single core process lifecycle.
 pub struct CoreManager {
-    config_dir: PathBuf,
+    config_dir: tempfile::TempDir,
     current: Option<CoreProcess>,
     log_tx: Option<Sender<String>>,
 }
 
 impl CoreManager {
-    /// Create a new `CoreManager` with the given config directory.
+    /// Create a new `CoreManager` with a temporary config directory.
+    /// Falls back to `config_dir` if tempdir creation fails.
     #[must_use]
-    pub const fn new(config_dir: PathBuf) -> Self {
+    pub fn new(fallback_config_dir: PathBuf) -> Self {
+        let config_dir = tempfile::Builder::new()
+            .prefix("xray-tui-config-")
+            .tempdir_in(&fallback_config_dir)
+            .unwrap_or_else(|_| tempfile::TempDir::new().expect("tempdir creation failed"));
         Self {
             config_dir,
             current: None,
@@ -65,7 +93,11 @@ impl CoreManager {
     }
 
     #[must_use]
-    pub const fn with_log_channel(config_dir: PathBuf, log_tx: Sender<String>) -> Self {
+    pub fn with_log_channel(fallback_config_dir: PathBuf, log_tx: Sender<String>) -> Self {
+        let config_dir = tempfile::Builder::new()
+            .prefix("xray-tui-config-")
+            .tempdir_in(&fallback_config_dir)
+            .unwrap_or_else(|_| tempfile::TempDir::new().expect("tempdir creation failed"));
         Self {
             config_dir,
             current: None,
@@ -91,7 +123,7 @@ impl CoreManager {
             .ok_or_else(|| ProcessError::Startup("Unknown core type".to_string()))?;
 
         // Write config JSON
-        let config_path = self.config_dir.join("config.json");
+        let config_path = self.config_dir.path().join("config.json");
         let json = match config {
             BackendConfig::Xray(c) => serde_json::to_string_pretty(c)?,
             BackendConfig::SingBox(c) => serde_json::to_string_pretty(c)?,
@@ -130,8 +162,9 @@ impl CoreManager {
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if log_tx.try_send(line).is_err() {
-                    break;
+                if log_tx.try_send(line.clone()).is_err() {
+                    warn!(target: "log_worker", "reader channel full, dropping log line");
+                    // Don't exit — keep reading and drop stale lines
                 }
             }
         });
@@ -146,12 +179,12 @@ impl CoreManager {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if log_tx.try_send(line).is_err() {
-                    break;
+                if log_tx.try_send(line.clone()).is_err() {
+                    warn!(target: "log_worker", "reader channel full, dropping log line");
+                    // Don't exit — keep reading and drop stale lines
                 }
             }
         });
-
         // Poll for readiness (check process hasn't exited early)
         let max_retries = 20; // 500ms * 20 = 10s
         for _ in 0..max_retries {
@@ -183,10 +216,10 @@ impl CoreManager {
         Ok(())
     }
 
-    /// Stop the running core process (SIGKILL) and clean up config.
+    /// Stop the running core process (graceful SIGTERM then SIGKILL).
     pub async fn stop(&mut self) -> Result<(), ProcessError> {
         if let Some(mut proc) = self.current.take() {
-            proc.kill().await?;
+            proc.graceful_stop().await?;
         }
         Ok(())
     }

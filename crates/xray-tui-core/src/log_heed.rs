@@ -3,12 +3,14 @@ use heed::types::{Bytes, Str, Unit};
 use heed::{Database, Env, EnvOpenOptions};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Constants ──────────────────────────────────────────────────────────
-
-/// Default virtual map size: 256 MB virtual address reservation (not physical RAM).
+/// Default virtual map size: 1 GB virtual address reservation (not physical RAM).
+/// Increased from 256 MB to reduce MapFull occurrences under sustained log output.
 /// LMDB only uses physical pages for actually written data.
-const DEFAULT_MAP_SIZE: usize = 268_435_456;
+const DEFAULT_MAP_SIZE: usize = 1_073_741_824;
 
 /// Database name for log entries.
 const LOG_DB_NAME: &str = "logs";
@@ -51,6 +53,8 @@ pub struct HeedLogStorage {
     logs: Database<U64BE, Bytes>,
     /// Key = target string, Value = () — a set of seen targets
     targets: Database<Str, Unit>,
+    /// Counter of MapFull events encountered (incremented instead of emitting tracing events).
+    pub mapsize_full_count: AtomicU64,
 }
 
 impl HeedLogStorage {
@@ -87,13 +91,12 @@ impl HeedLogStorage {
 
         wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
 
-        Ok(Self { env, logs, targets })
+        Ok(Self { env, logs, targets, mapsize_full_count: AtomicU64::new(0) })
     }
 
     /// Write a single log entry to the storage.
     ///
-    /// If writing fails (e.g. map full), logs an error via `tracing::error!`
-    /// and returns `Ok(())` — the UI must keep running even if logs fail.
+    /// Convenience wrapper around [`Self::write_log_batch`].
     pub fn write_log(
         &self,
         timestamp_nanos: u64,
@@ -107,31 +110,63 @@ impl HeedLogStorage {
             message: message.to_owned(),
             timestamp_nanos,
         };
-        let value = postcard::to_allocvec(&msg).map_err(|e| HeedError::Serde(e.to_string()))?;
+        self.write_log_batch(&[msg])
+    }
 
-        let mut wtxn = match self.env.write_txn() {
-            Ok(txn) => txn,
-            Err(e) => {
-                tracing::error!(target: "log_worker", "Heed write_txn error: {e}");
-                return Ok(());
-            }
-        };
-
-        if let Err(e) = self.logs.put(&mut wtxn, &timestamp_nanos, &value) {
-            tracing::error!(target: "log_worker", "Heed log write error: {e}");
-            // Don't return error — swallow so the UI keeps running
+    /// Write a batch of log entries in a single transaction.
+    ///
+    /// If the map is full, doubles the map size (up to 8 GB max) and retries once.
+    /// On persistent failure, increments [`mapsize_full_count`] instead of emitting tracing events.
+    pub fn write_log_batch(&self, messages: &[LogMessage]) -> Result<()> {
+        if messages.is_empty() {
             return Ok(());
         }
 
-        // Upsert target (put with existing key is a no-op for Unit values)
-        if let Err(e) = self.targets.put(&mut wtxn, target, &()) {
-            tracing::error!(target: "log_worker", "Heed target upsert error: {e}");
+        match self.try_write_batch(messages) {
+            Ok(()) => Ok(()),
+            Err(HeedError::MapFull) => {
+                // MapFull — try to resize and retry once
+                let current = self.env.info().map_size;
+                let new_size = current.saturating_mul(2).min(8_589_934_592); // cap at 8 GB
+                if new_size <= current {
+                    self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(()); // can't grow further, swallow
+                }
+                // SAFETY: no active transactions at this point (the failed write_txn was
+                // already dropped when `try_write_batch` returned the MapFull error).
+                unsafe { self.env.resize(new_size) }.map_err(|e| HeedError::Env(e.to_string()))?;
+                // Retry once after resize
+                if let Err(_) = self.try_write_batch(messages) {
+                    self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Internal: write a batch in one transaction. Returns [`HeedError::MapFull`] on MapFull.
+    fn try_write_batch(&self, messages: &[LogMessage]) -> Result<()> {
+        let mut wtxn = self.env.write_txn().map_err(|e| HeedError::Txn(e.to_string()))?;
+
+        for msg in messages {
+            let value = postcard::to_allocvec(msg)
+                .map_err(|e| HeedError::Serde(e.to_string()))?;
+
+            if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, &value) {
+                return Err(match e {
+                    heed::Error::Mdb(heed::MdbError::MapFull) => HeedError::MapFull,
+                    other => HeedError::Db(other.to_string()),
+                });
+            }
+
+            // Upsert target (put with existing key is a no-op for Unit values)
+            if let Err(_e) = self.targets.put(&mut wtxn, &msg.target, &()) {
+                // Non-critical — ignore individual target upsert failures
+            }
         }
 
-        if let Err(e) = wtxn.commit() {
-            tracing::error!(target: "log_worker", "Heed commit error: {e}");
-        }
-
+        wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
         Ok(())
     }
 
@@ -243,6 +278,39 @@ impl HeedLogStorage {
         wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
         Ok(deleted)
     }
+    // ── Async wrappers (spawn_blocking for use from async context) ──
+
+    /// Async version of [`Self::read_recent`] that wraps the heed call in `spawn_blocking`.
+    pub async fn read_recent_async(self: &Arc<Self>, limit: usize) -> Result<Vec<LogMessage>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.read_recent(limit))
+            .await
+            .map_err(|e| HeedError::Io(e.to_string()))?
+    }
+
+    /// Async version of [`Self::read_newer_than`] that wraps the heed call in `spawn_blocking`.
+    pub async fn read_newer_than_async(self: &Arc<Self>, after_ns: u64, limit: usize) -> Result<Vec<LogMessage>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.read_newer_than(after_ns, limit))
+            .await
+            .map_err(|e| HeedError::Io(e.to_string()))?
+    }
+
+    /// Async version of [`Self::read_older_than`] that wraps the heed call in `spawn_blocking`.
+    pub async fn read_older_than_async(self: &Arc<Self>, before_ns: u64, limit: usize) -> Result<Vec<LogMessage>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.read_older_than(before_ns, limit))
+            .await
+            .map_err(|e| HeedError::Io(e.to_string()))?
+    }
+
+    /// Async version of [`Self::get_targets`] that wraps the heed call in `spawn_blocking`.
+    pub async fn get_targets_async(self: &Arc<Self>) -> Result<Vec<String>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.get_targets())
+            .await
+            .map_err(|e| HeedError::Io(e.to_string()))?
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -263,6 +331,8 @@ pub enum HeedError {
     Txn(String),
     #[error("heed db error: {0}")]
     Db(String),
+    #[error("heed map full")]
+    MapFull,
     #[error("I/O error: {0}")]
     Io(String),
     #[error("serialization error: {0}")]

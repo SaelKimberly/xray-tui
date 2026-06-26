@@ -490,7 +490,7 @@ pub(crate) async fn update_profile_active_inner(
     )
     .await?;
     conn.execute(
-        "UPDATE group_profiles SET is_active = 1 WHERE id = ?1",
+        "UPDATE group_profiles SET is_active = 1 WHERE sub_uid = (SELECT COALESCE(sub_uid, id) FROM group_profiles WHERE id = ?1)",
         turso::params![id],
     )
     .await?;

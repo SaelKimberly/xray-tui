@@ -331,7 +331,7 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
     static SCHEMA_AC: std::sync::LazyLock<AhoCorasick> = std::sync::LazyLock::new(|| {
         AhoCorasick::builder()
             .ascii_case_insensitive(true)
-            .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
             .build([
                 "vmess://",
                 "vless://",

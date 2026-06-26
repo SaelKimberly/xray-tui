@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub logging: LogConfig,
     #[serde(default)]
     pub parsing: ParsingSettings,
+    #[serde(default)]
+    pub clash_api_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

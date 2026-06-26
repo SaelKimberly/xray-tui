@@ -143,19 +143,19 @@ fn shorten_target(target: &str) -> String {
 }
 
 /// Handle key events for the Logs tab.
-pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
+pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     let height = state.term_height.get().saturating_sub(5) as usize;
     match key.code {
         KeyCode::Up => {
             state.log_scroll = state.log_scroll.saturating_add(1);
-            try_load_older(state);
+            try_load_older(state).await;
         }
         KeyCode::Down => {
             state.log_scroll = state.log_scroll.saturating_sub(1);
         }
         KeyCode::PageUp => {
             state.log_scroll = state.log_scroll.saturating_add(height);
-            try_load_older(state);
+            try_load_older(state).await;
         }
         KeyCode::PageDown => {
             state.log_scroll = state.log_scroll.saturating_sub(height);
@@ -175,8 +175,8 @@ pub fn handle_key(state: &mut AppState, key: &KeyEvent) {
     }
 }
 
-/// Load older log entries from heed when scrolled near the top.
-pub(super) fn try_load_older(state: &mut AppState) {
+/// Load older log entries from heed when scrolled near the top (async).
+pub(super) async fn try_load_older(state: &mut AppState) {
     if !state.log_has_older {
         return;
     }
@@ -193,11 +193,11 @@ pub(super) fn try_load_older(state: &mut AppState) {
     let oldest_ts = state.log_cache[0].timestamp_nanos;
 
     let heed = match &state.heed_storage {
-        Some(h) => h,
+        Some(h) => h.clone(),
         None => return,
     };
 
-    let entries = heed.read_older_than(oldest_ts as u64, 500);
+    let entries = heed.read_older_than_async(oldest_ts as u64, 500).await;
 
     match entries {
         Ok(entries) => {
@@ -232,14 +232,14 @@ pub(super) fn try_load_older(state: &mut AppState) {
     }
 }
 
-/// Poll heal for new log entries newer than `last_seen_log_ns`.
-pub(super) fn poll_new_logs(state: &mut AppState) {
+/// Poll heed for new log entries newer than `last_seen_log_ns` (async).
+pub(super) async fn poll_new_logs(state: &mut AppState) {
     let heed = match &state.heed_storage {
-        Some(h) => h,
+        Some(h) => h.clone(),
         None => return,
     };
 
-    let entries = match heed.read_newer_than(state.last_seen_log_ns, 100) {
+    let entries = match heed.read_newer_than_async(state.last_seen_log_ns, 100).await {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(target: "log_worker", "Failed to poll new logs: {e}");
@@ -275,6 +275,7 @@ pub(super) fn poll_new_logs(state: &mut AppState) {
     }
     state.log_cache.truncate(10_000);
 }
+
 
 /// Count how many log entries match the current target filter.
 pub(super) fn count_filtered(state: &AppState) -> usize {

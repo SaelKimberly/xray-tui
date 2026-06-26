@@ -87,12 +87,25 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         state.spawn_update_check();
     }
 
-    // 9. Load initial logs from DB into cache
-    state.load_initial_logs();
+    // Initial logs no longer loaded here — deferred to first Logs tab access (lazy loading).
     while !state.should_quit {
-        loop {
+        // Process up to N events per frame to prevent input lag under held keys
+        const MAX_EVENTS_PER_FRAME: usize = 5;
+        for i in 0..MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
-                Ok(ev) => handle_event(&ev, state).await,
+                Ok(ev) => {
+                    if matches!(&ev, Event::Resize(_, _)) {
+                        // Process resize immediately — keep draining for more
+                        handle_event(&ev, state).await;
+                        continue;
+                    }
+                    handle_event(&ev, state).await;
+                    // Non-resize: stop after this event to render promptly
+                    if i < MAX_EVENTS_PER_FRAME - 1 {
+                        continue;
+                    }
+                    break;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     state.should_quit = true;
@@ -104,9 +117,15 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         // Process core process events (connect/disconnect/error)
         state.poll_core_events().await;
 
+        // Lazy-load initial logs on first Logs tab access
+        if !state.logs_loaded && state.current_tab == Tab::Logs {
+            state.load_initial_logs().await;
+            state.logs_loaded = true;
+        }
+
         // Progressive log loading: one batch per frame for Home key
         if state.log_seek_home {
-            crate::ui::logs::try_load_older(state);
+            crate::ui::logs::try_load_older(state).await;
             if !state.log_has_older {
                 let filtered = crate::ui::logs::count_filtered(state);
                 state.log_scroll = filtered.saturating_sub(1);
@@ -118,7 +137,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             let now = std::time::Instant::now();
             if now.duration_since(state.last_heed_poll) >= std::time::Duration::from_millis(100) {
                 state.last_heed_poll = now;
-                crate::ui::logs::poll_new_logs(state);
+                crate::ui::logs::poll_new_logs(state).await;
             }
         }
 
@@ -256,25 +275,32 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
 
     // Speed test menu mode
     if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
+        let sep_idx = SPEED_TEST_MENU_ITEMS
+            .iter()
+            .position(|item| matches!(item, SpeedTestMenuItem::Separator));
+        let max = SPEED_TEST_MENU_ITEMS.len().saturating_sub(1);
         match key.code {
             KeyCode::Up => {
                 if let crate::AppMode::SpeedTestMenu { ref mut selected } = state.mode {
                     *selected = selected.saturating_sub(1);
-                    // Skip the separator
-                    if *selected == 4 {
-                        *selected = 3;
+                    // Skip the separator using typed check
+                    if let Some(sep) = sep_idx
+                        && *selected == sep
+                    {
+                        *selected = sep.saturating_sub(1);
                     }
                 }
             }
             KeyCode::Down => {
                 if let crate::AppMode::SpeedTestMenu { ref mut selected } = state.mode {
-                    let max = 8usize;
                     if *selected < max {
                         *selected += 1;
                     }
-                    // Skip the separator
-                    if *selected == 4 {
-                        *selected = 5;
+                    // Skip the separator using typed check
+                    if let Some(sep) = sep_idx
+                        && *selected == sep
+                    {
+                        *selected = sep.saturating_add(1);
                     }
                 }
             }
@@ -327,15 +353,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.mode = crate::AppMode::List;
             }
             KeyCode::Char('?') => {
-                state.previous_mode = Some(Box::new(state.mode.clone()));
                 state.mode = crate::AppMode::Help;
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if state.connected_core.is_some() && state.confirmation.is_none() {
-                    state.confirmation = Some(ConfirmAction::Quit);
-                } else {
-                    state.should_quit = true;
-                }
             }
             _ => {}
         }
@@ -355,7 +373,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 | KeyCode::Char('t' | 'T')
         ) && !key.modifiers.contains(KeyModifiers::CONTROL);
         if is_logs_key {
-            logs::handle_key(state, key);
+            logs::handle_key(state, key).await;
             return;
         }
         // else: fall through to main handler for quit/tab/help/etc.
@@ -851,30 +869,40 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
-    let menu_items = [
-        "TCP Ping (Selected)",
-        "Real Ping (Selected)",
-        "Speed Test (Selected)",
-        "UDP Test (Selected)",
-        "",
-        "TCP Ping (All Visible)",
-        "TCP + Real Ping (All Visible)",
-        "Sort by Delay",
-        "Remove Bad Servers",
-    ];
+/// A typed item in the speed test menu.
+enum SpeedTestMenuItem {
+    Item(&'static str),
+    Separator,
+}
 
+const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
+    SpeedTestMenuItem::Item("TCP Ping (Selected)"),
+    SpeedTestMenuItem::Item("Real Ping (Selected)"),
+    SpeedTestMenuItem::Item("Speed Test (Selected)"),
+    SpeedTestMenuItem::Item("UDP Test (Selected)"),
+    SpeedTestMenuItem::Separator,
+    SpeedTestMenuItem::Item("TCP Ping (All Visible)"),
+    SpeedTestMenuItem::Item("TCP + Real Ping (All Visible)"),
+    SpeedTestMenuItem::Item("Sort by Delay"),
+    SpeedTestMenuItem::Item("Remove Bad Servers"),
+];
+
+fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let selected = match &state.mode {
         crate::AppMode::SpeedTestMenu { selected } => *selected,
         _ => return,
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, item) in menu_items.iter().enumerate() {
-        if item.is_empty() {
+    for (i, item) in SPEED_TEST_MENU_ITEMS.iter().enumerate() {
+        if matches!(item, SpeedTestMenuItem::Separator) {
             lines.push(Line::from(Span::raw(" ─────")));
             continue;
         }
+        let label = match item {
+            SpeedTestMenuItem::Item(label) => label,
+            SpeedTestMenuItem::Separator => unreachable!(),
+        };
         let prefix = if i == selected { "► " } else { "  " };
         let style = if i == selected {
             Style::default()
@@ -884,11 +912,11 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             Style::default().fg(Color::White)
         };
-        lines.push(Line::from(Span::styled(format!("{prefix}{item}"), style)));
+        lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
     }
 
     // Calculate popup dimensions
-    let item_count = menu_items.len() as u16;
+    let item_count = SPEED_TEST_MENU_ITEMS.len() as u16;
     let popup_width = 34u16;
     let popup_height = item_count + 2; // border top/bottom
 

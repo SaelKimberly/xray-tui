@@ -122,7 +122,7 @@ impl SingBoxConfigBuilder {
                     },
                 }),
                 clash_api: params.clash_api_enabled.then(|| ClashApiOptions {
-                    external_controller: format!("127.0.0.1:{}", super::CLASH_API_PORT),
+                    external_controller: format!("127.0.0.1:{}", params.clash_api_port.unwrap_or(super::CLASH_API_PORT)),
                 }),
             }),
         })
@@ -865,6 +865,7 @@ mod tests {
             http_port: None,
             listen: "127.0.0.1".to_string(),
             sniffing: false,
+            clash_api_port: None,
         };
         let rules = vec![];
         let dns = DnsSetting {

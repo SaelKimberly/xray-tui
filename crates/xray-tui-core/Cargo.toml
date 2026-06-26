@@ -40,6 +40,8 @@ xray-tui-db = { path = "../xray-tui-db" }
 
 # ============ Logging ============
 tracing.workspace = true
+libc = "0.2"
+tempfile = "3"
 
 # ============ Persistent Log Storage ============
 heed = { version = "0.22" }

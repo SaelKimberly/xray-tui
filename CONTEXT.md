@@ -25,7 +25,7 @@ xray-tui/
 ├── TUI_MANUAL.md
 └── AGENTS.md
 
-:- **LogMessage** | A persisted tracing event — stored in a heed (LMDB) database with fields `timestamp_nanos`, `level`, `target`, `message`, `source`. Written by `TuiLogLayer`, stored via `HeedLogStorage` (two LMDB databases: `logs` + `targets`). No SQLite table or background worker required. |
+:- **LogMessage** | A persisted tracing event — stored in a heed (LMDB) database with fields `timestamp_nanos`, `level`, `target`, `message`. Written by `TuiLogLayer` via a non-blocking `std::sync::mpsc::Sender` channel, batched (up to 100) by a background `spawn_blocking` writer, and stored via `HeedLogStorage` (two LMDB databases: `logs` + `targets`). Async read wrappers (`read_recent_async`, `read_newer_than_async`, etc.) wrap LMDB reads in `spawn_blocking` for use from async context. No SQLite table, no separate DB connection. |
 ## Key reference repositories
 
 - **Xray-core** (`thirdparty/Xray-core/`): Go implementation of the primary proxy core. Run as a subprocess, controlled via JSON config files and gRPC API. Handles VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, WireGuard, Hysteria2, and other native protocols.
@@ -62,9 +62,8 @@ xray-tui/
 - **Xray-core runs as a subprocess**; the TUI writes JSON config files and communicates via gRPC API.
 - **Sing-box runs as a subprocess**; the TUI writes JSON config files and communicates via sing-box's experimental V2Ray API (gRPC compatible).
 - **TUI framework**: **Ratatui + Crossterm** (async via tokio).
-- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `turso` for profiles, subscriptions, routing, DNS, stats. |
-- **Log storage**: `TuiLogLayer` sends tracing events to both the in-memory `log_buffer` (instant TUI display) and LMDB-backed `HeedLogStorage` for persistence. Uses `heed` (embedded LMDB) in `xray-tui-core::log_heed` with two databases: `logs` (u64 BE → postcard-encoded `LogMessage`) and `targets` (seen target string set). No separate SQLite table, no background worker, no dedicated DB connection. Configured at compile time with 256MB virtual map size. All reads/writes are synchronous (heed uses mmap); callers wrap in `Arc` for shared async access. |
-- **Multi-crate workspace**: `xray-tui` (bin), `xray-tui-core` (lib), `xray-tui-db` (lib), `xray-tui-config` (lib).
+:- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `turso` for profiles, subscriptions, routing, DNS, stats. |
+:- **Log storage**: `TuiLogLayer` sends tracing events to the log channel (non-blocking, `std::sync::mpsc::Sender`), which is consumed by a background `spawn_blocking` batched writer. Uses `heed` (embedded LMDB) in `xray-tui-core::log_heed` with two databases: `logs` (u64 BE → postcard-encoded `LogMessage`) and `targets` (seen target string set). MapFull triggers automatic resize (1 GB default, doubles up to 8 GB). Async wrappers (`read_recent_async`, `read_newer_than_async`, `read_older_than_async`, `get_targets_async`) wrap LMDB reads in `spawn_blocking` for non-blocking async calls from the TUI event loop. Initial log loading is lazy (deferred to first Logs tab access). |
 - **Protocols in scope**: Everything supported natively by either Xray-core or Sing-box. No third binary backends.
 
 ## Key source files

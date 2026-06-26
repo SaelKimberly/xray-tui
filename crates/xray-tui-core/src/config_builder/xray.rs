@@ -248,7 +248,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
                         "uot": true
                     }]
                 }),
-                stream_settings: None,
+                stream_settings: s_settings.clone(),
             })
         }
         Protocol::Trojan => {
@@ -280,7 +280,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
                 tag: "proxy".to_string(),
                 protocol: "socks".to_string(),
                 settings: json!({ "servers": [server] }),
-                stream_settings: None,
+                stream_settings: s_settings.clone(),
             })
         }
         Protocol::Http => {
@@ -293,7 +293,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
                 tag: "proxy".to_string(),
                 protocol: "http".to_string(),
                 settings: json!({ "servers": [server] }),
-                stream_settings: None,
+                stream_settings: s_settings.clone(),
             })
         }
         Protocol::Hysteria2 => {
@@ -311,7 +311,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
                         "password": password
                     }]
                 }),
-                stream_settings: None,
+                stream_settings: s_settings.clone(),
             })
         }
         _ => Err(BuildError::InvalidProfile(format!(
@@ -482,6 +482,7 @@ mod tests {
             http_port: None,
             listen: "127.0.0.1".to_string(),
             sniffing: false,
+            clash_api_port: None,
         };
         let rules = vec![];
         let dns = DnsSetting {

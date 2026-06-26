@@ -31,6 +31,7 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
     BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core,
 };
+use tracing::warn;
 use xray_tui_db::Database;
 use xray_tui_db::models::{
     ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule,
@@ -415,8 +416,12 @@ pub struct AppState {
     pub selected_targets: Vec<String>,
     /// Last time we polled heed for new log entries.
     pub last_heed_poll: std::time::Instant,
+    /// Channel sender for non-blocking log persistence.
+    /// TuiLogLayer and core log forwarder send LogMessage here; background writer batches and writes to heed.
+    pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
+    /// Whether initial logs have been loaded from heed into log_cache yet.
+    pub logs_loaded: bool,
 }
-
 /// Internal helper for batch ping deduplication.
 struct UniqueTarget {
     key: (String, u16),
@@ -482,6 +487,8 @@ impl AppState {
             known_targets: Vec::new(),
             selected_targets: Vec::new(),
             last_heed_poll: std::time::Instant::now(),
+            log_sender_tx: None,
+            logs_loaded: false,
         };
         state.reload_profiles().await;
         state.reload_groups().await;
@@ -491,12 +498,13 @@ impl AppState {
     }
 
     /// Load the most recent log entries from heed into [`log_cache`].
-    pub fn load_initial_logs(&mut self) {
+    /// Uses async heed methods that wrap LMDB reads in `spawn_blocking`.
+    pub async fn load_initial_logs(&mut self) {
         let heed = match &self.heed_storage {
-            Some(h) => h,
+            Some(h) => h.clone(),
             None => return,
         };
-        match heed.read_recent(500) {
+        match heed.read_recent_async(500).await {
             Ok(entries) => {
                 self.log_has_older = entries.len() >= 500;
                 self.log_cache = entries
@@ -514,7 +522,7 @@ impl AppState {
                     self.last_seen_log_ns = newest.timestamp_nanos as u64;
                 }
                 // Load known targets
-                if let Ok(targets) = heed.get_targets() {
+                if let Ok(targets) = heed.get_targets_async().await {
                     self.known_targets = targets;
                 }
             }
@@ -1816,7 +1824,7 @@ impl AppState {
 
     // ── Core connection management ──────────────────────────────────────
 
-    /// Connect to the selected profile by id.
+
     pub fn connect_to_profile(&mut self, profile_id: &str) {
         if self.connecting {
             return;
@@ -1871,6 +1879,7 @@ impl AppState {
             http_port: self.config.inbound.http_port,
             listen: self.config.inbound.listen.clone(),
             sniffing: self.config.inbound.sniffing,
+            clash_api_port: self.config.clash_api_port,
         };
 
         // Default DNS and routing for first pass
@@ -1896,15 +1905,14 @@ impl AppState {
 
         // Create log forwarding channel
         let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
-
-        let state_heed = self.heed_storage.clone();
+        let state_log_sender = self.log_sender_tx.clone();
         let handle = tokio::spawn(async move {
             // 1. Build config
             let backend_config =
                 match ConfigBuilder::build(&profile, core_type, &params, &routing, &dns) {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.try_send(CoreEvent::Error(format!("Config build failed: {e}")));
+                        try_send_or_warn(&tx, CoreEvent::Error(format!("Config build failed: {e}")), "config_build_error");
                         return;
                     }
                 };
@@ -1913,26 +1921,41 @@ impl AppState {
             let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
                 p
             } else {
-                let _ = tx.try_send(CoreEvent::Error(
+                try_send_or_warn(&tx, CoreEvent::Error(
                     "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
                         .to_string(),
-                ));
+                ), "binary_not_found");
                 return;
             };
 
             // 3. Start core
             let mut manager = CoreManager::with_log_channel(bin_configs_dir, log_line_tx);
             if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
-                let _ = tx.try_send(CoreEvent::Error(format!("Failed to start core: {e}")));
+                try_send_or_warn(&tx, CoreEvent::Error(format!("Failed to start core: {e}")), "core_start_error");
                 return;
             }
 
+            // 3b. Readiness probe: wait for the core's proxy port to open
+            let proxy_port = params.socks_port;
+            if proxy_port > 0 {
+                let probe_start = std::time::Instant::now();
+                loop {
+                    if probe_start.elapsed() > std::time::Duration::from_secs(10) {
+                        break;
+                    }
+                    match tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)).await {
+                        Ok(_) => break,
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+                    }
+                }
+            }
+
             // 4. Signal connected
-            let _ = tx.try_send(CoreEvent::Connected(core_type));
+            try_send_or_warn(&tx, CoreEvent::Connected(core_type), "connected");
 
             // Forward stderr log lines as CoreEvent::LogLine
             let log_tx = tx.clone();
-            let heed = state_heed.clone();
+            let log_sender = state_log_sender.clone();
             tokio::spawn(async move {
                 while let Some(line) = log_line_rx.recv().await {
                     let (level, target, message, ts_nanos) = parse_core_log_line(&line, core_type);
@@ -1942,17 +1965,22 @@ impl AppState {
                             .unwrap_or_default()
                             .as_nanos() as i64
                     });
-                    // Write to heed storage (non-blocking)
-                    if let Some(ref heed) = heed {
-                        let _ = heed.write_log(timestamp_nanos as u64, &level, &target, &message);
+                    // Write to log storage via non-blocking channel (batched async writer)
+                    if let Some(ref sender) = log_sender {
+                        let _ = sender.send(xray_tui_core::log_heed::LogMessage {
+                            level: level.clone(),
+                            target: target.clone(),
+                            message: message.clone(),
+                            timestamp_nanos: timestamp_nanos as u64,
+                        });
                     }
                     // Forward to TUI
-                    let _ = log_tx.try_send(CoreEvent::LogLine {
+                    try_send_or_warn(&log_tx, CoreEvent::LogLine {
                         level,
                         target,
                         message,
                         timestamp_nanos,
-                    });
+                    }, "log_line");
                 }
             });
 
@@ -1963,8 +1991,9 @@ impl AppState {
                 let provider = match grpc_client::create_stats_provider(CoreType::Xray).await {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        let _ = tx
-                            .try_send(CoreEvent::StatsError(format!("Stats API unavailable: {e}")));
+                        try_send_or_warn(&tx,
+                            CoreEvent::StatsError(format!("Stats API unavailable: {e}")),
+                            "stats_api_unavailable");
                         None
                     }
                 };
@@ -1988,16 +2017,16 @@ impl AppState {
                                                 today_down += stat.value;
                                             }
                                         }
-                                        let _ = tx.try_send(CoreEvent::StatsUpdate {
+                                        try_send_or_warn(&tx, CoreEvent::StatsUpdate {
                                             profile_id: profile_id.clone(),
                                             today_up,
                                             today_down,
                                             total_up: today_up,
                                             total_down: today_down,
-                                        });
+                                        }, "stats_update");
                                     }
                                     Err(e) => {
-                                    let _ = tx.try_send(CoreEvent::StatsError(format!("Stats query failed: {e}")));
+                                    try_send_or_warn(&tx, CoreEvent::StatsError(format!("Stats query failed: {e}")), "stats_query_err");
                                     }
                                 }
                                 // sys stats every 3rd tick (~9s)
@@ -2005,9 +2034,9 @@ impl AppState {
                                 if sys_tick_counter >= 3 {
                                     sys_tick_counter = 0;
                                     match provider.get_sys_stats().await {
-                                        Ok(sys) => { let _ = tx.try_send(CoreEvent::SysStatsUpdate(sys)); }
+                                        Ok(sys) => { try_send_or_warn(&tx, CoreEvent::SysStatsUpdate(sys), "sys_stats_update"); }
                                         Err(e) => {
-                                            let _ = tx.try_send(CoreEvent::StatsError(format!("Sys stats query failed: {e}")));
+                                            try_send_or_warn(&tx, CoreEvent::StatsError(format!("Sys stats query failed: {e}")), "sys_stats_err");
                                         }
                                     }
                                 }
@@ -2017,7 +2046,8 @@ impl AppState {
                 }
             } else {
                 // === Sing-box Clash API /traffic streaming ===
-                let url = format!("http://127.0.0.1:{CLASH_API_PORT}/traffic");
+                let clash_port = params.clash_api_port.unwrap_or(CLASH_API_PORT);
+                let url = format!("http://127.0.0.1:{clash_port}/traffic");
 
                 match reqwest::Client::new().get(&url).send().await {
                     Ok(resp) => {
@@ -2038,20 +2068,20 @@ impl AppState {
                                                 if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
                                                     session_up += t.up;
                                                     session_down += t.down;
-                                                    let _ = tx.try_send(CoreEvent::StatsUpdate {
+                                                    try_send_or_warn(&tx, CoreEvent::StatsUpdate {
                                                         profile_id: profile_id.clone(),
                                                         today_up: session_up,
                                                         today_down: session_down,
                                                         total_up: session_up,
                                                         total_down: session_down,
-                                                    });
+                                                    }, "clash_stats_update");
                                                 }
                                             }
                                         }
                                         Some(Err(e)) => {
-                                            let _ = tx.try_send(CoreEvent::StatsError(
+                                            try_send_or_warn(&tx, CoreEvent::StatsError(
                                                 format!("Clash API stream error: {e}")
-                                            ));
+                                            ), "clash_stream_err");
                                             break;
                                         }
                                         None => break,
@@ -2061,9 +2091,9 @@ impl AppState {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.try_send(CoreEvent::StatsError(format!(
+                        try_send_or_warn(&tx, CoreEvent::StatsError(format!(
                             "Clash API unavailable (is sing-box running?): {e}"
-                        )));
+                        )), "clash_unavailable");
                     }
                 }
             }
@@ -2072,7 +2102,7 @@ impl AppState {
             let _ = manager.stop().await;
 
             // 7. Signal disconnected
-            let _ = tx.try_send(CoreEvent::Disconnected);
+            try_send_or_warn(&tx, CoreEvent::Disconnected, "disconnected");
         });
         self.core_task_handle = Some(handle);
     }
@@ -2140,14 +2170,14 @@ impl AppState {
                 Ok(dur) => (Some(dur.as_millis() as u64), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+            try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::TcpPing,
                 latency_ms,
                 speed_bps: None,
                 ip_info: None,
                 error,
-            });
+            }, "tcp_ping_result");
         });
     }
 
@@ -2192,6 +2222,7 @@ impl AppState {
             http_port: None,
             listen: self.config.inbound.listen.clone(),
             sniffing: false,
+            clash_api_port: None,
         };
 
         let dns = DnsSetting {
@@ -2222,14 +2253,14 @@ impl AppState {
             let temp_id = uuid::Uuid::new_v4().to_string();
             let temp_dir = bin_configs_dir.join(&temp_id);
             if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-                let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                     profile_id: pid,
                     test_type: TestType::RealPing,
                     latency_ms: None,
                     speed_bps: None,
                     ip_info: None,
                     error: Some(format!("Failed to create temp dir: {e}")),
-                });
+                }, "real_ping_tempdir_err");
                 return;
             }
 
@@ -2238,14 +2269,14 @@ impl AppState {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                    try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                         profile_id: pid,
                         test_type: TestType::RealPing,
                         latency_ms: None,
                         speed_bps: None,
                         ip_info: None,
                         error: Some(format!("Config build failed: {e}")),
-                    });
+                    }, "real_ping_config_err");
                     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                     return;
                 }
@@ -2255,14 +2286,14 @@ impl AppState {
             let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
                 p
             } else {
-                let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                     profile_id: pid,
                     test_type: TestType::RealPing,
                     latency_ms: None,
                     speed_bps: None,
                     ip_info: None,
                     error: Some("Core binary not found".to_string()),
-                });
+                }, "real_ping_binary_err");
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 return;
             };
@@ -2271,14 +2302,14 @@ impl AppState {
             let (log_line_tx, mut _log_line_rx) = mpsc::channel::<String>(512);
             let mut manager = CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
             if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
-                let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                     profile_id: pid,
                     test_type: TestType::RealPing,
                     latency_ms: None,
                     speed_bps: None,
                     ip_info: None,
                     error: Some(format!("Failed to start core: {e}")),
-                });
+                }, "real_ping_start_err");
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 return;
             }
@@ -2302,14 +2333,14 @@ impl AppState {
                 Err(e) => (None, None, Some(e.to_string())),
             };
 
-            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+            try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::RealPing,
                 latency_ms,
                 speed_bps: None,
                 ip_info,
                 error,
-            });
+            }, "real_ping_result");
 
             // 7. Stop core and clean up
             let _ = manager.stop().await;
@@ -2357,14 +2388,14 @@ impl AppState {
                 Ok(bps) => (Some(bps), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+            try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::SpeedTest,
                 latency_ms: None,
                 speed_bps,
                 ip_info: None,
                 error,
-            });
+            }, "speed_test_result");
         });
     }
 
@@ -2400,14 +2431,14 @@ impl AppState {
                 Ok(dur) => (Some(dur.as_millis() as u64), None),
                 Err(e) => (None, Some(e.to_string())),
             };
-            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+            try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                 profile_id: pid,
                 test_type: TestType::UdpTest,
                 latency_ms,
                 speed_bps: None,
                 ip_info: None,
                 error,
-            });
+            }, "udp_test_result");
         });
     }
 
@@ -2477,14 +2508,14 @@ impl AppState {
                     };
 
                     for pid in &target.profile_ids {
-                        let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                        try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                             profile_id: pid.clone(),
                             test_type: TestType::TcpPing,
                             latency_ms,
                             speed_bps: None,
                             ip_info: None,
                             error: error.clone(),
-                        });
+                        }, "batch_tcp_ping");
                     }
                 }
                 // Sleep between pages (v2rayN pattern)
@@ -2611,14 +2642,14 @@ impl AppState {
 
                     let is_ok = latency_ms.is_some();
                     for pid in &target.profile_ids {
-                        let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                        try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
                             profile_id: pid.clone(),
                             test_type: TestType::TcpPing,
                             latency_ms,
                             speed_bps: None,
                             ip_info: None,
                             error: error.clone(),
-                        });
+                        }, "batch_tcp_ping_result");
                     }
 
                     // Immediately start real ping if TCP succeeded
@@ -2626,10 +2657,10 @@ impl AppState {
                         // If TCP succeeded, prepare for real ping: update emoji to RealPing
                         // before the handler clears it via SpeedTestResult.
                         for pid in &target.profile_ids {
-                            let _ = tx.try_send(CoreEvent::TestTypeUpdate {
+                            try_send_or_warn(&tx, CoreEvent::TestTypeUpdate {
                                 profile_id: pid.clone(),
                                 test_type: TestType::RealPing,
-                            });
+                            }, "test_type_update");
                         }
                         // Acquire semaphore before spawning — backpressure on the
                         // TCP loop when concurrency is maxed; released when task ends.
@@ -2660,6 +2691,7 @@ impl AppState {
                                 http_port: None,
                                 listen: proxy_addr.clone(),
                                 sniffing: false,
+                                clash_api_port: None,
                             };
 
                             let dns = DnsSetting {
@@ -2730,14 +2762,14 @@ impl AppState {
                             };
 
                             for pid in &target_profile_ids {
-                                let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                                    profile_id: pid.clone(),
-                                    test_type: TestType::RealPing,
-                                    latency_ms,
-                                    speed_bps: None,
-                                    ip_info: ip_info.clone(),
-                                    error: error.clone(),
-                                });
+                            try_send_or_warn(&tx, CoreEvent::SpeedTestResult {
+                                profile_id: pid.clone(),
+                                test_type: TestType::RealPing,
+                                latency_ms,
+                                speed_bps: None,
+                                ip_info: ip_info.clone(),
+                                error: error.clone(),
+                            }, "batch_real_ping");
                             }
 
                             let _ = manager.stop().await;
@@ -3311,22 +3343,22 @@ impl AppState {
             .await;
             if let Ok(inner) = result {
                 if let Some(tx) = &tx {
-                    let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
+                    try_send_or_warn(tx, CoreEvent::SubscriptionsUpdated {
                         group_id: inner.0,
                         count: inner.1,
                         warnings: inner.2,
                         error: inner.3,
-                    });
+                    }, "subs_updated");
                 }
             } else {
                 tracing::error!(target: "tui", "Subscription update timed out after 120s");
                 if let Some(tx) = &tx {
-                    let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
+                    try_send_or_warn(tx, CoreEvent::SubscriptionsUpdated {
                         group_id: gid.clone(),
                         count: 0,
                         warnings: Vec::new(),
                         error: Some("Subscription update timed out after 120s".into()),
-                    });
+                    }, "subs_timeout");
                 }
             }
         });
@@ -3456,12 +3488,12 @@ impl AppState {
                 } else {
                     None
                 };
-                let _ = tx.try_send(CoreEvent::UpdateCheckResult {
+                try_send_or_warn(&tx, CoreEvent::UpdateCheckResult {
                     core_type,
                     current_version: current,
                     latest_version: latest,
                     error,
-                });
+                }, "update_check_result");
             });
         }
     }
@@ -3547,13 +3579,13 @@ impl AppState {
             {
                 Ok(path) => path,
                 Err(e) => {
-                    let _ = tx.try_send(CoreEvent::UpdateCompleted {
+                    try_send_or_warn(&tx, CoreEvent::UpdateCompleted {
                         core_type,
                         old_version: old_version.clone(),
                         new_version: latest,
                         success: false,
                         error: Some(e.to_string()),
-                    });
+                    }, "update_completed_err");
                     return;
                 }
             };
@@ -3568,13 +3600,13 @@ impl AppState {
             let _ = std::fs::remove_file(&archive);
             let _ = std::fs::remove_dir_all(&temp_dir);
 
-            let _ = tx.try_send(CoreEvent::UpdateCompleted {
+            try_send_or_warn(&tx, CoreEvent::UpdateCompleted {
                 core_type,
                 old_version,
                 new_version: latest,
                 success,
                 error,
-            });
+            }, "update_completed");
         });
     }
 
@@ -3622,12 +3654,12 @@ impl AppState {
                     let result =
                         Self::do_update_subscription(url, ua, gid, db.clone(), validation.clone())
                             .await;
-                    let _ = tx.try_send(CoreEvent::SubscriptionsUpdated {
+                    try_send_or_warn(&tx, CoreEvent::SubscriptionsUpdated {
                         group_id: result.0,
                         count: result.1,
                         warnings: result.2,
                         error: result.3,
-                    });
+                    }, "auto_subs_updated");
                 }
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_mins(1)) => {},
@@ -3635,6 +3667,14 @@ impl AppState {
                 }
             }
         });
+    }
+}
+
+/// Helper to send a CoreEvent with a warning on channel full.
+/// Prevents silent event loss.
+fn try_send_or_warn(tx: &tokio::sync::mpsc::Sender<CoreEvent>, event: CoreEvent, label: &'static str) {
+    if let Err(_e) = tx.try_send(event) {
+        warn!(target: "log_worker", "try_send dropped {label}: channel full");
     }
 }
 

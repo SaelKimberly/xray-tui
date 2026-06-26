@@ -16,12 +16,13 @@ use xray_tui::AppState;
 use xray_tui_config::AppConfig;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_db::Database;
+// ── Custom tracing layer that forwards events to the TUI event loop ──
 
-// ── Custom tracing layer that forwards events to the TUI event loop and heed storage ──
-
+/// Non-blocking tracing layer that sends log events through a channel
+/// instead of writing to heed synchronously under the subscriber lock.
 struct TuiLogLayer {
     core_event_tx: tokio::sync::mpsc::Sender<xray_tui::CoreEvent>,
-    heed: Arc<HeedLogStorage>,
+    log_sender: std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>,
 }
 
 /// A field visitor that captures the `message` field.
@@ -67,13 +68,16 @@ where
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        // Write to heed storage (swallow errors — UI must keep running)
-        let _ = self
-            .heed
-            .write_log(timestamp_nanos, &level, &target, &message);
+        // Non-blocking send to the log storage channel (batched, async writer).
+        // If the channel is closed (writer panicked), silently drop — UI must keep running.
+        let _ = self.log_sender.send(xray_tui_core::log_heed::LogMessage {
+            level: level.clone(),
+            target: target.clone(),
+            message: message.clone(),
+            timestamp_nanos,
+        });
 
         // Send lightweight notification to TUI for the actions panel
-        // The logs tab reads from heed directly via polling.
         let _ = self.core_event_tx.try_send(xray_tui::CoreEvent::TuiLog {
             target,
             level,
@@ -101,25 +105,73 @@ async fn main() -> Result<()> {
     let db_path = config_dir.join("data.db");
     let db = Database::open(&db_path).await?;
     db.normalize_all_remarks().await?;
-
     // 3. Open heed log storage (~/.config/xray-tui/logs.lmdb)
     let log_path = config_dir.join("logs.lmdb");
     let heed = Arc::new(HeedLogStorage::new(&log_path)?);
 
+    // 3b. Create channel for non-blocking log persistence and spawn background batched writer.
+    //     TuiLogLayer sends messages via the channel; the background task batches up to
+    //     100 messages per heed write_transaction and runs heed ops on the blocking pool.
+    //     Uses unbounded std::sync::mpsc channel so TuiLogLayer::on_event never blocks.
+    let (log_sender_tx, log_rx) = std::sync::mpsc::channel::<xray_tui_core::log_heed::LogMessage>();
+
+    let writer_heed = heed.clone();
+    let _writer_handle = tokio::task::spawn_blocking(move || {
+        let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
+        loop {
+            // Wait for at least one message
+            match log_rx.recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => {
+                    // Channel closed (sender dropped) — flush and exit
+                    if !batch.is_empty() {
+                        let _ = writer_heed.write_log_batch(&batch);
+                        batch.clear();
+                    }
+                    return;
+                }
+            }
+            // Non-blocking drain to batch up to 100
+            while batch.len() < 100 {
+                match log_rx.try_recv() {
+                    Ok(msg) => batch.push(msg),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if !batch.is_empty() {
+                            let _ = writer_heed.write_log_batch(&batch);
+                            batch.clear();
+                        }
+                        return;
+                    }
+                }
+            }
+            // Flush batch when full
+            if batch.len() >= 100 {
+                let _ = writer_heed.write_log_batch(&batch);
+                batch.clear();
+            }
+        }
+    });
+
+    // 3c. Store the log sender in AppState so core log forwarding can use it
     let mut state = AppState::new(Arc::new(db), config).await;
     state.heed_storage = Some(heed.clone());
+    state.log_sender_tx = Some(log_sender_tx.clone());
 
-    // 4. Install tracing subscriber with TuiLogLayer
+    // 4. Install tracing subscriber with TuiLogLayer (non-blocking channel send)
     // Do not crash if global subscriber was already set (e.g., in tests)
     if tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stderr)
+                // Only xray_tui-* targets reach stderr via the fmt layer.
+                // "log_worker" and "tui" targets reach TuiLogLayer (unfiltered)
+                // for the Logs tab and actions panel.
                 .with_filter(tracing_subscriber::EnvFilter::new("xray_tui=info")),
         )
         .with(TuiLogLayer {
-            core_event_tx: state.core_event_tx.clone().unwrap(),
-            heed: heed.clone(),
+            core_event_tx: state.core_event_tx.clone().expect("core_event_tx must be set before tracing init"),
+            log_sender: log_sender_tx,
         })
         .try_init()
         .is_err()
@@ -127,7 +179,7 @@ async fn main() -> Result<()> {
         eprintln!("xray-tui: tracing subscriber already set — skipping TUI log layer");
     }
 
-    // 5. Spawn TTL maintenance task for old logs
+    // 5. Spawn TTL maintenance task for old logs (uses heed directly — infrequent)
     let ttl_heed = heed.clone();
     let ttl_dur = state.config.logging.ttl_secs.clone();
     tokio::spawn(async move {
@@ -143,17 +195,26 @@ async fn main() -> Result<()> {
                 .unwrap_or_default()
                 .as_nanos() as u64
                 - (ttl_dur.as_nanos() as u64);
-            if let Err(e) = ttl_heed.delete_older_than(cutoff) {
-                tracing::error!(target: "log_worker", "TTL cleanup error: {e}");
-            }
+            // Spawn_blocking for heed delete operation
+            let h = ttl_heed.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = h.delete_older_than(cutoff) {
+                    // Can't use tracing inside spawn_blocking from a tokio task without
+                    // the right context — but eprintln! is safe here (TTL runs rarely)
+                    eprintln!("xray-tui: TTL cleanup error: {e}");
+                }
+            }).await.ok();
         }
     });
-
     // Panic hook to restore terminal on unexpected crashes
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = std::panic::catch_unwind(|| {
+            let _ = crossterm::terminal::disable_raw_mode();
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        });
         prev_hook(panic_info);
     }));
 
