@@ -383,4 +383,3 @@ pub enum HeedError {
 
 /// Convenience alias.
 pub type Result<T, E = HeedError> = std::result::Result<T, E>;
-

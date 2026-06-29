@@ -3742,15 +3742,36 @@ impl AppState {
             .build()
         {
             Ok(c) => c,
-            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(e.to_string())),
+            Err(e) => {
+                return (
+                    group_id,
+                    0,
+                    ValidationSummary::default(),
+                    Some(e.to_string()),
+                );
+            }
         };
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
-            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(format!("HTTP: {e}"))),
+            Err(e) => {
+                return (
+                    group_id,
+                    0,
+                    ValidationSummary::default(),
+                    Some(format!("HTTP: {e}")),
+                );
+            }
         };
         let bytes = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(format!("Body: {e}"))),
+            Err(e) => {
+                return (
+                    group_id,
+                    0,
+                    ValidationSummary::default(),
+                    Some(format!("Body: {e}")),
+                );
+            }
         };
         let (profiles, summary) =
             match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {

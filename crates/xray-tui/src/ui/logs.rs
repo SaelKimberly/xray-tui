@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::{HashSet, VecDeque};
 
 use crate::AppState;
-use crate::ui::theme::ThemeStyles;
 use crate::ui::render_confirmation_overlay;
+use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::{Column, ColumnWidth, DataTable, DataTableRow, DataTableState};
 
 // ── DataTable row type ────────────────────────────────────────────────
@@ -34,10 +34,34 @@ impl DataTableRow for LogRow {
         if col_xs.len() < 4 {
             return;
         }
-        buf.set_stringn(col_xs[0], y, &self.ts, col_widths[0] as usize, Style::default().fg(Color::DarkGray));
-        buf.set_stringn(col_xs[1], y, &self.target, col_widths[1] as usize, self.target_style);
-        buf.set_stringn(col_xs[2], y, &self.level, col_widths[2] as usize, self.level_style);
-        buf.set_stringn(col_xs[3], y, &self.msg, col_widths[3] as usize, Style::default());
+        buf.set_stringn(
+            col_xs[0],
+            y,
+            &self.ts,
+            col_widths[0] as usize,
+            Style::default().fg(Color::DarkGray),
+        );
+        buf.set_stringn(
+            col_xs[1],
+            y,
+            &self.target,
+            col_widths[1] as usize,
+            self.target_style,
+        );
+        buf.set_stringn(
+            col_xs[2],
+            y,
+            &self.level,
+            col_widths[2] as usize,
+            self.level_style,
+        );
+        buf.set_stringn(
+            col_xs[3],
+            y,
+            &self.msg,
+            col_widths[3] as usize,
+            Style::default(),
+        );
     }
 
     fn height(&self, available_width: u16) -> u16 {
@@ -159,7 +183,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     if matches!(state.confirmation, Some(crate::ConfirmAction::ClearLogs)) {
         render_confirmation_overlay(frame, area, " Clear all logs? (y/N) ");
     }
-    if matches!(state.confirmation, Some(crate::ConfirmAction::PurgeLogsDatabase)) {
+    if matches!(
+        state.confirmation,
+        Some(crate::ConfirmAction::PurgeLogsDatabase)
+    ) {
         render_confirmation_overlay(frame, area, " Purge entire log database? (y/N) ");
     }
 }

@@ -129,38 +129,38 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
         }
     }
 
-#[must_use]
+    #[must_use]
     pub fn highlight_style(mut self, style: Style) -> Self {
         self.highlight_style = style;
         self
     }
 
-#[must_use]
+    #[must_use]
     pub fn selection_style(mut self, style: Style) -> Self {
         self.selection_style = style;
         self
     }
 
-#[must_use]
+    #[must_use]
     pub fn sort_column(mut self, col: Option<usize>, dir: SortDirection) -> Self {
         self.sort_column = col;
         self.sort_direction = dir;
         self
     }
 
-#[must_use]
+    #[must_use]
     pub fn column_spacing(mut self, spacing: u16) -> Self {
         self.column_spacing = spacing;
         self
     }
 
-#[must_use]
+    #[must_use]
     pub fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
-#[must_use]
+    #[must_use]
     pub fn header_divider(mut self, ch: char) -> Self {
         self.header_divider = Some(ch);
         self

@@ -1946,7 +1946,6 @@ fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()>
     Ok(())
 }
 
-
 /// Consolidated validation summary for a batch of profile imports (e.g. subscription).
 #[derive(Debug, Clone, Default)]
 pub struct ValidationSummary {
