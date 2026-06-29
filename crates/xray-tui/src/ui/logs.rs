@@ -1,4 +1,3 @@
-use chrono::Datelike;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -78,11 +77,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let visible_end = filtered_count.saturating_sub(scroll);
     let visible_indices = &filtered_indices[visible_start..visible_end];
 
-    let now_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64;
-    let hour_ns: i64 = 3_600_000_000_000;
 
     // Header
     let header_cells = ["Timestamp", "Target", "Level", "Message"]
@@ -91,8 +85,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let header = Row::new(header_cells);
 
     let widths = [
-        Constraint::Length(12),
         Constraint::Length(10),
+        Constraint::Length(18),
         Constraint::Length(7),
         Constraint::Min(10),
     ];
@@ -101,7 +95,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         .iter()
         .map(|&idx| {
             let log = &state.log_cache[idx];
-            let ts_str = fmt_ts(log.timestamp_nanos, now_nanos, hour_ns);
+            let ts_str = fmt_ts(log.timestamp_nanos);
             let target_style = if log.target.starts_with("xray") {
                 Style::default().fg(Color::Cyan)
             } else if log.target.starts_with("sing") {
@@ -134,13 +128,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(table, log_area);
 }
 
-/// Shorten a target string for display (max ~10 chars).
+/// Shorten a target string for display (max ~18 chars).
 fn shorten_target(target: &str) -> String {
-    if target.len() <= 10 {
+    if target.len() <= 18 {
         return target.to_string();
     }
-    // For "xray::infra::conf::serial" → "xry::inf.."
-    format!("{}..", &target[..8])
+    // For "xray::infra::conf::serial" → "xray::infra::con.."
+    format!("{}..", &target[..16])
 }
 
 /// Handle key events for the Logs tab.
@@ -169,7 +163,6 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
             state.log_scroll = 0;
         }
         KeyCode::Char('t' | 'T') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let _ = crate::AppMode::TargetPicker { selected: 0 };
             state.mode = crate::AppMode::TargetPicker { selected: 0 };
         }
         _ => {}
@@ -302,7 +295,7 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     let overlay = Block::default()
         .title(" Select Targets (t=done, Enter=toggle) ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
+        .border_style(Theme::CONTAINER_BORDER);
     let inner = overlay.inner(area);
     frame.render_widget(overlay, area);
 
@@ -381,35 +374,14 @@ pub fn handle_target_picker_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn fmt_ts(ts_nanos: i64, now_nanos: i64, hour_ns: i64) -> String {
+fn fmt_ts(ts_nanos: i64) -> String {
     let secs = if ts_nanos >= 0 {
         ts_nanos / 1_000_000_000
     } else {
         (ts_nanos - 999_999_999) / 1_000_000_000
     };
     let sub_nanos = ts_nanos.rem_euclid(1_000_000_000) as u32;
-    #[allow(clippy::option_if_let_else, reason = "complex timestamp formatting with chained fallbacks")]
-    if let Some(naive) = chrono::DateTime::from_timestamp(secs, sub_nanos).map(|dt| dt.naive_utc())
-    {
-        let diff = now_nanos - ts_nanos;
-        if diff >= 0 && diff < hour_ns {
-            naive.format("%H:%M:%S").to_string()
-        } else {
-            let now_secs = if now_nanos >= 0 {
-                now_nanos / 1_000_000_000
-            } else {
-                (now_nanos - 999_999_999) / 1_000_000_000
-            };
-            let now_sub = now_nanos.rem_euclid(1_000_000_000) as u32;
-            let now_naive = chrono::DateTime::from_timestamp(now_secs, now_sub)
-                .map_or(naive, |dt| dt.naive_utc());
-            if naive.year() == now_naive.year() {
-                naive.format("%m/%d %H:%M").to_string()
-            } else {
-                naive.format("%Y-%m-%d %H:%M").to_string()
-            }
-        }
-    } else {
-        format!("{}s", ts_nanos / 1_000_000_000)
-    }
+    chrono::DateTime::from_timestamp(secs, sub_nanos)
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| format!("{}s", ts_nanos / 1_000_000_000))
 }

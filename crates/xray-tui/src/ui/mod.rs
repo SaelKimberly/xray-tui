@@ -714,6 +714,13 @@ fn render(frame: &mut Frame, state: &AppState) {
             return;
         }
 
+        if matches!(&state.mode, crate::AppMode::TargetPicker { .. }) {
+            logs::render(frame, chunks[1], state);
+            logs::render_target_picker(frame, chunks[1], state);
+            status_bar::render(frame, chunks[3], state);
+            return;
+        }
+
         if matches!(&state.mode, crate::AppMode::Help) {
             match state.current_tab {
                 Tab::Profiles => profiles::render(frame, chunks[1], state),
