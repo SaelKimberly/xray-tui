@@ -155,7 +155,7 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 - `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
 - `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)
-- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled, DataTableRow trait
+:- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled with themed scrollbar, DataTableRow trait
 
 ::**`speed_test.rs`** — Async speed test engine:
 ```rust

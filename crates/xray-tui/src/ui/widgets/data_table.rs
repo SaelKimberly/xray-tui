@@ -4,11 +4,12 @@
     clippy::module_name_repetitions
 )]
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, StatefulWidget, Widget};
 use std::collections::HashSet;
+use tui_scrollbar::{GlyphSet, ScrollBar, ScrollLengths};
 
 // ── Width strategy ──────────────────────────────────────────────────────
 
@@ -101,6 +102,9 @@ pub struct DataTable<'a, R: DataTableRow> {
     pub column_spacing: u16,
     pub block: Option<Block<'a>>,
     pub header_divider: Option<char>,
+    pub show_scrollbar: bool,
+    pub scrollbar_thumb_style: Style,
+    pub scrollbar_track_style: Style,
 }
 
 impl<R: DataTableRow> Default for DataTable<'_, R> {
@@ -115,6 +119,9 @@ impl<R: DataTableRow> Default for DataTable<'_, R> {
             column_spacing: 1,
             block: None,
             header_divider: None,
+            show_scrollbar: false,
+            scrollbar_thumb_style: Style::default(),
+            scrollbar_track_style: Style::default(),
         }
     }
 }
@@ -163,6 +170,14 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
     #[must_use]
     pub fn header_divider(mut self, ch: char) -> Self {
         self.header_divider = Some(ch);
+        self
+    }
+
+    #[must_use]
+    pub fn scrollbar(mut self, thumb_style: Style, track_style: Style) -> Self {
+        self.show_scrollbar = true;
+        self.scrollbar_thumb_style = thumb_style;
+        self.scrollbar_track_style = track_style;
         self
     }
 }
@@ -273,11 +288,20 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             return;
         }
 
+        // Compute content area and scrollbar column
+        let (content_inner, scrollbar_area) = if self.show_scrollbar && inner.width >= 2 {
+            let halves = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            (halves[0], halves[1])
+        } else {
+            (inner, Rect::default())
+        };
+
         // Compute column pixel widths
-        let col_widths = compute_widths(&self.columns, inner.width, self.column_spacing);
+        let col_widths = compute_widths(&self.columns, content_inner.width, self.column_spacing);
         let col_xs: Vec<u16> = {
             let mut xs = Vec::with_capacity(col_widths.len());
-            let mut x = inner.x;
+            let mut x = content_inner.x;
             for (i, w) in col_widths.iter().enumerate() {
                 xs.push(x);
                 x += w;
@@ -317,9 +341,9 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
 
         // Divider
         if let Some(ch) = self.header_divider
-            && header_y < inner.bottom()
+            && header_y < content_inner.bottom()
         {
-            for x in inner.x..inner.right() {
+            for x in content_inner.x..content_inner.right() {
                 buf[(x, header_y)].set_char(ch);
                 buf[(x, header_y)].set_style(self.columns[0].style); // use first col style
             }
@@ -330,13 +354,13 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
         let row_heights: Vec<u16> = self
             .rows
             .iter()
-            .map(|row| row.height(inner.width))
+            .map(|row| row.height(content_inner.width))
             .collect();
 
         // Clamp offset — count rows from the end so max_offset is the
         // earliest visible row that still fills the viewport.
         let total_rows = self.rows.len();
-        let visible_height = inner.bottom().saturating_sub(header_y);
+        let visible_height = content_inner.bottom().saturating_sub(header_y);
         let mut rows_from_end = 0usize;
         let mut h_sum = 0u16;
         for h in row_heights.iter().rev() {
@@ -354,13 +378,13 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
         // Render visible rows
         let mut y = header_y;
         let mut row_idx = state.offset;
-        while y < inner.bottom() && row_idx < total_rows {
+        while y < content_inner.bottom() && row_idx < total_rows {
             let rh = row_heights[row_idx];
             if rh == 0 {
                 row_idx += 1;
                 continue;
             }
-            if y + rh > inner.bottom() {
+            if y + rh > content_inner.bottom() {
                 break;
             }
 
@@ -370,13 +394,13 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             // Apply selection/highlight styles via buffer background
             if is_selected {
                 for row_y in y..y + rh {
-                    for x in inner.x..inner.right() {
+                    for x in content_inner.x..content_inner.right() {
                         buf[(x, row_y)].set_style(self.highlight_style);
                     }
                 }
             } else if is_multi {
                 for row_y in y..y + rh {
-                    for x in inner.x..inner.right() {
+                    for x in content_inner.x..content_inner.right() {
                         buf[(x, row_y)].set_style(self.selection_style);
                     }
                 }
@@ -386,6 +410,21 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
 
             y += rh;
             row_idx += 1;
+        }
+
+        // Render vertical scrollbar
+        if self.show_scrollbar && scrollbar_area.width > 0 && total_rows > 0 {
+            let visible_rows = rows_from_end.max(1);
+            let lengths = ScrollLengths {
+                content_len: total_rows.max(1),
+                viewport_len: visible_rows.max(1),
+            };
+            let scrollbar = ScrollBar::vertical(lengths)
+                .offset(state.offset)
+                .thumb_style(self.scrollbar_thumb_style)
+                .track_style(self.scrollbar_track_style)
+                .glyph_set(GlyphSet::minimal());
+            scrollbar.render(scrollbar_area, buf);
         }
 
         // Update selected within bounds

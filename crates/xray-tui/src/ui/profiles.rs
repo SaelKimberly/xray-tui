@@ -312,7 +312,11 @@ fn render_data_grid(
         .highlight_style(ThemeStyles::table_row_selected(palette))
         .column_spacing(0)
         .block(block)
-        .sort_column(sort_column, sort_direction);
+        .sort_column(sort_column, sort_direction)
+        .scrollbar(
+            ThemeStyles::scrollbar_thumb(palette),
+            ThemeStyles::scrollbar_track(palette),
+        );
 
     let mut table_state = DataTableState {
         offset: data_offset,

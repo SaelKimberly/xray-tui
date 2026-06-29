@@ -49,7 +49,7 @@ cargo run
 - `theme.rs` — central Palette-derived style methods (ThemeStyles struct) — static methods returning Style from a &Palette
 - `actions_log.rs` — live state info panel: connection status, server info, test results, traffic/memory, recent logs
 - `palette_bridge.rs` — maps ratatui-themes `ThemePalette` → ratatui-cheese `Palette` (10-to-11 color role mapping)
-- `widgets/` — reusable widgets: `DataTable` (sortable, selectable, multi-select, virtual-scrolled table with Column/ColumnWidth/SortDirection/DataTableRow trait)
+:- `widgets/` — reusable widgets: `DataTable` (sortable, selectable, multi-select, virtual-scrolled with themed scrollbar, Column/ColumnWidth/SortDirection/DataTableRow trait)
 
 ### Reference repos (read-only — never edit)
 - `thirdparty/Xray-core/` — protocol behavior, config schema, API

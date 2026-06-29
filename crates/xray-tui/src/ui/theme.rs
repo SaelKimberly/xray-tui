@@ -103,4 +103,12 @@ impl ThemeStyles {
     pub fn footer_value(palette: &Palette) -> Style {
         Style::default().fg(palette.foreground)
     }
+
+    // ── Scrollbar ─────────────────────────────────────────────────────
+    pub fn scrollbar_thumb(palette: &Palette) -> Style {
+        Style::default().fg(palette.primary).bg(palette.surface)
+    }
+    pub fn scrollbar_track(palette: &Palette) -> Style {
+        Style::default().bg(palette.surface)
+    }
 }

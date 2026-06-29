@@ -172,7 +172,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let approx_visible = (log_area.height as usize).saturating_sub(2);
     let offset = filtered_count.saturating_sub(state.log_scroll + approx_visible);
 
-    let data_table = DataTable::new(columns, &log_rows).column_spacing(1);
+    let data_table = DataTable::new(columns, &log_rows)
+        .column_spacing(1)
+        .scrollbar(
+            ThemeStyles::scrollbar_thumb(&palette),
+            ThemeStyles::scrollbar_track(&palette),
+        );
     let mut dt_state = DataTableState {
         offset,
         selected: None,
