@@ -91,7 +91,12 @@ impl HeedLogStorage {
 
         wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
 
-        Ok(Self { env, logs, targets, mapsize_full_count: AtomicU64::new(0) })
+        Ok(Self {
+            env,
+            logs,
+            targets,
+            mapsize_full_count: AtomicU64::new(0),
+        })
     }
 
     /// Write a single log entry to the storage.
@@ -147,11 +152,13 @@ impl HeedLogStorage {
 
     /// Internal: write a batch in one transaction. Returns [`HeedError::MapFull`] on MapFull.
     fn try_write_batch(&self, messages: &[LogMessage]) -> Result<()> {
-        let mut wtxn = self.env.write_txn().map_err(|e| HeedError::Txn(e.to_string()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| HeedError::Txn(e.to_string()))?;
 
         for msg in messages {
-            let value = postcard::to_allocvec(msg)
-                .map_err(|e| HeedError::Serde(e.to_string()))?;
+            let value = postcard::to_allocvec(msg).map_err(|e| HeedError::Serde(e.to_string()))?;
 
             if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, &value) {
                 return Err(match e {
@@ -289,7 +296,11 @@ impl HeedLogStorage {
     }
 
     /// Async version of [`Self::read_newer_than`] that wraps the heed call in `spawn_blocking`.
-    pub async fn read_newer_than_async(self: &Arc<Self>, after_ns: u64, limit: usize) -> Result<Vec<LogMessage>> {
+    pub async fn read_newer_than_async(
+        self: &Arc<Self>,
+        after_ns: u64,
+        limit: usize,
+    ) -> Result<Vec<LogMessage>> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.read_newer_than(after_ns, limit))
             .await
@@ -297,7 +308,11 @@ impl HeedLogStorage {
     }
 
     /// Async version of [`Self::read_older_than`] that wraps the heed call in `spawn_blocking`.
-    pub async fn read_older_than_async(self: &Arc<Self>, before_ns: u64, limit: usize) -> Result<Vec<LogMessage>> {
+    pub async fn read_older_than_async(
+        self: &Arc<Self>,
+        before_ns: u64,
+        limit: usize,
+    ) -> Result<Vec<LogMessage>> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.read_older_than(before_ns, limit))
             .await

@@ -27,6 +27,7 @@ url = "2.5"
 uuid.workspace = true
 aho-corasick = "1.1"
 memchr = "2"
+ratatui-themes = "0.2"
 
 # ============ Memory ============
 smallvec = { version = "1", features = ["const_new"] }

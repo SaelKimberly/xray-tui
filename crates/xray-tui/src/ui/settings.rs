@@ -1,12 +1,17 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui_cheese::field::ValidationKind;
+use ratatui_cheese::input::{Input, InputState};
+use ratatui_cheese::list::{List, ListItem, ListItemContext, ListState};
+use ratatui_cheese::theme::Palette;
 use std::collections::HashMap;
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState, SettingsMode, SettingsSection};
 use xray_tui_core::CoreType;
 // ── Menu items ──────────────────────────────────────────────────────────
@@ -37,8 +42,9 @@ const SEPARATOR_AFTER: usize = 4; // after DNS Settings
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     if let AppMode::Settings { mode } = &state.mode {
+        let palette = state.current_palette();
         match mode {
-            SettingsMode::Menu { .. } => render_menu(frame, area, state),
+            SettingsMode::Menu { .. } => render_menu(frame, area, state, &palette),
             SettingsMode::CoreForm { .. }
             | SettingsMode::GuiForm { .. }
             | SettingsMode::InboundForm { .. }
@@ -49,10 +55,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             | SettingsMode::DnsForm { .. }
             | SettingsMode::ProtocolCoreForm { .. }
             | SettingsMode::LoggingForm { .. }
-            | SettingsMode::SpeedTestForm { .. } => render_form(frame, area, state),
-            SettingsMode::RoutingList { .. } => render_routing_list(frame, area, state),
-            SettingsMode::RoutingForm { .. } => render_routing_form(frame, area, state),
-            SettingsMode::UpdateForm { .. } => render_update_form(frame, area, state),
+            | SettingsMode::SpeedTestForm { .. } => render_form(frame, area, state, &palette),
+            SettingsMode::RoutingList { .. } => render_routing_list(frame, area, state, &palette),
+            SettingsMode::RoutingForm { .. } => render_routing_form(frame, area, state, &palette),
+            SettingsMode::UpdateForm { .. } => render_update_form(frame, area, state, &palette),
         }
     }
 }
@@ -85,7 +91,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
 // ● for sections with non-default values. Requires tracking which
 // settings differ from AppConfig::default().
 
-fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_menu(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
     let selected = match &state.mode {
         AppMode::Settings {
             mode: SettingsMode::Menu { selected },
@@ -96,8 +102,8 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" Settings ")
         .borders(Borders::ALL)
-        .border_style(Theme::CONTAINER_BORDER)
-        .title_style(Theme::CONTAINER_TITLE);
+        .border_style(ThemeStyles::container_border(palette))
+        .title_style(ThemeStyles::container_title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -113,24 +119,27 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         let prefix = if is_selected { "► " } else { "  " };
         let style = if is_selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Gray)
+                .fg(palette.surface)
+                .bg(palette.primary)
                 .add_modifier(Modifier::BOLD)
         } else if i > SEPARATOR_AFTER {
-            Theme::HINT
+            ThemeStyles::hint(palette)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette.foreground)
         };
 
         lines.push(Line::from(Span::styled(format!("{prefix}{name}"), style)));
         if is_selected {
-            lines.push(Line::from(Span::styled(format!("    {desc}"), Theme::HINT)));
+            lines.push(Line::from(Span::styled(
+                format!("    {desc}"),
+                ThemeStyles::hint(palette),
+            )));
         }
     }
 
     lines.push(Line::from(""));
     let help = " [↑/↓] Navigate  [Enter] Open  [Esc] Close ";
-    lines.push(Line::from(Span::styled(help, Theme::HINT)));
+    lines.push(Line::from(Span::styled(help, ThemeStyles::hint(palette))));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
@@ -307,7 +316,7 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
     clippy::option_if_let_else,
     reason = "three-branch if-else more readable than nested map_or_else for display formatting"
 )]
-fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_form(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
     let mode = match &state.mode {
         AppMode::Settings { mode } => mode,
         _ => return,
@@ -374,28 +383,28 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let title = form_title_from_mode(mode);
     let field_defs = form_field_defs(mode);
 
+    // Outer block
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(ThemeStyles::container_border(palette))
+        .title_style(ThemeStyles::container_title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let label_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let focus_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightYellow)
-        .add_modifier(Modifier::REVERSED);
-    let hint_style = Style::default().fg(Color::Gray);
-
-    let mut lines: Vec<Line> = Vec::new();
+    // Render each field as an Input widget with y-coordinate tracking
+    let mut y = inner.y;
+    let max_y = inner.bottom();
 
     for (i, (key, label, field_type)) in field_defs.iter().enumerate() {
+        if y >= max_y {
+            break;
+        }
+
         let is_focused = i == focus_index;
         let val = fields.get(i).map_or("", |(_, v)| v.as_str());
 
+        // Compute display value based on field type
         let display_val = if let Some(_options_csv) = field_type.strip_prefix("Select:") {
             format!("< {val} >")
         } else if *field_type == "Boolean" {
@@ -404,46 +413,37 @@ fn render_form(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 "[ ]".into()
             }
+        } else if val.is_empty() {
+            "(empty)".into()
         } else {
-            if val.is_empty() {
-                "(empty)".into()
-            } else {
-                val.to_string()
-            }
+            val.to_string()
         };
-        let prefix = if is_focused { "> " } else { "  " };
-        let label_text = format!("{prefix}{label}: ");
-        let value_text = format!("[{display_val}]");
 
-        let spans = vec![
-            Span::styled(
-                label_text,
-                if is_focused { focus_style } else { label_style },
-            ),
-            Span::styled(
-                value_text,
-                if is_focused {
-                    focus_style
-                } else {
-                    Style::default()
-                },
-            ),
-        ];
-        lines.push(Line::from(spans));
+        let input = Input::new(label).palette(palette);
+        let mut input_state = InputState::new();
+        input_state.set_value(display_val);
+        input_state.set_focused(is_focused);
+
+        // Show validation error if present
         if let Some(error) = form_errors.get(*key) {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ {error}"),
-                Theme::ERROR,
-            )));
+            input_state.set_validation(Some((ValidationKind::Error, error.clone())));
         }
+
+        let has_error = u16::from(input_state.validation().is_some());
+        let field_height = 2 + has_error;
+        let field_area = Rect::new(inner.x, y, inner.width, field_height.min(max_y - y));
+        frame.render_stateful_widget(&input, field_area, &mut input_state);
+        y += field_height;
     }
 
-    lines.push(Line::from(""));
-    let help = " [Tab] Next  [Shift+Tab] Prev  [Enter] Save  [Esc] Cancel ";
-    lines.push(Line::from(Span::styled(help, hint_style)));
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    // Help text at the bottom
+    if y < max_y {
+        let help = " [Tab] Next  [Shift+Tab] Prev  [Enter] Save  [Esc] Cancel ";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(help, ThemeStyles::hint(palette)))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 }
 
 const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
@@ -629,7 +629,7 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Update form ──────────────────────────────────────────────────────────
 
-fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
     let status_xray = match &state.mode {
         AppMode::Settings {
             mode: SettingsMode::UpdateForm { status_xray, .. },
@@ -647,21 +647,22 @@ fn render_update_form(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(ThemeStyles::container_border(palette))
+        .title_style(ThemeStyles::container_title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let label_style = Style::default()
-        .fg(Color::White)
+        .fg(palette.foreground)
         .add_modifier(Modifier::BOLD);
     let header_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(palette.primary)
         .add_modifier(Modifier::BOLD);
     let avail_style = Style::default()
-        .fg(Color::Green)
+        .fg(palette.success)
         .add_modifier(Modifier::BOLD);
-    let error_style = Style::default().fg(Color::Red);
-    let hint_style = Style::default().fg(Color::Gray);
+    let error_style = Style::default().fg(palette.error);
+    let hint_style = Style::default().fg(palette.muted);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -832,7 +833,49 @@ fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Routing list ────────────────────────────────────────────────────────
 
-fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
+// ── Routing rule list item for ratatui-cheese List ──────────────────────
+
+struct RoutingRuleItem {
+    index: usize,
+    rule_type: String,
+    targets: String,
+    outbound: String,
+}
+
+impl ListItem for RoutingRuleItem {
+    fn height(&self) -> u16 {
+        1
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &ListItemContext) {
+        let style = if ctx.selected {
+            Style::default()
+                .fg(ctx.palette.surface)
+                .bg(ctx.palette.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ctx.palette.foreground)
+        };
+        let num_style = if ctx.selected {
+            style
+        } else {
+            Style::default().fg(ctx.palette.muted)
+        };
+        let text = format!(
+            "{:>2}  {}  {:<32} {}",
+            self.index,
+            self.rule_type,
+            truncate_to(&self.targets, 32),
+            self.outbound,
+        );
+        buf.set_string(area.x, area.y, &text, style);
+        // Override the # column with num_style
+        let num_str = format!("{:>2}", self.index);
+        buf.set_string(area.x, area.y, &num_str, num_style);
+    }
+}
+
+fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
     let selected = match &state.mode {
         AppMode::Settings {
             mode: SettingsMode::RoutingList { selected },
@@ -853,7 +896,8 @@ fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(" Routing Rules ")
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(ThemeStyles::container_border(palette))
+        .title_style(ThemeStyles::container_title(palette));
     let inner = block.inner(overlay_area);
     frame.render_widget(block, overlay_area);
 
@@ -870,77 +914,58 @@ fn render_routing_list(frame: &mut Frame, area: Rect, state: &AppState) {
     let header = Line::from(vec![
         Span::styled(
             " #  ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            ThemeStyles::container_border(palette).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "Type  ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            ThemeStyles::container_border(palette).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "Domains/IPs                    ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            ThemeStyles::container_border(palette).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "Outbound Tag",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            ThemeStyles::container_border(palette).add_modifier(Modifier::BOLD),
         ),
     ]);
     frame.render_widget(header, chunks[0]);
 
-    // Rows
-    let mut rows = Vec::new();
-    for (i, rule) in rules.iter().enumerate() {
-        let is_selected = i == selected;
-        let domains = rule.domains.as_deref().unwrap_or("");
-        let ips = rule.ips.as_deref().unwrap_or("");
-        let targets = if !domains.is_empty() && !ips.is_empty() {
-            format!("{domains}, {ips}")
-        } else if !domains.is_empty() {
-            domains.to_string()
-        } else {
-            ips.to_string()
-        };
-        let outbound = rule.outbound_tag.as_deref().unwrap_or("-");
-        let style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Gray)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        rows.push(Line::from(vec![
-            Span::styled(
-                format!("{:>2}  ", i + 1),
-                if is_selected {
-                    style
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ),
-            Span::styled(format!("{}  ", rule.r#type), style),
-            Span::styled(truncate_to(&targets, 32), style),
-            Span::styled(outbound.to_string(), style),
-        ]));
-    }
+    // Build list items
+    let items: Vec<RoutingRuleItem> = rules
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| {
+            let domains = rule.domains.as_deref().unwrap_or("");
+            let ips = rule.ips.as_deref().unwrap_or("");
+            let targets = if !domains.is_empty() && !ips.is_empty() {
+                format!("{domains}, {ips}")
+            } else if !domains.is_empty() {
+                domains.to_string()
+            } else {
+                ips.to_string()
+            };
+            RoutingRuleItem {
+                index: i + 1,
+                rule_type: rule.r#type.to_string(),
+                targets,
+                outbound: rule.outbound_tag.as_deref().unwrap_or("-").to_string(),
+            }
+        })
+        .collect();
 
-    // Render as paragraph since we don't have a scrollable list widget
-    // In future: use ratatui List or Table
-    let list_para = Paragraph::new(rows);
-    frame.render_widget(list_para, chunks[1]);
+    // Render list widget
+    let list = List::new(&items)
+        .palette(palette.clone())
+        .show_paginator(false);
+    let mut list_state = ListState::new(items.len());
+    list_state.select(selected, items.len());
+    frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
     // Footer
     let footer = Paragraph::new(Line::from(Span::styled(
         " [a] Add  [e] Edit  [d] Delete  [Ctrl+↑/↓] Reorder  [Esc] Back ",
-        Style::default().fg(Color::DarkGray),
+        ThemeStyles::hint(palette),
     )));
     frame.render_widget(footer, chunks[2]);
 }
@@ -1151,7 +1176,7 @@ const ROUTING_FIELD_DEFS: &[(&str, &str, &str)] = &[
     ("rule_set_url", "Rule Set (URL)", "Text"),
 ];
 
-fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
     let (fields, focus_index, form_errors) = match &state.mode {
         AppMode::Settings {
             mode:
@@ -1178,75 +1203,59 @@ fn render_routing_form(frame: &mut Frame, area: Rect, state: &AppState) {
         " Add Routing Rule "
     };
 
+    // Outer block
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(ThemeStyles::container_border(palette))
+        .title_style(ThemeStyles::container_title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let label_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let focus_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightYellow)
-        .add_modifier(Modifier::REVERSED);
-    let hint_style = Style::default().fg(Color::Gray);
+    // Render each field as an Input widget with y-coordinate tracking
+    let mut y = inner.y;
+    let max_y = inner.bottom();
 
-    let mut lines: Vec<Line> = Vec::new();
+    for (i, (key, label, _field_type)) in ROUTING_FIELD_DEFS.iter().enumerate() {
+        if y >= max_y {
+            break;
+        }
 
-    for (i, (key, label, field_type)) in ROUTING_FIELD_DEFS.iter().enumerate() {
         let is_focused = i == focus_index;
         let val = fields.get(i).map_or("", |(_, v)| v.as_str());
 
-        let display_val = if *field_type == "Boolean" {
-            if val == "true" {
-                "[X]".into()
-            } else {
-                "[ ]".into()
-            }
+        // Compute display value
+        let display_val = if val.is_empty() {
+            "(empty)".into()
         } else {
-            if val.is_empty() {
-                "(empty)".into()
-            } else {
-                val.to_string()
-            }
+            val.to_string()
         };
 
-        let prefix = if is_focused { "> " } else { "  " };
-        let label_text = format!("{prefix}{label}: ");
-        let value_text = format!("[{display_val}]");
+        let input = Input::new(label).palette(palette);
+        let mut input_state = InputState::new();
+        input_state.set_value(display_val);
+        input_state.set_focused(is_focused);
 
-        let spans = vec![
-            Span::styled(
-                label_text,
-                if is_focused { focus_style } else { label_style },
-            ),
-            Span::styled(
-                value_text,
-                if is_focused {
-                    focus_style
-                } else {
-                    Style::default()
-                },
-            ),
-        ];
-        lines.push(Line::from(spans));
+        // Show validation error if present
         if let Some(error) = form_errors.get(*key) {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ {error}"),
-                Theme::ERROR,
-            )));
+            input_state.set_validation(Some((ValidationKind::Error, error.clone())));
         }
+
+        let has_error = u16::from(input_state.validation().is_some());
+        let field_height = 2 + has_error;
+        let field_area = Rect::new(inner.x, y, inner.width, field_height.min(max_y - y));
+        frame.render_stateful_widget(&input, field_area, &mut input_state);
+        y += field_height;
     }
 
-    lines.push(Line::from(""));
-    let help = " [Tab] Next  [Shift+Tab] Prev  [Enter] Save  [Esc] Cancel ";
-    lines.push(Line::from(Span::styled(help, hint_style)));
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    // Help text at the bottom
+    if y < max_y {
+        let help = " [Tab] Next  [Shift+Tab] Prev  [Enter] Save  [Esc] Cancel ";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(help, ThemeStyles::hint(palette)))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 }
 
 async fn handle_routing_form_key(state: &mut AppState, key: &KeyEvent) {
@@ -1338,153 +1347,6 @@ fn truncate_to(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max.saturating_sub(1)])
-    }
-}
-
-/// Extract (fields, `focus_index`, `form_errors`) from any settings form variant.
-#[allow(
-    clippy::type_complexity,
-    reason = "temporary tuple type in form extraction helper"
-)]
-pub const fn extract_form_fields(
-    state: &AppState,
-) -> Option<(&Vec<(String, String)>, &usize, &HashMap<String, String>)> {
-    let mode = match &state.mode {
-        AppMode::Settings { mode } => mode,
-        _ => return None,
-    };
-    match mode {
-        SettingsMode::CoreForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::GuiForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::InboundForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::DnsForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::SystemProxyForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::TunForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::MuxForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::StatsForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::ProtocolCoreForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::SpeedTestForm {
-            fields,
-            focus_index,
-            form_errors,
-        }
-        | SettingsMode::LoggingForm {
-            fields,
-            focus_index,
-            form_errors,
-        } => Some((fields, focus_index, form_errors)),
-        _ => None,
-    }
-}
-
-#[allow(
-    clippy::type_complexity,
-    reason = "temporary tuple type in form extraction helper"
-)]
-/// Mutable version of `extract_form_fields`.
-pub const fn extract_form_fields_mut(
-    state: &mut AppState,
-) -> Option<(
-    &mut Vec<(String, String)>,
-    &mut usize,
-    &mut HashMap<String, String>,
-)> {
-    match &mut state.mode {
-        AppMode::Settings {
-            mode:
-                SettingsMode::CoreForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::GuiForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::InboundForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::DnsForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::SystemProxyForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::TunForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::MuxForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::StatsForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::ProtocolCoreForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::SpeedTestForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                }
-                | SettingsMode::LoggingForm {
-                    fields,
-                    focus_index,
-                    form_errors,
-                },
-        } => Some((fields, focus_index, form_errors)),
-        _ => None,
     }
 }
 // ── Progress bar helpers ─────────────────────────────────────────────────

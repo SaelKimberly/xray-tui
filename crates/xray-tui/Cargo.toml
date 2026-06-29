@@ -28,6 +28,10 @@ dirs.workspace = true
 ratatui = "0.30"
 crossterm = "0.29"
 unicode-width = "0.2"
+ratatui-themes = "0.2"
+ratatui-cheese = "0.7"
+tui-popup = "0.7"
+tui-scrollbar = "0.2"
 arboard = "3.6"
 
 # ============ CLI ============

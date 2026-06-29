@@ -1,6 +1,6 @@
+use ratatui_themes::ThemeName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
 use xray_tui_core::CoreType;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -28,6 +28,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub parsing: ParsingSettings,
     #[serde(default)]
+    pub theme_name: ThemeName,
     pub clash_api_port: Option<u16>,
 }
 

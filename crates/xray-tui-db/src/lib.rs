@@ -9,8 +9,8 @@ pub mod error;
 pub mod models;
 pub mod schema;
 
-pub use error::{DatabaseError, ProfileWithDetails, Result};
 pub use database::Database;
+pub use error::{DatabaseError, ProfileWithDetails, Result};
 
 mod columns;
 mod convert;

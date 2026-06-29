@@ -62,7 +62,10 @@ impl<'de> Deserialize<'de> for DurationOrSecs {
                 if secs < 0 {
                     return Err(de::Error::custom("negative duration not supported"));
                 }
-                #[allow(clippy::cast_sign_loss, reason = "secs >= 0 enforced by check on line 62-64")]
+                #[allow(
+                    clippy::cast_sign_loss,
+                    reason = "secs >= 0 enforced by check on line 62-64"
+                )]
                 Ok(DurationOrSecs(Duration::from_secs(secs as u64)))
             }
 

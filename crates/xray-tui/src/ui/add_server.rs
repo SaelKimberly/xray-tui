@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::HashMap;
@@ -9,8 +9,14 @@ use xray_tui_config::forms::{FieldSection, FormFieldType, form_fields_for};
 use xray_tui_core::SINGBOX_ONLY_PROTOCOLS;
 use xray_tui_core::protocol::Protocol;
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState};
+use ratatui_cheese::field::ValidationKind;
+use ratatui_cheese::fieldset::{Fieldset, FieldsetFill};
+use ratatui_cheese::input::{Input, InputState};
+use ratatui_cheese::select::{Select, SelectOption, SelectState};
+use ratatui_cheese::theme::Palette;
+use tui_popup::{KnownSizeWrapper, Popup};
 
 /// Protocol picker layout groups
 const XRAY_PROTOCOLS: &[Protocol] = &[
@@ -70,6 +76,7 @@ const ALL_PICKER_PROTOCOLS: &[Protocol] = &[
 // ── Render dispatch ──────────────────────────────────────────────────────
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     match &state.mode {
         AppMode::AddServer { protocol: None, .. } => {
             render_protocol_picker(frame, area, state);
@@ -80,19 +87,37 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             focus_index,
             form_errors,
         } => {
-            render_form(frame, area, *p, fields, *focus_index, form_errors, false);
+            render_form(
+                frame,
+                area,
+                *p,
+                fields,
+                *focus_index,
+                form_errors,
+                false,
+                &palette,
+            );
         }
         AppMode::EditServer {
-            profile_id: _,
             fields,
             focus_index,
             form_errors,
+            ..
         } => {
             let proto = crate::get_field(fields, "config_type")
                 .and_then(|v| v.parse::<i32>().ok())
                 .and_then(Protocol::try_from_i32)
                 .unwrap_or(Protocol::Custom);
-            render_form(frame, area, proto, fields, *focus_index, form_errors, true);
+            render_form(
+                frame,
+                area,
+                proto,
+                fields,
+                *focus_index,
+                form_errors,
+                true,
+                &palette,
+            );
         }
         _ => {}
     }
@@ -102,93 +127,75 @@ pub fn render_import_url(frame: &mut Frame, area: Rect, state: &AppState) {
     let AppMode::ImportUrl { input, error } = &state.mode else {
         return;
     };
+    let palette = state.current_palette();
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(1)])
-        .split(area);
-
-    let title = "Import URL — Ctrl+V paste, Enter parse, Esc cancel";
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let input_para = if input.is_empty() {
-        Paragraph::new(" (paste URL here) ").block(block)
+    let display_text = if input.is_empty() {
+        "(paste URL here)".to_string()
     } else {
-        Paragraph::new(input.as_str()).block(block)
+        input.clone()
     };
-    frame.render_widget(input_para, chunks[0]);
 
+    let mut lines = vec![Line::from(Span::raw(&display_text))];
     if let Some(err) = error {
-        let err_style = Style::default().fg(Color::Red);
-        let err_line = Line::from(Span::styled(format!("Error: {err}"), err_style));
-        frame.render_widget(Paragraph::new(err_line), chunks[1]);
+        lines.push(Line::from(Span::styled(
+            format!("Error: {err}"),
+            ThemeStyles::error(&palette),
+        )));
     }
+    let para = Paragraph::new(lines);
+    let width = area.width.saturating_sub(4).max(20) as usize;
+    let height = 3usize;
+    let sized = KnownSizeWrapper {
+        inner: para,
+        width,
+        height,
+    };
+    let popup = Popup::new(sized)
+        .title(" Import URL — Ctrl+V paste, Enter parse, Esc cancel ")
+        .borders(Borders::ALL)
+        .border_style(ThemeStyles::container_border(&palette))
+        .style(Style::default().bg(palette.surface));
+    frame.render_widget(popup, area);
 }
 
 // ── Protocol picker ──────────────────────────────────────────────────────
 
 fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default()
-        .title("Select Protocol")
-        .borders(Borders::ALL)
-        .border_style(crate::ui::theme::Theme::CONTAINER_BORDER);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let palette = state.current_palette();
 
-    let xray_header_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let singbox_header_style = Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD);
-    let selected_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightYellow)
-        .add_modifier(Modifier::REVERSED);
-
-    let mut lines: Vec<Line> = Vec::new();
-    let mut idx: usize = 0;
-    let picker_offset = state.selected_index;
-
-    lines.push(Line::from(Span::styled(
-        "─ Xray-core ──────────────",
-        xray_header_style,
-    )));
+    // Build options with disabled separators for section headers
+    let mut item_labels: Vec<String> = Vec::new();
+    item_labels.push("=== Xray-core ===".to_string());
     for proto in XRAY_PROTOCOLS {
-        let is_sel = idx == picker_offset;
-        let text = format!("  {proto}");
-        let style = if is_sel {
-            selected_style
-        } else {
-            Style::default().fg(Color::Blue)
-        };
-        lines.push(Line::from(Span::styled(text, style)));
-        idx += 1;
+        item_labels.push(format!("  {proto}"));
     }
-
-    lines.push(Line::from(Span::styled(
-        "─ Sing-box ────────────────",
-        singbox_header_style,
-    )));
+    item_labels.push("=== Sing-box ===".to_string());
     for proto in singbox_protocols() {
-        let is_sel = idx == picker_offset;
-        let text = format!("  {proto}");
-        let style = if is_sel {
-            selected_style
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        lines.push(Line::from(Span::styled(text, style)));
-        idx += 1;
+        item_labels.push(format!("  {proto}"));
     }
+    let opts: Vec<SelectOption> = item_labels
+        .iter()
+        .map(|s| {
+            if s.starts_with("===") {
+                SelectOption::new(s).enabled(false)
+            } else {
+                SelectOption::new(s)
+            }
+        })
+        .collect();
+    // Map AppState.selected_index (protocol-only index) to Select cursor position
+    let xray_count = XRAY_PROTOCOLS.len();
+    let cursor_pos = if state.selected_index < xray_count {
+        1 + state.selected_index
+    } else {
+        1 + xray_count + 1 + (state.selected_index - xray_count)
+    };
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  ↑↓ Navigate  Enter Select  Esc Cancel",
-        Style::default().fg(Color::Gray),
-    )));
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    let select = Select::new("Select Protocol", &opts).palette(&palette);
+    let mut select_state = SelectState::from_options(&opts);
+    select_state.set_cursor(cursor_pos);
+    select_state.set_focused(true);
+    frame.render_stateful_widget(select, area, &mut select_state);
 }
 
 // ── Form render ──────────────────────────────────────────────────────────
@@ -203,101 +210,118 @@ fn render_form(
     focus_index: usize,
     form_errors: &HashMap<String, String>,
     _is_edit: bool,
+    palette: &Palette,
 ) {
     let title = format!(" {protocol} ");
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(crate::ui::theme::Theme::CONTAINER_BORDER)
-        .title_style(crate::ui::theme::Theme::CONTAINER_TITLE);
+        .border_style(ThemeStyles::container_border(palette))
+        .title_style(ThemeStyles::container_title(palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
     let form_fields = form_fields_for(protocol);
-    let focus_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightYellow)
-        .add_modifier(Modifier::REVERSED);
-    let label_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let required_style = Style::default().fg(Color::Red);
-    let hint_style = Theme::HINT;
 
-    let mut lines: Vec<Line> = Vec::new();
+    // Group fields by section
+    let sections: &[(&str, FieldSection)] = &[
+        ("General", FieldSection::Common),
+        ("Stream Settings", FieldSection::StreamSetting),
+        ("Protocol Settings", FieldSection::ProtocolSetting),
+    ];
 
-    for (i, ff) in form_fields.iter().enumerate() {
-        let is_focused = i == focus_index;
-        let val = fields.get(i).map_or("", |(_, v)| v.as_str());
-        let display_val = match ff.field_type {
-            FormFieldType::Password => {
-                if val.is_empty() {
-                    String::new()
-                } else {
-                    "••••••".into()
+    let mut y = inner.y;
+    let max_y = inner.y + inner.height;
+
+    for (sec_name, sec_key) in sections {
+        // Collect fields in this section
+        let sec_fields: Vec<(usize, &xray_tui_config::forms::FormField)> = form_fields
+            .iter()
+            .enumerate()
+            .filter(|(_, ff)| ff.section == *sec_key)
+            .collect();
+
+        if sec_fields.is_empty() {
+            continue;
+        }
+
+        // Fieldset section header (1 line)
+        if y >= max_y {
+            break;
+        }
+        let fs_area = Rect::new(inner.x, y, inner.width, 1);
+        let fieldset = Fieldset::new()
+            .title(sec_name)
+            .fill(FieldsetFill::Dash)
+            .palette(palette);
+        frame.render_widget(&fieldset, fs_area);
+        y += 1;
+
+        // Render each field in this section as an Input widget
+        for (i, ff) in &sec_fields {
+            if y >= max_y {
+                break;
+            }
+
+            let is_focused = *i == focus_index;
+            let val = fields.get(*i).map_or("", |(_, v)| v.as_str());
+
+            // Compute display value based on field type
+            let display_val = match ff.field_type {
+                FormFieldType::Password => {
+                    if val.is_empty() {
+                        String::new()
+                    } else {
+                        "••••••".into()
+                    }
                 }
-            }
-            FormFieldType::Boolean => {
-                if val == "true" {
-                    "[X]".into()
-                } else {
-                    "[ ]".into()
+                FormFieldType::Boolean => {
+                    if val == "true" {
+                        "[X]".into()
+                    } else {
+                        "[ ]".into()
+                    }
                 }
-            }
-            FormFieldType::Select(_) => {
-                format!("< {val} >")
-            }
-            _ => {
-                if val.is_empty() {
-                    "(empty)".into()
-                } else {
-                    val.to_string()
+                FormFieldType::Select(_) => {
+                    format!("< {val} >")
                 }
+                _ => val.to_string(),
+            };
+
+            // Build Input widget
+            let input = if matches!(ff.field_type, FormFieldType::Password) {
+                Input::new(ff.label).palette(palette).password_mode(true)
+            } else {
+                Input::new(ff.label).palette(palette)
+            };
+
+            let mut input_state = InputState::new();
+            input_state.set_value(display_val);
+            input_state.set_focused(is_focused);
+
+            // Set validation error if present
+            if let Some(error) = form_errors.get(ff.key) {
+                input_state.set_validation(Some((ValidationKind::Error, error.clone())));
             }
-        };
 
-        let req_mark = if ff.required { "*" } else { " " };
-        let label_text = format!("{}{}: ", req_mark, ff.label);
-        let value_text = format!("[{display_val}]");
-        let section_hint = match ff.section {
-            FieldSection::Common => "",
-            FieldSection::StreamSetting => " [stream]",
-            FieldSection::ProtocolSetting => " [proto]",
-        };
-
-        let spans = vec![
-            Span::styled(
-                label_text,
-                if is_focused && ff.required {
-                    required_style
-                } else {
-                    label_style
-                },
-            ),
-            Span::styled(
-                value_text,
-                if is_focused {
-                    focus_style
-                } else {
-                    Style::default()
-                },
-            ),
-            Span::styled(section_hint, hint_style),
-        ];
-        lines.push(Line::from(spans));
-        if let Some(error) = form_errors.get(ff.key) {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ {error}"),
-                Theme::ERROR,
-            )));
+            // Height: title line + prompt/value line + optional error line
+            let has_error = u16::from(input_state.validation().is_some());
+            let field_height = 2 + has_error;
+            let field_area = Rect::new(inner.x, y, inner.width, field_height.min(max_y - y));
+            frame.render_stateful_widget(&input, field_area, &mut input_state);
+            y += field_height;
         }
     }
 
-    lines.push(Line::from(""));
-    let help = " Tab/Shift+Tab focus  ↵ Enter save  Esc cancel  Ctrl+S save";
-    lines.push(Line::from(Span::styled(help, hint_style)));
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    // Help text at the bottom
+    if y < max_y {
+        let help = " Tab/Shift+Tab focus  ↵ Enter save  Esc cancel  Ctrl+S save";
+        let hint_style = ThemeStyles::hint(palette);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(help, hint_style))),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 }
 
 // ── Key handler ──────────────────────────────────────────────────────────
@@ -531,36 +555,29 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
     let AppMode::BatchImport { results, scroll } = &state.mode else {
         return;
     };
+    let palette = state.current_palette();
 
-    let block = Block::default()
-        .title(" Batch Import ")
-        .borders(Borders::ALL)
-        .border_style(crate::ui::theme::Theme::CONTAINER_BORDER)
-        .title_style(crate::ui::theme::Theme::CONTAINER_TITLE);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let max_visible = inner.height.saturating_sub(2) as usize;
     let total = results.len();
     let scroll = *scroll;
+
+    // Build content lines
+    let mut lines: Vec<Line> = Vec::new();
 
     // Status header
     let ok_count = results.iter().filter(|r| r.profile.is_some()).count();
     let err_count = results.iter().filter(|r| r.profile.is_none()).count();
     let header =
         format!(" {ok_count} valid, {err_count} invalid — Enter to import, Esc to cancel ");
-    let header_style = Style::default().fg(Color::Cyan);
-    let header_line = Line::from(Span::styled(&header, header_style));
-    frame.render_widget(
-        Paragraph::new(header_line),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(palette.primary),
+    )));
+    lines.push(Line::from(""));
 
     // URL list
-    let list_y = inner.y + 1;
-    let list_height = max_visible
-        .saturating_sub(1)
-        .min(total.saturating_sub(scroll));
+    let popup_width = area.width.saturating_sub(4) as usize;
+    let max_visible = 15usize;
+    let list_height = max_visible.min(total.saturating_sub(scroll));
     for i in 0..list_height {
         let idx = scroll + i;
         if idx >= total {
@@ -570,13 +587,13 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
 
         // Status icon
         let (icon, icon_style) = if item.profile.is_some() {
-            (" ✓", Style::default().fg(Color::Green))
+            (" ✓", ThemeStyles::success(&palette))
         } else {
-            (" ✗", Style::default().fg(Color::Red))
+            (" ✗", ThemeStyles::error(&palette))
         };
 
         // URL display (truncate to fit)
-        let max_url_len = inner.width.saturating_sub(5) as usize;
+        let max_url_len = popup_width.saturating_sub(5);
         let display = if item.url.len() > max_url_len {
             format!("{}…", &item.url[..max_url_len.saturating_sub(1)])
         } else {
@@ -584,35 +601,40 @@ pub fn render_batch_import(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let icon_span = Span::styled(icon, icon_style);
-        let url_span = Span::raw(&display);
-        let line = Line::from(vec![icon_span, Span::raw(" "), url_span]);
-        frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(inner.x, list_y + i as u16, inner.width, 1),
-        );
+        let url_span = Span::raw(display);
+        lines.push(Line::from(vec![icon_span, Span::raw(" "), url_span]));
     }
 
     // Scroll indicator
-    if total > max_visible.saturating_sub(1) {
+    if total > max_visible {
         let scroll_text = format!(
             " [{}-{}/{}] ",
             scroll + 1,
-            (scroll + max_visible.saturating_sub(1)).min(total),
+            (scroll + max_visible).min(total),
             total
         );
-        let scroll_style = Style::default().fg(Color::DarkGray);
-        let scroll_line = Line::from(Span::styled(&scroll_text, scroll_style));
-        let scroll_y = inner.y + inner.height.saturating_sub(1);
-        frame.render_widget(
-            Paragraph::new(scroll_line),
-            Rect::new(
-                inner.x + inner.width.saturating_sub(scroll_text.len() as u16 + 2),
-                scroll_y,
-                scroll_text.len() as u16 + 2,
-                1,
-            ),
-        );
+        lines.push(Line::from(Span::styled(
+            scroll_text,
+            Style::default().fg(palette.muted),
+        )));
     }
+
+    let total_lines = lines.len() as u16;
+    let para = Paragraph::new(lines);
+
+    let popup_w = area.width.saturating_sub(4).max(30) as usize;
+    let popup_h = (total_lines + 2).min(area.height.saturating_sub(2)).max(5) as usize;
+    let sized = KnownSizeWrapper {
+        inner: para,
+        width: popup_w,
+        height: popup_h,
+    };
+    let popup = Popup::new(sized)
+        .title(" Batch Import ")
+        .borders(Borders::ALL)
+        .border_style(ThemeStyles::container_border(&palette))
+        .style(Style::default().bg(palette.surface));
+    frame.render_widget(popup, area);
 }
 
 pub async fn handle_batch_import_key(state: &mut AppState, key: &KeyEvent) {

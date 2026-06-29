@@ -1,11 +1,10 @@
+use crate::AppState;
+use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-
-use crate::AppState;
-use crate::ui::theme::Theme;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -17,26 +16,32 @@ fn spinner_char() -> char {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     let (left_text, left_style) = if state.connecting {
         (
             format!(" {} Connecting... ", spinner_char()),
-            Theme::SPINNER,
+            ThemeStyles::spinner(&palette),
         )
     } else if state.speed_test_stop.load(Ordering::Relaxed) {
-        (" ■ Stopping...".to_string(), Theme::ERROR)
+        (" ■ Stopping...".to_string(), ThemeStyles::error(&palette))
     } else if let Some((done, total)) = state.test_progress {
         (
             format!(" Testing: {done}/{total} profiles..."),
-            Theme::WARNING,
+            ThemeStyles::warning(&palette),
         )
     } else if !state.testing_profiles.is_empty() {
-        (" Testing...".to_string(), Theme::WARNING)
+        (" Testing...".to_string(), ThemeStyles::warning(&palette))
     } else if let Some(err) = &state.connection_error {
-        (format!(" Error: {err}"), Theme::ERROR)
+        (format!(" Error: {err}"), ThemeStyles::error(&palette))
     } else {
         state.connected_core.as_ref().map_or_else(
-            || (" Disconnected".to_string(), Theme::ERROR),
-            |core| (format!(" Connected [{core}]"), Theme::SUCCESS),
+            || (" Disconnected".to_string(), ThemeStyles::error(&palette)),
+            |core| {
+                (
+                    format!(" Connected [{core}]"),
+                    ThemeStyles::success(&palette),
+                )
+            },
         )
     };
 
@@ -94,7 +99,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         if parts.is_empty() {
             Span::raw("")
         } else {
-            Span::styled(parts.join(" "), Theme::SPINNER)
+            Span::styled(parts.join(" "), ThemeStyles::spinner(&palette))
         }
     };
     // Mode indicator prefix
@@ -156,7 +161,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let line = Line::from(spans);
 
-    let bg = Theme::STATUS_BAR_BG;
+    let bg = ThemeStyles::status_bar_bg(&palette);
 
     let paragraph = Paragraph::new(line).style(bg);
     frame.render_widget(paragraph, area);

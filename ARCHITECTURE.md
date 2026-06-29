@@ -83,6 +83,8 @@ pub struct AppState {
     pub last_heed_poll: Instant,
     pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
     pub logs_loaded: bool,
+    /// Theme name from config, used to build Palette via ratatui-themes + palette_bridge.
+    pub theme_name: ratatui_themes::ThemeName,
 }
 
 ### CoreEvent Channel
@@ -151,8 +153,9 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 ::- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
-...
-- `theme.rs` — Central color palette and Style definitions (Theme struct with 19 constants across 6 groups)
+- `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
+- `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)
+- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled, DataTableRow trait
 
 ::**`speed_test.rs`** — Async speed test engine:
 ```rust

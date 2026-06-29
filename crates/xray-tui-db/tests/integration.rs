@@ -1,13 +1,14 @@
-#![allow(clippy::significant_drop_tightening, reason = "test db lifetime is the function scope")]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "test db lifetime is the function scope"
+)]
 
 use xray_tui_db::Database;
 use xray_tui_db::models::{Group, Profile};
 
 /// Helper: create an in-memory database for testing.
 async fn test_db() -> Database {
-    Database::open_in_memory()
-        .await
-        .expect("open in-memory db")
+    Database::open_in_memory().await.expect("open in-memory db")
 }
 
 fn make_profile(id: &str, sub_uid: i64) -> Profile {
@@ -118,9 +119,7 @@ async fn test_delete_group_cascade() {
         .expect("get profiles by group");
     assert_eq!(profiles.len(), 2);
 
-    db.delete_group("test-group-1")
-        .await
-        .expect("delete group");
+    db.delete_group("test-group-1").await.expect("delete group");
 
     let profiles_after = db
         .get_profiles_by_group("test-group-1")
@@ -148,11 +147,7 @@ async fn test_concurrent_reads() {
     for _ in 0..5 {
         let db_clone = std::sync::Arc::clone(&db);
         handles.push(tokio::spawn(async move {
-            
-            db_clone
-                .get_all_profiles()
-                .await
-                .expect("concurrent read")
+            db_clone.get_all_profiles().await.expect("concurrent read")
         }));
     }
 
@@ -171,10 +166,7 @@ async fn test_multi_step_atomicity() {
 
     let bad = make_profile("atomic-2", 0);
     let err = db.insert_profile(&bad).await;
-    assert!(
-        err.is_err(),
-        "insert with sub_uid=0 should return error"
-    );
+    assert!(err.is_err(), "insert with sub_uid=0 should return error");
 
     let found = db
         .get_profile("atomic-1")

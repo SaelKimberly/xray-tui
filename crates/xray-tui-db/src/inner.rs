@@ -5,9 +5,7 @@ use crate::models::*;
 // ── _inner helpers (read-only) ───────────────────────────────────────────
 
 #[inline]
-pub(crate) async fn get_all_profiles_inner(
-    conn: &turso::Connection,
-) -> Result<Vec<Profile>> {
+pub(crate) async fn get_all_profiles_inner(conn: &turso::Connection) -> Result<Vec<Profile>> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT gp.id, gp.sub_uid, gp.group_id, gp.remarks, gp.is_sub, gp.sub_id,
@@ -55,9 +53,7 @@ pub(crate) async fn get_profiles_by_group_inner(
 }
 
 #[inline]
-pub(crate) async fn get_all_groups_inner(
-    conn: &turso::Connection,
-) -> Result<Vec<Group>> {
+pub(crate) async fn get_all_groups_inner(conn: &turso::Connection) -> Result<Vec<Group>> {
     let mut stmt = conn
         .prepare_cached("SELECT * FROM groups ORDER BY sort_order")
         .await?;
@@ -133,8 +129,7 @@ pub(crate) async fn get_all_profiles_with_details_inner(
     while let Some(row) = rows.next().await? {
         let profile = Profile::from_row(&row)?;
 
-        let ext_profile_id: Option<String> =
-            row.get(ProfileDetailsCol::ExtProfileId as usize)?;
+        let ext_profile_id: Option<String> = row.get(ProfileDetailsCol::ExtProfileId as usize)?;
         let extension = if ext_profile_id.is_some() {
             Some(ProfileExtension {
                 profile_id: ext_profile_id.unwrap_or_default(),
@@ -156,8 +151,7 @@ pub(crate) async fn get_all_profiles_with_details_inner(
                 today_down: row.get::<Option<i32>>(ProfileDetailsCol::TodayDown as usize)?,
                 total_up: row.get::<Option<i32>>(ProfileDetailsCol::TotalUp as usize)?,
                 total_down: row.get::<Option<i32>>(ProfileDetailsCol::TotalDown as usize)?,
-                last_updated: row
-                    .get::<Option<String>>(ProfileDetailsCol::LastUpdated as usize)?,
+                last_updated: row.get::<Option<String>>(ProfileDetailsCol::LastUpdated as usize)?,
             })
         } else {
             None
@@ -223,9 +217,7 @@ pub(crate) async fn get_all_subscriptions_inner(
 }
 
 #[inline]
-pub(crate) async fn get_groups_due_update_inner(
-    conn: &turso::Connection,
-) -> Result<Vec<Group>> {
+pub(crate) async fn get_groups_due_update_inner(conn: &turso::Connection) -> Result<Vec<Group>> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT g.* FROM groups g
@@ -261,9 +253,7 @@ pub(crate) async fn get_all_routing_rules_inner(
 }
 
 #[inline]
-pub(crate) async fn get_dns_settings_inner(
-    conn: &turso::Connection,
-) -> Result<Option<DnsSetting>> {
+pub(crate) async fn get_dns_settings_inner(conn: &turso::Connection) -> Result<Option<DnsSetting>> {
     let mut stmt = conn
         .prepare_cached("SELECT * FROM dns_settings LIMIT 1")
         .await?;
@@ -277,10 +267,7 @@ pub(crate) async fn get_dns_settings_inner(
 // ── _inner helpers (write) ─────────────────────────────────────────────
 
 #[inline]
-pub(crate) async fn insert_profile_inner(
-    conn: &turso::Connection,
-    p: &Profile,
-) -> Result<()> {
+pub(crate) async fn insert_profile_inner(conn: &turso::Connection, p: &Profile) -> Result<()> {
     let sub_uid = p.sub_uid.unwrap_or(0);
     if sub_uid == 0 {
         return Err(DatabaseError::Generic(
@@ -329,10 +316,7 @@ pub(crate) async fn insert_profile_inner(
 }
 
 #[inline]
-pub(crate) async fn update_profile_inner(
-    conn: &turso::Connection,
-    p: &Profile,
-) -> Result<()> {
+pub(crate) async fn update_profile_inner(conn: &turso::Connection, p: &Profile) -> Result<()> {
     let sub_uid = p.sub_uid.unwrap_or(0);
     if sub_uid == 0 {
         return Err(DatabaseError::Generic(
@@ -362,15 +346,13 @@ pub(crate) async fn update_profile_inner(
 }
 
 #[inline]
-pub(crate) async fn delete_profile_inner(
-    conn: &turso::Connection,
-    id: &str,
-) -> Result<()> {
+pub(crate) async fn delete_profile_inner(conn: &turso::Connection, id: &str) -> Result<()> {
     let sub_uid: Option<i64> = {
         let mut stmt = conn
             .prepare_cached("SELECT sub_uid FROM group_profiles WHERE id = ?1")
             .await?;
-        stmt.query_row(turso::params![id]).await
+        stmt.query_row(turso::params![id])
+            .await
             .map_or(None, |row| row.get::<i64>(0).ok())
     };
     conn.execute(
@@ -400,7 +382,8 @@ pub(crate) async fn delete_profile_inner(
             let mut stmt = conn
                 .prepare_cached("SELECT COUNT(*) FROM group_profiles WHERE sub_uid = ?1")
                 .await?;
-            stmt.query_row(turso::params![su]).await
+            stmt.query_row(turso::params![su])
+                .await
                 .map_or(0, |row| row.get::<i64>(0).unwrap_or(0))
         };
         if remaining == 0 {
@@ -444,10 +427,7 @@ pub(crate) async fn upsert_server_stats_inner(
 }
 
 #[inline]
-pub(crate) async fn insert_group_inner(
-    conn: &turso::Connection,
-    g: &Group,
-) -> Result<()> {
+pub(crate) async fn insert_group_inner(conn: &turso::Connection, g: &Group) -> Result<()> {
     conn.execute(
         "INSERT INTO groups (id, name, subscription_url, subscription_enabled, user_agent, convert_target, core_type, sort_order, is_system) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         turso::params![
@@ -460,10 +440,7 @@ pub(crate) async fn insert_group_inner(
 }
 
 #[inline]
-pub(crate) async fn update_group_inner(
-    conn: &turso::Connection,
-    g: &Group,
-) -> Result<()> {
+pub(crate) async fn update_group_inner(conn: &turso::Connection, g: &Group) -> Result<()> {
     conn.execute(
         "UPDATE groups SET name=?1, subscription_url=?2, subscription_enabled=?3, user_agent=?4, convert_target=?5, core_type=?6, sort_order=?7, is_system=?8 WHERE id=?9",
         turso::params![
@@ -476,10 +453,7 @@ pub(crate) async fn update_group_inner(
 }
 
 #[inline]
-pub(crate) async fn update_profile_active_inner(
-    conn: &turso::Connection,
-    id: &str,
-) -> Result<()> {
+pub(crate) async fn update_profile_active_inner(conn: &turso::Connection, id: &str) -> Result<()> {
     conn.execute(
         "UPDATE group_profiles SET is_active = 0 WHERE is_active = 1",
         (),
@@ -688,7 +662,10 @@ pub(crate) async fn move_orphans_to_graveyard_inner(
     };
     let mut moved = 0;
     for p in &profiles_in_group {
-        #[allow(clippy::cast_sign_loss, reason = "sub_uid is always non-negative (bit pattern from compute_sub_uid)")]
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "sub_uid is always non-negative (bit pattern from compute_sub_uid)"
+        )]
         if !active_sub_uids.contains(&(p.sub_uid.unwrap_or(0) as u64)) {
             conn.execute(
                 "UPDATE group_profiles SET group_id = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -707,7 +684,10 @@ pub(crate) async fn purge_graveyard_inner(
     graveyard_id: &str,
     ttl_hours: i64,
 ) -> Result<usize> {
-    #[allow(clippy::cast_possible_truncation, reason = "row count fits in usize on all targets")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "row count fits in usize on all targets"
+    )]
     let count = conn
         .execute(
             "DELETE FROM group_profiles WHERE group_id = ?1 AND updated_at < datetime('now', ?2)",
@@ -754,10 +734,7 @@ pub(crate) async fn update_routing_rule_inner(
 }
 
 #[inline]
-pub(crate) async fn delete_routing_rule_inner(
-    conn: &turso::Connection,
-    id: &str,
-) -> Result<()> {
+pub(crate) async fn delete_routing_rule_inner(conn: &turso::Connection, id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM routing_rules WHERE id = ?1",
         turso::params![id],

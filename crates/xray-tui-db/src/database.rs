@@ -16,7 +16,9 @@ use crate::inner::{
     upsert_dns_settings_inner, upsert_profile_extension_inner, upsert_server_stats_inner,
     upsert_subscription_inner,
 };
-use crate::models::{self, DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat, Subscription};
+use crate::models::{
+    self, DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat, Subscription,
+};
 use crate::schema;
 
 pub struct Database {
@@ -25,10 +27,7 @@ pub struct Database {
 
 impl Database {
     fn conn(&self) -> Result<turso::Connection> {
-        let conn = self
-            .db
-            .connect()
-            .map_err(DatabaseError::Turso)?;
+        let conn = self.db.connect().map_err(DatabaseError::Turso)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(DatabaseError::Turso)?;
         Ok(conn)
@@ -96,8 +95,7 @@ impl Database {
         // Query user_version via PRAGMA
         let version: i32 = {
             let mut stmt = conn.prepare_cached("PRAGMA user_version").await?;
-            stmt
-                .query_row(())
+            stmt.query_row(())
                 .await
                 .ok()
                 .and_then(|row| row.get::<i32>(0).ok())
@@ -177,10 +175,7 @@ impl Database {
         get_profile_inner(&conn, id).await
     }
 
-    pub async fn get_subscription_by_group(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<Subscription>> {
+    pub async fn get_subscription_by_group(&self, group_id: &str) -> Result<Option<Subscription>> {
         let conn = self.conn()?;
         get_subscription_by_group_inner(&conn, group_id).await
     }
@@ -308,7 +303,8 @@ impl Database {
             let mut stmt = conn
                 .prepare_cached("SELECT is_system FROM groups WHERE id = ?1")
                 .await?;
-            stmt.query_row(turso::params![id]).await
+            stmt.query_row(turso::params![id])
+                .await
                 .map_or(None, |row| row.get::<i32>(0).ok())
         };
         if is_system == Some(1) {
@@ -335,7 +331,8 @@ impl Database {
             let mut stmt = conn
                 .prepare_cached("SELECT is_system FROM groups WHERE id = ?1")
                 .await?;
-            stmt.query_row(turso::params![group_id]).await
+            stmt.query_row(turso::params![group_id])
+                .await
                 .map_or(None, |row| row.get::<i32>(0).ok())
         };
         if is_system == Some(1) {
@@ -395,11 +392,7 @@ impl Database {
         Ok(result)
     }
 
-    pub async fn purge_graveyard(
-        &self,
-        graveyard_id: &str,
-        ttl_hours: i64,
-    ) -> Result<usize> {
+    pub async fn purge_graveyard(&self, graveyard_id: &str, ttl_hours: i64) -> Result<usize> {
         let mut conn = self.conn()?;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         let result = purge_graveyard_inner(&tx, graveyard_id, ttl_hours).await?;

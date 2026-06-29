@@ -2,25 +2,27 @@ use xray_tui_core::grpc_client::format_bytes;
 use xray_tui_core::protocol::Protocol;
 
 use crate::AppState;
-use crate::ui::theme::Theme;
+use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
+use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
 
 #[allow(clippy::missing_const_for_fn)]
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
+    let palette = state.current_palette();
     if state.connecting {
-        ("⠋", Theme::SPINNER)
+        ("⠋", ThemeStyles::spinner(&palette))
     } else if state.connected_core.is_some() {
-        ("●", Theme::SUCCESS)
+        ("●", ThemeStyles::success(&palette))
     } else if state.connection_error.is_some() {
-        ("⏹", Theme::ERROR)
+        ("⏹", ThemeStyles::error(&palette))
     } else if state.connected_profile_id.is_some() {
-        ("⏏", Theme::WARNING)
+        ("⏏", ThemeStyles::warning(&palette))
     } else {
-        ("○", Theme::HINT)
+        ("○", ThemeStyles::hint(&palette))
     }
 }
 
@@ -64,6 +66,7 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
 // ── Compact render (1-line bar) ────────────────────────────────────────
 
 pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     let (icon, icon_style) = connection_icon(state);
     let (proto, remarks, addr, port, core) = server_summary(state);
 
@@ -114,30 +117,40 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
     // Build the line
     let mut spans = Vec::new();
     spans.push(Span::styled(format!("{icon} "), icon_style));
-    spans.push(Span::styled(server_str, Theme::FOOTER_VALUE));
+    spans.push(Span::styled(
+        server_str,
+        ThemeStyles::footer_value(&palette),
+    ));
 
     if !test_str.is_empty() {
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(test_str, Theme::FOOTER_LABEL));
+        spans.push(Span::styled(test_str, ThemeStyles::footer_label(&palette)));
     }
 
     if state.current_traffic_up != 0 || state.current_traffic_down != 0 {
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(traffic_str, Theme::FOOTER_VALUE));
+        spans.push(Span::styled(
+            traffic_str,
+            ThemeStyles::footer_value(&palette),
+        ));
     }
 
     if !log_snippet.is_empty() {
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(log_snippet, Theme::FOOTER_LABEL));
+        spans.push(Span::styled(
+            log_snippet,
+            ThemeStyles::footer_label(&palette),
+        ));
     }
 
-    let paragraph = Paragraph::new(Line::from(spans)).style(Theme::STATUS_FOOTER);
+    let paragraph = Paragraph::new(Line::from(spans)).style(ThemeStyles::status_footer(&palette));
     frame.render_widget(paragraph, area);
 }
 
 // ── Full render (bordered panel) ───────────────────────────────────────
 
 pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     let (icon, icon_style) = connection_icon(state);
     let (proto, remarks, addr, port, core) = server_summary(state);
 
@@ -165,7 +178,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             format!("🖥 {server_info}")
         },
-        Theme::FOOTER_VALUE,
+        ThemeStyles::footer_value(&palette),
     ));
 
     // Row 3: Test results
@@ -189,7 +202,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     let row3 = Line::from(Span::styled(
         format!("⏱ TCP:{tcp_str}  RP:{rp_str}  SPD:{spd_str}"),
-        Theme::FOOTER_LABEL,
+        ThemeStyles::footer_label(&palette),
     ));
 
     // Row 4: Traffic & memory
@@ -202,7 +215,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     let row4 = Line::from(Span::styled(
         format!("📊 ⬆{traffic_up}  ⬇{traffic_down}    💾 {mem_mb}"),
-        Theme::FOOTER_VALUE,
+        ThemeStyles::footer_value(&palette),
     ));
     // Row 5: Core log (scan log_cache backwards for non-tui entry)
     let core_log = state
@@ -212,7 +225,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         .find(|l| l.target != "tui")
         .map(|l| format!("📋 Core: [{}] {}", l.level, l.message))
         .unwrap_or_default();
-    let row5 = Line::from(Span::styled(core_log, Theme::FOOTER_LABEL));
+    let row5 = Line::from(Span::styled(core_log, ThemeStyles::footer_label(&palette)));
 
     // Row 6: TUI log (scan log_cache backwards for tui entry)
     let tui_log = state
@@ -222,22 +235,13 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         .find(|l| l.target == "tui")
         .map(|l| format!("📋 TUI:  [{}] {} ({})", l.level, l.message, l.target))
         .unwrap_or_default();
-    let row6 = Line::from(Span::styled(tui_log, Theme::FOOTER_LABEL));
+    let row6 = Line::from(Span::styled(tui_log, ThemeStyles::footer_label(&palette)));
 
-    // Block with border
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Theme::CONTAINER_BORDER)
-        .title(Span::styled(" ⚙ Actions Log ", Theme::CONTAINER_TITLE));
-    frame.render_widget(block, area);
-
-    // Render rows inside the bordered area (offset by 1 for border)
-    let inner_area = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
+    let fieldset = Fieldset::new()
+        .title(" ⚙ Actions Log ")
+        .styles(FieldsetStyles::from_palette(&palette));
+    let inner_area = fieldset.inner(area);
+    frame.render_widget(fieldset, area);
     let available = inner_area.height as usize;
     let mut all_rows = vec![row1, row2, row3, row4, row5, row6];
     all_rows.truncate(available);

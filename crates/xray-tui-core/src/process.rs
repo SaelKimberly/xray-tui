@@ -27,7 +27,9 @@ impl CoreProcess {
     /// Gracefully stop the process: SIGTERM, wait 5s, then SIGKILL.
     async fn graceful_stop(&mut self) -> Result<(), ProcessError> {
         if let Some(child) = self.child.as_mut() {
-            let pid = child.id().ok_or_else(|| ProcessError::Startup("no child pid".into()))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| ProcessError::Startup("no child pid".into()))?;
             #[cfg(unix)]
             {
                 // Send SIGTERM for graceful shutdown

@@ -3,18 +3,55 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
-use std::collections::VecDeque;
+use ratatui::widgets::{Block, Borders, Paragraph};
+use std::collections::{HashSet, VecDeque};
 
 use crate::AppState;
-use crate::ui::theme::Theme;
+use crate::ui::theme::ThemeStyles;
+use crate::ui::widgets::{Column, ColumnWidth, DataTable, DataTableRow, DataTableState};
 
+// ── DataTable row type ────────────────────────────────────────────────
+
+/// Pre-computed log row data for `DataTable` rendering.
+struct LogRow {
+    ts: String,
+    target: String,
+    target_style: Style,
+    level: String,
+    level_style: Style,
+    msg: String,
+}
+
+impl DataTableRow for LogRow {
+    fn render(
+        &self,
+        col_xs: &[u16],
+        col_widths: &[u16],
+        buf: &mut ratatui::buffer::Buffer,
+        y: u16,
+    ) {
+        if col_xs.len() < 4 {
+            return;
+        }
+        buf.set_stringn(col_xs[0], y, &self.ts, col_widths[0] as usize, Style::default().fg(Color::DarkGray));
+        buf.set_stringn(col_xs[1], y, &self.target, col_widths[1] as usize, self.target_style);
+        buf.set_stringn(col_xs[2], y, &self.level, col_widths[2] as usize, self.level_style);
+        buf.set_stringn(col_xs[3], y, &self.msg, col_widths[3] as usize, Style::default());
+    }
+
+    fn height(&self, available_width: u16) -> u16 {
+        let text_width = unicode_width::UnicodeWidthStr::width(self.msg.as_str());
+        let msg_width = available_width.saturating_sub(25).max(1);
+        1 + (text_width as u16).saturating_sub(1) / msg_width
+    }
+}
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     let block = Block::default()
         .title(" Logs ")
         .borders(Borders::ALL)
-        .border_style(Theme::CONTAINER_BORDER)
-        .title_style(Theme::CONTAINER_TITLE);
+        .border_style(ThemeStyles::container_border(&palette))
+        .title_style(ThemeStyles::container_title(&palette));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -35,7 +72,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         " [T] Filter  (all)  \u{2191}\u{2193} Scroll  PgUp/PgDn  Home/End".to_string()
     };
-    let bar = Line::from(Span::styled(filter_text, Theme::HINT));
+    let bar = Line::from(Span::styled(filter_text, ThemeStyles::hint(&palette)));
     frame.render_widget(Paragraph::new(bar), filter_area);
 
     let log_count = state.log_cache.len();
@@ -45,7 +82,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             " No logs yet. Run a profile or wait for core output."
         };
-        let paragraph = Paragraph::new(Line::from(empty_msg)).style(Theme::HINT);
+        let paragraph = Paragraph::new(Line::from(empty_msg)).style(ThemeStyles::hint(&palette));
         frame.render_widget(paragraph, log_area);
         return;
     }
@@ -62,40 +99,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let filtered_count = filtered_indices.len();
     if filtered_count == 0 {
-        let paragraph =
-            Paragraph::new(Line::from(" No logs match current filter")).style(Theme::HINT);
+        let paragraph = Paragraph::new(Line::from(" No logs match current filter"))
+            .style(ThemeStyles::hint(&palette));
         frame.render_widget(paragraph, log_area);
         return;
     }
 
-    // Clamp scroll: 0 = most recent at bottom
-    let scroll = state.log_scroll.min(filtered_count.saturating_sub(1));
-
-    // Visible range
-    let height = (log_area.height as usize).saturating_sub(2); // 2 for header row
-    let visible_start = filtered_count.saturating_sub(scroll + height);
-    let visible_end = filtered_count.saturating_sub(scroll);
-    let visible_indices = &filtered_indices[visible_start..visible_end];
-
-
-    // Header
-    let header_cells = ["Timestamp", "Target", "Level", "Message"]
-        .into_iter()
-        .map(|h| Cell::from(h).style(Theme::TABLE_HEADER));
-    let header = Row::new(header_cells);
-
-    let widths = [
-        Constraint::Length(10),
-        Constraint::Length(18),
-        Constraint::Length(7),
-        Constraint::Min(10),
-    ];
-
-    let rows: Vec<Row> = visible_indices
+    // Build DataTable rows from the full filtered set
+    let log_rows: Vec<LogRow> = filtered_indices
         .iter()
         .map(|&idx| {
             let log = &state.log_cache[idx];
-            let ts_str = fmt_ts(log.timestamp_nanos);
             let target_style = if log.target.starts_with("xray") {
                 Style::default().fg(Color::Cyan)
             } else if log.target.starts_with("sing") {
@@ -106,26 +120,40 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 Style::default().fg(Color::Gray)
             };
             let level_style = match log.level.as_str() {
-                "error" | "fatal" | "panic" => Theme::ERROR,
-                "warning" | "warn" => Theme::WARNING,
-                "debug" | "trace" => Theme::HINT,
+                "error" | "fatal" | "panic" => ThemeStyles::error(&palette),
+                "warning" | "warn" => ThemeStyles::warning(&palette),
+                "debug" | "trace" => ThemeStyles::hint(&palette),
                 _ => Style::default(),
             };
-            // Truncate target for display
-            let target_display = shorten_target(&log.target);
-            Row::new(vec![
-                Cell::from(Span::styled(ts_str, Style::default().fg(Color::DarkGray))),
-                Cell::from(Span::styled(target_display, target_style)),
-                Cell::from(Span::styled(&log.level, level_style)),
-                Cell::from(Span::styled(&log.message, Style::default())),
-            ])
+            LogRow {
+                ts: fmt_ts(log.timestamp_nanos),
+                target: shorten_target(&log.target),
+                target_style,
+                level: log.level.clone(),
+                level_style,
+                msg: log.message.clone(),
+            }
         })
         .collect();
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default());
-    frame.render_widget(table, log_area);
+    let columns = vec![
+        Column::new("Time", ColumnWidth::Fixed(25)),
+        Column::new("Target", ColumnWidth::Ratio(1)),
+        Column::new("Lvl", ColumnWidth::Fixed(5)),
+        Column::new("Message", ColumnWidth::Ratio(4)),
+    ];
+
+    // Compute offset from bottom-aligned scroll (0 = newest at bottom)
+    let approx_visible = (log_area.height as usize).saturating_sub(2);
+    let offset = filtered_count.saturating_sub(state.log_scroll + approx_visible);
+
+    let data_table = DataTable::new(columns, &log_rows).column_spacing(1);
+    let mut dt_state = DataTableState {
+        offset,
+        selected: None,
+        multi_selected: HashSet::new(),
+    };
+    frame.render_stateful_widget(data_table, log_area, &mut dt_state);
 }
 
 /// Shorten a target string for display (max ~18 chars).
@@ -232,7 +260,10 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
         None => return,
     };
 
-    let entries = match heed.read_newer_than_async(state.last_seen_log_ns, 100).await {
+    let entries = match heed
+        .read_newer_than_async(state.last_seen_log_ns, 100)
+        .await
+    {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(target: "log_worker", "Failed to poll new logs: {e}");
@@ -269,7 +300,6 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
     state.log_cache.truncate(10_000);
 }
 
-
 /// Count how many log entries match the current target filter.
 pub(super) fn count_filtered(state: &AppState) -> usize {
     if state.selected_targets.is_empty() {
@@ -291,17 +321,18 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
         crate::AppMode::TargetPicker { selected } => *selected,
         _ => return,
     };
+    let palette = state.current_palette();
 
     let overlay = Block::default()
         .title(" Select Targets (t=done, Enter=toggle) ")
         .borders(Borders::ALL)
-        .border_style(Theme::CONTAINER_BORDER);
+        .border_style(ThemeStyles::container_border(&palette));
     let inner = overlay.inner(area);
     frame.render_widget(overlay, area);
 
     if state.known_targets.is_empty() {
         let text = Paragraph::new(Line::from(" No targets available"))
-            .style(Theme::HINT)
+            .style(ThemeStyles::hint(&palette))
             .alignment(Alignment::Center);
         frame.render_widget(text, inner);
         return;
@@ -381,7 +412,8 @@ fn fmt_ts(ts_nanos: i64) -> String {
         (ts_nanos - 999_999_999) / 1_000_000_000
     };
     let sub_nanos = ts_nanos.rem_euclid(1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, sub_nanos)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| format!("{}s", ts_nanos / 1_000_000_000))
+    chrono::DateTime::from_timestamp(secs, sub_nanos).map_or_else(
+        || format!("{}s", ts_nanos / 1_000_000_000),
+        |dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+    )
 }

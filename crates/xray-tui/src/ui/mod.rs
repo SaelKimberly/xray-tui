@@ -2,14 +2,17 @@ pub mod actions_log;
 pub mod add_server;
 pub mod groups;
 pub mod logs;
+pub mod palette_bridge;
 pub mod profiles;
 pub mod settings;
 pub mod statistics;
 pub mod status_bar;
 pub mod theme;
+pub mod widgets;
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -23,41 +26,28 @@ use ratatui::{Frame, Terminal};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tui_popup::{KnownSizeWrapper, Popup};
 use xray_tui_config::subscription::subscription_url_split;
 
 pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
     use unicode_width::UnicodeWidthStr;
-    let width = text.width() + 4;
-    let popup_width = width as u16;
-    let popup_height = 3u16; // border(1) + text(1) + border(1)
+    let width = text.width() as u16 + 2;
+    let height = 3u16;
 
-    // Return early if terminal too narrow for the popup
-    if area.width < popup_width {
+    if area.width < width + 2 || area.height < height + 2 {
         return;
     }
 
-    let h_pad = area.width.saturating_sub(popup_width) / 2;
-    let v_pad = area.height.saturating_sub(popup_height + 2);
-
-    let overlay_area = Rect::new(h_pad, v_pad, popup_width.min(area.width), popup_height);
-
-    let block = Block::default()
+    let para = Paragraph::new(text.to_string())
+        .style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    let sized = KnownSizeWrapper::new(para, width as usize, height as usize);
+    let popup = Popup::new(sized)
         .title(" Confirm ")
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_set(ratatui::symbols::border::ROUNDED)
         .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
         .style(Style::new().bg(Color::Rgb(40, 20, 20)));
-    let paragraph = Paragraph::new(text.to_string())
-        .style(
-            Style::new()
-                .fg(Color::White)
-                .bg(Color::Rgb(40, 20, 20))
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center);
-    let inner = block.inner(overlay_area);
-    frame.render_widget(block, overlay_area);
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(popup, area);
 }
 // ── Entry point ───────────────────────────────────────────────────────
 
@@ -65,8 +55,8 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    execute!(terminal.backend_mut(), EnableMouseCapture)?;
     let ts = terminal.size().unwrap_or_default();
     state.actions_compact = ts.height < 20;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
@@ -155,8 +145,8 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     state.shutdown_token.store(true, Ordering::Relaxed);
 
     disable_raw_mode()?;
+    execute!(terminal.backend_mut(), DisableMouseCapture)?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
 
     Ok(())
 }
@@ -164,8 +154,32 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
 // ── Event handling ────────────────────────────────────────────────────
 
 async fn handle_event(ev: &Event, state: &mut AppState) {
-    if let Event::Key(key) = ev {
-        handle_key(key, state).await;
+    match ev {
+        Event::Key(key) => handle_key(key, state).await,
+        Event::Mouse(mouse) => handle_mouse(mouse, state).await,
+        _ => {}
+    }
+}
+
+async fn handle_mouse(mouse: &MouseEvent, state: &mut AppState) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            let key = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+            handle_key(&key, state).await;
+        }
+        MouseEventKind::ScrollDown => {
+            let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+            handle_key(&key, state).await;
+        }
+        MouseEventKind::ScrollLeft => {
+            let key = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+            handle_key(&key, state).await;
+        }
+        MouseEventKind::ScrollRight => {
+            let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+            handle_key(&key, state).await;
+        }
+        _ => {}
     }
 }
 async fn handle_key(key: &KeyEvent, state: &mut AppState) {
@@ -528,7 +542,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.mode = crate::AppMode::SpeedTestMenu { selected: 0 };
         }
         // Stop current speed test
-        KeyCode::Char('s' | 'S') if state.current_tab == Tab::Profiles && !state.testing_profiles.is_empty() => {
+        KeyCode::Char('s' | 'S')
+            if state.current_tab == Tab::Profiles && !state.testing_profiles.is_empty() =>
+        {
             state.stop_speed_test();
             state.log_trace("info", "tui", "Speed test stopped by user");
         }
@@ -836,12 +852,16 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     let content = help_content(state);
     let lines: Vec<Line> = content
         .iter()
         .map(|(key, desc)| {
             Line::from(vec![
-                Span::styled(format!(" {key:<20}"), crate::ui::theme::Theme::HINT),
+                Span::styled(
+                    format!(" {key:<20}"),
+                    crate::ui::theme::ThemeStyles::hint(&palette),
+                ),
                 Span::raw("  "),
                 Span::styled(*desc, Style::default().fg(Color::White)),
             ])
@@ -851,37 +871,13 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let popup_width = 52u16.min(area.width.saturating_sub(4));
     let popup_height = (content.len() as u16 + 2).min(area.height.saturating_sub(4));
 
-    let vert_pad = (area.height.saturating_sub(popup_height)) / 2;
-    let horiz_pad = (area.width.saturating_sub(popup_width)) / 2;
-
-    let popup_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(vert_pad),
-            Constraint::Length(popup_height),
-            Constraint::Min(0),
-        ])
-        .split(area)[1];
-    let popup_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(horiz_pad),
-            Constraint::Length(popup_width),
-            Constraint::Min(0),
-        ])
-        .split(popup_area)[1];
-
-    let block = Block::default()
+    let para = Paragraph::new(lines).alignment(Alignment::Left);
+    let sized = KnownSizeWrapper::new(para, popup_width as usize, popup_height as usize);
+    let popup = Popup::new(sized)
         .title(" Keyboard Shortcuts ")
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_set(ratatui::symbols::border::ROUNDED)
         .style(Style::default().bg(Color::Rgb(30, 30, 40)));
-
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .alignment(ratatui::layout::Alignment::Left);
-
-    frame.render_widget(paragraph, popup_area);
+    frame.render_widget(popup, area);
 }
 
 /// A typed item in the speed test menu.
@@ -936,44 +932,19 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
     }
 
-    // Calculate popup dimensions
-    let item_count = SPEED_TEST_MENU_ITEMS.len() as u16;
-    let popup_width = 34u16;
-    let popup_height = item_count + 2; // border top/bottom
+    let popup_width = 34u16.min(area.width.saturating_sub(4));
+    let popup_height = (SPEED_TEST_MENU_ITEMS.len() as u16 + 2).min(area.height.saturating_sub(4));
 
-    let vert_pad = (area.height.saturating_sub(popup_height)) / 2;
-    let horiz_pad = (area.width.saturating_sub(popup_width)) / 2;
-
-    let popup_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(vert_pad),
-            Constraint::Length(popup_height),
-            Constraint::Min(0),
-        ])
-        .split(area)[1];
-
-    let popup_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(horiz_pad),
-            Constraint::Length(popup_width),
-            Constraint::Min(0),
-        ])
-        .split(popup_area)[1];
-
-    let block = Block::default()
+    let para = Paragraph::new(lines).alignment(Alignment::Left);
+    let sized = KnownSizeWrapper::new(para, popup_width as usize, popup_height as usize);
+    let popup = Popup::new(sized)
         .title(" Server Tools ")
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_set(ratatui::symbols::border::ROUNDED)
         .style(Style::default().bg(Color::Rgb(30, 30, 40)));
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .alignment(ratatui::layout::Alignment::Left);
-
-    frame.render_widget(paragraph, popup_area);
+    frame.render_widget(popup, area);
 }
 fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
+    let palette = state.current_palette();
     // Split area into [indicator(3) | tabs]
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -981,11 +952,11 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(area);
     // Connection indicator
     let indicator = if state.connecting {
-        Span::styled(" ⟳", crate::ui::theme::Theme::SPINNER)
+        Span::styled(" ⟳", crate::ui::theme::ThemeStyles::spinner(&palette))
     } else if state.connected_core.is_some() {
-        Span::styled(" ●", crate::ui::theme::Theme::SUCCESS)
+        Span::styled(" ●", crate::ui::theme::ThemeStyles::success(&palette))
     } else {
-        Span::styled(" ○", crate::ui::theme::Theme::HINT)
+        Span::styled(" ○", crate::ui::theme::ThemeStyles::hint(&palette))
     };
     let indicator_para = Paragraph::new(Line::from(indicator));
     frame.render_widget(indicator_para, chunks[0]);
@@ -999,7 +970,10 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Tab::Logs => " Logs ",
                 Tab::Statistics => " Statistics ",
             };
-            Line::from(Span::styled(name, crate::ui::theme::Theme::TAB_DESELECTED))
+            Line::from(Span::styled(
+                name,
+                crate::ui::theme::ThemeStyles::tab_deselected(&palette),
+            ))
         })
         .collect();
 
@@ -1010,7 +984,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 .position(|t| *t == state.current_tab)
                 .unwrap_or(0),
         )
-        .highlight_style(crate::ui::theme::Theme::TAB_SELECTED)
+        .highlight_style(crate::ui::theme::ThemeStyles::tab_selected(&palette))
         .divider(Span::raw(""));
     frame.render_widget(tabs, chunks[1]);
 }

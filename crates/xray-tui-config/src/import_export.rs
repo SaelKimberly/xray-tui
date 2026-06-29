@@ -1665,7 +1665,13 @@ fn format_shadowsocksr(profile: &Profile) -> String {
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .map_or_else(
-            || ("rc4-md5".to_string(), "origin".to_string(), "plain".to_string()),
+            || {
+                (
+                    "rc4-md5".to_string(),
+                    "origin".to_string(),
+                    "plain".to_string(),
+                )
+            },
             |v| {
                 let m = v
                     .get("method")
@@ -1677,7 +1683,11 @@ fn format_shadowsocksr(profile: &Profile) -> String {
                     .and_then(|p| p.as_str())
                     .unwrap_or("origin")
                     .to_string();
-                let o = v.get("obfs").and_then(|o| o.as_str()).unwrap_or("plain").to_string();
+                let o = v
+                    .get("obfs")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("plain")
+                    .to_string();
                 (m, p, o)
             },
         );
@@ -1823,9 +1833,10 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
         // Check protocol_settings for a password field (AnyTLS, Naïve, ShadowTLS, etc.)
         if let Some(ps) = &profile.protocol_settings
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
-                && let Some(pw) = v.get("password").and_then(|p| p.as_str()) {
-                    return !pw.is_empty();
-                }
+            && let Some(pw) = v.get("password").and_then(|p| p.as_str())
+        {
+            return !pw.is_empty();
+        }
         false
     }
 
@@ -2341,7 +2352,6 @@ mod tests {
     }
 
     // ── Round-trip tests for all protocols ──
-
 
     #[test]
     fn roundtrip_hysteria2() {

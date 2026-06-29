@@ -56,7 +56,10 @@ where
             return;
         }
 
-        #[allow(clippy::cast_possible_truncation, reason = "nanos since epoch fits u64 (584yr range)")]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "nanos since epoch fits u64 (584yr range)"
+        )]
         let timestamp_nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -114,7 +117,9 @@ async fn main() -> Result<()> {
         let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
         loop {
             // Wait for at least one message
-            if let Ok(msg) = log_rx.recv() { batch.push(msg) } else {
+            if let Ok(msg) = log_rx.recv() {
+                batch.push(msg);
+            } else {
                 // Channel closed (sender dropped) — flush and exit
                 if !batch.is_empty() {
                     let _ = writer_heed.write_log_batch(&batch);
@@ -161,7 +166,10 @@ async fn main() -> Result<()> {
                 .with_filter(tracing_subscriber::EnvFilter::new("xray_tui=info")),
         )
         .with(TuiLogLayer {
-            core_event_tx: state.core_event_tx.clone().expect("core_event_tx must be set before tracing init"),
+            core_event_tx: state
+                .core_event_tx
+                .clone()
+                .expect("core_event_tx must be set before tracing init"),
             log_sender: log_sender_tx,
         })
         .try_init()
@@ -181,7 +189,10 @@ async fn main() -> Result<()> {
             if ttl_dur.is_zero() {
                 continue; // 0 = keep forever
             }
-            #[allow(clippy::cast_possible_truncation, reason = "nanos since epoch fits u64 (584yr range)")]
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "nanos since epoch fits u64 (584yr range)"
+            )]
             let cutoff = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -195,7 +206,9 @@ async fn main() -> Result<()> {
                     // the right context — but eprintln! is safe here (TTL runs rarely)
                     eprintln!("xray-tui: TTL cleanup error: {e}");
                 }
-            }).await.ok();
+            })
+            .await
+            .ok();
         }
     });
     // Panic hook to restore terminal on unexpected crashes
@@ -205,7 +218,8 @@ async fn main() -> Result<()> {
             let _ = crossterm::terminal::disable_raw_mode();
         });
         let _ = std::panic::catch_unwind(|| {
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         });
         prev_hook(panic_info);
     }));
