@@ -20,6 +20,17 @@ impl fmt::Display for CoreType {
     }
 }
 
+impl CoreType {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Xray => "xray",
+            Self::SingBox => "sing-box",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseCoreTypeError(String);
 
@@ -33,11 +44,14 @@ impl FromStr for CoreType {
     type Err = ParseCoreTypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "xray" => Ok(Self::Xray),
-            "sing-box" | "singbox" => Ok(Self::SingBox),
-            "auto" => Ok(Self::Auto),
-            _ => Err(ParseCoreTypeError(s.to_owned())),
+        if s.eq_ignore_ascii_case("xray") {
+            Ok(Self::Xray)
+        } else if s.eq_ignore_ascii_case("sing-box") || s.eq_ignore_ascii_case("singbox") {
+            Ok(Self::SingBox)
+        } else if s.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else {
+            Err(ParseCoreTypeError(s.to_owned()))
         }
     }
 }

@@ -627,23 +627,15 @@ pub async fn handle_batch_import_key(state: &mut AppState, key: &KeyEvent) {
     match key.code {
         KeyCode::Down => {
             let new_scroll = (scroll + 1).min(results_len.saturating_sub(1));
-            state.mode = AppMode::BatchImport {
-                results: match &state.mode {
-                    AppMode::BatchImport { results, .. } => results.clone(),
-                    _ => return,
-                },
-                scroll: new_scroll,
-            };
+            if let AppMode::BatchImport { ref mut scroll, .. } = state.mode {
+                *scroll = new_scroll;
+            }
         }
         KeyCode::Up => {
             let new_scroll = scroll.saturating_sub(1);
-            state.mode = AppMode::BatchImport {
-                results: match &state.mode {
-                    AppMode::BatchImport { results, .. } => results.clone(),
-                    _ => return,
-                },
-                scroll: new_scroll,
-            };
+            if let AppMode::BatchImport { ref mut scroll, .. } = state.mode {
+                *scroll = new_scroll;
+            }
         }
         KeyCode::Enter => {
             state.confirm_batch_import().await;

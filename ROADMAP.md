@@ -108,7 +108,7 @@
 - ☐ Error handling & recovery flows
 - ☐ man page / --help
 - ☐ CI/CD, packaging
-- ☐ Performance optimization
+- ✅ Performance optimization — add_log owned strings (saves 3 allocs/log), get_str closure (saves 5-17 allocs/settings save), parse_core_log_line eq_ignore_ascii_case (removes to_lowercase alloc), BatchImport mutable scroll (avoids Vec clone per keypress), TCP ping spawn no longer clones Vec&lt;Profile&gt;, updater Cow&lt;OsStr&gt; over to_string_lossy
 - ☐ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
 - ☐ Log to file toggle — core log persistence with configurable path
 - ☐ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile

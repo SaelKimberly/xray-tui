@@ -15,7 +15,7 @@ use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
 use futures_util::StreamExt;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -366,7 +366,7 @@ pub struct AppState {
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
     /// Cached log entries for the Logs tab, newest at end.
-    pub log_cache: Vec<LogLine>,
+    pub log_cache: VecDeque<LogLine>,
     /// Whether there may be older entries in the DB to load.
     pub log_has_older: bool,
     /// Flag to trigger progressive loading of all logs to top (Home key).
@@ -395,8 +395,6 @@ pub struct AppState {
     pub connected_profile_id: Option<String>,
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
-    pub last_core_log: Option<(String, String)>,
-    pub last_tui_log: Option<(String, String, String)>,
     pub last_test_tcp: Option<u64>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
@@ -446,12 +444,12 @@ impl AppState {
             subscriptions: Vec::new(),
             selected_group_id: None,
             selected_index: 0,
+            log_scroll: 0,
             sort_column: SortColumn::Remarks,
             sort_ascending: true,
             search_query: String::new(),
             search_focused: false,
-            log_scroll: 0,
-            log_cache: Vec::new(),
+            log_cache: VecDeque::new(),
             log_has_older: false,
             log_seek_home: false,
             connected_core: None,
@@ -473,8 +471,6 @@ impl AppState {
             system_stats: None,
             actions_compact: false,
             connected_profile_id: None,
-            last_core_log: None,
-            last_tui_log: None,
             last_test_tcp: None,
             last_test_real: None,
             last_test_speed: None,
@@ -522,7 +518,7 @@ impl AppState {
                     })
                     .collect();
                 // Update last_seen_log_ns from the newest entry
-                if let Some(newest) = self.log_cache.last() {
+                if let Some(newest) = self.log_cache.back() {
                     self.last_seen_log_ns = newest.timestamp_nanos as u64;
                 }
                 // Load known targets
@@ -573,10 +569,9 @@ impl AppState {
             *self.cached_filtered_indices.borrow_mut() = indices;
             self.filter_cache_valid.set(true);
         }
-        let indices = self.cached_filtered_indices.borrow();
-        // Collect into Vec to release the borrow on indices, then return an iterator
-        let result: Vec<&ProfileRow> = indices.iter().map(|&i| &self.profiles[i]).collect();
-        result.into_iter()
+        // Clone indices (Vec<usize>) to drop the RefCell borrow, then map to ProfileRow refs
+        let indices: Vec<usize> = self.cached_filtered_indices.borrow().clone();
+        indices.into_iter().map(move |i| &self.profiles[i])
     }
 
     fn compute_filtered_indices(&self) -> Vec<usize> {
@@ -722,15 +717,15 @@ impl AppState {
         self.selected_group_id = Some(self.groups[new_idx].id.clone());
         self.filter_cache_valid.set(false);
     }
-    pub fn add_log(&mut self, level: &str, target: &str, message: &str, timestamp_nanos: i64) {
-        self.log_cache.push(LogLine {
-            level: level.to_owned(),
-            target: target.to_owned(),
-            message: message.to_owned(),
+    pub fn add_log(&mut self, level: String, target: String, message: String, timestamp_nanos: i64) {
+        self.log_cache.push_back(LogLine {
+            level,
+            target,
+            message,
             timestamp_nanos,
         });
         if self.log_cache.len() > 10000 {
-            self.log_cache.drain(0..self.log_cache.len() - 10000);
+            self.log_cache.truncate(10000);
         }
     }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
@@ -742,9 +737,9 @@ impl AppState {
             _ => tracing::info!(target: "tui", "{message}"),
         }
         self.add_log(
-            level,
-            "tui",
-            message,
+            level.to_owned(),
+            "tui".to_owned(),
+            message.to_owned(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -896,34 +891,36 @@ impl AppState {
     }
 
     pub async fn confirm_add_server(&mut self) {
-        let (protocol, fields, _form_errors) = if let AppMode::AddServer {
-            protocol: Some(p),
-            fields,
-            form_errors,
-            ..
-        } = &self.mode
-        {
-            (*p, fields.clone(), form_errors.clone())
-        } else {
-            self.log_trace("error", "tui", "Cannot confirm: no protocol selected");
-            return;
+        // Phase 1: validate using immutable borrow (extract only needed values)
+        let (protocol, address, port, user_id) = {
+            let (p, fields) = match &self.mode {
+                AppMode::AddServer {
+                    protocol: Some(p),
+                    fields,
+                    ..
+                } => (*p, fields),
+                _ => {
+                    self.log_trace("error", "tui", "Cannot confirm: no protocol selected");
+                    return;
+                }
+            };
+            let addr = fields
+                .iter()
+                .find(|(k, _)| k == "address")
+                .map_or("", |(_, v)| v.as_str());
+            let prt = fields
+                .iter()
+                .find(|(k, _)| k == "port")
+                .map_or("", |(_, v)| v.as_str());
+            let uid = fields
+                .iter()
+                .find(|(k, _)| k == "user_id")
+                .map_or("", |(_, v)| v.as_str());
+            (p, addr.to_owned(), prt.to_owned(), uid.to_owned())
         };
 
         // Validate fields
         let mut errors: HashMap<String, String> = HashMap::new();
-        let address = fields
-            .iter()
-            .find(|(k, _)| k == "address")
-            .map_or("", |(_, v)| v.as_str());
-        let port = fields
-            .iter()
-            .find(|(k, _)| k == "port")
-            .map_or("", |(_, v)| v.as_str());
-        let user_id = fields
-            .iter()
-            .find(|(k, _)| k == "user_id")
-            .map_or("", |(_, v)| v.as_str());
-
         if address.is_empty() {
             errors.insert("address".into(), "Address is required".into());
         }
@@ -948,6 +945,12 @@ impl AppState {
             return;
         }
 
+        // Phase 2: take ownership of fields (only on success)
+        let fields = match &mut self.mode {
+            AppMode::AddServer { fields, .. } => std::mem::take(fields),
+            _ => unreachable!(),
+        };
+
         let mut profile = Self::fields_to_profile(protocol, &fields);
         // Assign to currently selected real group (not All or Graveyard)
         if let Some(gid) = &self.selected_group_id
@@ -956,48 +959,57 @@ impl AppState {
         {
             profile.group_id = Some(gid.clone());
         }
-        if let Err(e) = self.db.insert_profile(&profile).await {
-            self.log_trace("error", "tui", &format!("Failed to add server: {e}"));
-            return;
+        match self.db.insert_profile(&profile).await {
+            Ok(_) => {
+                self.log_trace(
+                    "info",
+                    "tui",
+                    &format!(
+                        "Added server: {}",
+                        profile.remarks.as_deref().unwrap_or("unnamed")
+                    ),
+                );
+                self.mode = AppMode::List;
+                self.reload_profiles().await;
+            }
+            Err(e) => {
+                self.log_trace("error", "tui", &format!("Failed to add server: {e}"));
+                // Restore fields so the form isn't empty
+                if let AppMode::AddServer { fields: ref mut f, .. } = self.mode {
+                    *f = fields;
+                }
+            }
         }
-        self.log_trace(
-            "info",
-            "tui",
-            &format!(
-                "Added server: {}",
-                profile.remarks.as_deref().unwrap_or("unnamed")
-            ),
-        );
-        self.mode = AppMode::List;
-        self.reload_profiles().await;
     }
 
     pub async fn confirm_edit_server(&mut self) {
-        let (profile_id, fields, _form_errors) = match &self.mode {
-            AppMode::EditServer {
-                profile_id,
-                fields,
-                form_errors,
-                ..
-            } => (profile_id.clone(), fields.clone(), form_errors.clone()),
-            _ => return,
+        // Phase 1: validate using immutable borrow
+        let (profile_id, address, port, user_id) = {
+            let (pid, fields) = match &self.mode {
+                AppMode::EditServer {
+                    profile_id,
+                    fields,
+                    ..
+                } => (profile_id.clone(), fields),
+                _ => return,
+            };
+            let addr = fields
+                .iter()
+                .find(|(k, _)| k == "address")
+                .map_or("", |(_, v)| v.as_str());
+            let prt = fields
+                .iter()
+                .find(|(k, _)| k == "port")
+                .map_or("", |(_, v)| v.as_str());
+            let uid = fields
+                .iter()
+                .find(|(k, _)| k == "user_id")
+                .map_or("", |(_, v)| v.as_str());
+            (pid, addr.to_owned(), prt.to_owned(), uid.to_owned())
         };
 
         // Validate fields
         let mut errors: HashMap<String, String> = HashMap::new();
-        let address = fields
-            .iter()
-            .find(|(k, _)| k == "address")
-            .map_or("", |(_, v)| v.as_str());
-        let port = fields
-            .iter()
-            .find(|(k, _)| k == "port")
-            .map_or("", |(_, v)| v.as_str());
-        let user_id = fields
-            .iter()
-            .find(|(k, _)| k == "user_id")
-            .map_or("", |(_, v)| v.as_str());
-
         if address.is_empty() {
             errors.insert("address".into(), "Address is required".into());
         }
@@ -1032,6 +1044,12 @@ impl AppState {
             return;
         }
 
+        // Phase 2: take ownership of fields (only on success)
+        let fields = match &mut self.mode {
+            AppMode::EditServer { fields, .. } => std::mem::take(fields),
+            _ => unreachable!(),
+        };
+
         let mut profile = if let Ok(Some(p)) = self.db.get_profile(&profile_id).await {
             p
         } else {
@@ -1051,14 +1069,27 @@ impl AppState {
         profile.protocol_settings = new_profile.protocol_settings;
         profile.sub_uid = Some(profile.compute_sub_uid() as i64);
         profile.updated_at = Some(format_now());
-
-        if let Err(e) = self.db.update_profile(&profile).await {
-            self.log_trace("error", "tui", &format!("Failed to update server: {e}"));
-            return;
+        match self.db.update_profile(&profile).await {
+            Ok(_) => {
+                self.log_trace(
+                    "info",
+                    "tui",
+                    &format!(
+                        "Updated server: {}",
+                        profile.remarks.as_deref().unwrap_or("unnamed")
+                    ),
+                );
+                self.mode = AppMode::List;
+                self.reload_profiles().await;
+            }
+            Err(e) => {
+                self.log_trace("error", "tui", &format!("Failed to update server: {e}"));
+                // Restore fields so the form isn't empty
+                if let AppMode::EditServer { fields: ref mut f, .. } = self.mode {
+                    *f = fields;
+                }
+            }
         }
-        self.log_trace("info", "tui", "Server updated");
-        self.mode = AppMode::List;
-        self.reload_profiles().await;
     }
 
     pub fn cancel_form(&mut self) {
@@ -1367,70 +1398,70 @@ impl AppState {
             Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
             SystemProxy, Tun, Updates,
         };
-        let get = |key: &str| {
+        let get_str = |key: &str| -> &str {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
                 .map_or("", |(_, v)| v.as_str())
-                .to_owned()
         };
+        let get = |key: &str| get_str(key).to_owned();
         let get_opt = |key: &str| {
-            let v = get(key);
-            if v.is_empty() { None } else { Some(v) }
+            let v = get_str(key);
+            if v.is_empty() { None } else { Some(v.to_owned()) }
         };
         match section {
             Core => {
                 self.config.core.xray_path = get_opt("xray_path");
                 self.config.core.sing_box_path = get_opt("sing_box_path");
-                let core_str = get("default_core");
+                let core_str = get_str("default_core");
                 self.config.core.core_type = if core_str.is_empty() || core_str == "Auto" {
                     None
                 } else {
                     core_str.parse::<xray_tui_core::CoreType>().ok()
                 };
-                if !get("log_level").is_empty() {
+                if !get_str("log_level").is_empty() {
                     self.config.core.log_level = get("log_level");
                 }
             }
             Gui => {
                 self.config.gui.language = get("language");
                 self.config.gui.theme = get_opt("theme");
-                if let Ok(d) = humantime::parse_duration(&get("refresh_interval")) {
+                if let Ok(d) = humantime::parse_duration(get_str("refresh_interval")) {
                     *self.config.gui.refresh_interval_secs = d;
                 }
             }
             Inbound => {
-                if let Ok(v) = get("socks_port").parse::<u16>() {
+                if let Ok(v) = get_str("socks_port").parse::<u16>() {
                     self.config.inbound.socks_port = v;
                 }
-                self.config.inbound.http_port = get("http_port").parse::<u16>().ok();
-                self.config.inbound.mixed_port = get("mixed_port").parse::<u16>().ok();
-                if !get("listen").is_empty() {
+                self.config.inbound.http_port = get_str("http_port").parse::<u16>().ok();
+                self.config.inbound.mixed_port = get_str("mixed_port").parse::<u16>().ok();
+                if !get_str("listen").is_empty() {
                     self.config.inbound.listen = get("listen");
                 }
-                self.config.inbound.sniffing = get("sniffing") == "true";
+                self.config.inbound.sniffing = get_str("sniffing") == "true";
             }
             SystemProxy => {
-                self.config.system_proxy.enabled = get("enabled") == "true";
-                self.config.system_proxy.http_port = get("http_port").parse::<u16>().ok();
-                self.config.system_proxy.socks_port = get("socks_port").parse::<u16>().ok();
+                self.config.system_proxy.enabled = get_str("enabled") == "true";
+                self.config.system_proxy.http_port = get_str("http_port").parse::<u16>().ok();
+                self.config.system_proxy.socks_port = get_str("socks_port").parse::<u16>().ok();
                 self.config.system_proxy.bypass = get_opt("bypass");
             }
             Tun => {
-                self.config.tun.enabled = get("enabled") == "true";
+                self.config.tun.enabled = get_str("enabled") == "true";
                 self.config.tun.interface_name = get_opt("interface_name");
-                self.config.tun.mtu = get("mtu").parse::<u16>().ok();
+                self.config.tun.mtu = get_str("mtu").parse::<u16>().ok();
             }
             Mux => {
-                self.config.mux.enabled = get("enabled") == "true";
-                self.config.mux.concurrency = get("concurrency").parse::<u8>().ok();
-                self.config.mux.fragment_enabled = get("fragment_enabled") == "true";
+                self.config.mux.enabled = get_str("enabled") == "true";
+                self.config.mux.concurrency = get_str("concurrency").parse::<u8>().ok();
+                self.config.mux.fragment_enabled = get_str("fragment_enabled") == "true";
                 self.config.mux.fragment_packets = get_opt("fragment_packets");
                 self.config.mux.fragment_length = get_opt("fragment_length");
                 self.config.mux.fragment_interval = get_opt("fragment_interval");
             }
             Stats => {
-                self.config.statistics.enabled = get("enabled") == "true";
+                self.config.statistics.enabled = get_str("enabled") == "true";
             }
             ProtocolCore => {
                 for (key, val) in fields {
@@ -1448,38 +1479,38 @@ impl AppState {
                 }
             }
             SpeedTest => {
-                if !get("ping_url").is_empty() {
+                if !get_str("ping_url").is_empty() {
                     self.config.speed_test.ping_url = get("ping_url");
                 }
-                if !get("ip_api_url").is_empty() {
+                if !get_str("ip_api_url").is_empty() {
                     self.config.speed_test.ip_api_url = get("ip_api_url");
                 }
-                if let Ok(d) = humantime::parse_duration(&get("tcp_timeout_secs")) {
+                if let Ok(d) = humantime::parse_duration(get_str("tcp_timeout_secs")) {
                     *self.config.speed_test.tcp_timeout_secs = d;
                 }
-                if let Ok(d) = humantime::parse_duration(&get("real_ping_timeout_secs")) {
+                if let Ok(d) = humantime::parse_duration(get_str("real_ping_timeout_secs")) {
                     *self.config.speed_test.real_ping_timeout_secs = d;
                 }
-                if let Ok(v) = get("batch_page_size").parse::<usize>() {
+                if let Ok(v) = get_str("batch_page_size").parse::<usize>() {
                     self.config.speed_test.batch_page_size = v;
                 }
-                if let Ok(d) = humantime::parse_duration(&get("batch_delay_secs")) {
+                if let Ok(d) = humantime::parse_duration(get_str("batch_delay_secs")) {
                     *self.config.speed_test.batch_delay_secs = d;
                 }
-                if let Ok(v) = get("real_ping_retries").parse::<u32>() {
+                if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                     self.config.speed_test.real_ping_retries = v;
                 }
-                if let Ok(v) = get("real_ping_concurrency").parse::<usize>() {
+                if let Ok(v) = get_str("real_ping_concurrency").parse::<usize>() {
                     self.config.speed_test.real_ping_concurrency = v;
                 }
-                if let Ok(v) = get("tcp_ping_concurrency").parse::<usize>() {
+                if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
                     self.config.speed_test.tcp_ping_concurrency = v.max(1);
                 }
             }
             // Dns and Routing are handled separately (DB-backed)
             Dns | Routing | Updates => {}
             Logging => {
-                if let Ok(d) = humantime::parse_duration(&get("log_ttl_secs")) {
+                if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                     *self.config.logging.ttl_secs = d;
                 }
             }
@@ -1586,21 +1617,20 @@ impl AppState {
         let id = rule_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let get = |key: &str| {
+        let get_str = |key: &str| -> &str {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
                 .map_or("", |(_, v)| v.as_str())
-                .to_owned()
         };
         let get_opt = |key: &str| {
-            let v = get(key);
-            if v.is_empty() { None } else { Some(v) }
+            let v = get_str(key);
+            if v.is_empty() { None } else { Some(v.to_owned()) }
         };
         let rule = RoutingRule {
             id,
             group_id: None,
-            r#type: get("type").parse::<i32>().unwrap_or(0),
+            r#type: get_str("type").parse::<i32>().unwrap_or(0),
             domain_matcher: get_opt("domain_matcher"),
             domains: get_opt("domains"),
             ips: get_opt("ips"),
@@ -1636,16 +1666,15 @@ impl AppState {
             .ok()
             .flatten()
             .map_or_else(|| uuid::Uuid::new_v4().to_string(), |d| d.id);
-        let get = |key: &str| {
+        let get_str = |key: &str| -> &str {
             fields
                 .iter()
                 .find(|(k, _)| k == key)
                 .map_or("", |(_, v)| v.as_str())
-                .to_owned()
         };
         let get_opt = |key: &str| {
-            let v = get(key);
-            if v.is_empty() { None } else { Some(v) }
+            let v = get_str(key);
+            if v.is_empty() { None } else { Some(v.to_owned()) }
         };
         let dns = DnsSetting {
             id,
@@ -1653,8 +1682,8 @@ impl AppState {
             servers: get_opt("servers"),
             hosts: get_opt("hosts"),
             query_strategy: get_opt("query_strategy"),
-            disable_cache: Some(i32::from(get("disable_cache") == "true")),
-            disable_fallback: Some(i32::from(get("disable_fallback") == "true")),
+            disable_cache: Some(i32::from(get_str("disable_cache") == "true")),
+            disable_fallback: Some(i32::from(get_str("disable_fallback") == "true")),
             client_ip: get_opt("client_ip"),
         };
         match self.db.upsert_dns_settings(&dns).await {
@@ -1739,15 +1768,15 @@ impl AppState {
     }
 
     pub async fn confirm_batch_import(&mut self) {
-        let items = match &self.mode {
-            AppMode::BatchImport { results, .. } => results.clone(),
+        let items = match &mut self.mode {
+            AppMode::BatchImport { results, .. } => std::mem::take(results),
             _ => return,
         };
         let now = format_now();
         let mut imported = 0usize;
         let mut errors = 0usize;
-        for item in &items {
-            if let Some(mut profile) = item.profile.clone() {
+        for item in items {
+            if let Some(mut profile) = item.profile {
                 // Assign to currently selected real group (not All or Graveyard)
                 if let Some(gid) = &self.selected_group_id
                     && gid != ALL_GROUP_ID
@@ -2740,7 +2769,6 @@ impl AppState {
                         Err(_) => continue,
                     };
                     let target = item.0.clone();
-                    let profiles = item.1.clone();
                     let tx = tx.clone();
                     let tcp_timeout = tcp_timeout;
 
@@ -2772,17 +2800,20 @@ impl AppState {
                                 "batch_tcp_ping_result",
                             );
                         }
-                        (target, profiles, latency_ms)
+                        (target, latency_ms)
                     }));
                 }
 
                 // Collect TCP results, accumulate successes and completed set
-                for (target, profiles, latency_ms) in join_all(tcp_handles).await.into_iter().flatten() {
+                for (target, latency_ms) in join_all(tcp_handles).await.into_iter().flatten() {
                     for pid in &target.profile_ids {
                         tcp_completed.insert(pid.clone());
                     }
                     if latency_ms.is_some() {
-                        tcp_successes.push((target, profiles));
+                        // Re-extract profiles from batch_targets (avoid cloning into spawn)
+                        if let Some((_, profiles)) = batch_targets.iter().find(|(t, _)| t.key == target.key) {
+                            tcp_successes.push((target, profiles.clone()));
+                        }
                     }
                 }
 
@@ -3074,16 +3105,18 @@ impl AppState {
                     message,
                     timestamp_nanos,
                 } => {
-                    self.last_core_log = Some((level.clone(), message.clone()));
-                    self.add_log(&level, &target, &message, timestamp_nanos);
+                    self.add_log(level, target, message, timestamp_nanos);
                 }
                 CoreEvent::TuiLog {
                     target,
                     level,
                     message,
                 } => {
-                    self.last_tui_log = Some((target.clone(), level.clone(), message.clone()));
-                    // Note: TuiLog is already persisted to heed by TuiLogLayer
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as i64;
+                    self.add_log(level, target, message, ts);
                 }
                 CoreEvent::SubscriptionsUpdated {
                     group_id,
@@ -4024,11 +4057,7 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
             .get("level")
             .and_then(|v| v.as_str())
             .unwrap_or("info");
-        let level = if raw_level == "warn" {
-            "warning".to_string()
-        } else {
-            raw_level.to_string()
-        };
+        let level = if raw_level == "warn" { "warning" } else { raw_level };
         let msg = parsed
             .get("msg")
             .and_then(|v| v.as_str())
@@ -4045,7 +4074,7 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
         // Extract target from msg if it has a "tag: message" pattern
         let target = msg.find(": ").map_or_else(|| "sing".to_string(), |pos| format!("sing::{}", &msg[..pos]));
 
-        return (level, target, msg.to_string(), ts_nanos);
+        return (level.to_string(), target, msg.to_string(), ts_nanos);
     }
 
     // Xray-core format: "2026/06/25 15:18:54.387241 [Info] message"
@@ -4065,14 +4094,14 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
     };
 
     let (level_str, msg_after_level) = level_re.captures(remaining).map_or_else(
-        || ("info".to_string(), remaining),
+        || ("info", remaining),
         |caps| {
-            let raw = caps.get(1).unwrap().as_str().to_lowercase();
-            let lvl = if raw == "warn" {
-                "warning".to_string()
-            } else {
-                raw
-            };
+            let raw = caps.get(1).unwrap().as_str();
+            let lvl = if raw.eq_ignore_ascii_case("debug") { "debug" }
+                else if raw.eq_ignore_ascii_case("info") { "info" }
+                else if raw.eq_ignore_ascii_case("warn") || raw.eq_ignore_ascii_case("warning") { "warning" }
+                else if raw.eq_ignore_ascii_case("error") { "error" }
+                else { raw };
             let after = remaining[caps.get(0).unwrap().len()..].trim();
             (lvl, after)
         },
@@ -4094,7 +4123,7 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
     } else {
         (core_prefix.to_string(), msg_after_level.to_string())
     };
-    (level_str, target, message, ts_nanos)
+    (level_str.to_string(), target, message, ts_nanos)
 }
 
 #[cfg(test)]

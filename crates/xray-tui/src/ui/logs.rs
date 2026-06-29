@@ -5,6 +5,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use std::collections::VecDeque;
 
 use crate::AppState;
 use crate::ui::theme::Theme;
@@ -208,7 +209,7 @@ pub(super) async fn try_load_older(state: &mut AppState) {
             if entries.len() < 500 {
                 state.log_has_older = false;
             }
-            let new_lines: Vec<crate::LogLine> = entries
+            let mut new_lines: VecDeque<crate::LogLine> = entries
                 .into_iter()
                 .rev()
                 .map(|e| crate::LogLine {
@@ -220,9 +221,8 @@ pub(super) async fn try_load_older(state: &mut AppState) {
                 .collect();
             let n = new_lines.len();
             state.log_scroll = state.log_scroll.saturating_add(n);
-            let mut combined = new_lines;
-            combined.append(&mut state.log_cache);
-            state.log_cache = combined;
+            new_lines.append(&mut state.log_cache);
+            state.log_cache = new_lines;
             state.log_cache.truncate(10_000);
         }
         Err(e) => {
@@ -259,7 +259,7 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
     // Append new entries (entries are newest-first, reverse to append in order)
     let new_count = entries.len();
     for entry in entries.into_iter().rev() {
-        state.log_cache.push(crate::LogLine {
+        state.log_cache.push_back(crate::LogLine {
             level: entry.level,
             target: entry.target,
             message: entry.message,

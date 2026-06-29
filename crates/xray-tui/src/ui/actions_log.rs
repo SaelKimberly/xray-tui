@@ -9,7 +9,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-const fn connection_icon(state: &AppState) -> (&'static str, Style) {
+#[allow(clippy::missing_const_for_fn)]
+fn connection_icon(state: &AppState) -> (&'static str, Style) {
     if state.connecting {
         ("⠋", Theme::SPINNER)
     } else if state.connected_core.is_some() {
@@ -102,11 +103,13 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
     let traffic_down = format_bytes(state.current_traffic_down);
     let traffic_str = format!("⬆{traffic_up} ⬇{traffic_down}");
 
-    // Last core log segment
+    // Last core log segment (scan log_cache backwards for non-tui entry)
     let log_snippet = state
-        .last_core_log
-        .as_ref()
-        .map_or("", |(_, msg)| msg.as_str());
+        .log_cache
+        .iter()
+        .rev()
+        .find(|l| l.target != "tui")
+        .map_or("", |l| l.message.as_str());
 
     // Build the line
     let mut spans = Vec::new();
@@ -201,20 +204,23 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         format!("📊 ⬆{traffic_up}  ⬇{traffic_down}    💾 {mem_mb}"),
         Theme::FOOTER_VALUE,
     ));
-
-    // Row 5: Core log
+    // Row 5: Core log (scan log_cache backwards for non-tui entry)
     let core_log = state
-        .last_core_log
-        .as_ref()
-        .map(|(lvl, msg)| format!("📋 Core: [{lvl}] {msg}"))
+        .log_cache
+        .iter()
+        .rev()
+        .find(|l| l.target != "tui")
+        .map(|l| format!("📋 Core: [{}] {}", l.level, l.message))
         .unwrap_or_default();
     let row5 = Line::from(Span::styled(core_log, Theme::FOOTER_LABEL));
 
-    // Row 6: TUI log
+    // Row 6: TUI log (scan log_cache backwards for tui entry)
     let tui_log = state
-        .last_tui_log
-        .as_ref()
-        .map(|(target, lvl, msg)| format!("📋 TUI:  [{lvl}] {msg} ({target})"))
+        .log_cache
+        .iter()
+        .rev()
+        .find(|l| l.target == "tui")
+        .map(|l| format!("📋 TUI:  [{}] {} ({})", l.level, l.message, l.target))
         .unwrap_or_default();
     let row6 = Line::from(Span::styled(tui_log, Theme::FOOTER_LABEL));
 

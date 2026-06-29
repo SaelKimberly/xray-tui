@@ -1660,24 +1660,25 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
 fn format_shadowsocksr(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let password = profile.user_id.as_deref().unwrap_or("");
-
     let (method, protocol, obfs) = profile
         .protocol_settings
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .map_or_else(
-            || ("rc4-md5".into(), "origin".into(), "plain".into()),
+            || ("rc4-md5".to_string(), "origin".to_string(), "plain".to_string()),
             |v| {
                 let m = v
                     .get("method")
                     .and_then(|m| m.as_str())
-                    .unwrap_or("rc4-md5");
+                    .unwrap_or("rc4-md5")
+                    .to_string();
                 let p = v
                     .get("protocol")
                     .and_then(|p| p.as_str())
-                    .unwrap_or("origin");
-                let o = v.get("obfs").and_then(|o| o.as_str()).unwrap_or("plain");
-                (m.to_string(), p.to_string(), o.to_string())
+                    .unwrap_or("origin")
+                    .to_string();
+                let o = v.get("obfs").and_then(|o| o.as_str()).unwrap_or("plain").to_string();
+                (m, p, o)
             },
         );
 
@@ -1720,7 +1721,7 @@ fn parse_http(url: &str) -> Result<Profile> {
     // Split # for fragment (remark)
     let (host_and_port, fragment) = hostpart
         .split_once('#')
-        .map(|(h, f)| (h, Some(f.to_string())))
+        .map(|(h, f)| (h, Some(String::from(f))))
         .unwrap_or((hostpart, None));
 
     let (host, port_str) = host_and_port

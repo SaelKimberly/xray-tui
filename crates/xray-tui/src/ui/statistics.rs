@@ -17,10 +17,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let profile = &state.profiles[state.selected_index];
     let profile_name = profile.profile.remarks.as_deref().unwrap_or("Unknown");
-    let core_type = state
-        .connected_core
-        .map(|c| c.to_string())
-        .unwrap_or_default();
+    let core_type = state.connected_core.map_or("", |c| c.as_str());
 
     // Split area into 3 sections
     let chunks = Layout::default()

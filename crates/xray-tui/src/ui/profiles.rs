@@ -255,7 +255,7 @@ fn render_data_grid(
                 format!("{:>3}", scroll_offset + i + 1)
             };
 
-            let type_str = format!("{:.12}", protocol.to_string());
+            let type_str = format!("{:.12}", protocol);
             let remarks = row.profile.remarks.as_deref().unwrap_or("");
             let remarks_str = truncate_pad(remarks, 24);
             let address = row.profile.address.as_deref().unwrap_or("");

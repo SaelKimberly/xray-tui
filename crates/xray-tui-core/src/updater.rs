@@ -47,10 +47,10 @@ pub async fn get_current_version(core_type: CoreType, bin_dir: &Path) -> Option<
 
     // Try managed bin_dir first (inside per-core subdirectory), then PATH
     let bin_path = bin_dir.join(core_type.to_string()).join(exe);
-    let cmd = if bin_path.is_file() {
-        bin_path.to_string_lossy().to_string()
+    let cmd: std::borrow::Cow<'_, std::ffi::OsStr> = if bin_path.is_file() {
+        bin_path.as_os_str().into()
     } else {
-        exe.to_string()
+        std::ffi::OsStr::new(exe).into()
     };
 
     let output = tokio::process::Command::new(&cmd)
