@@ -104,7 +104,7 @@ pub enum CoreEvent {
         total_down: i64,
     },
     SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, ip_info, error },
-    SubscriptionsUpdated { group_id, count, error, warnings },
+    SubscriptionsUpdated { group_id, count, error, summary },
     UpdateCheckResult { core_type, current_version, latest_version, error },
     UpdateCompleted { core_type, old_version, new_version, success, error },
     /// A log line from the core process stdout (xray-core) or stderr (sing-box).

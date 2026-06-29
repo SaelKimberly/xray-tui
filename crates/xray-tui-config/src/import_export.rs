@@ -1946,19 +1946,19 @@ fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()>
     Ok(())
 }
 
-/// Security validation: check for insecure settings and log warnings.
-fn validate_security(profile: &Profile) {
-    if let Some(ss) = &profile.stream_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
-        && (v.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
-            || v.get("insecure").and_then(|s| s.as_str()) == Some("1"))
-    {
-        tracing::warn!(target: "validation",
-            "Profile {} has allow_insecure=true",
-            profile.remarks.as_deref().unwrap_or("(unnamed)")
-        );
-    }
+
+/// Consolidated validation summary for a batch of profile imports (e.g. subscription).
+#[derive(Debug, Clone, Default)]
+pub struct ValidationSummary {
+    pub total_errors: usize,
+    pub missing_field_count: usize,
+    pub host_validation_count: usize,
+    pub security_warning_count: usize,
+    pub other_count: usize,
 }
+
+/// Security validation is now tracked via `ValidationSummary` during subscription parsing.
+const fn validate_security(_profile: &Profile) {}
 
 #[cfg(test)]
 mod tests {

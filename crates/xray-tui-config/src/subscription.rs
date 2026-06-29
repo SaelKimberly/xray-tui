@@ -2,7 +2,7 @@
 
 use std::mem::MaybeUninit;
 
-use crate::import_export::{ValidationSettings, parse_share_url};
+use crate::import_export::{ImportError, ValidationSettings, ValidationSummary, parse_share_url};
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 
@@ -375,8 +375,8 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
 
 /// Parse base64-encoded subscription data into a list of Profiles.
 ///
-/// Returns `(profiles, warnings)` on success, where `warnings` is a list of
-/// validation non-fatal error messages for URLs that could not be parsed.
+/// Returns `(profiles, summary)` on success, where `summary` is a
+/// `ValidationSummary` counting the types of errors encountered.
 ///
 /// # Errors
 ///
@@ -384,7 +384,7 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
 pub fn parse_subscription_data(
     data: &[u8],
     settings: &ValidationSettings,
-) -> Result<(Vec<Profile>, Vec<String>), String> {
+) -> Result<(Vec<Profile>, ValidationSummary), String> {
     let mut decoder = StreamingDecoder::new();
     let mut all_urls = Vec::new();
 
@@ -400,20 +400,52 @@ pub fn parse_subscription_data(
 
     // Parse each URL into a Profile
     let mut profiles = Vec::new();
-    let mut warnings = Vec::new();
+    let mut summary = ValidationSummary::default();
     for url in &all_urls {
         match parse_share_url(url, settings) {
             Ok(profile) => profiles.push(profile),
-            Err(e) => {
-                // Collect validation warnings but don't fail the whole subscription
-                if matches!(e, crate::import_export::ImportError::Validation(_)) {
-                    warnings.push(format!("Subscription URL validation failed: {e}"));
+            Err(ImportError::Validation(msg)) => {
+                let lower = msg.to_lowercase();
+                if lower.starts_with("missing field") {
+                    summary.missing_field_count += 1;
+                } else if lower.starts_with("private ip")
+                    || lower.starts_with("loopback")
+                    || lower.starts_with("link-local")
+                    || lower.starts_with("unique-local")
+                    || lower.starts_with("localhost")
+                {
+                    summary.host_validation_count += 1;
+                } else {
+                    summary.other_count += 1;
                 }
+            }
+            Err(_) => {
+                summary.other_count += 1;
             }
         }
     }
 
-    Ok((profiles, warnings))
+    // Scan parsed profiles for allow_insecure / insecure settings
+    summary.security_warning_count = profiles
+        .iter()
+        .filter(|p| {
+            if let Some(ss) = &p.stream_settings
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
+            {
+                v.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
+                    || v.get("insecure").and_then(|s| s.as_str()) == Some("1")
+            } else {
+                false
+            }
+        })
+        .count();
+
+    summary.total_errors = summary.missing_field_count
+        + summary.host_validation_count
+        + summary.security_warning_count
+        + summary.other_count;
+
+    Ok((profiles, summary))
 }
 
 #[cfg(test)]
@@ -464,8 +496,12 @@ mod tests {
     #[test]
     fn test_parse_subscription_data_empty() {
         let settings = crate::import_export::ValidationSettings::default();
-        let (profiles, warnings) = parse_subscription_data(b"", &settings).unwrap();
+        let (profiles, summary) = parse_subscription_data(b"", &settings).unwrap();
         assert!(profiles.is_empty());
-        assert!(warnings.is_empty());
+        assert_eq!(summary.total_errors, 0);
+        assert_eq!(summary.missing_field_count, 0);
+        assert_eq!(summary.host_validation_count, 0);
+        assert_eq!(summary.security_warning_count, 0);
+        assert_eq!(summary.other_count, 0);
     }
 }

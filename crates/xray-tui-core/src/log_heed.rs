@@ -285,6 +285,25 @@ impl HeedLogStorage {
         wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
         Ok(deleted)
     }
+
+    /// Clear all log entries and targets from the database.
+    /// This empties both the `logs` and `targets` databases.
+    pub fn clear_all(&self) -> Result<()> {
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| HeedError::Txn(e.to_string()))?;
+
+        self.logs
+            .clear(&mut wtxn)
+            .map_err(|e| HeedError::Db(e.to_string()))?;
+        self.targets
+            .clear(&mut wtxn)
+            .map_err(|e| HeedError::Db(e.to_string()))?;
+
+        wtxn.commit().map_err(|e| HeedError::Txn(e.to_string()))?;
+        Ok(())
+    }
     // ── Async wrappers (spawn_blocking for use from async context) ──
 
     /// Async version of [`Self::read_recent`] that wraps the heed call in `spawn_blocking`.
@@ -326,6 +345,14 @@ impl HeedLogStorage {
             .await
             .map_err(|e| HeedError::Io(e.to_string()))?
     }
+
+    /// Async version of [`Self::clear_all`] that wraps the heed call in `spawn_blocking`.
+    pub async fn clear_all_async(self: &Arc<Self>) -> Result<()> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.clear_all())
+            .await
+            .map_err(|e| HeedError::Io(e.to_string()))?
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -356,3 +383,4 @@ pub enum HeedError {
 
 /// Convenience alias.
 pub type Result<T, E = HeedError> = std::result::Result<T, E>;
+

@@ -195,6 +195,8 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     state.disconnect();
                     state.should_quit = true;
                 }
+                Some(ConfirmAction::ClearLogs) => state.clear_logs(),
+                Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -387,7 +389,8 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 | KeyCode::PageDown
                 | KeyCode::Home
                 | KeyCode::End
-                | KeyCode::Char('t' | 'T')
+                | KeyCode::Delete
+                | KeyCode::Char('c' | 't' | 'T')
         ) && !key.modifiers.contains(KeyModifiers::CONTROL);
         if is_logs_key {
             logs::handle_key(state, key).await;
@@ -828,7 +831,8 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("↑↓", "Scroll logs"),
                     ("PgUp / PgDn", "Page up/down"),
                     ("Home / End", "Jump to oldest/newest"),
-                    ("c", "Toggle core logs"),
+                    ("c", "Clear log cache"),
+                    ("Del", "Purge all logs from database"),
                     ("t", "Toggle TUI logs"),
                     ("v", "Toggle validation/subscription logs"),
                     ("Tab / Shift+Tab", "Cycle tabs"),

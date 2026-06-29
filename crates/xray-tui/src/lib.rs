@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
-use xray_tui_config::{AppConfig, ValidationSettings};
+use xray_tui_config::{AppConfig, ValidationSettings, ValidationSummary};
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
@@ -283,7 +283,7 @@ pub enum CoreEvent {
         group_id: String,
         count: usize,
         error: Option<String>,
-        warnings: Vec<String>,
+        summary: ValidationSummary,
     },
     /// Result from a speed test operation
     SpeedTestResult {
@@ -328,6 +328,8 @@ pub enum ConfirmAction {
     DeleteProfile(String),
     DeleteGroup(String),
     ClearGroup(String),
+    ClearLogs,
+    PurgeLogsDatabase,
     Quit,
 }
 #[derive(Debug, Clone, Default)]
@@ -3202,11 +3204,19 @@ impl AppState {
                     group_id,
                     count,
                     error,
-                    warnings,
+                    summary,
                 } => {
                     self.updating_groups.remove(&group_id);
-                    for w in &warnings {
-                        self.log_trace("warn", "subscription", w);
+                    if summary.total_errors > 0 || summary.security_warning_count > 0 {
+                        let msg = format!(
+                            "Subscription validation: {} errors (missing fields: {}, host validation: {}, security warnings: {}, other: {})",
+                            summary.total_errors,
+                            summary.missing_field_count,
+                            summary.host_validation_count,
+                            summary.security_warning_count,
+                            summary.other_count,
+                        );
+                        self.log_trace("warn", "subscription", &msg);
                     }
                     if let Some(err) = error {
                         self.log_trace(
@@ -3620,6 +3630,42 @@ impl AppState {
         self.reload_profiles().await;
     }
 
+    pub fn clear_logs(&mut self) {
+        self.log_cache.clear();
+        self.log_scroll = 0;
+        // Set cursor to now so poll_new_logs doesn't re-read old entries
+        self.last_seen_log_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        self.confirmation = None;
+        self.log_trace("info", "tui", "Logs cleared");
+    }
+
+    /// Clear entire log database (heed) in addition to the in-memory cache.
+    /// Note: there may be a brief race with the background log writer;
+    /// any messages already in the mpsc channel will be written after the clear
+    /// and may reappear on next scroll load.
+    pub fn purge_logs_database(&mut self) {
+        self.log_cache.clear();
+        self.log_scroll = 0;
+        self.last_seen_log_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        // Clear the heed database in the background (best-effort)
+        if let Some(ref heed) = self.heed_storage {
+            let heed = heed.clone();
+            tokio::spawn(async move {
+                if let Err(e) = heed.clear_all_async().await {
+                    tracing::error!(target: "tui", "Failed to clear log database: {e}");
+                }
+            });
+        }
+        self.confirmation = None;
+        self.log_trace("info", "tui", "Log database cleared");
+    }
+
     // ── Subscription update ──────────────────────────────────────────
 
     pub fn update_group_subscriptions(&mut self, group_id: &str) {
@@ -3659,7 +3705,7 @@ impl AppState {
                         CoreEvent::SubscriptionsUpdated {
                             group_id: inner.0,
                             count: inner.1,
-                            warnings: inner.2,
+                            summary: inner.2,
                             error: inner.3,
                         },
                         "subs_updated",
@@ -3673,7 +3719,7 @@ impl AppState {
                         CoreEvent::SubscriptionsUpdated {
                             group_id: gid.clone(),
                             count: 0,
-                            warnings: Vec::new(),
+                            summary: ValidationSummary::default(),
                             error: Some("Subscription update timed out after 120s".into()),
                         },
                         "subs_timeout",
@@ -3689,33 +3735,33 @@ impl AppState {
         group_id: String,
         db: Arc<Database>,
         validation: xray_tui_config::import_export::ValidationSettings,
-    ) -> (String, usize, Vec<String>, Option<String>) {
+    ) -> (String, usize, ValidationSummary, Option<String>) {
         let client = match reqwest::Client::builder()
             .user_agent(&user_agent)
             .timeout(std::time::Duration::from_secs(30))
             .build()
         {
             Ok(c) => c,
-            Err(e) => return (group_id, 0, Vec::new(), Some(e.to_string())),
+            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(e.to_string())),
         };
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
-            Err(e) => return (group_id, 0, Vec::new(), Some(format!("HTTP: {e}"))),
+            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(format!("HTTP: {e}"))),
         };
         let bytes = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => return (group_id, 0, Vec::new(), Some(format!("Body: {e}"))),
+            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(format!("Body: {e}"))),
         };
-        let (profiles, warnings) =
+        let (profiles, summary) =
             match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
-                Ok((p, w)) => (p, w),
-                Err(e) => return (group_id, 0, Vec::new(), Some(e)),
+                Ok((p, s)) => (p, s),
+                Err(e) => return (group_id, 0, ValidationSummary::default(), Some(e)),
             };
         tracing::info!(
             target: "tui",
-            "Parsed {} profiles, {} warnings from subscription",
+            "Parsed {} profiles, {} errors from subscription",
             profiles.len(),
-            warnings.len()
+            summary.total_errors,
         );
         if profiles.is_empty() {
             tracing::info!(target: "tui", "Subscription returned 0 usable profiles — all URLs may have failed validation");
@@ -3744,7 +3790,7 @@ impl AppState {
         );
         if let Err(e) = db.subscription_upsert_profiles(&group_id, &enriched).await {
             tracing::error!(target: "tui", "DB upsert failed: {e}");
-            return (group_id, 0, Vec::new(), Some(format!("DB upsert: {e}")));
+            return (group_id, 0, summary, Some(format!("DB upsert: {e}")));
         }
         tracing::info!(target: "tui", "DB upsert succeeded");
 
@@ -3766,7 +3812,7 @@ impl AppState {
         };
         let _ = db.upsert_subscription(&sub).await;
 
-        (group_id, enriched.len(), warnings, None)
+        (group_id, enriched.len(), summary, None)
     }
 
     pub fn update_all_subscriptions(&mut self) {
@@ -3990,7 +4036,7 @@ impl AppState {
                         CoreEvent::SubscriptionsUpdated {
                             group_id: result.0,
                             count: result.1,
-                            warnings: result.2,
+                            summary: result.2,
                             error: result.3,
                         },
                         "auto_subs_updated",

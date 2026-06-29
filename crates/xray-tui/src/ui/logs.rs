@@ -8,6 +8,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
+use crate::ui::render_confirmation_overlay;
 use crate::ui::widgets::{Column, ColumnWidth, DataTable, DataTableRow, DataTableState};
 
 // ── DataTable row type ────────────────────────────────────────────────
@@ -154,6 +155,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         multi_selected: HashSet::new(),
     };
     frame.render_stateful_widget(data_table, log_area, &mut dt_state);
+
+    if matches!(state.confirmation, Some(crate::ConfirmAction::ClearLogs)) {
+        render_confirmation_overlay(frame, area, " Clear all logs? (y/N) ");
+    }
+    if matches!(state.confirmation, Some(crate::ConfirmAction::PurgeLogsDatabase)) {
+        render_confirmation_overlay(frame, area, " Purge entire log database? (y/N) ");
+    }
 }
 
 /// Shorten a target string for display (max ~18 chars).
@@ -192,6 +200,12 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Char('t' | 'T') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.mode = crate::AppMode::TargetPicker { selected: 0 };
+        }
+        KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.confirmation = Some(crate::ConfirmAction::ClearLogs);
+        }
+        KeyCode::Delete => {
+            state.confirmation = Some(crate::ConfirmAction::PurgeLogsDatabase);
         }
         _ => {}
     }
