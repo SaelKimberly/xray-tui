@@ -290,8 +290,8 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
 
         // Compute content area and scrollbar column
         let (content_inner, scrollbar_area) = if self.show_scrollbar && inner.width >= 2 {
-            let halves = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)])
-                .split(inner);
+            let halves =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(inner);
             (halves[0], halves[1])
         } else {
             (inner, Rect::default())

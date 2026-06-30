@@ -472,7 +472,8 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                             }
                             "core_type" => {
                                 const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
-                                let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                                let idx =
+                                    OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
                                 val.clear();
                                 val.push_str(OPTIONS[(idx + 1) % OPTIONS.len()]);
                             }
@@ -484,26 +485,26 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 }
                 KeyCode::Right => {
                     let field_key = keys[*focus_index];
-                    if field_key == "core_type" {
-                        if let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == field_key) {
-                            const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
-                            let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                            let new_idx = (idx + 1) % OPTIONS.len();
-                            val.clear();
-                            val.push_str(OPTIONS[new_idx]);
-                        }
+                    if field_key == "core_type"
+                        && let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == field_key)
+                    {
+                        const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
+                        let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                        let new_idx = (idx + 1) % OPTIONS.len();
+                        val.clear();
+                        val.push_str(OPTIONS[new_idx]);
                     }
                 }
                 KeyCode::Left => {
                     let field_key = keys[*focus_index];
-                    if field_key == "core_type" {
-                        if let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == field_key) {
-                            const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
-                            let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                            let new_idx = if idx == 0 { OPTIONS.len() - 1 } else { idx - 1 };
-                            val.clear();
-                            val.push_str(OPTIONS[new_idx]);
-                        }
+                    if field_key == "core_type"
+                        && let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == field_key)
+                    {
+                        const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
+                        let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                        let new_idx = if idx == 0 { OPTIONS.len() - 1 } else { idx - 1 };
+                        val.clear();
+                        val.push_str(OPTIONS[new_idx]);
                     }
                 }
                 KeyCode::Backspace => {

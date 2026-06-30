@@ -806,7 +806,6 @@ fn render(frame: &mut Frame, state: &AppState) {
         }
         status_bar::render(frame, chunks[3], state);
         return;
-    
     }
     match state.current_tab {
         Tab::Profiles => profiles::render(frame, chunks[1], state),
