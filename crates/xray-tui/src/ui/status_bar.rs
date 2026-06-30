@@ -183,17 +183,17 @@ const fn build_hints(state: &AppState) -> &'static str {
             match state.current_tab {
                 crate::Tab::Profiles => {
                     if matches!(state.mode, crate::AppMode::ManageGroups { .. }) {
-                        " [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                        " [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     } else if state.connected_core.is_some() {
-                        " [g] Groups  [Ctrl+Shift+C] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                        " [g] Groups  [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     } else if state.connecting {
-                        " [g] Groups  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                        " [g] Groups  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     } else {
-                        " [g] Groups  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit "
+                        " [g] Groups  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     }
                 }
-                crate::Tab::Settings => " [Enter] Open  [Ctrl+Q] Quit ",
-                crate::Tab::Logs | crate::Tab::Statistics => " [Ctrl+Q] Quit ",
+                crate::Tab::Settings => " [Enter] Open  [q/Ctrl+C] Quit ",
+                crate::Tab::Logs | crate::Tab::Statistics => " [q/Ctrl+C] Quit ",
             }
         }
     }

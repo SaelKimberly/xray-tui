@@ -418,6 +418,13 @@ fn render_confirmation_overlays(
                 &format!(" Delete \"{profile_name}\"? (y/N) "),
             );
         }
+        Some(ConfirmAction::DeleteProfiles(ref ids)) => {
+            render_confirmation_overlay(
+                frame,
+                area,
+                &format!(" Delete {} profiles? (y/N) ", ids.len()),
+            );
+        }
         Some(ConfirmAction::ClearGroup(ref group_id)) => {
             let group_name = state
                 .groups

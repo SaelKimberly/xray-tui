@@ -305,6 +305,7 @@ fn form_field_defs(mode: &SettingsMode) -> &'static [(&'static str, &'static str
             ("tcp_ping_concurrency", "TCP Ping Concurrency", "Number"),
         ],
         SettingsMode::LoggingForm { .. } => &[("log_ttl_secs", "Log Retention", "Text")],
+        SettingsMode::StatsForm { .. } => &[("enabled", "Enabled", "Boolean")],
         _ => &[],
     }
 }
@@ -459,6 +460,7 @@ const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
         SettingsMode::ProtocolCoreForm { .. } => Some(SettingsSection::ProtocolCore),
         SettingsMode::SpeedTestForm { .. } => Some(SettingsSection::SpeedTest),
         SettingsMode::LoggingForm { .. } => Some(SettingsSection::Logging),
+        SettingsMode::StatsForm { .. } => Some(SettingsSection::Stats),
         _ => None,
     }
 }
@@ -978,7 +980,6 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
         _ => return,
     };
 
-    state.reload_routing_rules().await;
     let rules = &state.routing_rules;
     let max = rules.len().saturating_sub(1);
 

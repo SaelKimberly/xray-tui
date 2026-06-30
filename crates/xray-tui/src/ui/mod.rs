@@ -190,6 +190,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
                 Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id).await,
                 Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
+                Some(ConfirmAction::DeleteProfiles(ids)) => {
+                    for id in &ids {
+                        state.delete_profile(id).await;
+                    }
+                    state.multi_select.clear();
+                }
                 Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
                 Some(ConfirmAction::Quit) => {
                     state.disconnect();
@@ -226,8 +232,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     ) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.disconnect();
-                state.should_quit = true;
+                if state.connected_core.is_some() && state.confirmation.is_none() {
+                    state.confirmation = Some(ConfirmAction::Quit);
+                } else {
+                    state.should_quit = true;
+                }
             }
             _ => groups::handle_key(state, key).await,
         }
@@ -238,8 +247,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     if matches!(&state.mode, crate::AppMode::Settings { .. }) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.disconnect();
-                state.should_quit = true;
+                if state.connected_core.is_some() && state.confirmation.is_none() {
+                    state.confirmation = Some(ConfirmAction::Quit);
+                } else {
+                    state.should_quit = true;
+                }
             }
             _ => settings::handle_key(state, key).await,
         }
@@ -260,7 +272,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.should_quit = true;
+                if state.connected_core.is_some() && state.confirmation.is_none() {
+                    state.confirmation = Some(ConfirmAction::Quit);
+                } else {
+                    state.should_quit = true;
+                }
             }
             _ => add_server::handle_key(state, key).await,
         }
@@ -601,10 +617,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
                 let ids: Vec<String> = state.multi_select.iter().cloned().collect();
-                for id in &ids {
-                    state.delete_profile(id).await;
-                }
-                state.multi_select.clear();
+                state.confirmation = Some(ConfirmAction::DeleteProfiles(ids));
             } else if let Some(id) = state.selected_profile_id() {
                 state.confirmation = Some(ConfirmAction::DeleteProfile(id));
             }
@@ -701,6 +714,9 @@ fn render(frame: &mut Frame, state: &AppState) {
     if overlay {
         render_tabs(frame, chunks[0], state);
         actions_log::render_full(frame, chunks[1], state);
+        if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
+            render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
+        }
         status_bar::render(frame, chunks[3], state);
         return;
     }
@@ -729,6 +745,9 @@ fn render(frame: &mut Frame, state: &AppState) {
         if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
             profiles::render(frame, chunks[1], state);
             render_speed_test_menu(frame, chunks[1], state);
+            if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
+                render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
+            }
             status_bar::render(frame, chunks[3], state);
             return;
         }
@@ -736,6 +755,9 @@ fn render(frame: &mut Frame, state: &AppState) {
         if matches!(&state.mode, crate::AppMode::TargetPicker { .. }) {
             logs::render(frame, chunks[1], state);
             logs::render_target_picker(frame, chunks[1], state);
+            if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
+                render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
+            }
             status_bar::render(frame, chunks[3], state);
             return;
         }
@@ -748,6 +770,9 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Tab::Statistics => statistics::render(frame, chunks[1], state),
             }
             render_help_overlay(frame, chunks[1], state);
+            if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
+                render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
+            }
             status_bar::render(frame, chunks[3], state);
             return;
         }
@@ -776,15 +801,21 @@ fn render(frame: &mut Frame, state: &AppState) {
             }
             _ => {}
         }
+        if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
+            render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
+        }
         status_bar::render(frame, chunks[3], state);
         return;
+    
     }
-
     match state.current_tab {
         Tab::Profiles => profiles::render(frame, chunks[1], state),
         Tab::Settings => settings::render(frame, chunks[1], state),
         Tab::Logs => logs::render(frame, chunks[1], state),
         Tab::Statistics => statistics::render(frame, chunks[1], state),
+    }
+    if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
+        render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
     }
     status_bar::render(frame, chunks[3], state);
 }
@@ -833,8 +864,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("Home / End", "Jump to oldest/newest"),
                     ("c", "Clear log cache"),
                     ("Del", "Purge all logs from database"),
-                    ("t", "Toggle TUI logs"),
-                    ("v", "Toggle validation/subscription logs"),
+                    ("t", "Open target filter"),
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),

@@ -319,19 +319,19 @@ right side shows contextual key hints.
 
 **Update indicator** — `[Update: xray]` or `[Update: xray, sing-box]` (yellow)
 appended when updates are available for installed backends.
-
 **Contextual hints (right side):**
+
 
 | Context                 | Hints                                    |
 | ----------------------- | ---------------------------------------- |
-| Profiles (disconnected) | `[F1] Actions Log  [Ctrl+Enter] Connect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
-| Profiles (connecting)   | `[F1] Actions Log  [Tab] Next  [?] Help  [Ctrl+Q] Quit`   |
- | Profiles (connected)    | `[F1] Actions Log  [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [Ctrl+Q] Quit` |
+| Profiles (disconnected) | `[F1] Actions Log  [Ctrl+Enter] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
+| Profiles (connecting)   | `[F1] Actions Log  [Tab] Next  [?] Help  [q/Ctrl+C] Quit`   |
+ | Profiles (connected)    | `[F1] Actions Log  [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
 | Settings menu           | `[↑↓] Navigate  [Enter] Open  [Esc] Close` |
 | Settings form           | `[Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel` |
 | Speed test menu         | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
 | Help overlay            | `[Esc] Close help`                       |
-| Logs / Statistics       | `[F1] Actions Log  [?] Help  [Ctrl+Q] Quit`               |
+| Logs / Statistics       | `[F1] Actions Log  [?] Help  [q/Ctrl+C] Quit`               |
 
 ## Keyboard Shortcuts — Full Reference
 
@@ -425,8 +425,7 @@ appended when updates are available for installed backends.
 
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |
-| `Ctrl+C`         | Quit application                    |
-| `Ctrl+Q`         | Quit application                    |
+| `q` / `Ctrl+C`   | Quit application                    |
 | `?`              | Help overlay (main screens only)    |
 
 ---

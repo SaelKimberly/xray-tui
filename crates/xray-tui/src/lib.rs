@@ -326,6 +326,7 @@ pub enum CoreEvent {
 
 pub enum ConfirmAction {
     DeleteProfile(String),
+    DeleteProfiles(Vec<String>),
     DeleteGroup(String),
     ClearGroup(String),
     ClearLogs,
@@ -742,6 +743,11 @@ impl AppState {
             message,
             timestamp_nanos,
         });
+        // Keep view stable when scrolled up: adjust scroll by 1 so offset
+        // doesn't shift. When at bottom (scroll == 0), stay at bottom.
+        if self.log_scroll != 0 {
+            self.log_scroll = self.log_scroll.saturating_add(1);
+        }
         if self.log_cache.len() > 10000 {
             self.log_cache.truncate(10000);
         }
