@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::ui::theme::ThemeStyles;
 use crate::{
     AppMode, AppState, BackendUpdateStatus, SettingsMode, SettingsSection, SplitFocus,
-    SplitRightPane,
+    SplitRightPane, Tab,
 };
 use ratatui_cheese::tree::{Tree, TreeState, TreeStyles};
 use xray_tui_core::CoreType;
@@ -376,9 +376,23 @@ async fn handle_tree_key(state: &mut AppState, key: &KeyEvent) {
         return;
     }
 
-    // Handle Esc separately to set mode
-    if key.code == KeyCode::Esc {
+    // Handle Tab/BackTab to exit Settings mode and cycle tabs
+    if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
         state.mode = AppMode::List;
+        let idx = Tab::ALL
+            .iter()
+            .position(|t| *t == state.current_tab)
+            .unwrap_or(0);
+        state.current_tab = match key.code {
+            KeyCode::Tab => Tab::ALL[(idx + 1) % Tab::ALL.len()],
+            _ => {
+                if idx == 0 {
+                    Tab::ALL[Tab::ALL.len() - 1]
+                } else {
+                    Tab::ALL[idx - 1]
+                }
+            }
+        };
         return;
     }
 

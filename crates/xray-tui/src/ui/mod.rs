@@ -460,6 +460,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 .position(|t| *t == state.current_tab)
                 .unwrap_or(0);
             state.current_tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
+            if state.current_tab == Tab::Settings && matches!(state.mode, AppMode::List) {
+                state.enter_settings();
+            }
         }
         KeyCode::BackTab => {
             let idx = Tab::ALL
@@ -471,6 +474,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             } else {
                 Tab::ALL[idx - 1]
             };
+            if state.current_tab == Tab::Settings && matches!(state.mode, AppMode::List) {
+                state.enter_settings();
+            }
         }
         KeyCode::Up if state.current_tab == Tab::Profiles => {
             state.selected_index = state.selected_index.saturating_sub(1);
