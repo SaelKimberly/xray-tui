@@ -74,23 +74,12 @@ pub struct LogLine {
     pub timestamp_nanos: i64,
 }
 
-/// Sub-modes for the Settings panel.
+/// Right pane content in the Settings split view.
 #[derive(Debug, Clone)]
-pub enum SettingsMode {
-    Menu {
-        selected: usize,
-    },
-    CoreForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    GuiForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    InboundForm {
+pub enum SplitRightPane {
+    Empty,
+    Form {
+        section: SettingsSection,
         fields: Vec<(String, String)>,
         focus_index: usize,
         form_errors: HashMap<String, String>,
@@ -104,53 +93,42 @@ pub enum SettingsMode {
         focus_index: usize,
         form_errors: HashMap<String, String>,
     },
-    DnsForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    SystemProxyForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    TunForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    MuxForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    StatsForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
     UpdateForm {
         status_xray: BackendUpdateStatus,
         status_singbox: BackendUpdateStatus,
     },
-    ProtocolCoreForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    SpeedTestForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
-    },
-    LoggingForm {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-        form_errors: HashMap<String, String>,
+}
+
+/// Which pane has focus in the Settings split view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitFocus {
+    Tree,
+    Right,
+}
+
+use ratatui_cheese::tree::TreeState;
+
+/// Sub-modes for the Settings panel.
+#[derive(Debug)]
+pub enum SettingsMode {
+    Split {
+        tree: RefCell<TreeState>,
+        focus: SplitFocus,
+        right: SplitRightPane,
     },
 }
 
-/// Identifies which section of the Settings panel is being edited.
+impl Clone for SettingsMode {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Split { tree, focus, right } => Self::Split {
+                tree: RefCell::new(tree.borrow().clone()),
+                focus: *focus,
+                right: right.clone(),
+            },
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Core,
@@ -1128,7 +1106,11 @@ impl AppState {
 
     pub fn enter_settings(&mut self) {
         self.mode = AppMode::Settings {
-            mode: SettingsMode::Menu { selected: 0 },
+            mode: SettingsMode::Split {
+                tree: RefCell::new(TreeState::all_expanded(5)),
+                focus: SplitFocus::Tree,
+                right: SplitRightPane::Empty,
+            },
         };
     }
 
@@ -1150,13 +1132,11 @@ impl AppState {
                     ),
                     (
                         "default_core".into(),
-                        format!(
-                            "{:?}",
-                            self.config
-                                .core
-                                .core_type
-                                .unwrap_or(xray_tui_core::CoreType::Auto)
-                        ),
+                        self.config
+                            .core
+                            .core_type
+                            .as_ref()
+                            .map_or_else(|| "Auto".into(), |ct| format!("{ct:?}")),
                     ),
                     ("log_level".into(), self.config.core.log_level.clone()),
                 ]
@@ -1549,86 +1529,32 @@ impl AppState {
         }
     }
 
-    pub async fn enter_settings_form(&mut self, section: SettingsSection) {
+    pub async fn build_right_pane(&mut self, section: SettingsSection) -> SplitRightPane {
         let fields = self.build_settings_fields(section).await;
-        let mode = match section {
-            SettingsSection::Core => SettingsMode::CoreForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::Gui => SettingsMode::GuiForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::Inbound => SettingsMode::InboundForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
+        match section {
             SettingsSection::Routing => {
                 self.reload_routing_rules().await;
-                SettingsMode::RoutingList { selected: 0 }
+                SplitRightPane::RoutingList { selected: 0 }
             }
-            SettingsSection::Dns => SettingsMode::DnsForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::SystemProxy => SettingsMode::SystemProxyForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::Tun => SettingsMode::TunForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::Mux => SettingsMode::MuxForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::Stats => SettingsMode::StatsForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::ProtocolCore => SettingsMode::ProtocolCoreForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-            SettingsSection::Updates => {
-                let status_xray = self
+            SettingsSection::Updates => SplitRightPane::UpdateForm {
+                status_xray: self
                     .update_status
                     .get(&CoreType::Xray)
                     .cloned()
-                    .unwrap_or_default();
-                let status_singbox = self
+                    .unwrap_or_default(),
+                status_singbox: self
                     .update_status
                     .get(&CoreType::SingBox)
                     .cloned()
-                    .unwrap_or_default();
-                SettingsMode::UpdateForm {
-                    status_xray,
-                    status_singbox,
-                }
-            }
-            SettingsSection::SpeedTest => SettingsMode::SpeedTestForm {
+                    .unwrap_or_default(),
+            },
+            _ => SplitRightPane::Form {
+                section,
                 fields,
                 focus_index: 0,
                 form_errors: HashMap::new(),
             },
-            SettingsSection::Logging => SettingsMode::LoggingForm {
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            },
-        };
-        self.mode = AppMode::Settings { mode };
+        }
     }
 
     pub fn save_settings_form(&mut self, section: SettingsSection, fields: &[(String, String)]) {
@@ -1638,7 +1564,6 @@ impl AppState {
         } else {
             self.log_trace("info", "tui", "Settings saved");
         }
-        self.enter_settings();
     }
 
     pub async fn save_routing_rule(
@@ -3399,9 +3324,13 @@ impl AppState {
                     // Refresh form snapshots if currently viewing the updates form
                     if let AppMode::Settings {
                         mode:
-                            SettingsMode::UpdateForm {
-                                status_xray,
-                                status_singbox,
+                            SettingsMode::Split {
+                                right:
+                                    SplitRightPane::UpdateForm {
+                                        status_xray,
+                                        status_singbox,
+                                    },
+                                ..
                             },
                     } = &mut self.mode
                     {
@@ -3459,9 +3388,13 @@ impl AppState {
                     // Refresh form snapshots if currently viewing the updates form
                     if let AppMode::Settings {
                         mode:
-                            SettingsMode::UpdateForm {
-                                status_xray,
-                                status_singbox,
+                            SettingsMode::Split {
+                                right:
+                                    SplitRightPane::UpdateForm {
+                                        status_xray,
+                                        status_singbox,
+                                    },
+                                ..
                             },
                     } = &mut self.mode
                     {

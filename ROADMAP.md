@@ -74,6 +74,7 @@
 - ✅ TUN mode config
 - ✅ Mux/fragment config
 - ✅ Statistics toggle
+:- ✅ Split-pane navigation (collapsible tree + form panel) — unified SettingsMode::Split replacing 10+ per-section form variants; Ctrl+W tree/form focus switching, SPLIT_SETTINGS_TREE const for easy section addition
 
 ## Phase 7 — Advanced Features
 

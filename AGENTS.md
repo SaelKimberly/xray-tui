@@ -15,7 +15,7 @@ cargo run
 
 ### Crate entry points
     - `crates/xray-tui/src/main.rs` — binary entry, tokio::main, TuiLogLayer tracing subscriber + subsystem init
-:- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode (incl. SpeedTestForm), SettingsSection (incl. SpeedTest), CoreEvent (incl. TestTypeUpdate), testing_details map
+:- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode (Split variant), SettingsSection (incl. SpeedTest), SplitFocus, SplitRightPane, CoreEvent (incl. TestTypeUpdate), testing_details map
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 :- `crates/xray-tui-db/src/lib.rs` — re-export hub; Database, DatabaseError, Result public
 :- `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
@@ -42,8 +42,7 @@ cargo run
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 :- `profiles.rs` — profile list DataGrid with connected indicator, IP info column, multi-sort indicators, graveyard group filter; multi-select, delete confirmation, batch import overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
-:- `settings.rs` — Settings panel with menu navigation, config forms (Core/GUI/Inbound/DNS/SystemProxy/TUN/Mux/Statistics/Protocol Core/SpeedTest/Logging), routing rules list+form, reorder. Full rewrite Phase 6.
-- `status_bar.rs` — bottom connection indicator + key hints
+:- `settings.rs` — Settings panel with split-pane tree+form view. Left pane: collapsible tree (SPLIT_SETTINGS_TREE const, SettingsSection-navigated). Right pane: Form, UpdateForm, Empty. Sections: Core, GUI, Inbound, System Proxy, TUN, Mux, Statistics, Protocol Core, SpeedTest, Logging, Routing Rules (list+form, reorder). Tree navigation (arrows) + form focus switching (Ctrl+W). Full rewrite. Replaced per-section SettingsMode variants with unified Split { tree, focus, right }.
 - `groups.rs` — system-group-aware management (is_system guard, clear action)
 - `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - `theme.rs` — central Palette-derived style methods (ThemeStyles struct) — static methods returning Style from a &Palette
@@ -96,8 +95,7 @@ TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR,
 Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
-**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Heed-backed log storage** (HeedLogStorage, LMDB, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. **Log subsystem overhaul** completed: non-blocking TuiLogLayer (std::sync::mpsc channel instead of direct heed writes), background batched heed writer (batch up to 100 messages per transaction, spawn_blocking), MapFull→resize_map with retry (1GB default, doubles up to 8GB, atomic counter instead of tracing events), async heed read wrappers (spawn_blocking for all reads), lazy log loading on first Logs tab access. **Theme system overhaul** completed: integrated ratatui-themes + ratatui-cheese crates, replaced hardcoded Theme Style constants with ThemeStyles + Palette pattern, added palette_bridge, extracted DataTable widget, added mouse support via tui-popup overlays.
-
+:**Phase overview**: Phases 0-6 (Foundation through Settings) are fully implemented. Phase 6 includes a split-pane settings refactor (unified SettingsMode::Split replacing per-section form variants). Phase 7 (Advanced Features) has completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Heed-backed log storage** (HeedLogStorage, LMDB, Settings→Logging form). Phase 8 (Polish) has completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. **Log subsystem overhaul** completed: non-blocking TuiLogLayer (std::sync::mpsc channel instead of direct heed writes), background batched heed writer (batch up to 100 messages per transaction, spawn_blocking), MapFull→resize_map with retry (1GB default, doubles up to 8GB, atomic counter instead of tracing events), async heed read wrappers (spawn_blocking for all reads), lazy log loading on first Logs tab access. **Theme system overhaul** completed: integrated ratatui-themes + ratatui-cheese crates, replaced hardcoded Theme Style constants with ThemeStyles + Palette pattern, added palette_bridge, extracted DataTable widget, added mouse support via tui-popup overlays.
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
 2. Create form fields in `crates/xray-tui-config/src/forms.rs` matching that protocol's parameters
@@ -154,7 +152,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 1. Create functions in `crates/xray-tui-core/src/updater.rs`: `get_current_version` (runs subprocess), `get_latest_version` (GitHub releases API), `download_release` (streaming download to temp dir), `install_binary` (extract to temp → verify → .bak → copy all → remove .bak on success/restore from .bak on failure)
 2. Add `UpdateCheckResult` and `UpdateCompleted` variants to `CoreEvent` enum in `crates/xray-tui/src/lib.rs`; handle them in `poll_core_events()` to update `update_status: HashMap<CoreType, BackendUpdateStatus>`
 3. Add `spawn_update_check()` and `spawn_update_download()` methods on `AppState` — each spawns a tokio task that calls updater functions and sends results back through the core event channel
-4. Add `UpdateForm` to `SettingsMode` and `Updates` to `SettingsSection`; wire into `enter_settings_form()` with snapshot of current status
+4. Add `UpdateForm` to `SplitRightPane` and `Updates` to `SettingsSection`; wire into `build_right_pane()` with snapshot of current status
 5. Create `render_update_form()` and `handle_update_form_key()` in `settings.rs` — C triggers check, D triggers download for all available updates, Esc goes back
 6. Add update-available indicator (colored `[Update: ...]`) to `status_bar.rs`
 7. Add startup check in `ui::run()` gated by `config.updates.check_on_startup`

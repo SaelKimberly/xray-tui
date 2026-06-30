@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "j
 chrono = { version = "0.4" }
 humantime.workspace = true
 regex = "1"
+url.workspace = true
 
 [lints]
 workspace = true

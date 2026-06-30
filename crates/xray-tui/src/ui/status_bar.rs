@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::SettingsSection;
 use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -105,22 +106,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     // Mode indicator prefix
     let mode_prefix = match &state.mode {
         crate::AppMode::Settings { mode } => match mode {
-            crate::SettingsMode::Menu { .. } => " Settings",
-            crate::SettingsMode::CoreForm { .. } => " Settings > Core",
-            crate::SettingsMode::GuiForm { .. } => " Settings > GUI",
-            crate::SettingsMode::InboundForm { .. } => " Settings > Inbound",
-            crate::SettingsMode::SystemProxyForm { .. } => " Settings > System Proxy",
-            crate::SettingsMode::TunForm { .. } => " Settings > TUN",
-            crate::SettingsMode::MuxForm { .. } => " Settings > Mux",
-            crate::SettingsMode::StatsForm { .. } => " Settings > Statistics",
-            crate::SettingsMode::DnsForm { .. } => " Settings > DNS",
-            crate::SettingsMode::RoutingList { .. } | crate::SettingsMode::RoutingForm { .. } => {
-                " Settings > Routing"
-            }
-            crate::SettingsMode::UpdateForm { .. } => " Settings > Updates",
-            crate::SettingsMode::ProtocolCoreForm { .. } => " Settings > Protocol Core",
-            crate::SettingsMode::LoggingForm { .. } => " Settings > Logging",
-            crate::SettingsMode::SpeedTestForm { .. } => " Settings > Speed Test",
+            crate::SettingsMode::Split { right, .. } => match right {
+                crate::SplitRightPane::Empty => " Settings",
+                crate::SplitRightPane::Form { section, .. } => status_bar_section_label(*section),
+                crate::SplitRightPane::RoutingList { .. }
+                | crate::SplitRightPane::RoutingForm { .. } => " Settings > Routing",
+                crate::SplitRightPane::UpdateForm { .. } => " Settings > Updates",
+            },
         },
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",
@@ -175,11 +167,29 @@ const fn build_hints(state: &AppState) -> &'static str {
     match &state.mode {
         crate::AppMode::SpeedTestMenu { .. } => " [↑↓] Navigate  [Enter] Select  [Esc] Close ",
         crate::AppMode::Settings { mode } => match mode {
-            crate::SettingsMode::Menu { .. } => " [↑↓] Navigate  [Enter] Open  [Esc] Close ",
-            _ => " [Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel ",
+            crate::SettingsMode::Split { focus, right, .. } => match focus {
+                crate::SplitFocus::Tree => {
+                    " [↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Esc] Close "
+                }
+                crate::SplitFocus::Right => match right {
+                    crate::SplitRightPane::Empty => " [Ctrl+W] Focus Tree ",
+                    crate::SplitRightPane::Form { .. } => {
+                        " [Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back "
+                    }
+                    crate::SplitRightPane::RoutingList { .. } => {
+                        " [↑/↓] Navigate  [A] Add  [E] Edit  [D] Delete  [Ctrl+W] Focus Tree  [Esc] Back "
+                    }
+                    crate::SplitRightPane::RoutingForm { .. } => {
+                        " [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back "
+                    }
+                    crate::SplitRightPane::UpdateForm { .. } => {
+                        " [C] Check  [D] Download  [Ctrl+W] Focus Tree  [Esc] Back "
+                    }
+                },
+            },
         },
         _ => {
-            // Default tab-based hints
+            // Default tab-based hints for non-Settings modes
             match state.current_tab {
                 crate::Tab::Profiles => {
                     if matches!(state.mode, crate::AppMode::ManageGroups { .. }) {
@@ -192,9 +202,26 @@ const fn build_hints(state: &AppState) -> &'static str {
                         " [g] Groups  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     }
                 }
-                crate::Tab::Settings => " [Enter] Open  [q/Ctrl+C] Quit ",
-                crate::Tab::Logs | crate::Tab::Statistics => " [q/Ctrl+C] Quit ",
+                _ => " [q/Ctrl+C] Quit ",
             }
         }
+    }
+}
+
+const fn status_bar_section_label(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Core => " Settings > Core",
+        SettingsSection::Gui => " Settings > GUI",
+        SettingsSection::Inbound => " Settings > Inbound",
+        SettingsSection::Dns => " Settings > DNS",
+        SettingsSection::SystemProxy => " Settings > System Proxy",
+        SettingsSection::Tun => " Settings > TUN",
+        SettingsSection::Mux => " Settings > Mux",
+        SettingsSection::Stats => " Settings > Statistics",
+        SettingsSection::ProtocolCore => " Settings > Protocol Core",
+        SettingsSection::SpeedTest => " Settings > Speed Test",
+        SettingsSection::Logging => " Settings > Logging",
+        SettingsSection::Updates => " Settings > Updates",
+        SettingsSection::Routing => " Settings > Routing",
     }
 }
