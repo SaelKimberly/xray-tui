@@ -772,3 +772,257 @@ pub(crate) async fn upsert_dns_settings_inner(
     .await?;
     Ok(())
 }
+
+// ── Ping batch inner helpers ───────────────────────────────────────────
+
+#[inline]
+pub(crate) async fn create_ping_batch_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+    group_id: Option<&str>,
+) -> Result<usize> {
+    let rows = conn
+        .execute(
+            "WITH source AS (
+                SELECT gp.id as profile_id, pc.config_type, pc.core_type, pc.address, pc.port
+                FROM group_profiles gp
+                JOIN profile_cores pc ON pc.sub_uid = gp.sub_uid
+                WHERE (?2 IS NULL OR gp.group_id = ?2)
+                  AND pc.address IS NOT NULL
+                  AND pc.port > 0
+                  AND pc.port <= 65535
+            ),
+            distinct_t AS (
+                SELECT DISTINCT config_type, address, port
+                FROM source
+            ),
+            ranked_t AS (
+                SELECT config_type, address, port,
+                       COUNT(*) OVER (ORDER BY config_type, address, port) as triplet_rank
+                FROM distinct_t
+            )
+            INSERT INTO ping_sessions (id, batch_id, profile_id, config_type, core_type, address, port, triplet_rank, ping_type)
+            SELECT
+                lower(hex(randomblob(16))),
+                ?1,
+                s.profile_id,
+                s.config_type,
+                s.core_type,
+                s.address,
+                s.port,
+                r.triplet_rank,
+                'fast'
+            FROM source s
+            JOIN ranked_t r ON r.config_type = s.config_type AND r.address = s.address AND r.port = s.port",
+            turso::params![batch_id, group_id],
+        )
+        .await?;
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(rows as usize)
+}
+
+#[inline]
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) async fn get_ping_batch_page_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<PingSession>> {
+    let mut stmt = conn
+        .prepare("SELECT * FROM ping_sessions WHERE batch_id = ?1 ORDER BY triplet_rank, profile_id LIMIT ?2 OFFSET ?3")
+        .await?;
+    let mut rows = stmt
+        .query(turso::params![batch_id, limit as i64, offset as i64])
+        .await?;
+    let mut sessions = Vec::new();
+    while let Some(row) = rows.next().await? {
+        sessions.push(PingSession::from_row(&row)?);
+    }
+    Ok(sessions)
+}
+#[inline]
+pub(crate) async fn batch_update_ping_results_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+    results: &[PingResultUpdate],
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(
+            "UPDATE ping_sessions SET status = ?2, ping_type = ?3, latency_ms = ?4, speed_bps = ?5, ip_info = ?6, error = ?7, updated_at = datetime('now') WHERE id = ?1 AND batch_id = ?8",
+        )
+        .await?;
+    for r in results {
+        stmt.execute(turso::params![
+            r.session_id.as_str(),
+            r.status.as_str(),
+            r.ping_type.as_str(),
+            r.latency_ms,
+            r.speed_bps,
+            r.ip_info.as_deref(),
+            r.error.as_deref(),
+            batch_id,
+        ])
+        .await?;
+    }
+    Ok(())
+}
+
+#[inline]
+pub(crate) async fn cancel_ping_batch_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+) -> Result<usize> {
+    let rows = conn
+        .execute(
+            "UPDATE ping_sessions SET status = 'cancelled', updated_at = datetime('now') WHERE batch_id = ?1 AND status IN ('queued', 'fast_pinging', 'real_pinging')",
+            turso::params![batch_id],
+        )
+        .await?;
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(rows as usize)
+}
+pub(crate) async fn cleanup_ping_batch_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM ping_sessions WHERE batch_id = ?1 AND status IN ('completed', 'failed', 'cancelled')",
+        turso::params![batch_id],
+    )
+    .await?;
+    Ok(())
+}
+
+#[inline]
+pub(crate) async fn update_session_status_inner(
+    conn: &turso::Connection,
+    session_id: &str,
+    status: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE ping_sessions SET status = ?2, updated_at = datetime('now') WHERE id = ?1",
+        turso::params![session_id, status],
+    )
+    .await?;
+    Ok(())
+}
+
+#[inline]
+pub(crate) async fn update_session_ping_type_inner(
+    conn: &turso::Connection,
+    session_id: &str,
+    ping_type: &str,
+    new_status: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE ping_sessions SET ping_type = ?2, status = ?3, updated_at = datetime('now') WHERE id = ?1",
+        turso::params![session_id, ping_type, new_status],
+    )
+    .await?;
+    Ok(())
+}
+
+#[inline]
+pub(crate) async fn batch_upsert_profile_extensions_inner(
+    conn: &turso::Connection,
+    extensions: &[ProfileExtension],
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO profile_extensions (profile_id, delay, speed, ip_info)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(profile_id) DO UPDATE SET
+               delay = COALESCE(?2, delay),
+               speed = COALESCE(?3, speed),
+               ip_info = COALESCE(?4, ip_info)",
+        )
+        .await?;
+    for ext in extensions {
+        stmt.execute(turso::params![
+            ext.profile_id.as_str(),
+            ext.delay,
+            ext.speed,
+            ext.ip_info.as_deref(),
+        ])
+        .await?;
+    }
+    Ok(())
+}
+#[inline]
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) async fn get_batch_page_ready_for_fast_ping_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+    limit: usize,
+) -> Result<Vec<PingSession>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM ping_sessions
+             WHERE batch_id = ?1 AND status = 'queued' AND ping_type = 'fast'
+             ORDER BY triplet_rank, profile_id
+             LIMIT ?2",
+        )
+        .await?;
+    let mut rows = stmt.query(turso::params![batch_id, limit as i64]).await?;
+    let mut sessions = Vec::new();
+    while let Some(row) = rows.next().await? {
+        sessions.push(PingSession::from_row(&row)?);
+    }
+    Ok(sessions)
+}
+#[inline]
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) async fn get_batch_page_ready_for_real_ping_inner(
+    conn: &turso::Connection,
+    batch_id: &str,
+    limit: usize,
+) -> Result<Vec<(PingSession, Profile)>> {
+    // Query returns 35 columns: 19 profile fields (ProfileCol order), then 16 ping_sessions fields (PingSessionCol order)
+    // Profile fields at offset 0-18, PingSession fields at offset 19-34
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                gp.id, gp.sub_uid, gp.group_id, gp.remarks, gp.is_sub, gp.sub_id,
+                gp.sort_order, gp.is_active, gp.updated_at,
+                pc.config_type, pc.core_type, pc.address, pc.port, pc.user_id,
+                pc.security, pc.network, pc.stream_settings, pc.protocol_settings,
+                COALESCE(gp.created_at, pc.created_at) AS created_at,
+                ps.id, ps.batch_id, ps.profile_id, ps.config_type, ps.core_type,
+                ps.address, ps.port, ps.triplet_rank, ps.ping_type, ps.status,
+                ps.latency_ms, ps.speed_bps, ps.ip_info, ps.error,
+                ps.created_at, ps.updated_at
+             FROM ping_sessions ps
+             JOIN group_profiles gp ON gp.id = ps.profile_id
+             JOIN profile_cores pc ON pc.sub_uid = gp.sub_uid
+             WHERE ps.batch_id = ?1 AND ps.status = 'queued' AND ps.ping_type = 'real'
+             ORDER BY ps.triplet_rank, ps.profile_id
+             LIMIT ?2",
+        )
+        .await?;
+    let mut rows = stmt.query(turso::params![batch_id, limit as i64]).await?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let profile = Profile::from_row(&row)?;
+        let session = PingSession {
+            id: row.get::<String>(19)?,
+            batch_id: row.get::<String>(20)?,
+            profile_id: row.get::<String>(21)?,
+            config_type: row.get::<i32>(22)?,
+            core_type: row.get::<String>(23)?,
+            address: row.get::<Option<String>>(24)?,
+            port: row.get::<Option<i32>>(25)?,
+            triplet_rank: row.get::<i32>(26)?,
+            ping_type: row.get::<String>(27)?,
+            status: row.get::<String>(28)?,
+            latency_ms: row.get::<Option<i32>>(29)?,
+            speed_bps: row.get::<Option<i32>>(30)?,
+            ip_info: row.get::<Option<String>>(31)?,
+            error: row.get::<Option<String>>(32)?,
+            created_at: row.get::<Option<String>>(33)?,
+            updated_at: row.get::<Option<String>>(34)?,
+        };
+        results.push((session, profile));
+    }
+    Ok(results)
+}

@@ -70,6 +70,27 @@ pub(crate) enum ServerStatCol {
     LastUpdated,
 }
 
+/// Column indices for `ping_sessions` table (SELECT * order).
+#[repr(usize)]
+pub(crate) enum PingSessionCol {
+    Id = 0,
+    BatchId,
+    ProfileId,
+    ConfigType,
+    CoreType,
+    Address,
+    Port,
+    TripletRank,
+    PingType,
+    Status,
+    LatencyMs,
+    SpeedBps,
+    IpInfo,
+    Error,
+    CreatedAt,
+    UpdatedAt,
+}
+
 /// Column indices for `routing_rules` table (SELECT * order).
 #[repr(usize)]
 pub(crate) enum RoutingRuleCol {

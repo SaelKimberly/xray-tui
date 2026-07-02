@@ -159,3 +159,36 @@ pub struct ServerStat {
     pub total_down: Option<i32>,
     pub last_updated: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingSession {
+    pub id: String,
+    pub batch_id: String,
+    pub profile_id: String,
+    pub config_type: i32,
+    pub core_type: String,
+    pub address: Option<String>,
+    pub port: Option<i32>,
+    pub triplet_rank: i32,
+    pub ping_type: String,
+    pub status: String,
+    pub latency_ms: Option<i32>,
+    pub speed_bps: Option<i32>,
+    pub ip_info: Option<String>,
+    pub error: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Result update for a single ping session — used to batch-write to DB.
+#[derive(Debug, Clone)]
+pub struct PingResultUpdate {
+    pub session_id: String,
+    pub profile_id: String,
+    pub status: String,
+    pub ping_type: String,
+    pub latency_ms: Option<i32>,
+    pub speed_bps: Option<i32>,
+    pub ip_info: Option<String>,
+    pub error: Option<String>,
+}

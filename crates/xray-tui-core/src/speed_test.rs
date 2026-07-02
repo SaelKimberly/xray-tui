@@ -51,6 +51,28 @@ pub async fn tcp_ping(
     }
 }
 
+/// Direct UDP ping: send a probe to `addr:port`, measure time to any response.
+/// Uses raw UDP (not through proxy). Timeout applied.
+/// Good for WireGuard endpoints, ShadowsocksR, and other UDP-based protocols.
+pub async fn udp_ping(
+    addr: &str,
+    port: u16,
+    test_timeout: Duration,
+) -> Result<Duration, SpeedTestError> {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect((addr, port)).await?;
+
+    let start = std::time::Instant::now();
+    socket.send(&[0u8]).await?;
+
+    let mut buf = [0u8; 64];
+    match timeout(test_timeout, socket.recv(&mut buf)).await {
+        Ok(Ok(_)) => Ok(start.elapsed()),
+        Ok(Err(e)) => Err(SpeedTestError::Io(e)),
+        Err(_) => Err(SpeedTestError::Timeout(test_timeout)),
+    }
+}
+
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 

@@ -512,7 +512,6 @@ fn form_field_defs_for_section(
             ("tcp_timeout_secs", "TCP Timeout", "Duration"),
             ("real_ping_timeout_secs", "Real Ping Timeout", "Duration"),
             ("batch_page_size", "Batch Page Size", "Number"),
-            ("batch_delay_secs", "Batch Delay", "Duration"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
             ("tcp_ping_concurrency", "TCP Ping Concurrency", "Number"),

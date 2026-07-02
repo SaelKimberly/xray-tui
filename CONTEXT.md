@@ -45,7 +45,9 @@ xray-tui/
 | **ALL_GROUP_ID** | Fixed UUID (`00000000-0000-0000-0000-000000000000`) identifying the system "All" group for showing every profile across groups |
 | **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update |
 | **Graveyard** | Destination group (`sub-graveyard`) for orphaned subscription profiles; purged after 24h |
-|- **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
+| **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
+| **Fast Ping** | Transport-level latency test using TCP handshake (TcpPingAdapter), UDP datagram (UdpPingAdapter), or QUIC handshake (QuicPingAdapter). Dispatched by FastPingManager based on protocol support. |
+| **PingSession** | SQLite record tracking a single ping attempt: batch_id, profile_id, adapter_type (TCP/UDP/QUIC), latency_ms, ip_info, error. Enables persistent history and async progress tracking via AtomicU16 counters. |
 | **Transport** | The network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around the transport |
 | **Config Type** | The proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |
@@ -63,6 +65,7 @@ xray-tui/
 - **Sing-box runs as a subprocess**; the TUI writes JSON config files and communicates via sing-box's experimental V2Ray API (gRPC compatible).
 - **TUI framework**: **Ratatui + Crossterm** (async via tokio).
 :- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `turso` for profiles, subscriptions, routing, DNS, stats. |
+- **Fast Ping architecture**: Transport-level latency tests via FastPingManager with adapter pattern. TcpPingAdapter (handshake), UdpPingAdapter (datagram), QuicPingAdapter (handshake). Protocols map to adapters automatically; unsupported protocols fall through to RealPingManager. PingSession table persists results with batch_id correlation. |
 :- **Log storage**: `TuiLogLayer` sends tracing events to the log channel (non-blocking, `std::sync::mpsc::Sender`), which is consumed by a background `spawn_blocking` batched writer. Uses `heed` (embedded LMDB) in `xray-tui-core::log_heed` with two databases: `logs` (u64 BE → postcard-encoded `LogMessage`) and `targets` (seen target string set). MapFull triggers automatic resize (1 GB default, doubles up to 8 GB). Async wrappers (`read_recent_async`, `read_newer_than_async`, `read_older_than_async`, `get_targets_async`) wrap LMDB reads in `spawn_blocking` for non-blocking async calls from the TUI event loop. Initial log loading is lazy (deferred to first Logs tab access). |
 :- **Theme system**: `ThemeStyles` (in `theme.rs`) replaces hardcoded `Style` constants with static methods taking `&Palette`. `Palette` comes from `ratatui_themes::ThemeName` → `Theme` → `palette_bridge::current_palette()`. Every screen uses `state.current_palette()` and `ThemeStyles::*` instead of bare `Color` values. New dependencies: `ratatui-cheese` (form widgets, `Palette`), `ratatui-themes` (theme definitions), `tui-popup` (overlays), `tui-scrollbar`. New modules: `palette_bridge`, `widgets/` (reusable `DataTable`). |
 - **Protocols in scope**: Everything supported natively by either Xray-core or Sing-box. No third binary backends.

@@ -83,6 +83,29 @@ impl ServerStat {
     }
 }
 
+impl PingSession {
+    pub(crate) fn from_row(row: &turso::Row) -> turso::Result<Self> {
+        Ok(Self {
+            id: row.get::<String>(PingSessionCol::Id as usize)?,
+            batch_id: row.get::<String>(PingSessionCol::BatchId as usize)?,
+            profile_id: row.get::<String>(PingSessionCol::ProfileId as usize)?,
+            config_type: row.get::<i32>(PingSessionCol::ConfigType as usize)?,
+            core_type: row.get::<String>(PingSessionCol::CoreType as usize)?,
+            address: row.get::<Option<String>>(PingSessionCol::Address as usize)?,
+            port: row.get::<Option<i32>>(PingSessionCol::Port as usize)?,
+            triplet_rank: row.get::<i32>(PingSessionCol::TripletRank as usize)?,
+            ping_type: row.get::<String>(PingSessionCol::PingType as usize)?,
+            status: row.get::<String>(PingSessionCol::Status as usize)?,
+            latency_ms: row.get::<Option<i32>>(PingSessionCol::LatencyMs as usize)?,
+            speed_bps: row.get::<Option<i32>>(PingSessionCol::SpeedBps as usize)?,
+            ip_info: row.get::<Option<String>>(PingSessionCol::IpInfo as usize)?,
+            error: row.get::<Option<String>>(PingSessionCol::Error as usize)?,
+            created_at: row.get::<Option<String>>(PingSessionCol::CreatedAt as usize)?,
+            updated_at: row.get::<Option<String>>(PingSessionCol::UpdatedAt as usize)?,
+        })
+    }
+}
+
 impl RoutingRule {
     pub(crate) fn from_row(row: &turso::Row) -> turso::Result<Self> {
         Ok(Self {

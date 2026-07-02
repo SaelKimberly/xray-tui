@@ -34,7 +34,13 @@ cargo run
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
 - `crates/xray-tui-db/src/models.rs` — Profile (computed JOIN view), ProfileCore (deduplicated server config), Group, Subscription, GRAVEYARD_GROUP_ID, ALL_GROUP_ID
-:- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (TCP ping, real ping with IP info, speed test, UDP test) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig. Batch versions (start_batch_ping, start_batch_then_real_ping) in `lib.rs` with concurrent TCP (`tcp_ping_concurrency`, default 20 via Semaphore), wave-ordered real pings, and stop-testing support (`speed_test_stop: Arc<AtomicBool>`).
+- `crates/xray-tui-core/src/speed_test.rs` — async speed test engine (tcp_ping, real_ping, speed_test, udp_test, udp_ping) using tokio + reqwest SOCKS5 proxy. RealPingResult includes latency + ISP info. Configurable via SpeedTestConfig. Batch versions (start_batch_ping, start_batch_then_real_ping) in `lib.rs` with FastPingManager dispatching TCP/UDP/QUIC adapters.
+- `crates/xray-tui-core/src/ping/mod.rs` — FastPingAdapter trait + FastPingManager adapter registry, PingCapability enum (Tcp/Udp/Quic/None), PingError, PingResult, ProfileKey structs
+- `crates/xray-tui-core/src/ping/adapters/mod.rs` — adapter trait registration, TcpPingAdapter, UdpPingAdapter (QuicPingAdapter gated by quic-ping feature)
+- `crates/xray-tui-core/src/ping/adapters/tcp.rs` — TCP handshake ping adapter supporting VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, Naive, AnyTLS, ShadowTLS, Tor, SSH, Redirect, TProxy, Mixed
+- `crates/xray-tui-core/src/ping/adapters/udp.rs` — direct UDP ping adapter for WireGuard and ShadowsocksR endpoints
+- `crates/xray-tui-core/src/ping/adapters/quic.rs` — QUIC handshake ping adapter (quic-ping feature) for QUIC-enabled protocols
+- `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager: launches temp core binary to test profile via SOCKS5 HTTP requests with IP info fetch
 :- `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
 
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel

@@ -4,20 +4,25 @@ use turso::Builder;
 use crate::error::{DatabaseError, Result};
 use crate::helpers::normalize_remark;
 use crate::inner::{
+    batch_update_ping_results_inner, batch_upsert_profile_extensions_inner,
+    cancel_ping_batch_inner, cleanup_ping_batch_inner, create_ping_batch_inner,
     delete_profile_inner, delete_routing_rule_inner, delete_subscriptions_by_group_inner,
     get_all_groups_inner, get_all_profiles_inner, get_all_profiles_with_details_inner,
-    get_all_routing_rules_inner, get_all_subscriptions_inner, get_dns_settings_inner,
-    get_groups_due_update_inner, get_profile_extension_inner, get_profile_inner,
-    get_profiles_by_group_inner, get_server_stats_inner, get_subscription_by_group_inner,
-    insert_group_inner, insert_profile_inner, insert_routing_rule_inner,
-    move_orphans_to_graveyard_inner, purge_graveyard_inner, reorder_profiles_inner,
-    reorder_routing_rules_inner, subscription_upsert_profiles_inner, update_group_inner,
-    update_profile_active_inner, update_profile_inner, update_routing_rule_inner,
-    upsert_dns_settings_inner, upsert_profile_extension_inner, upsert_server_stats_inner,
-    upsert_subscription_inner,
+    get_all_routing_rules_inner, get_all_subscriptions_inner,
+    get_batch_page_ready_for_fast_ping_inner, get_batch_page_ready_for_real_ping_inner,
+    get_dns_settings_inner, get_groups_due_update_inner, get_ping_batch_page_inner,
+    get_profile_extension_inner, get_profile_inner, get_profiles_by_group_inner,
+    get_server_stats_inner, get_subscription_by_group_inner, insert_group_inner,
+    insert_profile_inner, insert_routing_rule_inner, move_orphans_to_graveyard_inner,
+    purge_graveyard_inner, reorder_profiles_inner, reorder_routing_rules_inner,
+    subscription_upsert_profiles_inner, update_group_inner, update_profile_active_inner,
+    update_profile_inner, update_routing_rule_inner, update_session_ping_type_inner,
+    update_session_status_inner, upsert_dns_settings_inner, upsert_profile_extension_inner,
+    upsert_server_stats_inner, upsert_subscription_inner,
 };
 use crate::models::{
-    self, DnsSetting, Group, Profile, ProfileExtension, RoutingRule, ServerStat, Subscription,
+    self, DnsSetting, Group, PingResultUpdate, PingSession, Profile, ProfileExtension, RoutingRule,
+    ServerStat, Subscription,
 };
 use crate::schema;
 
@@ -440,6 +445,116 @@ impl Database {
         let mut conn = self.conn()?;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         upsert_dns_settings_inner(&tx, dns).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(())
+    }
+
+    // ── Ping batch management ──────────────────────────────────────────
+
+    pub async fn create_ping_batch(&self, batch_id: &str, group_id: Option<&str>) -> Result<usize> {
+        let conn = self.conn()?;
+        create_ping_batch_inner(&conn, batch_id, group_id).await
+    }
+
+    pub async fn get_ping_batch_page(
+        &self,
+        batch_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PingSession>> {
+        let conn = self.conn()?;
+        get_ping_batch_page_inner(&conn, batch_id, limit, offset).await
+    }
+
+    pub async fn batch_update_ping_results(
+        &self,
+        batch_id: &str,
+        results: &[PingResultUpdate],
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        batch_update_ping_results_inner(&tx, batch_id, results).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(())
+    }
+
+    pub async fn cancel_ping_batch(&self, batch_id: &str) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        let n = cancel_ping_batch_inner(&tx, batch_id).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(n)
+    }
+
+    pub async fn cleanup_ping_batch(&self, batch_id: &str) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        cleanup_ping_batch_inner(&tx, batch_id).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(())
+    }
+
+    pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        update_session_status_inner(&tx, session_id, status).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(())
+    }
+
+    pub async fn update_session_ping_type(
+        &self,
+        session_id: &str,
+        ping_type: &str,
+        new_status: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        update_session_ping_type_inner(&tx, session_id, ping_type, new_status).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(())
+    }
+
+    pub async fn get_batch_page_ready_for_fast_ping(
+        &self,
+        batch_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PingSession>> {
+        let conn = self.conn()?;
+        get_batch_page_ready_for_fast_ping_inner(&conn, batch_id, limit).await
+    }
+
+    pub async fn get_batch_page_ready_for_real_ping(
+        &self,
+        batch_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(PingSession, Profile)>> {
+        let conn = self.conn()?;
+        get_batch_page_ready_for_real_ping_inner(&conn, batch_id, limit).await
+    }
+
+    pub async fn batch_upsert_profile_extensions(
+        &self,
+        extensions: &[ProfileExtension],
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        batch_upsert_profile_extensions_inner(&tx, extensions).await?;
+        tx.commit().await.map_err(DatabaseError::Turso)?;
+        Ok(())
+    }
+
+    /// Flush both ping results and profile extensions in a single transaction.
+    pub async fn batch_flush_ping_buffer(
+        &self,
+        batch_id: &str,
+        results: &[PingResultUpdate],
+        extensions: &[ProfileExtension],
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
+        batch_update_ping_results_inner(&tx, batch_id, results).await?;
+        batch_upsert_profile_extensions_inner(&tx, extensions).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
         Ok(())
     }

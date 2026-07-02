@@ -18,10 +18,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
 use xray_tui_config::{AppConfig, ValidationSettings, ValidationSummary};
@@ -30,12 +30,13 @@ use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
-    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core,
+    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary,
+    ping::PingError, resolve_core,
 };
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, Profile, ProfileExtension, RoutingRule,
-    ServerStat, Subscription,
+    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, PingResultUpdate, Profile,
+    ProfileExtension, RoutingRule, ServerStat, Subscription,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -370,8 +371,6 @@ pub struct AppState {
     pub testing_profiles: HashSet<String>,
     /// Which test type is currently running per profile (for display).
     pub testing_details: HashMap<uuid::Uuid, TestType>,
-    /// Progress for batch tests: (completed, total)
-    pub test_progress: Option<(usize, usize)>,
     /// Cached update status for both backends.
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub actions_compact: bool,
@@ -379,6 +378,8 @@ pub struct AppState {
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
     pub last_test_tcp: Option<u64>,
+    /// Shared batch progress (total, completed) displayed in status bar.
+    pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
     pub current_traffic_up: i64,
@@ -405,17 +406,10 @@ pub struct AppState {
     /// Whether initial logs have been loaded from heed into `log_cache` yet.
     pub logs_loaded: bool,
 }
-/// Internal helper for batch ping deduplication.
-#[derive(Clone)]
-struct UniqueTarget {
-    key: (String, u16),
-    profile_ids: Vec<String>,
-}
-
 impl AppState {
     pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
         let theme_name = config.theme_name;
-        let (core_tx, core_rx) = tokio::sync::mpsc::channel(256);
+        let (core_tx, core_rx) = tokio::sync::mpsc::channel(65536);
         let mut state = Self {
             db,
             config,
@@ -452,7 +446,6 @@ impl AppState {
             updating_groups: HashSet::new(),
             testing_profiles: HashSet::new(),
             testing_details: HashMap::new(),
-            test_progress: None,
             system_stats: None,
             actions_compact: false,
             connected_profile_id: None,
@@ -466,6 +459,7 @@ impl AppState {
             core_task_handle: None,
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
+            batch_progress: None,
             term_height: Cell::new(80),
             heed_storage: None,
             last_seen_log_ns: 0,
@@ -727,7 +721,9 @@ impl AppState {
             self.log_scroll = self.log_scroll.saturating_add(1);
         }
         if self.log_cache.len() > 10000 {
-            self.log_cache.truncate(10000);
+            let excess = self.log_cache.len() - 10000;
+            self.log_cache.drain(0..excess);
+            self.log_scroll = self.log_scroll.saturating_sub(excess);
         }
     }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
@@ -1374,11 +1370,6 @@ impl AppState {
                         self.config.speed_test.batch_page_size.to_string(),
                     ),
                     (
-                        "batch_delay_secs".into(),
-                        humantime::format_duration(*self.config.speed_test.batch_delay_secs)
-                            .to_string(),
-                    ),
-                    (
                         "real_ping_retries".into(),
                         self.config.speed_test.real_ping_retries.to_string(),
                     ),
@@ -1505,9 +1496,6 @@ impl AppState {
                 }
                 if let Ok(v) = get_str("batch_page_size").parse::<usize>() {
                     self.config.speed_test.batch_page_size = v;
-                }
-                if let Ok(d) = humantime::parse_duration(get_str("batch_delay_secs")) {
-                    *self.config.speed_test.batch_delay_secs = d;
                 }
                 if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                     self.config.speed_test.real_ping_retries = v;
@@ -2184,10 +2172,12 @@ impl AppState {
         self.testing_profiles.insert(pid.clone());
         self.testing_details
             .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
-        let timeout_dur = std::time::Duration::from_secs(5);
+        let config_type = row.profile.config_type;
+        let timeout_dur = *self.config.speed_test.tcp_timeout_secs;
 
         tokio::spawn(async move {
-            let result = xray_tui_core::speed_test::tcp_ping(&addr, port, timeout_dur).await;
+            let fmgr = xray_tui_core::FastPingManager::new(timeout_dur);
+            let result = fmgr.ping(config_type, &addr, port).await;
             let (latency_ms, error) = match result {
                 Ok(dur) => (Some(dur.as_millis() as u64), None),
                 Err(e) => (None, Some(e.to_string())),
@@ -2501,152 +2491,32 @@ impl AppState {
         self.speed_test_stop.store(true, Ordering::Relaxed);
     }
 
-    /// Batch TCP ping all visible (filtered) profiles, deduplicating by address:port.
+    /// Batch TCP ping all visible (filtered) profiles — delegates to `start_batch_sieve`.
     pub fn start_batch_ping(&mut self) {
-        let visible: Vec<&ProfileRow> = self.filtered_profiles().collect();
-        if visible.is_empty() {
-            self.log_trace("info", "tui", "No profiles to ping");
-            return;
-        }
-
-        let tx = match &self.core_event_tx {
-            Some(tx) => tx.clone(),
-            None => return,
-        };
-
-        // Deduplicate: collect unique (address, port) pairs and the profiles that share them
-        let mut unique_targets: Vec<UniqueTarget> = Vec::new();
-        for row in &visible {
-            let addr = match &row.profile.address {
-                Some(a) => a.clone(),
-                None => continue,
-            };
-            let port = match row.profile.port {
-                Some(p) if p > 0 && p <= 65535 => p as u16,
-                _ => continue,
-            };
-            let key = (addr.clone(), port);
-            match unique_targets.iter_mut().find(|t| t.key == key) {
-                Some(t) => t.profile_ids.push(row.profile.id.clone()),
-                None => unique_targets.push(UniqueTarget {
-                    key,
-                    profile_ids: vec![row.profile.id.clone()],
-                }),
-            }
-        }
-
-        // All testing flags now set after the visible borrow is dropped
-        for target in &unique_targets {
-            for pid in &target.profile_ids {
-                self.testing_profiles.insert(pid.clone());
-                self.testing_details
-                    .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
-            }
-        }
-
-        let total = unique_targets.iter().map(|t| t.profile_ids.len()).sum();
-        self.test_progress = Some((0, total));
-        let timeout_dur = *self.config.speed_test.tcp_timeout_secs;
-        let batch_page_size = self.config.speed_test.batch_page_size;
-        let batch_delay = *self.config.speed_test.batch_delay_secs;
-        let tcp_concurrency = self.config.speed_test.tcp_ping_concurrency.max(1);
-        let stop_flag = self.speed_test_stop.clone();
-
-        tokio::spawn(async move {
-            use futures_util::future::join_all;
-            use tokio::sync::Semaphore;
-
-            let tcp_sem = Arc::new(Semaphore::new(tcp_concurrency));
-            // Track which profile IDs received a result (to avoid double-emission on cancel)
-            let mut tested_pids: HashSet<String> = HashSet::new();
-
-            'outer: for chunk in unique_targets.chunks(batch_page_size) {
-                if stop_flag.load(Ordering::Relaxed) {
-                    break 'outer;
-                }
-
-                let mut handles = Vec::with_capacity(chunk.len());
-                for target in chunk {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let permit = match tcp_sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    let tx = tx.clone();
-                    let target = target.clone();
-                    handles.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let result = xray_tui_core::speed_test::tcp_ping(
-                            &target.key.0,
-                            target.key.1,
-                            timeout_dur,
-                        )
-                        .await;
-                        let (latency_ms, error) = match result {
-                            Ok(dur) => (Some(dur.as_millis() as u64), None),
-                            Err(e) => (None, Some(e.to_string())),
-                        };
-
-                        for pid in &target.profile_ids {
-                            try_send_or_warn(
-                                &tx,
-                                CoreEvent::SpeedTestResult {
-                                    profile_id: pid.clone(),
-                                    test_type: TestType::TcpPing,
-                                    latency_ms,
-                                    speed_bps: None,
-                                    ip_info: None,
-                                    error: error.clone(),
-                                },
-                                "batch_tcp_ping",
-                            );
-                        }
-                        target.profile_ids
-                    }));
-                }
-                // Collect results and track which profiles were tested
-                for pids in join_all(handles).await.into_iter().flatten() {
-                    for pid in pids {
-                        tested_pids.insert(pid);
-                    }
-                }
-                tokio::time::sleep(batch_delay).await;
-            }
-
-            // If stopped, emit cancellation for profiles that never got a result
-            if stop_flag.load(Ordering::Relaxed) {
-                for chunk in unique_targets.chunks(batch_page_size) {
-                    for target in chunk {
-                        for pid in &target.profile_ids {
-                            if !tested_pids.contains(pid) {
-                                try_send_or_warn(
-                                    &tx,
-                                    CoreEvent::SpeedTestResult {
-                                        profile_id: pid.clone(),
-                                        test_type: TestType::TcpPing,
-                                        latency_ms: None,
-                                        speed_bps: None,
-                                        ip_info: None,
-                                        error: Some("Cancelled".to_string()),
-                                    },
-                                    "batch_cancelled",
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        self.start_batch_sieve(false);
     }
 
-    /// Batch TCP ping all visible profiles, then for TCP-successful targets run real ping
-    /// via a temporary core per target.
+    /// Batch TCP ping all visible profiles, then real ping TCP-successful targets via temp core.
+    /// Delegates to `start_batch_sieve`.
     pub fn start_batch_then_real_ping(&mut self) {
+        self.start_batch_sieve(true);
+    }
+    /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
+    /// Uses DB-backed `ping_sessions` table for queue management.
+    /// Phase 1 drains fast-pingable profiles quickly; Phase 2 handles remaining via temp core.
+    #[allow(clippy::needless_collect)]
+    pub fn start_batch_sieve(&mut self, real_ping_enabled: bool) {
         let visible: Vec<&ProfileRow> = self.filtered_profiles().collect();
         if visible.is_empty() {
-            self.log_trace("info", "tui", "No profiles to test");
+            self.log_trace(
+                "info",
+                "tui",
+                if real_ping_enabled {
+                    "No profiles to test"
+                } else {
+                    "No profiles to ping"
+                },
+            );
             return;
         }
 
@@ -2654,67 +2524,15 @@ impl AppState {
             Some(tx) => tx.clone(),
             None => return,
         };
+        let db = self.db.clone();
+        let stop_flag = self.speed_test_stop.clone();
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let page_size = self.config.speed_test.batch_page_size.max(1);
+        let group_id = self.selected_group_id.clone();
 
-        // Deduplicate: collect unique (address, port) pairs
-        let mut unique_targets: Vec<UniqueTarget> = Vec::new();
-        for row in &visible {
-            let addr = match &row.profile.address {
-                Some(a) => a.clone(),
-                None => continue,
-            };
-            let port = match row.profile.port {
-                Some(p) if p > 0 && p <= 65535 => p as u16,
-                _ => continue,
-            };
-            let key = (addr.clone(), port);
-            match unique_targets.iter_mut().find(|t| t.key == key) {
-                Some(t) => t.profile_ids.push(row.profile.id.clone()),
-                None => unique_targets.push(UniqueTarget {
-                    key,
-                    profile_ids: vec![row.profile.id.clone()],
-                }),
-            }
-        }
-
-        // Store ALL profiles per target (not just one representative)
-        let mut batch_targets: Vec<(UniqueTarget, Vec<Profile>)> = Vec::new();
-        for target in &unique_targets {
-            let profiles: Vec<Profile> = visible
-                .iter()
-                .filter(|r| target.profile_ids.contains(&r.profile.id))
-                .map(|r| r.profile.clone())
-                .collect();
-            if !profiles.is_empty() {
-                batch_targets.push((target.clone(), profiles));
-            }
-        }
-
-        if batch_targets.is_empty() {
-            self.log_trace("info", "tui", "No valid targets found");
-            return;
-        }
-
-        // Set all testing flags
-        for (target, _) in &batch_targets {
-            for pid in &target.profile_ids {
-                self.testing_profiles.insert(pid.clone());
-                self.testing_details
-                    .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
-            }
-        }
-
-        let total_profiles: usize = batch_targets.iter().map(|(t, _)| t.profile_ids.len()).sum();
-        // Total progress = TCP results + real ping results
-        let total_steps = total_profiles + total_profiles; // each profile appears in both phases
-        self.test_progress = Some((0, total_steps));
-
-        let tcp_timeout = *self.config.speed_test.tcp_timeout_secs;
+        let fast_timeout = *self.config.speed_test.tcp_timeout_secs;
         let real_ping_timeout = *self.config.speed_test.real_ping_timeout_secs;
-        let batch_page_size = self.config.speed_test.batch_page_size;
-        let batch_delay = *self.config.speed_test.batch_delay_secs;
         let retries = self.config.speed_test.real_ping_retries;
-        let concurrency = self.config.speed_test.real_ping_concurrency;
-        let tcp_concurrency = self.config.speed_test.tcp_ping_concurrency.max(1);
         let ping_url = self.config.speed_test.ping_url.clone();
         let ip_api_url = self.config.speed_test.ip_api_url.clone();
         let proxy_addr = self.config.inbound.listen.clone();
@@ -2725,306 +2543,297 @@ impl AppState {
             .join("xray-tui");
         let bin_dir = config_dir_path.join("bin");
         let bin_configs_dir = config_dir_path.join("binConfigs");
-        let stop_flag = self.speed_test_stop.clone();
+        let real_ping_concurrency = self.config.speed_test.real_ping_concurrency.max(1);
+
+        // Set up shared batch progress for status bar display
+        let total_count = visible.len() as u16;
+        let progress = Arc::new((AtomicU16::new(total_count), AtomicU16::new(0)));
+        self.batch_progress = Some(progress.clone());
 
         tokio::spawn(async move {
-            use futures_util::future::join_all;
-            use std::sync::Arc;
-            use std::sync::atomic::{AtomicU16, Ordering};
-            use tokio::sync::Semaphore;
+            use std::sync::atomic::Ordering;
 
-            /// Wave-order the entries: one profile from each host:port group first,
-            /// then one more from each group, etc. This prioritizes unique targets.
-            fn wave_order(
-                entries: Vec<(UniqueTarget, Vec<Profile>)>,
-            ) -> Vec<(Profile, (String, u16))> {
-                let mut groups: Vec<(String, u16, std::vec::IntoIter<Profile>)> = entries
-                    .into_iter()
-                    .map(|(t, profiles)| (t.key.0, t.key.1, profiles.into_iter()))
-                    .collect();
-                let mut result = Vec::new();
-                loop {
-                    let mut any_remaining = false;
-                    for (addr, port, iter) in &mut groups {
-                        if let Some(profile) = iter.next() {
-                            any_remaining = true;
-                            result.push((profile, (addr.clone(), *port)));
-                        }
-                    }
-                    if !any_remaining {
-                        break;
-                    }
+            // 1. Snapshot visible profiles into ping_sessions table
+            let count = db.create_ping_batch(&batch_id, group_id.as_deref()).await;
+            let count = match count {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(target: "tui", "create_ping_batch failed: {e}");
+                    progress.0.store(0, Ordering::Relaxed);
+                    return;
                 }
-                result
+            };
+            if count == 0 {
+                tracing::warn!(target: "tui", "create_ping_batch returned 0 — no matching profile_cores?");
+                progress.0.store(0, Ordering::Relaxed);
+                return;
             }
 
-            let real_ping_semaphore = Arc::new(Semaphore::new(concurrency));
-            let next_port = Arc::new(AtomicU16::new(base_proxy_port + 1));
-            let tcp_sem = Arc::new(Semaphore::new(tcp_concurrency));
-            let mut tcp_successes: Vec<(UniqueTarget, Vec<Profile>)> = Vec::new();
-            // Track all profile IDs that completed Phase 1 (success or failure)
-            let mut tcp_completed: HashSet<String> = HashSet::new();
+            let mut buffer: Vec<PingResultUpdate> = Vec::new();
 
-            // ── Phase 1: Concurrent TCP ping (paginated) ──
-            'phase1: for chunk in batch_targets.chunks(batch_page_size) {
-                if stop_flag.load(Ordering::Relaxed) {
-                    break 'phase1;
-                }
+            // 2. Initialize managers
+            let fmgr = xray_tui_core::FastPingManager::new(fast_timeout);
+            let rmgr = xray_tui_core::RealPingManager {
+                ping_url,
+                ip_api_url,
+                timeout: real_ping_timeout,
+                retries,
+                proxy_addr,
+                base_proxy_port,
+                bin_dir,
+                bin_configs_dir,
+            };
 
-                let mut tcp_handles = Vec::with_capacity(chunk.len());
-
-                for item in chunk {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let permit = match tcp_sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    let target = item.0.clone();
-                    let tx = tx.clone();
-                    let tcp_timeout = tcp_timeout;
-
-                    tcp_handles.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let result = xray_tui_core::speed_test::tcp_ping(
-                            &target.key.0,
-                            target.key.1,
-                            tcp_timeout,
-                        )
-                        .await;
-                        let (latency_ms, error) = match result {
-                            Ok(dur) => (Some(dur.as_millis() as u64), None),
-                            Err(e) => (None, Some(e.to_string())),
-                        };
-
-                        // Emit TCP results for all profiles sharing this target
-                        for pid in &target.profile_ids {
-                            try_send_or_warn(
-                                &tx,
-                                CoreEvent::SpeedTestResult {
-                                    profile_id: pid.clone(),
-                                    test_type: TestType::TcpPing,
-                                    latency_ms,
-                                    speed_bps: None,
-                                    ip_info: None,
-                                    error: error.clone(),
-                                },
-                                "batch_tcp_ping_result",
-                            );
-                        }
-                        (target, latency_ms)
-                    }));
-                }
-
-                // Collect TCP results, accumulate successes and completed set
-                for (target, latency_ms) in join_all(tcp_handles).await.into_iter().flatten() {
-                    for pid in &target.profile_ids {
-                        tcp_completed.insert(pid.clone());
-                    }
-                    if latency_ms.is_some() {
-                        // Re-extract profiles from batch_targets (avoid cloning into spawn)
-                        if let Some((_, profiles)) =
-                            batch_targets.iter().find(|(t, _)| t.key == target.key)
-                        {
-                            tcp_successes.push((target, profiles.clone()));
-                        }
-                    }
-                }
-
-                tokio::time::sleep(batch_delay).await;
-            }
-
-            // If stopped, emit cancellations for Phase 1 profiles that never completed
-            if stop_flag.load(Ordering::Relaxed) {
-                for (target, _) in &batch_targets {
-                    for pid in &target.profile_ids {
-                        if !tcp_completed.contains(pid) {
-                            try_send_or_warn(
-                                &tx,
-                                CoreEvent::SpeedTestResult {
-                                    profile_id: pid.clone(),
-                                    test_type: TestType::TcpPing,
-                                    latency_ms: None,
-                                    speed_bps: None,
-                                    ip_info: None,
-                                    error: Some("Cancelled".to_string()),
-                                },
-                                "batch_cancelled",
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Emit TestTypeUpdate::RealPing for all TCP-successful profiles
-            for (target, _) in &tcp_successes {
-                for pid in &target.profile_ids {
-                    try_send_or_warn(
-                        &tx,
-                        CoreEvent::TestTypeUpdate {
-                            profile_id: pid.clone(),
-                            test_type: TestType::RealPing,
-                        },
-                        "test_type_update",
-                    );
-                }
-            }
-
-            let wave_ordered = wave_order(tcp_successes);
-            let mut phase2_tested: HashSet<String> = HashSet::new();
-            let mut real_ping_handles = Vec::with_capacity(wave_ordered.len());
-
-            for (profile, _target_key) in wave_ordered {
+            // ── Phase 1: Fast Ping ──
+            loop {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
 
-                let permit = match real_ping_semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-                let tx = tx.clone();
-                let profile_id = profile.id.clone();
-                let socks_port = next_port.fetch_add(1, Ordering::Relaxed);
-                let proxy_addr = proxy_addr.clone();
-                let ping_url = ping_url.clone();
-                let ip_api_url = ip_api_url.clone();
-                let bin_dir = bin_dir.clone();
-                let bin_configs_dir = bin_configs_dir.clone();
-
-                phase2_tested.insert(profile_id.clone());
-
-                let handle = tokio::spawn(async move {
-                    let _permit = permit;
-
-                    let params = BuildParams {
-                        v2ray_api_enabled: false,
-                        clash_api_enabled: false,
-                        log_level: "error".to_string(),
-                        socks_port,
-                        http_port: None,
-                        listen: proxy_addr.clone(),
-                        sniffing: false,
-                        clash_api_port: None,
-                    };
-
-                    let dns = DnsSetting {
-                        id: "default".to_string(),
-                        name: None,
-                        servers: None,
-                        hosts: None,
-                        query_strategy: None,
-                        disable_cache: None,
-                        disable_fallback: None,
-                        client_ip: None,
-                    };
-
-                    // Temp core lifecycle
-                    let temp_id = uuid::Uuid::new_v4().to_string();
-                    let temp_dir = bin_configs_dir.join(&temp_id);
-                    if tokio::fs::create_dir_all(&temp_dir).await.is_err() {
-                        return;
-                    }
-
-                    let protocol =
-                        Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
-                    let resolved_core = resolve_core(protocol, None);
-
-                    let backend_config = if let Ok(c) =
-                        ConfigBuilder::build(&profile, resolved_core, &params, &[], &dns)
-                    {
-                        c
-                    } else {
-                        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                        return;
-                    };
-
-                    let bin_path = if let Some(p) = find_binary(resolved_core, &bin_dir) {
-                        p
-                    } else {
-                        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                        return;
-                    };
-
-                    let (log_line_tx, _log_rx) = mpsc::channel(512);
-                    let mut manager = CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
-                    if manager
-                        .start(resolved_core, &backend_config, &bin_path)
-                        .await
-                        .is_err()
-                    {
-                        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                        return;
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                    let result = xray_tui_core::speed_test::real_ping(
-                        &proxy_addr,
-                        socks_port,
-                        &ping_url,
-                        &ip_api_url,
-                        real_ping_timeout,
-                        retries,
-                    )
+                let sessions = db
+                    .get_batch_page_ready_for_fast_ping(&batch_id, page_size)
                     .await;
+                let Ok(sessions) = sessions else {
+                    tracing::error!(target: "tui", "get_batch_page_ready_for_fast_ping failed");
+                    progress.0.store(0, Ordering::Relaxed);
+                    break;
+                };
+                if sessions.is_empty() {
+                    break;
+                }
 
-                    let (latency_ms, ip_info, error) = match result {
-                        Ok(rp) => (Some(rp.latency_ms), rp.ip_info, None),
-                        Err(e) => (None, None, Some(e.to_string())),
+                for session in &sessions {
+                    let _ = tx.try_send(CoreEvent::TestTypeUpdate {
+                        profile_id: session.profile_id.clone(),
+                        test_type: TestType::TcpPing,
+                    });
+                    let _ = db.update_session_status(&session.id, "fast_pinging").await;
+
+                    let addr = match &session.address {
+                        Some(a) => a.clone(),
+                        None => continue,
                     };
+                    let port = session.port.unwrap_or(0) as u16;
+                    if port == 0 {
+                        continue;
+                    }
 
-                    // Emit result for THIS profile only (per-profile, not shared)
-                    try_send_or_warn(
-                        &tx,
-                        CoreEvent::SpeedTestResult {
-                            profile_id,
-                            test_type: TestType::RealPing,
-                            latency_ms,
-                            speed_bps: None,
-                            ip_info,
-                            error,
-                        },
-                        "batch_real_ping",
-                    );
-
-                    let _ = manager.stop().await;
-                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                });
-
-                real_ping_handles.push(handle);
-            }
-
-            // Wait for all remaining real ping tasks to complete
-            for handle in real_ping_handles {
-                let _ = handle.await;
-            }
-
-            // If stopped, emit cancellations for profiles that never got a real ping
-            if stop_flag.load(Ordering::Relaxed) {
-                let all_tested_set: HashSet<String> = phase2_tested;
-                for (_, profiles) in &batch_targets {
-                    for profile in profiles {
-                        if !all_tested_set.contains(&profile.id) {
-                            try_send_or_warn(
-                                &tx,
-                                CoreEvent::SpeedTestResult {
-                                    profile_id: profile.id.clone(),
-                                    test_type: TestType::RealPing,
+                    match fmgr.ping(session.config_type, &addr, port).await {
+                        Ok(dur) => {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let ms = dur.as_millis() as i32;
+                            buffer.push(PingResultUpdate {
+                                session_id: session.id.clone(),
+                                profile_id: session.profile_id.clone(),
+                                status: "completed".to_string(),
+                                ping_type: "fast".to_string(),
+                                latency_ms: Some(ms),
+                                speed_bps: None,
+                                ip_info: None,
+                                error: None,
+                            });
+                        }
+                        Err(PingError::NotSupported) => {
+                            if real_ping_enabled {
+                                // Demote to real ping for Phase 2
+                                let _ = db
+                                    .update_session_ping_type(&session.id, "real", "queued")
+                                    .await;
+                            } else {
+                                // No real ping phase — emit Cancelled immediately
+                                buffer.push(PingResultUpdate {
+                                    session_id: session.id.clone(),
+                                    profile_id: session.profile_id.clone(),
+                                    status: "cancelled".to_string(),
+                                    ping_type: "fast".to_string(),
                                     latency_ms: None,
                                     speed_bps: None,
                                     ip_info: None,
-                                    error: Some("Cancelled".to_string()),
-                                },
-                                "batch_cancelled",
-                            );
+                                    error: Some("Not supported by fast ping".to_string()),
+                                });
+                                let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                                    profile_id: session.profile_id.clone(),
+                                    test_type: TestType::TcpPing,
+                                    latency_ms: None,
+                                    speed_bps: None,
+                                    ip_info: None,
+                                    error: Some("Not supported by fast ping".to_string()),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            buffer.push(PingResultUpdate {
+                                session_id: session.id.clone(),
+                                profile_id: session.profile_id.clone(),
+                                status: "failed".to_string(),
+                                ping_type: "fast".to_string(),
+                                latency_ms: None,
+                                speed_bps: None,
+                                ip_info: None,
+                                error: Some(e.to_string()),
+                            });
                         }
                     }
+                    // Send SpeedTestResult to TUI for immediate feedback
+                    let last = buffer.last().unwrap();
+                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                        profile_id: session.profile_id.clone(),
+                        test_type: TestType::TcpPing,
+                        latency_ms: last.latency_ms.map(|v| v as u64),
+                        speed_bps: None,
+                        ip_info: None,
+                        error: last.error.clone(),
+                    });
+                }
+                // Flush buffer at page boundary
+                let flushed = buffer.len() as u16;
+                Self::batch_upsert_buffer(&batch_id, &db, &mut buffer).await;
+                progress.1.fetch_add(flushed, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            // ── Phase 2: Real Ping (only if enabled) ──
+            if real_ping_enabled {
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let sessions = db
+                        .get_batch_page_ready_for_real_ping(&batch_id, page_size)
+                        .await;
+                    let Ok(sessions) = sessions else {
+                        tracing::error!(target: "tui", "get_batch_page_ready_for_real_ping failed");
+                        progress.0.store(0, Ordering::Relaxed);
+                        break;
+                    };
+                    if sessions.is_empty() {
+                        break;
+                    }
+
+                    let sem = Arc::new(Semaphore::new(real_ping_concurrency));
+                    let mut handles = Vec::with_capacity(sessions.len());
+                    for (session, profile) in &sessions {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let permit = match Arc::clone(&sem).acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        let rmgr = rmgr.clone();
+                        let tx = tx.clone();
+                        let db = Arc::clone(&db);
+                        let session = session.clone();
+                        let profile = profile.clone();
+
+                        handles.push(tokio::spawn(async move {
+                            let _permit = permit;
+                            let _ = tx.try_send(CoreEvent::TestTypeUpdate {
+                                profile_id: session.profile_id.clone(),
+                                test_type: TestType::RealPing,
+                            });
+                            let _ = db.update_session_status(&session.id, "real_pinging").await;
+                            let result = rmgr.real_ping(&profile, session.config_type).await;
+                            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                                profile_id: session.profile_id.clone(),
+                                test_type: TestType::RealPing,
+                                latency_ms: result.latency_ms,
+                                speed_bps: None,
+                                ip_info: result.ip_info.clone(),
+                                error: result.error.clone(),
+                            });
+                            PingResultUpdate {
+                                session_id: session.id.clone(),
+                                profile_id: session.profile_id.clone(),
+                                status: if result.error.is_none() {
+                                    "completed".to_string()
+                                } else {
+                                    "failed".to_string()
+                                },
+                                ping_type: "real".to_string(),
+                                latency_ms: result.latency_ms.map(|v| v as i32),
+                                speed_bps: None,
+                                ip_info: result.ip_info.clone(),
+                                error: result.error,
+                            }
+                        }));
+                    }
+
+                    // Collect results
+                    for handle in handles {
+                        if let Ok(update) = handle.await {
+                            buffer.push(update);
+                        }
+                    }
+                    let flushed = buffer.len() as u16;
+                    Self::batch_upsert_buffer(&batch_id, &db, &mut buffer).await;
+                    progress.1.fetch_add(flushed, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
+
+            // Final flush + cancel remaining + cleanup
+            if stop_flag.load(Ordering::Relaxed) {
+                // Emit Cancelled events for any non-terminal sessions
+                if let Ok(sessions) = db.get_ping_batch_page(&batch_id, 65536, 0).await {
+                    for session in &sessions {
+                        if session.status == "completed"
+                            || session.status == "failed"
+                            || session.status == "cancelled"
+                        {
+                            continue;
+                        }
+                        let test_type = if session.ping_type == "real" {
+                            TestType::RealPing
+                        } else {
+                            TestType::TcpPing
+                        };
+                        let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                            profile_id: session.profile_id.clone(),
+                            test_type,
+                            latency_ms: None,
+                            speed_bps: None,
+                            ip_info: None,
+                            error: Some("Cancelled".to_string()),
+                        });
+                    }
+                }
+                let _ = db.cancel_ping_batch(&batch_id).await;
+            }
+            let flushed = buffer.len() as u16;
+            Self::batch_upsert_buffer(&batch_id, &db, &mut buffer).await;
+            progress.1.fetch_add(flushed, Ordering::Relaxed);
+            let _ = db.cleanup_ping_batch(&batch_id).await;
+            progress.0.store(0, Ordering::Relaxed); // signal batch is done; enables stale cleanup
         });
+    }
+
+    /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.
+    async fn batch_upsert_buffer(
+        batch_id: &str,
+        db: &Arc<Database>,
+        buffer: &mut Vec<PingResultUpdate>,
+    ) {
+        if buffer.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(buffer);
+        let extensions: Vec<ProfileExtension> = batch
+            .iter()
+            .filter_map(|r| {
+                r.latency_ms.map(|ms| ProfileExtension {
+                    profile_id: r.profile_id.clone(),
+                    delay: Some(ms),
+                    speed: None,
+                    sort_order: None,
+                    ip_info: r.ip_info.clone(),
+                })
+            })
+            .collect();
+        let _ = db
+            .batch_flush_ping_buffer(batch_id, &batch, &extensions)
+            .await;
     }
     /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
     pub async fn remove_failed_servers(&mut self) {
@@ -3044,6 +2853,14 @@ impl AppState {
 
     /// Poll core event channel and update state accordingly.
     pub async fn poll_core_events(&mut self) {
+        // Clean up stale batch_progress when the task has finished silently
+        // (e.g., create_ping_batch returned 0, no TestTypeUpdate events were ever sent).
+        if self.batch_progress.is_some()
+            && self.testing_profiles.is_empty()
+            && self.batch_progress.as_ref().map(|p| p.0.load(Ordering::Relaxed)) == Some(0)
+        {
+            self.batch_progress = None;
+        }
         while let Some(rx) = self.core_event_rx.as_mut() {
             let event = match rx.try_recv() {
                 Ok(event) => event,
@@ -3170,6 +2987,7 @@ impl AppState {
                     profile_id,
                     test_type,
                 } => {
+                    self.testing_profiles.insert(profile_id.clone());
                     self.testing_details
                         .insert(profile_id.parse().expect("valid UUID"), test_type);
                 }
@@ -3257,23 +3075,10 @@ impl AppState {
                         TestType::UdpTest => {} // no tracking for UDP
                     }
 
-                    // Update batch progress — use take() to avoid borrowing self.test_progress
-                    if let Some((done, total)) = self.test_progress.take() {
-                        let new_done = done + 1;
-                        if new_done >= total {
-                            self.log_trace(
-                                "info",
-                                "speedtest",
-                                &format!("Batch complete: {new_done}/{total} profiles tested"),
-                            );
-                        } else {
-                            self.test_progress = Some((new_done, total));
-                        }
-                    }
-
                     // Auto-reset stop flag when all tests complete
                     if self.testing_profiles.is_empty() {
                         self.speed_test_stop.store(false, Ordering::Relaxed);
+                        self.batch_progress = None;
                     }
                 }
                 CoreEvent::UpdateCheckResult {

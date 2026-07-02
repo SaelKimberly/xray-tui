@@ -407,8 +407,6 @@ pub struct SpeedTestConfig {
     pub batch_page_size: usize,
     #[serde(default = "default_tcp_ping_concurrency")]
     pub tcp_ping_concurrency: usize,
-    #[serde(default = "default_batch_delay_secs")]
-    pub batch_delay_secs: crate::DurationOrSecs,
     #[serde(default = "default_real_ping_retries")]
     pub real_ping_retries: u32,
     #[serde(default = "default_real_ping_concurrency")]
@@ -439,10 +437,6 @@ const fn default_batch_page_size() -> usize {
     1000
 }
 
-fn default_batch_delay_secs() -> crate::DurationOrSecs {
-    crate::DurationOrSecs::from(std::time::Duration::from_secs(1))
-}
-
 const fn default_real_ping_retries() -> u32 {
     2
 }
@@ -459,7 +453,6 @@ impl Default for SpeedTestConfig {
             tcp_timeout_secs: default_tcp_timeout_secs(),
             real_ping_timeout_secs: default_real_ping_timeout_secs(),
             batch_page_size: default_batch_page_size(),
-            batch_delay_secs: default_batch_delay_secs(),
             real_ping_retries: default_real_ping_retries(),
             real_ping_concurrency: default_real_ping_concurrency(),
             tcp_ping_concurrency: default_tcp_ping_concurrency(),

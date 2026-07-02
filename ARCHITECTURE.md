@@ -59,7 +59,7 @@ pub struct AppState {
     pub updating_groups: HashSet<String>,
     pub testing_profiles: HashSet<String>,
     pub testing_details: HashMap<uuid::Uuid, TestType>,
-    pub test_progress: Option<(usize, usize)>,
+    pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,  // (total, completed) for status bar
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub actions_compact: bool,
     pub connected_profile_id: Option<String>,
@@ -174,19 +174,11 @@ with both latency and IP metadata.
 Results are sent via CoreEvent::SpeedTestResult (with optional `ip_info` field) and handled in poll_core_events(),
 which updates the ProfileExtension (delay, ip_info) in memory and persists via upsert_profile_extension().
 
-**Batch ping (start_batch_ping)**: Deduplicates by (address, port) using the `UniqueTarget` helper struct.
-TCP phase is **concurrent** within each batch page, bounded by a `tokio::sync::Semaphore` with `tcp_ping_concurrency`
-(default 20, configurable in SpeedTestConfig). Supports cancellation via `speed_test_stop: Arc<AtomicBool>` flag
-on AppState — checked at page and target boundaries. Checked profiles receive "Cancelled" error results.
+**Fast Ping (start_batch_ping)**: Uses `FastPingManager` to dispatch to the appropriate adapter (TCP, UDP, or QUIC) based on protocol. TcpPingAdapter supports all TCP-based protocols; UdpPingAdapter supports WireGuard and ShadowsocksR; QuicPingAdapter (optional feature) supports QUIC-enabled protocols. Falls through to RealPingManager for protocols without a matching adapter. Phase 1 drains fast-pingable profiles concurrently, bounded by `tcp_ping_concurrency` semaphore (default 20). Uses `ping_sessions` table for queue management with shared `batch_progress: Arc<(AtomicU16, AtomicU16)>` for status bar display. Supports cancellation via `speed_test_stop` flag.
 
-**Batch-then-real-ping (start_batch_then_real_ping)**: Two-phase pipeline:
-1. **Phase 1**: Concurrent TCP ping on all deduplicated targets (same semaphore as batch_ping). Stores
-   **all** profiles per target (`Vec<(UniqueTarget, Vec<Profile>)>`) instead of one representative.
-   Collects TCP successes into `tcp_successes`.
-2. **Phase 2**: Wave-ordered real pings on TCP-successful profiles. **Wave ordering** interleaves profiles
-   from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates.
-   Each profile gets its own **temp core + real ping** (not shared across same-host profiles), bounded by
-   `real_ping_concurrency` semaphore. Supports cancellation with `phase2_tested` tracking.
+**Batch-then-real-ping (start_batch_then_real_ping)**: Two-phase pipeline using `ping_sessions` table:
+1. **Phase 1**: Creates ping_sessions records, runs Fast Ping on all visible profiles concurrently. Falls through to RealPingManager for protocols without adapter.
+2. **Phase 2**: Wave-ordered real pings on profiles that succeeded in Phase 1. Wave ordering interleaves profiles from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates. Each profile gets its own **temp core + real ping**. Bounded by `real_ping_concurrency` semaphore.
 
 **Stop testing**: `speed_test_stop: Arc<AtomicBool>` on AppState. Set via menu ("Stop Testing" at index 10)
 or hotkey `'s'`. Auto-resets when `testing_profiles` empties. `tested_pids`/`tcp_completed` sets prevent

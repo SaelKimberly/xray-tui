@@ -3,7 +3,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::models::GRAVEYARD_GROUP_ID;
@@ -64,28 +64,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows: Vec<&ProfileRow> = state.filtered_profiles().collect();
     let selected = state.selected_index;
     let palette = state.current_palette();
-    let gauge_height = state.test_progress.map_or(0, |_| 1u16);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(gauge_height),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(area);
 
     render_filter_strip(frame, chunks[0], state, &palette);
-
-    // Progress gauge for batch tests
-    if let Some((done, total)) = state.test_progress {
-        let progress = done as f64 / total.max(1) as f64;
-        let gauge = Gauge::default()
-            .gauge_style(ThemeStyles::progress_fill(&palette))
-            .label(format!(" Batch: {done}/{total} "))
-            .ratio(progress);
-        frame.render_widget(gauge, chunks[1]);
-    }
 
     // Empty state guidance
     if rows.is_empty() {
@@ -99,20 +87,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         let paragraph = Paragraph::new(msg)
             .style(ThemeStyles::hint(&palette))
             .alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(paragraph, chunks[2]);
-        render_footer(frame, chunks[3], state, &palette);
-        render_confirmation_overlays(frame, area, &rows, state);
+        frame.render_widget(paragraph, chunks[1]);
+        render_footer(frame, chunks[2], state, &palette);
         return;
     }
 
     let show_group = state.selected_group_id.is_none()
         || state.selected_group_id.as_deref() == Some(xray_tui_db::models::ALL_GROUP_ID);
     let show_group = show_group && frame.area().width >= 107;
-
     render_data_grid(
-        frame, chunks[2], &rows, selected, show_group, state, &palette,
+        frame, chunks[1], &rows, selected, show_group, state, &palette,
     );
-    render_footer(frame, chunks[3], state, &palette);
+    render_footer(frame, chunks[2], state, &palette);
     render_confirmation_overlays(frame, area, &rows, state);
 }
 

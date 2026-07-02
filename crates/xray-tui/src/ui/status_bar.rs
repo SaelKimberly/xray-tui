@@ -25,13 +25,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         )
     } else if state.speed_test_stop.load(Ordering::Relaxed) {
         (" ■ Stopping...".to_string(), ThemeStyles::error(&palette))
-    } else if let Some((done, total)) = state.test_progress {
-        (
-            format!(" Testing: {done}/{total} profiles..."),
-            ThemeStyles::warning(&palette),
-        )
-    } else if !state.testing_profiles.is_empty() {
-        (" Testing...".to_string(), ThemeStyles::warning(&palette))
+    } else if state.batch_progress.is_some() || !state.testing_profiles.is_empty() {
+        let progress_text = state.batch_progress.as_ref().map_or_else(
+            || " Testing...".to_string(),
+            |p| {
+                let total = p.0.load(Ordering::Relaxed);
+                let done = p.1.load(Ordering::Relaxed);
+                if total > 0 {
+                    format!(" Testing: {done}/{total}")
+                } else {
+                    " Testing...".to_string()
+                }
+            },
+        );
+        (progress_text, ThemeStyles::warning(&palette))
     } else if let Some(err) = &state.connection_error {
         (format!(" Error: {err}"), ThemeStyles::error(&palette))
     } else {

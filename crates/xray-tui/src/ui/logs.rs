@@ -290,7 +290,12 @@ pub(super) async fn try_load_older(state: &mut AppState) {
             state.log_scroll = state.log_scroll.saturating_add(n);
             new_lines.append(&mut state.log_cache);
             state.log_cache = new_lines;
-            state.log_cache.truncate(10_000);
+            let before = state.log_cache.len();
+            while state.log_cache.len() > 10_000 {
+                state.log_cache.pop_front();
+            }
+            let popped = before - state.log_cache.len();
+            state.log_scroll = state.log_scroll.saturating_sub(popped);
         }
         Err(e) => {
             state.log_has_older = false;
@@ -343,7 +348,13 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
         // If not at bottom, adjust scroll by new entries count
         state.log_scroll = state.log_scroll.saturating_add(new_count);
     }
-    state.log_cache.truncate(10_000);
+    let excess = state.log_cache.len().saturating_sub(10_000);
+    if excess > 0 {
+        state.log_cache.drain(0..excess);
+        if state.log_scroll > 0 {
+            state.log_scroll = state.log_scroll.saturating_sub(excess);
+        }
+    }
 }
 
 /// Count how many log entries match the current target filter.

@@ -12,6 +12,7 @@ pub mod config_builder;
 pub mod core_type;
 pub mod grpc_client;
 pub mod log_heed;
+pub mod ping;
 pub mod process;
 pub mod protocol;
 pub mod protocol_core_mapping;
@@ -19,6 +20,7 @@ pub mod speed_test;
 pub mod updater;
 
 pub use bin_manager::{CoreBinInfo, find_binary, get_core_info};
+
 pub use config_builder::{BackendConfig, BuildError, BuildParams, CLASH_API_PORT, ConfigBuilder};
 pub use core_type::CoreType;
 pub use grpc_client::{
@@ -26,8 +28,16 @@ pub use grpc_client::{
     format_uptime,
 };
 pub use log_heed::HeedLogStorage;
+#[cfg(feature = "quic-ping")]
+pub use ping::QuicPingAdapter;
+pub use ping::{
+    FastPingAdapter, FastPingManager, PingCapability, PingError, PingResult, ProfileKey,
+    RealPingManager, TcpPingAdapter, UdpPingAdapter,
+};
 pub use process::CoreManager;
 pub use protocol::Protocol;
 pub use protocol::SINGBOX_ONLY_PROTOCOLS;
 pub use protocol_core_mapping::resolve_core;
-pub use speed_test::{SpeedTestError, TestType, real_ping, speed_test, tcp_ping, udp_test};
+pub use speed_test::{
+    SpeedTestError, TestType, real_ping, speed_test, tcp_ping, udp_ping, udp_test,
+};

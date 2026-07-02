@@ -204,12 +204,13 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 
 ```
 ┌─ Speed Test ─────────────────────────────────────────┐
-│  TCP Ping (Selected)                                  │
+│  Fast Ping (Selected)                                  │
 │  Real Ping (Selected)                                 │
 │  Speed Test (Selected)                                │
 │  UDP Test (Selected)                                  │
 │  ─────                                                │
-│  Batch TCP Ping (All Visible)                         │
+│  Fast Ping (All Visible)                                │
+│  Fast + Real Ping (All Visible)                         │
 │  Sort by Delay                                        │
 │  Remove Bad Servers                                   │
 └───────────────────────────────────────────────────────┘
@@ -220,8 +221,7 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 - `Esc` — close menu
 - `?` — open help overlay
 
-Progress is shown in the status bar during batch tests (`Testing: N/M profiles...`
-or `Testing...`). A progress gauge appears below the filter strip during batch tests.
+Progress is shown in the status bar during batch tests (`Testing: {completed}/{total}` or `Testing...`).
 
 ---
 
@@ -454,15 +454,15 @@ appended when updates are available for installed backends.
 2. Press `t` to open the speed test menu
 3. Navigate with `↑↓` (skips the separator line)
 4. Press `Enter` on the test type:
-   - **TCP Ping** — measures TCP connection latency
+   - **Fast Ping** — auto-selects TCP or UDP/QUIC adapter based on protocol
    - **Real Ping** — measures response time through the proxy
    - **Speed Test** — downloads a test payload to measure throughput
    - **UDP Test** — tests UDP forwarding
-   - **Batch TCP Ping** — pings all visible profiles sequentially
+   - **Fast Ping (All Visible)** — batch fast pings all visible profiles
+   - **Fast + Real Ping (All Visible)** — batch fast ping followed by real ping for unsupported protocols
    - **Sort by Delay** — re-sorts the table by delay ascending
    - **Remove Bad Servers** — removes profiles with failed tests
 5. Results populate the Delay/Speed columns in the table
-6. A progress gauge appears below the filter strip during batch tests
 
 ### Connecting/Disconnecting
 
@@ -747,8 +747,7 @@ expect_text(session_id: "speed-test", pattern: "Connected", timeout: 15)
 send_keys(session_id: "speed-test", keys: "t")
 wait_for_stable(session_id: "speed-test")
 assert_contains(text: "Speed Test")
-
-# Select first test (TCP Ping) and run
+# Select first test (Fast Ping) and run
 send_keys(session_id: "speed-test", keys: "\r")
 wait_for_stable(session_id: "speed-test")
 

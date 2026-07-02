@@ -110,6 +110,26 @@ pub async fn create_tables(conn: &turso::Connection) -> turso::Result<()> {
             last_updated        TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS ping_sessions (
+            id              TEXT PRIMARY KEY NOT NULL,
+            batch_id        TEXT NOT NULL,
+            profile_id      TEXT NOT NULL REFERENCES group_profiles(id),
+            config_type     INTEGER NOT NULL,
+            core_type       TEXT NOT NULL,
+            address         TEXT,
+            port            INTEGER,
+            triplet_rank    INTEGER NOT NULL,
+            ping_type       TEXT NOT NULL DEFAULT 'fast',
+            status          TEXT NOT NULL DEFAULT 'queued',
+            latency_ms      INTEGER,
+            speed_bps       INTEGER,
+            ip_info         TEXT,
+            error           TEXT,
+            created_at      TEXT DEFAULT (datetime('now')),
+            updated_at      TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ping_sessions_batch ON ping_sessions(batch_id, status, triplet_rank);
         ",
     )
     .await?;

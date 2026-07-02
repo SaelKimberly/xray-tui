@@ -926,13 +926,13 @@ enum SpeedTestMenuItem {
 }
 
 const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
-    SpeedTestMenuItem::Item("TCP Ping (Selected)"),
+    SpeedTestMenuItem::Item("Fast Ping (Selected)"),
     SpeedTestMenuItem::Item("Real Ping (Selected)"),
     SpeedTestMenuItem::Item("Speed Test (Selected)"),
     SpeedTestMenuItem::Item("UDP Test (Selected)"),
     SpeedTestMenuItem::Separator,
-    SpeedTestMenuItem::Item("TCP Ping (All Visible)"),
-    SpeedTestMenuItem::Item("TCP + Real Ping (All Visible)"),
+    SpeedTestMenuItem::Item("Fast Ping (All Visible)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (All Visible)"),
     SpeedTestMenuItem::Item("Sort by Delay"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,
