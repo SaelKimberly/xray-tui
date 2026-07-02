@@ -465,11 +465,6 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     let key = keys[*focus_index];
                     if let Some((_, val)) = fields.iter_mut().find(|(k, _)| k == key) {
                         match key {
-                            "update_interval" => {
-                                if c.is_ascii_digit() || c == '-' {
-                                    val.push(c);
-                                }
-                            }
                             "core_type" => {
                                 const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
                                 let idx =

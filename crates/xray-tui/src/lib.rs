@@ -370,7 +370,7 @@ pub struct AppState {
     /// Profile IDs currently being tested
     pub testing_profiles: HashSet<String>,
     /// Which test type is currently running per profile (for display).
-    pub testing_details: HashMap<uuid::Uuid, TestType>,
+    pub testing_details: HashMap<String, TestType>,
     /// Cached update status for both backends.
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub actions_compact: bool,
@@ -2169,9 +2169,8 @@ impl AppState {
         };
 
         let pid = profile_id.to_string();
+        self.testing_details.insert(pid.clone(), TestType::TcpPing);
         self.testing_profiles.insert(pid.clone());
-        self.testing_details
-            .insert(pid.parse().expect("valid UUID"), TestType::TcpPing);
         let config_type = row.profile.config_type;
         let timeout_dur = *self.config.speed_test.tcp_timeout_secs;
 
@@ -2225,8 +2224,7 @@ impl AppState {
             None => return,
         };
         let pid = profile_id.to_string();
-        self.testing_details
-            .insert(pid.parse().expect("valid UUID"), TestType::RealPing);
+        self.testing_details.insert(pid.clone(), TestType::RealPing);
         self.testing_profiles.insert(pid.clone());
 
         // Build params for the temp core
@@ -2402,9 +2400,8 @@ impl AppState {
             None => return,
         };
         let pid = profile_id.to_string();
+        self.testing_details.insert(pid.clone(), TestType::SpeedTest);
         self.testing_profiles.insert(pid.clone());
-        self.testing_details
-            .insert(pid.parse().expect("valid UUID"), TestType::SpeedTest);
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
         let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
@@ -2457,9 +2454,8 @@ impl AppState {
             None => return,
         };
         let pid = profile_id.to_string();
+        self.testing_details.insert(pid.clone(), TestType::UdpTest);
         self.testing_profiles.insert(pid.clone());
-        self.testing_details
-            .insert(pid.parse().expect("valid UUID"), TestType::UdpTest);
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
         let timeout_dur = std::time::Duration::from_secs(5);
@@ -2987,9 +2983,8 @@ impl AppState {
                     profile_id,
                     test_type,
                 } => {
-                    self.testing_profiles.insert(profile_id.clone());
-                    self.testing_details
-                        .insert(profile_id.parse().expect("valid UUID"), test_type);
+                    self.testing_details.insert(profile_id.clone(), test_type);
+                    self.testing_profiles.insert(profile_id);
                 }
                 CoreEvent::SpeedTestResult {
                     profile_id,
@@ -3001,7 +2996,7 @@ impl AppState {
                 } => {
                     self.testing_profiles.remove(&profile_id);
                     self.testing_details
-                        .remove(&profile_id.parse().expect("valid UUID"));
+                        .remove(&profile_id);
 
                     // Update profile extension and extract name in a scoped block
                     // to drop the mutable borrow before further self-method calls.
@@ -3225,7 +3220,7 @@ impl AppState {
             ("name".into(), String::new()),
             ("subscription_url".into(), String::new()),
             ("user_agent".into(), String::new()),
-            ("update_interval".into(), "1440".into()),
+            ("update_interval".into(), "1h".into()),
             ("core_type".into(), "auto".into()),
         ];
         self.mode = AppMode::AddGroup {
@@ -3241,6 +3236,12 @@ impl AppState {
             self.log_trace("error", "tui", "Group not found");
             return;
         };
+        let update_interval_value = self.subscriptions
+            .iter()
+            .find(|s| s.group_id.as_deref() == Some(group_id))
+            .and_then(|s| s.update_interval).map_or_else(|| "1h".into(), |mins| humantime::format_duration(
+                std::time::Duration::from_secs(mins as u64 * 60)
+            ).to_string());
         let fields = vec![
             ("name".into(), group.name.unwrap_or_default()),
             (
@@ -3248,7 +3249,7 @@ impl AppState {
                 group.subscription_url.unwrap_or_default(),
             ),
             ("user_agent".into(), group.user_agent.unwrap_or_default()),
-            ("update_interval".into(), "1440".into()),
+            ("update_interval".into(), update_interval_value),
             (
                 "core_type".into(),
                 group.core_type.unwrap_or_else(|| "auto".into()),
@@ -3283,8 +3284,8 @@ impl AppState {
         }
         // Create subscription tracking row
         let interval: i32 = get_field(&fields, "update_interval")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1440);
+            .and_then(|v| humantime::parse_duration(&v).ok())
+            .map_or(60, |d| (d.as_secs() / 60) as i32);
         let sub = Subscription {
             id: uuid::Uuid::new_v4().to_string(),
             group_id: Some(group.id.clone()),
@@ -3331,8 +3332,8 @@ impl AppState {
         }
         // Update subscription tracking row
         let interval: i32 = get_field(&fields, "update_interval")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1440);
+            .and_then(|v| humantime::parse_duration(&v).ok())
+            .map_or(60, |d| (d.as_secs() / 60) as i32);
         if let Ok(Some(mut sub)) = self.db.get_subscription_by_group(&group_id).await {
             sub.url = group.subscription_url.clone().unwrap_or_default();
             sub.update_interval = Some(interval);
@@ -3564,13 +3565,16 @@ impl AppState {
             .await;
         let _ = db.purge_graveyard(GRAVEYARD_GROUP_ID, 24).await;
 
-        let now_str = format_now();
+        let existing = db.get_subscription_by_group(&group_id).await.ok().flatten();
+        let sub_id = existing.as_ref().map_or_else(|| uuid::Uuid::new_v4().to_string(), |s| s.id.clone());
+        let stored_interval = existing.as_ref().and_then(|s| s.update_interval).unwrap_or(60);
+
         let sub = Subscription {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: sub_id,
             group_id: Some(group_id.clone()),
             url: url.clone(),
-            last_updated: Some(now_str),
-            update_interval: Some(1440),
+            last_updated: Some(format_now()),
+            update_interval: Some(stored_interval),
             user_agent: Some(user_agent),
             status: Some("ok".into()),
             error_message: None,

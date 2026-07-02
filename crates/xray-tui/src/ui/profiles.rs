@@ -205,16 +205,14 @@ fn render_data_grid(
 
             let (indicator, indicator_fg) = if is_connected {
                 ("●".to_string(), ThemeStyles::success(palette))
-            } else if let Ok(pid) = row.profile.id.parse::<uuid::Uuid>() {
-                match state.testing_details.get(&pid) {
+            } else {
+                match state.testing_details.get(&row.profile.id) {
                     Some(TestType::TcpPing) => ("↔".to_string(), Style::default()),
                     Some(TestType::RealPing) => ("◎".to_string(), Style::default()),
                     Some(TestType::SpeedTest) => ("⇩".to_string(), Style::default()),
                     Some(TestType::UdpTest) => ("↗".to_string(), Style::default()),
                     None => (String::new(), Style::default()),
                 }
-            } else {
-                (String::new(), Style::default())
             };
 
             let protocol =
