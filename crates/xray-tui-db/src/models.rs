@@ -153,10 +153,10 @@ pub struct ProfileExtension {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStat {
     pub profile_id: String,
-    pub today_up: Option<i32>,
-    pub today_down: Option<i32>,
-    pub total_up: Option<i32>,
-    pub total_down: Option<i32>,
+    pub today_up: Option<i64>,
+    pub today_down: Option<i64>,
+    pub total_up: Option<i64>,
+    pub total_down: Option<i64>,
     pub last_updated: Option<String>,
 }
 

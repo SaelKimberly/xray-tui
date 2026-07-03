@@ -147,10 +147,10 @@ pub(crate) async fn get_all_profiles_with_details_inner(
         let stats = if stats_profile_id.is_some() {
             Some(ServerStat {
                 profile_id: stats_profile_id.unwrap_or_default(),
-                today_up: row.get::<Option<i32>>(ProfileDetailsCol::TodayUp as usize)?,
-                today_down: row.get::<Option<i32>>(ProfileDetailsCol::TodayDown as usize)?,
-                total_up: row.get::<Option<i32>>(ProfileDetailsCol::TotalUp as usize)?,
-                total_down: row.get::<Option<i32>>(ProfileDetailsCol::TotalDown as usize)?,
+                today_up: row.get::<Option<i64>>(ProfileDetailsCol::TodayUp as usize)?,
+                today_down: row.get::<Option<i64>>(ProfileDetailsCol::TodayDown as usize)?,
+                total_up: row.get::<Option<i64>>(ProfileDetailsCol::TotalUp as usize)?,
+                total_down: row.get::<Option<i64>>(ProfileDetailsCol::TotalDown as usize)?,
                 last_updated: row.get::<Option<String>>(ProfileDetailsCol::LastUpdated as usize)?,
             })
         } else {
@@ -519,7 +519,7 @@ pub(crate) async fn subscription_upsert_profiles_inner(
     // 1. Upsert cores
     {
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO profile_cores (sub_uid, config_type, core_type, address, port, user_id, security, network, stream_settings, protocol_settings, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
@@ -549,7 +549,7 @@ pub(crate) async fn subscription_upsert_profiles_inner(
     // 2. Upsert group profiles (target group) with dedup by sub_uid
     {
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO group_profiles (id, sub_uid, group_id, remarks, is_sub, sub_id, sort_order, is_active, updated_at, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(group_id, sub_uid) DO UPDATE SET
@@ -581,7 +581,7 @@ pub(crate) async fn subscription_upsert_profiles_inner(
     // 3. Upsert All group entries (same cores, different group)
     if group_id != ALL_GROUP_ID {
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "INSERT OR IGNORE INTO group_profiles (id, sub_uid, group_id, remarks, is_sub, sub_id, sort_order, is_active, updated_at, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )
@@ -875,7 +875,7 @@ pub(crate) async fn cancel_ping_batch_inner(
 ) -> Result<usize> {
     let rows = conn
         .execute(
-            "UPDATE ping_sessions SET status = 'cancelled', updated_at = datetime('now') WHERE batch_id = ?1 AND status IN ('queued', 'fast_pinging', 'real_pinging')",
+            "UPDATE ping_sessions SET status = 'cancelled', updated_at = datetime('now') WHERE batch_id = ?1 AND status = 'queued'",
             turso::params![batch_id],
         )
         .await?;
@@ -1005,22 +1005,22 @@ pub(crate) async fn get_batch_page_ready_for_real_ping_inner(
     while let Some(row) = rows.next().await? {
         let profile = Profile::from_row(&row)?;
         let session = PingSession {
-            id: row.get::<String>(19)?,
-            batch_id: row.get::<String>(20)?,
-            profile_id: row.get::<String>(21)?,
-            config_type: row.get::<i32>(22)?,
-            core_type: row.get::<String>(23)?,
-            address: row.get::<Option<String>>(24)?,
-            port: row.get::<Option<i32>>(25)?,
-            triplet_rank: row.get::<i32>(26)?,
-            ping_type: row.get::<String>(27)?,
-            status: row.get::<String>(28)?,
-            latency_ms: row.get::<Option<i32>>(29)?,
-            speed_bps: row.get::<Option<i32>>(30)?,
-            ip_info: row.get::<Option<String>>(31)?,
-            error: row.get::<Option<String>>(32)?,
-            created_at: row.get::<Option<String>>(33)?,
-            updated_at: row.get::<Option<String>>(34)?,
+            id: row.get::<String>(PingSessionJoinCol::SessionId as usize)?,
+            batch_id: row.get::<String>(PingSessionJoinCol::SessionBatchId as usize)?,
+            profile_id: row.get::<String>(PingSessionJoinCol::SessionProfileId as usize)?,
+            config_type: row.get::<i32>(PingSessionJoinCol::SessionConfigType as usize)?,
+            core_type: row.get::<String>(PingSessionJoinCol::SessionCoreType as usize)?,
+            address: row.get::<Option<String>>(PingSessionJoinCol::SessionAddress as usize)?,
+            port: row.get::<Option<i32>>(PingSessionJoinCol::SessionPort as usize)?,
+            triplet_rank: row.get::<i32>(PingSessionJoinCol::SessionTripletRank as usize)?,
+            ping_type: row.get::<String>(PingSessionJoinCol::SessionPingType as usize)?,
+            status: row.get::<String>(PingSessionJoinCol::SessionStatus as usize)?,
+            latency_ms: row.get::<Option<i32>>(PingSessionJoinCol::SessionLatencyMs as usize)?,
+            speed_bps: row.get::<Option<i32>>(PingSessionJoinCol::SessionSpeedBps as usize)?,
+            ip_info: row.get::<Option<String>>(PingSessionJoinCol::SessionIpInfo as usize)?,
+            error: row.get::<Option<String>>(PingSessionJoinCol::SessionError as usize)?,
+            created_at: row.get::<Option<String>>(PingSessionJoinCol::SessionCreatedAt as usize)?,
+            updated_at: row.get::<Option<String>>(PingSessionJoinCol::SessionUpdatedAt as usize)?,
         };
         results.push((session, profile));
     }

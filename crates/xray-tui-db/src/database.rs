@@ -27,19 +27,14 @@ use crate::models::{
 use crate::schema;
 
 pub struct Database {
-    db: turso::Database,
+    #[allow(dead_code)]
+    pool: turso::Database,
+    writer: tokio::sync::Mutex<turso::Connection>,
+    reader: tokio::sync::RwLock<turso::Connection>,
 }
 
+#[allow(clippy::significant_drop_tightening)]
 impl Database {
-    fn conn(&self) -> Result<turso::Connection> {
-        let conn = self.db.connect().map_err(DatabaseError::Turso)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(DatabaseError::Turso)?;
-        Ok(conn)
-    }
-
-    // ── Database ──────────────────────────────────────────────────────────
-
     pub async fn open(path: &Path) -> Result<Self> {
         let path_str = path
             .to_str()
@@ -48,9 +43,7 @@ impl Database {
             .build()
             .await
             .map_err(DatabaseError::Turso)?;
-        let db_ = Self { db: pool };
-        db_.initialize_schema().await?;
-        Ok(db_)
+        Self::from_pool(pool).await
     }
 
     pub async fn open_in_memory() -> Result<Self> {
@@ -58,13 +51,11 @@ impl Database {
             .build()
             .await
             .map_err(DatabaseError::Turso)?;
-        let db_ = Self { db: pool };
-        db_.initialize_schema().await?;
-        Ok(db_)
+        Self::from_pool(pool).await
     }
 
     async fn initialize_schema(&self) -> Result<()> {
-        let conn = self.conn()?;
+        let conn = self.writer.lock().await;
         schema::create_tables(&conn).await?;
 
         // Ensure graveyard group exists
@@ -93,10 +84,28 @@ impl Database {
         Ok(())
     }
 
+    async fn from_pool(pool: turso::Database) -> Result<Self> {
+        let writer = pool.connect().map_err(DatabaseError::Turso)?;
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(DatabaseError::Turso)?;
+        let reader = pool.connect().map_err(DatabaseError::Turso)?;
+        reader
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(DatabaseError::Turso)?;
+        let db_ = Self {
+            pool,
+            writer: tokio::sync::Mutex::new(writer),
+            reader: tokio::sync::RwLock::new(reader),
+        };
+        db_.initialize_schema().await?;
+        Ok(db_)
+    }
+
     /// One-time backfill: normalize all existing profile remarks.
     /// Uses `user_version` pragma to run exactly once.
     pub async fn normalize_all_remarks(&self) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         // Query user_version via PRAGMA
         let version: i32 = {
             let mut stmt = conn.prepare_cached("PRAGMA user_version").await?;
@@ -143,17 +152,17 @@ impl Database {
     // ── Query methods (public API) ──────────────────────────────────────
 
     pub async fn get_all_profiles(&self) -> Result<Vec<Profile>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_all_profiles_inner(&conn).await
     }
 
     pub async fn get_profiles_by_group(&self, group_id: &str) -> Result<Vec<Profile>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_profiles_by_group_inner(&conn, group_id).await
     }
 
     pub async fn get_all_groups(&self) -> Result<Vec<Group>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_all_groups_inner(&conn).await
     }
 
@@ -161,54 +170,54 @@ impl Database {
         &self,
         profile_id: &str,
     ) -> Result<Option<ProfileExtension>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_profile_extension_inner(&conn, profile_id).await
     }
 
     pub async fn get_server_stats(&self, profile_id: &str) -> Result<Option<ServerStat>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_server_stats_inner(&conn, profile_id).await
     }
 
     pub async fn get_all_profiles_with_details(&self) -> Result<Vec<super::ProfileWithDetails>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_all_profiles_with_details_inner(&conn).await
     }
 
     pub async fn get_profile(&self, id: &str) -> Result<Option<Profile>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_profile_inner(&conn, id).await
     }
 
     pub async fn get_subscription_by_group(&self, group_id: &str) -> Result<Option<Subscription>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_subscription_by_group_inner(&conn, group_id).await
     }
 
     pub async fn get_all_subscriptions(&self) -> Result<Vec<Subscription>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_all_subscriptions_inner(&conn).await
     }
 
     pub async fn get_groups_due_update(&self) -> Result<Vec<Group>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_groups_due_update_inner(&conn).await
     }
 
     pub async fn get_all_routing_rules(&self) -> Result<Vec<RoutingRule>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_all_routing_rules_inner(&conn).await
     }
 
     pub async fn get_dns_settings(&self) -> Result<Option<DnsSetting>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_dns_settings_inner(&conn).await
     }
 
     // ── Write methods (public API) ──────────────────────────────────────
 
     pub async fn insert_profile(&self, p: &Profile) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         insert_profile_inner(&tx, p).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -216,7 +225,7 @@ impl Database {
     }
 
     pub async fn update_profile(&self, p: &Profile) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         update_profile_inner(&tx, p).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -224,7 +233,7 @@ impl Database {
     }
 
     pub async fn delete_profile(&self, id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         delete_profile_inner(&tx, id).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -232,14 +241,16 @@ impl Database {
     }
 
     pub async fn clone_profile(&self, id: &str, new_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        let original = get_profile_inner(&conn, id)
-            .await?
-            .ok_or_else(|| DatabaseError::Generic(format!("profile not found: {id}")))?;
+        let original = {
+            let conn = self.reader.read().await;
+            get_profile_inner(&conn, id)
+                .await?
+                .ok_or_else(|| DatabaseError::Generic(format!("profile not found: {id}")))?
+        };
         let mut clone = original.clone();
         clone.id = new_id.to_string();
-        let mut conn2 = self.conn()?;
-        let tx = conn2.transaction().await.map_err(DatabaseError::Turso)?;
+        let mut conn = self.writer.lock().await;
+        let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         insert_profile_inner(&tx, &clone).await?;
         // Also copy profile_extension if exists
         if let Some(ext) = get_profile_extension_inner(&tx, id).await? {
@@ -252,7 +263,7 @@ impl Database {
     }
 
     pub async fn reorder_profiles(&self, ids: &[(String, i32)]) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         reorder_profiles_inner(&tx, ids).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -260,7 +271,7 @@ impl Database {
     }
 
     pub async fn upsert_profile_extension(&self, ext: &ProfileExtension) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         upsert_profile_extension_inner(&tx, ext).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -268,7 +279,7 @@ impl Database {
     }
 
     pub async fn upsert_server_stats(&self, stats: &ServerStat) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         upsert_server_stats_inner(&tx, stats).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -276,7 +287,7 @@ impl Database {
     }
 
     pub async fn insert_group(&self, g: &Group) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         insert_group_inner(&tx, g).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -284,7 +295,7 @@ impl Database {
     }
 
     pub async fn update_group(&self, g: &Group) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         update_group_inner(&tx, g).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -292,7 +303,7 @@ impl Database {
     }
 
     pub async fn update_profile_active(&self, id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         update_profile_active_inner(&tx, id).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -302,7 +313,7 @@ impl Database {
     // ── Group management ────────────────────────────────────────────────
 
     pub async fn delete_group(&self, id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         // Prevent deletion of system groups — propagate error on query failure
         let is_system: Option<i32> = {
             let mut stmt = conn
@@ -330,7 +341,7 @@ impl Database {
     }
 
     pub async fn clear_group(&self, group_id: &str) -> Result<usize> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         // Prevent clearing system groups — propagate error on query failure
         let is_system: Option<i32> = {
             let mut stmt = conn
@@ -356,7 +367,7 @@ impl Database {
     }
 
     pub async fn upsert_subscription(&self, sub: &Subscription) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         upsert_subscription_inner(&tx, sub).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -364,7 +375,7 @@ impl Database {
     }
 
     pub async fn delete_subscriptions_by_group(&self, group_id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         delete_subscriptions_by_group_inner(&tx, group_id).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -376,7 +387,7 @@ impl Database {
         group_id: &str,
         profiles: &[Profile],
     ) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         subscription_upsert_profiles_inner(&tx, group_id, profiles).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -389,7 +400,7 @@ impl Database {
         active_sub_uids: &[u64],
         graveyard_id: &str,
     ) -> Result<usize> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         let result =
             move_orphans_to_graveyard_inner(&tx, group_id, active_sub_uids, graveyard_id).await?;
@@ -398,7 +409,7 @@ impl Database {
     }
 
     pub async fn purge_graveyard(&self, graveyard_id: &str, ttl_hours: i64) -> Result<usize> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         let result = purge_graveyard_inner(&tx, graveyard_id, ttl_hours).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -408,7 +419,7 @@ impl Database {
     // ── Routing rules ───────────────────────────────────────────────────
 
     pub async fn insert_routing_rule(&self, r: &RoutingRule) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         insert_routing_rule_inner(&tx, r).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -416,7 +427,7 @@ impl Database {
     }
 
     pub async fn update_routing_rule(&self, r: &RoutingRule) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         update_routing_rule_inner(&tx, r).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -424,7 +435,7 @@ impl Database {
     }
 
     pub async fn delete_routing_rule(&self, id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         delete_routing_rule_inner(&tx, id).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -432,7 +443,7 @@ impl Database {
     }
 
     pub async fn reorder_routing_rules(&self, ids: &[(String, i32)]) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         reorder_routing_rules_inner(&tx, ids).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -442,7 +453,7 @@ impl Database {
     // ── DNS settings ────────────────────────────────────────────────────
 
     pub async fn upsert_dns_settings(&self, dns: &DnsSetting) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         upsert_dns_settings_inner(&tx, dns).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -452,7 +463,7 @@ impl Database {
     // ── Ping batch management ──────────────────────────────────────────
 
     pub async fn create_ping_batch(&self, batch_id: &str, group_id: Option<&str>) -> Result<usize> {
-        let conn = self.conn()?;
+        let conn = self.writer.lock().await;
         create_ping_batch_inner(&conn, batch_id, group_id).await
     }
 
@@ -462,7 +473,7 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<PingSession>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_ping_batch_page_inner(&conn, batch_id, limit, offset).await
     }
 
@@ -471,7 +482,7 @@ impl Database {
         batch_id: &str,
         results: &[PingResultUpdate],
     ) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         batch_update_ping_results_inner(&tx, batch_id, results).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -479,7 +490,7 @@ impl Database {
     }
 
     pub async fn cancel_ping_batch(&self, batch_id: &str) -> Result<usize> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         let n = cancel_ping_batch_inner(&tx, batch_id).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -487,7 +498,7 @@ impl Database {
     }
 
     pub async fn cleanup_ping_batch(&self, batch_id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         cleanup_ping_batch_inner(&tx, batch_id).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -495,7 +506,7 @@ impl Database {
     }
 
     pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         update_session_status_inner(&tx, session_id, status).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -508,7 +519,7 @@ impl Database {
         ping_type: &str,
         new_status: &str,
     ) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         update_session_ping_type_inner(&tx, session_id, ping_type, new_status).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -520,7 +531,7 @@ impl Database {
         batch_id: &str,
         limit: usize,
     ) -> Result<Vec<PingSession>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_batch_page_ready_for_fast_ping_inner(&conn, batch_id, limit).await
     }
 
@@ -529,7 +540,7 @@ impl Database {
         batch_id: &str,
         limit: usize,
     ) -> Result<Vec<(PingSession, Profile)>> {
-        let conn = self.conn()?;
+        let conn = self.reader.read().await;
         get_batch_page_ready_for_real_ping_inner(&conn, batch_id, limit).await
     }
 
@@ -537,7 +548,7 @@ impl Database {
         &self,
         extensions: &[ProfileExtension],
     ) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         batch_upsert_profile_extensions_inner(&tx, extensions).await?;
         tx.commit().await.map_err(DatabaseError::Turso)?;
@@ -551,7 +562,7 @@ impl Database {
         results: &[PingResultUpdate],
         extensions: &[ProfileExtension],
     ) -> Result<()> {
-        let mut conn = self.conn()?;
+        let mut conn = self.writer.lock().await;
         let tx = conn.transaction().await.map_err(DatabaseError::Turso)?;
         batch_update_ping_results_inner(&tx, batch_id, results).await?;
         batch_upsert_profile_extensions_inner(&tx, extensions).await?;

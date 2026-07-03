@@ -165,3 +165,26 @@ pub(crate) enum ProfileDetailsCol {
     TotalDown,
     LastUpdated,
 }
+
+/// Column indices for the real-ping JOIN query (35 cols).
+/// Profile fields 0-18 (`ProfileCol` order), `PingSession` fields 19-34 (`PingSessionCol` order).
+#[repr(usize)]
+#[allow(dead_code, clippy::enum_variant_names)]
+pub(crate) enum PingSessionJoinCol {
+    SessionId = 19,
+    SessionBatchId,
+    SessionProfileId,
+    SessionConfigType,
+    SessionCoreType,
+    SessionAddress,
+    SessionPort,
+    SessionTripletRank,
+    SessionPingType,
+    SessionStatus,
+    SessionLatencyMs,
+    SessionSpeedBps,
+    SessionIpInfo,
+    SessionError,
+    SessionCreatedAt,
+    SessionUpdatedAt,
+}

@@ -336,6 +336,9 @@ pub struct AppState {
     /// Cached filtered/sorted profile indices for performance.
     pub cached_filtered_indices: RefCell<Vec<usize>>,
     pub filter_cache_valid: Cell<bool>,
+    /// Generation counter bumped on every profile mutation.
+    /// Used to skip redundant reloads.
+    pub profile_gen: u64,
     pub groups: Vec<Group>,
     pub subscriptions: Vec<Subscription>,
     pub selected_group_id: Option<String>,
@@ -419,6 +422,7 @@ impl AppState {
             profiles: Vec::new(),
             cached_filtered_indices: RefCell::new(Vec::new()),
             filter_cache_valid: Cell::new(true),
+            profile_gen: 0,
             groups: Vec::new(),
             subscriptions: Vec::new(),
             selected_group_id: None,
@@ -531,6 +535,29 @@ impl AppState {
                 self.log_trace("error", "tui", &format!("Failed to load profiles: {e}"));
                 self.profiles.clear();
             }
+        }
+        self.filter_cache_valid.set(false);
+    }
+    /// Replace a profile row in-place, or append if not found.
+    fn upsert_profile_row(
+        &mut self,
+        profile: Profile,
+        extension: Option<ProfileExtension>,
+        stats: Option<ServerStat>,
+    ) {
+        let row = ProfileRow {
+            profile,
+            extension,
+            stats,
+        };
+        if let Some(existing) = self
+            .profiles
+            .iter_mut()
+            .find(|r| r.profile.id == row.profile.id)
+        {
+            *existing = row;
+        } else {
+            self.profiles.push(row);
         }
         self.filter_cache_valid.set(false);
     }
@@ -968,7 +995,8 @@ impl AppState {
                     ),
                 );
                 self.mode = AppMode::List;
-                self.reload_profiles().await;
+                self.profile_gen = self.profile_gen.wrapping_add(1);
+                self.upsert_profile_row(profile, None, None);
             }
             Err(e) => {
                 self.log_trace("error", "tui", &format!("Failed to add server: {e}"));
@@ -1079,7 +1107,11 @@ impl AppState {
                     ),
                 );
                 self.mode = AppMode::List;
-                self.reload_profiles().await;
+                self.profile_gen = self.profile_gen.wrapping_add(1);
+                let existing = self.profiles.iter().find(|r| r.profile.id == profile_id);
+                let existing_stats = existing.and_then(|r| r.stats.clone());
+                let existing_ext = existing.and_then(|r| r.extension.clone());
+                self.upsert_profile_row(profile, existing_ext, existing_stats);
             }
             Err(e) => {
                 self.log_trace("error", "tui", &format!("Failed to update server: {e}"));
@@ -1653,7 +1685,9 @@ impl AppState {
         self.log_trace("info", "tui", "Profile deleted");
         self.confirmation = None;
         self.multi_select.remove(id);
-        self.reload_profiles().await;
+        self.profile_gen = self.profile_gen.wrapping_add(1);
+        self.profiles.retain(|r| r.profile.id != id);
+        self.filter_cache_valid.set(false);
     }
 
     pub async fn clone_profile(&mut self, id: &str) {
@@ -1663,7 +1697,10 @@ impl AppState {
             return;
         }
         self.log_trace("info", "tui", "Profile cloned");
-        self.reload_profiles().await;
+        if let Ok(Some(new_profile)) = self.db.get_profile(&new_id).await {
+            self.profile_gen = self.profile_gen.wrapping_add(1);
+            self.upsert_profile_row(new_profile, None, None);
+        }
     }
 
     pub fn toggle_multi_select(&mut self, id: &str) {
@@ -1771,17 +1808,29 @@ impl AppState {
             Some(i) if i > 0 => i,
             _ => return,
         };
-        let prev_id = &filtered[idx - 1].profile.id;
+        let prev_id = filtered[idx - 1].profile.id.clone();
         let a_order = filtered[idx].profile.sort_order.unwrap_or(0);
         let b_order = filtered[idx - 1].profile.sort_order.unwrap_or(0);
+        // Drop filtered borrow before mutating self
+        drop(filtered);
         if let Err(e) = self
             .db
             .reorder_profiles(&[(id.clone(), b_order), (prev_id.clone(), a_order)])
             .await
         {
             self.log_trace("error", "tui", &format!("Failed to reorder: {e}"));
+            return;
         }
-        self.reload_profiles().await;
+        self.profile_gen = self.profile_gen.wrapping_add(1);
+        // Swap sort_order values in-memory
+        for row in &mut self.profiles {
+            if row.profile.id == id {
+                row.profile.sort_order = Some(b_order);
+            } else if row.profile.id == prev_id {
+                row.profile.sort_order = Some(a_order);
+            }
+        }
+        self.filter_cache_valid.set(false);
     }
 
     pub async fn move_profile_down(&mut self) {
@@ -1794,17 +1843,28 @@ impl AppState {
             Some(i) if i < filtered.len() - 1 => i,
             _ => return,
         };
-        let next_id = &filtered[idx + 1].profile.id;
+        let next_id = filtered[idx + 1].profile.id.clone();
         let a_order = filtered[idx].profile.sort_order.unwrap_or(0);
         let b_order = filtered[idx + 1].profile.sort_order.unwrap_or(0);
+        drop(filtered);
         if let Err(e) = self
             .db
             .reorder_profiles(&[(id.clone(), b_order), (next_id.clone(), a_order)])
             .await
         {
             self.log_trace("error", "tui", &format!("Failed to reorder: {e}"));
+            return;
         }
-        self.reload_profiles().await;
+        self.profile_gen = self.profile_gen.wrapping_add(1);
+        // Swap sort_order values in-memory
+        for row in &mut self.profiles {
+            if row.profile.id == id {
+                row.profile.sort_order = Some(b_order);
+            } else if row.profile.id == next_id {
+                row.profile.sort_order = Some(a_order);
+            }
+        }
+        self.filter_cache_valid.set(false);
     }
 
     pub async fn set_active(&mut self, id: &str) {
@@ -1812,7 +1872,15 @@ impl AppState {
             self.log_trace("error", "tui", &format!("Failed to set active: {e}"));
             return;
         }
-        self.reload_profiles().await;
+        self.profile_gen = self.profile_gen.wrapping_add(1);
+        for row in &mut self.profiles {
+            row.profile.is_active = if row.profile.id == id {
+                Some(1)
+            } else {
+                Some(0)
+            };
+        }
+        self.filter_cache_valid.set(false);
     }
 
     // ── Core connection management ──────────────────────────────────────
@@ -2400,7 +2468,8 @@ impl AppState {
             None => return,
         };
         let pid = profile_id.to_string();
-        self.testing_details.insert(pid.clone(), TestType::SpeedTest);
+        self.testing_details
+            .insert(pid.clone(), TestType::SpeedTest);
         self.testing_profiles.insert(pid.clone());
         let proxy_addr = self.config.inbound.listen.clone();
         let proxy_port = self.config.inbound.socks_port;
@@ -2603,7 +2672,6 @@ impl AppState {
                         profile_id: session.profile_id.clone(),
                         test_type: TestType::TcpPing,
                     });
-                    let _ = db.update_session_status(&session.id, "fast_pinging").await;
 
                     let addr = match &session.address {
                         Some(a) => a.clone(),
@@ -2719,7 +2787,6 @@ impl AppState {
                         };
                         let rmgr = rmgr.clone();
                         let tx = tx.clone();
-                        let db = Arc::clone(&db);
                         let session = session.clone();
                         let profile = profile.clone();
 
@@ -2729,7 +2796,6 @@ impl AppState {
                                 profile_id: session.profile_id.clone(),
                                 test_type: TestType::RealPing,
                             });
-                            let _ = db.update_session_status(&session.id, "real_pinging").await;
                             let result = rmgr.real_ping(&profile, session.config_type).await;
                             let _ = tx.try_send(CoreEvent::SpeedTestResult {
                                 profile_id: session.profile_id.clone(),
@@ -2853,7 +2919,11 @@ impl AppState {
         // (e.g., create_ping_batch returned 0, no TestTypeUpdate events were ever sent).
         if self.batch_progress.is_some()
             && self.testing_profiles.is_empty()
-            && self.batch_progress.as_ref().map(|p| p.0.load(Ordering::Relaxed)) == Some(0)
+            && self
+                .batch_progress
+                .as_ref()
+                .map(|p| p.0.load(Ordering::Relaxed))
+                == Some(0)
         {
             self.batch_progress = None;
         }
@@ -2901,10 +2971,10 @@ impl AppState {
                     self.connection_error = None;
                     let stats = ServerStat {
                         profile_id: profile_id.clone(),
-                        today_up: Some(today_up as i32),
-                        today_down: Some(today_down as i32),
-                        total_up: Some(total_up as i32),
-                        total_down: Some(total_down as i32),
+                        today_up: Some(today_up),
+                        today_down: Some(today_down),
+                        total_up: Some(total_up),
+                        total_down: Some(total_down),
                         last_updated: Some(crate::format_now()),
                     };
                     if let Err(e) = self.db.upsert_server_stats(&stats).await {
@@ -2995,8 +3065,7 @@ impl AppState {
                     error,
                 } => {
                     self.testing_profiles.remove(&profile_id);
-                    self.testing_details
-                        .remove(&profile_id);
+                    self.testing_details.remove(&profile_id);
 
                     // Update profile extension and extract name in a scoped block
                     // to drop the mutable borrow before further self-method calls.
@@ -3236,12 +3305,18 @@ impl AppState {
             self.log_trace("error", "tui", "Group not found");
             return;
         };
-        let update_interval_value = self.subscriptions
+        let update_interval_value = self
+            .subscriptions
             .iter()
             .find(|s| s.group_id.as_deref() == Some(group_id))
-            .and_then(|s| s.update_interval).map_or_else(|| "1h".into(), |mins| humantime::format_duration(
-                std::time::Duration::from_secs(mins as u64 * 60)
-            ).to_string());
+            .and_then(|s| s.update_interval)
+            .map_or_else(
+                || "1h".into(),
+                |mins| {
+                    humantime::format_duration(std::time::Duration::from_secs(mins as u64 * 60))
+                        .to_string()
+                },
+            );
         let fields = vec![
             ("name".into(), group.name.unwrap_or_default()),
             (
@@ -3566,8 +3641,13 @@ impl AppState {
         let _ = db.purge_graveyard(GRAVEYARD_GROUP_ID, 24).await;
 
         let existing = db.get_subscription_by_group(&group_id).await.ok().flatten();
-        let sub_id = existing.as_ref().map_or_else(|| uuid::Uuid::new_v4().to_string(), |s| s.id.clone());
-        let stored_interval = existing.as_ref().and_then(|s| s.update_interval).unwrap_or(60);
+        let sub_id = existing
+            .as_ref()
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), |s| s.id.clone());
+        let stored_interval = existing
+            .as_ref()
+            .and_then(|s| s.update_interval)
+            .unwrap_or(60);
 
         let sub = Subscription {
             id: sub_id,

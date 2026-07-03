@@ -74,10 +74,10 @@ impl ServerStat {
     pub(crate) fn from_row(row: &turso::Row) -> turso::Result<Self> {
         Ok(Self {
             profile_id: row.get::<String>(ServerStatCol::ProfileId as usize)?,
-            today_up: row.get::<Option<i32>>(ServerStatCol::TodayUp as usize)?,
-            today_down: row.get::<Option<i32>>(ServerStatCol::TodayDown as usize)?,
-            total_up: row.get::<Option<i32>>(ServerStatCol::TotalUp as usize)?,
-            total_down: row.get::<Option<i32>>(ServerStatCol::TotalDown as usize)?,
+            today_up: row.get::<Option<i64>>(ServerStatCol::TodayUp as usize)?,
+            today_down: row.get::<Option<i64>>(ServerStatCol::TodayDown as usize)?,
+            total_up: row.get::<Option<i64>>(ServerStatCol::TotalUp as usize)?,
+            total_down: row.get::<Option<i64>>(ServerStatCol::TotalDown as usize)?,
             last_updated: row.get::<Option<String>>(ServerStatCol::LastUpdated as usize)?,
         })
     }

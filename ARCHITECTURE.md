@@ -74,6 +74,9 @@ pub struct AppState {
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
     pub shutdown_token: Arc<AtomicBool>,
+    /// Generation counter bumped on every profile mutation.
+    /// Used to skip redundant reload_profiles() calls.
+    pub profile_gen: u64,
     pub core_task_handle: Option<JoinHandle<()>>,
     /// Heed-backed persistent log storage.
     pub heed_storage: Option<Arc<HeedLogStorage>>,

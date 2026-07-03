@@ -15,7 +15,7 @@ cargo run
 
 ### Crate entry points
     - `crates/xray-tui/src/main.rs` — binary entry, tokio::main, TuiLogLayer tracing subscriber + subsystem init
-:- `crates/xray-tui/src/lib.rs` — AppState, Tab, SortColumn, ProfileRow, LogLine, SettingsMode (Split variant), SettingsSection (incl. SpeedTest), SplitFocus, SplitRightPane, CoreEvent (incl. TestTypeUpdate), testing_details map
+:- `crates/xray-tui/src/lib.rs` — AppState (incl. profile_gen), Tab, SortColumn, ProfileRow, LogLine, SettingsMode (Split variant), SettingsSection (incl. SpeedTest), SplitFocus, SplitRightPane, CoreEvent (incl. TestTypeUpdate), testing_details map
 - `crates/xray-tui-core/src/lib.rs` — core logic facade
 :- `crates/xray-tui-db/src/lib.rs` — re-export hub; Database, DatabaseError, Result public
 :- `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
@@ -80,9 +80,7 @@ cargo run
 1. **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. The TUI writes JSON configs and manages the binary lifetime.
 2. **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, Shadowsocks, etc.) → xray-core by default. User overrides per-profile.
 3. **One core at a time**: Only one backend process runs per connection session. Switching profiles between backends stops the current core and starts the other. Matches v2rayN.
-4. **Ratatui + Crossterm** — TUI framework. Async via tokio. Single render thread with async tasks sending updates via mpsc channels.
-5. **SQLite via turso (async)** — Single DB file for all persistent data. Async pure-Rust SQLite engine. All DB methods are `async fn` with `#[repr(usize)]` column enums for compile-time safe row extraction. Transaction via `unchecked_transaction().await`. Connection wrapped in `Arc<Database>` for shared access across tasks.
-6. **Multi-crate workspace** — Separation: bin crate (TUI) + 3 lib crates (core, db, config).
+5. **SQLite via turso (async)** — Single DB file for all persistent data. Async pure-Rust SQLite engine. All DB methods are `async fn` with `#[repr(usize)]` column enums for compile-time safe row extraction. Transaction via `unchecked_transaction().await`. `Database` uses a **reader/writer split** for concurrency: `Database::from_pool()` opens two connections — `writer` (`tokio::sync::Mutex<Connection>`) for writes, `reader` (`tokio::sync::RwLock<Connection>`) for reads. All read methods acquire `reader.read().await`, all write methods acquire `writer.lock().await`. Shared access across tasks via `Arc<Database>`.
 7. **Config generation** — Two builders: xray.rs (ports v2rayN's CoreConfigContextBuilder) and singbox.rs (ports sing-box JSON format).
 8. **gRPC stats abstraction**: `StatsProvider` trait with `XrayGrpcClient` (xray-core native gRPC) and `SingBoxGrpcClient` (sing-box V2Ray API experimental).
 9. **Sing-box config differs structurally** from xray-core: `type` vs `protocol`, `route` vs `routing`, `experimental.v2ray_api` vs `stats`+`api`+`policy`, different TLS/transport key names.
