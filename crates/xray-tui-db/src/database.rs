@@ -101,13 +101,13 @@ impl Database {
             db.push_schema().await?;
         }
 
-        toasty::sql::statement("PRAGMA journal_mode=WAL")
+        toasty::sql::query("PRAGMA journal_mode=WAL")
             .exec(&mut conn)
             .await?;
-        toasty::sql::statement("PRAGMA busy_timeout=5000")
+        toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
             .await?;
-        toasty::sql::statement("PRAGMA foreign_keys=ON")
+        toasty::sql::query("PRAGMA foreign_keys=ON")
             .exec(&mut conn)
             .await?;
 
@@ -134,10 +134,10 @@ impl Database {
         let mut conn = db.connection().await?;
         db.push_schema().await?; // fresh DB — always safe
 
-        toasty::sql::statement("PRAGMA busy_timeout=5000")
+        toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
             .await?;
-        toasty::sql::statement("PRAGMA foreign_keys=ON")
+        toasty::sql::query("PRAGMA foreign_keys=ON")
             .exec(&mut conn)
             .await?;
 
@@ -199,7 +199,7 @@ impl Database {
             tracing::info!(target: "db", "Normalized {count} profile remarks");
         }
 
-        toasty::sql::statement("PRAGMA user_version = 1")
+        toasty::sql::query("PRAGMA user_version = 1")
             .exec(&mut conn)
             .await?;
         Ok(())
