@@ -853,19 +853,18 @@ mod tests {
             protocol_settings: None,
             is_sub: Some(0),
             sub_id: None,
-            group_id: None,
+            group_id: String::new(),
             sort_order: Some(0),
             is_active: Some(0),
             created_at: None,
             updated_at: None,
-            sub_uid: None,
+            sub_uid: 0,
+            version: 0,
+            extension: Default::default(),
+            group: Default::default(),
+            server_stat: Default::default(),
         };
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "u64 bit pattern stored in i64, not arithmetic"
-        )]
-        let sub_uid = Some(profile.compute_sub_uid() as i64);
-        profile.sub_uid = sub_uid;
+        profile.sub_uid = profile.compute_sub_uid();
         profile
     }
 

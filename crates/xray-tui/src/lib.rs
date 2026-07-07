@@ -593,14 +593,14 @@ impl AppState {
             .enumerate()
             .filter(|(_, row)| {
                 if let Some(group_id) = &self.selected_group_id
-                    && row.profile.group_id.as_deref() != Some(group_id.as_str())
+                    && row.profile.group_id != *group_id
                 {
                     return false;
                 }
                 // When viewing All, skip graveyard profiles and mirror rows
                 if self.selected_group_id.is_none()
-                    && (row.profile.group_id.as_deref() == Some(GRAVEYARD_GROUP_ID)
-                        || row.profile.group_id.as_deref() == Some(ALL_GROUP_ID))
+                    && (row.profile.group_id == GRAVEYARD_GROUP_ID
+                        || row.profile.group_id == ALL_GROUP_ID)
                 {
                     return false;
                 }
@@ -843,12 +843,16 @@ impl AppState {
             protocol_settings: None,
             is_sub: Some(0),
             sub_id: None,
-            group_id: None,
+            group_id: String::new(),
             sort_order: None,
             is_active: None,
             created_at: Some(now.clone()),
             updated_at: Some(now),
-            sub_uid: None,
+            sub_uid: 0,
+            version: 0,
+            extension: Default::default(),
+            group: Default::default(),
+            server_stat: Default::default(),
         };
         let mut stream_map = serde_json::Map::new();
         let mut proto_map = serde_json::Map::new();
@@ -911,7 +915,7 @@ impl AppState {
         if !proto_map.is_empty() {
             profile.protocol_settings = Some(serde_json::to_string(&proto_map).unwrap_or_default());
         }
-        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+        profile.sub_uid = profile.compute_sub_uid();
         profile
     }
 
@@ -982,7 +986,7 @@ impl AppState {
             && gid != ALL_GROUP_ID
             && gid != GRAVEYARD_GROUP_ID
         {
-            profile.group_id = Some(gid.clone());
+            profile.group_id = gid.clone();
         }
         match self.db.insert_profile(&profile).await {
             Ok(()) => {
@@ -1094,8 +1098,8 @@ impl AppState {
         profile.network = new_profile.network;
         profile.stream_settings = new_profile.stream_settings;
         profile.protocol_settings = new_profile.protocol_settings;
-        profile.sub_uid = Some(profile.compute_sub_uid() as i64);
         profile.updated_at = Some(format_now());
+        profile.sub_uid = profile.compute_sub_uid();
         match self.db.update_profile(&profile).await {
             Ok(()) => {
                 self.log_trace(
@@ -1772,9 +1776,9 @@ impl AppState {
                     && gid != ALL_GROUP_ID
                     && gid != GRAVEYARD_GROUP_ID
                 {
-                    profile.group_id = Some(gid.clone());
+                    profile.group_id = gid.clone();
                 }
-                profile.sub_uid = Some(profile.compute_sub_uid() as i64);
+                profile.sub_uid = profile.compute_sub_uid();
                 if profile.created_at.is_none() {
                     profile.created_at = Some(now.clone());
                 }
@@ -2890,6 +2894,7 @@ impl AppState {
                     speed: None,
                     sort_order: None,
                     ip_info: r.ip_info.clone(),
+                    profile: Default::default(),
                 })
             })
             .collect();
@@ -2976,6 +2981,7 @@ impl AppState {
                         total_up: Some(total_up),
                         total_down: Some(total_down),
                         last_updated: Some(crate::format_now()),
+                        profile: Default::default(),
                     };
                     if let Err(e) = self.db.upsert_server_stats(&stats).await {
                         self.log_trace("error", "tui", &format!("Failed to save stats: {e}"));
@@ -3082,6 +3088,7 @@ impl AppState {
                                     speed: None,
                                     sort_order: None,
                                     ip_info: None,
+                                    profile: Default::default(),
                                 });
                                 match test_type {
                                     TestType::RealPing => {
@@ -3608,19 +3615,19 @@ impl AppState {
             tracing::info!(target: "tui", "Subscription returned 0 usable profiles — all URLs may have failed validation");
         }
         let now = format_now();
-        let mut sub_uids: Vec<u64> = Vec::with_capacity(profiles.len());
+        let mut sub_uids: Vec<i64> = Vec::with_capacity(profiles.len());
         let enriched: Vec<Profile> = profiles
             .into_iter()
             .map(|mut p| {
-                p.sub_uid = Some(p.compute_sub_uid() as i64);
-                p.group_id = Some(group_id.clone());
+                p.group_id = group_id.clone();
+                p.sub_uid = p.compute_sub_uid();
                 p.is_sub = Some(1);
                 p.sub_id = Some(uuid::Uuid::new_v4().to_string());
                 p.updated_at = Some(now.clone());
                 if p.created_at.is_none() {
                     p.created_at = Some(now.clone());
                 }
-                sub_uids.push(p.sub_uid.unwrap_or(0) as u64);
+                sub_uids.push(p.sub_uid);
                 p
             })
             .collect();
@@ -4152,7 +4159,7 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
     (level_str.to_string(), target, message, ts_nanos)
 }
 
-#[cfg(test)]
+
 mod tests {
     use super::*;
 

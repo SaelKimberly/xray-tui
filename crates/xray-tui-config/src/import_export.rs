@@ -1512,6 +1512,8 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
 }
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Creates a Profile with default group_id="" and sub_uid=0.
+/// Callers MUST overwrite these fields before inserting into DB.
 fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
     let id = uuid::Uuid::new_v4().to_string();
     Profile {
@@ -1532,15 +1534,18 @@ fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
         protocol_settings: None,
         is_sub: Some(0),
         sub_id: None,
-        group_id: None,
+        group_id: String::new(),
         sort_order: None,
         is_active: Some(0),
         created_at: None,
         updated_at: None,
-        sub_uid: None,
+        version: 0,
+        sub_uid: 0,
+        extension: Default::default(),
+        group: Default::default(),
+        server_stat: Default::default(),
     }
 }
-
 fn addr_port(profile: &Profile) -> (String, i32) {
     let addr = profile.address.as_deref().unwrap_or("").to_string();
     let port = profile.port.unwrap_or(0);

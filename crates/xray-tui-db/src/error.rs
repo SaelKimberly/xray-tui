@@ -1,9 +1,9 @@
-use crate::models::{Profile, ProfileExtension, ServerStat};
+use crate::models_toasty::{Profile, ProfileExtension, ServerStat};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
-    #[error("turso error: {0}")]
-    Turso(#[from] turso::Error),
+    #[error("toasty error: {0}")]
+    Toasty(#[from] toasty::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("uuid error: {0}")]

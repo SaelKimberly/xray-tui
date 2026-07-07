@@ -10,7 +10,7 @@ xray-tui/
 ├── xray-tui/          # Binary: ratatui event loop + all screens
 │   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, settings, groups, logs, statistics, actions_log, theme, palette_bridge, widgets/)
 ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
-├── xray-tui-db/       # Library: SQLite persistence layer + query methods
+├── xray-tui-db/       # Library: toasty ORM persistence layer + query methods
 ├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management
 ├── thirdparty/
 │   ├── Xray-core/         # Source of truth for protocols and behavior
@@ -64,7 +64,7 @@ xray-tui/
 - **Xray-core runs as a subprocess**; the TUI writes JSON config files and communicates via gRPC API.
 - **Sing-box runs as a subprocess**; the TUI writes JSON config files and communicates via sing-box's experimental V2Ray API (gRPC compatible).
 - **TUI framework**: **Ratatui + Crossterm** (async via tokio).
-:- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `turso` for profiles, subscriptions, routing, DNS, stats. |
+:- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `toasty` ORM v0.7 (turso driver) for profiles, subscriptions, routing, DNS, stats. |
 - **Fast Ping architecture**: Transport-level latency tests via FastPingManager with adapter pattern. TcpPingAdapter (handshake), UdpPingAdapter (datagram), QuicPingAdapter (handshake). Protocols map to adapters automatically; unsupported protocols fall through to RealPingManager. PingSession table persists results with batch_id correlation. |
 :- **Log storage**: `TuiLogLayer` sends tracing events to the log channel (non-blocking, `std::sync::mpsc::Sender`), which is consumed by a background `spawn_blocking` batched writer. Uses `heed` (embedded LMDB) in `xray-tui-core::log_heed` with two databases: `logs` (u64 BE → postcard-encoded `LogMessage`) and `targets` (seen target string set). MapFull triggers automatic resize (1 GB default, doubles up to 8 GB). Async wrappers (`read_recent_async`, `read_newer_than_async`, `read_older_than_async`, `get_targets_async`) wrap LMDB reads in `spawn_blocking` for non-blocking async calls from the TUI event loop. Initial log loading is lazy (deferred to first Logs tab access). |
 :- **Theme system**: `ThemeStyles` (in `theme.rs`) replaces hardcoded `Style` constants with static methods taking `&Palette`. `Palette` comes from `ratatui_themes::ThemeName` → `Theme` → `palette_bridge::current_palette()`. Every screen uses `state.current_palette()` and `ThemeStyles::*` instead of bare `Color` values. New dependencies: `ratatui-cheese` (form widgets, `Palette`), `ratatui-themes` (theme definitions), `tui-popup` (overlays), `tui-scrollbar`. New modules: `palette_bridge`, `widgets/` (reusable `DataTable`). |
@@ -72,7 +72,7 @@ xray-tui/
 
 ## Key source files
 
-- `crates/xray-tui-db/src/models.rs` — ProfileCore struct for deduplicated server configs, Profile as JOIN view, ALL_GROUP_ID constant
+- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 8 tables, ProfileWithDetails, PingResultUpdate, ALL_GROUP_ID constant
 - `crates/xray-tui/src/ui/groups.rs` — system-group-aware management (is_system guard, clear action)
 - `crates/xray-tui/src/ui/actions_log.rs` — live event log panel: connection status, speed test results, core/TUI logs, traffic/memory
 :- `crates/xray-tui/src/lib.rs` — BatchImport mode, ClearGroup event, start_batch_import method, batch-then-real-ping flow, testing_details HashMap, logs_show_validation toggle, SpeedTestConfig

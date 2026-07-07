@@ -5,7 +5,7 @@
 ```
 xray-tui (bin)
   ├── xray-tui-core     (Protocol, CoreType, resolve_core)
-  ├── xray-tui-db       (Database, query methods, models)
+  ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
   └── xray-tui-config   (AppConfig load/save)
 ```
 
@@ -424,109 +424,20 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 
 ### xray-tui-db (library crate)
 
-`crates/xray-tui-db/src/lib.rs` — SQLite database layer.
+`crates/xray-tui-db/src/lib.rs` — toasty ORM database layer.
 
-**Schema initialization** (`schema.rs`):
-```sql
-CREATE TABLE IF NOT EXISTS profiles (
-    id TEXT PRIMARY KEY,
-    config_type INTEGER NOT NULL,
-    core_type TEXT NOT NULL DEFAULT 'xray',  -- 'xray' | 'sing-box' | 'auto'
-    remarks TEXT NOT NULL DEFAULT '',
-    address TEXT NOT NULL DEFAULT '',
-    port INTEGER NOT NULL DEFAULT 0,
-    user_id TEXT,
-    security TEXT,
-    network TEXT,
-    stream_settings TEXT,  -- JSON blob (transport + TLS + REALITY)
-    protocol_settings TEXT, -- JSON blob (protocol-specific fields)
-    is_sub INTEGER NOT NULL DEFAULT 0,
-    sub_id TEXT,
-    group_id TEXT NOT NULL,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+**Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
+- `Profile` — proxy server config; `#[unique(group_id, sub_uid)]` for subscription dedup
+- `Group` — subscription group with name, URL, sort order, is_system flag
+- `ProfileExtension` — per-profile test results (delay, speed, ip_info)
+- `ServerStat` — traffic counters (today/total up/down as i64)
+- `Subscription` — group subscription metadata
+- `RoutingRule` — domain/IP/port matchers with outbound tag; sort-ordered
+- `DnsSetting` — DNS resolver config
+- `PingSession` — ping batch tracking (batch_id, status, ping_type, latency)
 
-CREATE TABLE IF NOT EXISTS groups (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    subscription_url TEXT,
-    subscription_enabled INTEGER NOT NULL DEFAULT 0,
-    user_agent TEXT,
-    convert_target INTEGER,
-    core_type TEXT,          -- optional override for all servers in this group
-    sort_order INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS routing_rules (
-    id TEXT PRIMARY KEY,
-    group_id TEXT,
-    type INTEGER NOT NULL,
-    domain_matcher TEXT,
-    domains TEXT,
-    ips TEXT,
-    inbound_tags TEXT,
-    port TEXT,
-    source_ports TEXT,
-    network TEXT,
-    protocols TEXT,
-    domain_strategy TEXT,
-    outbound_tag TEXT,
-    balancer_tag TEXT,
-    rule_set_file TEXT,
-    rule_set_url TEXT,
-    sort_order INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS dns_settings (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    servers TEXT,
-    hosts TEXT,
-    query_strategy TEXT,
-    disable_cache INTEGER,
-    disable_fallback INTEGER,
-    client_ip TEXT
-);
-
-CREATE TABLE IF NOT EXISTS profile_extensions (
-    profile_id TEXT PRIMARY KEY,
-    delay INTEGER NOT NULL DEFAULT -1,
-    speed INTEGER NOT NULL DEFAULT -1,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    ip_info TEXT
-);
-
-CREATE TABLE IF NOT EXISTS server_stats (
-    profile_id TEXT PRIMARY KEY,
-    today_up INTEGER NOT NULL DEFAULT 0,
-    today_down INTEGER NOT NULL DEFAULT 0,
-    total_up INTEGER NOT NULL DEFAULT 0,
-    total_down INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS logs (
-    id              INTEGER PRIMARY KEY,
-    timestamp_nanos BIGINT NOT NULL,
-    level           TEXT NOT NULL DEFAULT 'info',
-    target          TEXT NOT NULL DEFAULT '',
-    message         TEXT NOT NULL,
-    metadata_json   TEXT,
-    source          TEXT NOT NULL DEFAULT 'tui'
-);
-CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp_nanos);
-CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
-CREATE INDEX IF NOT EXISTS idx_logs_source ON logs(source);
-```
-
-**Repository pattern** — Each table gets a typed repo (same as single-core design).
-
-
-**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage::store_entry()` via a synchronous call on the heed (LMDB) environment. The `HeedLogStorage` (in `log_heed.rs`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp and value as postcard-encoded `LogMessage`. A separate `targets` database tracks seen target strings. All reads/writes are synchronous (heed uses mmap); callers wrap in `Arc` for shared async access. Filtered queries read directly from LMDB — no background worker, no dedicated connection, no SQLite table.
-**Migration approach**: migratus-like version numbering in a `schema_version` table.
+**Schema management**: toasty's `db.push_schema()` creates tables on first open. `schema_needed()` helper checks for existing `profiles` table to skip re-push on existing DBs. System groups created by `ensure_system_groups()`. All operations via toasty query API (filter_by_id, create, update, delete) — no raw SQL, no manual column enums.
+**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB). Initial log loading is lazy (deferred to first Logs tab access).
 
 ### xray-tui-config (library crate)
 

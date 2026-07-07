@@ -228,14 +228,17 @@ fn render_data_grid(
             let type_str = format!("{protocol:.12}");
             let remarks = row.profile.remarks.as_deref().unwrap_or("");
             let remarks_str = truncate_pad(remarks, 24);
-            let group_str = row
-                .profile
-                .group_id
-                .as_deref()
-                .filter(|gid| *gid != GRAVEYARD_GROUP_ID)
-                .and_then(|gid| state.groups.iter().find(|g| g.id == *gid))
-                .and_then(|g| g.name.as_deref())
-                .map_or_else(String::new, |name| truncate_pad(name, 12));
+            let group_str = {
+                let gid: &str = &row.profile.group_id;
+                (gid != GRAVEYARD_GROUP_ID).then(|| {
+                    state.groups
+                        .iter()
+                        .find(|g| g.id == gid)
+                        .and_then(|g| g.name.as_deref())
+                })
+                .flatten()
+                .map_or_else(String::new, |name| truncate_pad(name, 12))
+            };
             let address = row.profile.address.as_deref().unwrap_or("");
             let address_str = truncate_pad(address, 30);
             let port_str = row
