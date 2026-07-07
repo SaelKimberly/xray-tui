@@ -21,7 +21,6 @@ cargo run
 :- `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
 - `crates/xray-tui-db/src/database.rs` — Database struct + all public query/write methods (toasty ORM, replaced raw turso SQLite)
 - `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 8 tables (Profile, Group, ProfileExtension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession); non-model types (ProfileWithDetails, PingResultUpdate); constants (GRAVEYARD_GROUP_ID, ALL_GROUP_ID)
-- `crates/xray-tui-db/src/helpers.rs` — private percent_decode / normalize_remark utilities
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box

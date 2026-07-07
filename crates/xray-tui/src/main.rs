@@ -101,7 +101,6 @@ async fn main() -> Result<()> {
     // 2. Open database (~/.config/xray-tui/data.db)
     let db_path = config_dir.join("data.db");
     let db = Database::open(&db_path).await?;
-    db.normalize_all_remarks().await?;
     // 3. Open heed log storage (~/.config/xray-tui/logs.lmdb)
     let log_path = config_dir.join("logs.lmdb");
     let heed = Arc::new(HeedLogStorage::new(&log_path)?);

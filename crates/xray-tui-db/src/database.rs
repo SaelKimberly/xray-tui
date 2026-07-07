@@ -6,7 +6,6 @@ use toasty_core::stmt::Value;
 use toasty_core::schema::db::Type as DbType;
 
 use crate::error::{DatabaseError, Result};
-use crate::helpers::normalize_remark;
 use crate::models_toasty::{
     ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, PingResultUpdate, PingSession, Profile,
     ProfileExtension, RoutingRule, ServerStat, Subscription,
@@ -20,14 +19,6 @@ pub struct Database {
 
 // ── Helpers (private) ───────────────────────────────────────────────────
 
-/// Check whether toasty's schema has already been applied (profiles table exists).
-async fn schema_needed(conn: &mut dyn toasty::Executor) -> Result<bool> {
-    let rows =
-        toasty::sql::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='profiles'")
-            .exec(conn)
-            .await?;
-    Ok(rows.is_empty())
-}
 
 /// Create system groups (All, Graveyard) if they don't exist.
 async fn ensure_system_groups(conn: &mut dyn toasty::Executor) -> Result<()> {
@@ -96,10 +87,36 @@ impl Database {
 
         let mut conn = db.connection().await?;
 
-        // Only push schema on fresh DB files — bare CREATE TABLE would fail if tables exist.
-        if schema_needed(&mut conn).await? {
+        // Schema versioning: push_schema() on version mismatch.
+        // toasty's diff handles both fresh (CREATE TABLE + indices) and
+        // existing (CREATE INDEX for missing #[unique], ALTER TABLE for new columns).
+        const SCHEMA_VERSION: i32 = 1;
+
+        let version: i32 = {
+            let rows = toasty::sql::query("PRAGMA user_version")
+                .exec(&mut conn)
+                .await?;
+            rows.first()
+                .and_then(|v| {
+                    if let Value::Record(fields) = v {
+                        fields.first().and_then(|f| match f {
+                            Value::I64(n) => Some(*n as i32),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        };
+
+        if version < SCHEMA_VERSION {
             db.push_schema().await?;
+            toasty::sql::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .exec(&mut conn)
+                .await?;
         }
+
 
         toasty::sql::query("PRAGMA journal_mode=WAL")
             .exec(&mut conn)
@@ -146,65 +163,6 @@ impl Database {
     }
 }
 
-// ── Schema migration helpers ────────────────────────────────────────────
-
-impl Database {
-    /// One-time backfill: normalize all existing profile remarks.
-    /// Uses `user_version` pragma to run exactly once.
-    pub async fn normalize_all_remarks(&self) -> Result<()> {
-        let mut conn = self.db.connection().await?;
-
-        let version: i32 = {
-            let rows = toasty::sql::query("PRAGMA user_version")
-                .exec(&mut conn)
-                .await?;
-            rows.first()
-                .and_then(|v| {
-                    if let Value::Record(fields) = v {
-                        fields.first().and_then(|f| match f {
-                            Value::I64(n) => Some(*n as i32),
-                            _ => None,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0)
-        };
-
-        if version >= 1 {
-            return Ok(());
-        }
-
-        let profiles: Vec<Profile> = Profile::all().exec(&mut conn).await?;
-        let mut count = 0u32;
-
-        let mut tx = conn.transaction().await?;
-        for p in &profiles {
-            if let Some(r) = &p.remarks {
-                let normalized = normalize_remark(r);
-                if normalized != *r {
-                    toasty::sql::statement("UPDATE profiles SET remarks = ?1 WHERE id = ?2")
-                        .bind(&normalized)
-                        .bind(&p.id)
-                        .exec(&mut tx)
-                        .await?;
-                    count += 1;
-                }
-            }
-        }
-        tx.commit().await?;
-
-        if count > 0 {
-            tracing::info!(target: "db", "Normalized {count} profile remarks");
-        }
-
-        toasty::sql::query("PRAGMA user_version = 1")
-            .exec(&mut conn)
-            .await?;
-        Ok(())
-    }
-}
 
 // ── Query methods (public API) ──────────────────────────────────────────
 

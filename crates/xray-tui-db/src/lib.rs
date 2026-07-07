@@ -5,4 +5,3 @@ pub use database::Database;
 pub use error::{DatabaseError, ProfileWithDetails, Result};
 
 mod database;
-mod helpers;
