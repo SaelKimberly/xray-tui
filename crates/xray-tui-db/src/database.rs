@@ -3,12 +3,13 @@ use std::path::Path;
 use toasty::stmt::IntoStatement;
 
 use toasty_core::stmt::Value;
+use toasty_core::schema::db::Type as DbType;
 
 use crate::error::{DatabaseError, Result};
 use crate::helpers::normalize_remark;
 use crate::models_toasty::{
-    DnsSetting, Group, PingResultUpdate, PingSession, Profile, ProfileExtension, RoutingRule,
-    ServerStat, Subscription, ALL_GROUP_ID, GRAVEYARD_GROUP_ID,
+    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, PingResultUpdate, PingSession, Profile,
+    ProfileExtension, RoutingRule, ServerStat, Subscription,
 };
 
 // ── Database handle ─────────────────────────────────────────────────────
@@ -21,11 +22,10 @@ pub struct Database {
 
 /// Check whether toasty's schema has already been applied (profiles table exists).
 async fn schema_needed(conn: &mut dyn toasty::Executor) -> Result<bool> {
-    let rows = toasty::sql::query(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='profiles'",
-    )
-    .exec(conn)
-    .await?;
+    let rows =
+        toasty::sql::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='profiles'")
+            .exec(conn)
+            .await?;
     Ok(rows.is_empty())
 }
 
@@ -284,15 +284,14 @@ impl Database {
         Ok(profile)
     }
 
-    pub async fn get_subscription_by_group(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<Subscription>> {
+    pub async fn get_subscription_by_group(&self, group_id: &str) -> Result<Option<Subscription>> {
         let mut conn = self.db.connection().await?;
-        Ok(Subscription::filter(Subscription::fields().group_id().eq(group_id.to_string()))
-            .first()
-            .exec(&mut conn)
-            .await?)
+        Ok(
+            Subscription::filter(Subscription::fields().group_id().eq(group_id.to_string()))
+                .first()
+                .exec(&mut conn)
+                .await?,
+        )
     }
 
     pub async fn get_all_subscriptions(&self) -> Result<Vec<Subscription>> {
@@ -685,11 +684,11 @@ impl Database {
         .bind(&sub.id)
         .bind(sub.group_id.as_deref())
         .bind(&sub.url)
-        .bind(sub.last_updated.as_deref())
-        .bind(opt_to_value(sub.update_interval, |v| Value::I64(v as i64)))
-        .bind(sub.user_agent.as_deref())
-        .bind(sub.status.as_deref())
-        .bind(sub.error_message.as_deref())
+        .bind_typed(sub.last_updated.clone(), DbType::Text)
+        .bind_typed(sub.update_interval, DbType::Integer(4))
+        .bind_typed(sub.user_agent.clone(), DbType::Text)
+        .bind_typed(sub.status.clone(), DbType::Text)
+        .bind_typed(sub.error_message.clone(), DbType::Text)
         .exec(&mut conn)
         .await?;
         Ok(())
@@ -927,11 +926,7 @@ impl Database {
 
 impl Database {
     /// Create a ping batch with Rust-side triplet dedup (replaces window function).
-    pub async fn create_ping_batch(
-        &self,
-        batch_id: &str,
-        group_id: Option<&str>,
-    ) -> Result<usize> {
+    pub async fn create_ping_batch(&self, batch_id: &str, group_id: Option<&str>) -> Result<usize> {
         let mut conn = self.db.connection().await?;
 
         let mut query = Profile::all()
@@ -1219,10 +1214,7 @@ impl Database {
 // ── Private helpers ─────────────────────────────────────────────────────
 
 /// Insert a single profile row using toasty's generated create (for use inside transactions).
-async fn insert_profile_inner(
-    executor: &mut dyn toasty::Executor,
-    p: &Profile,
-) -> Result<()> {
+async fn insert_profile_inner(executor: &mut dyn toasty::Executor, p: &Profile) -> Result<()> {
     Profile::create()
         .id(p.id.clone())
         .sub_uid(p.sub_uid)
@@ -1278,19 +1270,19 @@ async fn upsert_profile_row(
     .bind(group_id)
     .bind(p.config_type)
     .bind(&p.core_type)
-    .bind(opt_to_value(p.address.clone(), Value::String))
-    .bind(opt_to_value(p.port, |v| Value::I64(v as i64)))
-    .bind(opt_to_value(p.user_id.clone(), Value::String))
-    .bind(opt_to_value(p.security.clone(), Value::String))
-    .bind(opt_to_value(p.network.clone(), Value::String))
-    .bind(opt_to_value(p.stream_settings.clone(), Value::String))
-    .bind(opt_to_value(p.protocol_settings.clone(), Value::String))
-    .bind(opt_to_value(p.remarks.clone(), Value::String))
-    .bind(opt_to_value(p.is_sub, |v| Value::I64(v as i64)))
-    .bind(opt_to_value(p.sub_id.clone(), Value::String))
-    .bind(opt_to_value(p.sort_order, |v| Value::I64(v as i64)))
-    .bind(opt_to_value(p.is_active, |v| Value::I64(v as i64)))
-    .bind(opt_to_value(p.created_at.clone(), Value::String))
+    .bind_typed(p.address.clone(), DbType::Text)
+    .bind_typed(p.port, DbType::Integer(4))
+    .bind_typed(p.user_id.clone(), DbType::Text)
+    .bind_typed(p.security.clone(), DbType::Text)
+    .bind_typed(p.network.clone(), DbType::Text)
+    .bind_typed(p.stream_settings.clone(), DbType::Text)
+    .bind_typed(p.protocol_settings.clone(), DbType::Text)
+    .bind_typed(p.remarks.clone(), DbType::Text)
+    .bind_typed(p.is_sub, DbType::Integer(4))
+    .bind_typed(p.sub_id.clone(), DbType::Text)
+    .bind_typed(p.sort_order, DbType::Integer(4))
+    .bind_typed(p.is_active, DbType::Integer(4))
+    .bind_typed(p.created_at.clone(), DbType::Text)
     .exec(executor)
     .await?;
     Ok(())
@@ -1325,9 +1317,7 @@ fn deserialize_ping_sessions(rows: Vec<Value>) -> Result<Vec<PingSession>> {
 
 /// Deserialize rows from the real-ping JOIN query (ping_sessions JOIN profiles).
 /// Column order: ps.* (16 cols) then profiles.* (20 cols).
-fn deserialize_ping_session_pairs(
-    rows: Vec<Value>,
-) -> Result<Vec<(PingSession, Profile)>> {
+fn deserialize_ping_session_pairs(rows: Vec<Value>) -> Result<Vec<(PingSession, Profile)>> {
     let mut pairs = Vec::with_capacity(rows.len());
     for value in rows {
         if let Value::Record(fields) = value {
@@ -1427,11 +1417,3 @@ fn get_opt_i64(fields: &[Value], idx: usize) -> Option<i64> {
     })
 }
 
-/// Wrap an `Option<T>` into `Value`, mapping `None` to `Value::Null`.
-/// Avoids type-inference failures in the Turso driver for `Option<T>` bindings.
-fn opt_to_value<T, F>(val: Option<T>, to_val: F) -> Value
-where
-    F: FnOnce(T) -> Value,
-{
-    val.map(to_val).unwrap_or(Value::Null)
-}
