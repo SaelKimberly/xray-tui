@@ -217,8 +217,14 @@ impl ProtoSpec for TrojanConfig {
                         if let Some(ref v) = opts.sid {
                             parts.push(format!("sid={}", urlencoding::encode(v)));
                         }
+                        if let Some(v) = &opts.spx {
+                            parts.push(format!("spx={}", urlencoding::encode(v)));
+                        }
                     }
                 }
+            }
+            if self.security.tls.is_none() {
+                parts.push("security=none".to_string());
             }
             if self.transport.type_str() != "tcp" {
                 parts.push(format!("type={}", self.transport.type_str()));
@@ -398,5 +404,18 @@ mod tests {
         check_roundtrip::<TrojanConfig>(
             "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org",
         );
+    }
+
+    #[test]
+    fn trojan_security_none_roundtrip() {
+        let url = "trojan://pass@example.com:443?security=none";
+        let raw = crate::urlx::RawUrlX::from(url);
+        let config = TrojanConfig::try_parse(&raw).unwrap();
+        let rebuilt = config.reconstruct().unwrap();
+        assert!(rebuilt.contains("security=none"), "reconstructed URL should preserve security=none: {rebuilt}");
+        let raw2 = crate::urlx::RawUrlX::from(rebuilt.as_str());
+        let config2 = TrojanConfig::try_parse(&raw2).unwrap();
+        assert_eq!(config, config2);
+        assert!(config2.security.tls.is_none());
     }
 }
