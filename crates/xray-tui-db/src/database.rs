@@ -7,8 +7,8 @@ use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    Connection, DnsSetting, Group, PingResultUpdate, PingSession, Profile,
-    ProfileExtension, RoutingRule, ServerStat, Subscription,
+    Connection, DnsSetting, Group, PingResultUpdate, PingSession, Profile, ProfileExtension,
+    RoutingRule, ServerStat, Subscription,
 };
 
 // ── Database handle ─────────────────────────────────────────────────────
@@ -107,7 +107,6 @@ impl Database {
 
         Self::init_default_group(&mut conn).await?;
         Ok(Self { db })
-
     }
 
     async fn init_default_group(conn: &mut impl toasty::Executor) -> Result<()> {
@@ -176,7 +175,10 @@ impl Database {
     }
 
     /// Profiles in a specific group, with their connection metadata.
-    pub async fn get_profiles_by_group(&self, group_id: &str) -> Result<Vec<(Profile, Connection)>> {
+    pub async fn get_profiles_by_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<(Profile, Connection)>> {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
@@ -202,10 +204,7 @@ impl Database {
         Ok(groups)
     }
 
-    pub async fn get_profile_extension(
-        &self,
-        profile_id: i64,
-    ) -> Result<Option<ProfileExtension>> {
+    pub async fn get_profile_extension(&self, profile_id: i64) -> Result<Option<ProfileExtension>> {
         let mut conn = self.db.connection().await?;
         let ext = ProfileExtension::filter_by_profile_id(profile_id)
             .first()
@@ -239,13 +238,57 @@ impl Database {
         }
         Ok(result)
     }
+    /// All profiles with their extension, stats, and connection group_id.
+    /// Uses LEFT JOIN so profiles with 0 connections are still returned
+    /// (group_id will be None for orphans).
+    pub async fn get_all_profiles_with_connections(
+        &self,
+    ) -> Result<Vec<(Profile, Option<ProfileExtension>, Option<ServerStat>, Option<String>)>> {
+        let mut conn = self.db.connection().await?;
+        let rows = toasty::sql::query(
+            "SELECT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
+                    p.config_type, p.core_type, p.address, p.port, p.transport, p.security, p.created_at, \
+                    c.group_id \
+             FROM profiles p \
+             LEFT JOIN connections c ON c.profile_id = p.id",
+        )
+        .exec(&mut conn)
+        .await?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for value in rows {
+            if let Value::Record(fields) = value {
+                // Indices 0-11: profile fields
+                let profile = Profile {
+                    id: get_i64(&fields, 0)?,
+                    sig: get_i64(&fields, 1)?,
+                    cred_hash: get_i64(&fields, 2)?,
+                    proto_kind: get_string(&fields, 3)?,
+                    spec_blob: get_blob(&fields, 4),
+                    config_type: get_i64(&fields, 5)? as i32,
+                    core_type: get_string(&fields, 6)?,
+                    address: get_string(&fields, 7)?,
+                    port: get_i64(&fields, 8)? as i32,
+                    transport: get_opt_string(&fields, 9),
+                    security: get_opt_string(&fields, 10),
+                    created_at: get_i64(&fields, 11)?,
+                    extension: Default::default(),
+                    server_stat: Default::default(),
+                };
+                // Index 12: group_id (optional, from LEFT JOIN)
+                let group_id = get_opt_string(&fields, 12);
+                // Load extension and stats via dedicated methods
+                let ext = self.get_profile_extension(profile.id).await?;
+                let stats = self.get_server_stats(profile.id).await?;
+                result.push((profile, ext, stats, group_id));
+            }
+        }
+        Ok(result)
+    }
 
     pub async fn get_profile(&self, id: i64) -> Result<Option<Profile>> {
         let mut conn = self.db.connection().await?;
-        let profile = Profile::filter_by_id(id)
-            .first()
-            .exec(&mut conn)
-            .await?;
+        let profile = Profile::filter_by_id(id).first().exec(&mut conn).await?;
         Ok(profile)
     }
 
@@ -378,8 +421,8 @@ impl Database {
 
         // Upsert profile
         toasty::sql::statement(
-            "INSERT OR REPLACE INTO profiles (id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, address, port, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR REPLACE INTO profiles (id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, address, port, transport, security, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(p.id)
         .bind(p.sig)
@@ -390,7 +433,9 @@ impl Database {
         .bind(&p.core_type)
         .bind(&p.address)
         .bind(p.port)
-        .bind(now)
+        .bind(p.transport.as_deref())
+        .bind(p.security.as_deref())
+        .bind(p.created_at)
         .exec(&mut tx)
         .await?;
 
@@ -422,11 +467,12 @@ impl Database {
             .core_type(p.core_type.clone())
             .address(p.address.clone())
             .port(p.port)
+            .transport(p.transport.clone())
+            .security(p.security.clone())
             .exec(&mut conn)
             .await?;
         Ok(())
     }
-
 
     /// Delete a profile and all related rows (cascade manually).
     pub async fn delete_profile(&self, id: i64) -> Result<()> {
@@ -558,12 +604,10 @@ impl Database {
         let mut tx = conn.transaction().await?;
 
         // Deactivate all connections in this group
-        toasty::sql::statement(
-            "UPDATE connections SET is_active = 0 WHERE group_id = ?1",
-        )
-        .bind(group_id)
-        .exec(&mut tx)
-        .await?;
+        toasty::sql::statement("UPDATE connections SET is_active = 0 WHERE group_id = ?1")
+            .bind(group_id)
+            .exec(&mut tx)
+            .await?;
         // Activate target
         toasty::sql::statement(
             "UPDATE connections SET is_active = 1 WHERE profile_id = ?1 AND group_id = ?2",
@@ -605,7 +649,6 @@ impl Database {
             .bind(id)
             .exec(&mut tx)
             .await?;
-
 
         // Delete related extension/stat/ping data for profiles that now have no connections
         toasty::sql::statement(
@@ -660,12 +703,10 @@ impl Database {
         let mut tx = conn.transaction().await?;
 
         // Count connections first
-        let count_row = toasty::sql::query(
-            "SELECT COUNT(*) FROM connections WHERE group_id = ?1",
-        )
-        .bind(group_id)
-        .exec(&mut tx)
-        .await?;
+        let count_row = toasty::sql::query("SELECT COUNT(*) FROM connections WHERE group_id = ?1")
+            .bind(group_id)
+            .exec(&mut tx)
+            .await?;
         let count = count_row
             .first()
             .and_then(|v| {
@@ -810,12 +851,13 @@ impl Database {
         for (p, _) in profiles {
             uids.push(p.id);
             toasty::sql::statement(
-                "INSERT INTO profiles (id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, address, port, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                "INSERT INTO profiles (id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, address, port, transport, security, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(id) DO UPDATE SET \
                  sig=excluded.sig, cred_hash=excluded.cred_hash, \
                  spec_blob=excluded.spec_blob, config_type=excluded.config_type, \
-                 core_type=excluded.core_type, address=excluded.address, port=excluded.port",
+                 core_type=excluded.core_type, address=excluded.address, port=excluded.port, \
+                 transport=excluded.transport, security=excluded.security",
             )
             .bind(p.id)
             .bind(p.sig)
@@ -826,14 +868,18 @@ impl Database {
         .bind(&p.core_type)
         .bind(&p.address)
         .bind(p.port)
-        .bind(now)
+        .bind(p.transport.as_deref())
+        .bind(p.security.as_deref())
+        .bind(p.created_at)
             .exec(&mut tx)
             .await?;
         }
 
         // Phase 2: delete connections for profiles no longer in the subscription
         if !uids.is_empty() {
-            let ph: Vec<String> = uids.iter().enumerate()
+            let ph: Vec<String> = uids
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 2))
                 .collect();
             let sql = format!(
@@ -1028,19 +1074,24 @@ impl Database {
             let profiles = deserialize_profiles(rows)?;
             profiles
                 .into_iter()
-                .map(|p| (p, Connection {
-                    id: String::new(),
-                    profile_id: 0,
-                    group_id: String::new(),
-                    remarks: None,
-                    seen_at: None,
-                    is_sub: None,
-                    sort_order: None,
-                    is_active: None,
-                    updated_at: 0,
-                    profile: Default::default(),
-                    group: Default::default(),
-                }))
+                .map(|p| {
+                    (
+                        p,
+                        Connection {
+                            id: String::new(),
+                            profile_id: 0,
+                            group_id: String::new(),
+                            remarks: None,
+                            seen_at: None,
+                            is_sub: None,
+                            sort_order: None,
+                            is_active: None,
+                            updated_at: 0,
+                            profile: Default::default(),
+                            group: Default::default(),
+                        },
+                    )
+                })
                 .collect()
         };
 

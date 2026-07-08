@@ -518,15 +518,15 @@ impl AppState {
     }
 
     pub async fn reload_profiles(&mut self) {
-        match self.db.get_all_profiles_with_details().await {
+        match self.db.get_all_profiles_with_connections().await {
             Ok(rows) => {
                 self.profiles = rows
                     .into_iter()
-                    .map(|(profile, extension, stats)| ProfileRow {
+                    .map(|(profile, extension, stats, group_id)| ProfileRow {
                         profile,
                         extension,
                         stats,
-                        group_id: None,
+                        group_id,
                     })
                     .collect();
             }
@@ -543,12 +543,13 @@ impl AppState {
         profile: Profile,
         extension: Option<ProfileExtension>,
         stats: Option<ServerStat>,
+        group_id: Option<String>,
     ) {
         let row = ProfileRow {
             profile,
             extension,
             stats,
-            group_id: None,
+            group_id,
         };
         if let Some(existing) = self
             .profiles
@@ -990,7 +991,7 @@ impl AppState {
                 );
                 self.mode = AppMode::List;
                 self.profile_gen = self.profile_gen.wrapping_add(1);
-                self.upsert_profile_row(profile, None, None);
+                self.upsert_profile_row(profile, None, None, self.selected_group_id.clone());
             }
             Err(e) => {
                 self.log_trace("error", "tui", &format!("Failed to add server: {e}"));
@@ -1118,7 +1119,8 @@ impl AppState {
                 let existing = self.profiles.iter().find(|r| r.profile.id == profile_id);
                 let existing_stats = existing.and_then(|r| r.stats.clone());
                 let existing_ext = existing.and_then(|r| r.extension.clone());
-                self.upsert_profile_row(profile, existing_ext, existing_stats);
+                let existing_group_id = existing.and_then(|r| r.group_id.clone());
+                self.upsert_profile_row(profile, existing_ext, existing_stats, existing_group_id);
             }
             Err(e) => {
                 self.log_trace("error", "tui", &format!("Failed to update server: {e}"));
