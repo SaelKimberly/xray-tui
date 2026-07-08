@@ -157,6 +157,14 @@ impl ProtoSpec for VmessConfig {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(TinyText::from);
+        let insecure = json
+            .get("insecure")
+            .and_then(|v| v.as_str())
+            .and_then(|s| match s {
+                "1" | "true" | "True" => Some(true),
+                "0" | "false" | "False" => Some(false),
+                _ => None,
+            });
         let tls_str = json
             .get("tls")
             .and_then(|v| v.as_str())
@@ -176,7 +184,7 @@ impl ProtoSpec for VmessConfig {
                     sni: sni.clone(),
                     alpn,
                     fp,
-                    insecure: None,
+                    insecure,
                 })
             }),
             enc: scy.map(|s| crate::urlx::TinyText::from(s.as_str())),
@@ -278,6 +286,9 @@ impl ProtoSpec for VmessConfig {
             if let Some(ref v) = opts.fp {
                 map.insert("fp".into(), serde_json::Value::String(v.to_string()));
             }
+            if opts.insecure == Some(true) {
+                map.insert("insecure".into(), serde_json::Value::String("1".into()));
+            }
         }
         if let Some(ref v) = self.security.enc {
             map.insert("scy".into(), serde_json::Value::String(v.to_string()));
@@ -287,6 +298,12 @@ impl ProtoSpec for VmessConfig {
                 "net".into(),
                 serde_json::Value::String(self.transport.type_str().to_string()),
             );
+        }
+        // Emit XHttp/SplitHTTP mode
+        if let TransportConfig::XHttp(xcfg) = &self.transport
+            && let Some(ref mode) = xcfg.mode
+        {
+            map.insert("type".into(), serde_json::Value::String(mode.to_string()));
         }
         if let Some(ref v) = self.path {
             map.insert("path".into(), serde_json::Value::String(v.to_string()));
