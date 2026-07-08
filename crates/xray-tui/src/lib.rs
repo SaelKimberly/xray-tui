@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
+use xray_tui_config::import_export::{ProfileLegacy, ProfileMut};
 use xray_tui_config::{AppConfig, ValidationSettings, ValidationSummary};
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
@@ -37,7 +38,6 @@ use xray_tui_db::models::{
     Connection, DnsSetting, Group, PingResultUpdate, Profile, ProfileExtension, RoutingRule,
     ServerStat, Subscription,
 };
-use xray_tui_config::import_export::{ProfileLegacy, ProfileMut};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Profiles,
@@ -625,13 +625,8 @@ impl AppState {
                     .leg("remarks")
                     .unwrap_or_default()
                     .cmp(&b_row.profile.leg("remarks").unwrap_or_default()),
-                SortColumn::Address => a_row
-                    .profile
-                    .address
-                    .cmp(&b_row.profile.address),
-                SortColumn::Port => {
-                    a_row.profile.port.cmp(&b_row.profile.port)
-                }
+                SortColumn::Address => a_row.profile.address.cmp(&b_row.profile.address),
+                SortColumn::Port => a_row.profile.port.cmp(&b_row.profile.port),
                 SortColumn::Delay => {
                     let da = a_row.extension.as_ref().and_then(|e| e.delay).unwrap_or(-1);
                     let db = b_row.extension.as_ref().and_then(|e| e.delay).unwrap_or(-1);
@@ -768,6 +763,52 @@ impl AppState {
     }
 
     fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
+        let proto_kind = match protocol {
+            Protocol::Vmess => "vmess",
+            Protocol::Vless => "vless",
+            Protocol::Trojan => "trojan",
+            Protocol::Shadowsocks => "ss",
+            Protocol::Shadowsocks2022 => "ss-2022",
+            Protocol::ShadowsocksR => "ssr",
+            Protocol::Socks => "socks",
+            Protocol::Http => "http",
+            Protocol::WireGuard => "wireguard",
+            Protocol::Hysteria2 => "hysteria2",
+            Protocol::Tuic => "tuic",
+            Protocol::Hysteria => "hysteria",
+            Protocol::Naive => "naive",
+            Protocol::AnyTls => "anytls",
+            Protocol::ShadowTls => "shadowtls",
+            Protocol::Tor => "tor",
+            Protocol::Ssh => "ssh",
+            Protocol::Tailscale => "tailscale",
+            Protocol::Redirect => "redirect",
+            Protocol::TProxy => "tproxy",
+            Protocol::Mixed => "mixed",
+            Protocol::DokodemoDoor => "dokodemo-door",
+            Protocol::Freedom => "freedom",
+            Protocol::Blackhole => "blackhole",
+            Protocol::Dns => "dns",
+            Protocol::Loopback => "loopback",
+            Protocol::Custom => "custom",
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Form-created profiles cannot compute uid via ProtoSpec (no URL was parsed).
+        // Use random i64 PK instead of deterministic sig ^ cred_hash.
+        // This breaks the uid = sig ^ cred_hash convention for form profiles,
+        // but is safe because form profiles never participate in URL-based
+        // dedup (they have no proto_kind matchable to a ProtoSpec variant).
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let rand_bits = RandomState::new().build_hasher().finish();
+        let uid: i64 = (now ^ rand_bits) as i64;
+        // sig and cred_hash are meaningless for form profiles but kept non-zero
+        // to avoid any sentinel-value confusion in DB queries.
+        let sig = uid;
+        let cred_hash = 0;
         let mut address = String::new();
         let mut port: i32 = 0;
         let mut user_id: Option<String> = None;
@@ -842,10 +883,10 @@ impl AppState {
         };
 
         let mut profile = Profile {
-            id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
+            id: uid,
+            sig,
+            cred_hash,
+            proto_kind: proto_kind.to_string(),
             spec_blob: Vec::new(),
             config_type: protocol.to_i32(),
             core_type,
@@ -853,7 +894,7 @@ impl AppState {
             port,
             transport: network,
             security,
-            created_at: 0,
+            created_at: now as i64,
             extension: Default::default(),
             server_stat: Default::default(),
         };
@@ -942,7 +983,9 @@ impl AppState {
                     "tui",
                     &format!(
                         "Added server: {}",
-                        profile.leg("remarks").unwrap_or_else(|| "unnamed".to_string())
+                        profile
+                            .leg("remarks")
+                            .unwrap_or_else(|| "unnamed".to_string())
                     ),
                 );
                 self.mode = AppMode::List;
@@ -1065,7 +1108,9 @@ impl AppState {
                     "tui",
                     &format!(
                         "Updated server: {}",
-                        profile.leg("remarks").unwrap_or_else(|| "unnamed".to_string())
+                        profile
+                            .leg("remarks")
+                            .unwrap_or_else(|| "unnamed".to_string())
                     ),
                 );
                 self.mode = AppMode::List;
@@ -1653,10 +1698,19 @@ impl AppState {
     }
 
     pub async fn clone_profile(&mut self, id: i64) {
-        let profile = match self.profiles.iter().find(|r| r.profile.id == id).map(|r| r.profile.clone()) {
+        let profile = match self
+            .profiles
+            .iter()
+            .find(|r| r.profile.id == id)
+            .map(|r| r.profile.clone())
+        {
             Some(p) => p,
             None => {
-                self.log_trace("error", "tui", &format!("Profile {id} not found for cloning"));
+                self.log_trace(
+                    "error",
+                    "tui",
+                    &format!("Profile {id} not found for cloning"),
+                );
                 return;
             }
         };
@@ -3012,7 +3066,9 @@ impl AppState {
                                     }
                                 }
                                 let _ = self.db.upsert_profile_extension(ext).await;
-                                row.profile.leg("remarks").unwrap_or_else(|| profile_id.to_string())
+                                row.profile
+                                    .leg("remarks")
+                                    .unwrap_or_else(|| profile_id.to_string())
                             }
                             None => profile_id.to_string(),
                         }
@@ -3581,9 +3637,7 @@ impl AppState {
         let group_ids: Vec<String> = self
             .groups
             .iter()
-            .filter(|g| {
-                g.subscription_url.as_deref().is_some_and(|u| !u.is_empty())
-            })
+            .filter(|g| g.subscription_url.as_deref().is_some_and(|u| !u.is_empty()))
             .map(|g| g.id.clone())
             .collect();
         for gid in group_ids {
@@ -4061,7 +4115,6 @@ fn parse_core_log_line(line: &str, core_type: CoreType) -> (String, String, Stri
     };
     (level_str.to_string(), target, message, ts_nanos)
 }
-
 
 #[cfg(test)]
 mod tests {
