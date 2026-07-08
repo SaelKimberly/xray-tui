@@ -92,6 +92,15 @@ impl Database {
                 .await?;
             // Default group for fresh DB
             Self::init_default_group(&mut conn).await?;
+            toasty::sql::query("PRAGMA journal_mode=WAL")
+                .exec(&mut conn)
+                .await?;
+            toasty::sql::query("PRAGMA busy_timeout=5000")
+                .exec(&mut conn)
+                .await?;
+            toasty::sql::query("PRAGMA foreign_keys=ON")
+                .exec(&mut conn)
+                .await?;
             return Ok(Self { db });
         }
 
