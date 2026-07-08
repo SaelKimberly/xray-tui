@@ -157,8 +157,8 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
 
 /// Apply remark normalization and all validation checks to a parsed profile.
 fn normalize_and_validate(mut profile: Profile, settings: &ValidationSettings) -> Result<Profile> {
-    if let Some(ref r) = profile.remarks.clone() {
-        profile.remarks = Some(normalize_remark(r));
+    if let Some(ref r) = profile.leg("remarks") {
+        profile.set_remarks(Some(normalize_remark(r)));
     }
     validate_required_fields(&profile)?;
     validate_host(&profile, settings)?;
@@ -201,10 +201,10 @@ fn parse_vmess(url: &str) -> Result<Profile> {
         .map_err(|e| ImportError::Parse(format!("invalid vmess QR structure: {e}")))?;
 
     let mut profile = base_profile(Protocol::Vmess, &qr.add, qr.port);
-    profile.remarks = Some(qr.ps).filter(|s| !s.is_empty());
-    profile.user_id = Some(qr.id).filter(|s| !s.is_empty());
-    profile.security = Some(qr.scy).filter(|s| !s.is_empty());
-    profile.network = Some(qr.net).filter(|s| !s.is_empty());
+    profile.set_remarks(Some(qr.ps).filter(|s| !s.is_empty()));
+    profile.set_user_id(Some(qr.id).filter(|s| !s.is_empty()));
+    profile.set_security(Some(qr.scy).filter(|s| !s.is_empty()));
+    profile.set_network(Some(qr.net).filter(|s| !s.is_empty()));
 
     let mut stream = serde_json::Map::new();
     if !qr.tls.is_empty() {
@@ -229,7 +229,7 @@ fn parse_vmess(url: &str) -> Result<Profile> {
         stream.insert("ws.path".into(), serde_json::Value::String(qr.path));
     }
     if !stream.is_empty() {
-        profile.stream_settings = Some(serde_json::to_string(&stream)?);
+        profile.set_stream_settings(Some(serde_json::to_string(&stream)?));
     }
     Ok(profile)
 }
@@ -238,17 +238,17 @@ fn format_vmess(profile: &Profile) -> Result<String> {
     let (add, port) = addr_port(profile);
     let qr = serde_json::json!({
         "v": 2,
-        "ps": profile.remarks.as_deref().unwrap_or(""),
+        "ps": profile.leg("remarks").unwrap_or_default(),
         "add": add,
         "port": port,
-        "id": profile.user_id.as_deref().unwrap_or(""),
+        "id": profile.leg("user_id").unwrap_or_default(),
         "aid": 0,
-        "scy": profile.security.as_deref().unwrap_or("auto"),
-        "net": profile.network.as_deref().unwrap_or("tcp"),
+        "scy": profile.leg("security").unwrap_or_else(|| "auto".to_string()),
+        "net": profile.leg("network").unwrap_or_else(|| "tcp".to_string()),
         "type": "none",
         "host": "",
         "path": "",
-        "tls": profile.stream_settings.as_deref().unwrap_or(""),
+        "tls": profile.leg("stream_settings").unwrap_or_default(),
         "sni": "",
         "alpn": "",
         "fp": "",
@@ -268,102 +268,102 @@ fn parse_vless(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(0)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
     if !parsed.username.is_empty() {
-        profile.user_id = Some(parsed.username.clone());
+        profile.set_user_id(Some(parsed.username.clone()));
     }
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
             "flow" => {
                 let mut ps = serde_json::Map::new();
                 ps.insert("flow".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "security" => {
                 if v == "reality" {
-                    let mut ss = stream_settings(profile.stream_settings.as_deref());
+                    let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                     ss.insert(
                         "security".into(),
                         serde_json::Value::String("reality".into()),
                     );
-                    profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                    profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
                 }
             }
             "sni" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "fp" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert("fingerprint".into(), serde_json::Value::String(v.clone()));
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "alpn" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert("alpn".into(), serde_json::Value::String(v.clone()));
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "allowInsecure" | "allow_insecure" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert(
                     "allow_insecure".into(),
                     serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
                 );
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "type" => {
                 if v == "tcp" || v == "ws" || v == "grpc" {
-                    profile.network = Some(v.clone());
+                    profile.set_network(Some(v.clone()));
                 }
             }
             "path" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert("ws.path".into(), serde_json::Value::String(v.clone()));
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "host" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert("ws.host".into(), serde_json::Value::String(v.clone()));
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "serviceName" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 ss.insert(
                     "grpc.serviceName".into(),
                     serde_json::Value::String(v.clone()),
                 );
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "pbk" | "publicKey" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 let rs = ss
                     .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
                     obj.insert("publicKey".into(), serde_json::Value::String(v.clone()));
                 }
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "sid" | "shortId" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 let rs = ss
                     .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
                     obj.insert("shortId".into(), serde_json::Value::String(v.clone()));
                 }
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             "spx" | "spiderX" => {
-                let mut ss = stream_settings(profile.stream_settings.as_deref());
+                let mut ss = stream_settings(profile.leg("stream_settings").as_deref());
                 let rs = ss
                     .entry(String::from("realitySettings"))
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let Some(obj) = rs.as_object_mut() {
                     obj.insert("spiderX".into(), serde_json::Value::String(v.clone()));
                 }
-                profile.stream_settings = Some(serde_json::to_string(&ss)?);
+                profile.set_stream_settings(Some(serde_json::to_string(&ss)?));
             }
             _ => {}
         }
@@ -373,21 +373,21 @@ fn parse_vless(url: &str) -> Result<Profile> {
 
 fn format_vless(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
-    let userinfo = profile.user_id.as_deref().unwrap_or("");
+    let userinfo = profile.leg("user_id").unwrap_or_default();
     let mut query: Vec<(String, String)> = Vec::new();
     query.push(("encryption".into(), "none".into()));
 
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
         && let Some(flow) = v.get("flow").and_then(|f| f.as_str())
     {
         query.push(("flow".into(), flow.to_string()));
     }
-    if let Some(net) = &profile.network {
+    if let Some(net) = profile.leg("network") {
         query.push(("type".into(), net.clone()));
     }
-    if let Some(ss) = &profile.stream_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ss)
+    if let Some(ss) = profile.leg("stream_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ss)
     {
         if let Some(sni) = v.get("sni").and_then(|s| s.as_str()) {
             query.push(("sni".into(), sni.to_string()));
@@ -416,7 +416,7 @@ fn format_vless(profile: &Profile) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -469,13 +469,13 @@ fn parse_shadowsocks(url: &str) -> Result<Profile> {
             Protocol::Shadowsocks
         };
         let mut profile = base_profile(protocol, host, port);
-        profile.user_id = Some(password.to_string());
+        profile.set_user_id(Some(password.to_string()));
         let mut ps = serde_json::Map::new();
         ps.insert(
             "method".into(),
             serde_json::Value::String(method.to_string()),
         );
-        profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+        profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
         return Ok(profile);
     }
 
@@ -514,28 +514,28 @@ fn parse_shadowsocks_sip002(userinfo_b64: &str, rest2: &str) -> Result<Profile> 
         Protocol::Shadowsocks
     };
     let mut profile = base_profile(protocol, address, port);
-    profile.remarks = fragment;
-    profile.user_id = Some(password.to_string());
+    profile.set_remarks(fragment);
+    profile.set_user_id(Some(password.to_string()));
     let mut ps = serde_json::Map::new();
     ps.insert(
         "method".into(),
         serde_json::Value::String(method.to_string()),
     );
-    profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+    profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
     Ok(profile)
 }
 
 fn format_shadowsocks(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let method = profile
-        .protocol_settings
+        .leg("protocol_settings")
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("method").and_then(|m| m.as_str().map(String::from)))
         .unwrap_or_else(|| "aes-256-gcm".into());
-    let password = profile.user_id.as_deref().unwrap_or("");
+    let password = profile.leg("user_id").unwrap_or_default();
     let userinfo = base64_simd::STANDARD.encode_to_string(format!("{method}:{password}"));
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -553,36 +553,36 @@ fn parse_trojan(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     if !parsed.username.is_empty() {
-        profile.user_id = Some(parsed.username.clone());
+        profile.set_user_id(Some(parsed.username.clone()));
     }
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
             "sni" | "peer" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "allowInsecure" | "allow_insecure" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "allow_insecure".into(),
                     serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "alpn" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("alpn".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "fp" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("fingerprint".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -592,10 +592,10 @@ fn parse_trojan(url: &str) -> Result<Profile> {
 
 fn format_trojan(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
-    let pw = profile.user_id.as_deref().unwrap_or("");
+    let pw = profile.leg("user_id").unwrap_or_default();
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
         && let Some(sni) = v.get("sni").and_then(|s| s.as_str())
     {
         query.push(("sni".into(), sni.to_string()));
@@ -612,7 +612,7 @@ fn format_trojan(profile: &Profile) -> String {
                 .join("&")
         )
     };
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -630,7 +630,7 @@ fn parse_socks(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(1080)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
         ps.insert(
@@ -640,14 +640,14 @@ fn parse_socks(url: &str) -> Result<Profile> {
         if let Some(pw) = &parsed.password {
             ps.insert("password".into(), serde_json::Value::String(pw.clone()));
         }
-        profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+        profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
     }
     Ok(profile)
 }
 
 fn format_socks(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -665,33 +665,33 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
-            "auth" | "password" => profile.user_id = Some(v.clone()),
+            "auth" | "password" => profile.set_user_id(Some(v.clone())),
             "obfs" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("obfs".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "obfs-password" | "obfs_password" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("obfs_password".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "sni" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "insecure" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "insecure".into(),
                     serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -702,11 +702,11 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
 fn format_hysteria2(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(auth) = &profile.user_id {
+    if let Some(auth) = profile.leg("user_id") {
         query.push(("auth".into(), auth.clone()));
     }
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
         if let Some(obfs) = v
             .get("obfs")
@@ -735,7 +735,7 @@ fn format_hysteria2(profile: &Profile) -> String {
                 .join("&")
         )
     };
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -753,57 +753,57 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
             "protocol" | "type" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("protocol".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "auth" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("auth".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "obfs" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("obfs".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "upmbps" | "up_mbps" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "up_mbps".into(),
                     serde_json::Value::Number(serde_json::Number::from(
                         v.parse::<i64>().unwrap_or(100),
                     )),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "downmbps" | "down_mbps" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "down_mbps".into(),
                     serde_json::Value::Number(serde_json::Number::from(
                         v.parse::<i64>().unwrap_or(100),
                     )),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "sni" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "insecure" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "insecure".into(),
                     serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -814,8 +814,8 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
 fn format_hysteria(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
         if let Some(auth) = v
             .get("auth")
@@ -843,7 +843,7 @@ fn format_hysteria(profile: &Profile) -> String {
                 .join("&")
         )
     };
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -861,49 +861,49 @@ fn parse_tuic(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
-            "uuid" => profile.user_id = Some(v.clone()),
+            "uuid" => profile.set_user_id(Some(v.clone())),
             "password" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("password".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "congestion_control" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "congestion_control".into(),
                     serde_json::Value::String(v.clone()),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "udp_relay_mode" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "udp_relay_mode".into(),
                     serde_json::Value::String(v.clone()),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "sni" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "alpn" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("alpn".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "allow_insecure" | "insecure" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "insecure".into(),
                     serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -913,11 +913,11 @@ fn parse_tuic(url: &str) -> Result<Profile> {
 
 fn format_tuic(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
-    let uuid = profile.user_id.as_deref().unwrap_or("");
+    let uuid = profile.leg("user_id").unwrap_or_default();
     let mut query: Vec<(String, String)> = Vec::new();
     query.push(("uuid".into(), uuid.to_string()));
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
         if let Some(pw) = v
             .get("password")
@@ -946,7 +946,7 @@ fn format_tuic(profile: &Profile) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -964,7 +964,7 @@ fn parse_naive(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
         ps.insert(
@@ -974,7 +974,7 @@ fn parse_naive(url: &str) -> Result<Profile> {
         if let Some(pw) = &parsed.password {
             ps.insert("password".into(), serde_json::Value::String(pw.clone()));
         }
-        profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+        profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
     }
     Ok(profile)
 }
@@ -982,18 +982,18 @@ fn parse_naive(url: &str) -> Result<Profile> {
 fn format_naive(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let user = profile
-        .protocol_settings
+        .leg("protocol_settings")
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("user").and_then(|u| u.as_str().map(String::from)))
         .unwrap_or_default();
     let password = profile
-        .protocol_settings
+        .leg("protocol_settings")
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("password").and_then(|p| p.as_str().map(String::from)))
         .unwrap_or_default();
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -1016,32 +1016,32 @@ fn parse_anytls(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
             "password" | "auth" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("password".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "sni" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "alpn" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("alpn".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "insecure" | "allow_insecure" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert(
                     "insecure".into(),
                     serde_json::Value::Bool(v == "1" || v.eq_ignore_ascii_case("true")),
                 );
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -1052,8 +1052,8 @@ fn parse_anytls(url: &str) -> Result<Profile> {
 fn format_anytls(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
         if let Some(pw) = v
             .get("password")
@@ -1082,7 +1082,7 @@ fn format_anytls(profile: &Profile) -> String {
                 .join("&")
         )
     };
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -1100,24 +1100,24 @@ fn parse_shadowtls(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
             "password" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("password".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "version" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("version".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "sni" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("sni".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -1127,10 +1127,10 @@ fn parse_shadowtls(url: &str) -> Result<Profile> {
 
 fn format_shadowtls(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
         if let Some(pw) = v
             .get("password")
@@ -1173,40 +1173,40 @@ fn parse_wireguard(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
     // WireGuard URLs may not have a host:port authority; use query params
     let mut profile = base_profile(Protocol::WireGuard, "", 0);
-    profile.remarks.clone_from(&parsed.fragment);
+    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
             "private_key" | "privateKey" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("private_key".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "public_key" | "publicKey" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("public_key".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "endpoint" => {
                 if let Some((ep_addr, ep_port)) = v.rsplit_once(':') {
-                    profile.address = Some(ep_addr.to_string());
-                    profile.port = ep_port.parse::<i32>().ok();
+                    profile.address = ep_addr.to_string();
+                    profile.port = ep_port.parse::<i32>().unwrap_or(0);
                 }
             }
             "allowed_ips" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("allowed_ips".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "mtu" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("mtu".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             "dns" => {
-                let mut ps = protocol_settings(profile.protocol_settings.as_deref());
+                let mut ps = protocol_settings(profile.leg("protocol_settings").as_deref());
                 ps.insert("dns".into(), serde_json::Value::String(v.clone()));
-                profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+                profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
             }
             _ => {}
         }
@@ -1216,8 +1216,8 @@ fn parse_wireguard(url: &str) -> Result<Profile> {
 
 fn format_wireguard(profile: &Profile) -> String {
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
         if let Some(pk) = v
             .get("private_key")
@@ -1234,17 +1234,15 @@ fn format_wireguard(profile: &Profile) -> String {
             query.push(("publicKey".into(), pubk.to_string()));
         }
     }
-    if let Some(addr) = &profile.address
-        && let Some(port) = profile.port
-    {
-        query.push(("endpoint".into(), format!("{addr}:{port}")));
+    if !profile.address.is_empty() && profile.port > 0 {
+        query.push(("endpoint".into(), format!("{}:{}", profile.address, profile.port)));
     }
     let qs = query
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -1512,45 +1510,137 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
 }
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Creates a Profile with default group_id="" and sub_uid=0.
-/// Callers MUST overwrite these fields before inserting into DB.
-fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
-    let id = uuid::Uuid::new_v4().to_string();
+/// Build a new-style Profile from legacy parser fields.
+fn build_legacy_profile(
+    protocol: Protocol,
+    address: &str,
+    port: i32,
+    user_id: Option<String>,
+    remarks: Option<String>,
+    security: Option<String>,
+    network: Option<String>,
+    protocol_settings: Option<String>,
+    stream_settings: Option<String>,
+) -> Profile {
+    let mut extra = serde_json::Map::new();
+    if let Some(v) = user_id.filter(|s| !s.is_empty()) {
+        extra.insert("user_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = remarks.filter(|s| !s.is_empty()) {
+        extra.insert("remarks".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = protocol_settings.filter(|s| !s.is_empty()) {
+        if let Ok(val) = serde_json::from_str(&v) {
+            extra.insert("protocol_settings".into(), val);
+        }
+    }
+    if let Some(v) = stream_settings.filter(|s| !s.is_empty()) {
+        if let Ok(val) = serde_json::from_str(&v) {
+            extra.insert("stream_settings".into(), val);
+        }
+    }
+    let spec_blob = serde_json::to_vec(&serde_json::Value::Object(extra)).unwrap_or_default();
     Profile {
-        id,
+        id: 0,
+        sig: 0,
+        cred_hash: 0,
+        proto_kind: String::new(),
+        spec_blob,
         config_type: protocol.to_i32(),
-        core_type: "auto".into(),
-        remarks: None,
-        address: if address.is_empty() {
-            None
-        } else {
-            Some(address.to_string())
-        },
-        port: if port > 0 { Some(port) } else { None },
-        user_id: None,
-        security: None,
-        network: None,
-        stream_settings: None,
-        protocol_settings: None,
-        is_sub: Some(0),
-        sub_id: None,
-        group_id: String::new(),
-        sort_order: None,
-        is_active: Some(0),
-        created_at: None,
-        updated_at: None,
-        version: 0,
-        sub_uid: 0,
+        core_type: "auto".to_string(),
+        address: if address.is_empty() { String::new() } else { address.to_string() },
+        port: if port > 0 { port } else { 0 },
+        transport: network,
+        security,
+        created_at: 0,
         extension: Default::default(),
-        group: Default::default(),
         server_stat: Default::default(),
     }
 }
-fn addr_port(profile: &Profile) -> (String, i32) {
-    let addr = profile.address.as_deref().unwrap_or("").to_string();
-    let port = profile.port.unwrap_or(0);
-    (addr, port)
+
+/// Read a legacy field from a Profile's spec_blob (trait for auto-ref method dispatch).
+pub trait ProfileLegacy {
+    fn leg(&self, key: &str) -> Option<String>;
 }
+impl ProfileLegacy for Profile {
+    fn leg(&self, key: &str) -> Option<String> {
+        let extra: serde_json::Value = serde_json::from_slice(&self.spec_blob).ok()?;
+        let val = extra.get(key)?;
+        match val {
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => Some(val.to_string()),
+        }
+    }
+}
+
+/// Apply legacy fields to an existing Profile's spec_blob.
+fn set_legacy_fields(
+    profile: &mut Profile,
+    user_id: Option<String>,
+    remarks: Option<String>,
+    security: Option<String>,
+    network: Option<String>,
+    protocol_settings: Option<String>,
+    stream_settings: Option<String>,
+) {
+    let mut extra: serde_json::Value = serde_json::from_slice(&profile.spec_blob)
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    let map = match &mut extra {
+        serde_json::Value::Object(m) => m,
+        _ => return,
+    };
+    if let Some(v) = user_id.filter(|s| !s.is_empty()) {
+        map.insert("user_id".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = remarks.filter(|s| !s.is_empty()) {
+        map.insert("remarks".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = security.filter(|s| !s.is_empty()) {
+        map.insert("security".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = network.filter(|s| !s.is_empty()) {
+        map.insert("network".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = protocol_settings.filter(|s| !s.is_empty()) {
+        if let Ok(val) = serde_json::from_str(&v) {
+            map.insert("protocol_settings".into(), val);
+        }
+    }
+    if let Some(v) = stream_settings.filter(|s| !s.is_empty()) {
+        if let Ok(val) = serde_json::from_str(&v) {
+            map.insert("stream_settings".into(), val);
+        }
+    }
+    profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
+}
+
+/// Per-field setters — enables mechanical `profile.X = ...` -> `profile.set_X(...)` replacement.
+pub trait ProfileMut {
+    fn set_remarks(&mut self, v: Option<String>);
+    fn set_user_id(&mut self, v: Option<String>);
+    fn set_protocol_settings(&mut self, v: Option<String>);
+    fn set_stream_settings(&mut self, v: Option<String>);
+    fn set_security(&mut self, v: Option<String>);
+    fn set_network(&mut self, v: Option<String>);
+}
+impl ProfileMut for Profile {
+    fn set_remarks(&mut self, v: Option<String>) { set_legacy_fields(self, None, v, None, None, None, None); }
+    fn set_user_id(&mut self, v: Option<String>) { set_legacy_fields(self, v, None, None, None, None, None); }
+    fn set_protocol_settings(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, None, None, v, None); }
+    fn set_stream_settings(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, None, None, None, v); }
+    fn set_security(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, v, None, None, None); }
+    fn set_network(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, None, v, None, None); }
+}
+
+/// Legacy convenience — builds empty Profile via build_legacy_profile.
+fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
+    build_legacy_profile(protocol, address, port, None, None, None, None, None, None)
+}
+
+fn addr_port(profile: &Profile) -> (String, i32) {
+    (profile.address.clone(), profile.port)
+}
+
 
 fn stream_settings(existing: Option<&str>) -> serde_json::Map<String, serde_json::Value> {
     existing
@@ -1570,6 +1660,7 @@ fn protocol_settings(existing: Option<&str>) -> serde_json::Map<String, serde_js
         .unwrap_or_default()
 }
 
+// ── ShadowsocksR ──
 // ── ShadowsocksR ─────────────────────────────────────────────────────────
 
 /// Parse `ssr://` URL.
@@ -1621,7 +1712,7 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
     }
 
     let mut profile = base_profile(Protocol::ShadowsocksR, &raw_host, port);
-    profile.user_id = Some(password.to_string());
+    profile.set_user_id(Some(password.to_string()));
 
     let mut ps = serde_json::Map::new();
     ps.insert(
@@ -1650,13 +1741,13 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
             ps.insert((*key).into(), serde_json::Value::String(val_decoded));
         }
     }
-    profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+    profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
 
     if let Some(remarks_b64) = params.get("remarks")
         && let Ok(bytes) = crate::base64_util::decode_base64(remarks_b64)
         && let Ok(decoded) = String::from_utf8(bytes)
     {
-        profile.remarks = Some(decoded);
+        profile.set_remarks(Some(decoded));
     }
 
     Ok(profile)
@@ -1664,9 +1755,9 @@ fn parse_shadowsocksr(url: &str) -> Result<Profile> {
 
 fn format_shadowsocksr(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
-    let password = profile.user_id.as_deref().unwrap_or("");
+    let password = profile.leg("user_id").unwrap_or_default();
     let (method, protocol, obfs) = profile
-        .protocol_settings
+        .leg("protocol_settings")
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .map_or_else(
@@ -1698,8 +1789,8 @@ fn format_shadowsocksr(profile: &Profile) -> String {
         );
 
     let mut query_str = String::new();
-    if let Some(ps) = &profile.protocol_settings
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+    if let Some(ps) = profile.leg("protocol_settings")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
         && let Some(obfsparam) = v
             .get("obfsparam")
             .and_then(|o| o.as_str())
@@ -1708,7 +1799,7 @@ fn format_shadowsocksr(profile: &Profile) -> String {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(obfsparam);
         let _ = write!(query_str, "obfsparam={encoded}&");
     }
-    if let Some(remarks) = &profile.remarks {
+    if let Some(remarks) = profile.leg("remarks") {
         let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(remarks);
         let _ = write!(query_str, "remarks={encoded}");
     }
@@ -1747,7 +1838,7 @@ fn parse_http(url: &str) -> Result<Profile> {
         .map_err(|_| ImportError::Parse("http: invalid port".into()))?;
 
     let mut profile = base_profile(Protocol::Http, host, port);
-    profile.remarks = fragment.filter(|s| !s.is_empty());
+    profile.set_remarks(fragment.filter(|s| !s.is_empty()));
 
     if !userinfo.is_empty() {
         let mut ps = serde_json::Map::new();
@@ -1766,7 +1857,7 @@ fn parse_http(url: &str) -> Result<Profile> {
                 serde_json::Value::String(userinfo.to_string()),
             );
         }
-        profile.protocol_settings = Some(serde_json::to_string(&ps)?);
+        profile.set_protocol_settings(Some(serde_json::to_string(&ps)?));
     }
 
     Ok(profile)
@@ -1775,7 +1866,7 @@ fn parse_http(url: &str) -> Result<Profile> {
 fn format_http(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let (user, pass) = profile
-        .protocol_settings
+        .leg("protocol_settings")
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .map(|v| {
@@ -1800,7 +1891,7 @@ fn format_http(profile: &Profile) -> String {
     } else {
         format!("{user}:{pass}@")
     };
-    let remark = profile.remarks.as_deref().unwrap_or("");
+    let remark = profile.leg("remarks").unwrap_or_default();
     let fragment = if remark.is_empty() {
         String::new()
     } else {
@@ -1832,12 +1923,12 @@ impl From<crate::app_config::ParsingSettings> for ValidationSettings {
 fn validate_required_fields(profile: &Profile) -> Result<()> {
     /// Check if the profile has some form of password/credential.
     fn has_credential(profile: &Profile) -> bool {
-        if profile.user_id.is_some() && profile.user_id.as_deref() != Some("") {
+        if profile.leg("user_id").is_some() && profile.leg("user_id").as_deref() != Some("") {
             return true;
         }
         // Check protocol_settings for a password field (AnyTLS, Naïve, ShadowTLS, etc.)
-        if let Some(ps) = &profile.protocol_settings
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(ps)
+        if let Some(ps) = profile.leg("protocol_settings")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
             && let Some(pw) = v.get("password").and_then(|p| p.as_str())
         {
             return !pw.is_empty();
@@ -1862,10 +1953,10 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
         | Protocol::Naive
         | Protocol::AnyTls
         | Protocol::ShadowTls => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
+            if profile.address.is_empty() {
                 return Err(missing("address"));
             }
-            if profile.port.is_none() || profile.port == Some(0) {
+            if profile.port == 0 {
                 return Err(missing("port"));
             }
             if !has_credential(profile) {
@@ -1873,16 +1964,16 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
             }
         }
         Protocol::Hysteria | Protocol::Socks | Protocol::Http => {
-            if profile.address.is_none() || profile.address.as_deref() == Some("") {
+            if profile.address.is_empty() {
                 return Err(missing("address"));
             }
-            if profile.port.is_none() || profile.port == Some(0) {
+            if profile.port == 0 {
                 return Err(missing("port"));
             }
         }
         Protocol::WireGuard => {
-            if let Some(ps) = &profile.protocol_settings {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(ps) {
+            if let Some(ps) = profile.leg("protocol_settings") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps) {
                     let has_pubkey = v
                         .get("public_key")
                         .and_then(|s| s.as_str())
@@ -1909,10 +2000,10 @@ fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()>
         return Ok(());
     }
 
-    let addr = match &profile.address {
-        Some(a) if !a.is_empty() => a,
-        _ => return Ok(()), // no address to validate
-    };
+    let addr = &profile.address;
+    if addr.is_empty() {
+        return Ok(()); // no address to validate
+    }
 
     // Try parsing as IP address
     if let Ok(ip) = addr.parse::<IpAddr>() {
@@ -2014,9 +2105,9 @@ mod tests {
     #[test]
     fn roundtrip_vmess() {
         let mut p = base_profile(Protocol::Vmess, "example.com", 443);
-        p.user_id = Some("uuid-here".into());
-        p.network = Some("ws".into());
-        p.stream_settings = Some(r#"{"ws.path":"/api","tls.enable":true}"#.into());
+        p.set_user_id(Some("uuid-here".into()));
+        p.set_network(Some("ws".into()));
+        p.set_stream_settings(Some(r#"{"ws.path":"/api","tls.enable":true}"#.into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("vmess://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2028,8 +2119,8 @@ mod tests {
     #[test]
     fn roundtrip_vless() {
         let mut p = base_profile(Protocol::Vless, "server.com", 443);
-        p.user_id = Some("uuid".into());
-        p.remarks = Some("my vless".into());
+        p.set_user_id(Some("uuid".into()));
+        p.set_remarks(Some("my vless".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("vless://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2039,14 +2130,14 @@ mod tests {
     #[test]
     fn roundtrip_shadowsocks() {
         let mut p = base_profile(Protocol::Shadowsocks, "ss.example", 1080);
-        p.user_id = Some("password123".into());
+        p.set_user_id(Some("password123".into()));
         let mut ps = serde_json::Map::new();
         ps.insert(
             "method".into(),
             serde_json::Value::String("aes-256-gcm".into()),
         );
-        p.protocol_settings = Some(serde_json::to_string(&ps).unwrap());
-        p.remarks = Some("myss".into());
+        p.set_protocol_settings(Some(serde_json::to_string(&ps).unwrap()));
+        p.set_remarks(Some("myss".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("ss://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2056,8 +2147,8 @@ mod tests {
     #[test]
     fn roundtrip_trojan() {
         let mut p = base_profile(Protocol::Trojan, "trojan.example", 443);
-        p.user_id = Some("password".into());
-        p.remarks = Some("troj".into());
+        p.set_user_id(Some("password".into()));
+        p.set_remarks(Some("troj".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("trojan://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2076,8 +2167,8 @@ mod tests {
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         let url = format!("vmess://{b64}");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(p.address.as_deref(), Some("1.2.3.4"));
-        assert_eq!(p.port, Some(443));
+        assert_eq!(p.address, "1.2.3.4");
+        assert_eq!(p.port, 443);
     }
 
     #[test]
@@ -2090,25 +2181,24 @@ mod tests {
     const WORKING_URL_2: &str = "vless://a5ea9247-79f3-4655-aece-3fb51e1e669e@144.124.241.233:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=rezerv1.yunus.guru&fp=firefox&pbk=-X9CZv5MYKivpxPVP1vdgFKf2AJWmZ0Pju-j8LFmlh4&sid=6c88854e73e86773&type=tcp&headerType=none#%5B333ms%20%D0%A4%D0%B8%D0%BD%D0%BB%D1%8F%D0%BD%D0%B4%D0%B8%D1%8F%20FI%20%F0%9F%87%AB%F0%9F%87%AE%20%40vlesstrojan%5D";
     const WORKING_URL_3: &str = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTprMWRCT21PQjRvcWk3VW1wMzdhMWJR@82.38.31.192:8080?#%5B164ms%20%D0%90%D0%B2%D1%81%D1%82%D1%80%D0%B8%D1%8F%20AT%20%F0%9F%87%A6%F0%9F%87%B9%20%40vlesstrojan%5D";
     const WORKING_URL_4: &str = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpDSm1UQ0N4N0x0dWQ@108.181.126.122:8388?#%5B140ms%20%D0%90%D0%B2%D1%81%D1%82%D1%80%D0%B8%D1%8F%20AT%20%F0%9F%87%A6%F0%9F%87%B9%20%40vlesstrojan%5D";
-
     #[test]
     fn parse_working_txt_urls() {
         // ── VLESS Reality URL 1 ──
         let p = parse_share_url(WORKING_URL_1, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Vless.to_i32());
-        assert_eq!(p.address.as_deref(), Some("146.103.99.45"));
-        assert_eq!(p.port, Some(443));
+        assert_eq!(p.address, "146.103.99.45");
+        assert_eq!(p.port, 443);
         assert_eq!(
-            p.user_id.as_deref(),
+            p.leg("user_id").as_deref(),
             Some("a5ea9247-79f3-4655-aece-3fb51e1e669e")
         );
-        assert_eq!(p.network.as_deref(), Some("tcp"));
-        assert!(p.remarks.as_ref().unwrap().contains("Финляндия"));
+        assert_eq!(p.leg("network").as_deref(), Some("tcp"));
+        assert!(p.leg("remarks").unwrap().contains("Финляндия"));
 
         // Reality params now extracted (parser fix applied)
-        if let Some(ss) = &p.stream_settings {
+        if let Some(ss) = p.leg("stream_settings") {
             let v: serde_json::Value =
-                serde_json::from_str(ss).expect("stream_settings must be valid JSON");
+                serde_json::from_str(&ss).expect("stream_settings must be valid JSON");
             let obj = v.as_object().expect("stream_settings must be an object");
             assert_eq!(obj["sni"], "rezerv.yunus.guru");
             assert_eq!(obj["fingerprint"], "firefox");
@@ -2130,18 +2220,18 @@ mod tests {
         // ── VLESS Reality URL 2 ──
         let p = parse_share_url(WORKING_URL_2, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Vless.to_i32());
-        assert_eq!(p.address.as_deref(), Some("144.124.241.233"));
-        assert_eq!(p.port, Some(443));
+        assert_eq!(p.address, "144.124.241.233");
+        assert_eq!(p.port, 443);
         assert_eq!(
-            p.user_id.as_deref(),
+            p.leg("user_id").as_deref(),
             Some("a5ea9247-79f3-4655-aece-3fb51e1e669e")
         );
-        assert_eq!(p.network.as_deref(), Some("tcp"));
+        assert_eq!(p.leg("network").as_deref(), Some("tcp"));
 
         // Reality params now extracted (parser fix applied)
-        if let Some(ss) = &p.stream_settings {
+        if let Some(ss) = p.leg("stream_settings") {
             let v: serde_json::Value =
-                serde_json::from_str(ss).expect("stream_settings must be valid JSON");
+                serde_json::from_str(&ss).expect("stream_settings must be valid JSON");
             let obj = v.as_object().expect("stream_settings must be an object");
             assert_eq!(obj["sni"], "rezerv1.yunus.guru");
             assert_eq!(obj["fingerprint"], "firefox");
@@ -2163,31 +2253,31 @@ mod tests {
         // ── Shadowsocks URL 3 ──
         let p = parse_share_url(WORKING_URL_3, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.address.as_deref(), Some("82.38.31.192"));
-        assert_eq!(p.port, Some(8080));
-        assert!(p.remarks.as_ref().unwrap().contains("Австрия"));
-        if let Some(ps) = &p.protocol_settings {
+        assert_eq!(p.address, "82.38.31.192");
+        assert_eq!(p.port, 8080);
+        assert!(p.leg("remarks").unwrap().contains("Австрия"));
+        if let Some(ps) = p.leg("protocol_settings") {
             let v: serde_json::Value =
-                serde_json::from_str(ps).expect("protocol_settings must be valid JSON");
+                serde_json::from_str(&ps).expect("protocol_settings must be valid JSON");
             assert_eq!(v["method"], "chacha20-ietf-poly1305");
         } else {
             panic!("Shadowsocks URL should have protocol_settings");
         }
-        assert_eq!(p.user_id.as_deref(), Some("k1dBOmOB4oqi7Ump37a1bQ"));
+        assert_eq!(p.leg("user_id").as_deref(), Some("k1dBOmOB4oqi7Ump37a1bQ"));
 
         // ── Shadowsocks URL 4 ──
         let p = parse_share_url(WORKING_URL_4, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.address.as_deref(), Some("108.181.126.122"));
-        assert_eq!(p.port, Some(8388));
-        if let Some(ps) = &p.protocol_settings {
+        assert_eq!(p.address, "108.181.126.122");
+        assert_eq!(p.port, 8388);
+        if let Some(ps) = p.leg("protocol_settings") {
             let v: serde_json::Value =
-                serde_json::from_str(ps).expect("protocol_settings must be valid JSON");
+                serde_json::from_str(&ps).expect("protocol_settings must be valid JSON");
             assert_eq!(v["method"], "chacha20-ietf-poly1305");
         } else {
             panic!("Shadowsocks URL should have protocol_settings");
         }
-        assert_eq!(p.user_id.as_deref(), Some("CJmTCCx7Ltud"));
+        assert_eq!(p.leg("user_id").as_deref(), Some("CJmTCCx7Ltud"));
     }
 
     #[test]
@@ -2201,10 +2291,12 @@ mod tests {
         assert_eq!(p2.config_type, Protocol::Vless.to_i32());
         assert_eq!(p2.address, p1.address);
         assert_eq!(p2.port, p1.port);
-        assert_eq!(p2.user_id, p1.user_id);
-        assert_eq!(p2.network, p1.network);
+        assert_eq!(p2.leg("user_id"), p1.leg("user_id"));
+        assert_eq!(p2.leg("network"), p1.leg("network"));
         // Compare stream_settings (Reality params)
-        if let (Some(ss1), Some(ss2)) = (&p1.stream_settings, &p2.stream_settings) {
+        let ss1 = p1.leg("stream_settings");
+        let ss2 = p2.leg("stream_settings");
+        if let (Some(ss1), Some(ss2)) = (&ss1, &ss2) {
             let v1: serde_json::Value =
                 serde_json::from_str(ss1).expect("stream_settings must be valid JSON");
             let v2: serde_json::Value =
@@ -2227,12 +2319,14 @@ mod tests {
         assert_eq!(p2.config_type, Protocol::Shadowsocks.to_i32());
         assert_eq!(p2.address, p1.address);
         assert_eq!(p2.port, p1.port);
-        assert_eq!(p2.user_id, p1.user_id);
-        if let (Some(ps1), Some(ps2)) = (&p1.protocol_settings, &p2.protocol_settings) {
+        assert_eq!(p2.leg("user_id"), p1.leg("user_id"));
+        let ps1 = p1.leg("protocol_settings");
+        let ps2 = p2.leg("protocol_settings");
+        if let (Some(ps1), Some(ps2)) = (&ps1, &ps2) {
             let v1: serde_json::Value =
-                serde_json::from_str(ps1).expect("protocol_settings must be valid JSON");
+                serde_json::from_str(&ps1).expect("protocol_settings must be valid JSON");
             let v2: serde_json::Value =
-                serde_json::from_str(ps2).expect("protocol_settings must be valid JSON");
+                serde_json::from_str(&ps2).expect("protocol_settings must be valid JSON");
             assert_eq!(v1["method"], v2["method"]);
         }
     }
@@ -2278,7 +2372,7 @@ mod tests {
             reject_insecure: false,
         };
         let p = parse_share_url(url, &settings).unwrap();
-        assert_eq!(p.address.as_deref(), Some("127.0.0.1"));
+        assert_eq!(p.address, "127.0.0.1");
     }
 
     #[test]
@@ -2316,8 +2410,8 @@ mod tests {
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         let url = format!("vmess://{b64}extra-garbage-here");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(p.address.as_deref(), Some("5.6.7.8"));
-        assert_eq!(p.port, Some(8443));
+        assert_eq!(p.address, "5.6.7.8");
+        assert_eq!(p.port, 8443);
     }
 
     #[test]
@@ -2329,8 +2423,8 @@ mod tests {
         let url = format!("ssr://{url_encoded}");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::ShadowsocksR.to_i32());
-        assert_eq!(p.address.as_deref(), Some("1.2.3.4"));
-        assert_eq!(p.port, Some(1234));
+        assert_eq!(p.address, "1.2.3.4");
+        assert_eq!(p.port, 1234);
     }
 
     #[test]
@@ -2341,8 +2435,8 @@ mod tests {
         let url = format!("ss://{b64}");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.address.as_deref(), Some("9.9.9.9"));
-        assert_eq!(p.port, Some(4444));
+        assert_eq!(p.address, "9.9.9.9");
+        assert_eq!(p.port, 4444);
     }
 
     #[test]
@@ -2350,8 +2444,8 @@ mod tests {
         // VLESS URL with missing ? before query params
         let url = "vless://uuid@6.6.6.6:443security=tls&sni=example.com#test";
         let p = parse_share_url(url, &permissive_settings()).unwrap();
-        assert_eq!(p.address.as_deref(), Some("6.6.6.6"));
-        assert_eq!(p.port, Some(443));
+        assert_eq!(p.address, "6.6.6.6");
+        assert_eq!(p.port, 443);
         // The garbage after port is lost but URL still parses
     }
 
@@ -2360,8 +2454,8 @@ mod tests {
     #[test]
     fn roundtrip_hysteria2() {
         let mut p = base_profile(Protocol::Hysteria2, "hysteria2.example", 443);
-        p.user_id = Some("password".into());
-        p.remarks = Some("hy2-test".into());
+        p.set_user_id(Some("password".into()));
+        p.set_remarks(Some("hy2-test".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("hysteria2://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2371,8 +2465,8 @@ mod tests {
     #[test]
     fn roundtrip_hysteria() {
         let mut p = base_profile(Protocol::Hysteria, "hysteria.example", 443);
-        p.user_id = Some("password".into());
-        p.remarks = Some("hy-test".into());
+        p.set_user_id(Some("password".into()));
+        p.set_remarks(Some("hy-test".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("hysteria://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2382,8 +2476,8 @@ mod tests {
     #[test]
     fn roundtrip_tuic() {
         let mut p = base_profile(Protocol::Tuic, "tuic.example", 443);
-        p.user_id = Some("uuid".into());
-        p.remarks = Some("tuic-test".into());
+        p.set_user_id(Some("uuid".into()));
+        p.set_remarks(Some("tuic-test".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("tuic://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2393,8 +2487,8 @@ mod tests {
     #[test]
     fn roundtrip_socks() {
         let mut p = base_profile(Protocol::Socks, "socks.example", 1080);
-        p.user_id = Some("user:pass".into());
-        p.remarks = Some("socks-test".into());
+        p.set_user_id(Some("user:pass".into()));
+        p.set_remarks(Some("socks-test".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("socks://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2404,8 +2498,8 @@ mod tests {
     #[test]
     fn roundtrip_http() {
         let mut p = base_profile(Protocol::Http, "http.example", 8080);
-        p.user_id = Some("user:pass".into());
-        p.remarks = Some("http-test".into());
+        p.set_user_id(Some("user:pass".into()));
+        p.set_remarks(Some("http-test".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("http://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2415,9 +2509,9 @@ mod tests {
     #[test]
     fn roundtrip_wireguard() {
         let mut p = base_profile(Protocol::WireGuard, "wg.example", 51820);
-        p.user_id = Some("public-key".into());
-        p.remarks = Some("wg-test".into());
-        p.protocol_settings = Some(r#"{"public_key":"abc123"}"#.into());
+        p.set_user_id(Some("public-key".into()));
+        p.set_remarks(Some("wg-test".into()));
+        p.set_protocol_settings(Some(r#"{"public_key":"abc123"}"#.into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("wireguard://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2427,8 +2521,8 @@ mod tests {
     #[test]
     fn roundtrip_naive() {
         let mut p = base_profile(Protocol::Naive, "naive.example", 443);
-        p.remarks = Some("naive-test".into());
-        p.protocol_settings = Some(r#"{"user":"user","password":"pass"}"#.into());
+        p.set_remarks(Some("naive-test".into()));
+        p.set_protocol_settings(Some(r#"{"user":"user","password":"pass"}"#.into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("naive+https://"));
         assert!(url.contains("user:pass@")); // userinfo in URL
@@ -2440,9 +2534,9 @@ mod tests {
     #[test]
     fn roundtrip_shadowtls() {
         let mut p = base_profile(Protocol::ShadowTls, "shadowtls.example", 443);
-        p.user_id = Some("password".into());
-        p.remarks = Some("stls-test".into());
-        p.protocol_settings = Some(r#"{"password":"password"}"#.into());
+        p.set_user_id(Some("password".into()));
+        p.set_remarks(Some("stls-test".into()));
+        p.set_protocol_settings(Some(r#"{"password":"password"}"#.into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("shadowtls://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2452,9 +2546,9 @@ mod tests {
     #[test]
     fn roundtrip_anytls() {
         let mut p = base_profile(Protocol::AnyTls, "anytls.example", 443);
-        p.user_id = Some("password".into());
-        p.remarks = Some("anytls-test".into());
-        p.protocol_settings = Some(r#"{"password":"password"}"#.into());
+        p.set_user_id(Some("password".into()));
+        p.set_remarks(Some("anytls-test".into()));
+        p.set_protocol_settings(Some(r#"{"password":"password"}"#.into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("anytls://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -2466,11 +2560,12 @@ mod tests {
     #[test]
     fn roundtrip_shadowsocksr() {
         let mut p = base_profile(Protocol::ShadowsocksR, "ssr.example", 1234);
-        p.user_id = Some("password".into());
-        p.remarks = Some("ssr-test".into());
+        p.set_user_id(Some("password".into()));
+        p.set_remarks(Some("ssr-test".into()));
         let url = format_share_url(&p).unwrap();
         assert!(url.starts_with("ssr://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
     }
 }
+

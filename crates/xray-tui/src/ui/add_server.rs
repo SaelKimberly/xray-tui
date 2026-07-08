@@ -421,7 +421,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         } => Some(*p),
         AppMode::EditServer { profile_id, .. } => state
             .db
-            .get_profile(profile_id)
+            .get_profile(*profile_id)
             .await
             .ok()
             .flatten()

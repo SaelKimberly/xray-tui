@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
 use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
+use xray_tui_config::import_export::ProfileLegacy;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
@@ -19,7 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let profile = &state.profiles[state.selected_index];
-    let profile_name = profile.profile.remarks.as_deref().unwrap_or("Unknown");
+    let profile_name = profile.profile.leg("remarks").unwrap_or_else(|| "Unknown".to_string());
     let core_type = state.connected_core.map_or("", |c| c.as_str());
 
     // Split area into 3 sections

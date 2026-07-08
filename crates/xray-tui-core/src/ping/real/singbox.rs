@@ -87,8 +87,8 @@ pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingR
         Ok(rp) => PingResult {
             profile_key: ProfileKey {
                 config_type: r#type,
-                address: profile.address.unwrap_or_default(),
-                port: profile.port.unwrap_or(0) as u16,
+                address: profile.address.clone(),
+                port: profile.port as u16,
             },
             latency_ms: Some(rp.latency_ms),
             ip_info: rp.ip_info,
@@ -97,8 +97,8 @@ pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingR
         Err(e) => PingResult {
             profile_key: ProfileKey {
                 config_type: r#type,
-                address: profile.address.unwrap_or_default(),
-                port: profile.port.unwrap_or(0) as u16,
+                address: profile.address.clone(),
+                port: profile.port as u16,
             },
             latency_ms: None,
             ip_info: None,

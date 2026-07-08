@@ -1,6 +1,7 @@
 use xray_tui_core::grpc_client::format_bytes;
 use xray_tui_core::protocol::Protocol;
 
+use xray_tui_config::import_export::ProfileLegacy;
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
@@ -54,9 +55,9 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
         },
         |r| {
             let proto = Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
-            let remarks = r.profile.remarks.clone().unwrap_or_default();
-            let addr = r.profile.address.clone().unwrap_or_default();
-            let port = r.profile.port.unwrap_or(0) as u16;
+            let remarks = r.profile.leg("remarks").unwrap_or_default();
+            let addr = r.profile.address.clone();
+            let port = r.profile.port as u16;
             let core = state.resolved_core(r).to_string();
             (proto.to_string(), remarks, addr, port, core)
         },

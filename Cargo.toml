@@ -42,6 +42,8 @@ dirs = { version = "^6.0.0" }
 # ============ Text / Search / Hash ============
 uuid = { version = "^1.23.4", features = ["v4"] }
 
+# ============ Proto crate ============
+xray-tui-proto = { path = "crates/xray-tui-proto" }
 # ============ Logging ============
 tracing = { version = "0.1" }
 # ============ Time / Duration Parsing ============

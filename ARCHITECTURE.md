@@ -4,9 +4,10 @@
 
 ```
 xray-tui (bin)
-  ├── xray-tui-core     (Protocol, CoreType, resolve_core)
+  ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder)
+  │     └── xray-tui-proto  (ProtocolConfig types, URL parsing)
   ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
-  └── xray-tui-config   (AppConfig load/save)
+  └── xray-tui-config   (AppConfig load/save, import_export with bridge traits)
 ```
 
 ## Crate Responsibilities
@@ -20,8 +21,8 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 ```rust
 pub enum Tab { Profiles, Settings, Logs, Statistics }
 pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
+pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat>, group_id: Option<String> }
 pub enum AppMode { List, Help, Settings{ mode: SettingsMode }, AddServer{..}, EditServer{..}, ImportUrl{..}, BatchImport{results: Vec<BatchImportItem>, scroll: usize}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
-pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat> }
 pub struct LogLine { level: String, message: String, source: String }
 
 pub struct AppState {
@@ -100,16 +101,23 @@ pub enum CoreEvent {
     StatsError(String),
     ClearGroup(String),
     StatsUpdate {
-        profile_id: String,
+        profile_id: i64,
         today_up: i64,
         today_down: i64,
         total_up: i64,
         total_down: i64,
     },
-    SpeedTestResult { profile_id, test_type, latency_ms, speed_bps, ip_info, error },
-    SubscriptionsUpdated { group_id, count, error, summary },
-    UpdateCheckResult { core_type, current_version, latest_version, error },
-    UpdateCompleted { core_type, old_version, new_version, success, error },
+    SpeedTestResult {
+        profile_id: i64,
+        test_type: TestType,
+        latency_ms: Option<u64>,
+        speed_bps: Option<u64>,
+        ip_info: Option<String>,
+        error: Option<String>,
+    },
+    SubscriptionsUpdated { group_id: String, count: usize, error: Option<String>, summary: String },
+    UpdateCheckResult { core_type: CoreType, current_version: Option<String>, latest_version: Option<String>, error: Option<String> },
+    UpdateCompleted { core_type: CoreType, old_version: Option<String>, new_version: Option<String>, success: bool, error: Option<String> },
     /// A log line from the core process stdout (xray-core) or stderr (sing-box).
     LogLine {
         level: String,
@@ -122,14 +130,12 @@ pub enum CoreEvent {
         message: String,
     },
     /// Update the displayed test type for a profile without triggering cleanup.
-    /// Used by batch_then_real_ping to switch from TcpPing→RealPing emoji
-    /// after TCP completes but before real ping starts.
+    /// Used by batch_then_real_ping to switch from TcpPing→RealPing emoji.
     TestTypeUpdate {
-        profile_id: String,
+        profile_id: i64,
         test_type: TestType,
     },
 }
-```
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
 The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.

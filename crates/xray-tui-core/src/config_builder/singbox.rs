@@ -137,20 +137,10 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
         BuildError::InvalidProfile(format!("Unknown config_type: {}", profile.config_type))
     })?;
 
-    let address = profile.address.as_deref().unwrap_or("127.0.0.1");
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "port validated to u16 range before storage"
-    )]
-    let port = profile.port.unwrap_or(0) as u16;
-    let user_id = profile.user_id.as_deref().unwrap_or("");
-
-    let p_settings: Value = profile
-        .protocol_settings
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
+    let address = profile.address.as_str();
+    let port = profile.port as u16;
+    let user_id = ""; // TODO: cached on Profile
+    let (p_settings, _s_settings) = parse_settings(profile);
 
     match protocol {
         Protocol::Tuic => {
@@ -477,7 +467,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             Ok(out)
         }
         Protocol::Vmess => {
-            let security = profile.security.as_deref().unwrap_or("auto");
+            let security = "auto"; // TODO: from ProtocolConfig
             let mut out = json!({
                 "tag": "proxy",
                 "type": "vmess",
@@ -488,9 +478,6 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             });
             if let Some(tls) = build_tls(profile) {
                 out["tls"] = tls;
-            }
-            if let Some(net) = profile.network.as_deref().filter(|s| !s.is_empty()) {
-                out["network"] = json!(net);
             }
             Ok(out)
         }
@@ -511,9 +498,6 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
             }
             if let Some(tls) = build_tls(profile) {
                 out["tls"] = tls;
-            }
-            if let Some(net) = profile.network.as_deref().filter(|s| !s.is_empty()) {
-                out["network"] = json!(net);
             }
             Ok(out)
         }
@@ -549,7 +533,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, BuildError> {
                 .unwrap_or(1420);
 
             // Peer endpoint: URL import sets profile.address:port; form stores in protocol_settings["endpoint"]
-            let profile_addr = profile.address.as_deref().filter(|s| !s.is_empty());
+            let profile_addr = (!profile.address.is_empty()).then(|| profile.address.as_str());
             let (peer_addr, peer_port): (String, u16) = if let Some(addr) = profile_addr {
                 (addr.to_string(), port)
             } else if let Some(ep) = p_settings.get("endpoint").and_then(|v| v.as_str()) {
@@ -674,18 +658,14 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Extract protocol_settings and stream_settings from profile.spec_blob.
+/// These are JSON-encoded by ProfileMut setters and consumed by the builder.
 fn parse_settings(profile: &Profile) -> (Value, Value) {
-    let p = profile
-        .protocol_settings
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
-    let s = profile
-        .stream_settings
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
-    (p, s)
+    let extra: Value = serde_json::from_slice(&profile.spec_blob)
+        .unwrap_or_else(|_| json!({}));
+    let p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
+    let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
+    (p_settings, s_settings)
 }
 
 /// Build the TLS sub-object for sing-box outbound.
@@ -721,7 +701,7 @@ fn build_tls(profile: &Profile) -> Option<Value> {
         .and_then(|v| v.as_str())
         .or_else(|| s_settings.get("sni").and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty())
-        .or_else(|| profile.address.as_deref().filter(|s| !s.is_empty()));
+        .or_else(|| (!profile.address.is_empty()).then_some(profile.address.as_str()));
     if let Some(sni) = sni {
         tls.insert("server_name".into(), json!(sni));
     }
@@ -837,34 +817,30 @@ fn build_tls(profile: &Profile) -> Option<Value> {
 mod tests {
     use super::*;
     use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
+    use xray_tui_config::import_export::ProfileMut;
 
     fn test_profile(config_type: i32) -> Profile {
         let mut profile = Profile {
-            id: "test-id".to_string(),
+            id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            spec_blob: Vec::new(),
             config_type,
             core_type: String::new(),
-            remarks: Some("test".to_string()),
-            address: Some("example.com".to_string()),
-            port: Some(443),
-            user_id: Some("test-uuid-or-pass".to_string()),
+            address: "example.com".to_string(),
+            port: 443,
+            transport: Some("tcp".to_string()),
             security: Some("auto".to_string()),
-            network: Some("tcp".to_string()),
-            stream_settings: None,
-            protocol_settings: None,
-            is_sub: Some(0),
-            sub_id: None,
-            group_id: String::new(),
-            sort_order: Some(0),
-            is_active: Some(0),
-            created_at: None,
-            updated_at: None,
-            sub_uid: 0,
-            version: 0,
+            created_at: 0,
             extension: Default::default(),
-            group: Default::default(),
             server_stat: Default::default(),
         };
-        profile.sub_uid = profile.compute_sub_uid();
+        let extra = serde_json::json!({
+            "remarks": "test",
+            "user_id": "test-uuid-or-pass",
+        });
+        profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
         profile
     }
 
@@ -936,8 +912,8 @@ mod tests {
     #[test]
     fn singbox_hysteria2_config() {
         let mut profile = test_profile(Protocol::Hysteria2.to_i32());
-        profile.protocol_settings =
-            Some(r#"{"password": "sekret", "up_mbps": 50, "down_mbps": 200}"#.to_string());
+        profile.set_protocol_settings(
+            Some(r#"{"password": "sekret", "up_mbps": 50, "down_mbps": 200}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -982,7 +958,7 @@ mod tests {
     #[test]
     fn singbox_tuic_with_tls() {
         let mut profile = test_profile(Protocol::Tuic.to_i32());
-        profile.protocol_settings = Some(r#"{"password": "pass123"}"#.to_string());
+        profile.set_protocol_settings(Some(r#"{"password": "pass123"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1042,7 +1018,7 @@ mod tests {
     fn singbox_shadowsocksr_config() {
         let mut profile = test_profile(Protocol::ShadowsocksR.to_i32());
         profile.config_type = Protocol::ShadowsocksR.to_i32();
-        profile.protocol_settings = Some(r#"{"method":"aes-256-cfb","obfs":"tls1.2_ticket_auth","obfs_param":"www.example.com","protocol":"auth_aes128_md5","protocol_param":"test"}"#.to_string());
+        profile.set_protocol_settings(Some(r#"{"method":"aes-256-cfb","obfs":"tls1.2_ticket_auth","obfs_param":"www.example.com","protocol":"auth_aes128_md5","protocol_param":"test"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1058,10 +1034,10 @@ mod tests {
     fn singbox_hysteria_config() {
         let mut profile = test_profile(Protocol::Hysteria.to_i32());
         profile.config_type = Protocol::Hysteria.to_i32();
-        profile.protocol_settings = Some(
+        profile.set_protocol_settings(Some(
             r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#
                 .to_string(),
-        );
+        ));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1079,7 +1055,7 @@ mod tests {
     fn singbox_naive_config() {
         let mut profile = test_profile(Protocol::Naive.to_i32());
         profile.config_type = Protocol::Naive.to_i32();
-        profile.protocol_settings = Some(r#"{"user":"me","password":"pass456"}"#.to_string());
+        profile.set_protocol_settings(Some(r#"{"user":"me","password":"pass456"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1092,8 +1068,8 @@ mod tests {
     fn singbox_anytls_config() {
         let mut profile = test_profile(Protocol::AnyTls.to_i32());
         profile.config_type = Protocol::AnyTls.to_i32();
-        profile.protocol_settings =
-            Some(r#"{"password":"any-secret","sni":"tls.example.com"}"#.to_string());
+        profile.set_protocol_settings(
+            Some(r#"{"password":"any-secret","sni":"tls.example.com"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1106,9 +1082,9 @@ mod tests {
     fn singbox_shadowtls_config() {
         let mut profile = test_profile(Protocol::ShadowTls.to_i32());
         profile.config_type = Protocol::ShadowTls.to_i32();
-        profile.protocol_settings = Some(
+        profile.set_protocol_settings(Some(
             r#"{"password":"shadow-pw","version":"3","sni":"shadow.example.com"}"#.to_string(),
-        );
+        ));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1133,10 +1109,10 @@ mod tests {
     #[test]
     fn singbox_ssh_config() {
         let mut profile = test_profile(Protocol::Ssh.to_i32());
-        profile.protocol_settings = Some(
+        profile.set_protocol_settings(Some(
             r#"{"host":"ssh.example.com","ssh_port":2222,"username":"admin","password":"ssh-pw"}"#
                 .to_string(),
-        );
+        ));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1152,10 +1128,10 @@ mod tests {
     #[test]
     fn singbox_tailscale_config() {
         let mut profile = test_profile(Protocol::Tailscale.to_i32());
-        profile.protocol_settings = Some(
+        profile.set_protocol_settings(Some(
             r#"{"auth_key":"tskey-auth-xxxx","control_url":"https://control.tailscale.com"}"#
                 .to_string(),
-        );
+        ));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1167,8 +1143,8 @@ mod tests {
     #[test]
     fn singbox_vmess_config() {
         let mut profile = test_profile(Protocol::Vmess.to_i32());
-        profile.stream_settings =
-            Some(r#"{"tls.enable":true,"sni":"vmess.example.com"}"#.to_string());
+        profile.set_stream_settings(
+            Some(r#"{"tls.enable":true,"sni":"vmess.example.com"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1184,8 +1160,8 @@ mod tests {
     #[test]
     fn singbox_vless_config() {
         let mut profile = test_profile(Protocol::Vless.to_i32());
-        profile.protocol_settings =
-            Some(r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#.to_string());
+        profile.set_protocol_settings(
+            Some(r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1200,8 +1176,8 @@ mod tests {
     #[test]
     fn singbox_trojan_config() {
         let mut profile = test_profile(Protocol::Trojan.to_i32());
-        profile.stream_settings =
-            Some(r#"{"tls.enable":true,"sni":"trojan.example.com"}"#.to_string());
+        profile.set_stream_settings(
+            Some(r#"{"tls.enable":true,"sni":"trojan.example.com"}"#.to_string()));
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
@@ -1217,9 +1193,9 @@ mod tests {
     #[test]
     fn singbox_wireguard_config() {
         let mut profile = test_profile(Protocol::WireGuard.to_i32());
-        profile.protocol_settings = Some(r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820"}"#.to_string());
-        profile.address = None;
-        profile.port = None;
+        profile.set_protocol_settings(Some(r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820"}"#.to_string()));
+        profile.address = String::new();
+        profile.port = 0;
         let (params, rules, dns) = default_params();
         let config = SingBoxConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();

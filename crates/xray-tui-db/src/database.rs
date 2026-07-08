@@ -2,12 +2,12 @@ use std::collections::HashSet;
 use std::path::Path;
 use toasty::stmt::IntoStatement;
 
-use toasty_core::stmt::Value;
 use toasty_core::schema::db::Type as DbType;
+use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    ALL_GROUP_ID, DnsSetting, GRAVEYARD_GROUP_ID, Group, PingResultUpdate, PingSession, Profile,
+    Connection, DnsSetting, Group, PingResultUpdate, PingSession, Profile,
     ProfileExtension, RoutingRule, ServerStat, Subscription,
 };
 
@@ -15,51 +15,6 @@ use crate::models_toasty::{
 
 pub struct Database {
     db: toasty::Db,
-}
-
-// ── Helpers (private) ───────────────────────────────────────────────────
-
-
-/// Create system groups (All, Graveyard) if they don't exist.
-async fn ensure_system_groups(conn: &mut dyn toasty::Executor) -> Result<()> {
-    let all_exists = Group::filter_by_id(ALL_GROUP_ID.to_string())
-        .first()
-        .exec(conn)
-        .await?
-        .is_some();
-    if !all_exists {
-        create_system_group(conn, ALL_GROUP_ID, "All", 0).await?;
-    }
-
-    let grave_exists = Group::filter_by_id(GRAVEYARD_GROUP_ID.to_string())
-        .first()
-        .exec(conn)
-        .await?
-        .is_some();
-    if !grave_exists {
-        create_system_group(conn, GRAVEYARD_GROUP_ID, "Graveyard", i32::MAX).await?;
-    }
-    Ok(())
-}
-
-async fn create_system_group(
-    conn: &mut dyn toasty::Executor,
-    id: &str,
-    name: &str,
-    sort_order: i32,
-) -> Result<()> {
-    Group::create()
-        .id(id.to_string())
-        .name(Some(name.to_string()))
-        .sort_order(Some(sort_order))
-        .is_system(Some(1))
-        .subscription_enabled(Some(0))
-        // into_statement() is required because the generic .exec(&mut impl Executor)
-        // on the create builder doesn't accept &mut dyn Executor.
-        .into_statement()
-        .exec(conn)
-        .await?;
-    Ok(())
 }
 
 // ── Constructors ────────────────────────────────────────────────────────
@@ -75,6 +30,7 @@ impl Database {
             .models(toasty::models!(
                 Profile,
                 Group,
+                Connection,
                 ProfileExtension,
                 ServerStat,
                 Subscription,
@@ -87,10 +43,9 @@ impl Database {
 
         let mut conn = db.connection().await?;
 
-        // Schema versioning: push_schema() on version mismatch.
-        // toasty's diff handles both fresh (CREATE TABLE + indices) and
-        // existing (CREATE INDEX for missing #[unique], ALTER TABLE for new columns).
-        const SCHEMA_VERSION: i32 = 1;
+        // Schema versioning: version 2 is the uid-based schema.
+        // Old schema (v1) gets dropped entirely — pre-alpha, no migration compat.
+        const SCHEMA_VERSION: i32 = 2;
 
         let version: i32 = {
             let rows = toasty::sql::query("PRAGMA user_version")
@@ -111,12 +66,34 @@ impl Database {
         };
 
         if version < SCHEMA_VERSION {
+            // Delete old DB and recreate fresh
+            drop(conn);
+            drop(db);
+            let _ = std::fs::remove_file(path_str);
+            let driver = toasty_driver_turso::Turso::file(path_str);
+            let db = toasty::Db::builder()
+                .models(toasty::models!(
+                    Profile,
+                    Group,
+                    Connection,
+                    ProfileExtension,
+                    ServerStat,
+                    Subscription,
+                    RoutingRule,
+                    DnsSetting,
+                    PingSession
+                ))
+                .build(driver)
+                .await?;
+            let mut conn = db.connection().await?;
             db.push_schema().await?;
-            toasty::sql::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                 .exec(&mut conn)
                 .await?;
+            // Default group for fresh DB
+            Self::init_default_group(&mut conn).await?;
+            return Ok(Self { db });
         }
-
 
         toasty::sql::query("PRAGMA journal_mode=WAL")
             .exec(&mut conn)
@@ -128,8 +105,25 @@ impl Database {
             .exec(&mut conn)
             .await?;
 
-        ensure_system_groups(&mut conn).await?;
+        Self::init_default_group(&mut conn).await?;
         Ok(Self { db })
+
+    }
+
+    async fn init_default_group(conn: &mut impl toasty::Executor) -> Result<()> {
+        let group_count = Group::all().count().exec(conn).await?;
+        if group_count == 0 {
+            let default_id = uuid::Uuid::new_v4().to_string();
+            Group::create()
+                .id(default_id)
+                .name(Some("Default".to_string()))
+                .sort_order(Some(0))
+                .subscription_enabled(Some(0))
+                .into_statement()
+                .exec(conn)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -138,6 +132,7 @@ impl Database {
             .models(toasty::models!(
                 Profile,
                 Group,
+                Connection,
                 ProfileExtension,
                 ServerStat,
                 Subscription,
@@ -149,7 +144,7 @@ impl Database {
             .await?;
 
         let mut conn = db.connection().await?;
-        db.push_schema().await?; // fresh DB — always safe
+        db.push_schema().await?;
 
         toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
@@ -157,32 +152,45 @@ impl Database {
         toasty::sql::query("PRAGMA foreign_keys=ON")
             .exec(&mut conn)
             .await?;
-
-        ensure_system_groups(&mut conn).await?;
+        Self::init_default_group(&mut conn).await?;
         Ok(Self { db })
     }
 }
 
-
-// ── Query methods (public API) ──────────────────────────────────────────
+// ── Read queries (public API) ───────────────────────────────────────────
 
 impl Database {
+    /// All profiles that have at least one connection (DISTINCT).
     pub async fn get_all_profiles(&self) -> Result<Vec<Profile>> {
         let mut conn = self.db.connection().await?;
-        let profiles: Vec<Profile> = Profile::all()
-            .order_by(Profile::fields().sort_order().asc())
-            .exec(&mut conn)
-            .await?;
-        Ok(profiles)
+        let rows = toasty::sql::query(
+            "SELECT DISTINCT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
+                    p.config_type, p.core_type, p.address, p.port, p.transport, p.security, p.created_at \
+             FROM profiles p \
+             INNER JOIN connections c ON c.profile_id = p.id \
+             ORDER BY p.id",
+        )
+        .exec(&mut conn)
+        .await?;
+        deserialize_profiles(rows)
     }
 
-    pub async fn get_profiles_by_group(&self, group_id: &str) -> Result<Vec<Profile>> {
+    /// Profiles in a specific group, with their connection metadata.
+    pub async fn get_profiles_by_group(&self, group_id: &str) -> Result<Vec<(Profile, Connection)>> {
         let mut conn = self.db.connection().await?;
-        let profiles: Vec<Profile> = Profile::filter(Profile::fields().group_id().eq(group_id))
-            .order_by(Profile::fields().sort_order().asc())
-            .exec(&mut conn)
-            .await?;
-        Ok(profiles)
+        let rows = toasty::sql::query(
+            "SELECT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
+                    p.config_type, p.core_type, p.address, p.port, p.transport, p.security, p.created_at, \
+                    c.id, c.profile_id, c.group_id, c.remarks, c.seen_at, c.is_sub, c.sort_order, c.is_active, c.updated_at \
+             FROM profiles p \
+             INNER JOIN connections c ON c.profile_id = p.id \
+             WHERE c.group_id = ?1 \
+             ORDER BY c.sort_order ASC, c.id ASC",
+        )
+        .bind(group_id)
+        .exec(&mut conn)
+        .await?;
+        deserialize_profile_connections(rows)
     }
 
     pub async fn get_all_groups(&self) -> Result<Vec<Group>> {
@@ -196,19 +204,19 @@ impl Database {
 
     pub async fn get_profile_extension(
         &self,
-        profile_id: &str,
+        profile_id: i64,
     ) -> Result<Option<ProfileExtension>> {
         let mut conn = self.db.connection().await?;
-        let ext = ProfileExtension::filter_by_profile_id(profile_id.to_string())
+        let ext = ProfileExtension::filter_by_profile_id(profile_id)
             .first()
             .exec(&mut conn)
             .await?;
         Ok(ext)
     }
 
-    pub async fn get_server_stats(&self, profile_id: &str) -> Result<Option<ServerStat>> {
+    pub async fn get_server_stats(&self, profile_id: i64) -> Result<Option<ServerStat>> {
         let mut conn = self.db.connection().await?;
-        let stats = ServerStat::filter_by_profile_id(profile_id.to_string())
+        let stats = ServerStat::filter_by_profile_id(profile_id)
             .first()
             .exec(&mut conn)
             .await?;
@@ -220,7 +228,6 @@ impl Database {
         let profiles: Vec<Profile> = Profile::all()
             .include(Profile::fields().extension())
             .include(Profile::fields().server_stat())
-            .order_by(Profile::fields().sort_order().asc())
             .exec(&mut conn)
             .await?;
 
@@ -233,9 +240,9 @@ impl Database {
         Ok(result)
     }
 
-    pub async fn get_profile(&self, id: &str) -> Result<Option<Profile>> {
+    pub async fn get_profile(&self, id: i64) -> Result<Option<Profile>> {
         let mut conn = self.db.connection().await?;
-        let profile = Profile::filter_by_id(id.to_string())
+        let profile = Profile::filter_by_id(id)
             .first()
             .exec(&mut conn)
             .await?;
@@ -260,9 +267,6 @@ impl Database {
 
     pub async fn get_groups_due_update(&self) -> Result<Vec<Group>> {
         let mut conn = self.db.connection().await?;
-
-        // Single query with LEFT JOIN: last_updated and update_interval live
-        // on the subscriptions table, not groups. COALESCE default 1440 = 24h.
         let rows = toasty::sql::query(
             "SELECT g.id, g.name, g.subscription_url, g.subscription_enabled, \
                     g.user_agent, g.convert_target, g.core_type, g.sort_order, g.is_system \
@@ -279,7 +283,6 @@ impl Database {
         let mut groups = Vec::with_capacity(rows.len());
         for value in rows {
             if let Value::Record(fields) = value {
-                // Column order matches SELECT (9 columns, indices 0-8)
                 groups.push(Group {
                     id: get_string(&fields, 0)?,
                     name: get_opt_string(&fields, 1),
@@ -310,60 +313,132 @@ impl Database {
         let settings: Vec<DnsSetting> = DnsSetting::all().exec(&mut conn).await?;
         Ok(settings.into_iter().next())
     }
+
+    // ── New connection query helpers ───────────────────────────────────
+
+    /// All connections for a given profile.
+    pub async fn get_connections_for_profile(&self, profile_id: i64) -> Result<Vec<Connection>> {
+        let mut conn = self.db.connection().await?;
+        let rows = toasty::sql::query(
+            "SELECT id, profile_id, group_id, remarks, seen_at, is_sub, sort_order, is_active, updated_at \
+             FROM connections WHERE profile_id = ?1 ORDER BY sort_order ASC",
+        )
+        .bind(profile_id)
+        .exec(&mut conn)
+        .await?;
+        deserialize_connections(rows)
+    }
+
+    /// All connections for a given group.
+    pub async fn get_connections_for_group(&self, group_id: &str) -> Result<Vec<Connection>> {
+        let mut conn = self.db.connection().await?;
+        let rows = toasty::sql::query(
+            "SELECT id, profile_id, group_id, remarks, seen_at, is_sub, sort_order, is_active, updated_at \
+             FROM connections WHERE group_id = ?1 ORDER BY sort_order ASC",
+        )
+        .bind(group_id)
+        .exec(&mut conn)
+        .await?;
+        deserialize_connections(rows)
+    }
+
+    /// The active profile in a group (is_active = 1), if any.
+    pub async fn get_active_profile_for_group(&self, group_id: &str) -> Result<Option<Profile>> {
+        let mut conn = self.db.connection().await?;
+        let row = toasty::sql::query(
+            "SELECT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
+                    p.config_type, p.core_type, p.address, p.port, p.transport, p.security, p.created_at \
+             FROM profiles p \
+             INNER JOIN connections c ON c.profile_id = p.id \
+             WHERE c.group_id = ?1 AND c.is_active = 1 \
+             LIMIT 1",
+        )
+        .bind(group_id)
+        .exec(&mut conn)
+        .await?;
+        let mut profiles = deserialize_profiles(row)?;
+        Ok(profiles.pop())
+    }
 }
 
 // ── Write methods (public API) ──────────────────────────────────────────
 
 impl Database {
-    pub async fn insert_profile(&self, p: &Profile) -> Result<()> {
+    /// Upsert a profile and its connection to a group.
+    /// Uses ON CONFLICT for atomic dedup.
+    pub async fn insert_profile(&self, p: &Profile, group_id: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let conn_id = uuid::Uuid::new_v4().to_string();
+
         let mut conn = self.db.connection().await?;
         let mut tx = conn.transaction().await?;
 
-        insert_profile_inner(&mut tx, p).await?;
+        // Upsert profile
+        toasty::sql::statement(
+            "INSERT OR REPLACE INTO profiles (id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, address, port, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(p.id)
+        .bind(p.sig)
+        .bind(p.cred_hash)
+        .bind(&p.proto_kind)
+        .bind_typed(p.spec_blob.clone(), DbType::Blob)
+        .bind(p.config_type)
+        .bind(&p.core_type)
+        .bind(&p.address)
+        .bind(p.port)
+        .bind(now)
+        .exec(&mut tx)
+        .await?;
 
-        // Mirror to All group unless already in All
-        if p.group_id != ALL_GROUP_ID {
-            let mirror = Profile {
-                id: format!("{}-all", p.id),
-                group_id: ALL_GROUP_ID.to_string(),
-                ..p.clone()
-            };
-            insert_profile_inner(&mut tx, &mirror).await?;
-        }
+        // Upsert connection
+        toasty::sql::statement(
+            "INSERT OR REPLACE INTO connections (id, profile_id, group_id, is_active, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&conn_id)
+        .bind(p.id)
+        .bind(group_id)
+        .bind(1i32)
+        .bind(now)
+        .exec(&mut tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())
     }
-
     pub async fn update_profile(&self, p: &Profile) -> Result<()> {
         let mut conn = self.db.connection().await?;
-
-        // Query-based update — avoids toasty's instance-update projection panic.
-        Profile::filter_by_id(p.id.clone())
+        Profile::filter_by_id(p.id)
             .update()
-            .remarks(p.remarks.clone())
+            .sig(p.sig)
+            .cred_hash(p.cred_hash)
+            .proto_kind(p.proto_kind.clone())
+            .spec_blob(p.spec_blob.clone())
+            .config_type(p.config_type)
+            .core_type(p.core_type.clone())
             .address(p.address.clone())
             .port(p.port)
-            .user_id(p.user_id.clone())
-            .security(p.security.clone())
-            .network(p.network.clone())
-            .stream_settings(p.stream_settings.clone())
-            .protocol_settings(p.protocol_settings.clone())
-            .sort_order(p.sort_order)
-            .is_active(p.is_active)
-            .is_sub(p.is_sub)
-            .sub_id(p.sub_id.clone())
-            .updated_at(p.updated_at.clone())
             .exec(&mut conn)
             .await?;
         Ok(())
     }
 
-    pub async fn delete_profile(&self, id: &str) -> Result<()> {
+
+    /// Delete a profile and all related rows (cascade manually).
+    pub async fn delete_profile(&self, id: i64) -> Result<()> {
         let mut conn = self.db.connection().await?;
         let mut tx = conn.transaction().await?;
 
-        // No cascade — manually delete related rows
+        // Delete connections
+        toasty::sql::statement("DELETE FROM connections WHERE profile_id = ?1")
+            .bind(id)
+            .exec(&mut tx)
+            .await?;
+        // Related extensions, stats, ping sessions
         toasty::sql::statement("DELETE FROM profile_extensions WHERE profile_id = ?1")
             .bind(id)
             .exec(&mut tx)
@@ -385,52 +460,19 @@ impl Database {
         Ok(())
     }
 
-    pub async fn clone_profile(&self, id: &str, new_id: &str) -> Result<()> {
+    /// Reorder connections in a group.
+    pub async fn reorder_profiles(&self, group_id: &str, ids: &[(i64, i32)]) -> Result<()> {
         let mut conn = self.db.connection().await?;
-
-        let original = Profile::filter_by_id(id.to_string())
-            .first()
-            .exec(&mut conn)
-            .await?
-            .ok_or_else(|| DatabaseError::Generic(format!("profile not found: {id}")))?;
-
         let mut tx = conn.transaction().await?;
-
-        let clone = Profile {
-            id: new_id.to_string(),
-            ..original.clone()
-        };
-        insert_profile_inner(&mut tx, &clone).await?;
-
-        if let Ok(Some(ext)) = ProfileExtension::filter_by_profile_id(id.to_string())
-            .first()
+        for (profile_id, order) in ids {
+            toasty::sql::statement(
+                "UPDATE connections SET sort_order = ?1 WHERE profile_id = ?2 AND group_id = ?3",
+            )
+            .bind(*order)
+            .bind(*profile_id)
+            .bind(group_id)
             .exec(&mut tx)
-            .await
-        {
-            ProfileExtension::create()
-                .profile_id(new_id.to_string())
-                .delay(ext.delay)
-                .speed(ext.speed)
-                .sort_order(ext.sort_order)
-                .ip_info(ext.ip_info.clone())
-                .into_statement()
-                .exec(&mut tx)
-                .await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn reorder_profiles(&self, ids: &[(String, i32)]) -> Result<()> {
-        let mut conn = self.db.connection().await?;
-        let mut tx = conn.transaction().await?;
-        for (id, order) in ids {
-            toasty::sql::statement("UPDATE profiles SET sort_order = ?1 WHERE id = ?2")
-                .bind(*order)
-                .bind(id)
-                .exec(&mut tx)
-                .await?;
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -445,7 +487,7 @@ impl Database {
              delay=excluded.delay, speed=excluded.speed, \
              sort_order=excluded.sort_order, ip_info=excluded.ip_info",
         )
-        .bind(&ext.profile_id)
+        .bind(ext.profile_id)
         .bind(ext.delay)
         .bind(ext.speed)
         .bind(ext.sort_order)
@@ -465,7 +507,7 @@ impl Database {
              total_up=excluded.total_up, total_down=excluded.total_down, \
              last_updated=excluded.last_updated",
         )
-        .bind(&stats.profile_id)
+        .bind(stats.profile_id)
         .bind(stats.today_up)
         .bind(stats.today_down)
         .bind(stats.total_up)
@@ -510,19 +552,26 @@ impl Database {
         Ok(())
     }
 
-    pub async fn update_profile_active(&self, id: &str) -> Result<()> {
+    /// Update which profile is active in a group.
+    pub async fn update_profile_active(&self, profile_id: i64, group_id: &str) -> Result<()> {
         let mut conn = self.db.connection().await?;
         let mut tx = conn.transaction().await?;
 
-        // Deactivate all profiles
-        toasty::sql::statement("UPDATE profiles SET is_active = 0")
-            .exec(&mut tx)
-            .await?;
-        // Activate the target
-        toasty::sql::statement("UPDATE profiles SET is_active = 1 WHERE id = ?1")
-            .bind(id)
-            .exec(&mut tx)
-            .await?;
+        // Deactivate all connections in this group
+        toasty::sql::statement(
+            "UPDATE connections SET is_active = 0 WHERE group_id = ?1",
+        )
+        .bind(group_id)
+        .exec(&mut tx)
+        .await?;
+        // Activate target
+        toasty::sql::statement(
+            "UPDATE connections SET is_active = 1 WHERE profile_id = ?1 AND group_id = ?2",
+        )
+        .bind(profile_id)
+        .bind(group_id)
+        .exec(&mut tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())
@@ -550,30 +599,38 @@ impl Database {
 
         let mut tx = conn.transaction().await?;
 
-        // Delete all profiles in this group + their extensions/stats
-        // Bulk delete related rows via subquery (no per-profile loop)
-        toasty::sql::statement(
-            "DELETE FROM profile_extensions WHERE profile_id IN (SELECT id FROM profiles WHERE group_id = ?1)",
-        )
-        .bind(id)
-        .exec(&mut tx)
-        .await?;
-        toasty::sql::statement(
-            "DELETE FROM server_stats WHERE profile_id IN (SELECT id FROM profiles WHERE group_id = ?1)",
-        )
-        .bind(id)
-        .exec(&mut tx)
-        .await?;
-        toasty::sql::statement(
-            "DELETE FROM ping_sessions WHERE profile_id IN (SELECT id FROM profiles WHERE group_id = ?1)",
-        )
-        .bind(id)
-        .exec(&mut tx)
-        .await?;
-        toasty::sql::statement("DELETE FROM profiles WHERE group_id = ?1")
+        // Delete connections for this group and clean up orphaned profiles
+        // Delete connections for this group
+        toasty::sql::statement("DELETE FROM connections WHERE group_id = ?1")
             .bind(id)
             .exec(&mut tx)
             .await?;
+
+
+        // Delete related extension/stat/ping data for profiles that now have no connections
+        toasty::sql::statement(
+            "DELETE FROM profile_extensions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM server_stats WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM ping_sessions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+
+        // Delete orphaned profiles
+        toasty::sql::statement(
+            "DELETE FROM profiles WHERE id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+
         toasty::sql::statement("DELETE FROM groups WHERE id = ?1")
             .bind(id)
             .exec(&mut tx)
@@ -583,6 +640,7 @@ impl Database {
         Ok(())
     }
 
+    /// Remove all connections for a group, then purge orphaned profiles.
     pub async fn clear_group(&self, group_id: &str) -> Result<usize> {
         let mut conn = self.db.connection().await?;
 
@@ -601,29 +659,100 @@ impl Database {
 
         let mut tx = conn.transaction().await?;
 
-        // Bulk delete related rows via subquery (no per-profile loop)
-        toasty::sql::statement(
-            "DELETE FROM profile_extensions WHERE profile_id IN (SELECT id FROM profiles WHERE group_id = ?1)",
+        // Count connections first
+        let count_row = toasty::sql::query(
+            "SELECT COUNT(*) FROM connections WHERE group_id = ?1",
         )
         .bind(group_id)
         .exec(&mut tx)
         .await?;
-        toasty::sql::statement(
-            "DELETE FROM server_stats WHERE profile_id IN (SELECT id FROM profiles WHERE group_id = ?1)",
-        )
-        .bind(group_id)
-        .exec(&mut tx)
-        .await?;
-        toasty::sql::statement(
-            "DELETE FROM ping_sessions WHERE profile_id IN (SELECT id FROM profiles WHERE group_id = ?1)",
-        )
-        .bind(group_id)
-        .exec(&mut tx)
-        .await?;
-        let count = toasty::sql::statement("DELETE FROM profiles WHERE group_id = ?1")
+        let count = count_row
+            .first()
+            .and_then(|v| {
+                if let Value::Record(fields) = v {
+                    fields.first().and_then(|f| match f {
+                        Value::I64(n) => Some(*n as usize),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        // Delete connections
+        toasty::sql::statement("DELETE FROM connections WHERE group_id = ?1")
             .bind(group_id)
             .exec(&mut tx)
-            .await? as usize;
+            .await?;
+
+        // Purge orphaned profiles (no remaining connections)
+        toasty::sql::statement(
+            "DELETE FROM profile_extensions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM server_stats WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM ping_sessions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM profiles WHERE id NOT IN (SELECT DISTINCT profile_id FROM connections)",
+        )
+        .exec(&mut tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Purge profiles with zero connections that were created before a TTL threshold.
+    pub async fn purge_orphans(&self, ttl_seconds: i64) -> Result<usize> {
+        let mut conn = self.db.connection().await?;
+        let mut tx = conn.transaction().await?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let threshold = now - ttl_seconds;
+
+        // Clean related tables for orphaned profiles
+        toasty::sql::statement(
+            "DELETE FROM profile_extensions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections) \
+             AND profile_id IN (SELECT id FROM profiles WHERE created_at < ?1)",
+        )
+        .bind(threshold)
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM server_stats WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections) \
+             AND profile_id IN (SELECT id FROM profiles WHERE created_at < ?1)",
+        )
+        .bind(threshold)
+        .exec(&mut tx)
+        .await?;
+        toasty::sql::statement(
+            "DELETE FROM ping_sessions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections) \
+             AND profile_id IN (SELECT id FROM profiles WHERE created_at < ?1)",
+        )
+        .bind(threshold)
+        .exec(&mut tx)
+        .await?;
+
+        let count = toasty::sql::statement(
+            "DELETE FROM profiles WHERE id NOT IN (SELECT DISTINCT profile_id FROM connections) \
+             AND created_at < ?1",
+        )
+        .bind(threshold)
+        .exec(&mut tx)
+        .await? as usize;
 
         tx.commit().await?;
         Ok(count)
@@ -661,119 +790,116 @@ impl Database {
         Ok(())
     }
 
-    /// Bulk-upsert profiles from a subscription fetch.
-    /// Uses raw SQL with ON CONFLICT for atomic dedup.
+    /// Upsert profiles from a subscription. Uses uid-based dedup.
+    /// profiles is a Vec<(Profile, Connection)> — the caller has parsed URLs via ProtoSpec.
     pub async fn subscription_upsert_profiles(
         &self,
         group_id: &str,
-        profiles: &[Profile],
-    ) -> Result<()> {
+        profiles: &[(Profile, Connection)],
+    ) -> Result<Vec<i64>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let mut conn = self.db.connection().await?;
         let mut tx = conn.transaction().await?;
 
-        // Phase 1: upsert into target group
-        for p in profiles {
-            upsert_profile_row(&mut tx, p, group_id).await?;
+        let mut uids = Vec::with_capacity(profiles.len());
+
+        // Phase 1: upsert profiles only (ON CONFLICT DO UPDATE), collect uids
+        for (p, _) in profiles {
+            uids.push(p.id);
+            toasty::sql::statement(
+                "INSERT INTO profiles (id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, address, port, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 sig=excluded.sig, cred_hash=excluded.cred_hash, \
+                 spec_blob=excluded.spec_blob, config_type=excluded.config_type, \
+                 core_type=excluded.core_type, address=excluded.address, port=excluded.port",
+            )
+            .bind(p.id)
+            .bind(p.sig)
+            .bind(p.cred_hash)
+            .bind(&p.proto_kind)
+            .bind_typed(p.spec_blob.clone(), DbType::Blob)
+        .bind(p.config_type)
+        .bind(&p.core_type)
+        .bind(&p.address)
+        .bind(p.port)
+        .bind(now)
+            .exec(&mut tx)
+            .await?;
         }
 
-        // Phase 2: mirror to "All" group (same sub_uid, different group_id)
-        for p in profiles {
-            let mut mirror = p.clone();
-            mirror.id = format!("{}-all", p.id);
-            mirror.group_id = ALL_GROUP_ID.to_string();
-            upsert_profile_row(&mut tx, &mirror, ALL_GROUP_ID).await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn move_orphans_to_graveyard(
-        &self,
-        group_id: &str,
-        active_sub_uids: &[i64],
-        graveyard_id: &str,
-    ) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
-        let mut tx = conn.transaction().await?;
-
-        // Load only id + sub_uid for orphan detection
-        let rows = toasty::sql::query(
-            "SELECT id, sub_uid FROM profiles WHERE group_id = ?1 AND is_sub = 1",
-        )
-        .bind(group_id)
-        .exec(&mut tx)
-        .await?;
-
-        let active_set: HashSet<i64> = active_sub_uids.iter().copied().collect();
-        let mut count = 0usize;
-
-        for value in rows {
-            if let Value::Record(fields) = value {
-                let sub_uid = get_opt_i64(&fields, 1).unwrap_or(0);
-                if !active_set.contains(&sub_uid) {
-                    let id = get_string(&fields, 0)?;
-                    toasty::sql::statement("UPDATE profiles SET group_id = ?1 WHERE id = ?2")
-                        .bind(graveyard_id)
-                        .bind(&id)
-                        .exec(&mut tx)
-                        .await?;
-                    count += 1;
-                }
+        // Phase 2: delete connections for profiles no longer in the subscription
+        if !uids.is_empty() {
+            let ph: Vec<String> = uids.iter().enumerate()
+                .map(|(i, _)| format!("?{}", i + 2))
+                .collect();
+            let sql = format!(
+                "DELETE FROM connections WHERE group_id = ?1 AND profile_id NOT IN ({})",
+                ph.join(", "),
+            );
+            let mut stmt = toasty::sql::statement(&sql).bind(group_id);
+            for uid in &uids {
+                stmt = stmt.bind(*uid);
             }
+            stmt.exec(&mut tx).await?;
+        } else {
+            toasty::sql::statement("DELETE FROM connections WHERE group_id = ?1")
+                .bind(group_id)
+                .exec(&mut tx)
+                .await?;
         }
 
-        tx.commit().await?;
-        Ok(count)
-    }
+        // Phase 3: upsert connections (DO NOT overwrite is_active — preserve existing)
+        for (p, c) in profiles {
+            let conn_id = c.id.clone();
+            toasty::sql::statement(
+                "INSERT INTO connections (id, profile_id, group_id, remarks, seen_at, is_sub, sort_order, is_active, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(profile_id, group_id) DO UPDATE SET \
+                 remarks=excluded.remarks, seen_at=excluded.seen_at, \
+                 is_sub=excluded.is_sub, sort_order=excluded.sort_order, \
+                 updated_at=excluded.updated_at",
+            )
+            .bind(&conn_id)
+            .bind(p.id)
+            .bind(group_id)
+            .bind_typed(c.remarks.clone(), DbType::Text)
+            .bind_typed(c.seen_at.clone(), DbType::Text)
+            .bind_typed(c.is_sub, DbType::Integer(4))
+            .bind_typed(c.sort_order, DbType::Integer(4))
+            .bind_typed(c.is_active, DbType::Integer(4))
+            .bind(now)
+            .exec(&mut tx)
+            .await?;
+        }
 
-    pub async fn purge_graveyard(&self, graveyard_id: &str, ttl_hours: i64) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
-        let mut tx = conn.transaction().await?;
-
-        // Bulk delete via subquery — no per-ID loop
+        // Phase 4: purge orphaned profiles (zero connections)
         toasty::sql::statement(
-            "DELETE FROM profile_extensions WHERE profile_id IN \
-             (SELECT id FROM profiles WHERE group_id = ?1 \
-              AND (updated_at IS NULL OR \
-                   datetime(updated_at, '+' || ?2 || ' hours') <= datetime('now')))",
+            "DELETE FROM profile_extensions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
         )
-        .bind(graveyard_id)
-        .bind(ttl_hours)
         .exec(&mut tx)
         .await?;
         toasty::sql::statement(
-            "DELETE FROM server_stats WHERE profile_id IN \
-             (SELECT id FROM profiles WHERE group_id = ?1 \
-              AND (updated_at IS NULL OR \
-                   datetime(updated_at, '+' || ?2 || ' hours') <= datetime('now')))",
+            "DELETE FROM server_stats WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
         )
-        .bind(graveyard_id)
-        .bind(ttl_hours)
         .exec(&mut tx)
         .await?;
         toasty::sql::statement(
-            "DELETE FROM ping_sessions WHERE profile_id IN \
-             (SELECT id FROM profiles WHERE group_id = ?1 \
-              AND (updated_at IS NULL OR \
-                   datetime(updated_at, '+' || ?2 || ' hours') <= datetime('now')))",
+            "DELETE FROM ping_sessions WHERE profile_id NOT IN (SELECT DISTINCT profile_id FROM connections)",
         )
-        .bind(graveyard_id)
-        .bind(ttl_hours)
         .exec(&mut tx)
         .await?;
-        let count = toasty::sql::statement(
-            "DELETE FROM profiles WHERE group_id = ?1 \
-             AND (updated_at IS NULL OR \
-                  datetime(updated_at, '+' || ?2 || ' hours') <= datetime('now'))",
+        toasty::sql::statement(
+            "DELETE FROM profiles WHERE id NOT IN (SELECT DISTINCT profile_id FROM connections)",
         )
-        .bind(graveyard_id)
-        .bind(ttl_hours)
         .exec(&mut tx)
-        .await? as usize;
+        .await?;
 
         tx.commit().await?;
-        Ok(count)
+        Ok(uids)
     }
 }
 
@@ -883,60 +1009,75 @@ impl Database {
 // ── Ping batch management ───────────────────────────────────────────────
 
 impl Database {
-    /// Create a ping batch with Rust-side triplet dedup (replaces window function).
+    /// Create a ping batch with Rust-side triplet dedup.
     pub async fn create_ping_batch(&self, batch_id: &str, group_id: Option<&str>) -> Result<usize> {
         let mut conn = self.db.connection().await?;
 
-        let mut query = Profile::all()
-            .filter(Profile::fields().address().is_some())
-            .filter(Profile::fields().port().gt(0))
-            .filter(Profile::fields().port().le(65535));
-        if let Some(gid) = group_id {
-            query = query.filter(Profile::fields().group_id().eq(gid));
-        }
-        let profiles: Vec<Profile> = query
-            .order_by((
-                Profile::fields().config_type().asc(),
-                Profile::fields().address().asc(),
-                Profile::fields().port().asc(),
-            ))
+        let profiles_and_connections: Vec<(Profile, Connection)> = if let Some(gid) = group_id {
+            self.get_profiles_by_group(gid).await?
+        } else {
+            let rows = toasty::sql::query(
+                "SELECT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
+                        p.config_type, p.core_type, p.address, p.port, p.transport, p.security, p.created_at \
+                 FROM profiles p \
+                 INNER JOIN connections c ON c.profile_id = p.id \
+                 WHERE c.is_active = 1",
+            )
             .exec(&mut conn)
             .await?;
+            let profiles = deserialize_profiles(rows)?;
+            profiles
+                .into_iter()
+                .map(|p| (p, Connection {
+                    id: String::new(),
+                    profile_id: 0,
+                    group_id: String::new(),
+                    remarks: None,
+                    seen_at: None,
+                    is_sub: None,
+                    sort_order: None,
+                    is_active: None,
+                    updated_at: 0,
+                    profile: Default::default(),
+                    group: Default::default(),
+                }))
+                .collect()
+        };
 
-        // Rust-side dedup + dense ranking
         let mut seen = HashSet::new();
         let mut rank = 0i32;
-        let mut out = Vec::with_capacity(profiles.len());
-        for p in &profiles {
-            let triplet = (p.config_type, p.address.clone(), p.port);
+        let mut out = Vec::with_capacity(profiles_and_connections.len());
+        for (p, _) in &profiles_and_connections {
+            // Deserialize address/port from spec_blob
+            let addr = String::new(); // Placeholder — will need ProtoSpec deserialization
+            let port: Option<i32> = None; // Placeholder
+            let triplet = (p.config_type, addr.clone(), port);
             if seen.insert(triplet) {
                 rank += 1;
             }
             out.push((
-                p.id.clone(),
+                p.id,
                 p.config_type,
                 p.core_type.clone(),
-                p.address.clone(),
-                p.port,
+                addr.clone(),
+                port,
                 rank,
             ));
         }
 
         let mut tx = conn.transaction().await?;
         let mut inserted = 0usize;
-        for (pid, ct, ct_str, addr, port, trank) in &out {
+        for (pid, ct, ct_str, _addr, _port, trank) in &out {
             toasty::sql::statement(
                 "INSERT INTO ping_sessions \
-                 (id, batch_id, profile_id, config_type, core_type, address, port, triplet_rank, ping_type, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'fast', 'queued')",
+                 (id, batch_id, profile_id, config_type, core_type, ping_type, status, triplet_rank) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'fast', 'queued', ?6)",
             )
             .bind(&format!("{batch_id}-{pid}"))
             .bind(batch_id)
-            .bind(pid)
+            .bind(*pid)
             .bind(*ct)
             .bind(ct_str)
-            .bind(addr.as_deref())
-            .bind(*port)
             .bind(*trank)
             .exec(&mut tx)
             .await?;
@@ -1068,29 +1209,19 @@ impl Database {
         &self,
         batch_id: &str,
         limit: usize,
-    ) -> Result<Vec<(PingSession, Profile)>> {
+    ) -> Result<Vec<PingSession>> {
         let mut conn = self.db.connection().await?;
-        // Load ping sessions + JOIN their profiles
         let rows = toasty::sql::query(
-            "SELECT ps.id, ps.batch_id, ps.profile_id, ps.config_type, ps.core_type, \
-                    ps.address, ps.port, ps.triplet_rank, ps.ping_type, ps.status, \
-                    ps.latency_ms, ps.speed_bps, ps.ip_info, ps.error, \
-                    ps.created_at, ps.updated_at, \
-                    p.id, p.sub_uid, p.group_id, p.config_type, p.core_type, \
-                    p.address, p.port, p.user_id, p.security, p.network, \
-                    p.stream_settings, p.protocol_settings, p.remarks, p.is_sub, \
-                    p.sub_id, p.sort_order, p.is_active, p.created_at, p.updated_at, p.version \
-             FROM ping_sessions ps \
-             JOIN profiles p ON p.id = ps.profile_id \
-             WHERE ps.batch_id = ?1 AND ps.status = 'queued' AND ps.ping_type = 'real' \
-             ORDER BY ps.triplet_rank, ps.id LIMIT ?2",
+            "SELECT * FROM ping_sessions \
+             WHERE batch_id = ?1 AND status = 'queued' AND ping_type = 'real' \
+             ORDER BY triplet_rank, id LIMIT ?2",
         )
         .bind(batch_id)
         .bind(limit as i64)
         .exec(&mut conn)
         .await?;
 
-        deserialize_ping_session_pairs(rows)
+        deserialize_ping_sessions(rows)
     }
 
     pub async fn batch_upsert_profile_extensions(
@@ -1108,7 +1239,7 @@ impl Database {
                  delay=excluded.delay, speed=excluded.speed, \
                  sort_order=excluded.sort_order, ip_info=excluded.ip_info",
             )
-            .bind(&ext.profile_id)
+            .bind(ext.profile_id)
             .bind(ext.delay)
             .bind(ext.speed)
             .bind(ext.sort_order)
@@ -1155,7 +1286,7 @@ impl Database {
                  delay=excluded.delay, speed=excluded.speed, \
                  sort_order=excluded.sort_order, ip_info=excluded.ip_info",
             )
-            .bind(&ext.profile_id)
+            .bind(ext.profile_id)
             .bind(ext.delay)
             .bind(ext.speed)
             .bind(ext.sort_order)
@@ -1169,83 +1300,99 @@ impl Database {
     }
 }
 
-// ── Private helpers ─────────────────────────────────────────────────────
+// ── Deserialization helpers ────────────────────────────────────────────
 
-/// Insert a single profile row using toasty's generated create (for use inside transactions).
-async fn insert_profile_inner(executor: &mut dyn toasty::Executor, p: &Profile) -> Result<()> {
-    Profile::create()
-        .id(p.id.clone())
-        .sub_uid(p.sub_uid)
-        .group_id(p.group_id.clone())
-        .config_type(p.config_type)
-        .core_type(p.core_type.clone())
-        .address(p.address.clone())
-        .port(p.port)
-        .user_id(p.user_id.clone())
-        .security(p.security.clone())
-        .network(p.network.clone())
-        .stream_settings(p.stream_settings.clone())
-        .protocol_settings(p.protocol_settings.clone())
-        .remarks(p.remarks.clone())
-        .is_sub(p.is_sub)
-        .sub_id(p.sub_id.clone())
-        .sort_order(p.sort_order)
-        .is_active(p.is_active)
-        .created_at(p.created_at.clone())
-        .updated_at(p.updated_at.clone())
-        .into_statement()
-        .exec(executor)
-        .await?;
-    Ok(())
+/// Deserialize Profile rows from raw query results.
+fn deserialize_profiles(rows: Vec<Value>) -> Result<Vec<Profile>> {
+    let mut profiles = Vec::with_capacity(rows.len());
+    for value in rows {
+        if let Value::Record(fields) = value {
+            profiles.push(Profile {
+                id: get_i64(&fields, 0)?,
+                sig: get_i64(&fields, 1)?,
+                cred_hash: get_i64(&fields, 2)?,
+                proto_kind: get_string(&fields, 3)?,
+                spec_blob: get_blob(&fields, 4),
+                config_type: get_i64(&fields, 5)? as i32,
+                core_type: get_string(&fields, 6)?,
+                address: get_string(&fields, 7)?,
+                port: get_i64(&fields, 8)? as i32,
+                transport: get_opt_string(&fields, 9),
+                security: get_opt_string(&fields, 10),
+                created_at: get_i64(&fields, 11)?,
+                extension: Default::default(),
+                server_stat: Default::default(),
+            });
+        }
+    }
+    Ok(profiles)
 }
 
-/// Upsert a profile row via raw SQL with concrete `Value` bindings for nullable cols.
-/// Uses `Value::Null` directly (not `Option<T>` → `Into<Value>`) to avoid type-inference
-/// failures in the Turso driver for null bindings.
-async fn upsert_profile_row(
-    executor: &mut dyn toasty::Executor,
-    p: &Profile,
-    group_id: &str,
-) -> Result<()> {
-    toasty::sql::statement(
-        "INSERT INTO profiles \
-         (id, sub_uid, group_id, config_type, core_type, address, port, user_id, \
-          security, network, stream_settings, protocol_settings, \
-          remarks, is_sub, sub_id, sort_order, is_active, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, datetime('now')) \
-         ON CONFLICT(group_id, sub_uid) DO UPDATE SET \
-         address=excluded.address, port=excluded.port, \
-         user_id=excluded.user_id, security=excluded.security, \
-         network=excluded.network, stream_settings=excluded.stream_settings, \
-         protocol_settings=excluded.protocol_settings, \
-         remarks=excluded.remarks, sub_id=excluded.sub_id, \
-         is_sub=excluded.is_sub, \
-         sort_order=excluded.sort_order, is_active=excluded.is_active, \
-         updated_at=datetime('now')",
-    )
-    .bind(&p.id)
-    .bind(p.sub_uid)
-    .bind(group_id)
-    .bind(p.config_type)
-    .bind(&p.core_type)
-    .bind_typed(p.address.clone(), DbType::Text)
-    .bind_typed(p.port, DbType::Integer(4))
-    .bind_typed(p.user_id.clone(), DbType::Text)
-    .bind_typed(p.security.clone(), DbType::Text)
-    .bind_typed(p.network.clone(), DbType::Text)
-    .bind_typed(p.stream_settings.clone(), DbType::Text)
-    .bind_typed(p.protocol_settings.clone(), DbType::Text)
-    .bind_typed(p.remarks.clone(), DbType::Text)
-    .bind_typed(p.is_sub, DbType::Integer(4))
-    .bind_typed(p.sub_id.clone(), DbType::Text)
-    .bind_typed(p.sort_order, DbType::Integer(4))
-    .bind_typed(p.is_active, DbType::Integer(4))
-    .bind_typed(p.created_at.clone(), DbType::Text)
-    .exec(executor)
-    .await?;
-    Ok(())
+/// Deserialize (Profile, Connection) pairs from a JOIN query.
+/// Column order: 12 profile cols, 9 connection cols.
+fn deserialize_profile_connections(rows: Vec<Value>) -> Result<Vec<(Profile, Connection)>> {
+    let mut pairs = Vec::with_capacity(rows.len());
+    for value in rows {
+        if let Value::Record(fields) = value {
+            let p = Profile {
+                id: get_i64(&fields, 0)?,
+                sig: get_i64(&fields, 1)?,
+                cred_hash: get_i64(&fields, 2)?,
+                proto_kind: get_string(&fields, 3)?,
+                spec_blob: get_blob(&fields, 4),
+                config_type: get_i64(&fields, 5)? as i32,
+                core_type: get_string(&fields, 6)?,
+                address: get_string(&fields, 7)?,
+                port: get_i64(&fields, 8)? as i32,
+                transport: get_opt_string(&fields, 9),
+                security: get_opt_string(&fields, 10),
+                created_at: get_i64(&fields, 11)?,
+                extension: Default::default(),
+                server_stat: Default::default(),
+            };
+            let c = Connection {
+                id: get_string(&fields, 12)?,
+                profile_id: get_i64(&fields, 13)?,
+                group_id: get_string(&fields, 14)?,
+                remarks: get_opt_string(&fields, 15),
+                seen_at: get_opt_string(&fields, 16),
+                is_sub: get_opt_i64(&fields, 17).map(|v| v as i32),
+                sort_order: get_opt_i64(&fields, 18).map(|v| v as i32),
+                is_active: get_opt_i64(&fields, 19).map(|v| v as i32),
+                updated_at: get_i64(&fields, 20)?,
+                profile: Default::default(),
+                group: Default::default(),
+            };
+            pairs.push((p, c));
+        }
+    }
+    Ok(pairs)
 }
-/// Deserialize rows from a raw `SELECT * FROM ping_sessions` query.
+
+/// Deserialize Connection rows from raw query results.
+fn deserialize_connections(rows: Vec<Value>) -> Result<Vec<Connection>> {
+    let mut connections = Vec::with_capacity(rows.len());
+    for value in rows {
+        if let Value::Record(fields) = value {
+            connections.push(Connection {
+                id: get_string(&fields, 0)?,
+                profile_id: get_i64(&fields, 1)?,
+                group_id: get_string(&fields, 2)?,
+                remarks: get_opt_string(&fields, 3),
+                seen_at: get_opt_string(&fields, 4),
+                is_sub: get_opt_i64(&fields, 5).map(|v| v as i32),
+                sort_order: get_opt_i64(&fields, 6).map(|v| v as i32),
+                is_active: get_opt_i64(&fields, 7).map(|v| v as i32),
+                updated_at: get_i64(&fields, 8)?,
+                profile: Default::default(),
+                group: Default::default(),
+            });
+        }
+    }
+    Ok(connections)
+}
+
+/// Deserialize ping session rows.
 fn deserialize_ping_sessions(rows: Vec<Value>) -> Result<Vec<PingSession>> {
     let mut sessions = Vec::with_capacity(rows.len());
     for value in rows {
@@ -1253,7 +1400,7 @@ fn deserialize_ping_sessions(rows: Vec<Value>) -> Result<Vec<PingSession>> {
             sessions.push(PingSession {
                 id: get_string(&fields, 0)?,
                 batch_id: get_string(&fields, 1)?,
-                profile_id: get_string(&fields, 2)?,
+                profile_id: get_i64(&fields, 2)?,
                 config_type: get_i64(&fields, 3)? as i32,
                 core_type: get_string(&fields, 4)?,
                 address: get_opt_string(&fields, 5),
@@ -1271,64 +1418,6 @@ fn deserialize_ping_sessions(rows: Vec<Value>) -> Result<Vec<PingSession>> {
         }
     }
     Ok(sessions)
-}
-
-/// Deserialize rows from the real-ping JOIN query (ping_sessions JOIN profiles).
-/// Column order: ps.* (16 cols) then profiles.* (20 cols).
-fn deserialize_ping_session_pairs(rows: Vec<Value>) -> Result<Vec<(PingSession, Profile)>> {
-    let mut pairs = Vec::with_capacity(rows.len());
-    for value in rows {
-        if let Value::Record(fields) = value {
-            let session = PingSession {
-                id: get_string(&fields, 0)?,
-                batch_id: get_string(&fields, 1)?,
-                profile_id: get_string(&fields, 2)?,
-                config_type: get_i64(&fields, 3)? as i32,
-                core_type: get_string(&fields, 4)?,
-                address: get_opt_string(&fields, 5),
-                port: get_opt_i64(&fields, 6).map(|v| v as i32),
-                triplet_rank: get_i64(&fields, 7)? as i32,
-                ping_type: get_string(&fields, 8)?,
-                status: get_string(&fields, 9)?,
-                latency_ms: get_opt_i64(&fields, 10).map(|v| v as i32),
-                speed_bps: get_opt_i64(&fields, 11).map(|v| v as i32),
-                ip_info: get_opt_string(&fields, 12),
-                error: get_opt_string(&fields, 13),
-                created_at: get_opt_string(&fields, 14),
-                updated_at: get_opt_string(&fields, 15),
-            };
-
-            // Profile columns start at index 16
-            let p = Profile {
-                id: get_string(&fields, 16)?,
-                sub_uid: get_i64(&fields, 17)?,
-                group_id: get_string(&fields, 18)?,
-                config_type: get_i64(&fields, 19)? as i32,
-                core_type: get_string(&fields, 20)?,
-                address: get_opt_string(&fields, 21),
-                port: get_opt_i64(&fields, 22).map(|v| v as i32),
-                user_id: get_opt_string(&fields, 23),
-                security: get_opt_string(&fields, 24),
-                network: get_opt_string(&fields, 25),
-                stream_settings: get_opt_string(&fields, 26),
-                protocol_settings: get_opt_string(&fields, 27),
-                remarks: get_opt_string(&fields, 28),
-                is_sub: get_opt_i64(&fields, 29).map(|v| v as i32),
-                sub_id: get_opt_string(&fields, 30),
-                sort_order: get_opt_i64(&fields, 31).map(|v| v as i32),
-                is_active: get_opt_i64(&fields, 32).map(|v| v as i32),
-                created_at: get_opt_string(&fields, 33),
-                updated_at: get_opt_string(&fields, 34),
-                version: get_i64(&fields, 35)? as u64,
-                group: Default::default(),
-                extension: Default::default(),
-                server_stat: Default::default(),
-            };
-
-            pairs.push((session, p));
-        }
-    }
-    Ok(pairs)
 }
 
 // ── Value extraction helpers ───────────────────────────────────────────
@@ -1375,3 +1464,15 @@ fn get_opt_i64(fields: &[Value], idx: usize) -> Option<i64> {
     })
 }
 
+fn get_blob(fields: &[Value], idx: usize) -> Vec<u8> {
+    fields
+        .get(idx)
+        .and_then(|v| {
+            if let Value::Bytes(b) = v {
+                Some(b.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}

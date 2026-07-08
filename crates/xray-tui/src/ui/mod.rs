@@ -187,24 +187,26 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // confirmation is handled even when inside a sub-mode like ManageGroups.
     if state.confirmation.is_some() {
         match key.code {
-            KeyCode::Char('y' | 'Y') => match state.confirmation.take() {
-                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(&id).await,
-                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
-                Some(ConfirmAction::DeleteProfiles(ids)) => {
-                    for id in &ids {
-                        state.delete_profile(id).await;
+            KeyCode::Char('y') | KeyCode::Enter => {
+                match state.confirmation.take() {
+                    Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(id).await,
+                    Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
+                    Some(ConfirmAction::DeleteProfiles(ids)) => {
+                        for id in &ids {
+                            state.delete_profile(*id).await;
+                        }
+                        state.multi_select.clear();
                     }
-                    state.multi_select.clear();
+                    Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
+                    Some(ConfirmAction::Quit) => {
+                        state.disconnect();
+                        state.should_quit = true;
+                    }
+                    Some(ConfirmAction::ClearLogs) => state.clear_logs(),
+                    Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
+                    None => {}
                 }
-                Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
-                Some(ConfirmAction::Quit) => {
-                    state.disconnect();
-                    state.should_quit = true;
-                }
-                Some(ConfirmAction::ClearLogs) => state.clear_logs(),
-                Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
-                None => {}
-            },
+            }
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
                 state.confirmation = None;
             }
@@ -345,22 +347,22 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 match selected {
                     0 => {
                         if let Some(id) = state.selected_profile_id() {
-                            state.start_tcp_ping(&id);
+                            state.start_tcp_ping(id);
                         }
                     }
                     1 => {
                         if let Some(id) = state.selected_profile_id() {
-                            state.start_real_ping(&id);
+                            state.start_real_ping(id);
                         }
                     }
                     2 => {
                         if let Some(id) = state.selected_profile_id() {
-                            state.start_speed_test(&id);
+                            state.start_speed_test(id);
                         }
                     }
                     3 => {
                         if let Some(id) = state.selected_profile_id() {
-                            state.start_udp_test(&id);
+                            state.start_udp_test(id);
                         }
                     }
                     5 => {
@@ -519,13 +521,13 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && state.current_tab == Tab::Profiles =>
         {
             if let Some(id) = state.selected_profile_id() {
-                state.connect_to_profile(&id);
+                state.connect_to_profile(id);
             }
         }
 
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
-                state.set_active(&id).await;
+                state.set_active(&id.to_string()).await;
             }
         }
         KeyCode::Enter if state.current_tab == Tab::Settings => {
@@ -533,7 +535,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char(' ') if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
-                state.toggle_multi_select(&id);
+                state.toggle_multi_select(id);
             }
         }
         // Ctrl+A: select all filtered profiles
@@ -541,9 +543,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            let ids: Vec<String> = state
+            let ids: Vec<i64> = state
                 .filtered_profiles()
-                .map(|r| r.profile.id.clone())
+                .map(|r| r.profile.id)
                 .collect();
             for id in ids {
                 state.multi_select.insert(id);
@@ -608,7 +610,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('e' | 'E') if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
-                state.start_edit_profile(&id).await;
+                state.start_edit_profile(&id.to_string()).await;
             }
         }
         KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
@@ -622,7 +624,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
-                let ids: Vec<String> = state.multi_select.iter().cloned().collect();
+                let ids: Vec<i64> = state.multi_select.iter().cloned().collect();
                 state.confirmation = Some(ConfirmAction::DeleteProfiles(ids));
             } else if let Some(id) = state.selected_profile_id() {
                 state.confirmation = Some(ConfirmAction::DeleteProfile(id));
@@ -633,7 +635,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && state.current_tab == Tab::Profiles =>
         {
             if let Some(id) = state.selected_profile_id() {
-                state.clone_profile(&id).await;
+                state.clone_profile(id).await;
             }
         }
         KeyCode::Char('v')

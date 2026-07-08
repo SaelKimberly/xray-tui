@@ -26,6 +26,8 @@ dirs.workspace = true
 tokio.workspace = true
 tokio.features = ["process", "signal", "sync", "fs", "time", "io-util", "rt", "rt-multi-thread"]
 futures-util.workspace = true
+# ============ Proto crate (ProtocolConfig) ============
+xray-tui-proto.workspace = true
 
 # ============ Protocol ============
 tonic = "0.14"
@@ -56,3 +58,6 @@ byteorder = "1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+
+[dev-dependencies]
+xray-tui-config = { path = "../xray-tui-config" }

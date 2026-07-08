@@ -81,31 +81,27 @@ mod tests {
 
     fn test_profile(config_type: i32) -> Profile {
         let mut profile = Profile {
-            id: "test-smoke".to_string(),
+            id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            spec_blob: Vec::new(),
             config_type,
             core_type: String::new(),
-            remarks: Some("smoke test".to_string()),
-            address: Some("example.com".to_string()),
-            port: Some(443),
-            user_id: Some("test-uuid".to_string()),
+            address: "example.com".to_string(),
+            port: 443,
+            transport: Some("tcp".to_string()),
             security: Some("auto".to_string()),
-            network: Some("tcp".to_string()),
-            stream_settings: None,
-            protocol_settings: None,
-            is_sub: Some(0),
-            sub_id: None,
-            group_id: String::new(),
-            sort_order: Some(0),
-            is_active: Some(0),
-            created_at: None,
-            updated_at: None,
-            sub_uid: 0,
-            version: 0,
+            created_at: 0,
             extension: Default::default(),
-            group: Default::default(),
             server_stat: Default::default(),
         };
-        profile.sub_uid = profile.compute_sub_uid();
+        // spec_blob fields via bridge traits
+        let extra = serde_json::json!({
+            "remarks": "smoke test",
+            "user_id": "test-uuid",
+        });
+        profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
         profile
     }
 
@@ -169,3 +165,4 @@ mod tests {
         assert!(result.is_err());
     }
 }
+

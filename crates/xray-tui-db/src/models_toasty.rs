@@ -2,44 +2,26 @@ use toasty::Deferred;
 
 // ── Primary models (toasty ORM, mapped to DB tables) ────────────────────
 
+/// Profile with uid-based PK. uid = sig ^ cred_hash (computed by ProtoSpec).
 #[derive(Debug, Clone, toasty::Model)]
-#[unique(group_id, sub_uid)]
 pub struct Profile {
     #[key]
-    pub id: String,
+    pub id: i64,                   // = uid = sig ^ cred_hash
 
-    /// Hash-based dedup key; unique per group.
-    pub sub_uid: i64,
-    pub group_id: String,
+    pub sig: i64,                  // cached from ProtoSpec::sig()
+    pub cred_hash: i64,            // cached from ProtoSpec::cred_hash()
+    pub proto_kind: String,        // "vmess", "vless", "trojan", etc.
+    pub spec_blob: Vec<u8>,        // postcard-encoded ProtocolConfig variant
 
-    // — Protocol config (formerly profile_cores table) —
-    pub config_type: i32,
-    pub core_type: String,
-    pub address: Option<String>,
-    pub port: Option<i32>,
-    pub user_id: Option<String>,
-    pub security: Option<String>,
-    pub network: Option<String>,
-    pub stream_settings: Option<String>,
-    pub protocol_settings: Option<String>,
+    pub config_type: i32,          // kept for core routing
+    pub core_type: String,         // "auto", "xray", "sing-box"
+    pub address: String,           // cached from ProtoSpec::host()
+    pub port: i32,                 // cached from ProtoSpec::port()
+    pub transport: Option<String>, // cached from ProtoSpec::transport_type()
+    pub security: Option<String>,  // cached from ProtoSpec::security_type()
+    pub created_at: i64,           // UNIX timestamp
 
-    // — Profile metadata (formerly group_profiles table) —
-    pub remarks: Option<String>,
-    pub is_sub: Option<i32>,
-    pub sub_id: Option<String>,
-    pub sort_order: Option<i32>,
-    pub is_active: Option<i32>,
-    pub updated_at: Option<String>,
-    pub created_at: Option<String>,
-
-    /// Optimistic concurrency version — auto-managed by toasty.
-    #[version]
-    pub version: u64,
-
-    // — Relations (query-only; toasty manages FK at ORM layer) —
-    #[belongs_to(key = group_id, references = id)]
-    pub group: Deferred<Option<Group>>,
-
+    // — Relations —
     #[has_one]
     pub extension: Deferred<Option<ProfileExtension>>,
 
@@ -47,10 +29,34 @@ pub struct Profile {
     pub server_stat: Deferred<Option<ServerStat>>,
 }
 
+/// Many-to-many connection between profiles and groups.
+/// Replaces the old Profile.group_id field.
+#[derive(Debug, Clone, toasty::Model)]
+#[unique(profile_id, group_id)]
+pub struct Connection {
+    #[key]
+    pub id: String,                 // UUID — toasty requires PK
+    pub profile_id: i64,            // -> profiles.id
+    pub group_id: String,           // -> groups.id
+
+    pub remarks: Option<String>,
+    pub seen_at: Option<String>,    // subscription last-seen timestamp
+    pub is_sub: Option<i32>,
+    pub sort_order: Option<i32>,
+    pub is_active: Option<i32>,
+    pub updated_at: i64,
+
+    #[belongs_to(key = profile_id, references = id)]
+    pub profile: Deferred<Option<Profile>>,
+
+    #[belongs_to(key = group_id, references = id)]
+    pub group: Deferred<Option<Group>>,
+}
+
 #[derive(Debug, Clone, toasty::Model)]
 pub struct ProfileExtension {
     #[key]
-    pub profile_id: String,
+    pub profile_id: i64,
 
     pub delay: Option<i32>,
     pub speed: Option<i32>,
@@ -64,7 +70,7 @@ pub struct ProfileExtension {
 #[derive(Debug, Clone, toasty::Model)]
 pub struct ServerStat {
     #[key]
-    pub profile_id: String,
+    pub profile_id: i64,
 
     pub today_up: Option<i64>,
     pub today_down: Option<i64>,
@@ -149,7 +155,7 @@ pub struct PingSession {
     pub id: String,
 
     pub batch_id: String,
-    pub profile_id: String,
+    pub profile_id: i64,
     pub config_type: i32,
     pub core_type: String,
     pub address: Option<String>,
@@ -171,7 +177,7 @@ pub struct PingSession {
 #[derive(Debug, Clone)]
 pub struct PingResultUpdate {
     pub session_id: String,
-    pub profile_id: String,
+    pub profile_id: i64,
     pub status: String,
     pub ping_type: String,
     pub latency_ms: Option<i32>,
@@ -179,39 +185,3 @@ pub struct PingResultUpdate {
     pub ip_info: Option<String>,
     pub error: Option<String>,
 }
-
-
-impl Profile {
-    /// Hash the semantic profile fields to produce a dedup key.
-    /// Uses rapidhash v3 for stable output across crate versions.
-    #[must_use]
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "u64 bit pattern stored in i64, not arithmetic"
-    )]
-    pub fn compute_sub_uid(&self) -> i64 {
-        use rapidhash::v3::{DEFAULT_RAPID_SECRETS, RapidStreamHasherV3};
-        let mut h = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
-        h.write(&self.config_type.to_le_bytes());
-        h.write(b":");
-        h.write(self.address.as_deref().unwrap_or("").as_bytes());
-        h.write(b":");
-        h.write(&self.port.unwrap_or(0).to_le_bytes());
-        h.write(b":");
-        h.write(self.user_id.as_deref().unwrap_or("").as_bytes());
-        h.write(b":");
-        h.write(self.security.as_deref().unwrap_or("").as_bytes());
-        h.write(b":");
-        h.write(self.network.as_deref().unwrap_or("").as_bytes());
-        h.write(b":");
-        h.write(self.stream_settings.as_deref().unwrap_or("").as_bytes());
-        h.write(b":");
-        h.write(self.protocol_settings.as_deref().unwrap_or("").as_bytes());
-        h.finish() as i64
-    }
-}
-// ──── Constants ──────────────────────────────────────────────────────────
-
-pub const GRAVEYARD_GROUP_ID: &str = "00000000-0000-0000-0000-000000000001";
-pub const GRAVEYARD_GROUP_TTL_HOURS: i64 = 24;
-pub const ALL_GROUP_ID: &str = "00000000-0000-0000-0000-000000000000";

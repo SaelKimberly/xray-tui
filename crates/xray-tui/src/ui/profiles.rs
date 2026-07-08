@@ -6,7 +6,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_db::models::GRAVEYARD_GROUP_ID;
 
 use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
@@ -16,6 +15,7 @@ use crate::ui::widgets::data_table::{
 };
 use crate::{AppState, ConfirmAction, ProfileRow};
 use ratatui_cheese::theme::Palette;
+use xray_tui_config::import_export::ProfileLegacy;
 
 // ── DataTable row wrapper ───────────────────────────────────────────────
 
@@ -92,8 +92,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let show_group = state.selected_group_id.is_none()
-        || state.selected_group_id.as_deref() == Some(xray_tui_db::models::ALL_GROUP_ID);
+    let show_group = state.selected_group_id.is_none();
     let show_group = show_group && frame.area().width >= 107;
     render_data_grid(
         frame, chunks[1], &rows, selected, show_group, state, &palette,
@@ -193,7 +192,7 @@ fn render_data_grid(
         .enumerate()
         .map(|(i, row)| {
             let is_selected = i == selected_index;
-            let is_connected = state.connected_profile_id.as_deref() == Some(&row.profile.id);
+            let is_connected = state.connected_profile_id.as_ref() == Some(&row.profile.id);
             let row_style = match (is_selected, is_connected) {
                 (true, true) => ThemeStyles::table_row_connected(palette)
                     .add_modifier(ratatui::style::Modifier::UNDERLINED),
@@ -226,25 +225,21 @@ fn render_data_grid(
             };
 
             let type_str = format!("{protocol:.12}");
-            let remarks = row.profile.remarks.as_deref().unwrap_or("");
-            let remarks_str = truncate_pad(remarks, 24);
-            let group_str = {
-                let gid: &str = &row.profile.group_id;
-                (gid != GRAVEYARD_GROUP_ID).then(|| {
+            let remarks = row.profile.leg("remarks").unwrap_or_default();
+            let remarks_str = truncate_pad(&remarks, 24);
+            let group_str = row
+                .group_id
+                .as_ref()
+                .and_then(|gid| {
                     state.groups
                         .iter()
-                        .find(|g| g.id == gid)
+                        .find(|g| g.id == *gid)
                         .and_then(|g| g.name.as_deref())
                 })
-                .flatten()
-                .map_or_else(String::new, |name| truncate_pad(name, 12))
-            };
-            let address = row.profile.address.as_deref().unwrap_or("");
+                .map_or_else(String::new, |name| truncate_pad(name, 12));
+            let address = row.profile.address.as_str();
             let address_str = truncate_pad(address, 30);
-            let port_str = row
-                .profile
-                .port
-                .map_or_else(|| "     -".to_string(), |p| format!("{p:>6}"));
+            let port_str = format!("{:>6}", row.profile.port);
             let delay_str = row
                 .extension
                 .as_ref()
@@ -269,7 +264,7 @@ fn render_data_grid(
             );
 
             ProfileTableRowData {
-                id: row.profile.id.clone(),
+                id: row.profile.id.to_string(),
                 indicator,
                 indicator_fg,
                 idx_str,
@@ -313,7 +308,7 @@ fn render_data_grid(
 
     // Populate multi_selected from state.multi_select
     for (i, row) in data_rows.iter().enumerate() {
-        if state.multi_select.contains(&row.id) {
+        if state.multi_select.contains(&row.id.parse::<i64>().unwrap_or(0)) {
             table_state.multi_selected.insert(i);
         }
     }
@@ -361,12 +356,9 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
     let line = if has_profile {
         let row = &state.profiles[state.selected_index];
         let core = state.resolved_core(row);
-        let remarks = row.profile.remarks.as_deref().unwrap_or("-");
-        let addr = row.profile.address.as_deref().unwrap_or("-");
-        let port = row
-            .profile
-            .port
-            .map_or_else(|| "-".into(), |p| p.to_string());
+        let remarks = row.profile.leg("remarks").unwrap_or_else(|| "-".to_string());
+        let addr = if row.profile.address.is_empty() { "-" } else { &row.profile.address };
+        let port = row.profile.port.to_string();
         Line::from(vec![
             Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
             Span::styled(remarks, ThemeStyles::footer_value(palette)),
@@ -397,8 +389,8 @@ fn render_confirmation_overlays(
             let profile_name = rows
                 .iter()
                 .find(|r| r.profile.id == *delete_id)
-                .and_then(|r| r.profile.remarks.as_deref())
-                .unwrap_or("unknown");
+                .and_then(|r| r.profile.leg("remarks"))
+                .unwrap_or_default();
             render_confirmation_overlay(
                 frame,
                 area,

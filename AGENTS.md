@@ -20,7 +20,8 @@ cargo run
 - `crates/xray-tui-db/src/lib.rs` — re-export hub; Database, DatabaseError, Result public
 - `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
 - `crates/xray-tui-db/src/database.rs` — Database struct + all public query/write methods (toasty ORM, replaced raw turso SQLite)
-- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 8 tables (Profile, Group, ProfileExtension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession); non-model types (ProfileWithDetails, PingResultUpdate); constants (GRAVEYARD_GROUP_ID, ALL_GROUP_ID)
+:- `crates/xray-tui-proto/src/` — Protocol config types (VMess, VLESS, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard) with URL parsing/splitting infrastructure. Adopted from sub-healer project. 73 unit + 3 doc tests.
+- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Profile, Connection, Group, ProfileExtension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession); non-model types (ProfileWithDetails, PingResultUpdate); constants (GRAVEYARD_GROUP_ID, ALL_GROUP_ID)
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
@@ -81,6 +82,7 @@ cargo run
 7. **Sing-box config differs structurally** from xray-core: `type` vs `protocol`, `route` vs `routing`, `experimental.v2ray_api` vs `stats`+`api`+`policy`, different TLS/transport key names.
 8. **Theme system**: `ThemeStyles` struct (in `theme.rs`) provides static methods returning `Style` from a `&Palette`. Palette is constructed from `ratatui_themes::ThemeName` -> `ratatui_themes::Theme` -> `palette_bridge::current_palette()`. AppState::current_palette() is canonical accessor. Every screen accepts `&Palette` and calls `ThemeStyles::*` methods instead of hardcoded colors.
 9. **Sing-box V2Ray API is experimental**: May require build tag `with_v2ray_api`. If unavailable, stats/logs show "not supported by core".
+10. **spec_blob + bridge traits**: Profile data stored as hybrid — cached fields (address, port, transport, security) + `spec_blob` (postcard-encoded ProtocolConfig variant). Bridge traits `ProfileLegacy::leg()` and `ProfileMut::set_xxx()` in xray-tui-config enable old parse/format function code to read/write the new schema without full rewrite. `Connection` table replaces `Profile.group_id` for many-to-many group membership. `Profile.id` is i64 (uid = sig ^ cred_hash).
 
 ## Protocols: In Scope
 

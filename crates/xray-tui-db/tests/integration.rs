@@ -3,6 +3,7 @@
     reason = "test db lifetime is the function scope"
 )]
 
+use serde_json;
 use xray_tui_db::Database;
 use xray_tui_db::models::{Group, Profile};
 
@@ -11,84 +12,113 @@ async fn test_db() -> Database {
     Database::in_memory().await.expect("open in-memory db")
 }
 
-fn make_profile(id: &str, sub_uid_val: i64) -> Profile {
-    Profile {
+fn test_group(id: &str) -> Group {
+    Group {
         id: id.to_string(),
+        name: Some(id.to_string()),
+        subscription_url: None,
+        subscription_enabled: None,
+        user_agent: None,
+        convert_target: None,
+        core_type: None,
+        sort_order: None,
+        is_system: None,
+    }
+}
+
+fn make_profile(id_counter: i64) -> Profile {
+    let spec_blob = serde_json::to_vec(&serde_json::json!({
+        "remarks": format!("test-{id_counter}"),
+        "user_id": "uuid",
+    }))
+    .unwrap_or_default();
+    Profile {
+        id: id_counter,
+        sig: id_counter,
+        cred_hash: id_counter,
+        proto_kind: "test".to_string(),
+        spec_blob,
         config_type: 1,
         core_type: "xray".to_string(),
-        remarks: Some(format!("test-{id}")),
-        address: Some("127.0.0.1".to_string()),
-        port: Some(1080),
-        user_id: Some("uuid".to_string()),
+        address: "127.0.0.1".to_string(),
+        port: 1080,
+        transport: Some("tcp".to_string()),
         security: Some("auto".to_string()),
-        network: Some("tcp".to_string()),
-        stream_settings: None,
-        protocol_settings: None,
-        is_sub: Some(0),
-        sub_id: None,
-        group_id: String::new(),
-        sort_order: Some(0),
-        is_active: Some(0),
-        created_at: None,
-        updated_at: None,
-        sub_uid: sub_uid_val,
-        version: 0,
+        created_at: 0,
         extension: Default::default(),
-        group: Default::default(),
         server_stat: Default::default(),
     }
+}
+
+fn spec_remarks(blob: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(blob).ok()?;
+    v.get("remarks")?.as_str().map(|s| s.to_string())
 }
 
 #[tokio::test]
 async fn test_create_and_read_profile() {
     let db = test_db().await;
-    let p = make_profile("prof-1", 42);
-    db.insert_profile(&p).await.expect("insert profile");
+    db.insert_group(&test_group("test-group"))
+        .await
+        .expect("insert group");
+    let p = make_profile(1);
+    db.insert_profile(&p, "test-group")
+        .await
+        .expect("insert profile");
 
     let found = db
-        .get_profile("prof-1")
+        .get_profile(1)
         .await
         .expect("get profile")
         .expect("profile should exist");
 
-    assert_eq!(found.id, "prof-1");
+    assert_eq!(found.id, 1);
     assert_eq!(found.config_type, 1);
-    assert_eq!(found.sub_uid, 42);
-    assert_eq!(found.remarks.as_deref(), Some("test-prof-1"));
+    assert_eq!(spec_remarks(&found.spec_blob).as_deref(), Some("test-1"));
 }
 
 #[tokio::test]
 async fn test_update_profile() {
     let db = test_db().await;
-    let p = make_profile("prof-up", 43);
-    db.insert_profile(&p).await.expect("insert");
+    db.insert_group(&test_group("test-group"))
+        .await
+        .expect("insert group");
+    let p = make_profile(2);
+    db.insert_profile(&p, "test-group")
+        .await
+        .expect("insert");
 
-    let mut updated = p.clone();
-    updated.remarks = Some("updated-remark".to_string());
-    updated.port = Some(2080);
+    let mut updated = make_profile(2);
+    updated.address = "192.168.1.1".to_string();
+    updated.port = 2080;
     db.update_profile(&updated).await.expect("update");
 
     let found = db
-        .get_profile("prof-up")
+        .get_profile(2)
         .await
         .expect("get profile")
         .expect("profile should exist after update");
 
-    assert_eq!(found.remarks.as_deref(), Some("updated-remark"));
-    assert_eq!(found.port, Some(2080));
+    assert_eq!(found.address, "192.168.1.1");
+    assert_eq!(found.port, 2080);
 }
 
 #[tokio::test]
 async fn test_delete_profile() {
     let db = test_db().await;
-    let p = make_profile("prof-del", 44);
-    db.insert_profile(&p).await.expect("insert");
+    db.insert_group(&test_group("test-group"))
+        .await
+        .expect("insert group");
+    let p = make_profile(3);
+    db.insert_profile(&p, "test-group")
+        .await
+        .expect("insert");
 
-    assert!(db.get_profile("prof-del").await.expect("get").is_some());
+    assert!(db.get_profile(3).await.expect("get").is_some());
 
-    db.delete_profile("prof-del").await.expect("delete");
+    db.delete_profile(3).await.expect("delete");
 
-    let found = db.get_profile("prof-del").await.expect("get");
+    let found = db.get_profile(3).await.expect("get");
     assert!(found.is_none(), "deleted profile should not exist");
 }
 
@@ -96,40 +126,35 @@ async fn test_delete_profile() {
 async fn test_delete_group_cascade() {
     let db = test_db().await;
 
-    let group = Group {
-        id: "test-group-1".to_string(),
-        name: Some("test-group".to_string()),
-        subscription_url: None,
-        subscription_enabled: Some(0),
-        user_agent: None,
-        convert_target: None,
-        core_type: None,
-        sort_order: Some(0),
-        is_system: Some(0),
-    };
-    db.insert_group(&group).await.expect("insert group");
+    db.insert_group(&test_group("test-group-1"))
+        .await
+        .expect("insert group");
 
-    let mut p1 = make_profile("prof-g1", 50);
-    p1.group_id = "test-group-1".to_string();
-    let mut p2 = make_profile("prof-g2", 51);
-    p2.group_id = "test-group-1".to_string();
+    let p1 = make_profile(10);
+    let p2 = make_profile(11);
 
-    db.insert_profile(&p1).await.expect("insert p1");
-    db.insert_profile(&p2).await.expect("insert p2");
+    db.insert_profile(&p1, "test-group-1")
+        .await
+        .expect("insert p1");
+    db.insert_profile(&p2, "test-group-1")
+        .await
+        .expect("insert p2");
 
     let profiles = db
         .get_profiles_by_group("test-group-1")
         .await
         .expect("get profiles by group");
-    assert_eq!(profiles.len(), 2);
+    assert_eq!(profiles.len(), 2, "two profiles in group");
 
-    db.delete_group("test-group-1").await.expect("delete group");
+    db.delete_group("test-group-1")
+        .await
+        .expect("delete group");
 
     let profiles_after = db
         .get_profiles_by_group("test-group-1")
         .await
         .expect("get profiles after delete");
-    assert!(profiles_after.is_empty(), "profiles should be cascaded");
+    assert!(profiles_after.is_empty(), "profiles should be cleaned up");
 
     let all_groups = db.get_all_groups().await.expect("get all groups");
     assert!(
@@ -142,9 +167,15 @@ async fn test_delete_group_cascade() {
 async fn test_concurrent_reads() {
     let db = std::sync::Arc::new(test_db().await);
 
+    db.insert_group(&test_group("test-group"))
+        .await
+        .expect("insert group");
+
     for i in 0..5 {
-        let p = make_profile(&format!("concurrent-{i}"), 100 + i);
-        db.insert_profile(&p).await.expect("insert");
+        let p = make_profile(100 + i);
+        db.insert_profile(&p, "test-group")
+            .await
+            .expect("insert");
     }
 
     let mut handles = Vec::new();
@@ -156,9 +187,8 @@ async fn test_concurrent_reads() {
     }
 
     for h in handles {
-        let result = h.await.expect("join");
-        // Each insert mirrors to All group, so 5 inserts = 10 total
-        assert_eq!(result.len(), 10);
+        let results = h.await.expect("join");
+        assert_eq!(results.len(), 5, "should see 5 profiles");
     }
 }
 
@@ -166,22 +196,24 @@ async fn test_concurrent_reads() {
 async fn test_multi_step_atomicity() {
     let db = test_db().await;
 
-    let p = make_profile("atomic-1", 200);
-    db.insert_profile(&p).await.expect("insert valid profile");
+    db.insert_group(&test_group("test-group"))
+        .await
+        .expect("insert group");
 
-    // sub_uid=0 is valid with a different sub_uid (unique constraint on (group_id, sub_uid) still exists,
-    // but ("", 0) doesn't conflict with ("", 200)).
-    let nope = make_profile("atomic-2", 0);
-    let result = db.insert_profile(&nope).await;
-    assert!(result.is_ok(), "insert with sub_uid=0 should succeed now");
+    let p = make_profile(200);
+    db.insert_profile(&p, "test-group")
+        .await
+        .expect("insert valid profile");
+
+    // Upsert: duplicate id silently succeeds (ON CONFLICT DO UPDATE)
+    let dupe = make_profile(200);
+    let result = db.insert_profile(&dupe, "test-group").await;
+    assert!(result.is_ok(), "upsert duplicate should succeed");
 
     let found = db
-        .get_profile("atomic-1")
+        .get_profile(200)
         .await
         .expect("get")
         .expect("original profile should exist");
-    assert_eq!(found.sub_uid, 200);
-
-    let exists = db.get_profile("atomic-2").await.expect("get");
-    assert!(exists.is_some(), "profile with sub_uid=0 should exist");
+    assert_eq!(found.id, 200);
 }
