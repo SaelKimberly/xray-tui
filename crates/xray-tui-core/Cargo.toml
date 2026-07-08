@@ -26,9 +26,6 @@ dirs.workspace = true
 tokio.workspace = true
 tokio.features = ["process", "signal", "sync", "fs", "time", "io-util", "rt", "rt-multi-thread"]
 futures-util.workspace = true
-# ============ Proto crate (ProtocolConfig) ============
-xray-tui-proto.workspace = true
-
 # ============ Protocol ============
 tonic = "0.14"
 semver = { version = "1.0", features = ["std"] }

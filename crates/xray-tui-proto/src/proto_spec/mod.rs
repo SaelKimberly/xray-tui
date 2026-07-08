@@ -198,9 +198,7 @@ pub trait ProtoSpec: Serialize + DeserializeOwned + std::fmt::Debug + Clone {
     /// Extract country flag emojis detected in this server's remarks string.
     /// Returns deduplicated flag emojis in order of detection.
     fn country_flags(&self) -> SmallVec<[crate::urlx::TinyText; 4]> {
-        self.remarks()
-            .map(|_| SmallVec::new())
-            .unwrap_or_default()
+        self.remarks().map(|_| SmallVec::new()).unwrap_or_default()
     }
     /// Generate JSON config for the specified proxy core.
     ///
@@ -241,7 +239,6 @@ pub enum ProtocolConfig {
     Mixed(PlaceholderConfig),
 }
 
-#[macro_export]
 macro_rules! dispatch {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
