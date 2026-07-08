@@ -97,14 +97,23 @@ impl ProtoSpec for TrojanConfig {
 
         // Security mode: tls (default), none, or reality
         let security = match utils::query_get(&query, "security") {
-            Some("tls") | None => SecurityConfig {
-                tls: Some(TlsConfig::Tls(TlsOpts {
-                    sni: utils::query_get(&query, "sni").map(TinyText::from),
-                    alpn: utils::query_get(&query, "alpn").map(TinyText::from),
-                    fp: utils::query_get(&query, "fp").map(TinyText::from),
-                    insecure: None,
-                })),
-                enc: None,
+            Some("tls") | None => {
+                let insecure = utils::query_get_multi(&query, &[
+                    "allowInsecure", "allow_insecure", "allowinsecure", "skipVerify",
+                ]).and_then(|v| match v {
+                    "1" | "true" | "True" => Some(true),
+                    "0" | "false" | "False" => Some(false),
+                    _ => None,
+                });
+                SecurityConfig {
+                    tls: Some(TlsConfig::Tls(TlsOpts {
+                        sni: utils::query_get(&query, "sni").map(TinyText::from),
+                        alpn: utils::query_get(&query, "alpn").map(TinyText::from),
+                        fp: utils::query_get(&query, "fp").map(TinyText::from),
+                        insecure,
+                    })),
+                    enc: None,
+                }
             },
             Some("reality") => SecurityConfig {
                 tls: Some(TlsConfig::Reality(RealityOpts {
@@ -187,6 +196,9 @@ impl ProtoSpec for TrojanConfig {
                         }
                         if let Some(ref v) = opts.fp {
                             parts.push(format!("fp={}", urlencoding::encode(v)));
+                        }
+                        if let Some(true) = opts.insecure {
+                            parts.push("allowInsecure=1".to_string());
                         }
                     }
                     TlsConfig::Reality(opts) => {
