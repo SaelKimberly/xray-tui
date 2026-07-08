@@ -145,7 +145,12 @@ impl ProtoSpec for SsConfig {
         } else {
             format!("{host}:{}", self.port)
         };
-        Ok(format!("ss://{encoded}@{hostport}"))
+        let fragment = self
+            .remarks
+            .as_ref()
+            .map(|f| format!("#{}", urlencoding::encode(f)))
+            .unwrap_or_default();
+        Ok(format!("ss://{encoded}@{hostport}{fragment}"))
     }
 
     fn schema(&self) -> SchemeX {
@@ -197,7 +202,6 @@ impl SsConfig {
         hasher.finish()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
@@ -205,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_ss_basic() {
-        let url = "ss://Y2xlb2Y6cGFzc3dvcmRAMTwzMC4wLjE2MDo4MDgw@1.2.3.4:8080";
+        let url = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
         let raw = crate::urlx::RawUrlX::from(url);
         let config = SsConfig::try_parse(&raw).expect("failed");
         assert_eq!(config.schema(), SchemeX::SS);
@@ -215,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_reconstruct_roundtrip() {
-        let input = "ss://Y2xlb2Y6cGFzc3dvcmRAMTwzMC4wLjE2MDo4MDgw@1.2.3.4:8080";
+        let input = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
         let raw = crate::urlx::RawUrlX::from(input);
         let parsed = SsConfig::try_parse(&raw).expect("failed to parse");
         let reconstructed = parsed.reconstruct().expect("failed to reconstruct");
@@ -230,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip() {
-        let input = "ss://Y2xlb2Y6cGFzc3dvcmRAMTwzMC4wLjE2MDo4MDgw@1.2.3.4:8080";
+        let input = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
         let raw = crate::urlx::RawUrlX::from(input);
         let parsed = SsConfig::try_parse(&raw).expect("failed");
         let json = serde_json::to_string(&parsed).expect("serialize");
@@ -244,6 +248,16 @@ mod tests {
 
     #[test]
     fn test_roundtrip() {
-        check_roundtrip::<SsConfig>("ss://Y2xlb2Y6cGFzc3dvcmRAMTwzMC4wLjE2MDo4MDgw@1.2.3.4:8080");
+        check_roundtrip::<SsConfig>("ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080");
+    }
+
+    #[test]
+    fn ss_reconstruct_with_remarks() {
+        let url = "ss://Y2xlb2Y6cGFzc3dvcmQ@example.com:443#my-server";
+        let raw = crate::urlx::RawUrlX::from(url);
+        let config = SsConfig::try_parse(&raw).unwrap();
+        assert_eq!(config.remarks.as_deref(), Some("my-server"));
+        let rebuilt = config.reconstruct().unwrap();
+        assert!(rebuilt.contains("#my-server"), "reconstruct should preserve fragment: {rebuilt}");
     }
 }
