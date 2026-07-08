@@ -20,7 +20,7 @@ cargo run
 - `crates/xray-tui-db/src/lib.rs` — re-export hub; Database, DatabaseError, Result public
 - `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
 - `crates/xray-tui-db/src/database.rs` — Database struct + all public query/write methods (toasty ORM, replaced raw turso SQLite)
-:- `crates/xray-tui-proto/src/` — Protocol config types (VMess, VLESS, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard) with URL parsing/splitting infrastructure. Adopted from sub-healer project. 73 unit + 3 doc tests.
+- `crates/xray-tui-proto/src/` — Protocol config types (VMess, VLESS, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard, Hysteria2, Hysteria1, TUIC, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR) with URL parsing/splitting infrastructure + Clash YAML conversion. Adopted from sub-healer project. 94 unit + 3 doc tests.
 - `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Profile, Connection, Group, ProfileExtension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession); non-model types (ProfileWithDetails, PingResultUpdate); constants (GRAVEYARD_GROUP_ID, ALL_GROUP_ID)
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
@@ -39,6 +39,7 @@ cargo run
 - `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager: launches temp core binary to test profile via SOCKS5 HTTP requests with IP info fetch
 - `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
+- `crates/xray-tui-proto/src/clash/mod.rs` — Clash YAML proxy structs (ClashProxy enum + 29 per-protocol Clash config structs with kebab-case serde) for bidirectional conversion between Clash YAML and internal ProtocolConfig types
 
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
@@ -85,6 +86,7 @@ cargo run
 10. **spec_blob + bridge traits**: Profile data stored as hybrid — cached fields (address, port, transport, security) + `spec_blob` (postcard-encoded ProtocolConfig variant). Bridge traits `ProfileLegacy::leg()` and `ProfileMut::set_xxx()` in xray-tui-config enable old parse/format function code to read/write the new schema without full rewrite. `Connection` table replaces `Profile.group_id` for many-to-many group membership. `Profile.id` is i64 (uid = sig ^ cred_hash).
 
 11. **Dual uid scheme**: Profiles parsed from share URLs get `uid = sig ^ cred_hash` from `ProtoSpec` (deterministic, dedup-compatible). Profiles created via TUI form get a random i64 PK because no URL was parsed — `sig` and `cred_hash` are set to `uid` and `0` respectively and are meaningless. Form profiles don't participate in URL-based dedup.
+12. **Clash YAML conversion**: `ProtoSpec` trait has default `try_from_clash`/`to_clash` methods (both return Err). Per-protocol overrides implement bidirectional conversion between Clash YAML structs and internal ProtocolConfig types. `common.rs` provides conversion helpers for TLS/security, transport, host/port. `dispatch!` macro in `mod.rs` routes `try_from_clash` by `ClashProxy` variant. Hysteria2 uses `port_spec_serde` (PortSpec); all other protocols use `port_serde` (u16).
 
 ## Protocols: In Scope
 
@@ -108,6 +110,14 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 3. Create `XxxFmt::parse_share_url` and `XxxFmt::format_share_url` in `crates/xray-tui-config/src/import_export.rs`
 4. Add profile validation in appropriate config builder (`xray.rs` or `singbox.rs`)
 5. Reference: v2rayN's individual `*Fmt.cs` files for format specs; sing-box's `option/*.go` for JSON config structs
+
+### Adding a new Clash YAML protocol conversion
+1. Add Clash struct in `crates/xray-tui-proto/src/clash/mod.rs` (kebab-case serde field names)
+2. Add `use crate::clash::{ClashProxy, ClashXxx};` import in the protocol's config file
+3. Implement `try_from_clash(&proxy)` — match `ClashProxy::Xxx(c)` arm; convert fields using helpers from `common.rs` (`clash_server_to_host`, `clash_tls_to_security`, `transport_to_clash` for transport, `PortSpec::new_with(c.port)` or `c.port` for port)
+4. Implement `to_clash(&self)` — construct `ClashProxy::Xxx(ClashXxx { fields })` using `host_spec_to_string`, `security_to_clash_tls`, `port_spec_first` or `self.port`, `transport_to_clash` for transport
+5. Add test with `check_clash_roundtrip::<XxxConfig>()` in the protocol's test module
+6. Add dispatch arm in `clash_match!` macro in `mod.rs`
 
 ### Adding subscription management features
 1. `confirm_add_group()` / `confirm_edit_group()` in `crates/xray-tui/src/lib.rs` handle form submit

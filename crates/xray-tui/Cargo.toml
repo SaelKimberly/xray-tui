@@ -7,6 +7,7 @@ edition.workspace = true
 xray-tui-core = { path = "../xray-tui-core" }
 xray-tui-db = { path = "../xray-tui-db" }
 xray-tui-config = { path = "../xray-tui-config" }
+xray-tui-proto = { path = "../xray-tui-proto" }
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true

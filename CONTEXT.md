@@ -11,6 +11,7 @@ xray-tui/
 │   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, settings, groups, logs, statistics, actions_log, theme, palette_bridge, widgets/)
 ├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
 ├── xray-tui-db/       # Library: toasty ORM persistence layer + query methods
+├── xray-tui-proto/    # Library: protocol config types, URL parse/format, Clash YAML structs and conversion (16 protocols)
 ├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management
 ├── thirdparty/
 │   ├── Xray-core/         # Source of truth for protocols and behavior

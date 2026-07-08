@@ -84,9 +84,7 @@ async fn test_update_profile() {
         .await
         .expect("insert group");
     let p = make_profile(2);
-    db.insert_profile(&p, "test-group")
-        .await
-        .expect("insert");
+    db.insert_profile(&p, "test-group").await.expect("insert");
 
     let mut updated = make_profile(2);
     updated.address = "192.168.1.1".to_string();
@@ -110,9 +108,7 @@ async fn test_delete_profile() {
         .await
         .expect("insert group");
     let p = make_profile(3);
-    db.insert_profile(&p, "test-group")
-        .await
-        .expect("insert");
+    db.insert_profile(&p, "test-group").await.expect("insert");
 
     assert!(db.get_profile(3).await.expect("get").is_some());
 
@@ -146,9 +142,7 @@ async fn test_delete_group_cascade() {
         .expect("get profiles by group");
     assert_eq!(profiles.len(), 2, "two profiles in group");
 
-    db.delete_group("test-group-1")
-        .await
-        .expect("delete group");
+    db.delete_group("test-group-1").await.expect("delete group");
 
     let profiles_after = db
         .get_profiles_by_group("test-group-1")
@@ -173,9 +167,7 @@ async fn test_concurrent_reads() {
 
     for i in 0..5 {
         let p = make_profile(100 + i);
-        db.insert_profile(&p, "test-group")
-            .await
-            .expect("insert");
+        db.insert_profile(&p, "test-group").await.expect("insert");
     }
 
     let mut handles = Vec::new();

@@ -12,4 +12,7 @@ pub use app_config::{
     StatisticsConfig, SystemProxyConfig, TunConfig,
 };
 pub use duration_or_secs::DurationOrSecs;
-pub use import_export::{ProfileLegacy, ProfileMut, ValidationSettings, ValidationSummary};
+pub use import_export::{
+    flatten_json_to_fields, parse_profile_settings, profile_config, profile_user_id,
+    ValidationSettings, ValidationSummary,
+};

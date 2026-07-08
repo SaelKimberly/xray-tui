@@ -139,12 +139,12 @@
 - ☐ SIP008 format — Shadowsocks SIP008 subscription format support
 - ☐ SOCKS4/5 share link import — socks:// scheme with SOCKS4 auth fields
 
-### Clash
+### Clash YAML
 
+- ✅ Clash YAML proto_spec parsing — `clash/mod.rs` with 29 ClashProxy/ClashXxx serde structs, `try_from_clash`/`to_clash` on ProtoSpec trait, per-protocol implementations for all 16 protocols, dispatch macro, roundtrip tests (13/13 passing)
 - ☐ Clash Mixin — YAML overlay injected into sing-box config for Clash-compatible features
 - ☐ Clash API proxies view — real-time proxy group selector TUI tab
 - ☐ Clash API connections view — real-time active connection monitor TUI tab
-
 ### Core Management
 
 - ☐ Automatic server failover — health-check based fallback between profiles in a group

@@ -247,12 +247,19 @@ impl Database {
         }
         Ok(result)
     }
-    /// All profiles with their extension, stats, and connection group_id.
+    /// All profiles with their extension, stats, and connection `group_id`.
     /// Uses LEFT JOIN so profiles with 0 connections are still returned
-    /// (group_id will be None for orphans).
+    /// (`group_id` will be None for orphans).
     pub async fn get_all_profiles_with_connections(
         &self,
-    ) -> Result<Vec<(Profile, Option<ProfileExtension>, Option<ServerStat>, Option<String>)>> {
+    ) -> Result<
+        Vec<(
+            Profile,
+            Option<ProfileExtension>,
+            Option<ServerStat>,
+            Option<String>,
+        )>,
+    > {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT p.id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
@@ -394,7 +401,7 @@ impl Database {
         deserialize_connections(rows)
     }
 
-    /// The active profile in a group (is_active = 1), if any.
+    /// The active profile in a group (`is_active` = 1), if any.
     pub async fn get_active_profile_for_group(&self, group_id: &str) -> Result<Option<Profile>> {
         let mut conn = self.db.connection().await?;
         let row = toasty::sql::query(
@@ -642,12 +649,11 @@ impl Database {
             .first()
             .exec(&mut conn)
             .await
+            && g.is_system == Some(1)
         {
-            if g.is_system == Some(1) {
-                return Err(DatabaseError::Generic(
-                    "cannot delete system group".to_string(),
-                ));
-            }
+            return Err(DatabaseError::Generic(
+                "cannot delete system group".to_string(),
+            ));
         }
 
         let mut tx = conn.transaction().await?;
@@ -701,12 +707,11 @@ impl Database {
             .first()
             .exec(&mut conn)
             .await
+            && g.is_system == Some(1)
         {
-            if g.is_system == Some(1) {
-                return Err(DatabaseError::Generic(
-                    "cannot clear system group".to_string(),
-                ));
-            }
+            return Err(DatabaseError::Generic(
+                "cannot clear system group".to_string(),
+            ));
         }
 
         let mut tx = conn.transaction().await?;
@@ -841,7 +846,7 @@ impl Database {
     }
 
     /// Upsert profiles from a subscription. Uses uid-based dedup.
-    /// profiles is a Vec<(Profile, Connection)> — the caller has parsed URLs via ProtoSpec.
+    /// profiles is a Vec<(Profile, Connection)> — the caller has parsed URLs via `ProtoSpec`.
     pub async fn subscription_upsert_profiles(
         &self,
         group_id: &str,
@@ -879,13 +884,18 @@ impl Database {
         .bind(p.port)
         .bind(p.transport.as_deref())
         .bind(p.security.as_deref())
-        .bind(p.created_at)
+        .bind(now)
             .exec(&mut tx)
             .await?;
         }
 
         // Phase 2: delete connections for profiles no longer in the subscription
-        if !uids.is_empty() {
+        if uids.is_empty() {
+            toasty::sql::statement("DELETE FROM connections WHERE group_id = ?1")
+                .bind(group_id)
+                .exec(&mut tx)
+                .await?;
+        } else {
             let ph: Vec<String> = uids
                 .iter()
                 .enumerate()
@@ -900,11 +910,6 @@ impl Database {
                 stmt = stmt.bind(*uid);
             }
             stmt.exec(&mut tx).await?;
-        } else {
-            toasty::sql::statement("DELETE FROM connections WHERE group_id = ?1")
-                .bind(group_id)
-                .exec(&mut tx)
-                .await?;
         }
 
         // Phase 3: upsert connections (DO NOT overwrite is_active — preserve existing)
@@ -1133,7 +1138,7 @@ impl Database {
                  (id, batch_id, profile_id, config_type, core_type, ping_type, status, triplet_rank) \
                  VALUES (?1, ?2, ?3, ?4, ?5, 'fast', 'queued', ?6)",
             )
-            .bind(&format!("{batch_id}-{pid}"))
+            .bind(format!("{batch_id}-{pid}"))
             .bind(batch_id)
             .bind(*pid)
             .bind(*ct)

@@ -40,7 +40,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
 
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
@@ -48,6 +48,9 @@ use super::common::{
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::proto_spec::common::*;
+use crate::clash::{ClashProxy, ClashTrojan};
+use crate::proto_spec::ProtoSpecError;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,15 +101,23 @@ impl ProtoSpec for TrojanConfig {
         // Security mode: tls (default), none, or reality
         let security = match utils::query_get(&query, "security") {
             Some("tls") | None => {
-                let insecure = utils::query_get_multi(&query, &[
-                    "allowInsecure", "allow_insecure", "allowinsecure", "skipVerify",
-                ]).and_then(|v| match v {
+                let insecure = utils::query_get_multi(
+                    &query,
+                    &[
+                        "allowInsecure",
+                        "allow_insecure",
+                        "allowinsecure",
+                        "skipVerify",
+                    ],
+                )
+                .and_then(|v| match v {
                     "1" | "true" | "True" => Some(true),
                     "0" | "false" | "False" => Some(false),
                     _ => None,
                 });
                 SecurityConfig {
                     tls: Some(TlsConfig::Tls(TlsOpts {
+                pin_sha256: None,
                         sni: utils::query_get(&query, "sni").map(TinyText::from),
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
@@ -114,7 +125,7 @@ impl ProtoSpec for TrojanConfig {
                     })),
                     enc: None,
                 }
-            },
+            }
             Some("reality") => SecurityConfig {
                 tls: Some(TlsConfig::Reality(RealityOpts {
                     sni: utils::query_get(&query, "sni").map(TinyText::from),
@@ -197,7 +208,7 @@ impl ProtoSpec for TrojanConfig {
                         if let Some(ref v) = opts.fp {
                             parts.push(format!("fp={}", urlencoding::encode(v)));
                         }
-                        if let Some(true) = opts.insecure {
+                        if opts.insecure == Some(true) {
                             parts.push("allowInsecure=1".to_string());
                         }
                     }
@@ -311,6 +322,86 @@ impl ProtoSpec for TrojanConfig {
     fn security(&self) -> Option<&SecurityConfig> {
         Some(&self.security)
     }
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Trojan(c) => {
+                let security = clash_tls_to_security(
+                    Some(c.tls),
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    clash_alpn_as_str(&c.alpn),
+                    c.fingerprint.as_deref(),
+                    None,
+                );
+                // Infer network from available transport opts (ClashTrojan has no network field)
+                let network = if c.ws_opts.is_some() {
+                    Some("ws")
+                } else if c.grpc_opts.is_some() {
+                    Some("grpc")
+                } else {
+                    None
+                };
+                let transport = clash_transport_to_transport(
+                    network,
+                    &c.ws_opts,
+                    &c.grpc_opts,
+                    &None,
+                    &None,
+                    &None,
+                    Some(&c.server),
+                );
+                // Derive path from transport (same pattern as try_parse)
+                let path = match &transport {
+                    TransportConfig::Ws(ws) => ws.path.clone(),
+                    TransportConfig::Grpc(g) => g.path.clone(),
+                    TransportConfig::Http(h) => h.path.clone(),
+                    TransportConfig::HttpUpgrade(cfg) => cfg.path.clone(),
+                    TransportConfig::XHttp(cfg) => cfg.path.clone(),
+                    _ => None,
+                };
+                Ok(Self {
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                    password: c.password.clone(),
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    security,
+                    transport,
+                    path,
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected trojan clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let server = host_spec_to_string(&self.host);
+        let (tls, servername, skip_cert_verify, alpn_str, fingerprint) = security_to_clash_tls(&self.security);
+        let (_, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, &server);
+        Ok(ClashProxy::Trojan(ClashTrojan {
+            name,
+            server,
+            port: self.port,
+            password: self.password.clone(),
+            udp: None,
+            tfo: None,
+            flow: None,
+            flow_show: None,
+            tls: tls.unwrap_or(true),
+            servername,
+            skip_cert_verify,
+            alpn: alpn_str.map(|s| vec![s]),
+            fingerprint,
+            ws_opts,
+            grpc_opts,
+        }))
+    }
+
 }
 
 impl TrojanConfig {
@@ -350,10 +441,13 @@ impl TrojanConfig {
     }
 }
 
+use crate::proto_spec::common::*;
+
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
     use crate::urlx::SchemeX;
+use crate::urlx::PortSpec;
 
     #[test]
     fn test_trojan_basic() {
@@ -407,12 +501,23 @@ mod tests {
     }
 
     #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<TrojanConfig>(
+            "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org",
+        );
+    }
+
+    #[test]
     fn trojan_security_none_roundtrip() {
         let url = "trojan://pass@example.com:443?security=none";
         let raw = crate::urlx::RawUrlX::from(url);
         let config = TrojanConfig::try_parse(&raw).unwrap();
         let rebuilt = config.reconstruct().unwrap();
-        assert!(rebuilt.contains("security=none"), "reconstructed URL should preserve security=none: {rebuilt}");
+        assert!(
+            rebuilt.contains("security=none"),
+            "reconstructed URL should preserve security=none: {rebuilt}"
+        );
         let raw2 = crate::urlx::RawUrlX::from(rebuilt.as_str());
         let config2 = TrojanConfig::try_parse(&raw2).unwrap();
         assert_eq!(config, config2);

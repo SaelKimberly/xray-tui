@@ -42,6 +42,7 @@ tar = "0.4"
 
 # ============ Internal ============
 xray-tui-db = { path = "../xray-tui-db" }
+xray-tui-proto = { path = "../xray-tui-proto" }
 
 # ============ Logging ============
 tracing.workspace = true

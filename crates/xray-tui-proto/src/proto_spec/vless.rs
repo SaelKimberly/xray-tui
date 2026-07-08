@@ -31,7 +31,7 @@
 //! - UUID is validated via `uuid::Uuid::parse_str`
 //! - For `type=grpc`, path is read from `serviceName` query param
 //! - For `type=kcp`/`mkcp`, path is read from `seed` query param
-//! - REALITY is VLESS-only (not supported by VMess)
+//! - REALITY is VLESS-only (not supported by `VMess`)
 //! - IPv6 addresses must be bracketed `[::1]`
 //! - Empty `type` defaults to `"tcp"`, empty `security` to `"none"`
 //!
@@ -39,13 +39,13 @@
 //! - Xray-core: `proxy/vless/account.go`, `proxy/vless/encoding/addons.proto`
 //! - sing-box: `option/vless.go`
 //! - v2rayN: `VLESSFmt.cs`
-//! - outbound: `dialer/v2ray/v2ray.go` ParseVlessURL
+//! - outbound: `dialer/v2ray/v2ray.go` `ParseVlessURL`
 
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
 
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
@@ -53,6 +53,9 @@ use super::common::{
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::proto_spec::common::*;
+use crate::clash::{ClashProxy, ClashVless};
+use crate::proto_spec::ProtoSpecError;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,15 +137,23 @@ impl ProtoSpec for VlessConfig {
         // TLS/security config
         let security = match utils::query_get(&query, "security") {
             Some("tls") => {
-                let insecure = utils::query_get_multi(&query, &[
-                    "allowInsecure", "allow_insecure", "allowinsecure", "skipVerify",
-                ]).and_then(|v| match v {
+                let insecure = utils::query_get_multi(
+                    &query,
+                    &[
+                        "allowInsecure",
+                        "allow_insecure",
+                        "allowinsecure",
+                        "skipVerify",
+                    ],
+                )
+                .and_then(|v| match v {
                     "1" | "true" | "True" => Some(true),
                     "0" | "false" | "False" => Some(false),
                     _ => None,
                 });
                 SecurityConfig {
                     tls: Some(TlsConfig::Tls(TlsOpts {
+                pin_sha256: None,
                         sni: utils::query_get(&query, "sni").map(TinyText::from),
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
@@ -150,7 +161,7 @@ impl ProtoSpec for VlessConfig {
                     })),
                     enc: None,
                 }
-            },
+            }
             Some("reality") => SecurityConfig {
                 tls: Some(TlsConfig::Reality(RealityOpts {
                     sni: utils::query_get(&query, "sni").map(TinyText::from),
@@ -198,7 +209,7 @@ impl ProtoSpec for VlessConfig {
             }
             if let Some(extra) = utils::query_get(&query, "extra") {
                 let mut bytes = extra.as_bytes().to_vec();
-                match serde_json::from_slice(&mut bytes) {
+                match serde_json::from_slice(&bytes) {
                     Ok(v) => xcfg.extra = Some(v),
                     Err(_) => {
                         return Err(ParseError::InvalidConf(
@@ -267,7 +278,7 @@ impl ProtoSpec for VlessConfig {
                         if let Some(ref v) = opts.fp {
                             q.append_pair("fp", v);
                         }
-                        if let Some(true) = opts.insecure {
+                        if opts.insecure == Some(true) {
                             q.append_pair("allowInsecure", "1");
                         }
                     }
@@ -386,6 +397,85 @@ impl ProtoSpec for VlessConfig {
     fn security(&self) -> Option<&SecurityConfig> {
         Some(&self.security)
     }
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Vless(c) => {
+                let security = clash_tls_to_security(
+                    c.tls,
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    clash_alpn_as_str(&c.alpn),
+                    None,
+                    c.reality_opts.as_ref(),
+                );
+                let transport = clash_transport_to_transport(
+                    c.network.as_deref(),
+                    &c.ws_opts,
+                    &c.grpc_opts,
+                    &None,
+                    &None,
+                    &None,
+                    Some(&c.server),
+                );
+                let path = match &transport {
+                    TransportConfig::Ws(ws) => ws.path.clone(),
+                    TransportConfig::Grpc(g) => g.path.clone(),
+                    TransportConfig::Http(h) => h.path.clone(),
+                    TransportConfig::HttpUpgrade(cfg) => cfg.path.clone(),
+                    TransportConfig::XHttp(cfg) => cfg.path.clone(),
+                    _ => None,
+                };
+                Ok(Self {
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                    uuid: c.uuid.clone(),
+                    uuid_origin: None,
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    security,
+                    transport,
+                    encryption: c.encryption.clone().map(TinyText::from),
+                    flow: c.flow.clone().map(TinyText::from),
+                    path,
+                    splice: None,
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected vless clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let server = host_spec_to_string(&self.host);
+        let alpn_str = self.security.alpn();
+        let (network, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, &server);
+        let (tls, servername, skip_cert_verify, _, _) = security_to_clash_tls(&self.security);
+        let reality_opts = security_to_clash_reality(&self.security);
+        Ok(ClashProxy::Vless(ClashVless {
+            name,
+            server,
+            port: self.port,
+            uuid: self.uuid.clone(),
+            udp: None,
+            tfo: None,
+            network,
+            flow: self.flow.as_ref().map(|s| s.to_string()),
+            encryption: self.encryption.as_ref().map(|s| s.to_string()),
+            tls,
+            servername,
+            skip_cert_verify,
+            alpn: alpn_str.map(|s| vec![s.to_string()]),
+            reality_opts,
+            ws_opts,
+            grpc_opts,
+            xhttp_opts: None,
+        }))
+    }
+
 }
 
 impl VlessConfig {
@@ -440,7 +530,7 @@ impl VlessConfig {
     }
 }
 
-/// Try to recover a valid XHttp mode from an unrecognized mode string
+/// Try to recover a valid `XHttp` mode from an unrecognized mode string
 /// by matching the longest known valid prefix.
 fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
     const VALID_MODES: &[&str] = &["packet-up", "stream-one", "stream-up", "auto"];
@@ -451,10 +541,13 @@ fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
         .map(|v| v as _)
 }
 
+use crate::proto_spec::common::*;
+
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
     use crate::urlx::SchemeX;
+use crate::urlx::PortSpec;
 
     #[test]
     fn test_vless_basic() {
@@ -524,6 +617,14 @@ mod tests {
             "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@host:443?type=ws&path=%2F",
         );
         check_roundtrip::<VlessConfig>("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@host:443");
+    }
+
+    #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<VlessConfig>(
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws",
+        );
     }
 
     #[test]

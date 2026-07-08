@@ -158,15 +158,15 @@ The `disconnect_tx` oneshot channel signals the running core task to stop gracef
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
-:::- `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, or Empty. 12 sections: Core, GUI, Protocol Core, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture.
+- `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, or Empty. 12 sections: Core, GUI, Protocol Core, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
-::- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
+- `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 - `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
 - `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)
-:- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled with themed scrollbar, DataTableRow trait
+- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled with themed scrollbar, DataTableRow trait
 
-::**`speed_test.rs`** — Async speed test engine:
+**`speed_test.rs`** — Async speed test engine:
 ```rust
 pub enum TestType { TcpPing, RealPing, SpeedTest, UdpTest }
 pub struct RealPingResult { pub latency_ms: u64, pub ip_info: Option<String> }
@@ -434,6 +434,7 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 
 **Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
 - `Profile` — proxy server config; `#[unique(group_id, sub_uid)]` for subscription dedup
+- `Connection` — many-to-many Profile↔Group membership; replaces `Profile.group_id`
 - `Group` — subscription group with name, URL, sort order, is_system flag
 - `ProfileExtension` — per-profile test results (delay, speed, ip_info)
 - `ServerStat` — traffic counters (today/total up/down as i64)

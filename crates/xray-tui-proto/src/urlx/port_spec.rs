@@ -213,9 +213,9 @@ mod tests {
     fn port_spec_range_inclusive_semantics() {
         let mut spec = PortSpec::new();
         spec.add_range(100..200);
-        assert!(spec.contains(100));  // start
-        assert!(spec.contains(200));  // end (was failing with exclusive)
-        assert!(!spec.contains(99));  // below
+        assert!(spec.contains(100)); // start
+        assert!(spec.contains(200)); // end (was failing with exclusive)
+        assert!(!spec.contains(99)); // below
         assert!(!spec.contains(201)); // above
         assert_eq!(spec.length(), 101);
         let collected: Vec<u16> = spec.iter().collect();

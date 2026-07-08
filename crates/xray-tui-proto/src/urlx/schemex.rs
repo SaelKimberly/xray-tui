@@ -23,6 +23,13 @@ pub enum SchemeX {
     Slipnet,
     Stormdns,
     WireGuard,
+    Socks,
+    Http,
+    Naive,
+    ShadowTls,
+    Tor,
+    Ssh,
+    Tailscale,
     Undefined,
     Unknown(TinyText),
 }
@@ -45,8 +52,15 @@ impl SchemeX {
             Self::Slipnet => "slipnet",
             Self::SlipnetEnc => "slipnet-enc",
             Self::Stormdns => "stormdns",
+            Self::Socks => "socks",
+            Self::Http => "http",
+            Self::Naive => "naive+https",
+            Self::ShadowTls => "shadowtls",
+            Self::Tor => "tor",
+            Self::Ssh => "ssh",
+            Self::Tailscale => "tailscale",
             Self::WireGuard => "wireguard",
-            Self::Undefined => "undefined",
+            Self::Undefined => return None,
             Self::Unknown(_) => return None,
         };
         Some(schema)
@@ -83,9 +97,12 @@ impl SchemeX {
                     "tg://",
                     "slipnet://",
                     "stormdns://",
+                    "socks://",
+                    "http://",
+                    "naive+https://",
+                    "naive+quic://",
+                    "shadowtls://",
                     "tuic://",
-                    "wireguard://",
-                    "slipnet-enc://",
                 ])
                 .unwrap()
         });
@@ -157,21 +174,28 @@ impl std::str::FromStr for SchemeX {
             s.strip_suffix("://").unwrap_or(s),
             Vless => "vless";
             Vmess => "vmess";
+            Trojan => "trojan";
             SS => "shadowsocks", "ss";
             SSR => "shadowsocksr", "ssr";
-            Hysteria2 => "hhysteria2", "hysteria2", "hhy2", "hy2";
-            Hysteria => "hhysteria", "hysteria", "hhy", "hy";
-            Trojan => "trojan";
             TUIC => "tuic";
-            Warp => "warp";
+            Hysteria => "hysteria", "hy";
+            Hysteria2 => "hysteria2", "hy2";
             AnyTLS => "anytls";
+            Http => "http";
+            Socks => "socks", "socks5";
+            Naive => "naive+https", "naive+quic", "naive";
+            ShadowTls => "shadowtls";
+            Tor => "tor";
+            Ssh => "ssh";
+            Tailscale => "tailscale";
             Https => "https";
             Tg => "tg";
             Slipnet => "slipnet";
             SlipnetEnc => "slipnet-enc";
             Stormdns => "stormdns";
-            WireGuard => "wireguard";
             Undefined => "undefined";
+            Warp => "warp";
+            WireGuard => "wireguard";
         );
 
         Ok(scheme)

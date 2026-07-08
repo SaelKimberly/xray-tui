@@ -3973,9 +3973,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.1"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "web-time",
  "zeroize",
@@ -4175,6 +4175,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -5572,6 +5585,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6275,6 +6294,7 @@ dependencies = [
  "xray-tui-config",
  "xray-tui-core",
  "xray-tui-db",
+ "xray-tui-proto",
 ]
 
 [[package]]
@@ -6287,7 +6307,6 @@ dependencies = [
  "escape8259",
  "humantime",
  "memchr",
- "postcard",
  "ratatui-themes",
  "serde",
  "serde_json",
@@ -6300,6 +6319,7 @@ dependencies = [
  "uuid",
  "xray-tui-core",
  "xray-tui-db",
+ "xray-tui-proto",
 ]
 
 [[package]]
@@ -6364,12 +6384,13 @@ dependencies = [
  "itoa",
  "memchr",
  "nom 8.0.0",
- "postcard",
  "rapidhash",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_with",
+ "serde_yaml",
  "smallvec",
  "smartstring",
  "thiserror 2.0.18",

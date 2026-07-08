@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
-use xray_tui_config::import_export::{ProfileLegacy, ProfileMut};
+use xray_tui_config::import_export::encode_profile_spec;
 use xray_tui_config::{AppConfig, ValidationSettings, ValidationSummary};
+use xray_tui_proto::proto_spec::ProtoSpec;
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
@@ -600,14 +601,17 @@ impl AppState {
                 }
                 if !self.search_query.is_empty() {
                     let q = self.search_query.to_lowercase();
-                    let remarks = row.profile.leg("remarks").unwrap_or_default();
                     let address = row.profile.address.clone();
                     let port = row.profile.port.to_string();
-                    if !remarks.to_lowercase().contains(&q)
-                        && !address.to_lowercase().contains(&q)
+                    if !address.to_lowercase().contains(&q)
                         && !port.contains(&q)
                     {
-                        return false;
+                        let remarks = xray_tui_config::import_export::profile_config(&row.profile)
+                            .and_then(|c| c.remarks().map(String::from))
+                            .unwrap_or_default();
+                        if !remarks.to_lowercase().contains(&q) {
+                            return false;
+                        }
                     }
                 }
                 true
@@ -621,11 +625,15 @@ impl AppState {
             let b_row = &self.profiles[b];
             let cmp = match self.sort_column {
                 SortColumn::ConfigType => a_row.profile.config_type.cmp(&b_row.profile.config_type),
-                SortColumn::Remarks => a_row
-                    .profile
-                    .leg("remarks")
-                    .unwrap_or_default()
-                    .cmp(&b_row.profile.leg("remarks").unwrap_or_default()),
+                SortColumn::Remarks => {
+                    let a_rem = xray_tui_config::import_export::profile_config(&a_row.profile)
+                        .and_then(|c| c.remarks().map(String::from))
+                        .unwrap_or_default();
+                    let b_rem = xray_tui_config::import_export::profile_config(&b_row.profile)
+                        .and_then(|c| c.remarks().map(String::from))
+                        .unwrap_or_default();
+                    a_rem.cmp(&b_rem)
+                }
                 SortColumn::Address => a_row.profile.address.cmp(&b_row.profile.address),
                 SortColumn::Port => a_row.profile.port.cmp(&b_row.profile.port),
                 SortColumn::Delay => {
@@ -899,18 +907,27 @@ impl AppState {
             extension: Default::default(),
             server_stat: Default::default(),
         };
-        if let Some(v) = remarks {
-            profile.set_remarks(Some(v));
+        let mut extra = serde_json::Map::new();
+        if let Some(v) = &remarks {
+            extra.insert("remarks".into(), serde_json::Value::String(v.clone()));
         }
-        if let Some(v) = user_id {
-            profile.set_user_id(Some(v));
+        if let Some(v) = &user_id {
+            extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
         }
-        if let Some(v) = protocol_settings_str {
-            profile.set_protocol_settings(Some(v));
+        if let Some(v) = &protocol_settings_str {
+            if let Ok(val) = serde_json::from_str(v) {
+                extra.insert("protocol_settings".into(), val);
+            }
         }
-        if let Some(v) = stream_settings_str {
-            profile.set_stream_settings(Some(v));
+        if let Some(v) = &stream_settings_str {
+            if let Ok(val) = serde_json::from_str(v) {
+                extra.insert("stream_settings".into(), val);
+            }
         }
+        profile.spec_blob = encode_profile_spec(
+            &proto_kind,
+            serde_json::to_vec(&extra).unwrap_or_default(),
+        );
         profile
     }
 
@@ -979,16 +996,10 @@ impl AppState {
         let group_id = self.selected_group_id.clone().unwrap_or_default();
         match self.db.insert_profile(&profile, &group_id).await {
             Ok(()) => {
-                self.log_trace(
-                    "info",
-                    "tui",
-                    &format!(
-                        "Added server: {}",
-                        profile
-                            .leg("remarks")
-                            .unwrap_or_else(|| "unnamed".to_string())
-                    ),
-                );
+                let remarks = xray_tui_config::import_export::profile_config(&profile)
+                    .and_then(|c| c.remarks().map(String::from))
+                    .unwrap_or_else(|| "unnamed".to_string());
+                self.log_trace("info", "tui", &format!("Added server: {remarks}"));
                 self.mode = AppMode::List;
                 self.profile_gen = self.profile_gen.wrapping_add(1);
                 self.upsert_profile_row(profile, None, None, self.selected_group_id.clone());
@@ -1090,30 +1101,12 @@ impl AppState {
         profile.security.clone_from(&new_profile.security);
         profile.sig = new_profile.sig;
         profile.cred_hash = new_profile.cred_hash;
-        if let Some(v) = new_profile.leg("remarks") {
-            profile.set_remarks(Some(v));
-        }
-        if let Some(v) = new_profile.leg("user_id") {
-            profile.set_user_id(Some(v));
-        }
-        if let Some(v) = new_profile.leg("stream_settings") {
-            profile.set_stream_settings(Some(v));
-        }
-        if let Some(v) = new_profile.leg("protocol_settings") {
-            profile.set_protocol_settings(Some(v));
-        }
         match self.db.update_profile(&profile).await {
             Ok(()) => {
-                self.log_trace(
-                    "info",
-                    "tui",
-                    &format!(
-                        "Updated server: {}",
-                        profile
-                            .leg("remarks")
-                            .unwrap_or_else(|| "unnamed".to_string())
-                    ),
-                );
+                let remarks = xray_tui_config::import_export::profile_config(&profile)
+                    .and_then(|c| c.remarks().map(String::from))
+                    .unwrap_or_else(|| "unnamed".to_string());
+                self.log_trace("info", "tui", &format!("Updated server: {remarks}"));
                 self.mode = AppMode::List;
                 self.profile_gen = self.profile_gen.wrapping_add(1);
                 let existing = self.profiles.iter().find(|r| r.profile.id == profile_id);
@@ -3068,8 +3061,8 @@ impl AppState {
                                     }
                                 }
                                 let _ = self.db.upsert_profile_extension(ext).await;
-                                row.profile
-                                    .leg("remarks")
+                                xray_tui_config::import_export::profile_config(&row.profile)
+                                    .and_then(|c| c.remarks().map(String::from))
                                     .unwrap_or_else(|| profile_id.to_string())
                             }
                             None => profile_id.to_string(),
@@ -3588,7 +3581,8 @@ impl AppState {
                     id: uuid::Uuid::new_v4().to_string(),
                     profile_id: p.id,
                     group_id: group_id.clone(),
-                    remarks: p.leg("remarks"),
+                    remarks: xray_tui_config::import_export::profile_config(&p)
+                        .and_then(|c| c.remarks().map(String::from)),
                     seen_at: Some(format_now()),
                     is_sub: Some(1),
                     sort_order: None,
@@ -3890,9 +3884,23 @@ fn common_field_defaults() -> Vec<(String, String)> {
 
 fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
     let mut fields = common_field_defaults();
-    if let Some(v) = profile.leg("remarks") {
-        set_field(&mut fields, "remarks", &v);
+    if let Some(config) = xray_tui_config::import_export::profile_config(profile) {
+        if let Some(v) = config.remarks() {
+            set_field(&mut fields, "remarks", v);
+        }
+        if let Some(v) = xray_tui_config::import_export::profile_user_id(&config) {
+            set_field(&mut fields, "user_id", &v);
+        }
+        if let Some(v) = config.security_type() {
+            set_field(&mut fields, "security", v);
+        }
+        if let Some(v) = config.transport_type() {
+            set_field(&mut fields, "network", v);
+        }
+        let (_ps, ss) = config.to_settings();
+        xray_tui_config::import_export::flatten_json_to_fields(&ss, &mut fields);
     }
+    // Cached fields not in spec_blob
     if !profile.address.is_empty() {
         set_field(&mut fields, "address", &profile.address);
     }
@@ -3900,49 +3908,6 @@ fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
         set_field(&mut fields, "port", &profile.port.to_string());
     }
     set_field(&mut fields, "core_type", &profile.core_type);
-    if let Some(v) = profile.leg("user_id") {
-        set_field(&mut fields, "user_id", &v);
-    }
-    if let Some(v) = profile.leg("security") {
-        set_field(&mut fields, "security", &v);
-    }
-    if let Some(v) = profile.leg("network") {
-        set_field(&mut fields, "network", &v);
-    }
-
-    // Flatten stream_settings into dotted keys
-    if let Some(ss) = profile.leg("stream_settings")
-        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&ss)
-    {
-        for (k, v) in obj {
-            let val = match &v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
-                _ => continue,
-            };
-            fields.push((k, val));
-        }
-    }
-
-    // Flatten protocol_settings
-    if let Some(ps) = profile.leg("protocol_settings")
-        && let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&ps)
-    {
-        for (k, v) in obj {
-            let val = match &v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
-                _ => continue,
-            };
-            // Skip duplicates already set explicitly
-            if !fields.iter().any(|(fk, _)| fk == &k) {
-                fields.push((k, val));
-            }
-        }
-    }
-
     fields
 }
 fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {

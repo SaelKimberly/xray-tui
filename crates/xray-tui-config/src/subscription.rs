@@ -2,7 +2,9 @@
 
 use std::mem::MaybeUninit;
 
-use crate::import_export::{ImportError, ProfileLegacy, ValidationSettings, ValidationSummary, parse_share_url};
+use crate::import_export::{
+    ImportError, ValidationSettings, ValidationSummary, parse_share_url,
+};
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 
@@ -429,11 +431,9 @@ pub fn parse_subscription_data(
     summary.security_warning_count = profiles
         .iter()
         .filter(|p| {
-            if let Some(ss) = p.leg("stream_settings")
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ss)
-            {
-                v.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
-                    || v.get("insecure").and_then(|s| s.as_str()) == Some("1")
+            if let Some(config) = crate::import_export::profile_config(p) {
+                let (_, s_settings) = config.to_settings();
+                s_settings.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
             } else {
                 false
             }

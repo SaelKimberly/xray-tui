@@ -5,7 +5,7 @@
 //! ss://<base64url_no_pad(method:password)>@<host>:<port>#<remarks>?plugin=...
 //! ```
 //!
-//! # Legacy QRCode Format (also accepted)
+//! # Legacy `QRCode` Format (also accepted)
 //! ```text
 //! ss://<base64(method:password@host:port)>
 //! ```
@@ -45,6 +45,7 @@
 //! - subconverter: `subparser.cpp` `explodeSS()`
 //! - go-shadowsocks2: `parseURL()` (plain format)
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use base64::Engine;
@@ -56,6 +57,9 @@ use super::common::SecurityConfig;
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::clash::{ClashProxy, ClashSS};
+use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::*;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +80,9 @@ pub struct SsConfig {
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
     pub security: SecurityConfig,
     pub remarks: Option<TinyText>,
+    pub plugin: Option<TinyText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_opts: Option<HashMap<String, String>>,
 }
 
 impl ProtoSpec for SsConfig {
@@ -124,6 +131,16 @@ impl ProtoSpec for SsConfig {
 
         let remarks = utils::decode_fragment(raw)?;
 
+        let query = utils::parse_query(raw.query);
+        let plugin = utils::query_get(&query, "plugin").map(TinyText::from);
+        let plugin_opts = utils::query_get(&query, "plugin_opts").map(|s| {
+            s.split(';')
+                .filter_map(|pair| {
+                    pair.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect::<HashMap<String, String>>()
+        });
+
         Ok(Self {
             sig_cache: std::sync::OnceLock::new(),
             cred_hash_cache: std::sync::OnceLock::new(),
@@ -133,6 +150,8 @@ impl ProtoSpec for SsConfig {
             port: parsed_port,
             security: SecurityConfig::default(),
             remarks,
+            plugin,
+            plugin_opts,
         })
     }
 
@@ -145,12 +164,29 @@ impl ProtoSpec for SsConfig {
         } else {
             format!("{host}:{}", self.port)
         };
+        let mut query_parts: Vec<String> = Vec::new();
+        if let Some(plugin) = &self.plugin {
+            query_parts.push(format!("plugin={}", urlencoding::encode(plugin)));
+        }
+        if let Some(opts) = &self.plugin_opts {
+            let encoded_opts = opts
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            query_parts.push(format!("plugin_opts={}", urlencoding::encode(&encoded_opts)));
+        }
+        let query_string = if query_parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query_parts.join("&"))
+        };
         let fragment = self
             .remarks
             .as_ref()
             .map(|f| format!("#{}", urlencoding::encode(f)))
             .unwrap_or_default();
-        Ok(format!("ss://{encoded}@{hostport}{fragment}"))
+        Ok(format!("ss://{encoded}@{hostport}{query_string}{fragment}"))
     }
 
     fn schema(&self) -> SchemeX {
@@ -170,13 +206,28 @@ impl ProtoSpec for SsConfig {
     }
     fn cred_hash(&self) -> u64 {
         let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
+            let mut val = utils::compute_cred_hash(
                 Some(&self.host),
                 Some(self.port),
                 None,
                 &self.method,
                 &self.password,
             );
+            // Include plugin and plugin_opts in credential hash
+            if let Some(plugin) = &self.plugin {
+                use rapidhash::v3::RapidStreamHasherV3;
+                let mut h = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
+                h.write(plugin.as_bytes());
+                if let Some(opts) = &self.plugin_opts {
+                    for (k, v) in opts {
+                        h.write(k.as_bytes());
+                        h.write(b"=");
+                        h.write(v.as_bytes());
+                        h.write(b";");
+                    }
+                }
+                val ^= h.finish();
+            }
             NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
         });
         v.get()
@@ -191,6 +242,55 @@ impl ProtoSpec for SsConfig {
     fn transport_type(&self) -> Option<&str> {
         None
     }
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Shadowsocks(c) => {
+                Ok(Self {
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                    method: TinyText::from(c.cipher.as_str()),
+                    password: c.password.clone(),
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    security: SecurityConfig::default(),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                    plugin: c.plugin.clone().map(TinyText::from),
+                    plugin_opts: c.plugin_opts.as_ref().map(|opts_str| {
+                        opts_str.split(';')
+                            .filter_map(|pair| {
+                                pair.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                            })
+                            .collect::<HashMap<String, String>>()
+                    }),
+                })
+            }
+            _ => Err(ParseError::Unknown("expected shadowsocks clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        Ok(ClashProxy::Shadowsocks(ClashSS {
+            name,
+            server: host_spec_to_string(&self.host),
+            port: self.port,
+            cipher: self.method.to_string(),
+            password: self.password.clone(),
+            udp: None,
+            udp_over_tcp: None,
+            plugin: self.plugin.as_ref().map(|s| s.to_string()),
+            plugin_opts: self.plugin_opts.as_ref().map(|opts| {
+                opts.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            }),
+        }))
+    }
+
 }
 
 impl SsConfig {
@@ -199,9 +299,22 @@ impl SsConfig {
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"ss");
         hasher.write(self.method.as_bytes());
+        if let Some(plugin) = &self.plugin {
+            hasher.write(plugin.as_bytes());
+        }
+        if let Some(opts) = &self.plugin_opts {
+            for (k, v) in opts {
+                hasher.write(k.as_bytes());
+                hasher.write(b"=");
+                hasher.write(v.as_bytes());
+                hasher.write(b";");
+            }
+        }
         hasher.finish()
     }
 }
+use crate::urlx::PortSpec;
+
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
@@ -252,12 +365,21 @@ mod tests {
     }
 
     #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<SsConfig>("ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080");
+    }
+
+    #[test]
     fn ss_reconstruct_with_remarks() {
         let url = "ss://Y2xlb2Y6cGFzc3dvcmQ@example.com:443#my-server";
         let raw = crate::urlx::RawUrlX::from(url);
         let config = SsConfig::try_parse(&raw).unwrap();
         assert_eq!(config.remarks.as_deref(), Some("my-server"));
         let rebuilt = config.reconstruct().unwrap();
-        assert!(rebuilt.contains("#my-server"), "reconstruct should preserve fragment: {rebuilt}");
+        assert!(
+            rebuilt.contains("#my-server"),
+            "reconstruct should preserve fragment: {rebuilt}"
+        );
     }
 }

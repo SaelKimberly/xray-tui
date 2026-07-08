@@ -1,4 +1,4 @@
-//! WireGuard (`wireguard://`) URL parsing.
+//! `WireGuard` (`wireguard://`) URL parsing.
 //!
 //! # Format
 //! ```text
@@ -24,7 +24,7 @@
 //! - `reserved` accepts both comma-separated decimals and base64-encoded bytes
 //! - All query values are percent-decoded
 //! - Default MTU: 1420 (Xray-core)
-//! - Default port: 2408 (v2rayN parser), 51820 (WireGuard native)
+//! - Default port: 2408 (v2rayN parser), 51820 (`WireGuard` native)
 //!
 //! # References
 //! - v2rayN: `WireguardFmt.cs`
@@ -42,6 +42,9 @@ use super::common::SecurityConfig;
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::clash::{ClashProxy, ClashWireGuard};
+use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::*;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,11 +68,17 @@ pub struct WireguardConfig {
     pub preshared_key: Option<String>,
     pub reserved: Option<TinyText>,
     pub mtu: Option<TinyText>,
+    /// Persistent keepalive interval in seconds (from Clash format)
+    pub persistent_keepalive: Option<u32>,
+    /// DNS servers (from Clash format)
+    pub dns: Option<Vec<String>>,
+    /// Force remote DNS resolution (from Clash format)
+    pub remote_dns_resolve: Option<bool>,
     pub remarks: Option<TinyText>,
 }
 
 impl ProtoSpec for WireguardConfig {
-    /// Parse a WireGuard URL.
+    /// Parse a `WireGuard` URL.
     ///
     /// Private key is percent-encoded in userinfo (may contain `+`, `/`, `=`).
     /// `address` and `publickey`/`public_key` are required; `presharedkey`/`psk`
@@ -110,6 +119,26 @@ impl ProtoSpec for WireguardConfig {
         // mtu: interface MTU (defaults vary: 1420 Xray, 1280 WireGuard-go)
         let mtu = utils::query_get(&query, "mtu").map(TinyText::from);
 
+        // persistent_keepalive/keepalive: optional keepalive interval
+        let persistent_keepalive = utils::query_get_multi(&query, &["persistent_keepalive", "keepalive"])
+            .and_then(|s| s.parse::<u32>().ok());
+
+        // dns: comma-separated DNS servers
+        let dns = utils::query_get(&query, "dns").map(|s| {
+            s.split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<String>>()
+        }).filter(|v| !v.is_empty());
+
+        // remote_dns_resolve/remote_dns: force remote DNS resolution
+        let remote_dns_resolve = utils::query_get_multi(&query, &["remote_dns_resolve", "remote_dns"])
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            });
+
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
@@ -124,6 +153,9 @@ impl ProtoSpec for WireguardConfig {
             preshared_key,
             reserved,
             mtu,
+            persistent_keepalive,
+            dns,
+            remote_dns_resolve,
             remarks,
         })
     }
@@ -142,16 +174,25 @@ impl ProtoSpec for WireguardConfig {
             "publickey={}",
             urlencoding::encode(&self.public_key)
         ));
-        if let Some(ref v) = self.preshared_key
+        if let Some(v) = &self.preshared_key
             && !v.is_empty()
         {
             parts.push(format!("presharedkey={}", urlencoding::encode(v)));
         }
-        if let Some(ref v) = self.reserved {
+        if let Some(v) = &self.reserved {
             parts.push(format!("reserved={}", urlencoding::encode(v)));
         }
-        if let Some(ref v) = self.mtu {
+        if let Some(v) = &self.mtu {
             parts.push(format!("mtu={}", urlencoding::encode(v)));
+        }
+        if let Some(v) = &self.persistent_keepalive {
+            parts.push(format!("persistent_keepalive={}", v));
+        }
+        if let Some(v) = &self.dns {
+            parts.push(format!("dns={}", urlencoding::encode(&v.join(","))));
+        }
+        if let Some(v) = &self.remote_dns_resolve {
+            parts.push(format!("remote_dns_resolve={}", v));
         }
 
         let query_string = if parts.is_empty() {
@@ -211,8 +252,63 @@ impl ProtoSpec for WireguardConfig {
     fn transport_type(&self) -> Option<&str> {
         None
     }
-}
 
+
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Wireguard(c) => {
+                // ClashWireGuard.ip may not have CIDR suffix; add /32 if missing
+                let address = c.ip.as_deref().map(|ip| {
+                    if ip.contains('/') {
+                        TinyText::from(ip)
+                    } else {
+                        TinyText::from(format!("{}/32", ip))
+                    }
+                }).unwrap_or_default();
+
+                Ok(Self {
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                    private_key: c.private_key.clone(),
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    security: SecurityConfig::default(),
+                    address,
+                    public_key: c.public_key.clone(),
+                    preshared_key: c.pre_shared_key.clone(),
+                    reserved: c.reserved.clone().map(TinyText::from),
+                    mtu: c.mtu.map(|v| TinyText::from(v.to_string())),
+                    persistent_keepalive: c.persistent_keepalive,
+                    dns: c.dns.clone(),
+                    remote_dns_resolve: None,
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected wireguard clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        Ok(ClashProxy::Wireguard(ClashWireGuard {
+            name,
+            server: host_spec_to_string(&self.host),
+            port: self.port,
+            private_key: self.private_key.clone(),
+            public_key: self.public_key.clone(),
+            ip: Some(self.address.split('/').next().unwrap_or(&self.address).to_string()),
+            ipv6: None,
+            pre_shared_key: self.preshared_key.clone(),
+            reserved: self.reserved.as_ref().map(|s| s.to_string()),
+            mtu: self.mtu.as_ref().and_then(|v| v.parse::<u32>().ok()),
+            dns: self.dns.clone(),
+            persistent_keepalive: self.persistent_keepalive,
+        }))
+    }
+}
 impl WireguardConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
@@ -220,18 +316,31 @@ impl WireguardConfig {
         hasher.write(b"wireguard");
         hasher.write(self.address.as_bytes());
         hasher.write(self.public_key.as_bytes());
-        if let Some(ref v) = self.preshared_key {
+        if let Some(v) = &self.preshared_key {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.reserved {
+        if let Some(v) = &self.reserved {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.mtu {
+        if let Some(v) = &self.mtu {
             hasher.write(v.as_bytes());
+        }
+        if let Some(v) = &self.persistent_keepalive {
+            hasher.write(&v.to_le_bytes());
+        }
+        if let Some(v) = &self.dns {
+            for svr in v {
+                hasher.write(svr.as_bytes());
+            }
+        }
+        if let Some(v) = &self.remote_dns_resolve {
+            hasher.write(&[*v as u8]);
         }
         hasher.finish()
     }
 }
+
+use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {
@@ -336,8 +445,51 @@ mod tests {
     use super::WireguardConfig;
 
     #[test]
+    fn test_wireguard_full() {
+        // Full WireGuard with all new fields in query params
+        let url = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&persistent_keepalive=25&dns=1.1.1.1%2C8.8.8.8&remote_dns_resolve=true&presharedkey=psk123&mtu=1280";
+        let raw = crate::urlx::RawUrlX::from(url);
+        let config = WireguardConfig::try_parse(&raw).expect("failed");
+        assert_eq!(config.schema(), SchemeX::WireGuard);
+        assert_eq!(config.persistent_keepalive, Some(25));
+        assert_eq!(
+            config.dns.as_deref(),
+            Some(&["1.1.1.1".to_string(), "8.8.8.8".to_string()][..])
+        );
+        assert_eq!(config.remote_dns_resolve, Some(true));
+        assert_eq!(config.mtu.as_deref(), Some("1280"));
+        assert_eq!(config.preshared_key.as_deref(), Some("psk123"));
+
+        // Roundtrip: reconstruct and re-parse
+        let reconstructed = config.reconstruct().expect("reconstruct");
+        let raw2 = crate::urlx::RawUrlX::from(reconstructed.as_str());
+        let reparsed = WireguardConfig::try_parse(&raw2).expect("re-parse");
+        assert_eq!(config.persistent_keepalive, reparsed.persistent_keepalive);
+        assert_eq!(config.dns, reparsed.dns);
+        assert_eq!(config.remote_dns_resolve, reparsed.remote_dns_resolve);
+        assert_eq!(config.mtu, reparsed.mtu);
+        assert_eq!(config.host, reparsed.host);
+        assert_eq!(config.port, reparsed.port);
+
+        // Test alternative query key names
+        let url2 = "wireguard://key@1.2.3.4:51820?address=10.0.0.1%2F32&publickey=pubkey&keepalive=30&remote_dns=false";
+        let raw2 = crate::urlx::RawUrlX::from(url2);
+        let config2 = WireguardConfig::try_parse(&raw2).expect("failed");
+        assert_eq!(config2.persistent_keepalive, Some(30));
+        assert_eq!(config2.remote_dns_resolve, Some(false));
+    }
+
+    #[test]
     fn test_roundtrip() {
         check_roundtrip::<WireguardConfig>(
+            "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280#%40V2rayBaaz",
+        );
+    }
+
+    #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<WireguardConfig>(
             "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280#%40V2rayBaaz",
         );
     }

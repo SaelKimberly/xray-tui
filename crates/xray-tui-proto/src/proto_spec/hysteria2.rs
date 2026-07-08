@@ -22,14 +22,14 @@
 //!
 //! | Key            | Values                    | Purpose                          | Default   |
 //! |----------------|---------------------------|----------------------------------|-----------|
-//! | `security`     | tls                       | TLS mode (always QUIC-TLS)       | `"tls"`   |
 //! | `obfs`         | salamander                | Obfuscation type                 | —         |
 //! | `obfs-password`| string (min 4 bytes)      | Obfuscation pre-shared key       | —         |
 //! | `insecure`     | 1/0, true/false           | Skip TLS verification            | `false`   |
 //! | `sni`          | domain                    | TLS SNI override                 | hostname  |
-//! | `pinSHA256`    | hex hash                  | Certificate pinning (SHA-256)    | —         |
 //! | `up`           | bandwidth string          | Upload speed limit               | —         |
 //! | `down`         | bandwidth string          | Download speed limit             | —         |
+//! | `mportHopInt`  | integer (seconds)         | Port hopping interval            | —         |
+//! | `pinSHA256`    | SHA-256 base64 string     | Certificate SHA-256 pin          | —         |
 //!
 //! # Port Hopping
 //! Port supports special syntax from Hysteria's URL parser fork:
@@ -60,6 +60,9 @@ use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::proto_spec::common::*;
+use crate::clash::{ClashProxy, ClashHysteria2};
+use crate::proto_spec::ProtoSpecError;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +85,8 @@ pub struct Hysteria2Config {
     pub obfs_password: Option<TinyText>,
     pub up: Option<TinyText>,
     pub down: Option<TinyText>,
+    pub hop_interval: Option<u32>,
+    pub pin_sha256: Option<TinyText>,
     pub remarks: Option<TinyText>,
 }
 
@@ -114,6 +119,7 @@ impl ProtoSpec for Hysteria2Config {
         let up = utils::query_get(&query, "up").map(TinyText::from);
         let security = SecurityConfig {
             tls: Some(TlsConfig::Tls(TlsOpts {
+                pin_sha256: None,
                 sni: utils::query_get(&query, "sni").map(TinyText::from),
                 alpn: None,
                 fp: None,
@@ -126,6 +132,12 @@ impl ProtoSpec for Hysteria2Config {
             enc: None,
         };
         let down = utils::query_get(&query, "down").map(TinyText::from);
+        // hop_interval: port hopping interval in seconds (keys: mportHopInt, hop_interval)
+        let hop_interval = utils::query_get_multi(&query, &["mportHopInt", "hop_interval"])
+            .and_then(|v| v.parse().ok());
+        // pin_sha256: certificate SHA-256 pin (keys: pinSHA256, pin_sha256)
+        let pin_sha256 = utils::query_get_multi(&query, &["pinSHA256", "pin_sha256"])
+            .map(TinyText::from);
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
@@ -139,6 +151,8 @@ impl ProtoSpec for Hysteria2Config {
             obfs_password,
             up,
             down,
+            hop_interval,
+            pin_sha256,
             remarks,
         })
     }
@@ -175,6 +189,12 @@ impl ProtoSpec for Hysteria2Config {
             }
             if let Some(ref v) = self.down {
                 parts.push(format!("down={}", urlencoding::encode(v)));
+            }
+            if let Some(v) = &self.hop_interval {
+                parts.push(format!("mportHopInt={v}"));
+            }
+            if let Some(v) = &self.pin_sha256 {
+                parts.push(format!("pinSHA256={}", urlencoding::encode(v)));
             }
             if parts.is_empty() {
                 String::new()
@@ -232,12 +252,60 @@ impl ProtoSpec for Hysteria2Config {
     impl_sig_cache!();
 
     fn transport_type(&self) -> Option<&str> {
-        None
+        Some("quic")
     }
 
     fn security(&self) -> Option<&SecurityConfig> {
         Some(&self.security)
     }
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Hysteria2(c) => {
+                let port = PortSpec::new_with(c.port);
+                Ok(Self {
+                    auth: c.password.clone(),
+                    host: clash_server_to_host(&c.server)?,
+                    port,
+                    hop_interval: c.hop_interval,
+                    up: c.up.clone().map(|v| TinyText::from(v.to_string())),
+                    down: c.down.clone().map(|v| TinyText::from(v.to_string())),
+                    obfs: c.obfs.clone().map(TinyText::from),
+                    obfs_password: c.obfs_password.clone().map(TinyText::from),
+                    security: clash_tls_to_security(Some(true), c.servername.as_deref(), c.skip_cert_verify, c.alpn.as_deref().and_then(|v| v.first().map(|s| s.as_str())), None, None),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                    pin_sha256: None,
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                })
+            }
+            _ => Err(ParseError::Unknown("expected hysteria2 clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let first_port = port_spec_first(&self.port);
+        let alpn_str = self.security.alpn();
+        Ok(ClashProxy::Hysteria2(ClashHysteria2 {
+            name,
+            server: host_spec_to_string(&self.host),
+            port: first_port,
+            password: self.auth.clone(),
+            ports: None,
+            hop_interval: self.hop_interval,
+            up: self.up.as_ref().and_then(|v| v.parse().ok()),
+            down: self.down.as_ref().and_then(|v| v.parse().ok()),
+            obfs: self.obfs.as_ref().map(|s| s.to_string()),
+            obfs_password: self.obfs_password.as_ref().map(|s| s.to_string()),
+            skip_cert_verify: self.security.insecure(),
+            servername: self.security.sni().map(|s| s.to_string()),
+            alpn: alpn_str.map(|s| vec![s.to_string()]),
+        }))
+    }
+
 }
 
 impl Hysteria2Config {
@@ -265,9 +333,17 @@ impl Hysteria2Config {
         if let Some(ref v) = self.down {
             hasher.write(v.as_bytes());
         }
+        if let Some(v) = &self.hop_interval {
+            hasher.write(v.to_string().as_bytes());
+        }
+        if let Some(v) = &self.pin_sha256 {
+            hasher.write(v.as_bytes());
+        }
         hasher.finish()
     }
 }
+
+use crate::proto_spec::common::*;
 
 #[cfg(test)]
 mod tests {
@@ -320,12 +396,42 @@ mod tests {
         assert_eq!(parsed.auth, deserialized.auth);
     }
 
+    #[test]
+    fn test_hysteria2_full() {
+        let url = "hysteria2://b4bd0613-ff7c-4f2f-954d-185915e6ddad@206.71.158.41:35000?security=tls&obfs=salamander&obfs-password=password123&insecure=1&sni=jnir.pichondan.com&up=50mbps&down=100mbps&mportHopInt=10&pinSHA256=abc123deadbeef";
+        let raw = crate::urlx::RawUrlX::from(url);
+        let config = Hysteria2Config::try_parse(&raw).expect("failed to parse full config");
+        assert_eq!(config.schema(), SchemeX::Hysteria2);
+        assert_eq!(config.obfs.as_deref(), Some("salamander"));
+        assert_eq!(config.obfs_password.as_deref(), Some("password123"));
+        assert_eq!(config.security.insecure(), Some(true));
+        assert_eq!(config.security.sni(), Some("jnir.pichondan.com"));
+        assert_eq!(config.up.as_deref(), Some("50mbps"));
+        assert_eq!(config.down.as_deref(), Some("100mbps"));
+        assert_eq!(config.hop_interval, Some(10));
+        assert_eq!(config.pin_sha256.as_deref(), Some("abc123deadbeef"));
+
+        // Roundtrip: reconstruct and re-parse
+        let reconstructed = config.reconstruct().expect("reconstruct");
+        let raw2 = crate::urlx::RawUrlX::from(reconstructed.as_str());
+        let reparsed = Hysteria2Config::try_parse(&raw2).expect("re-parse");
+        assert_eq!(reparsed.hop_interval, Some(10));
+        assert_eq!(reparsed.pin_sha256.as_deref(), Some("abc123deadbeef"));
+    }
     use super::super::test_helpers::check_roundtrip;
     use super::Hysteria2Config;
 
     #[test]
     fn test_roundtrip() {
         check_roundtrip::<Hysteria2Config>(
+            "hysteria2://b4bd0613-ff7c-4f2f-954d-185915e6ddad@206.71.158.41:35000?security=tls&obfs=salamander&obfs-password=password123&insecure=1&sni=jnir.pichondan.com",
+        );
+    }
+
+    #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<Hysteria2Config>(
             "hysteria2://b4bd0613-ff7c-4f2f-954d-185915e6ddad@206.71.158.41:35000?security=tls&obfs=salamander&obfs-password=password123&insecure=1&sni=jnir.pichondan.com",
         );
     }

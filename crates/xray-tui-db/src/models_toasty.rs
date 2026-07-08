@@ -2,16 +2,16 @@ use toasty::Deferred;
 
 // ── Primary models (toasty ORM, mapped to DB tables) ────────────────────
 
-/// Profile with uid-based PK. uid = sig ^ cred_hash (computed by ProtoSpec).
+/// Profile with uid-based PK. uid = sig ^ `cred_hash` (computed by `ProtoSpec`).
 #[derive(Debug, Clone, toasty::Model)]
 pub struct Profile {
     #[key]
-    pub id: i64,                   // = uid = sig ^ cred_hash
+    pub id: i64, // = uid = sig ^ cred_hash
 
-    pub sig: i64,                  // cached from ProtoSpec::sig()
-    pub cred_hash: i64,            // cached from ProtoSpec::cred_hash()
-    pub proto_kind: String,        // "vmess", "vless", "trojan", etc.
-    pub spec_blob: Vec<u8>,        // postcard-encoded ProtocolConfig variant
+    pub sig: i64,           // cached from ProtoSpec::sig()
+    pub cred_hash: i64,     // cached from ProtoSpec::cred_hash()
+    pub proto_kind: String, // "vmess", "vless", "trojan", etc.
+    pub spec_blob: Vec<u8>, // JSON-encoded ProtocolConfig variant (or legacy JSON blob)
 
     pub config_type: i32,          // kept for core routing
     pub core_type: String,         // "auto", "xray", "sing-box"
@@ -30,17 +30,17 @@ pub struct Profile {
 }
 
 /// Many-to-many connection between profiles and groups.
-/// Replaces the old Profile.group_id field.
+/// Replaces the old `Profile.group_id` field.
 #[derive(Debug, Clone, toasty::Model)]
 #[unique(profile_id, group_id)]
 pub struct Connection {
     #[key]
-    pub id: String,                 // UUID — toasty requires PK
-    pub profile_id: i64,            // -> profiles.id
-    pub group_id: String,           // -> groups.id
+    pub id: String, // UUID — toasty requires PK
+    pub profile_id: i64,  // -> profiles.id
+    pub group_id: String, // -> groups.id
 
     pub remarks: Option<String>,
-    pub seen_at: Option<String>,    // subscription last-seen timestamp
+    pub seen_at: Option<String>, // subscription last-seen timestamp
     pub is_sub: Option<i32>,
     pub sort_order: Option<i32>,
     pub is_active: Option<i32>,

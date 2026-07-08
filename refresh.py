@@ -51,7 +51,8 @@ class Config:
 REPOS: list[Config] = [
     # five mainstream repos
     Config("https://github.com/SagerNet/sing-box.git", "sing-box", "stable"),
-    Config("https://github.com/v2ray/v2ray-core.git", "v2ray-core", "master"),
+    Config("https://github.com/v2fly/v2ray-core.git", "v2ray-core", "master"),
+    Config("https://github.com/v2ray/v2ray-core.git", "v2ray-core-legacy", "master"),
     Config("https://github.com/XTLS/Xray-core.git", "Xray-core", "main"),
     Config("https://github.com/yaling888/quirktiva.git", "quirktiva", "plus"),
     Config("https://github.com/MetaCubeX/mihomo.git", "mihomo", "Alpha"),

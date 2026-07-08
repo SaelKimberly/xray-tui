@@ -1,4 +1,4 @@
-//! ShadowsocksR (`ssr://`) URL parsing.
+//! `ShadowsocksR` (`ssr://`) URL parsing.
 //!
 //! # Format
 //! ```text
@@ -49,6 +49,9 @@ use super::common::SecurityConfig;
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::proto_spec::common::*;
+use crate::clash::{ClashProxy, ClashSSR};
+use crate::proto_spec::ProtoSpecError;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,11 +120,7 @@ impl ProtoSpec for SsrConfig {
             base64::prelude::BASE64_URL_SAFE_NO_PAD
                 .decode(r.trim_end_matches('='))
                 .ok()
-                .and_then(|d| {
-                    String::from_utf8(d.clone())
-                        .ok()
-                        .map(TinyText::from)
-                })
+                .and_then(|d| String::from_utf8(d).ok().map(TinyText::from))
                 .unwrap_or_else(|| TinyText::from(r.as_str()))
         });
 
@@ -224,7 +223,56 @@ impl ProtoSpec for SsrConfig {
     fn transport_type(&self) -> Option<&str> {
         None
     }
+
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::ShadowsocksR(c) => {
+                let mut params = std::collections::HashMap::new();
+                params.insert("protocol".into(), c.protocol.clone());
+                params.insert("obfs".into(), c.obfs.clone());
+                if let Some(pp) = &c.protocol_param {
+                    params.insert("protocol_param".into(), pp.clone());
+                }
+                if let Some(op) = &c.obfs_param {
+                    params.insert("obfs_param".into(), op.clone());
+                }
+                Ok(Self {
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    security: SecurityConfig::default(),
+                    protocol: TinyText::from(c.protocol.as_str()),
+                    method: TinyText::from(c.cipher.as_str()),
+                    obfs: TinyText::from(c.obfs.as_str()),
+                    password: c.password.clone(),
+                    params,
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                })
+            }
+            _ => Err(ParseError::Unknown("expected ssr clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        Ok(ClashProxy::ShadowsocksR(ClashSSR {
+            name,
+            server: host_spec_to_string(&self.host),
+            port: self.port,
+            cipher: self.method.to_string(),
+            password: self.password.clone(),
+            protocol: self.protocol.to_string(),
+            obfs: self.obfs.to_string(),
+            protocol_param: self.params.get("protocol_param").cloned(),
+            obfs_param: self.params.get("obfs_param").cloned(),
+        }))
+    }
 }
+
 
 /// Strip trailing non-base64 garbage (Telegram annotation text and decorative
 /// hyphens) from the SSR userinfo before base64 decoding.
@@ -288,6 +336,8 @@ impl SsrConfig {
         hasher.finish()
     }
 }
+
+use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {
@@ -375,4 +425,6 @@ mod tests {
     fn test_roundtrip() {
         check_roundtrip::<SsrConfig>(SSR_URL);
     }
+
+
 }

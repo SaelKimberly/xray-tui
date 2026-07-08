@@ -1,7 +1,6 @@
 use xray_tui_core::grpc_client::format_bytes;
 use xray_tui_core::protocol::Protocol;
 
-use xray_tui_config::import_export::ProfileLegacy;
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
 use ratatui::Frame;
@@ -10,6 +9,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
+use xray_tui_config::import_export::profile_config;
+use xray_tui_proto::proto_spec::ProtoSpec;
 
 #[allow(clippy::missing_const_for_fn)]
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
@@ -55,7 +56,9 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
         },
         |r| {
             let proto = Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
-            let remarks = r.profile.leg("remarks").unwrap_or_default();
+            let remarks = profile_config(&r.profile)
+                .and_then(|c| c.remarks().map(String::from))
+                .unwrap_or_default();
             let addr = r.profile.address.clone();
             let port = r.profile.port as u16;
             let core = state.resolved_core(r).to_string();

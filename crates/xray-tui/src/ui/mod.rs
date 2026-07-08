@@ -187,26 +187,24 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // confirmation is handled even when inside a sub-mode like ManageGroups.
     if state.confirmation.is_some() {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
-                match state.confirmation.take() {
-                    Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(id).await,
-                    Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
-                    Some(ConfirmAction::DeleteProfiles(ids)) => {
-                        for id in &ids {
-                            state.delete_profile(*id).await;
-                        }
-                        state.multi_select.clear();
+            KeyCode::Char('y') | KeyCode::Enter => match state.confirmation.take() {
+                Some(ConfirmAction::DeleteProfile(id)) => state.delete_profile(id).await,
+                Some(ConfirmAction::DeleteGroup(id)) => state.delete_group(&id).await,
+                Some(ConfirmAction::DeleteProfiles(ids)) => {
+                    for id in &ids {
+                        state.delete_profile(*id).await;
                     }
-                    Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
-                    Some(ConfirmAction::Quit) => {
-                        state.disconnect();
-                        state.should_quit = true;
-                    }
-                    Some(ConfirmAction::ClearLogs) => state.clear_logs(),
-                    Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
-                    None => {}
+                    state.multi_select.clear();
                 }
-            }
+                Some(ConfirmAction::ClearGroup(id)) => state.clear_group(&id).await,
+                Some(ConfirmAction::Quit) => {
+                    state.disconnect();
+                    state.should_quit = true;
+                }
+                Some(ConfirmAction::ClearLogs) => state.clear_logs(),
+                Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
+                None => {}
+            },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
                 state.confirmation = None;
             }
@@ -543,10 +541,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            let ids: Vec<i64> = state
-                .filtered_profiles()
-                .map(|r| r.profile.id)
-                .collect();
+            let ids: Vec<i64> = state.filtered_profiles().map(|r| r.profile.id).collect();
             for id in ids {
                 state.multi_select.insert(id);
             }
@@ -624,7 +619,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
-                let ids: Vec<i64> = state.multi_select.iter().cloned().collect();
+                let ids: Vec<i64> = state.multi_select.iter().copied().collect();
                 state.confirmation = Some(ConfirmAction::DeleteProfiles(ids));
             } else if let Some(id) = state.selected_profile_id() {
                 state.confirmation = Some(ConfirmAction::DeleteProfile(id));

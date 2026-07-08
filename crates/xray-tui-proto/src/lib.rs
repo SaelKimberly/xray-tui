@@ -1,9 +1,9 @@
+pub mod clash;
 pub mod proto_spec;
 pub mod urlx;
-pub(crate) mod utils;
-
-pub use urlx::SchemeX;
+pub mod utils;
 pub(crate) use urlx::PortSpec;
+pub use urlx::SchemeX;
 
 macro_rules! nom_bail {
     ($input: expr, $code: ident) => {{

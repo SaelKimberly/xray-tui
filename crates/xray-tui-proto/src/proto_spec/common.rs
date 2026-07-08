@@ -1,9 +1,12 @@
 use crate::proto_spec::ParseError;
+use crate::clash::{
+    ClashGrpcOpts, ClashH2Opts, ClashHttpOpts, ClashKcpOpts, ClashRealityOpts, ClashWSOpts,
+};
 use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
 
-use crate::urlx::{HostSpec, TinyText};
+use crate::urlx::{HostSpec, PortSpec, TinyText};
 
 // ========================================
 // Transport Configurations
@@ -71,7 +74,7 @@ impl TransportConfig {
 
     /// # Errors
     ///
-    /// Return ParseError, if protocol_type is invalid and could not be recovered.
+    /// Return `ParseError`, if `protocol_type` is invalid and could not be recovered.
     pub fn from_type_and_path(
         protocol_type: Option<&str>,
         path: Option<&str>,
@@ -159,6 +162,8 @@ pub struct WebSocketConfig {
     pub headers: Option<std::collections::HashMap<String, String>>,
     pub max_early_data: Option<u32>,
     pub early_data_header_name: Option<TinyText>,
+    pub v2ray_http_upgrade: Option<bool>,
+    pub v2ray_http_upgrade_fast_open: Option<bool>,
 }
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -167,6 +172,9 @@ pub struct GrpcConfig {
     pub path: Option<TinyText>,
     pub authority: Option<TinyText>,
     pub service_name: Option<TinyText>,
+    pub mode: Option<TinyText>,
+    pub user_agent: Option<TinyText>,
+    pub ping_interval: Option<u32>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -177,6 +185,8 @@ pub struct HttpConfig {
     pub host: Option<TinyText>,
     pub method: Option<TinyText>,
     pub headers: Option<std::collections::HashMap<String, String>>,
+    pub idle_timeout: Option<u32>,
+    pub ping_timeout: Option<u32>,
 }
 /// `HTTPUpgrade` transport config (fake WebSocket upgrade).
 ///
@@ -224,6 +234,15 @@ pub struct KcpConfig {
     pub read_buffer: Option<u32>,
     pub write_buffer: Option<u32>,
     pub seed: Option<TinyText>,
+    pub header_type: Option<TinyText>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct QuicOpts {
+    pub security: Option<TinyText>,
+    pub key: Option<TinyText>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -309,10 +328,10 @@ impl SecurityConfig {
     #[must_use]
     pub fn sid(&self) -> Option<&str> {
         if let Some(TlsConfig::Reality(RealityOpts {
-            sni: Some(ref sni), ..
+            sid: Some(ref sid), ..
         })) = self.tls
         {
-            Some(sni.as_str())
+            Some(sid.as_str())
         } else {
             None
         }
@@ -348,6 +367,15 @@ pub struct TlsOpts {
     pub alpn: Option<TinyText>,
     pub fp: Option<TinyText>,
     pub insecure: Option<bool>,
+    #[cfg(feature = "experimental")]
+    pub pqv: Option<TinyText>,
+    #[cfg(feature = "experimental")]
+    pub ech: Option<TinyText>,
+    #[cfg(feature = "experimental")]
+    pub vcn: Option<bool>,
+    #[cfg(feature = "experimental")]
+    pub pcs: Option<TinyText>,
+    pub pin_sha256: Option<TinyText>,
 }
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -358,6 +386,234 @@ pub struct RealityOpts {
     pub pbk: Option<String>,
     pub sid: Option<TinyText>,
     pub spx: Option<TinyText>,
+}
+
+/// Convert Clash TLS fields to a SecurityConfig.
+pub(crate) fn clash_tls_to_security(
+    tls: Option<bool>,
+    servername: Option<&str>,
+    skip_cert_verify: Option<bool>,
+    alpn: Option<&str>,
+    fingerprint: Option<&str>,
+    reality_opts: Option<&ClashRealityOpts>,
+) -> SecurityConfig {
+    if tls.is_none() || tls == Some(false) {
+        return SecurityConfig::default();
+    }
+    if let Some(r) = reality_opts {
+        return SecurityConfig {
+            tls: Some(TlsConfig::Reality(RealityOpts {
+                sni: servername.map(TinyText::from),
+                pbk: r.public_key.clone(),
+                sid: r.short_id.clone().map(TinyText::from),
+                fp: fingerprint.map(TinyText::from),
+                ..RealityOpts::default()
+            })),
+            enc: None,
+        };
+    }
+    SecurityConfig {
+        tls: Some(TlsConfig::Tls(TlsOpts {
+            sni: servername.map(TinyText::from),
+            insecure: skip_cert_verify,
+            alpn: alpn.map(TinyText::from),
+            fp: fingerprint.map(TinyText::from),
+            ..TlsOpts::default()
+        })),
+        enc: None,
+    }
+}
+
+/// Convert a SecurityConfig back to Clash TLS fields.
+pub(crate) fn security_to_clash_tls(security: &SecurityConfig) -> (Option<bool>, Option<String>, Option<bool>, Option<String>, Option<String>) {
+    match &security.tls {
+        Some(TlsConfig::Tls(opts)) => (
+            Some(true),
+            opts.sni.as_ref().map(|s| s.to_string()),
+            opts.insecure,
+            opts.alpn.as_ref().map(|s| s.to_string()),
+            opts.fp.as_ref().map(|s| s.to_string()),
+        ),
+        Some(TlsConfig::Reality(opts)) => (
+            None,
+            opts.sni.as_ref().map(|s| s.to_string()),
+            None,
+            None,
+            opts.fp.as_ref().map(|s| s.to_string()),
+        ),
+        None => (None, None, None, None, None),
+    }
+}
+
+/// Convert a SecurityConfig to Clash reality_opts.
+pub(crate) fn security_to_clash_reality(security: &SecurityConfig) -> Option<ClashRealityOpts> {
+    match &security.tls {
+        Some(TlsConfig::Reality(opts)) => Some(ClashRealityOpts {
+            public_key: opts.pbk.clone(),
+            short_id: opts.sid.as_ref().map(|s| s.to_string()),
+            support_x25519mlkem768: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Clash server string to HostSpec.
+pub(crate) fn clash_server_to_host(server: &str) -> Result<HostSpec, ParseError> {
+    let (_, host) = crate::utils::host_port::host(server.as_bytes())
+        .map_err(|_| ParseError::InvalidHost(format!("invalid clash server: {server}").into()))?;
+    Ok(host.to_owned())
+}
+
+/// Convert Clash transport fields to a TransportConfig.
+pub(crate) fn clash_transport_to_transport(
+    network: Option<&str>,
+    ws_opts: &Option<ClashWSOpts>,
+    grpc_opts: &Option<ClashGrpcOpts>,
+    h2_opts: &Option<ClashH2Opts>,
+    http_opts: &Option<ClashHttpOpts>,
+    mkcp_opts: &Option<ClashKcpOpts>,
+    server: Option<&str>,
+) -> TransportConfig {
+    match network {
+        Some("ws" | "websocket") if ws_opts.is_some() => {
+            let w = ws_opts.as_ref().unwrap();
+            TransportConfig::Ws(WebSocketConfig {
+                path: w.path.clone().map(TinyText::from),
+                host: w.headers.as_ref().and_then(|h| h.get("Host").cloned()).map(TinyText::from),
+                headers: w.headers.clone(),
+                max_early_data: w.max_early_data,
+                early_data_header_name: w.early_data_header_name.clone().map(TinyText::from),
+                v2ray_http_upgrade: w.v2ray_http_upgrade,
+                v2ray_http_upgrade_fast_open: w.v2ray_http_upgrade_fast_open,
+            })
+        }
+        Some("grpc") => {
+            TransportConfig::Grpc(GrpcConfig {
+                path: grpc_opts.as_ref().and_then(|g| g.grpc_service_name.clone()).map(TinyText::from),
+                authority: None,
+                service_name: grpc_opts.as_ref().and_then(|g| g.grpc_service_name.clone()).map(TinyText::from),
+                mode: None,
+                user_agent: grpc_opts.as_ref().and_then(|g| g.grpc_user_agent.clone()).map(TinyText::from),
+                ping_interval: grpc_opts.as_ref().and_then(|g| g.ping_interval),
+            })
+        }
+        Some("h2" | "http") => {
+            let h = h2_opts.as_ref();
+            TransportConfig::Http(HttpConfig {
+                path: h.and_then(|h| h.path.clone()).map(TinyText::from),
+                host: h.and_then(|h| h.host.as_ref().and_then(|v| v.first()).map(|s| s.as_str())).or(server).map(|s| TinyText::from(s.to_string())),
+                method: None,
+                headers: None,
+                idle_timeout: None,
+                ping_timeout: None,
+            })
+        }
+        Some("kcp" | "mkcp") if mkcp_opts.is_some() => {
+            let k = mkcp_opts.as_ref().unwrap();
+            TransportConfig::Kcp(KcpConfig {
+                mtu: k.mtu,
+                tti: k.tti,
+                uplink_capacity: k.uplink_capacity,
+                downlink_capacity: k.downlink_capacity,
+                congestion: k.congestion,
+                read_buffer: k.read_buffer,
+                write_buffer: k.write_buffer,
+                seed: k.seed.clone().map(TinyText::from),
+                header_type: k.header.clone().map(TinyText::from),
+            })
+        }
+        _ => TransportConfig::Tcp,
+    }
+}
+
+/// Convert a TransportConfig back to Clash transport fields.
+pub(crate) fn transport_to_clash(
+    transport: &TransportConfig,
+    server: &str,
+) -> (Option<String>, Option<ClashWSOpts>, Option<ClashGrpcOpts>, Option<ClashH2Opts>, Option<ClashHttpOpts>, Option<ClashKcpOpts>) {
+    match transport {
+        TransportConfig::Ws(w) => (
+            Some("ws".to_string()),
+            Some(ClashWSOpts {
+                path: w.path.as_ref().map(|s| s.to_string()),
+                headers: w.headers.clone(),
+                max_early_data: w.max_early_data,
+                early_data_header_name: w.early_data_header_name.as_ref().map(|s| s.to_string()),
+                v2ray_http_upgrade: w.v2ray_http_upgrade,
+                v2ray_http_upgrade_fast_open: w.v2ray_http_upgrade_fast_open,
+            }),
+            None, None, None, None,
+        ),
+        TransportConfig::Grpc(g) => (
+            Some("grpc".to_string()),
+            None,
+            Some(ClashGrpcOpts {
+                grpc_service_name: g.service_name.as_ref().or(g.path.as_ref()).map(|s| s.to_string()),
+                grpc_user_agent: g.user_agent.as_ref().map(|s| s.to_string()),
+                ping_interval: g.ping_interval,
+                max_concurrent_streams: None,
+            }),
+            None, None, None,
+        ),
+        TransportConfig::Http(h) => (
+            Some("http".to_string()),
+            None, None,
+            Some(ClashH2Opts {
+                host: Some(vec![h.host.as_ref().map(|s| s.to_string()).unwrap_or_else(|| server.to_string())]),
+                path: h.path.as_ref().map(|s| s.to_string()),
+            }),
+            None, None,
+        ),
+        TransportConfig::Kcp(k) => (
+            Some("kcp".to_string()),
+            None, None, None, None,
+            Some(ClashKcpOpts {
+                mtu: k.mtu,
+                tti: k.tti,
+                uplink_capacity: k.uplink_capacity,
+                downlink_capacity: k.downlink_capacity,
+                congestion: k.congestion,
+                write_buffer: k.write_buffer,
+                read_buffer: k.read_buffer,
+                seed: k.seed.as_ref().map(|s| s.to_string()),
+                header: k.header_type.as_ref().map(|s| s.to_string()),
+            }),
+        ),
+        _ => (None, None, None, None, None, None),
+    }
+}
+
+/// Convert a Clash ALPN (Option<Vec<String>>) to Option<&str> for clash_tls_to_security.
+pub(crate) fn clash_alpn_as_str(alpn: &Option<Vec<String>>) -> Option<&str> {
+    alpn.as_ref().and_then(|v| v.first()).map(|s| s.as_str())
+}
+
+/// Convert a Clash server string to HostSpec.
+
+pub(crate) fn host_spec_to_string(h: &HostSpec) -> String {
+    match h {
+        HostSpec::IpAddress(ip) => match ip {
+            rustls::pki_types::IpAddr::V4(v4) => std::net::Ipv4Addr::from(*v4).to_string(),
+            rustls::pki_types::IpAddr::V6(v6) => std::net::Ipv6Addr::from(*v6).to_string(),
+        },
+        HostSpec::DnsName(dns) => dns.as_ref().to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Convert a u16 port to PortSpec (single-port).
+pub(crate) fn port_spec_from_u16(p: u16) -> PortSpec {
+    PortSpec::new_with(p)
+}
+
+/// Get the first port from PortSpec, or default.
+pub(crate) fn port_spec_first(p: &PortSpec) -> u16 {
+    p.iter().next().unwrap_or(443)
+}
+
+/// Convert Option<String> to Option<TinyText>.
+pub(crate) fn opt_string_to_tiny(s: Option<String>) -> Option<TinyText> {
+    s.map(TinyText::from)
 }
 
 #[cfg(test)]

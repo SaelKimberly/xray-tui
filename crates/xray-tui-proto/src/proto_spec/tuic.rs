@@ -12,7 +12,7 @@
 //!
 //! | Key                  | Values                       | Purpose                          | Default   |
 //! |----------------------|------------------------------|----------------------------------|-----------|
-//! | `congestion_control` | cubic, bbr, new_reno, bbr3  | QUIC congestion control          | `"bbr"`   |
+//! | `congestion_control` | cubic, bbr, `new_reno`, bbr3  | QUIC congestion control          | `"bbr"`   |
 //! | `udp_relay_mode`     | native, quic                 | UDP relay transport              | `"native"`|
 //! | `alpn`               | comma-separated (h3,h2)      | TLS ALPN negotiation             | `"h3"`    |
 //! | `sni`                | domain                       | TLS SNI override                 | hostname  |
@@ -35,12 +35,15 @@ use std::{fmt::Write, num::NonZeroU64};
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::proto_spec::common::*;
+use crate::clash::{ClashProxy, ClashTuic};
+use crate::proto_spec::ProtoSpecError;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +106,7 @@ impl ProtoSpec for TuicConfig {
         let udp_relay_mode = utils::query_get(&query, "udp_relay_mode").map(TinyText::from);
         let security = SecurityConfig {
             tls: Some(TlsConfig::Tls(TlsOpts {
+                pin_sha256: None,
                 sni: utils::query_get(&query, "sni").map(TinyText::from),
                 alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                 fp: None,
@@ -173,8 +177,7 @@ impl ProtoSpec for TuicConfig {
         base.push_str(&query_string);
 
         if let Some(ref remarks) = self.remarks {
-            let frag = urlencoding::decode(remarks)
-                .unwrap_or(std::borrow::Cow::Borrowed(remarks));
+            let frag = urlencoding::decode(remarks).unwrap_or(std::borrow::Cow::Borrowed(remarks));
             let frag = frag.trim();
             if !frag.is_empty() {
                 _ = write!(base, "#{}", urlencoding::encode(frag));
@@ -220,11 +223,70 @@ impl ProtoSpec for TuicConfig {
     impl_sig_cache!();
 
     fn transport_type(&self) -> Option<&str> {
-        None
+        Some("quic")
     }
 
     fn security(&self) -> Option<&SecurityConfig> {
         Some(&self.security)
+    }
+
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Tuic(c) => {
+                let (uuid, password) = match c.token.split_once(':') {
+                    Some((u, p)) if !u.is_empty() => (u.to_string(), p.to_string()),
+                    _ => (c.token.clone(), String::new()),
+                };
+                Ok(Self {
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                    uuid,
+                    password,
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    congestion_control: c.congestion_controller.clone().map(TinyText::from),
+                    udp_relay_mode: c.udp_relay_mode.clone().map(TinyText::from),
+                    security: clash_tls_to_security(
+                        Some(true),
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        clash_alpn_as_str(&c.alpn),
+                        None,
+                        None,
+                    ),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected tuic clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let alpn_str = self.security.alpn();
+        let token = if self.password.is_empty() {
+            self.uuid.clone()
+        } else {
+            format!("{}:{}", self.uuid, self.password)
+        };
+        Ok(ClashProxy::Tuic(ClashTuic {
+            name,
+            server: host_spec_to_string(&self.host),
+            port: self.port,
+            token,
+            ip: None,
+            heartbeat_interval: None,
+            reduce_rtt: None,
+            request_timeout: None,
+            udp_relay_mode: self.udp_relay_mode.as_ref().map(|s| s.to_string()),
+            congestion_controller: self.congestion_control.as_ref().map(|s| s.to_string()),
+            skip_cert_verify: self.security.insecure(),
+            servername: self.security.sni().map(|s| s.to_string()),
+            alpn: alpn_str.map(|s| vec![s.to_string()]),
+        }))
     }
 }
 
@@ -256,6 +318,7 @@ impl TuicConfig {
 mod tests {
     use super::super::{ProtoSpec, ProtocolConfig};
     use crate::urlx::SchemeX;
+use crate::urlx::PortSpec;
 
     #[test]
     fn test_tuic_basic() {
@@ -351,6 +414,14 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         check_roundtrip::<TuicConfig>(
+            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
+        );
+    }
+
+    #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<TuicConfig>(
             "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
         );
     }

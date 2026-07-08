@@ -15,7 +15,8 @@ use crate::ui::widgets::data_table::{
 };
 use crate::{AppState, ConfirmAction, ProfileRow};
 use ratatui_cheese::theme::Palette;
-use xray_tui_config::import_export::ProfileLegacy;
+use xray_tui_config::import_export::profile_config;
+use xray_tui_proto::proto_spec::ProtoSpec;
 
 // ── DataTable row wrapper ───────────────────────────────────────────────
 
@@ -225,13 +226,16 @@ fn render_data_grid(
             };
 
             let type_str = format!("{protocol:.12}");
-            let remarks = row.profile.leg("remarks").unwrap_or_default();
+            let remarks = profile_config(&row.profile)
+                .and_then(|c| c.remarks().map(String::from))
+                .unwrap_or_default();
             let remarks_str = truncate_pad(&remarks, 24);
             let group_str = row
                 .group_id
                 .as_ref()
                 .and_then(|gid| {
-                    state.groups
+                    state
+                        .groups
                         .iter()
                         .find(|g| g.id == *gid)
                         .and_then(|g| g.name.as_deref())
@@ -308,7 +312,10 @@ fn render_data_grid(
 
     // Populate multi_selected from state.multi_select
     for (i, row) in data_rows.iter().enumerate() {
-        if state.multi_select.contains(&row.id.parse::<i64>().unwrap_or(0)) {
+        if state
+            .multi_select
+            .contains(&row.id.parse::<i64>().unwrap_or(0))
+        {
             table_state.multi_selected.insert(i);
         }
     }
@@ -356,8 +363,14 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
     let line = if has_profile {
         let row = &state.profiles[state.selected_index];
         let core = state.resolved_core(row);
-        let remarks = row.profile.leg("remarks").unwrap_or_else(|| "-".to_string());
-        let addr = if row.profile.address.is_empty() { "-" } else { &row.profile.address };
+        let remarks = profile_config(&row.profile)
+            .and_then(|c| c.remarks().map(String::from))
+            .unwrap_or_else(|| "-".to_string());
+        let addr = if row.profile.address.is_empty() {
+            "-"
+        } else {
+            &row.profile.address
+        };
         let port = row.profile.port.to_string();
         Line::from(vec![
             Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
@@ -389,7 +402,7 @@ fn render_confirmation_overlays(
             let profile_name = rows
                 .iter()
                 .find(|r| r.profile.id == *delete_id)
-                .and_then(|r| r.profile.leg("remarks"))
+                .and_then(|r| profile_config(&r.profile).and_then(|c| c.remarks().map(String::from)))
                 .unwrap_or_default();
             render_confirmation_overlay(
                 frame,

@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_db::models::Profile;
+use xray_tui_proto::proto_spec::{PlaceholderConfig, ProtocolConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
@@ -98,6 +99,84 @@ fn scheme_primary_index(scheme: &str) -> Option<usize> {
         _ => None,
     }
 }
+
+/// Deserialize a Profile's `spec_blob` as a [`ProtocolConfig`].
+///
+/// Returns `None` if the blob is not valid [`ProtocolConfig`] JSON
+/// (e.g., still in the legacy JSON format before migration completes).
+#[must_use]
+pub fn profile_config(profile: &Profile) -> Option<ProtocolConfig> {
+    serde_json::from_slice(&profile.spec_blob).ok()
+}
+
+
+/// Serialize a `ProtocolConfig` into a JSON `Vec<u8>` for `spec_blob`.
+///
+/// Wraps the settings JSON blob in a [`PlaceholderConfig`] stub and
+/// JSON-encodes it. Used by form-creation code to produce the same
+/// JSON-encoded `spec_blob` format as `parse_share_url`.
+#[must_use]
+pub fn encode_profile_spec(proto_name: &str, settings_json: Vec<u8>) -> Vec<u8> {
+    let config = ProtocolConfig::from_legacy_parse(proto_name, settings_json);
+    serde_json::to_vec(&config).unwrap_or_default()
+}
+
+/// Parse protocol_settings and stream_settings from a Profile's `spec_blob`.
+///
+/// Handles both JSON-encoded [`ProtocolConfig`] (new format) and
+/// raw JSON blobs (legacy format). Returns `(protocol_settings, stream_settings)`
+/// as JSON Values. Called by config builders (singbox.rs, xray.rs).
+#[must_use]
+pub fn parse_profile_settings(profile: &Profile) -> (serde_json::Value, serde_json::Value) {
+    // New format: JSON-encoded ProtocolConfig
+    if let Ok(config) = serde_json::from_slice::<ProtocolConfig>(&profile.spec_blob) {
+        return config.to_settings();
+    }
+    // Legacy format: JSON blob
+    let extra: serde_json::Value = serde_json::from_slice(&profile.spec_blob)
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    let p = extra.get("protocol_settings").cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let s = extra.get("stream_settings").cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    (p, s)
+}
+
+/// Push entries from a JSON object as dotted-key form fields.
+/// Only string, bool, and number values are included — objects and arrays are skipped.
+pub fn flatten_json_to_fields(
+    json: &serde_json::Value,
+    fields: &mut Vec<(String, String)>,
+) {
+    if let serde_json::Value::Object(obj) = json {
+        for (k, v) in obj {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            fields.push((k.clone(), val));
+        }
+    }
+}
+
+/// Extract user identification from a `ProtocolConfig` for form population.
+/// Checks common field names used across protocols: "id", "password", "uuid",
+/// "user_id", "client_id", "method", "secret", "key".
+#[must_use]
+pub fn profile_user_id(config: &ProtocolConfig) -> Option<String> {
+    let (ps, _ss) = config.to_settings();
+    let obj = ps.as_object()?;
+    for key in &["id", "password", "uuid", "user_id", "client_id", "method", "secret", "key"] {
+        if let Some(serde_json::Value::String(v)) = obj.get(*key) {
+            if !v.is_empty() {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
 /// Parse a share URL into a Profile.
 /// Tries the scheme-mapped parser first, then falls back through all other parsers.
 /// Validates the parsed profile against the given settings.
@@ -112,11 +191,10 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
     if let Some(idx) = primary_idx
         && let Ok(profile) = PARSE_ORDER[idx](url)
     {
-        return normalize_and_validate(profile, settings);
+        return convert_spec_blob(profile, settings);
     }
 
     // Fallback: try all parsers (skip primary if it was attempted)
-    // For unknown schemes, if a parser succeeds but validation fails, continue trying.
     let mut last_error = ImportError::UnsupportedScheme;
     let mut validation_error = None;
     for (i, parser) in PARSE_ORDER.iter().enumerate() {
@@ -127,18 +205,15 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
         }
         match parser(url) {
             Ok(profile) => {
-                match normalize_and_validate(profile, settings) {
-                    Ok(validated) => return Ok(validated),
+                match validate_profile(profile, settings) {
+                    Ok(validated) => return convert_spec_blob(validated, settings),
                     Err(e @ ImportError::Validation(_)) => {
-                        // Parser matched but validation rejected — save this for later
-                        // but continue trying other parsers (for unknown schemes)
                         if has_known_scheme {
                             return Err(e);
                         }
                         validation_error = Some(e);
                     }
                     Err(e) => {
-                        // Parser returned Ok but validation failed with non-Validation error
                         if has_known_scheme {
                             return Err(e);
                         }
@@ -150,19 +225,51 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
         }
     }
 
-    // If any parser matched but validation rejected, return that error.
-    // Otherwise return the last parse error (or UnsupportedScheme if none matched).
     validation_error.map_or(Err(last_error), Err)
 }
 
-/// Apply remark normalization and all validation checks to a parsed profile.
-fn normalize_and_validate(mut profile: Profile, settings: &ValidationSettings) -> Result<Profile> {
-    if let Some(ref r) = profile.leg("remarks") {
-        profile.set_remarks(Some(normalize_remark(r)));
-    }
+/// Convert a legacy-parsed Profile's JSON spec_blob to JSON-encoded ProtocolConfig.
+fn convert_spec_blob(mut profile: Profile, settings: &ValidationSettings) -> Result<Profile> {
+    use xray_tui_core::protocol::Protocol;
+    use xray_tui_proto::proto_spec::ProtoSpec;
+
+    let proto = Protocol::try_from_i32(profile.config_type)
+        .ok_or_else(|| ImportError::Parse(format!("unknown config_type: {}", profile.config_type)))?;
+    let proto_name = proto.to_string();
+
+    // Copy the legacy JSON blob and wrap it as a ProtocolConfig (PlaceholderConfig variant)
+    let settings_json = std::mem::take(&mut profile.spec_blob);
+    let config = ProtocolConfig::from_legacy_parse(&proto_name, settings_json);
+    // JSON-encode into spec_blob
+    profile.spec_blob = serde_json::to_vec(&config)
+        .map_err(|e| ImportError::Parse(format!("failed to serialize config: {e}")))?;
+
+    profile.id = config.uid() as i64;
+    profile.sig = config.sig() as i64;
+    profile.cred_hash = config.cred_hash() as i64;
+
+    // Validate
     validate_required_fields(&profile)?;
     validate_host(&profile, settings)?;
-    validate_security(&profile);
+
+    // Normalize remarks (percent-decode, trim whitespace) — after validation
+    // so user_id/address/port checks use raw values
+    if let Some(r) = profile.leg("remarks").filter(|s| !s.is_empty()) {
+        let normalized = normalize_remark(&r);
+        if normalized != r {
+            profile.set_remarks(Some(normalized));
+        }
+    }
+
+    Ok(profile)
+}
+
+/// Validate a parsed profile, normalizing remarks.
+fn validate_profile(mut profile: Profile, _settings: &ValidationSettings) -> Result<Profile> {
+    let remarks = profile.leg("remarks");
+    if let Some(r) = &remarks {
+        profile.set_remarks(Some(normalize_remark(r)));
+    }
     Ok(profile)
 }
 
@@ -268,7 +375,15 @@ fn parse_vless(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(0)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
     if !parsed.username.is_empty() {
         profile.set_user_id(Some(parsed.username.clone()));
     }
@@ -384,7 +499,7 @@ fn format_vless(profile: &Profile) -> String {
         query.push(("flow".into(), flow.to_string()));
     }
     if let Some(net) = profile.leg("network") {
-        query.push(("type".into(), net.clone()));
+        query.push(("type".into(), net));
     }
     if let Some(ss) = profile.leg("stream_settings")
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ss)
@@ -553,7 +668,15 @@ fn parse_trojan(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     if !parsed.username.is_empty() {
         profile.set_user_id(Some(parsed.username.clone()));
@@ -630,7 +753,15 @@ fn parse_socks(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(1080)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
         ps.insert(
@@ -665,7 +796,15 @@ fn parse_hysteria2(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
@@ -703,7 +842,7 @@ fn format_hysteria2(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(auth) = profile.leg("user_id") {
-        query.push(("auth".into(), auth.clone()));
+        query.push(("auth".into(), auth));
     }
     if let Some(ps) = profile.leg("protocol_settings")
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
@@ -753,7 +892,15 @@ fn parse_hysteria(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     for (k, v) in &parsed.query_pairs {
         match k.as_ref() {
@@ -861,7 +1008,15 @@ fn parse_tuic(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -915,7 +1070,7 @@ fn format_tuic(profile: &Profile) -> String {
     let (add, port) = addr_port(profile);
     let uuid = profile.leg("user_id").unwrap_or_default();
     let mut query: Vec<(String, String)> = Vec::new();
-    query.push(("uuid".into(), uuid.to_string()));
+    query.push(("uuid".into(), uuid));
     if let Some(ps) = profile.leg("protocol_settings")
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&ps)
     {
@@ -964,7 +1119,15 @@ fn parse_naive(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
     if !parsed.username.is_empty() {
         let mut ps = serde_json::Map::new();
         ps.insert(
@@ -1016,7 +1179,15 @@ fn parse_anytls(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -1100,7 +1271,15 @@ fn parse_shadowtls(url: &str) -> Result<Profile> {
         &parsed.host,
         i32::from(parsed.port.unwrap_or(443)),
     );
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -1173,7 +1352,15 @@ fn parse_wireguard(url: &str) -> Result<Profile> {
     let parsed = split_share_url(url)?;
     // WireGuard URLs may not have a host:port authority; use query params
     let mut profile = base_profile(Protocol::WireGuard, "", 0);
-    set_legacy_fields(&mut profile, None, parsed.fragment.clone(), None, None, None, None);
+    set_legacy_fields(
+        &mut profile,
+        None,
+        parsed.fragment.clone(),
+        None,
+        None,
+        None,
+        None,
+    );
 
     for (k, v) in &parsed.query_pairs {
         match k.as_str() {
@@ -1235,7 +1422,10 @@ fn format_wireguard(profile: &Profile) -> String {
         }
     }
     if !profile.address.is_empty() && profile.port > 0 {
-        query.push(("endpoint".into(), format!("{}:{}", profile.address, profile.port)));
+        query.push((
+            "endpoint".into(),
+            format!("{}:{}", profile.address, profile.port),
+        ));
     }
     let qs = query
         .iter()
@@ -1529,15 +1719,15 @@ fn build_legacy_profile(
     if let Some(v) = remarks.filter(|s| !s.is_empty()) {
         extra.insert("remarks".into(), serde_json::Value::String(v));
     }
-    if let Some(v) = protocol_settings.filter(|s| !s.is_empty()) {
-        if let Ok(val) = serde_json::from_str(&v) {
-            extra.insert("protocol_settings".into(), val);
-        }
+    if let Some(v) = protocol_settings.filter(|s| !s.is_empty())
+        && let Ok(val) = serde_json::from_str(&v)
+    {
+        extra.insert("protocol_settings".into(), val);
     }
-    if let Some(v) = stream_settings.filter(|s| !s.is_empty()) {
-        if let Ok(val) = serde_json::from_str(&v) {
-            extra.insert("stream_settings".into(), val);
-        }
+    if let Some(v) = stream_settings.filter(|s| !s.is_empty())
+        && let Ok(val) = serde_json::from_str(&v)
+    {
+        extra.insert("stream_settings".into(), val);
     }
     let spec_blob = serde_json::to_vec(&serde_json::Value::Object(extra)).unwrap_or_default();
     Profile {
@@ -1548,7 +1738,11 @@ fn build_legacy_profile(
         spec_blob,
         config_type: protocol.to_i32(),
         core_type: "auto".to_string(),
-        address: if address.is_empty() { String::new() } else { address.to_string() },
+        address: if address.is_empty() {
+            String::new()
+        } else {
+            address.to_string()
+        },
         port: if port > 0 { port } else { 0 },
         transport: network,
         security,
@@ -1558,12 +1752,18 @@ fn build_legacy_profile(
     }
 }
 
-/// Read a legacy field from a Profile's spec_blob (trait for auto-ref method dispatch).
+/// Read a legacy field from a Profile's `spec_blob` (trait for auto-ref method dispatch).
 pub trait ProfileLegacy {
     fn leg(&self, key: &str) -> Option<String>;
 }
 impl ProfileLegacy for Profile {
     fn leg(&self, key: &str) -> Option<String> {
+        // New format: JSON-encoded ProtocolConfig
+        if let Ok(config) = serde_json::from_slice::<ProtocolConfig>(&self.spec_blob) {
+            return leg_from_config(&config, key);
+        }
+
+        // Legacy format: JSON blob
         let extra: serde_json::Value = serde_json::from_slice(&self.spec_blob).ok()?;
         let val = extra.get(key)?;
         match val {
@@ -1573,7 +1773,116 @@ impl ProfileLegacy for Profile {
     }
 }
 
-/// Apply legacy fields to an existing Profile's spec_blob.
+/// Helper: extract a legacy field from a JSON-decoded ProtocolConfig.
+/// For stub protocols (PlaceholderConfig), reads from the opaque settings_json blob.
+/// For full protocol types, uses ProtoSpec trait methods.
+fn leg_from_config(config: &ProtocolConfig, key: &str) -> Option<String> {
+    use xray_tui_proto::proto_spec::ProtoSpec;
+
+    // Handle protocol_settings/stream_settings via to_settings() which covers all variants
+    match key {
+        "protocol_settings" => {
+            let (p, _) = config.to_settings();
+            return (p.is_object() && p.as_object().map_or(false, |m| !m.is_empty()))
+                .then(|| serde_json::to_string(&p).unwrap_or_default());
+        }
+        "stream_settings" => {
+            let (_, s) = config.to_settings();
+            return (s.is_object() && s.as_object().map_or(false, |m| !m.is_empty()))
+                .then(|| serde_json::to_string(&s).unwrap_or_default());
+        }
+        _ => {}
+    }
+
+    // For stub protocols (PlaceholderConfig), extract from settings_json
+    if let Some(settings_json) = stub_settings_json(config) {
+        if let Ok(extra) = serde_json::from_slice::<serde_json::Value>(settings_json) {
+            if let Some(val) = extra.get(key).and_then(|v| v.as_str()).map(String::from) {
+                return Some(val);
+            }
+        }
+    }
+
+    // For full protocol types, use ProtoSpec trait methods
+    match key {
+        "remarks" => config.remarks().map(String::from),
+        "user_id" => config_user_id(config),
+        "security" => config.security_type().map(String::from),
+        "network" => config.transport_type().map(String::from),
+        _ => None,
+    }
+}
+
+/// Return the settings_json blob if the config is a stub (PlaceholderConfig-based) protocol.
+fn stub_settings_json(config: &ProtocolConfig) -> Option<&[u8]> {
+    match config {
+        // Typed protocol configs — not stubs, no settings_json
+        ProtocolConfig::Socks(_)
+        | ProtocolConfig::Http(_)
+        | ProtocolConfig::Naive(_)
+        | ProtocolConfig::AnyTls(_)
+        | ProtocolConfig::ShadowTls(_)
+        | ProtocolConfig::Tor(_)
+        | ProtocolConfig::Ssh(_)
+        | ProtocolConfig::Tailscale(_)
+        | ProtocolConfig::Hysteria1(_) => None,
+        // Placeholder stubs — still have opaque JSON blobs
+        ProtocolConfig::Redirect(c)
+        | ProtocolConfig::TProxy(c)
+        | ProtocolConfig::Mixed(c) => Some(&c.settings_json),
+        _ => None,
+    }
+}
+
+/// Extract user_id from a ProtocolConfig for the legacy bridge.
+fn config_user_id(config: &ProtocolConfig) -> Option<String> {
+    match config {
+        ProtocolConfig::Vless(c) => Some(c.uuid.clone()),
+        ProtocolConfig::Vmess(c) => Some(c.uuid.clone()),
+        ProtocolConfig::Trojan(c) => Some(c.password.clone()),
+        ProtocolConfig::Ss(c) => Some(c.password.clone()),
+        ProtocolConfig::Ssr(c) => Some(c.password.clone()),
+        ProtocolConfig::Tuic(c) => Some(c.uuid.clone()),
+        ProtocolConfig::Hysteria2(c) => Some(c.auth.clone()),
+        ProtocolConfig::Wireguard(_) => None,
+        // Typed protocol configs — no settings_json
+        ProtocolConfig::Socks(_)
+        | ProtocolConfig::Http(_)
+        | ProtocolConfig::Naive(_)
+        | ProtocolConfig::AnyTls(_)
+        | ProtocolConfig::ShadowTls(_)
+        | ProtocolConfig::Tor(_)
+        | ProtocolConfig::Ssh(_)
+        | ProtocolConfig::Tailscale(_)
+        | ProtocolConfig::Hysteria1(_) => None,
+        // Placeholder-based protocols: extract from settings_json
+        ProtocolConfig::Redirect(c)
+        | ProtocolConfig::TProxy(c)
+        | ProtocolConfig::Mixed(c) => {
+            let extra: serde_json::Value =
+                serde_json::from_slice(&c.settings_json).ok()?;
+            // Try top-level user_id first, then nested in protocol_settings
+            if let Some(v) = extra.get("user_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                return Some(v.to_string());
+            }
+            // Fallback: check protocol_settings for credential fields
+            if let Some(p) = extra.get("protocol_settings") {
+                if let Some(v) = p.get("user_id")
+                    .or_else(|| p.get("username"))
+                    .or_else(|| p.get("user"))
+                    .or_else(|| p.get("password"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(v.to_string());
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Apply legacy fields to an existing Profile's `spec_blob`.
 fn set_legacy_fields(
     profile: &mut Profile,
     user_id: Option<String>,
@@ -1583,35 +1892,116 @@ fn set_legacy_fields(
     protocol_settings: Option<String>,
     stream_settings: Option<String>,
 ) {
+    // Try JSON-encoded ProtocolConfig format first
+    if let Ok(config) = serde_json::from_slice::<ProtocolConfig>(&profile.spec_blob) {
+        // Only stub protocols can be meaningfully patched
+        let settings_json = match &config {
+            // Typed protocol configs — no settings_json
+            ProtocolConfig::Socks(_)
+            | ProtocolConfig::Http(_)
+            | ProtocolConfig::Naive(_)
+            | ProtocolConfig::AnyTls(_)
+            | ProtocolConfig::ShadowTls(_)
+            | ProtocolConfig::Tor(_)
+            | ProtocolConfig::Ssh(_)
+            | ProtocolConfig::Tailscale(_)
+            | ProtocolConfig::Hysteria1(_) => None,
+            // Placeholder-based protocols: extract from settings_json
+            ProtocolConfig::Redirect(c)
+            | ProtocolConfig::TProxy(c)
+            | ProtocolConfig::Mixed(c) => Some(c.settings_json.clone()),
+            _ => None,
+        };
+        let Some(sj) = settings_json else { return };
+
+        let mut extra: serde_json::Value = serde_json::from_slice(&sj)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+        patch_legacy_json(&mut extra, &user_id, &remarks, &security, &network,
+                          &protocol_settings, &stream_settings);
+        let new_sj = serde_json::to_vec(&extra).unwrap_or(sj);
+
+        // Re-build the ProtocolConfig with updated settings_json
+        let pname = stub_name(&config).unwrap_or("socks");
+        let placeholder = PlaceholderConfig {
+            proto_name: pname.to_string(),
+            settings_json: new_sj,
+        };
+        let new_config = match config {
+            ProtocolConfig::Redirect(_) => ProtocolConfig::Redirect(placeholder),
+            ProtocolConfig::TProxy(_) => ProtocolConfig::TProxy(placeholder),
+            ProtocolConfig::Mixed(_) => ProtocolConfig::Mixed(placeholder),
+            _ => return,
+        };
+        profile.spec_blob = serde_json::to_vec(&new_config)
+            .unwrap_or(profile.spec_blob.clone());
+        return;
+    }
+
+    // Legacy format: JSON blob
     let mut extra: serde_json::Value = serde_json::from_slice(&profile.spec_blob)
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-    let map = match &mut extra {
+    patch_legacy_json(&mut extra, &user_id, &remarks, &security, &network,
+                      &protocol_settings, &stream_settings);
+    profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
+}
+
+/// Insert legacy fields into a JSON object.
+fn patch_legacy_json(
+    extra: &mut serde_json::Value,
+    user_id: &Option<String>,
+    remarks: &Option<String>,
+    security: &Option<String>,
+    network: &Option<String>,
+    protocol_settings: &Option<String>,
+    stream_settings: &Option<String>,
+) {
+    let map = match extra {
         serde_json::Value::Object(m) => m,
         _ => return,
     };
-    if let Some(v) = user_id.filter(|s| !s.is_empty()) {
-        map.insert("user_id".into(), serde_json::Value::String(v));
+    if let Some(v) = user_id.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("user_id".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = remarks.filter(|s| !s.is_empty()) {
-        map.insert("remarks".into(), serde_json::Value::String(v));
+    if let Some(v) = remarks.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("remarks".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = security.filter(|s| !s.is_empty()) {
-        map.insert("security".into(), serde_json::Value::String(v));
+    if let Some(v) = security.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("security".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = network.filter(|s| !s.is_empty()) {
-        map.insert("network".into(), serde_json::Value::String(v));
+    if let Some(v) = network.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("network".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = protocol_settings.filter(|s| !s.is_empty()) {
-        if let Ok(val) = serde_json::from_str(&v) {
-            map.insert("protocol_settings".into(), val);
-        }
+    if let Some(v) = protocol_settings.as_ref().filter(|s| !s.is_empty())
+        && let Ok(val) = serde_json::from_str(v)
+    {
+        map.insert("protocol_settings".into(), val);
     }
-    if let Some(v) = stream_settings.filter(|s| !s.is_empty()) {
-        if let Ok(val) = serde_json::from_str(&v) {
-            map.insert("stream_settings".into(), val);
-        }
+    if let Some(v) = stream_settings.as_ref().filter(|s| !s.is_empty())
+        && let Ok(val) = serde_json::from_str(v)
+    {
+        map.insert("stream_settings".into(), val);
     }
-    profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
+}
+
+/// Extract the stub protocol name from a PlaceholderConfig-based ProtocolConfig.
+fn stub_name(config: &ProtocolConfig) -> Option<&str> {
+    match config {
+        // Typed protocol configs — no proto_name; callers fallback to default
+        ProtocolConfig::Socks(_)
+        | ProtocolConfig::Http(_)
+        | ProtocolConfig::Naive(_)
+        | ProtocolConfig::AnyTls(_)
+        | ProtocolConfig::ShadowTls(_)
+        | ProtocolConfig::Tor(_)
+        | ProtocolConfig::Ssh(_)
+        | ProtocolConfig::Tailscale(_)
+        | ProtocolConfig::Hysteria1(_) => None,
+        // Placeholder-based protocols: extract proto_name
+        ProtocolConfig::Redirect(c)
+        | ProtocolConfig::TProxy(c)
+        | ProtocolConfig::Mixed(c) => Some(&c.proto_name),
+        _ => None,
+    }
 }
 
 /// Per-field setters — enables mechanical `profile.X = ...` -> `profile.set_X(...)` replacement.
@@ -1624,15 +2014,27 @@ pub trait ProfileMut {
     fn set_network(&mut self, v: Option<String>);
 }
 impl ProfileMut for Profile {
-    fn set_remarks(&mut self, v: Option<String>) { set_legacy_fields(self, None, v, None, None, None, None); }
-    fn set_user_id(&mut self, v: Option<String>) { set_legacy_fields(self, v, None, None, None, None, None); }
-    fn set_protocol_settings(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, None, None, v, None); }
-    fn set_stream_settings(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, None, None, None, v); }
-    fn set_security(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, v, None, None, None); }
-    fn set_network(&mut self, v: Option<String>) { set_legacy_fields(self, None, None, None, v, None, None); }
+    fn set_remarks(&mut self, v: Option<String>) {
+        set_legacy_fields(self, None, v, None, None, None, None);
+    }
+    fn set_user_id(&mut self, v: Option<String>) {
+        set_legacy_fields(self, v, None, None, None, None, None);
+    }
+    fn set_protocol_settings(&mut self, v: Option<String>) {
+        set_legacy_fields(self, None, None, None, None, v, None);
+    }
+    fn set_stream_settings(&mut self, v: Option<String>) {
+        set_legacy_fields(self, None, None, None, None, None, v);
+    }
+    fn set_security(&mut self, v: Option<String>) {
+        set_legacy_fields(self, None, None, v, None, None, None);
+    }
+    fn set_network(&mut self, v: Option<String>) {
+        set_legacy_fields(self, None, None, None, v, None, None);
+    }
 }
 
-/// Legacy convenience — builds empty Profile via build_legacy_profile.
+/// Legacy convenience — builds empty Profile via `build_legacy_profile`.
 fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
     build_legacy_profile(protocol, address, port, None, None, None, None, None, None)
 }
@@ -1640,7 +2042,6 @@ fn base_profile(protocol: Protocol, address: &str, port: i32) -> Profile {
 fn addr_port(profile: &Profile) -> (String, i32) {
     (profile.address.clone(), profile.port)
 }
-
 
 fn stream_settings(existing: Option<&str>) -> serde_json::Map<String, serde_json::Value> {
     existing
@@ -2077,6 +2478,7 @@ mod tests {
         let result = normalize_remark("%E6%B5%8B%E8%AF%95");
         assert_eq!(result, "测试");
     }
+
 
     #[test]
     fn normalize_remark_whitespace_collapsed() {
@@ -2568,4 +2970,3 @@ mod tests {
         assert_eq!(parsed.config_type, p.config_type);
     }
 }
-

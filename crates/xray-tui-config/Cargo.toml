@@ -20,7 +20,6 @@ humantime.workspace = true
 base64-simd = "0.8"
 escape8259 = "0.5"
 urlencoding = "2.1"
-postcard = { version = "^1.1.0", default-features = false, features = ["alloc"] }
 simdutf8 = "0.1"
 url = "2.5"
 
@@ -35,6 +34,7 @@ smallvec = { version = "1", features = ["const_new"] }
 
 # ============ Internal ============
 xray-tui-core = { path = "../xray-tui-core" }
+xray-tui-proto = { path = "../xray-tui-proto" }
 xray-tui-db = { path = "../xray-tui-db" }
 
 # ============ Logging ============

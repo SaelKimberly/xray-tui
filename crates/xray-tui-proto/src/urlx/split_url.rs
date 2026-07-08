@@ -1,4 +1,4 @@
-use std::{borrow::Cow, hint::cold_path};
+use std::borrow::Cow;
 
 use base64::Engine;
 use bstr::ByteSlice;

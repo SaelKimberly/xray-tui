@@ -1,4 +1,4 @@
-//! VMess (`vmess://`) URL parsing.
+//! `VMess` (`vmess://`) URL parsing.
 //!
 //! # Format
 //! ```text
@@ -18,7 +18,7 @@
 //! | `add` | `add`| string | Server address (IP or domain)   | — (required)   |
 //! | `port`| `port`| int   | Server port                     | — (required)   |
 //! | `id`  | `id` | string  | User UUID                       | — (required)   |
-//! | `aid` | `aid`| string  | AlterId (additional IDs)        | `"0"`          |
+//! | `aid` | `aid`| string  | `AlterId` (additional IDs)        | `"0"`          |
 //! | `scy` | `scy`| string  | Encryption method               | `"auto"`       |
 //! | `net` | `net`| string  | Transport type                  | `"tcp"`        |
 //! | `type`| `type`| string | TCP/KCP header / gRPC mode      | `"none"`       |
@@ -55,12 +55,15 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
+use crate::proto_spec::common::*;
+use crate::clash::{ClashProxy, ClashVmess};
+use crate::proto_spec::ProtoSpecError;
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +89,7 @@ pub struct VmessConfig {
 }
 
 impl ProtoSpec for VmessConfig {
-    /// Parse a VMess URL.
+    /// Parse a `VMess` URL.
     ///
     /// Decodes the base64 userinfo → parses lenient JSON with abbreviated v2rayN keys.
     /// Trailing non-base64 annotation (Telegram emoji, Persian text, etc.) is stripped
@@ -181,6 +184,7 @@ impl ProtoSpec for VmessConfig {
         let security = SecurityConfig {
             tls: tls_str.map(|_| {
                 TlsConfig::Tls(TlsOpts {
+                pin_sha256: None,
                     sni: sni.clone(),
                     alpn,
                     fp,
@@ -363,6 +367,86 @@ impl ProtoSpec for VmessConfig {
     fn security(&self) -> Option<&SecurityConfig> {
         Some(&self.security)
     }
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        match proxy {
+            ClashProxy::Vmess(c) => {
+                let security = {
+                    let mut s = clash_tls_to_security(
+                        c.tls,
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        clash_alpn_as_str(&c.alpn),
+                        c.fingerprint.as_deref(),
+                        None,
+                    );
+                    s.enc = Some(TinyText::from(c.cipher.as_str()));
+                    s
+                };
+                let transport = clash_transport_to_transport(
+                    c.network.as_deref(),
+                    &c.ws_opts,
+                    &c.grpc_opts,
+                    &c.h2_opts,
+                    &c.http_opts,
+                    &c.mkcp_opts,
+                    Some(&c.server),
+                );
+                let path = match &transport {
+                    TransportConfig::Ws(ws) => ws.path.clone(),
+                    TransportConfig::Grpc(g) => g.path.clone(),
+                    TransportConfig::Http(h) => h.path.clone(),
+                    TransportConfig::HttpUpgrade(cfg) => cfg.path.clone(),
+                    TransportConfig::XHttp(cfg) => cfg.path.clone(),
+                    _ => None,
+                };
+                Ok(Self {
+                    sig_cache: std::sync::OnceLock::new(),
+                    cred_hash_cache: std::sync::OnceLock::new(),
+                    uuid: c.uuid.clone(),
+                    host: clash_server_to_host(&c.server)?,
+                    port: c.port,
+                    security,
+                    transport,
+                    alter_id: c.alter_id.map(|v| TinyText::from(v.to_string())),
+                    path,
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected vmess clash proxy".into())),
+        }
+    }
+
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let server = host_spec_to_string(&self.host);
+        let (tls, servername, skip_cert_verify, alpn_str, fingerprint) = security_to_clash_tls(&self.security);
+        let (network, ws_opts, grpc_opts, h2_opts, http_opts, mkcp_opts) = transport_to_clash(&self.transport, &server);
+        Ok(ClashProxy::Vmess(ClashVmess {
+            name,
+            server,
+            port: self.port,
+            uuid: self.uuid.clone(),
+            cipher: self.security.enc.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "auto".to_string()),
+            alter_id: self.alter_id.as_ref().and_then(|v| v.parse::<u32>().ok()),
+            udp: None,
+            tfo: None,
+            network,
+            tls,
+            servername,
+            skip_cert_verify,
+            alpn: alpn_str.map(|s| vec![s]),
+            fingerprint,
+            ws_opts,
+            grpc_opts,
+            h2_opts,
+            http_opts,
+            mkcp_opts,
+        }))
+    }
+
 }
 
 impl VmessConfig {
@@ -397,10 +481,13 @@ impl VmessConfig {
     }
 }
 
+use crate::proto_spec::common::*;
+
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
     use crate::urlx::SchemeX;
+use crate::urlx::PortSpec;
 
     #[test]
     fn test_vmess_basic() {
@@ -442,6 +529,14 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         check_roundtrip::<VmessConfig>(
+            "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==",
+        );
+    }
+
+    #[test]
+    fn test_clash_roundtrip() {
+        use super::super::test_helpers::check_clash_roundtrip;
+        check_clash_roundtrip::<VmessConfig>(
             "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==",
         );
     }
