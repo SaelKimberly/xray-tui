@@ -85,38 +85,29 @@ impl PortSpec {
     pub const fn contains(&self, port: u16) -> bool {
         let arr = self.ports.as_slice();
         let mut idx = 0;
-        loop {
+        while idx < arr.len() {
             match &arr[idx] {
                 PortDecl::Single(p) if *p == port => return true,
-                PortDecl::Range(r) if r.start <= port && port < r.end => return true,
+                PortDecl::Range(r) if r.start <= port && port <= r.end => return true,
                 _ => {}
-            }
-            if idx == self.ports.len() {
-                break false;
             }
             idx += 1;
         }
+        false
     }
 
     pub const fn length(&self) -> usize {
         let mut length = 0_usize;
         let mut idx = 0;
         let arr = self.ports.as_slice();
-        loop {
+        while idx < arr.len() {
             match &arr[idx] {
-                PortDecl::Single(_) => {
-                    length += 1;
-                    idx += 1;
-                }
-                PortDecl::Range(r) => {
-                    length += (r.end - r.start + 1) as usize;
-                    idx += 1;
-                }
+                PortDecl::Single(_) => length += 1,
+                PortDecl::Range(r) => length += (r.end - r.start + 1) as usize,
             }
-            if idx == self.ports.len() {
-                break length;
-            }
+            idx += 1;
         }
+        length
     }
 
     /// Get the first port
@@ -202,5 +193,34 @@ impl Iterator for PortSpecIter<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_port_spec_contains_no_panic() {
+        let spec = PortSpec::new();
+        assert!(!spec.contains(80));
+        assert_eq!(spec.length(), 0);
+        assert!(spec.first().is_none());
+        assert!(spec.last().is_none());
+    }
+
+    #[test]
+    fn port_spec_range_inclusive_semantics() {
+        let mut spec = PortSpec::new();
+        spec.add_range(100..200);
+        assert!(spec.contains(100));  // start
+        assert!(spec.contains(200));  // end (was failing with exclusive)
+        assert!(!spec.contains(99));  // below
+        assert!(!spec.contains(201)); // above
+        assert_eq!(spec.length(), 101);
+        let collected: Vec<u16> = spec.iter().collect();
+        assert_eq!(collected.len(), 101);
+        assert_eq!(collected[0], 100);
+        assert_eq!(collected[100], 200);
     }
 }
