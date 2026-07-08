@@ -84,6 +84,8 @@ cargo run
 9. **Sing-box V2Ray API is experimental**: May require build tag `with_v2ray_api`. If unavailable, stats/logs show "not supported by core".
 10. **spec_blob + bridge traits**: Profile data stored as hybrid — cached fields (address, port, transport, security) + `spec_blob` (postcard-encoded ProtocolConfig variant). Bridge traits `ProfileLegacy::leg()` and `ProfileMut::set_xxx()` in xray-tui-config enable old parse/format function code to read/write the new schema without full rewrite. `Connection` table replaces `Profile.group_id` for many-to-many group membership. `Profile.id` is i64 (uid = sig ^ cred_hash).
 
+11. **Dual uid scheme**: Profiles parsed from share URLs get `uid = sig ^ cred_hash` from `ProtoSpec` (deterministic, dedup-compatible). Profiles created via TUI form get a random i64 PK because no URL was parsed — `sig` and `cred_hash` are set to `uid` and `0` respectively and are meaningless. Form profiles don't participate in URL-based dedup.
+
 ## Protocols: In Scope
 
 ### Xray-core native
