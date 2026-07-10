@@ -157,7 +157,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Build display rows with optional sub-rows for expanded endpoints
     let display_rows = build_display_rows(&rows, selected, state, &palette);
-    let display_selected = resolve_display_selected(&display_rows, selected);
+    let display_selected = resolve_display_selected(&display_rows, selected, state.selected_sub);
 
     render_data_grid(frame, chunks[1], &display_rows, display_selected, state, &palette);
     render_footer(frame, chunks[2], state, &palette);
@@ -286,13 +286,24 @@ fn build_display_rows<'a>(
     result
 }
 
-/// For a given endpoint index, find its position in the display row list (accounts for sub-rows).
-fn resolve_display_selected(display_rows: &[DisplayRowData], endpoint_idx: usize) -> usize {
+/// For a given endpoint index and optional sub-row, find its position in the display row list.
+fn resolve_display_selected(
+    display_rows: &[DisplayRowData],
+    endpoint_idx: usize,
+    selected_sub: Option<usize>,
+) -> usize {
     let mut display_pos = 0;
     let mut ep_count = 0;
-    for row in display_rows {
+    while display_pos < display_rows.len() {
+        let row = &display_rows[display_pos];
         if matches!(row, DisplayRowData::Endpoint { .. }) {
             if ep_count == endpoint_idx {
+                // Found the right endpoint — if sub-row selected, advance to it
+                if let Some(sub) = selected_sub {
+                    // Skip the endpoint itself (1) + n sub-rows
+                    display_pos += 1 + sub;
+                    return display_pos.min(display_rows.len().saturating_sub(1));
+                }
                 return display_pos;
             }
             ep_count += 1;

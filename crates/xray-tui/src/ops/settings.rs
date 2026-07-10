@@ -28,7 +28,7 @@ pub async fn build_settings_fields(
 ) -> Vec<(String, String)> {
     use crate::SettingsSection::{
         Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-        SystemProxy, Tun, Updates,
+        Subscriptions, SystemProxy, Tun, Updates,
     };
     match section {
         Core => {
@@ -274,6 +274,7 @@ pub async fn build_settings_fields(
                 humantime::format_duration(*state.config.logging.ttl_secs).to_string(),
             )]
         }
+        Subscriptions => vec![],
     }
 }
 
@@ -284,7 +285,7 @@ fn apply_settings_fields(
 ) {
     use crate::SettingsSection::{
         Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-        SystemProxy, Tun, Updates,
+        Subscriptions, SystemProxy, Tun, Updates,
     };
     let get_str = |key: &str| -> &str {
         fields
@@ -399,7 +400,7 @@ fn apply_settings_fields(
             }
         }
         // Dns and Routing are handled separately (DB-backed)
-        Dns | Routing | Updates => {}
+        Dns | Routing | Updates | Subscriptions => {}
         Logging => {
             if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                 *state.config.logging.ttl_secs = d;
@@ -426,6 +427,10 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
                 .get(&CoreType::SingBox)
                 .cloned()
                 .unwrap_or_default(),
+        },
+        SettingsSection::Subscriptions => SplitRightPane::GroupList {
+            selected: 0,
+            selected_mask: vec![false; state.groups.len()],
         },
         _ => SplitRightPane::Form {
             section,

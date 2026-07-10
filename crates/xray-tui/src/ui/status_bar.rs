@@ -119,6 +119,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 crate::SplitRightPane::RoutingList { .. }
                 | crate::SplitRightPane::RoutingForm { .. } => " Settings > Routing",
                 crate::SplitRightPane::UpdateForm { .. } => " Settings > Updates",
+                crate::SplitRightPane::GroupList { .. } => " Settings > Subscriptions",
+                crate::SplitRightPane::GroupForm { .. } => " Settings > Subscriptions",
             },
         },
         crate::AppMode::AddServer { .. } => " Add Server",
@@ -192,6 +194,12 @@ const fn build_hints(state: &AppState) -> &'static str {
                     crate::SplitRightPane::UpdateForm { .. } => {
                         " [C] Check  [D] Download  [Ctrl+W] Focus Tree  [Esc] Back "
                     }
+                    crate::SplitRightPane::GroupList { .. } => {
+                        " [↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Focus Tree  [Esc] Back "
+                    }
+                    crate::SplitRightPane::GroupForm { .. } => {
+                        " [Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back "
+                    }
                 },
             },
         },
@@ -199,14 +207,12 @@ const fn build_hints(state: &AppState) -> &'static str {
             // Default tab-based hints for non-Settings modes
             match state.current_tab {
                 crate::Tab::Profiles => {
-                    if matches!(state.mode, crate::AppMode::ManageGroups { .. }) {
-                        " [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
-                    } else if state.connected_core.is_some() {
-                        " [g] Groups  [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
+                    if state.connected_core.is_some() {
+                        " [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     } else if state.connecting {
-                        " [g] Groups  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
+                        " [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     } else {
-                        " [g] Groups  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
+                        " [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     }
                 }
                 _ => " [q/Ctrl+C] Quit ",
@@ -230,5 +236,6 @@ const fn status_bar_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Logging => " Settings > Logging",
         SettingsSection::Updates => " Settings > Updates",
         SettingsSection::Routing => " Settings > Routing",
+        SettingsSection::Subscriptions => " Settings > Subscriptions",
     }
 }

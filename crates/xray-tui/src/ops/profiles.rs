@@ -230,6 +230,9 @@ pub fn toggle_expand(state: &mut AppState) {
     if let Some(ep_id) = ep_id {
         if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
             ep_row.expanded = !ep_row.expanded;
+            if !ep_row.expanded {
+                state.selected_sub = None;
+            }
         }
     }
 }
@@ -240,6 +243,7 @@ pub fn collapse_expand(state: &mut AppState) {
             ep_row.expanded = false;
         }
     }
+    state.selected_sub = None;
 }
 
 fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
@@ -760,4 +764,85 @@ pub const fn cycle_purgatory_view(state: &mut AppState) {
         PurgatoryView::Stale => PurgatoryView::All,
         PurgatoryView::All => PurgatoryView::Active,
     };
+}
+
+/// Navigate protocol sub-rows when on an expanded endpoint.
+/// Returns true if sub-row navigation was handled (caller should stop).
+pub fn nav_protocol_down(state: &mut AppState) -> bool {
+    // Extract data before any mutable access.
+    let proto_count = match filtered_profiles(state).nth(state.selected_index) {
+        Some(row) if row.expanded => row.protocols.len(),
+        _ => return false,
+    };
+    if proto_count <= 1 {
+        return false;
+    }
+    match state.selected_sub {
+        None => {
+            state.selected_sub = Some(0);
+            true
+        }
+        Some(n) if n + 1 < proto_count => {
+            state.selected_sub = Some(n + 1);
+            true
+        }
+        Some(_) => {
+            state.selected_sub = None;
+            false
+        }
+    }
+}
+
+/// Navigate protocol sub-rows when on an expanded endpoint.
+/// Returns true if sub-row navigation was handled (caller should stop).
+pub fn nav_protocol_up(state: &mut AppState) -> bool {
+    // Collect the full state we need before any mutable access.
+    let current_expanded = filtered_profiles(state)
+        .nth(state.selected_index)
+        .map(|r| r.expanded && r.protocols.len() > 1)
+        .unwrap_or(false);
+    let prev_info: Option<(bool, usize)> = if state.selected_index > 0 {
+        filtered_profiles(state)
+            .nth(state.selected_index - 1)
+            .map(|r| (r.expanded, r.protocols.len()))
+    } else {
+        None
+    };
+    if !current_expanded {
+        return false;
+    }
+    match state.selected_sub {
+        None => {
+            // Check if previous endpoint is expanded — move to its last sub-row
+            if let Some((expanded, len)) = prev_info {
+                if expanded && len > 1 {
+                    state.selected_sub = Some(len - 1);
+                    return true;
+                }
+            }
+            false
+        }
+        Some(n) if n > 0 => {
+            state.selected_sub = Some(n - 1);
+            true
+        }
+        Some(0) => {
+            // Move back to the endpoint row
+            state.selected_sub = None;
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// Check whether the current selection is on a protocol sub-row.
+pub fn is_on_sub_row(state: &AppState) -> bool {
+    state.selected_sub.is_some()
+}
+
+/// Get the protocol ID for the currently selected sub-row, if any.
+pub fn selected_sub_protocol_id(state: &AppState) -> Option<i64> {
+    let n = state.selected_sub?;
+    let row = filtered_profiles(state).nth(state.selected_index)?;
+    row.protocols.get(n).map(|p| p.id)
 }

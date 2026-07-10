@@ -112,6 +112,19 @@ pub enum SplitRightPane {
         status_xray: BackendUpdateStatus,
         status_singbox: BackendUpdateStatus,
     },
+    /// Group/subscription list shown in the settings Subscriptions section.
+    GroupList {
+        selected: usize,
+        selected_mask: Vec<bool>,
+    },
+    /// Add/edit group form shown in the settings Subscriptions section.
+    GroupForm {
+        /// None = adding a new group; Some(gid) = editing an existing group.
+        group_id: Option<String>,
+        fields: Vec<(String, String)>,
+        focus_index: usize,
+        form_errors: HashMap<String, String>,
+    },
 }
 
 /// Which pane has focus in the Settings split view.
@@ -158,6 +171,7 @@ pub enum SettingsSection {
     Updates,
     SpeedTest,
     Logging,
+    Subscriptions,
 }
 
 impl std::fmt::Display for SettingsSection {
@@ -176,6 +190,7 @@ impl std::fmt::Display for SettingsSection {
             Self::Updates => write!(f, "Updates"),
             Self::SpeedTest => write!(f, "Speed Test"),
             Self::Logging => write!(f, "Logging"),
+            Self::Subscriptions => write!(f, "Subscriptions"),
         }
     }
 }
@@ -212,21 +227,6 @@ pub enum AppMode {
     ImportUrl {
         input: String,
         error: Option<String>,
-    },
-    /// Managing subscription groups
-    ManageGroups {
-        selected: usize,
-    },
-    /// Adding a new subscription group
-    AddGroup {
-        fields: Vec<(String, String)>,
-        focus_index: usize,
-    },
-    /// Editing an existing subscription group
-    EditGroup {
-        group_id: String,
-        fields: Vec<(String, String)>,
-        focus_index: usize,
     },
     /// Speed test menu overlay
     SpeedTestMenu {

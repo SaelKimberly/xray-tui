@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::collections::HashMap;
 
 use xray_tui_config::import_export::{ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
@@ -8,7 +9,7 @@ use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
 
 use crate::AppState;
 
-use crate::types::{AppMode, CoreEvent};
+use crate::types::{CoreEvent, SplitRightPane};
 use crate::{format_now, get_field, try_send_or_warn};
 
 pub fn start_add_group(state: &mut AppState) {
@@ -19,10 +20,16 @@ pub fn start_add_group(state: &mut AppState) {
         ("update_interval".into(), "1h".into()),
         ("core_type".into(), "auto".into()),
     ];
-    state.mode = AppMode::AddGroup {
-        fields,
-        focus_index: 0,
-    };
+    if let crate::AppMode::Settings {
+        mode: crate::SettingsMode::Split { right, .. },
+    } = &mut state.mode {
+        *right = SplitRightPane::GroupForm {
+            group_id: None,
+            fields,
+            focus_index: 0,
+            form_errors: HashMap::new(),
+        };
+    }
 }
 
 pub fn start_edit_group(state: &mut AppState, group_id: &str) {
@@ -48,16 +55,27 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
             group.core_type.unwrap_or_else(|| "auto".into()),
         ),
     ];
-    state.mode = AppMode::EditGroup {
-        group_id: group_id.into(),
-        fields,
-        focus_index: 0,
-    };
+    if let crate::AppMode::Settings {
+        mode: crate::SettingsMode::Split { right, .. },
+    } = &mut state.mode {
+        *right = SplitRightPane::GroupForm {
+            group_id: Some(group_id.into()),
+            fields,
+            focus_index: 0,
+            form_errors: HashMap::new(),
+        };
+    }
 }
 
 pub async fn confirm_add_group(state: &mut AppState) {
     let fields = match &state.mode {
-        AppMode::AddGroup { fields, .. } => fields.clone(),
+        crate::AppMode::Settings {
+            mode:
+                crate::SettingsMode::Split {
+                    right: SplitRightPane::GroupForm { fields, .. },
+                    ..
+                },
+        } => fields.clone(),
         _ => return,
     };
     let interval: i32 = get_field(&fields, "update_interval")
@@ -89,16 +107,36 @@ pub async fn confirm_add_group(state: &mut AppState) {
             group.name.as_deref().unwrap_or("unnamed")
         ),
     );
-    state.mode = AppMode::List;
     state.reload_groups().await;
+    if let crate::AppMode::Settings {
+        mode:
+            crate::SettingsMode::Split {
+                right, ..
+            },
+    } = &mut state.mode {
+        *right = SplitRightPane::GroupList {
+            selected: 0,
+            selected_mask: vec![false; state.groups.len()],
+        };
+    }
 }
-
 pub async fn confirm_edit_group(state: &mut AppState) {
-    let (group_id, fields) = match &state.mode {
-        AppMode::EditGroup {
-            group_id, fields, ..
+    let (group_id_opt, fields) = match &state.mode {
+        crate::AppMode::Settings {
+            mode:
+                crate::SettingsMode::Split {
+                    right:
+                        SplitRightPane::GroupForm {
+                            group_id, fields, ..
+                        },
+                    ..
+                },
         } => (group_id.clone(), fields.clone()),
         _ => return,
+    };
+    let group_id = match group_id_opt {
+        Some(id) => id,
+        None => return,
     };
     let mut group = if let Some(g) = state.groups.iter().find(|g| g.id == group_id) {
         g.clone()
@@ -119,8 +157,18 @@ pub async fn confirm_edit_group(state: &mut AppState) {
         return;
     }
     state.log_trace("info", "tui", "Group updated");
-    state.mode = AppMode::List;
     state.reload_groups().await;
+    if let crate::AppMode::Settings {
+        mode:
+            crate::SettingsMode::Split {
+                right, ..
+            },
+    } = &mut state.mode {
+        *right = SplitRightPane::GroupList {
+            selected: 0,
+            selected_mask: vec![false; state.groups.len()],
+        };
+    }
 }
 
 pub async fn delete_group(state: &mut AppState, group_id: &str) {

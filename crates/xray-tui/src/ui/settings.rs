@@ -107,6 +107,10 @@ const SETTINGS_TREE: &[SettingsTreeGroup] = &[
                 name: "Logging",
                 section: Some(SettingsSection::Logging),
             },
+            SettingsTreeNode {
+                name: "Subscriptions",
+                section: Some(SettingsSection::Subscriptions),
+            },
         ],
     },
 ];
@@ -215,6 +219,8 @@ fn render_right_pane(
         SplitRightPane::RoutingList { .. } => " Routing Rules ",
         SplitRightPane::RoutingForm { .. } => " Routing Rule ",
         SplitRightPane::UpdateForm { .. } => " Updates ",
+        SplitRightPane::GroupList { .. } => " Subscriptions ",
+        SplitRightPane::GroupForm { .. } => " Edit Group ",
     };
     let block = Block::default()
         .title(title)
@@ -265,6 +271,28 @@ fn render_right_pane(
         } => {
             render_update_form_inner(frame, inner, palette, status_xray, status_singbox);
         }
+        SplitRightPane::GroupList {
+            selected,
+            selected_mask,
+        } => {
+            render_group_list_inner(frame, inner, state, palette, *selected, selected_mask);
+        }
+        SplitRightPane::GroupForm {
+            fields,
+            focus_index,
+            form_errors,
+            ..
+        } => {
+            render_form_with_area(
+                frame,
+                inner,
+                palette,
+                SettingsSection::Subscriptions,
+                fields.as_slice(),
+                *focus_index,
+                form_errors,
+            );
+        }
         SplitRightPane::Empty => {}
     }
 }
@@ -308,6 +336,8 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                     SplitRightPane::RoutingList { .. } => 2,
                     SplitRightPane::RoutingForm { .. } => 3,
                     SplitRightPane::UpdateForm { .. } => 4,
+                    SplitRightPane::GroupList { .. } => 5,
+                    SplitRightPane::GroupForm { .. } => 6,
                 },
                 _ => return,
             };
@@ -316,6 +346,8 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                 2 => handle_routing_list_key(state, key).await,
                 3 => handle_routing_form_key(state, key).await,
                 4 => handle_update_form_key(state, key),
+                5 => handle_group_list_key(state, key).await,
+                6 => handle_group_form_key(state, key).await,
                 _ => {}
             }
         }
@@ -332,6 +364,7 @@ const fn form_title_for_section(section: SettingsSection) -> &'static str {
         SettingsSection::Tun => " TUN Mode ",
         SettingsSection::Mux => " Mux / Fragment ",
         SettingsSection::Stats => " Statistics ",
+        SettingsSection::Subscriptions => " Subscriptions ",
         SettingsSection::ProtocolCore => " Protocol Core ",
         SettingsSection::SpeedTest => " Speed Test Settings ",
         SettingsSection::Logging => " Logging ",
@@ -518,6 +551,13 @@ fn form_field_defs_for_section(
         ],
         SettingsSection::Logging => &[("log_ttl_secs", "Log Retention", "Duration")],
         SettingsSection::Stats => &[("enabled", "Enabled", "Boolean")],
+        SettingsSection::Subscriptions => &[
+            ("name", "Name", "Text"),
+            ("subscription_url", "Subscription URL", "Url"),
+            ("user_agent", "User Agent", "Text"),
+            ("update_interval", "Update Interval", "Duration"),
+            ("core_type", "Core Type", "Select:Auto,Xray,SingBox"),
+        ],
         SettingsSection::Updates | SettingsSection::Routing => &[],
     }
 }
@@ -1469,6 +1509,443 @@ fn render_routing_form_inner(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+// ── Group List (Subscriptions) ───────────────────────────────────────────
+
+struct GroupListItem {
+    name: String,
+    url: String,
+    status: String,
+    selected: bool,
+}
+
+impl ListItem for GroupListItem {
+    fn height(&self) -> u16 {
+        1
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &ListItemContext) {
+        let is_focused = ctx.selected;
+        let sel_mark = if self.selected { " \u{2713} " } else { "   " };
+        let name_str = format!(" {:<20}", self.name);
+        let url_str = format!(" {:<40}", self.url);
+        let status_str = format!(" {:<10}", self.status);
+        let line = format!("{sel_mark}{name_str}{url_str}{status_str}");
+        let style = if is_focused {
+            Style::default()
+                .fg(ctx.palette.primary)
+                .bg(ctx.palette.surface)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(ctx.palette.foreground)
+        };
+        buf.set_string(area.x + 1, area.y, &line, style);
+    }
+}
+
+fn render_group_list_inner(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    palette: &Palette,
+    selected: usize,
+    selected_mask: &[bool],
+) {
+    let groups = &state.groups;
+    let list_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+
+    // Build list items
+    let items: Vec<GroupListItem> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let status = g.status.as_deref().unwrap_or("never");
+            let url = g.url.as_deref().unwrap_or("");
+            // Truncate long URLs for display
+            let url_display = if url.len() > 38 {
+                format!("{}…", &url[..37])
+            } else {
+                url.to_string()
+            };
+            GroupListItem {
+                name: g.name.clone().unwrap_or_else(|| "Unnamed".to_string()),
+                url: url_display,
+                status: status.to_string(),
+                selected: selected_mask.get(i).copied().unwrap_or(false),
+            }
+        })
+        .collect();
+
+    // Render list widget
+    let list = List::new(&items)
+        .palette(palette.clone())
+        .show_paginator(false);
+    let mut list_state = ListState::new(items.len());
+    list_state.select(selected, items.len());
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+
+    // Footer with action hints
+    let footer_y = area.bottom().saturating_sub(1);
+    let footer = Paragraph::new(Line::from(Span::styled(
+        " [Space] Toggle select  [a] Add  [e] Edit  [d] Delete selected  [u] Update  [Esc] Back ",
+        Style::default().fg(palette.muted),
+    )));
+    frame.render_widget(footer, Rect::new(area.x, footer_y, area.width, 1));
+}
+
+async fn handle_group_list_key(state: &mut AppState, key: &KeyEvent) {
+    // Extract current selection state (read-only, copies usize)
+    let (selected, max) = match &state.mode {
+        AppMode::Settings {
+            mode:
+                SettingsMode::Split {
+                    right: SplitRightPane::GroupList { selected, .. },
+                    ..
+                },
+        } => (*selected, state.groups.len().saturating_sub(1)),
+        _ => return,
+    };
+
+    match key.code {
+        KeyCode::Up => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupList {
+                                ref mut selected, ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                *selected = selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if selected < max
+                && let AppMode::Settings {
+                    mode:
+                        SettingsMode::Split {
+                            right:
+                                SplitRightPane::GroupList {
+                                    ref mut selected, ..
+                                },
+                            ..
+                        },
+                } = state.mode
+            {
+                *selected += 1;
+            }
+        }
+        KeyCode::Char(' ') => {
+            // Toggle selection for the current row
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupList {
+                                ref mut selected,
+                                ref mut selected_mask,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *selected < selected_mask.len() {
+                    selected_mask[*selected] = !selected_mask[*selected];
+                }
+            }
+        }
+        KeyCode::Char('a' | 'A') => {
+            crate::ops::subscriptions::start_add_group(state);
+        }
+        KeyCode::Char('e' | 'E') => {
+            if !state.groups.is_empty() && selected < state.groups.len() {
+                let group_id = state.groups[selected].id.clone();
+                crate::ops::subscriptions::start_edit_group(state, &group_id);
+            }
+        }
+        KeyCode::Char('d' | 'D') => {
+            // Read selection state without borrow conflict
+            let ids_from_mask: Vec<String> = match &state.mode {
+                AppMode::Settings {
+                    mode:
+                        SettingsMode::Split {
+                            right:
+                                SplitRightPane::GroupList {
+                                    selected,
+                                    selected_mask,
+                                },
+                            ..
+                        },
+                } => {
+                    let ids: Vec<String> = selected_mask
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, m)| *m)
+                        .filter_map(|(i, _)| state.groups.get(i).map(|g| g.id.clone()))
+                        .collect();
+                    let sel = *selected;
+                    if ids.is_empty() {
+                        // Fall back to current selection
+                        state
+                            .groups
+                            .get(sel)
+                            .map(|g| vec![g.id.clone()])
+                            .unwrap_or_default()
+                    } else {
+                        ids
+                    }
+                }
+                _ => return,
+            };
+            for group_id in ids_from_mask {
+                crate::ops::subscriptions::delete_group(state, &group_id).await;
+            }
+            // Clamp selected after deletion
+            let new_max = state.groups.len().saturating_sub(1);
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupList {
+                                ref mut selected, ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *selected > new_max && new_max > 0 {
+                    *selected = new_max;
+                } else if new_max == 0 {
+                    *selected = 0;
+                }
+            }
+        }
+        KeyCode::Char('u' | 'U') => {
+            crate::ops::subscriptions::update_all_subscriptions(state);
+        }
+        KeyCode::Esc => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        ref mut right,
+                        ref mut focus,
+                        ..
+                    },
+            } = state.mode
+            {
+                *right = SplitRightPane::Empty;
+                *focus = SplitFocus::Tree;
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
+    let (group_id, _focus_index, max_index) = match &state.mode {
+        AppMode::Settings {
+            mode:
+                SettingsMode::Split {
+                    right: SplitRightPane::GroupForm { group_id, focus_index, fields, .. },
+                    ..
+                },
+        } => (
+            group_id.clone(),
+            *focus_index,
+            fields.len().saturating_sub(1),
+        ),
+        _ => return,
+    };
+
+    match key.code {
+        KeyCode::Tab => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index < max_index {
+                    *focus_index += 1;
+                }
+            }
+        }
+        KeyCode::BackTab => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index > 0 {
+                    *focus_index -= 1;
+                }
+            }
+        }
+        KeyCode::Enter => {
+            // Save the form
+            if group_id.is_some() {
+                crate::ops::subscriptions::confirm_edit_group(state).await;
+            } else {
+                crate::ops::subscriptions::confirm_add_group(state).await;
+            }
+        }
+        KeyCode::Esc => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        ref mut right,
+                        ref mut focus,
+                        ..
+                    },
+            } = state.mode
+            {
+                *right = SplitRightPane::GroupList {
+                    selected: 0,
+                    selected_mask: vec![false; state.groups.len()],
+                };
+                *focus = SplitFocus::Right;
+            }
+        }
+        KeyCode::Up => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index > 0 {
+                    *focus_index -= 1;
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index < max_index {
+                    *focus_index += 1;
+                }
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut fields,
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index >= fields.len() {
+                    return;
+                }
+                // core_type field: cycle on any char (toggle mode)
+                let key_name = match *focus_index {
+                    4 => "core_type",
+                    _ => "",
+                };
+                if key_name == "core_type" {
+                    const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
+                    let (_, ref mut val) = fields[*focus_index];
+                    let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                    val.clear();
+                    val.push_str(OPTIONS[(idx + 1) % OPTIONS.len()]);
+                } else {
+                    let (_, ref mut val) = fields[*focus_index];
+                    val.push(c);
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut fields,
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index < fields.len() {
+                    let (_, ref mut val) = fields[*focus_index];
+                    val.pop();
+                }
+            }
+        }
+        KeyCode::Right | KeyCode::Left => {
+            // core_type field: cycle through options on Left/Right
+            if let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        right:
+                            SplitRightPane::GroupForm {
+                                ref mut fields,
+                                ref mut focus_index,
+                                ..
+                            },
+                        ..
+                    },
+            } = state.mode
+            {
+                if *focus_index == 4 && *focus_index < fields.len() {
+                    const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
+                    let (_, ref mut val) = fields[*focus_index];
+                    let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                    let next = OPTIONS[if key.code == KeyCode::Right {
+                        (idx + 1) % OPTIONS.len()
+                    } else if idx == 0 {
+                        OPTIONS.len() - 1
+                    } else {
+                        idx - 1
+                    }];
+                    val.clear();
+                    val.push_str(next);
+                }
+            }
+        }
+        _ => {}
+}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

@@ -50,6 +50,8 @@ pub struct AppState {
     /// Purgatory retention in seconds (default 30 days).
     pub purgatory_retention_secs: i64,
     pub selected_index: usize,
+    /// Optional protocol sub-row index for expanded endpoint tree navigation.
+    pub selected_sub: Option<usize>,
     /// Scroll offset from the bottom of the log buffer (0 = newest visible).
     pub log_scroll: usize,
     pub sort_column: SortColumn,
@@ -209,6 +211,7 @@ impl AppState {
             purgatory_ttl_secs,
             purgatory_retention_secs,
 
+            selected_sub: None,
             selected_index: 0,
             log_scroll: 0,
             sort_column: SortColumn::Remarks,
@@ -463,6 +466,19 @@ impl AppState {
     pub fn collapse_expand(&mut self) {
         profiles::collapse_expand(self);
     }
+    pub fn nav_protocol_down(&mut self) -> bool {
+        profiles::nav_protocol_down(self)
+    }
+    pub fn nav_protocol_up(&mut self) -> bool {
+        profiles::nav_protocol_up(self)
+    }
+    pub fn is_on_sub_row(&self) -> bool {
+        profiles::is_on_sub_row(self)
+    }
+    /// Get the protocol ID for the currently selected sub-row.
+    pub fn selected_sub_protocol_id(&self) -> Option<i64> {
+        profiles::selected_sub_protocol_id(self)
+    }
 
     fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
         let proto_kind = match protocol {
@@ -642,7 +658,7 @@ impl AppState {
     async fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
         use crate::SettingsSection::{
             Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-            SystemProxy, Tun, Updates,
+            Subscriptions, SystemProxy, Tun, Updates,
         };
         match section {
             Core => {
@@ -918,13 +934,14 @@ impl AppState {
                     humantime::format_duration(*self.config.logging.ttl_secs).to_string(),
                 )]
             }
+            Subscriptions => vec![],
         }
     }
 
     fn apply_settings_fields(&mut self, section: SettingsSection, fields: &[(String, String)]) {
         use crate::SettingsSection::{
             Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-            SystemProxy, Tun, Updates,
+            Subscriptions, SystemProxy, Tun, Updates,
         };
         let get_str = |key: &str| -> &str {
             fields
@@ -1037,7 +1054,7 @@ impl AppState {
                 }
             }
             // Dns and Routing are handled separately (DB-backed)
-            Dns | Routing | Updates => {}
+            Dns | Routing | Updates | Subscriptions => {}
             Logging => {
                 if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                     *self.config.logging.ttl_secs = d;

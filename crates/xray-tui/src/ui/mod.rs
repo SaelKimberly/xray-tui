@@ -1,6 +1,5 @@
 pub mod actions_log;
 pub mod add_server;
-pub mod groups;
 pub mod logs;
 pub mod palette_bridge;
 pub mod profiles;
@@ -184,7 +183,7 @@ async fn handle_mouse(mouse: &MouseEvent, state: &mut AppState) {
 }
 async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // Delete confirmation: only y/n/esc — check before mode dispatch so
-    // confirmation is handled even when inside a sub-mode like ManageGroups.
+    // confirmation is handled even when inside a sub-mode like settings.
     if state.confirmation.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => match state.confirmation.take() {
@@ -216,30 +215,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // F1 toggles actions panel compact/full — works across all modes
     if matches!(key.code, KeyCode::F(1)) {
         state.actions_compact = !state.actions_compact;
-        return;
-    }
-
-    // Group management overlay mode: pass to groups handler
-    if matches!(&state.mode, crate::AppMode::ManageGroups { .. }) {
-        groups::handle_key(state, key).await;
-        return;
-    }
-
-    // Group form mode: route to groups handler (with Ctrl+C quit)
-    if matches!(
-        &state.mode,
-        crate::AppMode::AddGroup { .. } | crate::AppMode::EditGroup { .. }
-    ) {
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if state.connected_core.is_some() && state.confirmation.is_none() {
-                    state.confirmation = Some(ConfirmAction::Quit);
-                } else {
-                    state.should_quit = true;
-                }
-            }
-            _ => groups::handle_key(state, key).await,
-        }
         return;
     }
 
@@ -479,28 +454,36 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
         }
         KeyCode::Up if state.current_tab == Tab::Profiles => {
-            state.selected_index = state.selected_index.saturating_sub(1);
+            if !state.nav_protocol_up() {
+                state.selected_index = state.selected_index.saturating_sub(1);
+            }
         }
         KeyCode::Down if state.current_tab == Tab::Profiles => {
-            let max = state.filtered_len().saturating_sub(1);
-            if state.selected_index < max {
-                state.selected_index += 1;
+            if !state.nav_protocol_down() {
+                let max = state.filtered_len().saturating_sub(1);
+                if state.selected_index < max {
+                    state.selected_index += 1;
+                }
             }
         }
         KeyCode::Home if state.current_tab == Tab::Profiles => {
             state.selected_index = 0;
+            state.selected_sub = None;
         }
         KeyCode::End if state.current_tab == Tab::Profiles => {
             state.selected_index = state.filtered_len().saturating_sub(1);
+            state.selected_sub = None;
         }
         KeyCode::PageUp if state.current_tab == Tab::Profiles => {
             let page = state.term_height.get().saturating_sub(5) as usize;
             state.selected_index = state.selected_index.saturating_sub(page);
+            state.selected_sub = None;
         }
         KeyCode::PageDown if state.current_tab == Tab::Profiles => {
             let page = state.term_height.get().saturating_sub(5) as usize;
             let max = state.filtered_len().saturating_sub(1);
             state.selected_index = (state.selected_index + page).min(max);
+            state.selected_sub = None;
         }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -529,7 +512,18 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.collapse_expand();
         }
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
-            if let Some(id) = state.selected_profile_id() {
+            if state.is_on_sub_row() {
+                // Set manual protocol override on sub-row
+                let ep_id = state.selected_profile_id();
+                let proto_id = state.selected_sub_protocol_id();
+                if let (Some(ep), Some(p)) = (ep_id, proto_id) {
+                    if let Err(e) = state.db.set_protocol_override(ep, p).await {
+                        state.log_trace("error", "tui", &format!("Failed to set protocol override: {e}"));
+                    }
+                    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
+                    state.filter_cache_valid.set(false);
+                }
+            } else if let Some(id) = state.selected_profile_id() {
                 state.set_active(&id.to_string()).await;
             }
         }
@@ -614,7 +608,14 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
         }
         KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
-            state.mode = AppMode::ManageGroups { selected: 0 };
+            state.enter_settings();
+            let pane = state.build_right_pane(crate::SettingsSection::Subscriptions).await;
+            if let crate::AppMode::Settings {
+                mode: crate::SettingsMode::Split { right, focus, .. },
+            } = &mut state.mode {
+                *right = pane;
+                *focus = crate::SplitFocus::Right;
+            }
         }
         KeyCode::Char('p' | 'P') if state.current_tab == Tab::Profiles => {
             state.cycle_purgatory_view();
@@ -752,15 +753,11 @@ fn render(frame: &mut Frame, state: &AppState) {
     } else {
         actions_log::render_full(frame, chunks[2], state);
     }
-    // Render tabs — only in modes that show them (not AddServer, EditServer, ImportUrl, Group forms, BatchImport)
     let is_form_mode = matches!(
         &state.mode,
         crate::AppMode::AddServer { .. }
             | crate::AppMode::EditServer { .. }
             | crate::AppMode::ImportUrl { .. }
-            | crate::AppMode::ManageGroups { .. }
-            | crate::AppMode::AddGroup { .. }
-            | crate::AppMode::EditGroup { .. }
             | crate::AppMode::BatchImport { .. }
     );
     if !is_form_mode {
@@ -810,15 +807,6 @@ fn render(frame: &mut Frame, state: &AppState) {
             crate::AppMode::ImportUrl { .. } => {
                 add_server::render_import_url(frame, chunks[1], state);
             }
-            crate::AppMode::ManageGroups { .. } => {
-                groups::render_group_overlay(frame, chunks[1], state);
-            }
-            crate::AppMode::AddGroup { .. } => {
-                groups::render_group_form(frame, chunks[1], state, false);
-            }
-            crate::AppMode::EditGroup { .. } => {
-                groups::render_group_form(frame, chunks[1], state, true);
-            }
             crate::AppMode::BatchImport { .. } => {
                 add_server::render_batch_import(frame, chunks[1], state);
             }
@@ -863,9 +851,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("a", "Add new server"),
                     ("e", "Edit selected server"),
                     ("d", "Delete selected server(s)"),
-                    ("P", "Cycle view: Active/Stale/All"),
-                    ("g", "Manage subscription groups"),
-                    ("[ / ]", "Cycle groups"),
+                    ("g", "Open subscriptions settings"),
                     ("t", "Open speed test menu"),
                     ("o", "Cycle sort column"),
                     ("/", "Search/filter"),
