@@ -25,7 +25,7 @@
 //! - `insecure` accepts aliases: `insecure`, `allow_insecure`, `allowInsecure`
 //! - `protocol` accepts alias `type`
 //! - `up_mbps` accepts alias `upmbps`; `down_mbps` accepts alias `downmbps`
-//! - Default up_mbps/down_mbps of 100 are not stored
+//! - Default `up_mbps/down_mbps` of 100 are not stored
 //! - IPv6 addresses must be bracketed
 //!
 //! # References
@@ -38,15 +38,15 @@ use std::{fmt::Write, num::NonZeroU64};
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
-use crate::clash::{ClashProxy, ClashHysteria1};
+use crate::clash::{ClashHysteria1, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{clash_server_to_host, clash_tls_to_security, host_spec_to_string};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,22 +94,20 @@ impl ProtoSpec for Hysteria1Config {
         };
 
         // Port defaults to 443 when not specified in the URL
-        let (parsed_host, parsed_port) =
-            if let Ok((h, p)) = utils::parse_hostport(hostport)
-                && let Some(port) = p.first()
-            {
-                (h, port)
-            } else {
-                // No port in hostport — parse as bare host, default port to 443
-                let host = utils::parse_host(hostport)?;
-                (host, 443)
-            };
+        let (parsed_host, parsed_port) = if let Ok((h, p)) = utils::parse_hostport(hostport)
+            && let Some(port) = p.first()
+        {
+            (h, port)
+        } else {
+            // No port in hostport — parse as bare host, default port to 443
+            let host = utils::parse_host(hostport)?;
+            (host, 443)
+        };
 
         let query = utils::parse_query(raw.query);
 
         // protocol: "protocol" or "type" (udp, wechat-video, faketcp)
-        let protocol =
-            utils::query_get_multi(&query, &["protocol", "type"]).map(TinyText::from);
+        let protocol = utils::query_get_multi(&query, &["protocol", "type"]).map(TinyText::from);
 
         // obfs: obfuscation type (e.g., xplus, salamander)
         let obfs = utils::query_get(&query, "obfs").map(TinyText::from);
@@ -204,8 +202,7 @@ impl ProtoSpec for Hysteria1Config {
         base.push_str(&query_string);
 
         if let Some(remarks) = &self.remarks {
-            let frag =
-                urlencoding::decode(remarks).unwrap_or(std::borrow::Cow::Borrowed(remarks));
+            let frag = urlencoding::decode(remarks).unwrap_or(std::borrow::Cow::Borrowed(remarks));
             let frag = frag.trim();
             if !frag.is_empty() {
                 _ = write!(base, "#{}", urlencoding::encode(frag));
@@ -265,35 +262,42 @@ impl ProtoSpec for Hysteria1Config {
 
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Hysteria(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    auth: match c.auth_str.as_str() { "" => None, s => Some(s.to_string()) },
-                    protocol: c.protocol.clone().map(TinyText::from),
-                    obfs: c.obfs.clone().map(TinyText::from),
-                    up_mbps: c.up.as_ref()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|&v| v != 100),
-                    down_mbps: c.down.as_ref()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|&v| v != 100),
-                    security: clash_tls_to_security(
-                        Some(true),
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        c.alpn.as_deref().and_then(|v| v.first().map(|s| s.as_str())),
-                        None,
-                        None,
-                    ),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
+            ClashProxy::Hysteria(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                auth: match c.auth_str.as_str() {
+                    "" => None,
+                    s => Some(s.to_string()),
+                },
+                protocol: c.protocol.clone().map(TinyText::from),
+                obfs: c.obfs.clone().map(TinyText::from),
+                up_mbps: c
+                    .up
+                    .as_ref()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&v| v != 100),
+                down_mbps: c
+                    .down
+                    .as_ref()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&v| v != 100),
+                security: clash_tls_to_security(
+                    Some(true),
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    c.alpn
+                        .as_deref()
+                        .and_then(|v| v.first().map(std::string::String::as_str)),
+                    None,
+                    None,
+                ),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+            }),
             _ => Err(ParseError::Unknown("expected hysteria1 clash proxy".into())),
         }
     }
@@ -307,12 +311,12 @@ impl ProtoSpec for Hysteria1Config {
             port: self.port,
             auth_str: self.auth.clone().unwrap_or_default(),
             ports: None,
-            obfs: self.obfs.as_ref().map(|s| s.to_string()),
-            protocol: self.protocol.as_ref().map(|s| s.to_string()),
+            obfs: self.obfs.as_ref().map(std::string::ToString::to_string),
+            protocol: self.protocol.as_ref().map(std::string::ToString::to_string),
             up: self.up_mbps.map(|v| v.to_string()),
             down: self.down_mbps.map(|v| v.to_string()),
             alpn: alpn_str.map(|s| vec![s.to_string()]),
-            servername: self.security.sni().map(|s| s.to_string()),
+            servername: self.security.sni().map(std::string::ToString::to_string),
             skip_cert_verify: self.security.insecure(),
         }))
     }
@@ -346,8 +350,8 @@ impl Hysteria1Config {
 mod tests {
     use super::super::ProtoSpec;
     use super::Hysteria1Config;
+    use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
-use crate::urlx::PortSpec;
 
     #[test]
     fn test_hysteria1_basic() {
@@ -451,7 +455,8 @@ use crate::urlx::PortSpec;
 
     #[test]
     fn test_serde_roundtrip() {
-        let input = "hysteria://example.com:443?protocol=udp&up_mbps=200&insecure=1&sni=real.example.com";
+        let input =
+            "hysteria://example.com:443?protocol=udp&up_mbps=200&insecure=1&sni=real.example.com";
         let raw = crate::urlx::RawUrlX::from(input);
         let parsed = Hysteria1Config::try_parse(&raw).expect("failed to parse");
         let json = serde_json::to_string(&parsed).expect("serialize");

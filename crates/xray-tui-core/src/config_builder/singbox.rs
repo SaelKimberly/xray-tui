@@ -128,7 +128,7 @@ impl SingBoxConfigBuilder {
                 }),
             }),
         })
-}
+    }
 }
 
 fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<Value, BuildError> {
@@ -658,7 +658,9 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
 }
 
 fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
-    if let Ok(config) = serde_json::from_slice::<xray_tui_proto::proto_spec::ProtocolConfig>(&protocol.spec_blob) {
+    if let Ok(config) =
+        serde_json::from_slice::<xray_tui_proto::proto_spec::ProtocolConfig>(&protocol.spec_blob)
+    {
         return config.to_settings();
     }
     let extra: Value = serde_json::from_slice(&protocol.spec_blob).unwrap_or_else(|_| json!({}));
@@ -876,16 +878,14 @@ mod tests {
     fn set_protocol_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
         let mut extra: serde_json::Value =
             serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["protocol_settings"] =
-            serde_json::from_str(json_str).unwrap_or_default();
+        extra["protocol_settings"] = serde_json::from_str(json_str).unwrap_or_default();
         protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
     }
 
     fn set_stream_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
         let mut extra: serde_json::Value =
             serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["stream_settings"] =
-            serde_json::from_str(json_str).unwrap_or_default();
+        extra["stream_settings"] = serde_json::from_str(json_str).unwrap_or_default();
         protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
     }
 
@@ -922,7 +922,8 @@ mod tests {
     fn singbox_tuic_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "tuic");
@@ -932,11 +933,13 @@ mod tests {
     #[test]
     fn singbox_hysteria2_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
-        set_protocol_settings_json(&mut protocol, 
+        set_protocol_settings_json(
+            &mut protocol,
             r#"{"password": "sekret", "up_mbps": 50, "down_mbps": 200}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "hysteria2");
@@ -950,7 +953,8 @@ mod tests {
     fn singbox_shadowsocks_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
@@ -960,7 +964,8 @@ mod tests {
     fn singbox_socks_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Socks.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "socks");
@@ -970,7 +975,8 @@ mod tests {
     fn singbox_http_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Http.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "http");
@@ -981,7 +987,8 @@ mod tests {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         set_protocol_settings_json(&mut protocol, r#"{"password": "pass123"}"#);
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let proxy = &json["outbounds"].as_array().unwrap()[0];
         assert_eq!(proxy["tls"]["enabled"], true);
@@ -993,7 +1000,8 @@ mod tests {
     fn singbox_default_inbound() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 1);
@@ -1005,7 +1013,8 @@ mod tests {
     fn singbox_experimental_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let exp = &json["experimental"];
         let v2ray = &exp["v2ray_api"];
@@ -1023,7 +1032,8 @@ mod tests {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (mut params, rules, dns) = default_params();
         params.clash_api_enabled = true;
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let exp = &json["experimental"];
         // clash_api should be present when clash_api_enabled is true
@@ -1039,9 +1049,13 @@ mod tests {
     fn singbox_shadowsocksr_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::ShadowsocksR.to_i32());
         protocol.config_type = Protocol::ShadowsocksR.to_i32();
-        set_protocol_settings_json(&mut protocol, r#"{"method":"aes-256-cfb","obfs":"tls1.2_ticket_auth","obfs_param":"www.example.com","protocol":"auth_aes128_md5","protocol_param":"test"}"#);
+        set_protocol_settings_json(
+            &mut protocol,
+            r#"{"method":"aes-256-cfb","obfs":"tls1.2_ticket_auth","obfs_param":"www.example.com","protocol":"auth_aes128_md5","protocol_param":"test"}"#,
+        );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocksr");
@@ -1055,11 +1069,13 @@ mod tests {
     fn singbox_hysteria_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria.to_i32());
         protocol.config_type = Protocol::Hysteria.to_i32();
-        set_protocol_settings_json(&mut protocol, 
-            r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#
+        set_protocol_settings_json(
+            &mut protocol,
+            r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "hysteria");
@@ -1077,7 +1093,8 @@ mod tests {
         protocol.config_type = Protocol::Naive.to_i32();
         set_protocol_settings_json(&mut protocol, r#"{"user":"me","password":"pass456"}"#);
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "naive");
@@ -1088,11 +1105,13 @@ mod tests {
     fn singbox_anytls_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::AnyTls.to_i32());
         protocol.config_type = Protocol::AnyTls.to_i32();
-        set_protocol_settings_json(&mut protocol, 
+        set_protocol_settings_json(
+            &mut protocol,
             r#"{"password":"any-secret","sni":"tls.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "anytls");
@@ -1103,11 +1122,13 @@ mod tests {
     fn singbox_shadowtls_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::ShadowTls.to_i32());
         protocol.config_type = Protocol::ShadowTls.to_i32();
-        set_protocol_settings_json(&mut protocol, 
+        set_protocol_settings_json(
+            &mut protocol,
             r#"{"password":"shadow-pw","version":"3","sni":"shadow.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "shadowtls");
@@ -1120,7 +1141,8 @@ mod tests {
     fn singbox_tor_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tor.to_i32());
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "tor");
@@ -1130,11 +1152,13 @@ mod tests {
     #[test]
     fn singbox_ssh_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Ssh.to_i32());
-        set_protocol_settings_json(&mut protocol, 
+        set_protocol_settings_json(
+            &mut protocol,
             r#"{"host":"ssh.example.com","ssh_port":2222,"username":"admin","password":"ssh-pw"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "ssh");
@@ -1148,11 +1172,13 @@ mod tests {
     #[test]
     fn singbox_tailscale_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Tailscale.to_i32());
-        set_protocol_settings_json(&mut protocol, 
+        set_protocol_settings_json(
+            &mut protocol,
             r#"{"auth_key":"tskey-auth-xxxx","control_url":"https://control.tailscale.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "tailscale");
@@ -1162,11 +1188,13 @@ mod tests {
     #[test]
     fn singbox_vmess_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        set_stream_settings_json(&mut protocol, 
+        set_stream_settings_json(
+            &mut protocol,
             r#"{"tls.enable":true,"sni":"vmess.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "vmess");
@@ -1180,11 +1208,13 @@ mod tests {
     #[test]
     fn singbox_vless_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        set_protocol_settings_json(&mut protocol, 
+        set_protocol_settings_json(
+            &mut protocol,
             r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "vless");
@@ -1197,11 +1227,13 @@ mod tests {
     #[test]
     fn singbox_trojan_config() {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Trojan.to_i32());
-        set_stream_settings_json(&mut protocol, 
+        set_stream_settings_json(
+            &mut protocol,
             r#"{"tls.enable":true,"sni":"trojan.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "trojan");
@@ -1215,11 +1247,15 @@ mod tests {
     #[test]
     fn singbox_wireguard_config() {
         let (mut endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::WireGuard.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820"}"#);
+        set_protocol_settings_json(
+            &mut protocol,
+            r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820"}"#,
+        );
         endpoint.host = String::new();
         endpoint.port = 0;
         let (params, rules, dns) = default_params();
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "wireguard");
@@ -1266,7 +1302,8 @@ mod tests {
             rule_set_url: None,
             sort_order: Some(0),
         }];
-        let config = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let route = &json["route"];
         assert_eq!(route["rules"].as_array().unwrap().len(), 1);

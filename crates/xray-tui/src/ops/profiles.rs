@@ -1,23 +1,19 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
 
-use tracing::warn;
-
+use crate::ProfileRow;
+use xray_tui_config::import_export::{
+    Profile, ValidationSettings, encode_profile_spec, profile_config,
+};
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{CoreType, resolve_core};
-use xray_tui_config::import_export::{encode_profile_spec, profile_config, ValidationSettings, Profile};
-use xray_tui_config::AppConfig;
-use crate::ProfileRow;
-use xray_tui_db::Database;
 
 use crate::AppState;
-use crate::types::*;
-use crate::{common_field_defaults, get_field, profile_to_fields, try_send_or_warn};
 use crate::state::profile_to_endpoint_protocol;
-use xray_tui_proto::proto_spec::ProtoSpec;
+use crate::types::{AppMode, BatchImportItem, SortColumn};
+use crate::{common_field_defaults, profile_to_fields};
 use xray_tui_db::models::{ProfileExtension, ServerStat};
+use xray_tui_proto::proto_spec::ProtoSpec;
 
 pub async fn reload_profiles(state: &mut AppState) {
     match state.db.get_active_endpoints(0).await {
@@ -75,9 +71,7 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
                 let q = state.search_query.to_lowercase();
                 let address = row.endpoint.host.clone();
                 let port = row.endpoint.port.to_string();
-                if !address.to_lowercase().contains(&q)
-                    && !port.contains(&q)
-                {
+                if !address.to_lowercase().contains(&q) && !port.contains(&q) {
                     let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
                     if !remarks.to_lowercase().contains(&q) {
                         return false;
@@ -94,7 +88,10 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
         let a_row = &state.profiles[a];
         let b_row = &state.profiles[b];
         let cmp = match state.sort_column {
-            SortColumn::ConfigType => a_row.active_protocol().config_type.cmp(&b_row.active_protocol().config_type),
+            SortColumn::ConfigType => a_row
+                .active_protocol()
+                .config_type
+                .cmp(&b_row.active_protocol().config_type),
             SortColumn::Remarks => {
                 let a_rem = a_row.active_protocol().remarks.clone().unwrap_or_default();
                 let b_rem = b_row.active_protocol().remarks.clone().unwrap_or_default();
@@ -103,13 +100,29 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
             SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
             SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
             SortColumn::Delay => {
-                let da = a_row.extensions.get(&a_row.active_protocol().id).and_then(|e| e.delay).unwrap_or(-1);
-                let db = b_row.extensions.get(&b_row.active_protocol().id).and_then(|e| e.delay).unwrap_or(-1);
+                let da = a_row
+                    .extensions
+                    .get(&a_row.active_protocol().id)
+                    .and_then(|e| e.delay)
+                    .unwrap_or(-1);
+                let db = b_row
+                    .extensions
+                    .get(&b_row.active_protocol().id)
+                    .and_then(|e| e.delay)
+                    .unwrap_or(-1);
                 da.cmp(&db)
             }
             SortColumn::Speed => {
-                let sa = a_row.extensions.get(&a_row.active_protocol().id).and_then(|e| e.speed).unwrap_or(-1);
-                let sb = b_row.extensions.get(&b_row.active_protocol().id).and_then(|e| e.speed).unwrap_or(-1);
+                let sa = a_row
+                    .extensions
+                    .get(&a_row.active_protocol().id)
+                    .and_then(|e| e.speed)
+                    .unwrap_or(-1);
+                let sb = b_row
+                    .extensions
+                    .get(&b_row.active_protocol().id)
+                    .and_then(|e| e.speed)
+                    .unwrap_or(-1);
                 sa.cmp(&sb)
             }
             SortColumn::Traffic => {
@@ -164,7 +177,8 @@ pub fn cycle_group(state: &mut AppState, _dir: i8) {
 }
 
 pub fn resolved_core(state: &AppState, row: &ProfileRow) -> CoreType {
-    let protocol = Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
+    let protocol =
+        Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
     let profile_override = row.active_protocol().core_type.parse::<CoreType>().ok();
     let config_override = state
         .config
@@ -189,7 +203,7 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
     let protocol_id: i64 = id.parse().unwrap_or(0);
     match state.db.get_active_endpoints(86400).await {
         Ok(rows) => {
-            if let Some(row) = rows.iter().find(|r| r.endpoint.id == protocol_id) {
+            if let Some(_row) = rows.iter().find(|r| r.endpoint.id == protocol_id) {
                 state.mode = AppMode::EditServer {
                     protocol_id,
                     fields: Vec::new(),
@@ -310,15 +324,15 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
         }
     }
 
-    let protocol_settings_str = if !proto_map.is_empty() {
+    let protocol_settings_str = if proto_map.is_empty() {
+        None
+    } else {
         Some(serde_json::to_string(&proto_map).unwrap_or_default())
-    } else {
-        None
     };
-    let stream_settings_str = if !stream_map.is_empty() {
-        Some(serde_json::to_string(&stream_map).unwrap_or_default())
-    } else {
+    let stream_settings_str = if stream_map.is_empty() {
         None
+    } else {
+        Some(serde_json::to_string(&stream_map).unwrap_or_default())
     };
 
     let mut profile = Profile {
@@ -347,20 +361,18 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
     if let Some(v) = &user_id {
         extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = &protocol_settings_str {
-        if let Ok(val) = serde_json::from_str(v) {
-            extra.insert("protocol_settings".into(), val);
-        }
+    if let Some(v) = &protocol_settings_str
+        && let Ok(val) = serde_json::from_str(v)
+    {
+        extra.insert("protocol_settings".into(), val);
     }
-    if let Some(v) = &stream_settings_str {
-        if let Ok(val) = serde_json::from_str(v) {
-            extra.insert("stream_settings".into(), val);
-        }
+    if let Some(v) = &stream_settings_str
+        && let Ok(val) = serde_json::from_str(v)
+    {
+        extra.insert("stream_settings".into(), val);
     }
-    profile.spec_blob = encode_profile_spec(
-        &proto_kind,
-        serde_json::to_vec(&extra).unwrap_or_default(),
-    );
+    profile.spec_blob =
+        encode_profile_spec(proto_kind, serde_json::to_vec(&extra).unwrap_or_default());
     profile
 }
 
@@ -425,7 +437,11 @@ pub async fn confirm_add_server(state: &mut AppState) {
     let profile = fields_to_profile(protocol, &fields);
     let group_id = state.selected_group_id.clone().unwrap_or_default();
     let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
-    match state.db.insert_manual_endpoint(&endpoint, &protocol, &group_id).await {
+    match state
+        .db
+        .insert_manual_endpoint(&endpoint, &protocol, &group_id)
+        .await
+    {
         Ok(()) => {
             let remarks = profile_config(&profile)
                 .and_then(|c| c.remarks().map(String::from))
@@ -451,7 +467,9 @@ pub async fn confirm_edit_server(state: &mut AppState) {
     let (protocol_id, address, port, user_id) = {
         let (pid, fields) = match &state.mode {
             AppMode::EditServer {
-                protocol_id, fields, ..
+                protocol_id,
+                fields,
+                ..
             } => (protocol_id, fields),
             _ => return,
         };
@@ -478,7 +496,8 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         errors.insert("port".into(), "Port must be 1-65535".into());
     }
     let protocol = Protocol::try_from_i32(
-        state.db
+        state
+            .db
             .get_endpoint(protocol_id)
             .await
             .ok()
@@ -509,14 +528,25 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         _ => unreachable!(),
     };
 
-    if state.db.get_endpoint(protocol_id).await.ok().flatten().is_none() {
+    if state
+        .db
+        .get_endpoint(protocol_id)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
         state.log_trace("error", "tui", "Profile not found for edit");
         return;
     }
     let new_profile = fields_to_profile(protocol, &fields);
     let (endpoint, protocol_row) = profile_to_endpoint_protocol(&new_profile);
     let group_id = state.selected_group_id.clone().unwrap_or_default();
-    match state.db.subscription_upsert(&group_id, &[(endpoint, vec![protocol_row])]).await {
+    match state
+        .db
+        .subscription_upsert(&group_id, &[(endpoint, vec![protocol_row])])
+        .await
+    {
         Ok(_ids) => {
             let remarks = profile_config(&new_profile)
                 .and_then(|c| c.remarks().map(String::from))
@@ -553,7 +583,11 @@ pub async fn delete_profile(state: &mut AppState, id: i64) {
 pub async fn clone_profile(state: &mut AppState, id: i64) {
     let found = state.profiles.iter().find(|r| r.endpoint.id == id);
     if found.is_none() {
-        state.log_trace("error", "tui", &format!("Profile {id} not found for cloning"));
+        state.log_trace(
+            "error",
+            "tui",
+            &format!("Profile {id} not found for cloning"),
+        );
         return;
     }
     state.log_trace("info", "tui", "Profile cloned");
@@ -572,8 +606,7 @@ pub fn import_url(state: &mut AppState, url: &str) {
     match xray_tui_config::import_export::parse_share_url(url, &settings) {
         Ok(parsed) => {
             let profile = Profile::from(&parsed);
-            let protocol =
-                Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
+            let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
             let fields = profile_to_fields(&profile);
             state.mode = AppMode::AddServer {
                 protocol: Some(protocol),
@@ -630,7 +663,12 @@ pub async fn confirm_batch_import(state: &mut AppState) {
     for item in items {
         if let Some(profile) = item.profile {
             let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
-            if state.db.insert_manual_endpoint(&endpoint, &protocol, &group_id).await.is_ok() {
+            if state
+                .db
+                .insert_manual_endpoint(&endpoint, &protocol, &group_id)
+                .await
+                .is_ok()
+            {
                 imported += 1;
             } else {
                 errors += 1;
@@ -653,7 +691,7 @@ pub async fn move_profile_up(state: &mut AppState) {
     };
     let filtered: Vec<&ProfileRow> = filtered_profiles(state).collect();
     let idx = filtered.iter().position(|r| r.endpoint.id == id);
-    let idx = match idx {
+    let _idx = match idx {
         Some(i) if i > 0 => i,
         _ => return,
     };
@@ -669,7 +707,7 @@ pub async fn move_profile_down(state: &mut AppState) {
         None => return,
     };
     let filtered: Vec<&ProfileRow> = filtered_profiles(state).collect();
-    let idx = match filtered.iter().position(|r| r.endpoint.id == id) {
+    let _idx = match filtered.iter().position(|r| r.endpoint.id == id) {
         Some(i) if i < filtered.len() - 1 => i,
         _ => return,
     };
@@ -681,7 +719,7 @@ pub async fn move_profile_down(state: &mut AppState) {
 
 pub async fn set_active(state: &mut AppState, id: &str) {
     let pid: i64 = id.parse().unwrap_or(0);
-    let group_id = state.selected_group_id.clone().unwrap_or_default();
+    let _group_id = state.selected_group_id.clone().unwrap_or_default();
     if let Err(e) = state.db.set_protocol_override(pid, 0).await {
         state.log_trace("error", "tui", &format!("Failed to set active: {e}"));
         return;

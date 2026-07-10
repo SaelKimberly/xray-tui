@@ -1,14 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use ratatui_cheese::tree::TreeState;
 use xray_tui_core::CoreType;
 use xray_tui_db::models::{DnsSetting, RoutingRule};
-use xray_tui_db::Database;
-use ratatui_cheese::tree::TreeState;
 
 use crate::AppState;
-use crate::types::*;
-use crate::{get_field, try_send_or_warn};
+use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
 
 pub fn cancel_form(state: &mut AppState) {
     state.mode = AppMode::List;
@@ -24,7 +22,10 @@ pub fn enter_settings(state: &mut AppState) {
     };
 }
 
-pub async fn build_settings_fields(state: &AppState, section: SettingsSection) -> Vec<(String, String)> {
+pub async fn build_settings_fields(
+    state: &AppState,
+    section: SettingsSection,
+) -> Vec<(String, String)> {
     use crate::SettingsSection::{
         Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
         SystemProxy, Tun, Updates,
@@ -32,72 +33,200 @@ pub async fn build_settings_fields(state: &AppState, section: SettingsSection) -
     match section {
         Core => {
             vec![
-                ("xray_path".into(), state.config.core.xray_path.clone().unwrap_or_default()),
-                ("sing_box_path".into(), state.config.core.sing_box_path.clone().unwrap_or_default()),
-                ("default_core".into(), state.config.core.core_type.map(|c| c.to_string()).unwrap_or_else(|| "Auto".into())),
+                (
+                    "xray_path".into(),
+                    state.config.core.xray_path.clone().unwrap_or_default(),
+                ),
+                (
+                    "sing_box_path".into(),
+                    state.config.core.sing_box_path.clone().unwrap_or_default(),
+                ),
+                (
+                    "default_core".into(),
+                    state
+                        .config
+                        .core
+                        .core_type
+                        .map_or_else(|| "Auto".into(), |c| c.to_string()),
+                ),
                 ("log_level".into(), state.config.core.log_level.clone()),
             ]
         }
         Gui => {
             vec![
                 ("language".into(), state.config.gui.language.clone()),
-                ("theme".into(), state.config.gui.theme.clone().unwrap_or_default()),
-                ("refresh_interval".into(), humantime::format_duration(*state.config.gui.refresh_interval_secs).to_string()),
+                (
+                    "theme".into(),
+                    state.config.gui.theme.clone().unwrap_or_default(),
+                ),
+                (
+                    "refresh_interval".into(),
+                    humantime::format_duration(*state.config.gui.refresh_interval_secs).to_string(),
+                ),
             ]
         }
         Inbound => {
             vec![
-                ("socks_port".into(), state.config.inbound.socks_port.to_string()),
-                ("http_port".into(), state.config.inbound.http_port.map(|p| p.to_string()).unwrap_or_default()),
-                ("mixed_port".into(), state.config.inbound.mixed_port.map(|p| p.to_string()).unwrap_or_default()),
+                (
+                    "socks_port".into(),
+                    state.config.inbound.socks_port.to_string(),
+                ),
+                (
+                    "http_port".into(),
+                    state
+                        .config
+                        .inbound
+                        .http_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "mixed_port".into(),
+                    state
+                        .config
+                        .inbound
+                        .mixed_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                ),
                 ("listen".into(), state.config.inbound.listen.clone()),
                 ("sniffing".into(), state.config.inbound.sniffing.to_string()),
             ]
         }
         SystemProxy => {
             vec![
-                ("enabled".into(), state.config.system_proxy.enabled.to_string()),
-                ("http_port".into(), state.config.system_proxy.http_port.map(|p| p.to_string()).unwrap_or_default()),
-                ("socks_port".into(), state.config.system_proxy.socks_port.map(|p| p.to_string()).unwrap_or_default()),
-                ("bypass".into(), state.config.system_proxy.bypass.clone().unwrap_or_default()),
+                (
+                    "enabled".into(),
+                    state.config.system_proxy.enabled.to_string(),
+                ),
+                (
+                    "http_port".into(),
+                    state
+                        .config
+                        .system_proxy
+                        .http_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "socks_port".into(),
+                    state
+                        .config
+                        .system_proxy
+                        .socks_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "bypass".into(),
+                    state.config.system_proxy.bypass.clone().unwrap_or_default(),
+                ),
             ]
         }
         Tun => {
             vec![
                 ("enabled".into(), state.config.tun.enabled.to_string()),
-                ("interface_name".into(), state.config.tun.interface_name.clone().unwrap_or_default()),
-                ("mtu".into(), state.config.tun.mtu.map(|m| m.to_string()).unwrap_or_default()),
+                (
+                    "interface_name".into(),
+                    state.config.tun.interface_name.clone().unwrap_or_default(),
+                ),
+                (
+                    "mtu".into(),
+                    state
+                        .config
+                        .tun
+                        .mtu
+                        .map(|m| m.to_string())
+                        .unwrap_or_default(),
+                ),
             ]
         }
         Mux => {
             vec![
                 ("enabled".into(), state.config.mux.enabled.to_string()),
-                ("concurrency".into(), state.config.mux.concurrency.map(|c| c.to_string()).unwrap_or_default()),
-                ("fragment_enabled".into(), state.config.mux.fragment_enabled.to_string()),
-                ("fragment_packets".into(), state.config.mux.fragment_packets.clone().unwrap_or_default()),
-                ("fragment_length".into(), state.config.mux.fragment_length.clone().unwrap_or_default()),
-                ("fragment_interval".into(), state.config.mux.fragment_interval.clone().unwrap_or_default()),
+                (
+                    "concurrency".into(),
+                    state
+                        .config
+                        .mux
+                        .concurrency
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "fragment_enabled".into(),
+                    state.config.mux.fragment_enabled.to_string(),
+                ),
+                (
+                    "fragment_packets".into(),
+                    state
+                        .config
+                        .mux
+                        .fragment_packets
+                        .clone()
+                        .unwrap_or_default(),
+                ),
+                (
+                    "fragment_length".into(),
+                    state.config.mux.fragment_length.clone().unwrap_or_default(),
+                ),
+                (
+                    "fragment_interval".into(),
+                    state
+                        .config
+                        .mux
+                        .fragment_interval
+                        .clone()
+                        .unwrap_or_default(),
+                ),
             ]
         }
         Stats => {
-            vec![
-                ("enabled".into(), state.config.statistics.enabled.to_string()),
-            ]
+            vec![(
+                "enabled".into(),
+                state.config.statistics.enabled.to_string(),
+            )]
         }
-        ProtocolCore => state.config.core.protocol_core_overrides
+        ProtocolCore => state
+            .config
+            .core
+            .protocol_core_overrides
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         SpeedTest => {
             vec![
                 ("ping_url".into(), state.config.speed_test.ping_url.clone()),
-                ("ip_api_url".into(), state.config.speed_test.ip_api_url.clone()),
-                ("tcp_timeout_secs".into(), humantime::format_duration(*state.config.speed_test.tcp_timeout_secs).to_string()),
-                ("real_ping_timeout_secs".into(), humantime::format_duration(*state.config.speed_test.real_ping_timeout_secs).to_string()),
-                ("batch_page_size".into(), state.config.speed_test.batch_page_size.to_string()),
-                ("real_ping_retries".into(), state.config.speed_test.real_ping_retries.to_string()),
-                ("real_ping_concurrency".into(), state.config.speed_test.real_ping_concurrency.to_string()),
-                ("tcp_ping_concurrency".into(), state.config.speed_test.tcp_ping_concurrency.to_string()),
+                (
+                    "ip_api_url".into(),
+                    state.config.speed_test.ip_api_url.clone(),
+                ),
+                (
+                    "tcp_timeout_secs".into(),
+                    humantime::format_duration(*state.config.speed_test.tcp_timeout_secs)
+                        .to_string(),
+                ),
+                (
+                    "real_ping_timeout_secs".into(),
+                    humantime::format_duration(*state.config.speed_test.real_ping_timeout_secs)
+                        .to_string(),
+                ),
+                (
+                    "batch_page_size".into(),
+                    state.config.speed_test.batch_page_size.to_string(),
+                ),
+                (
+                    "real_ping_retries".into(),
+                    state.config.speed_test.real_ping_retries.to_string(),
+                ),
+                (
+                    "real_ping_concurrency".into(),
+                    state.config.speed_test.real_ping_concurrency.to_string(),
+                ),
+                (
+                    "tcp_ping_concurrency".into(),
+                    state.config.speed_test.tcp_ping_concurrency.to_string(),
+                ),
             ]
         }
         Dns => {
@@ -105,9 +234,20 @@ pub async fn build_settings_fields(state: &AppState, section: SettingsSection) -
                 vec![
                     ("servers".into(), dns.servers.unwrap_or_default()),
                     ("hosts".into(), dns.hosts.unwrap_or_default()),
-                    ("query_strategy".into(), dns.query_strategy.unwrap_or_default()),
-                    ("disable_cache".into(), dns.disable_cache.map(|v| v.to_string()).unwrap_or_default()),
-                    ("disable_fallback".into(), dns.disable_fallback.map(|v| v.to_string()).unwrap_or_default()),
+                    (
+                        "query_strategy".into(),
+                        dns.query_strategy.unwrap_or_default(),
+                    ),
+                    (
+                        "disable_cache".into(),
+                        dns.disable_cache.map(|v| v.to_string()).unwrap_or_default(),
+                    ),
+                    (
+                        "disable_fallback".into(),
+                        dns.disable_fallback
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                    ),
                     ("client_ip".into(), dns.client_ip.unwrap_or_default()),
                 ]
             } else {
@@ -122,20 +262,26 @@ pub async fn build_settings_fields(state: &AppState, section: SettingsSection) -
             }
         }
         Updates => {
-            vec![
-                ("check_on_startup".into(), state.config.updates.check_on_startup.to_string()),
-            ]
+            vec![(
+                "check_on_startup".into(),
+                state.config.updates.check_on_startup.to_string(),
+            )]
         }
         Routing => vec![],
         Logging => {
-            vec![
-                ("log_ttl_secs".into(), humantime::format_duration(*state.config.logging.ttl_secs).to_string()),
-            ]
+            vec![(
+                "log_ttl_secs".into(),
+                humantime::format_duration(*state.config.logging.ttl_secs).to_string(),
+            )]
         }
     }
 }
 
-fn apply_settings_fields(state: &mut AppState, section: SettingsSection, fields: &[(String, String)]) {
+fn apply_settings_fields(
+    state: &mut AppState,
+    section: SettingsSection,
+    fields: &[(String, String)],
+) {
     use crate::SettingsSection::{
         Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
         SystemProxy, Tun, Updates,
@@ -212,12 +358,14 @@ fn apply_settings_fields(state: &mut AppState, section: SettingsSection, fields:
         ProtocolCore => {
             for (key, val) in fields {
                 if val == "Auto" {
-                    state.config
+                    state
+                        .config
                         .core
                         .protocol_core_overrides
                         .remove(key.as_str());
                 } else {
-                    state.config
+                    state
+                        .config
                         .core
                         .protocol_core_overrides
                         .insert(key.clone(), val.clone());
@@ -288,7 +436,11 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
     }
 }
 
-pub fn save_settings_form(state: &mut AppState, section: SettingsSection, fields: &[(String, String)]) {
+pub fn save_settings_form(
+    state: &mut AppState,
+    section: SettingsSection,
+    fields: &[(String, String)],
+) {
     apply_settings_fields(state, section, fields);
     if let Err(e) = state.config.save() {
         state.log_trace("error", "tui", &format!("Failed to save config: {e}"));

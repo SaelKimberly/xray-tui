@@ -1,4 +1,5 @@
 /// Protocol security ranking (lower = more secure = shown first).
+#[must_use]
 pub fn protocol_security_rank(proto_kind: &str) -> u8 {
     match proto_kind {
         "wireguard" => 0,

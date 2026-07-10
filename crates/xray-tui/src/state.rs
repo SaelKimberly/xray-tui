@@ -1,36 +1,32 @@
-
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::warn;
 
-use xray_tui_config::import_export::{encode_profile_spec, profile_config, Profile, ValidationSummary};
-use xray_tui_config::{AppConfig, ValidationSettings};
+use xray_tui_config::AppConfig;
+use xray_tui_config::import_export::{Profile, ValidationSummary, encode_profile_spec};
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{
-    BuildParams, CLASH_API_PORT, ConfigBuilder,
-    CoreManager, CoreType, find_binary, resolve_core,
-};
+use xray_tui_core::{CoreType, resolve_core};
 use xray_tui_db::models::{
-    DnsSetting, Endpoint, Group, PingResultUpdate, PingSession, ProfileExtension, ProtocolRow,
-    RoutingRule, ServerStat,
+    Endpoint, Group, PingResultUpdate, ProfileExtension, ProtocolRow, RoutingRule,
 };
-use xray_tui_db::{stable_hash, Database};
+use xray_tui_db::{Database, stable_hash};
 
-use crate::types::*;
 use crate::BackendUpdateStatus;
-use crate::{common_field_defaults, format_now, get_field, try_send_or_warn, ClashTraffic};
-use crate::ui::settings::PROTOCOL_CORE_DEFS;
+use crate::format_now;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
+use crate::types::{
+    AppMode, ConfirmAction, CoreEvent, LogLine, ProfileRow, SettingsSection, SortColumn,
+    SplitRightPane, Tab,
+};
+use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -115,24 +111,26 @@ pub struct AppState {
     pub logs_loaded: bool,
 }
 
-/// Convert a `Profile` from import_export into an `Endpoint` + `ProtocolRow` pair
+/// Convert a `Profile` from `import_export` into an `Endpoint` + `ProtocolRow` pair
 /// for use with the new database API (`insert_manual_endpoint`, `subscription_upsert`).
-pub(crate) fn profile_to_endpoint_protocol(
-    profile: &Profile,
-) -> (Endpoint, ProtocolRow) {
+pub fn profile_to_endpoint_protocol(profile: &Profile) -> (Endpoint, ProtocolRow) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let host_type = if profile.address.parse::<std::net::IpAddr>().is_ok() {
-        if profile.address.contains(':') { "ipv6" } else { "ipv4" }
+        if profile.address.contains(':') {
+            "ipv6"
+        } else {
+            "ipv4"
+        }
     } else {
         "dns"
     }
     .to_string();
 
     let endpoint = Endpoint {
-        id: stable_hash(&profile.address, profile.port as i64),
+        id: stable_hash(&profile.address, i64::from(profile.port)),
         host: profile.address.clone(),
         host_type,
         port: profile.port,
@@ -272,18 +270,18 @@ impl AppState {
         }
     }
 
-    pub async fn reload_profiles(&mut self)  {
-        profiles::reload_profiles(self).await
+    pub async fn reload_profiles(&mut self) {
+        profiles::reload_profiles(self).await;
     }
 
-    pub async fn reload_groups(&mut self)  {
-        profiles::reload_groups(self).await
+    pub async fn reload_groups(&mut self) {
+        profiles::reload_groups(self).await;
     }
-    pub async fn reload_routing_rules(&mut self)  {
-        profiles::reload_routing_rules(self).await
+    pub async fn reload_routing_rules(&mut self) {
+        profiles::reload_routing_rules(self).await;
     }
 
-    pub fn filtered_profiles(&self) -> impl Iterator<Item = &ProfileRow>  {
+    pub fn filtered_profiles(&self) -> impl Iterator<Item = &ProfileRow> {
         profiles::filtered_profiles(self)
     }
 
@@ -297,9 +295,7 @@ impl AppState {
                     let q = self.search_query.to_lowercase();
                     let address = row.endpoint.host.clone();
                     let port = row.endpoint.port.to_string();
-                    if !address.to_lowercase().contains(&q)
-                        && !port.contains(&q)
-                    {
+                    if !address.to_lowercase().contains(&q) && !port.contains(&q) {
                         let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
                         if !remarks.to_lowercase().contains(&q) {
                             return false;
@@ -316,7 +312,10 @@ impl AppState {
             let a_row = &self.profiles[a];
             let b_row = &self.profiles[b];
             let cmp = match self.sort_column {
-                SortColumn::ConfigType => a_row.active_protocol().config_type.cmp(&b_row.active_protocol().config_type),
+                SortColumn::ConfigType => a_row
+                    .active_protocol()
+                    .config_type
+                    .cmp(&b_row.active_protocol().config_type),
                 SortColumn::Remarks => {
                     let a_rem = a_row.active_protocol().remarks.clone().unwrap_or_default();
                     let b_rem = b_row.active_protocol().remarks.clone().unwrap_or_default();
@@ -325,13 +324,29 @@ impl AppState {
                 SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
                 SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
                 SortColumn::Delay => {
-                    let da = a_row.extensions.get(&a_row.active_protocol().id).and_then(|e| e.delay).unwrap_or(-1);
-                    let db = b_row.extensions.get(&b_row.active_protocol().id).and_then(|e| e.delay).unwrap_or(-1);
+                    let da = a_row
+                        .extensions
+                        .get(&a_row.active_protocol().id)
+                        .and_then(|e| e.delay)
+                        .unwrap_or(-1);
+                    let db = b_row
+                        .extensions
+                        .get(&b_row.active_protocol().id)
+                        .and_then(|e| e.delay)
+                        .unwrap_or(-1);
                     da.cmp(&db)
                 }
                 SortColumn::Speed => {
-                    let sa = a_row.extensions.get(&a_row.active_protocol().id).and_then(|e| e.speed).unwrap_or(-1);
-                    let sb = b_row.extensions.get(&b_row.active_protocol().id).and_then(|e| e.speed).unwrap_or(-1);
+                    let sa = a_row
+                        .extensions
+                        .get(&a_row.active_protocol().id)
+                        .and_then(|e| e.speed)
+                        .unwrap_or(-1);
+                    let sb = b_row
+                        .extensions
+                        .get(&b_row.active_protocol().id)
+                        .and_then(|e| e.speed)
+                        .unwrap_or(-1);
                     sa.cmp(&sb)
                 }
                 SortColumn::Traffic => {
@@ -366,12 +381,12 @@ impl AppState {
         indices
     }
 
-    pub fn filtered_len(&self) -> usize  {
+    pub fn filtered_len(&self) -> usize {
         profiles::filtered_len(self)
     }
 
-    pub fn cycle_group(&mut self, _dir: i8)  {
-        profiles::cycle_group(self, _dir)
+    pub fn cycle_group(&mut self, _dir: i8) {
+        profiles::cycle_group(self, _dir);
     }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
     pub fn log_trace(&mut self, level: &str, _target: &str, message: &str) {
@@ -390,19 +405,19 @@ impl AppState {
     /// 1. Per-profile override (`row.active_protocol().core_type`)
     /// 2. Per-protocol config override (`config.core.protocol_core_overrides`)
     /// 3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
-    pub fn resolved_core(&self, row: &ProfileRow) -> CoreType  {
+    pub fn resolved_core(&self, row: &ProfileRow) -> CoreType {
         profiles::resolved_core(self, row)
     }
     // ── CRUD operations ──────────────────────────────────────────────────
 
-    pub fn start_add_server(&mut self)  {
-        profiles::start_add_server(self)
+    pub fn start_add_server(&mut self) {
+        profiles::start_add_server(self);
     }
-    pub async fn start_edit_profile(&mut self, id: &str)  {
-        profiles::start_edit_profile(self, id).await
+    pub async fn start_edit_profile(&mut self, id: &str) {
+        profiles::start_edit_profile(self, id).await;
     }
 
-    pub fn selected_profile_id(&self) -> Option<i64>  {
+    pub fn selected_profile_id(&self) -> Option<i64> {
         profiles::selected_profile_id(self)
     }
 
@@ -515,15 +530,15 @@ impl AppState {
             }
         }
 
-        let protocol_settings_str = if !proto_map.is_empty() {
+        let protocol_settings_str = if proto_map.is_empty() {
+            None
+        } else {
             Some(serde_json::to_string(&proto_map).unwrap_or_default())
-        } else {
-            None
         };
-        let stream_settings_str = if !stream_map.is_empty() {
-            Some(serde_json::to_string(&stream_map).unwrap_or_default())
-        } else {
+        let stream_settings_str = if stream_map.is_empty() {
             None
+        } else {
+            Some(serde_json::to_string(&stream_map).unwrap_or_default())
         };
 
         let mut profile = Profile {
@@ -537,7 +552,7 @@ impl AppState {
             address,
             port,
             transport: network.clone(),
-            network: network.clone(),
+            network: network,
             security,
             created_at: now as i64,
             remarks: remarks.clone(),
@@ -552,39 +567,37 @@ impl AppState {
         if let Some(v) = &user_id {
             extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
         }
-        if let Some(v) = &protocol_settings_str {
-            if let Ok(val) = serde_json::from_str(v) {
-                extra.insert("protocol_settings".into(), val);
-            }
+        if let Some(v) = &protocol_settings_str
+            && let Ok(val) = serde_json::from_str(v)
+        {
+            extra.insert("protocol_settings".into(), val);
         }
-        if let Some(v) = &stream_settings_str {
-            if let Ok(val) = serde_json::from_str(v) {
-                extra.insert("stream_settings".into(), val);
-            }
+        if let Some(v) = &stream_settings_str
+            && let Ok(val) = serde_json::from_str(v)
+        {
+            extra.insert("stream_settings".into(), val);
         }
-        profile.spec_blob = encode_profile_spec(
-            &proto_kind,
-            serde_json::to_vec(&extra).unwrap_or_default(),
-        );
+        profile.spec_blob =
+            encode_profile_spec(proto_kind, serde_json::to_vec(&extra).unwrap_or_default());
         profile
     }
 
-    pub async fn confirm_add_server(&mut self)  {
-        profiles::confirm_add_server(self).await
+    pub async fn confirm_add_server(&mut self) {
+        profiles::confirm_add_server(self).await;
     }
 
-    pub async fn confirm_edit_server(&mut self)  {
-        profiles::confirm_edit_server(self).await
+    pub async fn confirm_edit_server(&mut self) {
+        profiles::confirm_edit_server(self).await;
     }
 
-    pub fn cancel_form(&mut self)  {
-        settings::cancel_form(self)
+    pub fn cancel_form(&mut self) {
+        settings::cancel_form(self);
     }
 
     // ── Settings helpers ──────────────────────────────────────────────────
 
-    pub fn enter_settings(&mut self)  {
-        settings::enter_settings(self)
+    pub fn enter_settings(&mut self) {
+        settings::enter_settings(self);
     }
 
     async fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
@@ -994,78 +1007,82 @@ impl AppState {
         }
     }
 
-    pub async fn build_right_pane(&mut self, section: SettingsSection) -> SplitRightPane  {
+    pub async fn build_right_pane(&mut self, section: SettingsSection) -> SplitRightPane {
         settings::build_right_pane(self, section).await
     }
-    pub fn save_settings_form(&mut self, section: SettingsSection, fields: &[(String, String)])  {
-        settings::save_settings_form(self, section, fields)
+    pub fn save_settings_form(&mut self, section: SettingsSection, fields: &[(String, String)]) {
+        settings::save_settings_form(self, section, fields);
     }
-    pub async fn save_routing_rule(&mut self, rule_id: Option<String>, fields: &[(String, String)])  {
-        settings::save_routing_rule(self, rule_id, fields).await
+    pub async fn save_routing_rule(
+        &mut self,
+        rule_id: Option<String>,
+        fields: &[(String, String)],
+    ) {
+        settings::save_routing_rule(self, rule_id, fields).await;
     }
-    pub async fn save_dns_settings(&mut self, fields: &[(String, String)])  {
-        settings::save_dns_settings(self, fields).await
+    pub async fn save_dns_settings(&mut self, fields: &[(String, String)]) {
+        settings::save_dns_settings(self, fields).await;
     }
-    pub async fn delete_profile(&mut self, id: i64)  {
-        profiles::delete_profile(self, id).await
+    pub async fn delete_profile(&mut self, id: i64) {
+        profiles::delete_profile(self, id).await;
     }
-    pub async fn clone_profile(&mut self, id: i64)  {
-        profiles::clone_profile(self, id).await
+    pub async fn clone_profile(&mut self, id: i64) {
+        profiles::clone_profile(self, id).await;
     }
-    pub fn toggle_multi_select(&mut self, id: i64)  {
-        profiles::toggle_multi_select(self, id)
+    pub fn toggle_multi_select(&mut self, id: i64) {
+        profiles::toggle_multi_select(self, id);
     }
-    pub fn import_url(&mut self, url: &str)  {
-        profiles::import_url(self, url)
+    pub fn import_url(&mut self, url: &str) {
+        profiles::import_url(self, url);
     }
-    pub fn start_batch_import(&mut self, urls: &[String])  {
-        profiles::start_batch_import(self, urls)
+    pub fn start_batch_import(&mut self, urls: &[String]) {
+        profiles::start_batch_import(self, urls);
     }
-    pub async fn confirm_batch_import(&mut self)  {
-        profiles::confirm_batch_import(self).await
+    pub async fn confirm_batch_import(&mut self) {
+        profiles::confirm_batch_import(self).await;
     }
-    pub async fn move_profile_up(&mut self)  {
-        profiles::move_profile_up(self).await
+    pub async fn move_profile_up(&mut self) {
+        profiles::move_profile_up(self).await;
     }
-    pub async fn move_profile_down(&mut self)  {
-        profiles::move_profile_down(self).await
+    pub async fn move_profile_down(&mut self) {
+        profiles::move_profile_down(self).await;
     }
-    pub async fn set_active(&mut self, id: &str)  {
-        profiles::set_active(self, id).await
+    pub async fn set_active(&mut self, id: &str) {
+        profiles::set_active(self, id).await;
     }
     pub fn connect_to_profile(&mut self, protocol_id: i64) {
-        connect::connect_to_profile(self, protocol_id)
+        connect::connect_to_profile(self, protocol_id);
     }
     pub fn disconnect(&mut self) {
-        connect::disconnect(self)
+        connect::disconnect(self);
     }
-    pub fn start_tcp_ping(&mut self, protocol_id: i64)  {
-        ping::start_tcp_ping(self, protocol_id)
+    pub fn start_tcp_ping(&mut self, protocol_id: i64) {
+        ping::start_tcp_ping(self, protocol_id);
     }
-    pub fn start_real_ping(&mut self, protocol_id: i64)  {
-        ping::start_real_ping(self, protocol_id)
+    pub fn start_real_ping(&mut self, protocol_id: i64) {
+        ping::start_real_ping(self, protocol_id);
     }
-    pub fn start_speed_test(&mut self, protocol_id: i64)  {
-        ping::start_speed_test(self, protocol_id)
+    pub fn start_speed_test(&mut self, protocol_id: i64) {
+        ping::start_speed_test(self, protocol_id);
     }
-    pub fn start_udp_test(&mut self, protocol_id: i64)  {
-        ping::start_udp_test(self, protocol_id)
+    pub fn start_udp_test(&mut self, protocol_id: i64) {
+        ping::start_udp_test(self, protocol_id);
     }
-    pub fn stop_speed_test(&mut self)  {
-        ping::stop_speed_test(self)
+    pub fn stop_speed_test(&mut self) {
+        ping::stop_speed_test(self);
     }
-    pub fn start_batch_ping(&mut self)  {
-        ping::start_batch_ping(self)
+    pub fn start_batch_ping(&mut self) {
+        ping::start_batch_ping(self);
     }
-    pub fn start_batch_then_real_ping(&mut self)  {
-        ping::start_batch_then_real_ping(self)
+    pub fn start_batch_then_real_ping(&mut self) {
+        ping::start_batch_then_real_ping(self);
     }
     /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
     /// Uses DB-backed `ping_sessions` table for queue management.
     /// Phase 1 drains fast-pingable profiles quickly; Phase 2 handles remaining via temp core.
     #[allow(clippy::needless_collect)]
-    pub fn start_batch_sieve(&mut self, real_ping_enabled: bool)  {
-        ping::start_batch_sieve(self, real_ping_enabled)
+    pub fn start_batch_sieve(&mut self, real_ping_enabled: bool) {
+        ping::start_batch_sieve(self, real_ping_enabled);
     }
 
     /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.
@@ -1082,7 +1099,7 @@ impl AppState {
             .iter()
             .filter_map(|r| {
                 r.latency_ms.map(|ms| ProfileExtension {
-                    protocol_id: r.protocol_id.clone(),
+                    protocol_id: r.protocol_id,
                     delay: Some(ms),
                     speed: None,
                     sort_order: None,
@@ -1096,38 +1113,38 @@ impl AppState {
             .await;
     }
     /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
-    pub async fn remove_failed_servers(&mut self)  {
-        ping::remove_failed_servers(self).await
+    pub async fn remove_failed_servers(&mut self) {
+        ping::remove_failed_servers(self).await;
     }
 
     /// Poll core event channel and update state accordingly.
-    pub async fn poll_core_events(&mut self)  {
-        events::poll_core_events(self).await
+    pub async fn poll_core_events(&mut self) {
+        events::poll_core_events(self).await;
     }
     // ── Group management ─────────────────────────────────────────────
 
-    pub fn start_add_group(&mut self)  {
-        subscriptions::start_add_group(self)
+    pub fn start_add_group(&mut self) {
+        subscriptions::start_add_group(self);
     }
 
-    pub fn start_edit_group(&mut self, group_id: &str)  {
-        subscriptions::start_edit_group(self, group_id)
+    pub fn start_edit_group(&mut self, group_id: &str) {
+        subscriptions::start_edit_group(self, group_id);
     }
 
-    pub async fn confirm_add_group(&mut self)  {
-        subscriptions::confirm_add_group(self).await
+    pub async fn confirm_add_group(&mut self) {
+        subscriptions::confirm_add_group(self).await;
     }
 
-    pub async fn confirm_edit_group(&mut self)  {
-        subscriptions::confirm_edit_group(self).await
+    pub async fn confirm_edit_group(&mut self) {
+        subscriptions::confirm_edit_group(self).await;
     }
 
-    pub async fn delete_group(&mut self, group_id: &str)  {
-        subscriptions::delete_group(self, group_id).await
+    pub async fn delete_group(&mut self, group_id: &str) {
+        subscriptions::delete_group(self, group_id).await;
     }
 
-    pub async fn clear_group(&mut self, group_id: &str)  {
-        subscriptions::clear_group(self, group_id).await
+    pub async fn clear_group(&mut self, group_id: &str) {
+        subscriptions::clear_group(self, group_id).await;
     }
 
     pub fn clear_logs(&mut self) {
@@ -1168,8 +1185,8 @@ impl AppState {
 
     // ── Subscription update ──────────────────────────────────────────
 
-    pub fn update_group_subscriptions(&mut self, group_id: &str)  {
-        subscriptions::update_group_subscriptions(self, group_id)
+    pub fn update_group_subscriptions(&mut self, group_id: &str) {
+        subscriptions::update_group_subscriptions(self, group_id);
     }
 
     async fn do_update_subscription(
@@ -1250,35 +1267,34 @@ impl AppState {
         tracing::info!(target: "tui", "DB upsert succeeded");
 
         // Update group metadata (last_refreshed, status) — merged from old Subscription
-        if let Ok(groups) = db.get_all_groups().await {
-            if let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id) {
-                grp.last_refreshed = Some(format_now());
-                grp.status = Some("ok".into());
-                grp.error_message = None;
-                let _ = db.update_group(&grp).await;
-            }
+        if let Ok(groups) = db.get_all_groups().await
+            && let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id)
+        {
+            grp.last_refreshed = Some(format_now());
+            grp.status = Some("ok".into());
+            grp.error_message = None;
+            let _ = db.update_group(&grp).await;
         }
 
         (group_id, pairs.len(), summary, None)
-
     }
 
-    pub fn update_all_subscriptions(&mut self)  {
-        subscriptions::update_all_subscriptions(self)
+    pub fn update_all_subscriptions(&mut self) {
+        subscriptions::update_all_subscriptions(self);
     }
 
     /// Spawn async task to check for backend updates on startup or manual trigger.
     pub fn spawn_update_check(&mut self) {
-        updates::spawn_update_check(self)
+        updates::spawn_update_check(self);
     }
 
     /// Spawn async task to download and install an update for the given core.
     pub fn spawn_update_download(&mut self, core_type: CoreType) {
-        updates::spawn_update_download(self, core_type)
+        updates::spawn_update_download(self, core_type);
     }
 
     /// Start a background task to check and update subscriptions.
-    pub fn spawn_auto_update(&mut self)  {
-        subscriptions::spawn_auto_update(self)
+    pub fn spawn_auto_update(&mut self) {
+        subscriptions::spawn_auto_update(self);
     }
 }

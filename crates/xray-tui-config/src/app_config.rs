@@ -44,9 +44,15 @@ pub struct PurgatoryConfig {
     pub enabled: bool,
 }
 
-const fn default_purgatory_ttl_days() -> u64 { 7 }
-const fn default_purgatory_retention_days() -> u64 { 30 }
-const fn default_purgatory_enabled() -> bool { true }
+const fn default_purgatory_ttl_days() -> u64 {
+    7
+}
+const fn default_purgatory_retention_days() -> u64 {
+    30
+}
+const fn default_purgatory_enabled() -> bool {
+    true
+}
 
 impl Default for PurgatoryConfig {
     fn default() -> Self {

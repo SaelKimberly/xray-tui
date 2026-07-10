@@ -53,11 +53,9 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
             )
         },
         |r| {
-            let proto = Protocol::try_from_i32(r.active_protocol().config_type).unwrap_or(Protocol::Custom);
-            let remarks = r.active_protocol()
-                .remarks
-                .clone()
-                .unwrap_or_default();
+            let proto =
+                Protocol::try_from_i32(r.active_protocol().config_type).unwrap_or(Protocol::Custom);
+            let remarks = r.active_protocol().remarks.clone().unwrap_or_default();
             let addr = r.endpoint.host.clone();
             let port = r.endpoint.port as u16;
             let core = state.resolved_core(r).to_string();

@@ -666,7 +666,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && key.modifiers.contains(KeyModifiers::SHIFT)
                 && state.current_tab == Tab::Profiles =>
         {
-            let url = state.selected_profile_id().and_then(|id| {
+            let _url = state.selected_profile_id().and_then(|id| {
                 let row = state.filtered_profiles().find(|r| r.endpoint.id == id)?;
                 let active = row.active_protocol();
                 let parsed = xray_tui_config::import_export::ParsedProtocol {

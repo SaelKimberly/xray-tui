@@ -61,11 +61,13 @@ impl ConfigBuilder {
     ) -> Result<BackendConfig, BuildError> {
         match core_type {
             CoreType::Xray => {
-                let config = xray::XrayConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
+                let config =
+                    xray::XrayConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
                 Ok(BackendConfig::Xray(config))
             }
             CoreType::SingBox => {
-                let config = singbox::SingBoxConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
+                let config =
+                    singbox::SingBoxConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
                 Ok(BackendConfig::SingBox(config))
             }
             CoreType::Auto => Err(BuildError::InvalidProfile(
@@ -145,7 +147,9 @@ mod tests {
     fn build_xray_via_dispatch() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns).unwrap();
+        let config =
+            ConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+                .unwrap();
         assert!(matches!(config, BackendConfig::Xray(_)));
     }
 
@@ -153,8 +157,15 @@ mod tests {
     fn build_singbox_tuic_via_dispatch() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            ConfigBuilder::build(&endpoint, &protocol, CoreType::SingBox, &params, &rules, &dns).unwrap();
+        let config = ConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            CoreType::SingBox,
+            &params,
+            &rules,
+            &dns,
+        )
+        .unwrap();
         assert!(matches!(config, BackendConfig::SingBox(_)));
     }
 
@@ -163,8 +174,15 @@ mod tests {
         // Shadowsocks is supported by both xray and sing-box builders
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
-        let config =
-            ConfigBuilder::build(&endpoint, &protocol, CoreType::SingBox, &params, &rules, &dns).unwrap();
+        let config = ConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            CoreType::SingBox,
+            &params,
+            &rules,
+            &dns,
+        )
+        .unwrap();
         assert!(matches!(config, BackendConfig::SingBox(_)));
     }
 
@@ -172,7 +190,8 @@ mod tests {
     fn build_auto_returns_error() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let result = ConfigBuilder::build(&endpoint, &protocol, CoreType::Auto, &params, &rules, &dns);
+        let result =
+            ConfigBuilder::build(&endpoint, &protocol, CoreType::Auto, &params, &rules, &dns);
         assert!(result.is_err());
     }
 }

@@ -59,7 +59,7 @@ use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashSS};
 use crate::proto_spec::ProtoSpecError;
-use crate::proto_spec::common::*;
+use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +136,8 @@ impl ProtoSpec for SsConfig {
         let plugin_opts = utils::query_get(&query, "plugin_opts").map(|s| {
             s.split(';')
                 .filter_map(|pair| {
-                    pair.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                    pair.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
                 })
                 .collect::<HashMap<String, String>>()
         });
@@ -174,7 +175,10 @@ impl ProtoSpec for SsConfig {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(";");
-            query_parts.push(format!("plugin_opts={}", urlencoding::encode(&encoded_opts)));
+            query_parts.push(format!(
+                "plugin_opts={}",
+                urlencoding::encode(&encoded_opts)
+            ));
         }
         let query_string = if query_parts.is_empty() {
             String::new()
@@ -244,30 +248,32 @@ impl ProtoSpec for SsConfig {
     }
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Shadowsocks(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    method: TinyText::from(c.cipher.as_str()),
-                    password: c.password.clone(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    security: SecurityConfig::default(),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                    plugin: c.plugin.clone().map(TinyText::from),
-                    plugin_opts: c.plugin_opts.as_ref().map(|opts_str| {
-                        opts_str.split(';')
-                            .filter_map(|pair| {
-                                pair.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
-                            })
-                            .collect::<HashMap<String, String>>()
-                    }),
-                })
-            }
-            _ => Err(ParseError::Unknown("expected shadowsocks clash proxy".into())),
+            ClashProxy::Shadowsocks(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                method: TinyText::from(c.cipher.as_str()),
+                password: c.password.clone(),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                security: SecurityConfig::default(),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+                plugin: c.plugin.clone().map(TinyText::from),
+                plugin_opts: c.plugin_opts.as_ref().map(|opts_str| {
+                    opts_str
+                        .split(';')
+                        .filter_map(|pair| {
+                            pair.split_once('=')
+                                .map(|(k, v)| (k.to_string(), v.to_string()))
+                        })
+                        .collect::<HashMap<String, String>>()
+                }),
+            }),
+            _ => Err(ParseError::Unknown(
+                "expected shadowsocks clash proxy".into(),
+            )),
         }
     }
 
@@ -281,7 +287,7 @@ impl ProtoSpec for SsConfig {
             password: self.password.clone(),
             udp: None,
             udp_over_tcp: None,
-            plugin: self.plugin.as_ref().map(|s| s.to_string()),
+            plugin: self.plugin.as_ref().map(std::string::ToString::to_string),
             plugin_opts: self.plugin_opts.as_ref().map(|opts| {
                 opts.iter()
                     .map(|(k, v)| format!("{k}={v}"))
@@ -290,7 +296,6 @@ impl ProtoSpec for SsConfig {
             }),
         }))
     }
-
 }
 
 impl SsConfig {
@@ -313,7 +318,6 @@ impl SsConfig {
         hasher.finish()
     }
 }
-use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {

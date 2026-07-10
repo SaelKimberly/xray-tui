@@ -9,8 +9,8 @@
 
 pub mod bin_manager;
 pub mod config_builder;
-pub mod dns;
 pub mod core_type;
+pub mod dns;
 pub mod grpc_client;
 pub mod log_heed;
 pub mod ping;

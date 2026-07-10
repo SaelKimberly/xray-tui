@@ -1,13 +1,10 @@
 use std::sync::{Arc, Mutex};
-use tracing::warn;
 
 use xray_tui_core::CoreType;
-use xray_tui_db::models::PingResultUpdate;
-use xray_tui_db::Database;
 
 use crate::AppState;
-use crate::types::*;
 use crate::try_send_or_warn;
+use crate::types::CoreEvent;
 
 /// Spawn async task to check for backend updates on startup or manual trigger.
 pub fn spawn_update_check(state: &mut AppState) {
@@ -21,8 +18,7 @@ pub fn spawn_update_check(state: &mut AppState) {
         let tx = tx.clone();
         let bin_dir = bin_dir.clone();
         tokio::spawn(async move {
-            let current =
-                xray_tui_core::updater::get_current_version(core_type, &bin_dir).await;
+            let current = xray_tui_core::updater::get_current_version(core_type, &bin_dir).await;
             let latest = xray_tui_core::updater::get_latest_version(core_type).await;
             let error = if current.is_none() && latest.is_none() {
                 Some("binary not found and check failed".into())
@@ -86,7 +82,11 @@ pub fn spawn_update_download(state: &mut AppState, core_type: CoreType) {
     let client = reqwest::Client::new();
     let temp_dir = std::env::temp_dir().join(format!("xray-tui-update-{core_type}"));
 
-    state.update_status.entry(core_type).or_default().downloading = true;
+    state
+        .update_status
+        .entry(core_type)
+        .or_default()
+        .downloading = true;
 
     let last_report = Arc::new(Mutex::new(std::time::Instant::now()));
     let core_type_progress = core_type;
@@ -141,8 +141,7 @@ pub fn spawn_update_download(state: &mut AppState, core_type: CoreType) {
             }
         };
         // Install
-        let result =
-            xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
+        let result = xray_tui_core::updater::install_binary(&archive, core_type, &bin_dir).await;
         let (success, error) = match result {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e.to_string())),

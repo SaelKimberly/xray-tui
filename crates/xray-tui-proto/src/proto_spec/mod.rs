@@ -4,40 +4,42 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX};
 use crate::clash::ClashProxy;
+use crate::urlx::{HostSpec, RawUrlX, SchemeX};
 
 pub mod common;
 pub mod utils;
 
+mod anytls;
+mod http_client;
+mod hysteria1;
 mod hysteria2;
+mod naive;
+pub mod security_rank;
+mod shadowtls;
+mod socks;
 mod ss;
+mod ssh;
 mod ssr;
+mod tailscale;
+mod tor;
 mod trojan;
 mod tuic;
 mod vless;
 mod vmess;
 mod wireguard;
-mod http_client;
-mod anytls;
-mod hysteria1;
-mod naive;
-mod socks;
-mod ssh;
-mod tailscale;
-mod tor;
-mod shadowtls;
-pub mod security_rank;
 pub use anytls::AnyTlsConfig;
 pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig};
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;
 pub use hysteria2::Hysteria2Config;
 pub use naive::NaiveConfig;
+pub use security_rank::protocol_security_rank;
+pub use shadowtls::ShadowTlsConfig;
 pub use socks::Socks5Config;
 pub use ss::SsConfig;
-pub use ssr::SsrConfig;
 pub use ssh::SshConfig;
+pub use ssr::SsrConfig;
 pub use tailscale::TailscaleConfig;
 pub use tor::TorConfig;
 pub use trojan::TrojanConfig;
@@ -45,8 +47,6 @@ pub use tuic::TuicConfig;
 pub use vless::VlessConfig;
 pub use vmess::VmessConfig;
 pub use wireguard::WireguardConfig;
-pub use shadowtls::ShadowTlsConfig;
-pub use security_rank::protocol_security_rank;
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("invalid host: {0}")]
@@ -209,17 +209,17 @@ impl ProtocolConfig {
         // Only for protocols that don't have URL format (PlaceholderConfig variants).
         // Full-protocol types must use ProtocolConfig::try_parse().
         match proto_name.to_lowercase().as_str() {
-            "redirect" => ProtocolConfig::Redirect(placeholder(proto_name, settings_json)),
-            "tproxy" => ProtocolConfig::TProxy(placeholder(proto_name, settings_json)),
-            "mixed" => ProtocolConfig::Mixed(placeholder(proto_name, settings_json)),
+            "redirect" => Self::Redirect(placeholder(proto_name, settings_json)),
+            "tproxy" => Self::TProxy(placeholder(proto_name, settings_json)),
+            "mixed" => Self::Mixed(placeholder(proto_name, settings_json)),
             p => {
                 // Unknown/unparsed protocol — wrap as Mixed for backward compat
-                ProtocolConfig::Mixed(placeholder(p, settings_json))
+                Self::Mixed(placeholder(p, settings_json))
             }
         }
     }
 
-    /// Extract protocol_settings and stream_settings as JSON Values.
+    /// Extract `protocol_settings` and `stream_settings` as JSON Values.
     ///
     /// For full protocol config types, builds from typed fields.
     /// For [`PlaceholderConfig`] stubs, extracts from the opaque `settings_json` blob.
@@ -227,9 +227,7 @@ impl ProtocolConfig {
     pub fn to_settings(&self) -> (serde_json::Value, serde_json::Value) {
         match self {
             // Placeholder-based protocols: extract from settings_json
-            ProtocolConfig::Redirect(c)
-            | ProtocolConfig::TProxy(c)
-            | ProtocolConfig::Mixed(c) => {
+            Self::Redirect(c) | Self::TProxy(c) | Self::Mixed(c) => {
                 let extra: serde_json::Value =
                     serde_json::from_slice(&c.settings_json).unwrap_or_default();
                 let p = extra
@@ -305,7 +303,9 @@ pub trait ProtoSpec: Serialize + DeserializeOwned + std::fmt::Debug + Clone {
         Self: Sized,
     {
         let _ = proxy;
-        Err(ParseError::Unknown("clash parsing not implemented for this protocol".into()))
+        Err(ParseError::Unknown(
+            "clash parsing not implemented for this protocol".into(),
+        ))
     }
 
     /// Serialize this protocol to a Clash YAML proxy entry.
@@ -453,9 +453,12 @@ impl ProtoSpec for ProtocolConfig {
             ClashProxy::Tor(_) => TorConfig::try_from_clash(proxy).map(Self::Tor),
             ClashProxy::Ssh(_) => SshConfig::try_from_clash(proxy).map(Self::Ssh),
             ClashProxy::Tailscale(_) => TailscaleConfig::try_from_clash(proxy).map(Self::Tailscale),
-            ClashProxy::Snell(_) | ClashProxy::Direct(_) | ClashProxy::Dns(_) | ClashProxy::Reject(_) => {
-                Err(ParseError::Unknown("cannot convert clash proxy type to outbound protocol".into()))
-            }
+            ClashProxy::Snell(_)
+            | ClashProxy::Direct(_)
+            | ClashProxy::Dns(_)
+            | ClashProxy::Reject(_) => Err(ParseError::Unknown(
+                "cannot convert clash proxy type to outbound protocol".into(),
+            )),
         }
     }
 
@@ -482,7 +485,7 @@ impl ProtoSpec for ProtocolConfig {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct PlaceholderConfig {
     pub proto_name: String,
-    /// Opaque JSON blob containing protocol_settings/stream_settings from legacy parsing.
+    /// Opaque JSON blob containing `protocol_settings/stream_settings` from legacy parsing.
     /// Stored as `{"protocol_settings": {...}, "stream_settings": {...}}` JSON.
     pub settings_json: Vec<u8>,
 }

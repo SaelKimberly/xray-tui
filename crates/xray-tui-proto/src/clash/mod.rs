@@ -1,6 +1,6 @@
 //! Clash/mihomo YAML proxy format.
 //!
-//! Per-protocol structs with kebab-case serde. Conversion to/from ProtocolConfig
+//! Per-protocol structs with kebab-case serde. Conversion to/from `ProtocolConfig`
 //! lives in each protocol's implementation.
 //! Only mihomo/meta-v1 (`proxies:` array entries).
 
@@ -572,6 +572,6 @@ fn default_cipher() -> String {
     "auto".to_string()
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }

@@ -213,8 +213,8 @@ fn render_data_grid(
                 }
             };
 
-            let protocol =
-                Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
+            let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
+                .unwrap_or(Protocol::Custom);
             let is_multi = state.multi_select.contains(&row.endpoint.id);
 
             let idx_str = if is_multi {
@@ -224,11 +224,7 @@ fn render_data_grid(
             };
 
             let type_str = format!("{protocol:.12}");
-            let remarks = row
-                .active_protocol()
-                .remarks
-                .clone()
-                .unwrap_or_default();
+            let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
             let remarks_str = truncate_pad(&remarks, 24);
             let group_str = String::new();
             let address = row.endpoint.host.as_str();
@@ -249,13 +245,13 @@ fn render_data_grid(
                 .get(&row.active_protocol().id)
                 .and_then(|e| e.ip_info.as_deref())
                 .map_or_else(|| "     -".to_string(), |ip| truncate_pad(ip, 19));
-            let traffic = row
-                .stats
-                .get(&row.active_protocol().id)
-                .map_or_else(|| "        -".to_string(), |s| {
+            let traffic = row.stats.get(&row.active_protocol().id).map_or_else(
+                || "        -".to_string(),
+                |s| {
                     let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
                     format_traffic(total as u64)
-                });
+                },
+            );
 
             ProfileTableRowData {
                 id: row.endpoint.id.to_string(),
@@ -353,7 +349,11 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
     let line = if has_profile {
         let row = &state.profiles[state.selected_index];
         let core = state.resolved_core(row);
-        let remarks = row.active_protocol().remarks.clone().unwrap_or_else(|| "-".to_string());
+        let remarks = row
+            .active_protocol()
+            .remarks
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
 
         let addr = if row.endpoint.host.is_empty() {
             "-"

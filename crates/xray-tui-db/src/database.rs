@@ -7,11 +7,11 @@ use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
+use crate::models_toasty::EndpointRow;
 use crate::models_toasty::{
     DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession, ProfileExtension,
     ProtocolRow, RoutingRule, ServerStat,
 };
-use crate::models_toasty::EndpointRow;
 
 // ── Database handle ─────────────────────────────────────────────────────
 
@@ -116,11 +116,8 @@ impl Database {
 // ── Read queries (public API) ───────────────────────────────────────────
 
 impl Database {
-    /// Active endpoints: max(last_seen_at) >= active_threshold
-    pub async fn get_active_endpoints(
-        &self,
-        active_threshold: i64,
-    ) -> Result<Vec<EndpointRow>> {
+    /// Active endpoints: `max(last_seen_at)` >= `active_threshold`
+    pub async fn get_active_endpoints(&self, active_threshold: i64) -> Result<Vec<EndpointRow>> {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
@@ -165,7 +162,7 @@ impl Database {
         deserialize_endpoint_rows(rows)
     }
 
-    /// Stale endpoints: max(last_seen_at) < active_threshold AND >= stale_threshold
+    /// Stale endpoints: `max(last_seen_at)` < `active_threshold` AND >= `stale_threshold`
     pub async fn get_stale_endpoints(
         &self,
         active_threshold: i64,
@@ -212,7 +209,10 @@ impl Database {
         Ok(all.pop())
     }
 
-    pub async fn get_profile_extension(&self, protocol_id: i64) -> Result<Option<ProfileExtension>> {
+    pub async fn get_profile_extension(
+        &self,
+        protocol_id: i64,
+    ) -> Result<Option<ProfileExtension>> {
         let mut conn = self.db.connection().await?;
         let ext = ProfileExtension::filter_by_protocol_id(protocol_id)
             .first()
@@ -275,7 +275,11 @@ impl Database {
         Ok(groups)
     }
 
-    pub async fn get_stale_count(&self, active_threshold: i64, stale_threshold: i64) -> Result<usize> {
+    pub async fn get_stale_count(
+        &self,
+        active_threshold: i64,
+        stale_threshold: i64,
+    ) -> Result<usize> {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT COUNT(DISTINCT e.id) \
@@ -464,7 +468,7 @@ impl Database {
         Ok(())
     }
 
-    /// Purge endpoints where every protocol has last_seen_at < threshold.
+    /// Purge endpoints where every protocol has `last_seen_at` < threshold.
     /// Returns count of deleted endpoints.
     pub async fn purge_expired(&self, expire_threshold: i64) -> Result<usize> {
         let mut conn = self.db.connection().await?;
@@ -536,7 +540,7 @@ impl Database {
         Ok(count)
     }
 
-    /// Restore a stale endpoint by setting last_seen_at = now on all its protocols.
+    /// Restore a stale endpoint by setting `last_seen_at` = now on all its protocols.
     pub async fn restore_endpoint(&self, endpoint_id: i64) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -598,13 +602,11 @@ impl Database {
 
     pub async fn set_protocol_override(&self, endpoint_id: i64, protocol_id: i64) -> Result<()> {
         let mut conn = self.db.connection().await?;
-        toasty::sql::statement(
-            "UPDATE endpoints SET manual_protocol_override = ?1 WHERE id = ?2",
-        )
-        .bind(protocol_id)
-        .bind(endpoint_id)
-        .exec(&mut conn)
-        .await?;
+        toasty::sql::statement("UPDATE endpoints SET manual_protocol_override = ?1 WHERE id = ?2")
+            .bind(protocol_id)
+            .bind(endpoint_id)
+            .exec(&mut conn)
+            .await?;
         Ok(())
     }
 
@@ -620,11 +622,7 @@ impl Database {
     }
 
     /// Upsert resolved IPs as child endpoints of a DNS endpoint.
-    pub async fn upsert_resolved_ips(
-        &self,
-        dns_endpoint_id: i64,
-        ips: &[IpAddr],
-    ) -> Result<()> {
+    pub async fn upsert_resolved_ips(&self, dns_endpoint_id: i64, ips: &[IpAddr]) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -643,7 +641,7 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(eid)
-            .bind(&ip.to_string())
+            .bind(ip.to_string())
             .bind(host_type)
             .bind(0i32)
             .bind(dns_endpoint_id)
@@ -656,11 +654,7 @@ impl Database {
 
     /// Resolve a DNS endpoint's hostname, replace its child IPs, return the
     /// resolved addresses.
-    pub async fn resolve_endpoint_dns(
-        &self,
-        endpoint_id: i64,
-        host: &str,
-    ) -> Result<Vec<IpAddr>> {
+    pub async fn resolve_endpoint_dns(&self, endpoint_id: i64, host: &str) -> Result<Vec<IpAddr>> {
         use std::time::Duration;
         use tokio::time::timeout;
 
@@ -672,7 +666,7 @@ impl Database {
             Err(_) => {
                 return Err(DatabaseError::Generic(format!(
                     "DNS resolution timed out for {host}"
-                )))
+                )));
             }
         };
 
@@ -711,7 +705,7 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(eid)
-            .bind(&ip.to_string())
+            .bind(ip.to_string())
             .bind(host_type)
             .bind(0i32)
             .bind(endpoint_id)
@@ -985,11 +979,7 @@ impl Database {
 
 impl Database {
     /// Create a ping batch with Rust-side triplet dedup.
-    pub async fn create_ping_batch(
-        &self,
-        batch_id: &str,
-        group_id: Option<&str>,
-    ) -> Result<usize> {
+    pub async fn create_ping_batch(&self, batch_id: &str, group_id: Option<&str>) -> Result<usize> {
         let mut conn = self.db.connection().await?;
 
         // Get protocols, optionally filtered by group
@@ -1312,12 +1302,12 @@ impl Database {
 
 // ── Deserialization helpers ────────────────────────────────────────────
 
-/// Deserialize JOIN query results into EndpointRow instances.
+/// Deserialize JOIN query results into `EndpointRow` instances.
 /// Column order (0-32):
 ///   0-8: Endpoint fields
-///   9-21: ProtocolRow fields
-///   22-26: ProfileExtension fields (nullable from LEFT JOIN)
-///   27-32: ServerStat fields (nullable from LEFT JOIN)
+///   9-21: `ProtocolRow` fields
+///   22-26: `ProfileExtension` fields (nullable from LEFT JOIN)
+///   27-32: `ServerStat` fields (nullable from LEFT JOIN)
 fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
     let mut map: HashMap<i64, EndpointRow> = HashMap::new();
     // Preserve insertion order
@@ -1327,30 +1317,27 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
         if let Value::Record(fields) = value {
             let eid = get_i64(&fields, 0)?;
 
-            if !map.contains_key(&eid) {
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(eid) {
                 order.push(eid);
-                map.insert(
-                    eid,
-                    EndpointRow {
-                        endpoint: Endpoint {
-                            id: eid,
-                            host: get_string(&fields, 1)?,
-                            host_type: get_string(&fields, 2)?,
-                            port: get_i64(&fields, 3)? as i32,
-                            port_spec_str: get_opt_string(&fields, 4),
-                            parent_id: get_opt_i64(&fields, 5),
-                            last_source: get_opt_string(&fields, 6),
-                            created_at: get_i64(&fields, 7)?,
-                            manual_protocol_override: get_opt_i64(&fields, 8),
-                        },
-                        protocols: Vec::new(),
-                        extensions: HashMap::new(),
-                        stats: HashMap::new(),
-                        resolved_ips: Vec::new(),
-                        selected_protocol: 0,
-                        expanded: false,
+                e.insert(EndpointRow {
+                    endpoint: Endpoint {
+                        id: eid,
+                        host: get_string(&fields, 1)?,
+                        host_type: get_string(&fields, 2)?,
+                        port: get_i64(&fields, 3)? as i32,
+                        port_spec_str: get_opt_string(&fields, 4),
+                        parent_id: get_opt_i64(&fields, 5),
+                        last_source: get_opt_string(&fields, 6),
+                        created_at: get_i64(&fields, 7)?,
+                        manual_protocol_override: get_opt_i64(&fields, 8),
                     },
-                );
+                    protocols: Vec::new(),
+                    extensions: HashMap::new(),
+                    stats: HashMap::new(),
+                    resolved_ips: Vec::new(),
+                    selected_protocol: 0,
+                    expanded: false,
+                });
             }
 
             if let Some(entry) = map.get_mut(&eid) {
@@ -1379,47 +1366,37 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
 
                 // Add extension if present (field 22 is protocol_id, non-null = exists)
                 if let Some(ext_pid) = get_opt_i64(&fields, 22) {
-                    if !entry.extensions.contains_key(&ext_pid) {
-                        entry.extensions.insert(
-                            ext_pid,
-                            ProfileExtension {
-                                protocol_id: ext_pid,
-                                delay: get_opt_i64(&fields, 23).map(|v| v as i32),
-                                speed: get_opt_i64(&fields, 24).map(|v| v as i32),
-                                sort_order: get_opt_i64(&fields, 25).map(|v| v as i32),
-                                ip_info: get_opt_string(&fields, 26),
-                                protocol_row: Default::default(),
-                            },
-                        );
-                    }
+                    entry
+                        .extensions
+                        .entry(ext_pid)
+                        .or_insert_with(|| ProfileExtension {
+                            protocol_id: ext_pid,
+                            delay: get_opt_i64(&fields, 23).map(|v| v as i32),
+                            speed: get_opt_i64(&fields, 24).map(|v| v as i32),
+                            sort_order: get_opt_i64(&fields, 25).map(|v| v as i32),
+                            ip_info: get_opt_string(&fields, 26),
+                            protocol_row: Default::default(),
+                        });
                 }
 
                 // Add stats if present (field 27 is protocol_id, non-null = exists)
                 if let Some(stat_pid) = get_opt_i64(&fields, 27) {
-                    if !entry.stats.contains_key(&stat_pid) {
-                        entry.stats.insert(
-                            stat_pid,
-                            ServerStat {
-                                protocol_id: stat_pid,
-                                today_up: get_opt_i64(&fields, 28),
-                                today_down: get_opt_i64(&fields, 29),
-                                total_up: get_opt_i64(&fields, 30),
-                                total_down: get_opt_i64(&fields, 31),
-                                last_updated: get_opt_string(&fields, 32),
-                                protocol_row: Default::default(),
-                            },
-                        );
-                    }
+                    entry.stats.entry(stat_pid).or_insert_with(|| ServerStat {
+                        protocol_id: stat_pid,
+                        today_up: get_opt_i64(&fields, 28),
+                        today_down: get_opt_i64(&fields, 29),
+                        total_up: get_opt_i64(&fields, 30),
+                        total_down: get_opt_i64(&fields, 31),
+                        last_updated: get_opt_string(&fields, 32),
+                        protocol_row: Default::default(),
+                    });
                 }
             }
         }
     }
 
     // Return in insertion order
-    Ok(order
-        .into_iter()
-        .filter_map(|id| map.remove(&id))
-        .collect())
+    Ok(order.into_iter().filter_map(|id| map.remove(&id)).collect())
 }
 
 /// Deserialize ping session rows.

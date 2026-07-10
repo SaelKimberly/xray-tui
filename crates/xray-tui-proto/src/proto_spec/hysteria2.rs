@@ -60,9 +60,11 @@ use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
-use crate::clash::{ClashProxy, ClashHysteria2};
+use crate::clash::{ClashHysteria2, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{
+    clash_server_to_host, clash_tls_to_security, host_spec_to_string, port_spec_first,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,8 +138,8 @@ impl ProtoSpec for Hysteria2Config {
         let hop_interval = utils::query_get_multi(&query, &["mportHopInt", "hop_interval"])
             .and_then(|v| v.parse().ok());
         // pin_sha256: certificate SHA-256 pin (keys: pinSHA256, pin_sha256)
-        let pin_sha256 = utils::query_get_multi(&query, &["pinSHA256", "pin_sha256"])
-            .map(TinyText::from);
+        let pin_sha256 =
+            utils::query_get_multi(&query, &["pinSHA256", "pin_sha256"]).map(TinyText::from);
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
@@ -267,11 +269,20 @@ impl ProtoSpec for Hysteria2Config {
                     host: clash_server_to_host(&c.server)?,
                     port,
                     hop_interval: c.hop_interval,
-                    up: c.up.clone().map(|v| TinyText::from(v.to_string())),
-                    down: c.down.clone().map(|v| TinyText::from(v.to_string())),
+                    up: c.up.clone().map(|v| TinyText::from(v)),
+                    down: c.down.clone().map(|v| TinyText::from(v)),
                     obfs: c.obfs.clone().map(TinyText::from),
                     obfs_password: c.obfs_password.clone().map(TinyText::from),
-                    security: clash_tls_to_security(Some(true), c.servername.as_deref(), c.skip_cert_verify, c.alpn.as_deref().and_then(|v| v.first().map(|s| s.as_str())), None, None),
+                    security: clash_tls_to_security(
+                        Some(true),
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        c.alpn
+                            .as_deref()
+                            .and_then(|v| v.first().map(std::string::String::as_str)),
+                        None,
+                        None,
+                    ),
                     remarks: match c.name.as_str() {
                         "" => None,
                         s => Some(TinyText::from(s)),
@@ -298,14 +309,16 @@ impl ProtoSpec for Hysteria2Config {
             hop_interval: self.hop_interval,
             up: self.up.as_ref().and_then(|v| v.parse().ok()),
             down: self.down.as_ref().and_then(|v| v.parse().ok()),
-            obfs: self.obfs.as_ref().map(|s| s.to_string()),
-            obfs_password: self.obfs_password.as_ref().map(|s| s.to_string()),
+            obfs: self.obfs.as_ref().map(std::string::ToString::to_string),
+            obfs_password: self
+                .obfs_password
+                .as_ref()
+                .map(std::string::ToString::to_string),
             skip_cert_verify: self.security.insecure(),
-            servername: self.security.sni().map(|s| s.to_string()),
+            servername: self.security.sni().map(std::string::ToString::to_string),
             alpn: alpn_str.map(|s| vec![s.to_string()]),
         }))
     }
-
 }
 
 impl Hysteria2Config {
@@ -342,8 +355,6 @@ impl Hysteria2Config {
         hasher.finish()
     }
 }
-
-use crate::proto_spec::common::*;
 
 #[cfg(test)]
 mod tests {

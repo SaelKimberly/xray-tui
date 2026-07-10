@@ -45,7 +45,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
@@ -53,9 +53,12 @@ use super::common::{
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashVless};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{
+    clash_alpn_as_str, clash_server_to_host, clash_tls_to_security, clash_transport_to_transport,
+    host_spec_to_string, security_to_clash_reality, security_to_clash_tls, transport_to_clash,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +156,7 @@ impl ProtoSpec for VlessConfig {
                 });
                 SecurityConfig {
                     tls: Some(TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                        pin_sha256: None,
                         sni: utils::query_get(&query, "sni").map(TinyText::from),
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
@@ -208,7 +211,7 @@ impl ProtoSpec for VlessConfig {
                 }
             }
             if let Some(extra) = utils::query_get(&query, "extra") {
-                let mut bytes = extra.as_bytes().to_vec();
+                let bytes = extra.as_bytes().to_vec();
                 match serde_json::from_slice(&bytes) {
                     Ok(v) => xcfg.extra = Some(v),
                     Err(_) => {
@@ -463,8 +466,11 @@ impl ProtoSpec for VlessConfig {
             udp: None,
             tfo: None,
             network,
-            flow: self.flow.as_ref().map(|s| s.to_string()),
-            encryption: self.encryption.as_ref().map(|s| s.to_string()),
+            flow: self.flow.as_ref().map(std::string::ToString::to_string),
+            encryption: self
+                .encryption
+                .as_ref()
+                .map(std::string::ToString::to_string),
             tls,
             servername,
             skip_cert_verify,
@@ -475,7 +481,6 @@ impl ProtoSpec for VlessConfig {
             xhttp_opts: None,
         }))
     }
-
 }
 
 impl VlessConfig {
@@ -541,13 +546,11 @@ fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
         .map(|v| v as _)
 }
 
-use crate::proto_spec::common::*;
-
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
+    use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
-use crate::urlx::PortSpec;
 
     #[test]
     fn test_vless_basic() {

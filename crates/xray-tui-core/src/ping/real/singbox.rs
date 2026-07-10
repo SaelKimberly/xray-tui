@@ -12,7 +12,11 @@ use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow};
 /// ConfigBuilder::build handles both cores, so the flow is identical
 /// to xray.rs. Separation exists for future divergence (different startup
 /// flags, API ports, etc.).
-pub(super) async fn real_ping(endpoint: &Endpoint, protocol: &ProtocolRow, ctx: &RealPingManager) -> PingResult {
+pub(super) async fn real_ping(
+    endpoint: &Endpoint,
+    protocol: &ProtocolRow,
+    ctx: &RealPingManager,
+) -> PingResult {
     let endpoint = endpoint.clone();
     let protocol = protocol.clone();
     let proxy_addr = ctx.proxy_addr.clone();
@@ -54,8 +58,9 @@ pub(super) async fn real_ping(endpoint: &Endpoint, protocol: &ProtocolRow, ctx: 
             client_ip: None,
         };
 
-        let backend_config = ConfigBuilder::build(&endpoint, &protocol, resolved_core, &params, &[], &dns)
-            .map_err(|_| "Build config failed".to_string())?;
+        let backend_config =
+            ConfigBuilder::build(&endpoint, &protocol, resolved_core, &params, &[], &dns)
+                .map_err(|_| "Build config failed".to_string())?;
 
         let bin_path =
             find_binary(resolved_core, &bin_dir).ok_or_else(|| "Binary not found".to_string())?;

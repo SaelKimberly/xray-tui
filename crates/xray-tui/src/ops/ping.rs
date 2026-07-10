@@ -1,22 +1,18 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use tokio::sync::{Semaphore, mpsc};
-use tracing::warn;
 
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{
-    BuildParams, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core,
-};
-use xray_tui_db::models::{DnsSetting, PingResultUpdate, ProfileExtension};
+use xray_tui_core::{BuildParams, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core};
 use xray_tui_db::Database;
+use xray_tui_db::models::{DnsSetting, PingResultUpdate, ProfileExtension};
 
-use xray_tui_core::ping::PingError;
 use crate::AppState;
-use crate::types::*;
 use crate::try_send_or_warn;
+use crate::types::{CoreEvent, ProfileRow};
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
@@ -92,7 +88,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         state.log_trace("error", "tui", "Profile not found for real ping");
         return;
     };
-    let p = protocol.clone();
+    let p = protocol;
     let resolved_protocol = Protocol::try_from_i32(p.config_type).unwrap_or(Protocol::Custom);
     let core_override = state
         .config
@@ -105,7 +101,9 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         Some(tx) => tx.clone(),
         None => return,
     };
-    state.testing_details.insert(protocol_id, TestType::RealPing);
+    state
+        .testing_details
+        .insert(protocol_id, TestType::RealPing);
     state.testing_profiles.insert(protocol_id);
 
     // Build params for the temp core
@@ -164,26 +162,26 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         }
 
         // 2. Build config
-        let backend_config = match ConfigBuilder::build(&endpoint, &p, core_type, &params, &[], &dns)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                try_send_or_warn(
-                    &tx,
-                    CoreEvent::SpeedTestResult {
-                        protocol_id,
-                        test_type: TestType::RealPing,
-                        latency_ms: None,
-                        speed_bps: None,
-                        ip_info: None,
-                        error: Some(format!("Config build failed: {e}")),
-                    },
-                    "real_ping_config_err",
-                );
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                return;
-            }
-        };
+        let backend_config =
+            match ConfigBuilder::build(&endpoint, &p, core_type, &params, &[], &dns) {
+                Ok(c) => c,
+                Err(e) => {
+                    try_send_or_warn(
+                        &tx,
+                        CoreEvent::SpeedTestResult {
+                            protocol_id,
+                            test_type: TestType::RealPing,
+                            latency_ms: None,
+                            speed_bps: None,
+                            ip_info: None,
+                            error: Some(format!("Config build failed: {e}")),
+                        },
+                        "real_ping_config_err",
+                    );
+                    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                    return;
+                }
+            };
 
         // 3. Find binary
         let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
@@ -280,7 +278,9 @@ pub fn start_speed_test(state: &mut AppState, protocol_id: i64) {
         Some(tx) => tx.clone(),
         None => return,
     };
-    state.testing_details.insert(protocol_id, TestType::SpeedTest);
+    state
+        .testing_details
+        .insert(protocol_id, TestType::SpeedTest);
     state.testing_profiles.insert(protocol_id);
     let proxy_addr = state.config.inbound.listen.clone();
     let proxy_port = state.config.inbound.socks_port;
@@ -393,7 +393,7 @@ async fn batch_upsert_buffer(
         .iter()
         .filter_map(|r| {
             r.latency_ms.map(|ms| ProfileExtension {
-                protocol_id: r.protocol_id.clone(),
+                protocol_id: r.protocol_id,
                 delay: Some(ms),
                 speed: None,
                 sort_order: None,
@@ -506,7 +506,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
 
             for session in &sessions {
                 let _ = tx.try_send(CoreEvent::TestTypeUpdate {
-                    protocol_id: session.protocol_id.clone(),
+                    protocol_id: session.protocol_id,
                     test_type: TestType::TcpPing,
                 });
 
@@ -525,7 +525,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                         let ms = dur.as_millis() as i32;
                         buffer.push(PingResultUpdate {
                             session_id: session.id.clone(),
-                            protocol_id: session.protocol_id.clone(),
+                            protocol_id: session.protocol_id,
                             status: "completed".to_string(),
                             ping_type: "fast".to_string(),
                             latency_ms: Some(ms),
@@ -544,7 +544,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                             // No real ping phase — emit Cancelled immediately
                             buffer.push(PingResultUpdate {
                                 session_id: session.id.clone(),
-                                protocol_id: session.protocol_id.clone(),
+                                protocol_id: session.protocol_id,
                                 status: "cancelled".to_string(),
                                 ping_type: "fast".to_string(),
                                 latency_ms: None,
@@ -553,7 +553,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                                 error: Some("Not supported by fast ping".to_string()),
                             });
                             let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                                protocol_id: session.protocol_id.clone(),
+                                protocol_id: session.protocol_id,
                                 test_type: TestType::TcpPing,
                                 latency_ms: None,
                                 speed_bps: None,
@@ -565,7 +565,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                     Err(e) => {
                         buffer.push(PingResultUpdate {
                             session_id: session.id.clone(),
-                            protocol_id: session.protocol_id.clone(),
+                            protocol_id: session.protocol_id,
                             status: "failed".to_string(),
                             ping_type: "fast".to_string(),
                             latency_ms: None,
@@ -578,7 +578,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                 // Send SpeedTestResult to TUI for immediate feedback
                 let last = buffer.last().unwrap();
                 let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                    protocol_id: session.protocol_id.clone(),
+                    protocol_id: session.protocol_id,
                     test_type: TestType::TcpPing,
                     latency_ms: last.latency_ms.map(|v| v as u64),
                     speed_bps: None,
@@ -637,7 +637,13 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                             protocol_id: session.protocol_id,
                             test_type: TestType::RealPing,
                         });
-                        let result = rmgr.real_ping(&profile.endpoint, profile.active_protocol(), session.config_type).await;
+                        let result = rmgr
+                            .real_ping(
+                                &profile.endpoint,
+                                profile.active_protocol(),
+                                session.config_type,
+                            )
+                            .await;
                         let _ = tx.try_send(CoreEvent::SpeedTestResult {
                             protocol_id: session.protocol_id,
                             test_type: TestType::RealPing,
@@ -693,7 +699,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                         TestType::TcpPing
                     };
                     let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                        protocol_id: session.protocol_id.clone(),
+                        protocol_id: session.protocol_id,
                         test_type,
                         latency_ms: None,
                         speed_bps: None,

@@ -44,7 +44,7 @@ use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashWireGuard};
 use crate::proto_spec::ProtoSpecError;
-use crate::proto_spec::common::*;
+use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,23 +120,28 @@ impl ProtoSpec for WireguardConfig {
         let mtu = utils::query_get(&query, "mtu").map(TinyText::from);
 
         // persistent_keepalive/keepalive: optional keepalive interval
-        let persistent_keepalive = utils::query_get_multi(&query, &["persistent_keepalive", "keepalive"])
-            .and_then(|s| s.parse::<u32>().ok());
+        let persistent_keepalive =
+            utils::query_get_multi(&query, &["persistent_keepalive", "keepalive"])
+                .and_then(|s| s.parse::<u32>().ok());
 
         // dns: comma-separated DNS servers
-        let dns = utils::query_get(&query, "dns").map(|s| {
-            s.split(',')
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<String>>()
-        }).filter(|v| !v.is_empty());
+        let dns = utils::query_get(&query, "dns")
+            .map(|s| {
+                s.split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .filter(|v| !v.is_empty());
 
         // remote_dns_resolve/remote_dns: force remote DNS resolution
-        let remote_dns_resolve = utils::query_get_multi(&query, &["remote_dns_resolve", "remote_dns"])
-            .and_then(|s| match s.to_lowercase().as_str() {
-                "true" | "1" | "yes" => Some(true),
-                "false" | "0" | "no" => Some(false),
-                _ => None,
+        let remote_dns_resolve =
+            utils::query_get_multi(&query, &["remote_dns_resolve", "remote_dns"]).and_then(|s| {
+                match s.to_lowercase().as_str() {
+                    "true" | "1" | "yes" => Some(true),
+                    "false" | "0" | "no" => Some(false),
+                    _ => None,
+                }
             });
 
         let remarks = utils::decode_fragment(raw)?;
@@ -186,13 +191,13 @@ impl ProtoSpec for WireguardConfig {
             parts.push(format!("mtu={}", urlencoding::encode(v)));
         }
         if let Some(v) = &self.persistent_keepalive {
-            parts.push(format!("persistent_keepalive={}", v));
+            parts.push(format!("persistent_keepalive={v}"));
         }
         if let Some(v) = &self.dns {
             parts.push(format!("dns={}", urlencoding::encode(&v.join(","))));
         }
         if let Some(v) = &self.remote_dns_resolve {
-            parts.push(format!("remote_dns_resolve={}", v));
+            parts.push(format!("remote_dns_resolve={v}"));
         }
 
         let query_string = if parts.is_empty() {
@@ -253,18 +258,20 @@ impl ProtoSpec for WireguardConfig {
         None
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
             ClashProxy::Wireguard(c) => {
                 // ClashWireGuard.ip may not have CIDR suffix; add /32 if missing
-                let address = c.ip.as_deref().map(|ip| {
-                    if ip.contains('/') {
-                        TinyText::from(ip)
-                    } else {
-                        TinyText::from(format!("{}/32", ip))
-                    }
-                }).unwrap_or_default();
+                let address =
+                    c.ip.as_deref()
+                        .map(|ip| {
+                            if ip.contains('/') {
+                                TinyText::from(ip)
+                            } else {
+                                TinyText::from(format!("{ip}/32"))
+                            }
+                        })
+                        .unwrap_or_default();
 
                 Ok(Self {
                     sig_cache: std::sync::OnceLock::new(),
@@ -299,10 +306,16 @@ impl ProtoSpec for WireguardConfig {
             port: self.port,
             private_key: self.private_key.clone(),
             public_key: self.public_key.clone(),
-            ip: Some(self.address.split('/').next().unwrap_or(&self.address).to_string()),
+            ip: Some(
+                self.address
+                    .split('/')
+                    .next()
+                    .unwrap_or(&self.address)
+                    .to_string(),
+            ),
             ipv6: None,
             pre_shared_key: self.preshared_key.clone(),
-            reserved: self.reserved.as_ref().map(|s| s.to_string()),
+            reserved: self.reserved.as_ref().map(std::string::ToString::to_string),
             mtu: self.mtu.as_ref().and_then(|v| v.parse::<u32>().ok()),
             dns: self.dns.clone(),
             persistent_keepalive: self.persistent_keepalive,
@@ -334,13 +347,11 @@ impl WireguardConfig {
             }
         }
         if let Some(v) = &self.remote_dns_resolve {
-            hasher.write(&[*v as u8]);
+            hasher.write(&[u8::from(*v)]);
         }
         hasher.finish()
     }
 }
-
-use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {

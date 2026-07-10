@@ -55,15 +55,18 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashVmess};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{
+    clash_alpn_as_str, clash_server_to_host, clash_tls_to_security, clash_transport_to_transport,
+    host_spec_to_string, security_to_clash_tls, transport_to_clash,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +187,7 @@ impl ProtoSpec for VmessConfig {
         let security = SecurityConfig {
             tls: tls_str.map(|_| {
                 TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                    pin_sha256: None,
                     sni: sni.clone(),
                     alpn,
                     fp,
@@ -422,14 +425,20 @@ impl ProtoSpec for VmessConfig {
     fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
         let name = self.remarks.as_deref().unwrap_or("").to_string();
         let server = host_spec_to_string(&self.host);
-        let (tls, servername, skip_cert_verify, alpn_str, fingerprint) = security_to_clash_tls(&self.security);
-        let (network, ws_opts, grpc_opts, h2_opts, http_opts, mkcp_opts) = transport_to_clash(&self.transport, &server);
+        let (tls, servername, skip_cert_verify, alpn_str, fingerprint) =
+            security_to_clash_tls(&self.security);
+        let (network, ws_opts, grpc_opts, h2_opts, http_opts, mkcp_opts) =
+            transport_to_clash(&self.transport, &server);
         Ok(ClashProxy::Vmess(ClashVmess {
             name,
             server,
             port: self.port,
             uuid: self.uuid.clone(),
-            cipher: self.security.enc.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "auto".to_string()),
+            cipher: self
+                .security
+                .enc
+                .as_ref()
+                .map_or_else(|| "auto".to_string(), std::string::ToString::to_string),
             alter_id: self.alter_id.as_ref().and_then(|v| v.parse::<u32>().ok()),
             udp: None,
             tfo: None,
@@ -446,7 +455,6 @@ impl ProtoSpec for VmessConfig {
             mkcp_opts,
         }))
     }
-
 }
 
 impl VmessConfig {
@@ -481,13 +489,11 @@ impl VmessConfig {
     }
 }
 
-use crate::proto_spec::common::*;
-
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
+    use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
-use crate::urlx::PortSpec;
 
     #[test]
     fn test_vmess_basic() {

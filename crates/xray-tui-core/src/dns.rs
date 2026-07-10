@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Resolve a hostname to IP addresses.
 ///

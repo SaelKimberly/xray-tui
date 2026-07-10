@@ -9,10 +9,10 @@ pub mod subscription;
 
 pub use app_config::{
     AppConfig, CoreConfig, GuiConfig, InboundConfig, LogConfig, MuxConfig, ParsingSettings,
-    StatisticsConfig, SystemProxyConfig, TunConfig, UpdateConfig, PurgatoryConfig,
+    PurgatoryConfig, StatisticsConfig, SystemProxyConfig, TunConfig, UpdateConfig,
 };
 pub use duration_or_secs::DurationOrSecs;
 pub use import_export::{
-    flatten_json_to_fields, parse_profile_settings, profile_config, profile_user_id,
-    ValidationSettings, ValidationSummary,
+    ValidationSettings, ValidationSummary, flatten_json_to_fields, parse_profile_settings,
+    profile_config, profile_user_id,
 };

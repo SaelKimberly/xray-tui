@@ -30,9 +30,11 @@ use super::common::{SecurityConfig, TlsConfig};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::clash::{ClashProxy, ClashNaive};
+use crate::clash::{ClashNaive, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
-use crate::proto_spec::common::*;
+use crate::proto_spec::common::{
+    clash_server_to_host, clash_tls_to_security, host_spec_to_string, security_to_clash_tls,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,31 +157,28 @@ impl ProtoSpec for NaiveConfig {
         None
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Naive(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    username: c.username.clone(),
-                    password: c.password.clone(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    security: clash_tls_to_security(
-                        c.tls,
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        None,
-                        None,
-                        None,
-                    ),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
+            ClashProxy::Naive(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                username: c.username.clone(),
+                password: c.password.clone(),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                security: clash_tls_to_security(
+                    c.tls,
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    None,
+                    None,
+                    None,
+                ),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+            }),
             _ => Err(ParseError::Unknown("expected naive clash proxy".into())),
         }
     }
@@ -211,8 +210,6 @@ impl NaiveConfig {
         hasher.finish()
     }
 }
-
-use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {

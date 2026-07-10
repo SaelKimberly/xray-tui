@@ -1,18 +1,12 @@
-use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tracing::warn;
-
-use xray_tui_core::speed_test::TestType;
 use xray_tui_core::CoreType;
+use xray_tui_core::speed_test::TestType;
 use xray_tui_db::models::{ProfileExtension, ServerStat};
-use xray_tui_db::Database;
 
 use crate::AppState;
-use crate::types::*;
-use crate::{format_now, try_send_or_warn};
+use crate::format_now;
+use crate::types::{AppMode, CoreEvent, SettingsMode, SplitRightPane};
 
 /// Poll core event channel and update state accordingly.
 pub async fn poll_core_events(state: &mut AppState) {
@@ -160,13 +154,15 @@ pub async fn poll_core_events(state: &mut AppState) {
                         .find(|r| r.endpoint.id == protocol_id);
                     match row {
                         Some(row) => {
-                            let ext = row.extensions.entry(protocol_id).or_insert_with(|| ProfileExtension {
-                                protocol_id,
-                                delay: None,
-                                speed: None,
-                                sort_order: None,
-                                ip_info: None,
-                                protocol_row: Default::default(),
+                            let ext = row.extensions.entry(protocol_id).or_insert_with(|| {
+                                ProfileExtension {
+                                    protocol_id,
+                                    delay: None,
+                                    speed: None,
+                                    sort_order: None,
+                                    ip_info: None,
+                                    protocol_row: Default::default(),
+                                }
                             });
                             match test_type {
                                 TestType::RealPing => {
@@ -177,12 +173,15 @@ pub async fn poll_core_events(state: &mut AppState) {
                                     ext.delay = latency_ms.map(|v| v as i32);
                                 }
                                 TestType::SpeedTest => {
-                                    ext.speed = speed_bps
-                                        .map(|v| std::cmp::min(v, i32::MAX as u64) as i32);
+                                    ext.speed =
+                                        speed_bps.map(|v| std::cmp::min(v, i32::MAX as u64) as i32);
                                 }
                             }
                             let _ = state.db.upsert_profile_extension(ext).await;
-                            row.active_protocol().remarks.clone().unwrap_or_else(|| protocol_id.to_string())
+                            row.active_protocol()
+                                .remarks
+                                .clone()
+                                .unwrap_or_else(|| protocol_id.to_string())
                         }
                         None => protocol_id.to_string(),
                     }
@@ -195,10 +194,8 @@ pub async fn poll_core_events(state: &mut AppState) {
                         &format!("{test_type:?} failed for {name}: {err}"),
                     );
                 } else {
-                    let latency_str =
-                        latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default();
-                    let speed_str =
-                        speed_bps.map(|bps| format!("{bps}bps")).unwrap_or_default();
+                    let latency_str = latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default();
+                    let speed_str = speed_bps.map(|bps| format!("{bps}bps")).unwrap_or_default();
                     let detail = if !speed_str.is_empty() {
                         speed_str
                     } else if !latency_str.is_empty() {
@@ -250,9 +247,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                                 let cur = xray_tui_core::updater::parse_version(cur_str);
                                 let latest = xray_tui_core::updater::parse_version(latest_str);
                                 match (cur, latest) {
-                                    (Some(c), Some(l)) => {
-                                        xray_tui_core::updater::is_newer(&c, &l)
-                                    }
+                                    (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
                                     _ => false,
                                 }
                             }

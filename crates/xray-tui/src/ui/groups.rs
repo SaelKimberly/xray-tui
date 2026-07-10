@@ -78,9 +78,7 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Build sorted group items
     let mut sorted_groups: Vec<(usize, &Group)> = state.groups.iter().enumerate().collect();
-    sorted_groups.sort_by_key(|(_, g)| {
-        g.name.as_deref().unwrap_or("").to_string()
-    });
+    sorted_groups.sort_by_key(|(_, g)| g.name.as_deref().unwrap_or("").to_string());
 
     let items: Vec<GroupListItem> = sorted_groups
         .iter()

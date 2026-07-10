@@ -173,7 +173,10 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
 }
 
 // ── Outbound construction ────────────────────────────────────────────
-fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<Outbound, BuildError> {
+fn build_proxy_outbound(
+    endpoint: &Endpoint,
+    protocol: &ProtocolRow,
+) -> Result<Outbound, BuildError> {
     let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
         BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
     })?;

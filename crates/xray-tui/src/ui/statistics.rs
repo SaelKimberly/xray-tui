@@ -7,8 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
 use xray_tui_config::import_export::profile_config;
-use xray_tui_proto::proto_spec::ProtoSpec;
 use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
+use xray_tui_proto::proto_spec::ProtoSpec;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
@@ -40,8 +40,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         protocol_settings: None,
         stream_settings: None,
     })
-        .and_then(|c| c.remarks().map(String::from))
-        .unwrap_or_else(|| "Unknown".to_string());
+    .and_then(|c| c.remarks().map(String::from))
+    .unwrap_or_else(|| "Unknown".to_string());
     let core_type = state.connected_core.map_or("", |c| c.as_str());
 
     // Split area into 3 sections

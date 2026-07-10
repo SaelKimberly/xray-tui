@@ -43,7 +43,9 @@ use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashSocks5};
 use crate::proto_spec::ProtoSpecError;
-use crate::proto_spec::common::*;
+use crate::proto_spec::common::{
+    clash_server_to_host, clash_tls_to_security, host_spec_to_string, security_to_clash_tls,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,9 +86,7 @@ impl ProtoSpec for Socks5Config {
         } else {
             // Fallback: socks://user:pass@host:port collapsed into userinfo
             let (ui, hp) = raw.userinfo.split_once('@').ok_or_else(|| {
-                ParseError::InvalidUserInfo(
-                    format!("{}: missing hostport", raw.userinfo).into(),
-                )
+                ParseError::InvalidUserInfo(format!("{}: missing hostport", raw.userinfo).into())
             })?;
             (ui, hp)
         };
@@ -190,31 +190,28 @@ impl ProtoSpec for Socks5Config {
         None
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Socks5(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    username: c.username.clone(),
-                    password: c.password.clone(),
-                    security: clash_tls_to_security(
-                        c.tls,
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        None,
-                        None,
-                        None,
-                    ),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
+            ClashProxy::Socks5(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                username: c.username.clone(),
+                password: c.password.clone(),
+                security: clash_tls_to_security(
+                    c.tls,
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    None,
+                    None,
+                    None,
+                ),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+            }),
             _ => Err(ParseError::Unknown("expected socks5 clash proxy".into())),
         }
     }
@@ -247,12 +244,10 @@ impl Socks5Config {
     }
 }
 
-use crate::urlx::PortSpec;
-
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::check_roundtrip;
     use super::super::ProtoSpec;
+    use super::super::test_helpers::check_roundtrip;
     use super::Socks5Config;
     use crate::urlx::SchemeX;
 

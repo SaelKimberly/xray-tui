@@ -1,4 +1,4 @@
-//! AnyTLS (`anytls://`) URL parsing.
+//! `AnyTLS` (`anytls://`) URL parsing.
 //!
 //! # Format
 //! ```text
@@ -34,11 +34,11 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
 use super::utils;
+use super::{ParseError, ProtoSpec, impl_sig_cache};
 use crate::clash::{ClashAnyTls, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
-use super::{impl_sig_cache, ParseError, ProtoSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,14 +61,14 @@ pub struct AnyTlsConfig {
 }
 
 impl ProtoSpec for AnyTlsConfig {
-    /// Parse an AnyTLS URL.
+    /// Parse an `AnyTLS` URL.
     ///
     /// Userinfo is ignored (no auth in userinfo). Password comes from query params.
     /// TLS is always used, configured via sni/alpn/insecure query params.
     fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
-        let hostport = raw.hostport.ok_or_else(|| {
-            ParseError::InvalidUserInfo("anytls: missing hostport".into())
-        })?;
+        let hostport = raw
+            .hostport
+            .ok_or_else(|| ParseError::InvalidUserInfo("anytls: missing hostport".into()))?;
 
         let (parsed_host, parsed_port) = utils::parse_hostport(hostport)?;
         let parsed_port = parsed_port
@@ -78,8 +78,7 @@ impl ProtoSpec for AnyTlsConfig {
         let query = utils::parse_query(raw.query);
 
         // Password from query: password or auth alias
-        let password = utils::query_get_multi(&query, &["password", "auth"])
-            .map(str::to_string);
+        let password = utils::query_get_multi(&query, &["password", "auth"]).map(str::to_string);
 
         // TLS config (AnyTLS always uses TLS)
         let insecure = utils::query_get_multi(
@@ -98,7 +97,7 @@ impl ProtoSpec for AnyTlsConfig {
         let security = if sni.is_some() || alpn.is_some() || insecure.is_some() {
             SecurityConfig {
                 tls: Some(TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                    pin_sha256: None,
                     sni,
                     alpn,
                     fp: None,
@@ -206,20 +205,18 @@ impl ProtoSpec for AnyTlsConfig {
 
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Anytls(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    password: Some(c.password.clone()),
-                    security: SecurityConfig::default(),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
+            ClashProxy::Anytls(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                password: Some(c.password.clone()),
+                security: SecurityConfig::default(),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+            }),
             _ => Err(ParseError::Unknown("expected anytls clash proxy".into())),
         }
     }
@@ -232,7 +229,7 @@ impl ProtoSpec for AnyTlsConfig {
             port: self.port,
             password: self.password.clone().unwrap_or_default(),
             tls: Some(true),
-            servername: self.security.sni().map(|s| s.to_string()),
+            servername: self.security.sni().map(std::string::ToString::to_string),
             skip_cert_verify: self.security.insecure(),
             idle_session_check_interval: None,
             idle_session_timeout: None,
@@ -258,7 +255,10 @@ impl AnyTlsConfig {
     }
 }
 
-use crate::proto_spec::common::*;
+use crate::proto_spec::common::{
+    SecurityConfig, TlsConfig, TlsOpts, clash_server_to_host, host_spec_to_string,
+    should_skip_param,
+};
 
 #[cfg(test)]
 mod tests {

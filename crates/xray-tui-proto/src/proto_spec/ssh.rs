@@ -24,14 +24,14 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::TinyText;
-use crate::urlx::{host_serde, port_serde};
-use crate::urlx::HostSpec;
-use crate::proto_spec::common::SecurityConfig;
-use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashSsh};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::SecurityConfig;
+use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
+use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
+use crate::urlx::HostSpec;
+use crate::urlx::TinyText;
+use crate::urlx::{host_serde, port_serde};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +63,16 @@ pub struct SshConfig {
 impl ProtoSpec for SshConfig {
     /// SSH does not support URL format — always returns an error.
     fn try_parse(_raw: &crate::urlx::RawUrlX<'_>) -> Result<Self, ParseError> {
-        Err(ParseError::Unknown("SSH does not support URL format".into()))
+        Err(ParseError::Unknown(
+            "SSH does not support URL format".into(),
+        ))
     }
 
     /// SSH does not support URL format — always returns an error.
     fn reconstruct(&self) -> Result<String, ParseError> {
-        Err(ParseError::Unknown("SSH does not support URL format".into()))
+        Err(ParseError::Unknown(
+            "SSH does not support URL format".into(),
+        ))
     }
 
     fn schema(&self) -> crate::urlx::SchemeX {
@@ -88,9 +92,9 @@ impl ProtoSpec for SshConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN)
-        });
+        let v = self
+            .cred_hash_cache
+            .get_or_init(|| NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN));
         v.get()
     }
 
@@ -104,30 +108,27 @@ impl ProtoSpec for SshConfig {
         None
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Ssh(c) => {
-                Ok(Self {
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    user: Some(c.user.clone()),
-                    password: c.password.clone(),
-                    private_key: c.private_key.clone(),
-                    private_key_path: c.private_key_path.clone(),
-                    private_key_passphrase: None,
-                    host_key: c.host_key.clone(),
-                    host_key_algorithms: c.host_key_algorithms.clone(),
-                    client_version: c.client_version.clone(),
-                    security: SecurityConfig::default(),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                })
-            }
+            ClashProxy::Ssh(c) => Ok(Self {
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                user: Some(c.user.clone()),
+                password: c.password.clone(),
+                private_key: c.private_key.clone(),
+                private_key_path: c.private_key_path.clone(),
+                private_key_passphrase: None,
+                host_key: c.host_key.clone(),
+                host_key_algorithms: c.host_key_algorithms.clone(),
+                client_version: c.client_version.clone(),
+                security: SecurityConfig::default(),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+            }),
             _ => Err(ParseError::Unknown("expected ssh clash proxy".into())),
         }
     }
@@ -164,8 +165,6 @@ impl SshConfig {
     }
 }
 
-use crate::urlx::PortSpec;
-
 #[cfg(test)]
 mod tests {
     use super::SshConfig;
@@ -178,6 +177,4 @@ mod tests {
         let raw = RawUrlX::from(url);
         assert!(SshConfig::try_parse(&raw).is_err());
     }
-
-
 }

@@ -35,15 +35,17 @@ use std::{fmt::Write, num::NonZeroU64};
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashTuic};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{
+    clash_alpn_as_str, clash_server_to_host, clash_tls_to_security, host_spec_to_string,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,10 +283,16 @@ impl ProtoSpec for TuicConfig {
             heartbeat_interval: None,
             reduce_rtt: None,
             request_timeout: None,
-            udp_relay_mode: self.udp_relay_mode.as_ref().map(|s| s.to_string()),
-            congestion_controller: self.congestion_control.as_ref().map(|s| s.to_string()),
+            udp_relay_mode: self
+                .udp_relay_mode
+                .as_ref()
+                .map(std::string::ToString::to_string),
+            congestion_controller: self
+                .congestion_control
+                .as_ref()
+                .map(std::string::ToString::to_string),
             skip_cert_verify: self.security.insecure(),
-            servername: self.security.sni().map(|s| s.to_string()),
+            servername: self.security.sni().map(std::string::ToString::to_string),
             alpn: alpn_str.map(|s| vec![s.to_string()]),
         }))
     }
@@ -317,8 +325,8 @@ impl TuicConfig {
 #[cfg(test)]
 mod tests {
     use super::super::{ProtoSpec, ProtocolConfig};
+    use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
-use crate::urlx::PortSpec;
 
     #[test]
     fn test_tuic_basic() {

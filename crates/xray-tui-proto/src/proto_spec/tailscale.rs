@@ -25,14 +25,14 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::TinyText;
-use crate::urlx::{host_serde, port_serde};
-use crate::urlx::HostSpec;
-use crate::proto_spec::common::SecurityConfig;
-use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashTailscale};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::SecurityConfig;
+use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
+use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
+use crate::urlx::HostSpec;
+use crate::urlx::TinyText;
+use crate::urlx::{host_serde, port_serde};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,12 +65,16 @@ pub struct TailscaleConfig {
 impl ProtoSpec for TailscaleConfig {
     /// Tailscale does not support URL format — always returns an error.
     fn try_parse(_raw: &crate::urlx::RawUrlX<'_>) -> Result<Self, ParseError> {
-        Err(ParseError::Unknown("Tailscale does not support URL format".into()))
+        Err(ParseError::Unknown(
+            "Tailscale does not support URL format".into(),
+        ))
     }
 
     /// Tailscale does not support URL format — always returns an error.
     fn reconstruct(&self) -> Result<String, ParseError> {
-        Err(ParseError::Unknown("Tailscale does not support URL format".into()))
+        Err(ParseError::Unknown(
+            "Tailscale does not support URL format".into(),
+        ))
     }
 
     fn schema(&self) -> crate::urlx::SchemeX {
@@ -90,9 +94,9 @@ impl ProtoSpec for TailscaleConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN)
-        });
+        let v = self
+            .cred_hash_cache
+            .get_or_init(|| NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN));
         v.get()
     }
 
@@ -106,34 +110,31 @@ impl ProtoSpec for TailscaleConfig {
         None
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Tailscale(c) => {
-                Ok(Self {
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    hostname: match c.hostname.as_str() {
-                        "" => None,
-                        s => Some(s.to_string()),
-                    },
-                    auth_key: c.auth_key.clone(),
-                    control_url: c.control_url.clone(),
-                    state_directory: c.state_dir.clone(),
-                    ephemeral: Some(c.ephemeral),
-                    accept_routes: Some(c.accept_routes),
-                    exit_node: c.exit_node.clone(),
-                    exit_node_allow_lan_access: c.exit_node_allow_lan_access.clone(),
-                    advertise_routes: None,
-                    security: SecurityConfig::default(),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                })
-            }
+            ClashProxy::Tailscale(c) => Ok(Self {
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                hostname: match c.hostname.as_str() {
+                    "" => None,
+                    s => Some(s.to_string()),
+                },
+                auth_key: c.auth_key.clone(),
+                control_url: c.control_url.clone(),
+                state_directory: c.state_dir.clone(),
+                ephemeral: Some(c.ephemeral),
+                accept_routes: Some(c.accept_routes),
+                exit_node: c.exit_node.clone(),
+                exit_node_allow_lan_access: c.exit_node_allow_lan_access,
+                advertise_routes: None,
+                security: SecurityConfig::default(),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+            }),
             _ => Err(ParseError::Unknown("expected tailscale clash proxy".into())),
         }
     }
@@ -151,7 +152,7 @@ impl ProtoSpec for TailscaleConfig {
             ephemeral: self.ephemeral.unwrap_or(false),
             accept_routes: self.accept_routes.unwrap_or(false),
             exit_node: self.exit_node.clone(),
-            exit_node_allow_lan_access: self.exit_node_allow_lan_access.clone(),
+            exit_node_allow_lan_access: self.exit_node_allow_lan_access,
         }))
     }
 }
@@ -177,8 +178,6 @@ impl TailscaleConfig {
     }
 }
 
-use crate::urlx::PortSpec;
-
 #[cfg(test)]
 mod tests {
     use super::TailscaleConfig;
@@ -191,6 +190,4 @@ mod tests {
         let raw = RawUrlX::from(url);
         assert!(TailscaleConfig::try_parse(&raw).is_err());
     }
-
-
 }

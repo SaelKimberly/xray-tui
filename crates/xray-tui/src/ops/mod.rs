@@ -1,4 +1,7 @@
-#![allow(clippy::too_many_lines, reason = "extracted from state.rs, will be refined")]
+#![allow(
+    clippy::too_many_lines,
+    reason = "extracted from state.rs, will be refined"
+)]
 
 pub mod connect;
 pub mod core;

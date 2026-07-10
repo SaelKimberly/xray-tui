@@ -6,7 +6,7 @@ use toasty::Deferred;
 #[derive(Debug, Clone, toasty::Model)]
 pub struct Endpoint {
     #[key]
-    pub id: i64,                       // stable_hash(host, port) for known types; stable_hash("undefined", config_uid) for exotic
+    pub id: i64, // stable_hash(host, port) for known types; stable_hash("undefined", config_uid) for exotic
     pub host: String,                  // canonical host string; empty for undefined
     pub host_type: String,             // "ipv4" | "ipv6" | "dns" | "undefined"
     pub port: i32,                     // primary port; 0 for undefined
@@ -17,24 +17,24 @@ pub struct Endpoint {
     pub manual_protocol_override: Option<i64>, // FK -> protocols.id, NULL = auto-select best
 }
 
-/// ProtocolRow: a protocol configuration. Replaces Profile.
-/// PK = uid = sig ^ cred_hash (same as old Profile.id).
+/// `ProtocolRow`: a protocol configuration. Replaces Profile.
+/// PK = uid = sig ^ `cred_hash` (same as old Profile.id).
 #[derive(Debug, Clone, toasty::Model)]
 pub struct ProtocolRow {
     #[key]
-    pub id: i64,                  // = uid = sig ^ cred_hash (same as old Profile.id)
-    pub endpoint_id: i64,         // FK -> endpoints.id
+    pub id: i64, // = uid = sig ^ cred_hash (same as old Profile.id)
+    pub endpoint_id: i64, // FK -> endpoints.id
     pub sig: i64,
     pub cred_hash: i64,
     pub proto_kind: String,
     pub spec_blob: Vec<u8>,
-    pub config_type: i32,         // same semantics: 0 = share URL, 1 = form created
+    pub config_type: i32, // same semantics: 0 = share URL, 1 = form created
     pub core_type: String,
     pub transport: Option<String>,
     pub security: Option<String>,
     pub remarks: Option<String>,
     pub created_at: i64,
-    pub last_seen_at: i64,        // per-config staleness tracking
+    pub last_seen_at: i64, // per-config staleness tracking
 
     #[belongs_to(key = endpoint_id, references = id)]
     pub endpoint: Deferred<Option<Endpoint>>,
@@ -46,15 +46,15 @@ pub struct ProtocolRow {
 }
 
 /// Many-to-many link between endpoints and groups.
-/// Replaces Connection (was profile_id/group_id, now endpoint_id/group_id).
+/// Replaces Connection (was `profile_id/group_id`, now `endpoint_id/group_id`).
 #[derive(Debug, Clone, toasty::Model)]
 #[unique(endpoint_id, group_id)]
 pub struct EndpointGroup {
     #[key]
-    pub id: String,            // UUID
-    pub endpoint_id: i64,      // -> endpoints.id
-    pub group_id: String,      // -> groups.id
-    pub last_seen_at: i64,     // per-source last confirmation
+    pub id: String, // UUID
+    pub endpoint_id: i64,  // -> endpoints.id
+    pub group_id: String,  // -> groups.id
+    pub last_seen_at: i64, // per-source last confirmation
     pub sort_order: Option<i32>,
 
     #[belongs_to(key = endpoint_id, references = id)]
@@ -63,14 +63,14 @@ pub struct EndpointGroup {
     pub group: Deferred<Option<Group>>,
 }
 
-/// Group: merged with old Subscription fields. Removed is_system.
+/// Group: merged with old Subscription fields. Removed `is_system`.
 #[derive(Debug, Clone, toasty::Model)]
 pub struct Group {
     #[key]
     pub id: String,
     pub name: Option<String>,
-    pub url: Option<String>,           // was subscription_url
-    pub enabled: Option<i32>,           // was subscription_enabled
+    pub url: Option<String>,  // was subscription_url
+    pub enabled: Option<i32>, // was subscription_enabled
     pub user_agent: Option<String>,
     pub convert_target: Option<i32>,
     pub core_type: Option<String>,
@@ -84,7 +84,7 @@ pub struct Group {
 #[derive(Debug, Clone, toasty::Model)]
 pub struct ProfileExtension {
     #[key]
-    pub protocol_id: i64,  // was profile_id
+    pub protocol_id: i64, // was profile_id
 
     pub delay: Option<i32>,
     pub speed: Option<i32>,
@@ -92,13 +92,13 @@ pub struct ProfileExtension {
     pub ip_info: Option<String>,
 
     #[belongs_to(key = protocol_id, references = id)]
-    pub protocol_row: Deferred<Option<ProtocolRow>>,  // was protocol
+    pub protocol_row: Deferred<Option<ProtocolRow>>, // was protocol
 }
 
 #[derive(Debug, Clone, toasty::Model)]
 pub struct ServerStat {
     #[key]
-    pub protocol_id: i64,  // was profile_id
+    pub protocol_id: i64, // was profile_id
 
     pub today_up: Option<i64>,
     pub today_down: Option<i64>,
@@ -107,7 +107,7 @@ pub struct ServerStat {
     pub last_updated: Option<String>,
 
     #[belongs_to(key = protocol_id, references = id)]
-    pub protocol_row: Deferred<Option<ProtocolRow>>,  // was protocol
+    pub protocol_row: Deferred<Option<ProtocolRow>>, // was protocol
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -154,7 +154,7 @@ pub struct PingSession {
     pub id: String,
 
     pub batch_id: String,
-    pub protocol_id: i64,  // was profile_id
+    pub protocol_id: i64, // was profile_id
     pub config_type: i32,
     pub core_type: String,
     pub address: Option<String>,
@@ -176,7 +176,7 @@ pub struct PingSession {
 #[derive(Debug, Clone)]
 pub struct PingResultUpdate {
     pub session_id: String,
-    pub protocol_id: i64,  // was profile_id
+    pub protocol_id: i64, // was profile_id
     pub status: String,
     pub ping_type: String,
     pub latency_ms: Option<i32>,
@@ -204,8 +204,11 @@ pub struct EndpointRow {
 
 impl EndpointRow {
     /// Returns the currently selected protocol row.
+    #[must_use]
     pub fn active_protocol(&self) -> &ProtocolRow {
-        self.protocols.get(self.selected_protocol).unwrap_or_else(|| &self.protocols[0])
+        self.protocols
+            .get(self.selected_protocol)
+            .unwrap_or_else(|| &self.protocols[0])
     }
 }
 

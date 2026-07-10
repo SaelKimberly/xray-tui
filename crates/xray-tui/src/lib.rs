@@ -11,10 +11,10 @@
     reason = "single-threaded TUI, futures never sent across threads; manual let-else where match is clearer"
 )]
 
-pub mod ui;
+pub mod ops;
 mod state;
 mod types;
-pub mod ops;
+pub mod ui;
 
 // Re-exports
 pub use state::AppState;
@@ -22,23 +22,15 @@ pub use types::*;
 
 // ── Helper functions ───────────────────────────────────────────────────
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use xray_tui_config::import_export::{profile_config, Profile};
-use xray_tui_db::Database;
-use xray_tui_db::models::{EndpointRow, Group};
+use xray_tui_config::import_export::{Profile, profile_config};
 use xray_tui_proto::proto_spec::ProtoSpec;
 
 /// Helper to send a `CoreEvent` with a warning on channel full.
 /// Prevents silent event loss.
-fn try_send_or_warn(
-    tx: &mpsc::Sender<CoreEvent>,
-    event: CoreEvent,
-    label: &'static str,
-) {
+fn try_send_or_warn(tx: &mpsc::Sender<CoreEvent>, event: CoreEvent, label: &'static str) {
     if let Err(_e) = tx.try_send(event) {
         warn!(target: "log_worker", "try_send dropped {label}: channel full");
     }
@@ -72,7 +64,7 @@ pub(crate) fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
         xray_tui_config::import_export::flatten_json_to_fields(&ss, &mut fields);
     }
     // Cached fields not in spec_blob
-    use xray_tui_config::import_export::Profile;
+
     if !profile.address.is_empty() {
         set_field(&mut fields, "address", &profile.address);
     }
@@ -118,18 +110,23 @@ pub(crate) fn format_now() -> String {
     let remaining = remaining % 3600;
     let minute = remaining / 60;
     let second = remaining % 60;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-pub(crate) fn parse_core_log_line(line: &str, _core_type: xray_tui_core::CoreType) -> (String, String, String, Option<i64>) {
+pub(crate) fn parse_core_log_line(
+    line: &str,
+    _core_type: xray_tui_core::CoreType,
+) -> (String, String, String, Option<i64>) {
     // Simple log line parser: first []-delimited tokens are timestamp and level, rest is message.
     let line = line.trim();
-    let mut parts = line.splitn(4, ' ').collect::<Vec<_>>();
+    let parts = line.splitn(4, ' ').collect::<Vec<_>>();
     let level = if parts.len() >= 2 {
         let l = parts[0].trim_matches(|c| c == '[' || c == ']' || c == ' ');
-        if l.is_empty() { "info".to_string() } else { l.to_lowercase() }
+        if l.is_empty() {
+            "info".to_string()
+        } else {
+            l.to_lowercase()
+        }
     } else {
         "info".to_string()
     };
@@ -169,7 +166,10 @@ mod tests {
         let mut fields = common_field_defaults();
         set_field(&mut fields, "port", "8443");
         assert_eq!(
-            fields.iter().find(|(k, _)| k == "port").map(|(_, v)| v.as_str()),
+            fields
+                .iter()
+                .find(|(k, _)| k == "port")
+                .map(|(_, v)| v.as_str()),
             Some("8443")
         );
         set_field(&mut fields, "new_key", "value");

@@ -3,12 +3,11 @@ use std::collections::HashMap;
 
 use ratatui_cheese::tree::TreeState;
 use xray_tui_config::import_export::{Profile, ValidationSummary};
+use xray_tui_core::CoreType;
 use xray_tui_core::grpc_client;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::CoreType;
-use xray_tui_db::models::EndpointRow;
 
-/// Re-export EndpointRow as ProfileRow for backward compatibility.
+/// Re-export `EndpointRow` as `ProfileRow` for backward compatibility.
 pub use xray_tui_db::models::EndpointRow as ProfileRow;
 
 /// Clash API /traffic response struct.
@@ -40,9 +39,16 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: &[Self] = &[Self::Profiles, Self::Settings, Self::Logs, Self::Statistics, Self::Actions];
+    pub const ALL: &[Self] = &[
+        Self::Profiles,
+        Self::Settings,
+        Self::Logs,
+        Self::Statistics,
+        Self::Actions,
+    ];
 
-    pub fn next(&self) -> Self {
+    #[must_use]
+    pub const fn next(&self) -> Self {
         match self {
             Self::Profiles => Self::Settings,
             Self::Settings => Self::Logs,
@@ -51,7 +57,8 @@ impl Tab {
             Self::Actions => Self::Profiles,
         }
     }
-    pub fn prev(&self) -> Self {
+    #[must_use]
+    pub const fn prev(&self) -> Self {
         match self {
             Self::Profiles => Self::Actions,
             Self::Settings => Self::Profiles,

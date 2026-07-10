@@ -1,4 +1,4 @@
-//! ShadowTLS (`shadowtls://`) URL parsing.
+//! `ShadowTLS` (`shadowtls://`) URL parsing.
 //!
 //! # Format
 //! ```text
@@ -12,7 +12,7 @@
 //!
 //! | Key       | Type     | Required | Default | Description          |
 //! |-----------|----------|----------|---------|----------------------|
-//! | `password`| `String` | ❌       | —       | ShadowTLS password   |
+//! | `password`| `String` | ❌       | —       | `ShadowTLS` password   |
 //! | `version` | `String` | ❌       | —       | Protocol version     |
 //! | `sni`     | `String` | ❌       | —       | TLS SNI              |
 //!
@@ -24,15 +24,17 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashShadowTls};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{
+    clash_server_to_host, clash_tls_to_security, host_spec_to_string, security_to_clash_tls,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,9 +58,9 @@ pub struct ShadowTlsConfig {
 }
 
 impl ProtoSpec for ShadowTlsConfig {
-    /// Parse a ShadowTLS URL.
+    /// Parse a `ShadowTLS` URL.
     ///
-    /// ShadowTLS uses standard `host:port` with config in query params.
+    /// `ShadowTLS` uses standard `host:port` with config in query params.
     /// No userinfo — password is extracted from query.
     fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
         let hostport = raw.hostport.ok_or_else(|| {
@@ -80,7 +82,7 @@ impl ProtoSpec for ShadowTlsConfig {
         let security = if let Some(sni) = utils::query_get(&query, "sni") {
             SecurityConfig {
                 tls: Some(TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                    pin_sha256: None,
                     sni: Some(TinyText::from(sni)),
                     ..Default::default()
                 })),
@@ -118,10 +120,10 @@ impl ProtoSpec for ShadowTlsConfig {
             query_parts.push(format!("version={}", urlencoding::encode(version)));
         }
         // Emit sni when it differs from host or is explicitly set
-        if let Some(sni) = self.security.sni() {
-            if !should_skip_param(&self.host, &sni) {
-                query_parts.push(format!("sni={}", urlencoding::encode(sni)));
-            }
+        if let Some(sni) = self.security.sni()
+            && !should_skip_param(&self.host, sni)
+        {
+            query_parts.push(format!("sni={}", urlencoding::encode(sni)));
         }
 
         let query_string = if query_parts.is_empty() {
@@ -187,35 +189,34 @@ impl ProtoSpec for ShadowTlsConfig {
 
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Shadowtls(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    password: Some(c.password.clone()),
-                    version: c.version.map(|v| TinyText::from(v.to_string())),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    security: clash_tls_to_security(
-                        c.tls,
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        None,
-                        None,
-                        None,
-                    ),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
+            ClashProxy::Shadowtls(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                password: Some(c.password.clone()),
+                version: c.version.map(|v| TinyText::from(v.to_string())),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                security: clash_tls_to_security(
+                    c.tls,
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    None,
+                    None,
+                    None,
+                ),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+            }),
             _ => Err(ParseError::Unknown("expected shadowtls clash proxy".into())),
         }
     }
 
     fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
         let name = self.remarks.as_deref().unwrap_or("").to_string();
-        let (tls, servername, skip_cert_verify, _alpn, _fingerprint) = security_to_clash_tls(&self.security);
+        let (tls, servername, skip_cert_verify, _alpn, _fingerprint) =
+            security_to_clash_tls(&self.security);
         Ok(ClashProxy::Shadowtls(ClashShadowTls {
             name,
             server: host_spec_to_string(&self.host),
@@ -228,7 +229,6 @@ impl ProtoSpec for ShadowTlsConfig {
         }))
     }
 }
-
 
 impl ShadowTlsConfig {
     /// Compute a deterministic signature based on non-credential fields:
@@ -252,8 +252,8 @@ impl ShadowTlsConfig {
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
+    use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
-use crate::urlx::PortSpec;
 
     #[test]
     fn test_shadowtls_basic() {
@@ -299,7 +299,8 @@ use crate::urlx::PortSpec;
         let raw = crate::urlx::RawUrlX::from(input);
         let parsed = super::ShadowTlsConfig::try_parse(&raw).expect("failed");
         let json = serde_json::to_string(&parsed).expect("serialize");
-        let deserialized: super::ShadowTlsConfig = serde_json::from_str(&json).expect("deserialize");
+        let deserialized: super::ShadowTlsConfig =
+            serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(parsed.host, deserialized.host, "host mismatch");
         assert_eq!(parsed.port, deserialized.port, "port mismatch");

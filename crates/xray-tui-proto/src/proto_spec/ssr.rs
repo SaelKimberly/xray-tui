@@ -49,9 +49,9 @@ use super::common::SecurityConfig;
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashSSR};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,7 +273,6 @@ impl ProtoSpec for SsrConfig {
     }
 }
 
-
 /// Strip trailing non-base64 garbage (Telegram annotation text and decorative
 /// hyphens) from the SSR userinfo before base64 decoding.
 ///
@@ -336,8 +335,6 @@ impl SsrConfig {
         hasher.finish()
     }
 }
-
-use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {
@@ -425,6 +422,4 @@ mod tests {
     fn test_roundtrip() {
         check_roundtrip::<SsrConfig>(SSR_URL);
     }
-
-
 }

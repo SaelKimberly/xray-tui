@@ -20,14 +20,14 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::TinyText;
-use crate::urlx::{host_serde, port_serde};
-use crate::urlx::HostSpec;
-use crate::proto_spec::common::SecurityConfig;
-use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashTor};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::SecurityConfig;
+use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
+use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
+use crate::urlx::HostSpec;
+use crate::urlx::TinyText;
+use crate::urlx::{host_serde, port_serde};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,12 +55,16 @@ pub struct TorConfig {
 impl ProtoSpec for TorConfig {
     /// Tor does not support URL format — always returns an error.
     fn try_parse(_raw: &crate::urlx::RawUrlX<'_>) -> Result<Self, ParseError> {
-        Err(ParseError::Unknown("Tor does not support URL format".into()))
+        Err(ParseError::Unknown(
+            "Tor does not support URL format".into(),
+        ))
     }
 
     /// Tor does not support URL format — always returns an error.
     fn reconstruct(&self) -> Result<String, ParseError> {
-        Err(ParseError::Unknown("Tor does not support URL format".into()))
+        Err(ParseError::Unknown(
+            "Tor does not support URL format".into(),
+        ))
     }
 
     fn schema(&self) -> crate::urlx::SchemeX {
@@ -80,9 +84,9 @@ impl ProtoSpec for TorConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN)
-        });
+        let v = self
+            .cred_hash_cache
+            .get_or_init(|| NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN));
         v.get()
     }
 
@@ -96,26 +100,23 @@ impl ProtoSpec for TorConfig {
         None
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Tor(c) => {
-                Ok(Self {
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    executable_path: None,
-                    extra_args: None,
-                    data_directory: None,
-                    torrc: None,
-                    security: SecurityConfig::default(),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                })
-            }
+            ClashProxy::Tor(c) => Ok(Self {
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                executable_path: None,
+                extra_args: None,
+                data_directory: None,
+                torrc: None,
+                security: SecurityConfig::default(),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+            }),
             _ => Err(ParseError::Unknown("expected tor clash proxy".into())),
         }
     }
@@ -145,8 +146,6 @@ impl TorConfig {
     }
 }
 
-use crate::urlx::PortSpec;
-
 #[cfg(test)]
 mod tests {
     use super::TorConfig;
@@ -159,6 +158,4 @@ mod tests {
         let raw = RawUrlX::from(url);
         assert!(TorConfig::try_parse(&raw).is_err());
     }
-
-
 }

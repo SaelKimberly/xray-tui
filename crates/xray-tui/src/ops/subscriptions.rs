@@ -1,17 +1,15 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tracing::warn;
-
-use xray_tui_config::import_export::{ValidationSettings, ValidationSummary, Profile};
-use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
+use xray_tui_config::import_export::{Profile, ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
+use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
 
 use crate::AppState;
-use crate::types::*;
-use crate::{format_now, get_field, try_send_or_warn};
 use crate::state::profile_to_endpoint_protocol;
+use crate::types::{AppMode, CoreEvent};
+use crate::{format_now, get_field, try_send_or_warn};
 
 pub fn start_add_group(state: &mut AppState) {
     let fields = vec![
@@ -37,16 +35,12 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
     let update_interval_value = group.refresh_interval.map_or_else(
         || "1h".into(),
         |mins| {
-            humantime::format_duration(std::time::Duration::from_secs(mins as u64 * 60))
-                .to_string()
+            humantime::format_duration(std::time::Duration::from_secs(mins as u64 * 60)).to_string()
         },
     );
     let fields = vec![
         ("name".into(), group.name.unwrap_or_default()),
-        (
-            "subscription_url".into(),
-            group.url.unwrap_or_default(),
-        ),
+        ("subscription_url".into(), group.url.unwrap_or_default()),
         ("user_agent".into(), group.user_agent.unwrap_or_default()),
         ("update_interval".into(), update_interval_value),
         (
@@ -185,7 +179,7 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let validation: ValidationSettings = state.config.parsing.clone().into();
     tokio::spawn(async move {
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_mins(2),
             do_update_subscription(url, user_agent, gid.clone(), db, validation),
         )
         .await;
@@ -298,13 +292,13 @@ async fn do_update_subscription(
     tracing::info!(target: "tui", "DB upsert succeeded");
 
     // Update group metadata (last_refreshed, status) — merged from old Subscription
-    if let Ok(groups) = db.get_all_groups().await {
-        if let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id) {
-            grp.last_refreshed = Some(format_now());
-            grp.status = Some("ok".into());
-            grp.error_message = None;
-            let _ = db.update_group(&grp).await;
-        }
+    if let Ok(groups) = db.get_all_groups().await
+        && let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id)
+    {
+        grp.last_refreshed = Some(format_now());
+        grp.status = Some("ok".into());
+        grp.error_message = None;
+        let _ = db.update_group(&grp).await;
     }
 
     (group_id, pairs.len(), summary, None)
@@ -344,7 +338,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                 g
             } else {
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {},
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {},
                     () = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
                 }
                 continue;
@@ -377,7 +371,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                 );
             }
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {},
+                () = tokio::time::sleep(Duration::from_mins(1)) => {},
                 () = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,
             }
         }

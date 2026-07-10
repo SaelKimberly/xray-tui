@@ -36,9 +36,11 @@ use super::common::{SecurityConfig, TlsConfig, TlsOpts};
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::clash::{ClashProxy, ClashHttp};
+use crate::clash::{ClashHttp, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
-use crate::proto_spec::common::*;
+use crate::proto_spec::common::{
+    clash_server_to_host, clash_tls_to_security, host_spec_to_string, security_to_clash_tls,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +68,7 @@ impl ProtoSpec for HttpClientConfig {
         // Userinfo is optional for HTTP.
         // When present (URL has `@`): raw.userinfo = "user:pass", raw.hostport = "host:port"
         // When absent (no `@`): raw.userinfo == raw.hostport (both are "host:port")
-        let has_userinfo = raw.hostport.map_or(false, |hp| raw.userinfo != hp);
+        let has_userinfo = raw.hostport.is_some_and(|hp| raw.userinfo != hp);
         let (username, password) = if has_userinfo && !raw.userinfo.is_empty() {
             if let Some((u, p)) = raw.userinfo.split_once(':') {
                 (Some(u.to_string()), Some(p.to_string()))
@@ -77,9 +79,9 @@ impl ProtoSpec for HttpClientConfig {
             (None, None)
         };
 
-        let hostport = raw.hostport.ok_or_else(|| {
-            ParseError::InvalidHostPort("missing hostport in http URL".into())
-        })?;
+        let hostport = raw
+            .hostport
+            .ok_or_else(|| ParseError::InvalidHostPort("missing hostport in http URL".into()))?;
 
         let (parsed_host, parsed_port) = if hostport.contains(':') {
             let (h, p) = utils::parse_hostport(hostport)?;
@@ -111,7 +113,7 @@ impl ProtoSpec for HttpClientConfig {
                 });
                 SecurityConfig {
                     tls: Some(TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                        pin_sha256: None,
                         sni: utils::query_get(&query, "sni").map(TinyText::from),
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
@@ -154,24 +156,21 @@ impl ProtoSpec for HttpClientConfig {
         let query_string = {
             let mut parts: Vec<String> = Vec::new();
             if let Some(tls_config) = &self.security.tls {
-                match tls_config {
-                    TlsConfig::Tls(opts) => {
-                        if opts.sni.is_some() || opts.alpn.is_some() || opts.fp.is_some() {
-                            parts.push("security=tls".to_string());
-                        }
-                        if let Some(v) = &opts.sni {
-                            if !super::common::should_skip_param(&self.host, v) {
-                                parts.push(format!("sni={}", urlencoding::encode(v)));
-                            }
-                        }
-                        if let Some(v) = &opts.alpn {
-                            parts.push(format!("alpn={}", urlencoding::encode(v)));
-                        }
-                        if let Some(v) = &opts.fp {
-                            parts.push(format!("fp={}", urlencoding::encode(v)));
-                        }
+                if let TlsConfig::Tls(opts) = tls_config {
+                    if opts.sni.is_some() || opts.alpn.is_some() || opts.fp.is_some() {
+                        parts.push("security=tls".to_string());
                     }
-                    _ => {}
+                    if let Some(v) = &opts.sni
+                        && !super::common::should_skip_param(&self.host, v)
+                    {
+                        parts.push(format!("sni={}", urlencoding::encode(v)));
+                    }
+                    if let Some(v) = &opts.alpn {
+                        parts.push(format!("alpn={}", urlencoding::encode(v)));
+                    }
+                    if let Some(v) = &opts.fp {
+                        parts.push(format!("fp={}", urlencoding::encode(v)));
+                    }
                 }
             }
             if parts.is_empty() {
@@ -238,31 +237,28 @@ impl ProtoSpec for HttpClientConfig {
         }
     }
 
-
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
-            ClashProxy::Http(c) => {
-                Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    username: c.username.clone(),
-                    password: c.password.clone(),
-                    security: clash_tls_to_security(
-                        c.tls,
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        None,
-                        None,
-                        None,
-                    ),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
+            ClashProxy::Http(c) => Ok(Self {
+                sig_cache: std::sync::OnceLock::new(),
+                cred_hash_cache: std::sync::OnceLock::new(),
+                host: clash_server_to_host(&c.server)?,
+                port: c.port,
+                username: c.username.clone(),
+                password: c.password.clone(),
+                security: clash_tls_to_security(
+                    c.tls,
+                    c.servername.as_deref(),
+                    c.skip_cert_verify,
+                    None,
+                    None,
+                    None,
+                ),
+                remarks: match c.name.as_str() {
+                    "" => None,
+                    s => Some(TinyText::from(s)),
+                },
+            }),
             _ => Err(ParseError::Unknown("expected http clash proxy".into())),
         }
     }
@@ -294,8 +290,6 @@ impl HttpClientConfig {
         hasher.finish()
     }
 }
-
-use crate::urlx::PortSpec;
 
 #[cfg(test)]
 mod tests {

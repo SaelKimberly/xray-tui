@@ -40,7 +40,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde, PortSpec};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
@@ -48,9 +48,12 @@ use super::common::{
 use super::impl_sig_cache;
 use super::utils;
 use super::{ParseError, ProtoSpec};
-use crate::proto_spec::common::*;
 use crate::clash::{ClashProxy, ClashTrojan};
 use crate::proto_spec::ProtoSpecError;
+use crate::proto_spec::common::{
+    clash_alpn_as_str, clash_server_to_host, clash_tls_to_security, clash_transport_to_transport,
+    host_spec_to_string, security_to_clash_tls, transport_to_clash,
+};
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,7 +120,7 @@ impl ProtoSpec for TrojanConfig {
                 });
                 SecurityConfig {
                     tls: Some(TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                        pin_sha256: None,
                         sni: utils::query_get(&query, "sni").map(TinyText::from),
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
@@ -381,7 +384,8 @@ impl ProtoSpec for TrojanConfig {
     fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
         let name = self.remarks.as_deref().unwrap_or("").to_string();
         let server = host_spec_to_string(&self.host);
-        let (tls, servername, skip_cert_verify, alpn_str, fingerprint) = security_to_clash_tls(&self.security);
+        let (tls, servername, skip_cert_verify, alpn_str, fingerprint) =
+            security_to_clash_tls(&self.security);
         let (_, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, &server);
         Ok(ClashProxy::Trojan(ClashTrojan {
             name,
@@ -401,7 +405,6 @@ impl ProtoSpec for TrojanConfig {
             grpc_opts,
         }))
     }
-
 }
 
 impl TrojanConfig {
@@ -441,13 +444,11 @@ impl TrojanConfig {
     }
 }
 
-use crate::proto_spec::common::*;
-
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
+    use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
-use crate::urlx::PortSpec;
 
     #[test]
     fn test_trojan_basic() {
