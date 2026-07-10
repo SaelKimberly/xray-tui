@@ -832,6 +832,34 @@ fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow) -> Option<Value> {
         tls.insert("utls".into(), json!(utls));
     }
 
+    // ech: stream.ech.enable + stream.ech.config
+    let ech_enabled = s_settings
+        .get("ech.enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || p_settings
+            .get("ech.enable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if ech_enabled {
+        let mut ech = serde_json::Map::new();
+        ech.insert("enabled".into(), json!(true));
+        if let Some(config) = s_settings
+            .get("ech.config")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                p_settings
+                    .get("ech.config")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            })
+        {
+            ech.insert("config".into(), json!(config));
+        }
+        tls.insert("ech".into(), json!(ech));
+    }
+
     // reality: check both URL-import (security) and form (reality.show) paths
     let is_reality = s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
         || s_settings
