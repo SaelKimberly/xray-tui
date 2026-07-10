@@ -929,10 +929,20 @@ impl AppState {
                 ]
             }
             Logging => {
-                vec![(
-                    "log_ttl_secs".into(),
-                    humantime::format_duration(*self.config.logging.ttl_secs).to_string(),
-                )]
+                vec![
+                    (
+                        "log_ttl_secs".into(),
+                        humantime::format_duration(*self.config.logging.ttl_secs).to_string(),
+                    ),
+                    (
+                        "log_to_file".into(),
+                        self.config.logging.log_to_file.to_string(),
+                    ),
+                    (
+                        "log_file_path".into(),
+                        self.config.logging.log_file_path.clone(),
+                    ),
+                ]
             }
             Subscriptions => vec![],
         }
@@ -1046,9 +1056,6 @@ impl AppState {
                 if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                     self.config.speed_test.real_ping_retries = v;
                 }
-                if let Ok(v) = get_str("real_ping_concurrency").parse::<usize>() {
-                    self.config.speed_test.real_ping_concurrency = v;
-                }
                 if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
                     self.config.speed_test.tcp_ping_concurrency = v.max(1);
                 }
@@ -1058,6 +1065,10 @@ impl AppState {
             Logging => {
                 if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                     *self.config.logging.ttl_secs = d;
+                }
+                self.config.logging.log_to_file = get_str("log_to_file") == "true";
+                if !get_str("log_file_path").is_empty() {
+                    self.config.logging.log_file_path = get("log_file_path");
                 }
             }
         }

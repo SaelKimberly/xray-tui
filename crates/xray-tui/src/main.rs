@@ -13,9 +13,11 @@ use xray_tui_db::Database;
 
 /// Non-blocking tracing layer that sends log events through a channel
 /// instead of writing to heed synchronously under the subscriber lock.
+/// Optionally writes to a file when log_to_file is enabled.
 struct TuiLogLayer {
     core_event_tx: tokio::sync::mpsc::Sender<xray_tui::CoreEvent>,
     log_sender: std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>,
+    log_file: Option<std::sync::Mutex<std::fs::File>>,
 }
 
 /// A field visitor that captures the `message` field.
@@ -64,6 +66,18 @@ where
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+
+        // Optional file log — write JSON line when enabled
+        if let Some(ref file_mutex) = self.log_file {
+            use std::io::Write;
+            if let Ok(mut file) = file_mutex.lock() {
+                let _ = writeln!(
+                    file,
+                    r#"{{"ts":{timestamp_nanos},"level":"{level}","target":"{target}","msg":"{message}"}}"#,
+                );
+            }
+        }
+
 
         // Non-blocking send to the log storage channel (batched, async writer).
         // If the channel is closed (writer panicked), silently drop — UI must keep running.
@@ -147,14 +161,25 @@ async fn main() -> Result<()> {
             }
         }
     });
-
-    // 3c. Store the log sender in AppState so core log forwarding can use it
+    // 3c. Capture log config before moving config into AppState
+    let log_to_file = config.logging.log_to_file;
+    let log_file_path = config.logging.log_file_path.clone();
     let mut state = AppState::new(Arc::new(db), config).await;
     state.heed_storage = Some(heed.clone());
     state.log_sender_tx = Some(log_sender_tx.clone());
-
-    // 4. Install tracing subscriber with TuiLogLayer (non-blocking channel send)
-    // Do not crash if global subscriber was already set (e.g., in tests)
+    // 4. Install tracing subscriber with TuiLogLayer (non-blocking channel send).
+    //    Do not crash if global subscriber was already set (e.g., in tests)
+    let log_file = if log_to_file {
+        Some(std::sync::Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file_path)
+                .expect("failed to open log file for appending"),
+        ))
+    } else {
+        None
+    };
     if tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -170,6 +195,7 @@ async fn main() -> Result<()> {
                 .clone()
                 .expect("core_event_tx must be set before tracing init"),
             log_sender: log_sender_tx,
+            log_file,
         })
         .try_init()
         .is_err()

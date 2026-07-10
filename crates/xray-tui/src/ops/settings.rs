@@ -269,10 +269,20 @@ pub async fn build_settings_fields(
         }
         Routing => vec![],
         Logging => {
-            vec![(
-                "log_ttl_secs".into(),
-                humantime::format_duration(*state.config.logging.ttl_secs).to_string(),
-            )]
+            vec![
+                (
+                    "log_ttl_secs".into(),
+                    humantime::format_duration(*state.config.logging.ttl_secs).to_string(),
+                ),
+                (
+                    "log_to_file".into(),
+                    state.config.logging.log_to_file.to_string(),
+                ),
+                (
+                    "log_file_path".into(),
+                    state.config.logging.log_file_path.clone(),
+                ),
+            ]
         }
         Subscriptions => vec![],
     }
@@ -392,18 +402,20 @@ fn apply_settings_fields(
             if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                 state.config.speed_test.real_ping_retries = v;
             }
-            if let Ok(v) = get_str("real_ping_concurrency").parse::<usize>() {
-                state.config.speed_test.real_ping_concurrency = v;
-            }
             if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
                 state.config.speed_test.tcp_ping_concurrency = v.max(1);
             }
         }
         // Dns and Routing are handled separately (DB-backed)
         Dns | Routing | Updates | Subscriptions => {}
+        // Dns and Routing are handled separately (DB-backed)
         Logging => {
             if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                 *state.config.logging.ttl_secs = d;
+            }
+            state.config.logging.log_to_file = get_str("log_to_file") == "true";
+            if !get_str("log_file_path").is_empty() {
+                state.config.logging.log_file_path = get("log_file_path");
             }
         }
     }

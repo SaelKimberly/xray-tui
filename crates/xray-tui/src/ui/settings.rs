@@ -549,7 +549,11 @@ fn form_field_defs_for_section(
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
             ("tcp_ping_concurrency", "TCP Ping Concurrency", "Number"),
         ],
-        SettingsSection::Logging => &[("log_ttl_secs", "Log Retention", "Duration")],
+        SettingsSection::Logging => &[
+            ("log_ttl_secs", "Log Retention", "Duration"),
+            ("log_to_file", "Log to File", "Boolean"),
+            ("log_file_path", "Log File Path", "Text"),
+        ],
         SettingsSection::Stats => &[("enabled", "Enabled", "Boolean")],
         SettingsSection::Subscriptions => &[
             ("name", "Name", "Text"),

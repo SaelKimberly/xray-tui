@@ -504,16 +504,26 @@ pub struct ParsingSettings {
 pub struct LogConfig {
     #[serde(default = "default_log_ttl_secs")]
     pub ttl_secs: crate::DurationOrSecs,
+    #[serde(default)]
+    pub log_to_file: bool,
+    #[serde(default = "default_log_file_path")]
+    pub log_file_path: String,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
             ttl_secs: default_log_ttl_secs(),
+            log_to_file: false,
+            log_file_path: default_log_file_path(),
         }
     }
 }
 
 fn default_log_ttl_secs() -> crate::DurationOrSecs {
     crate::DurationOrSecs::from(std::time::Duration::from_hours(72))
+}
+
+fn default_log_file_path() -> String {
+    "xray-tui.log".into()
 }
