@@ -841,6 +841,9 @@ mod tests {
             spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
             transport: Some("tcp".to_string()),
             security: Some("auto".to_string()),
+            config_type,
+            core_type: "auto".to_string(),
+            endpoint: Default::default(),
             remarks: None,
             created_at: 0,
             last_seen_at: 0,
@@ -1284,11 +1287,11 @@ mod tests {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (params, _, dns) = default_params();
         let rules = vec![RoutingRule {
-            id: "r1",
+            id: "r1".to_string(),
             group_id: None,
             r#type: 0,
             domain_matcher: None,
-            domains: Some("example.com"),
+            domains: Some("example.com".to_string()),
             ips: None,
             inbound_tags: None,
             port: None,
@@ -1296,7 +1299,7 @@ mod tests {
             network: None,
             protocols: None,
             domain_strategy: None,
-            outbound_tag: Some("direct"),
+            outbound_tag: Some("direct".to_string()),
             balancer_tag: None,
             rule_set_file: None,
             rule_set_url: None,

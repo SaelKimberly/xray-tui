@@ -269,8 +269,8 @@ impl ProtoSpec for Hysteria2Config {
                     host: clash_server_to_host(&c.server)?,
                     port,
                     hop_interval: c.hop_interval,
-                    up: c.up.clone().map(|v| TinyText::from(v)),
-                    down: c.down.clone().map(|v| TinyText::from(v)),
+                    up: c.up.clone().map(TinyText::from),
+                    down: c.down.clone().map(TinyText::from),
                     obfs: c.obfs.clone().map(TinyText::from),
                     obfs_password: c.obfs_password.clone().map(TinyText::from),
                     security: clash_tls_to_security(

@@ -617,6 +617,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char(']') if state.current_tab == Tab::Profiles => {
             state.cycle_group(1);
         }
+        KeyCode::Char('p' | 'P') if state.current_tab == Tab::Profiles => {
+            state.cycle_purgatory_view();
+            state.reload_profiles().await;
+        }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
                 let ids: Vec<i64> = state.multi_select.iter().copied().collect();
@@ -853,7 +857,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("a", "Add new server"),
                     ("e", "Edit selected server"),
                     ("d", "Delete selected server(s)"),
-                    ("c", "Clone selected server"),
+                    ("P", "Cycle view: Active/Stale/All"),
                     ("g", "Manage subscription groups"),
                     ("[ / ]", "Cycle groups"),
                     ("t", "Open speed test menu"),

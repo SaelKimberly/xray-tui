@@ -13,7 +13,7 @@ use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
     Column, ColumnWidth, DataTable, DataTableRow, DataTableState, SortDirection,
 };
-use crate::{AppState, ConfirmAction, ProfileRow};
+use crate::{AppState, ConfirmAction, EndpointRow};
 use ratatui_cheese::theme::Palette;
 
 // ── DataTable row wrapper ───────────────────────────────────────────────
@@ -60,7 +60,7 @@ impl DataTableRow for ProfileTableRowData {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    let rows: Vec<&ProfileRow> = state.filtered_profiles().collect();
+    let rows: Vec<&EndpointRow> = state.filtered_profiles().collect();
     let selected = state.selected_index;
     let palette = state.current_palette();
     let chunks = Layout::default()
@@ -76,7 +76,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Empty state guidance
     if rows.is_empty() {
-        let msg = if state.filtered_len() == 0 && state.profiles.is_empty() {
+        let msg = if state.filtered_len() == 0 && state.endpoints.is_empty() {
             " No profiles — press 'a' to add one "
         } else if state.filtered_len() == 0 {
             " No profiles match the current filter "
@@ -91,28 +91,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let show_group = state.selected_group_id.is_none();
-    let show_group = show_group && frame.area().width >= 107;
-    render_data_grid(
-        frame, chunks[1], &rows, selected, show_group, state, &palette,
-    );
+    render_data_grid(frame, chunks[1], &rows, selected, state, &palette);
     render_footer(frame, chunks[2], state, &palette);
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
 fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
-    let group_name = state.selected_group_id.as_ref().map_or("All", |gid| {
-        state
-            .groups
-            .iter()
-            .find(|g| g.id == *gid)
-            .and_then(|g| g.name.as_deref())
-            .unwrap_or("All")
-    });
-
-    let group_text = format!(" Group: {group_name}");
-    let group_span = Span::styled(group_text, ThemeStyles::container_title(palette));
-
+    let view_label = match state.purgatory_view {
+        xray_tui_db::models::PurgatoryView::Active => "Active",
+        xray_tui_db::models::PurgatoryView::Stale => "Stale",
+        xray_tui_db::models::PurgatoryView::All => "All",
+    };
+    let view_text = format!(" View: {view_label} [P]");
+    let view_span = Span::styled(view_text, ThemeStyles::container_title(palette));
     let search_text = if state.search_focused {
         format!("/ {}▉", state.search_query)
     } else if state.search_query.is_empty() {
@@ -122,17 +113,15 @@ fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, palette:
     };
     let search_span = Span::styled(search_text, ThemeStyles::warning(palette));
 
-    let line = Line::from(vec![group_span, Span::raw("  "), search_span]);
+    let line = Line::from(vec![view_span, Span::raw("  "), search_span]);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
-
 fn render_data_grid(
     frame: &mut Frame,
     area: Rect,
-    rows: &[&ProfileRow],
+    rows: &[&EndpointRow],
     selected_index: usize,
-    show_group: bool,
     state: &AppState,
     palette: &Palette,
 ) {
@@ -166,15 +155,6 @@ fn render_data_grid(
         Column::new("Type", ColumnWidth::Fixed(12)),
         Column::new("Remarks", ColumnWidth::Fixed(24)),
     ];
-    // Group column: width 0 when hidden, 12 when shown
-    columns.push(Column::new(
-        "Group",
-        if show_group {
-            ColumnWidth::Fixed(12)
-        } else {
-            ColumnWidth::Fixed(0)
-        },
-    ));
     columns.extend_from_slice(&[
         Column::new("Address", ColumnWidth::Fixed(30)),
         Column::new("Port", ColumnWidth::Fixed(6)),
@@ -344,10 +324,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
         return;
     }
 
-    let has_profile = state.selected_index < state.profiles.len();
+    let has_profile = state.selected_index < state.endpoints.len();
 
     let line = if has_profile {
-        let row = &state.profiles[state.selected_index];
+        let row = &state.endpoints[state.selected_index];
         let core = state.resolved_core(row);
         let remarks = row
             .active_protocol()
@@ -383,7 +363,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
 fn render_confirmation_overlays(
     frame: &mut Frame,
     area: Rect,
-    rows: &[&ProfileRow],
+    rows: &[&EndpointRow],
     state: &AppState,
 ) {
     match state.confirmation {

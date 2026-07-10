@@ -31,7 +31,7 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
     let from_connected = state
         .connected_protocol_id
         .as_ref()
-        .and_then(|id| state.profiles.iter().find(|r| r.endpoint.id == *id));
+        .and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id == *id));
 
     // Fall back to selected profile
     let row = from_connected.or_else(|| {

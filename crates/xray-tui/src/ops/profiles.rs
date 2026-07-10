@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use crate::ProfileRow;
+use crate::EndpointRow;
 use xray_tui_config::import_export::{
     Profile, ValidationSettings, encode_profile_spec, profile_config,
 };
@@ -12,17 +12,36 @@ use crate::AppState;
 use crate::state::profile_to_endpoint_protocol;
 use crate::types::{AppMode, BatchImportItem, SortColumn};
 use crate::{common_field_defaults, profile_to_fields};
-use xray_tui_db::models::{ProfileExtension, ServerStat};
+use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
 use xray_tui_proto::proto_spec::ProtoSpec;
 
 pub async fn reload_profiles(state: &mut AppState) {
-    match state.db.get_active_endpoints(0).await {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let result = match state.purgatory_view {
+        PurgatoryView::Active => {
+            let threshold = now - state.purgatory_ttl_secs;
+            state.db.get_active_endpoints(threshold).await
+        }
+        PurgatoryView::Stale => {
+            let active_threshold = now - state.purgatory_ttl_secs;
+            let stale_threshold = now - state.purgatory_retention_secs;
+            state
+                .db
+                .get_stale_endpoints(active_threshold, stale_threshold)
+                .await
+        }
+        PurgatoryView::All => state.db.get_active_endpoints(0).await,
+    };
+    match result {
         Ok(rows) => {
-            state.profiles = rows;
+            state.endpoints = rows;
         }
         Err(e) => {
             state.log_trace("error", "tui", &format!("Failed to load profiles: {e}"));
-            state.profiles.clear();
+            state.endpoints.clear();
         }
     }
     state.filter_cache_valid.set(false);
@@ -42,14 +61,14 @@ pub async fn reload_routing_rules(state: &mut AppState) {
     state.routing_rules = state.db.get_all_routing_rules().await.unwrap_or_default();
 }
 
-pub fn filtered_profiles(state: &AppState) -> impl Iterator<Item = &ProfileRow> {
+pub fn filtered_profiles(state: &AppState) -> impl Iterator<Item = &EndpointRow> {
     if !state.filter_cache_valid.get() {
         let indices = compute_filtered_indices(state);
         *state.cached_filtered_indices.borrow_mut() = indices;
         state.filter_cache_valid.set(true);
     }
     let indices: Vec<usize> = state.cached_filtered_indices.borrow().clone();
-    indices.into_iter().map(move |i| &state.profiles[i])
+    indices.into_iter().map(move |i| &state.endpoints[i])
 }
 
 pub fn filtered_len(state: &AppState) -> usize {
@@ -63,7 +82,7 @@ pub fn filtered_len(state: &AppState) -> usize {
 
 fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
     let mut indices: Vec<usize> = state
-        .profiles
+        .endpoints
         .iter()
         .enumerate()
         .filter(|(_, row)| {
@@ -85,8 +104,8 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
 
     let asc = state.sort_ascending;
     indices.sort_by(|&a, &b| {
-        let a_row = &state.profiles[a];
-        let b_row = &state.profiles[b];
+        let a_row = &state.endpoints[a];
+        let b_row = &state.endpoints[b];
         let cmp = match state.sort_column {
             SortColumn::ConfigType => a_row
                 .active_protocol()
@@ -137,7 +156,7 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
                 ta.cmp(&tb)
             }
             SortColumn::Core => {
-                let resolve = |row: &ProfileRow| -> String {
+                let resolve = |row: &EndpointRow| -> String {
                     let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
                         .unwrap_or(Protocol::Custom);
                     let core = resolve_core(
@@ -176,7 +195,7 @@ pub fn cycle_group(state: &mut AppState, _dir: i8) {
     }
 }
 
-pub fn resolved_core(state: &AppState, row: &ProfileRow) -> CoreType {
+pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
     let protocol =
         Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
     let profile_override = row.active_protocol().core_type.parse::<CoreType>().ok();
@@ -448,7 +467,7 @@ pub async fn confirm_add_server(state: &mut AppState) {
                 .unwrap_or_else(|| "unnamed".to_string());
             state.log_trace("info", "tui", &format!("Added server: {remarks}"));
             state.mode = AppMode::List;
-            state.profile_gen = state.profile_gen.wrapping_add(1);
+            state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             upsert_profile_row(state, profile, None, None, state.selected_group_id.clone());
         }
         Err(e) => {
@@ -553,7 +572,7 @@ pub async fn confirm_edit_server(state: &mut AppState) {
                 .unwrap_or_else(|| "unnamed".to_string());
             state.log_trace("info", "tui", &format!("Updated server: {remarks}"));
             state.mode = AppMode::List;
-            state.profile_gen = state.profile_gen.wrapping_add(1);
+            state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             reload_profiles(state).await;
         }
         Err(e) => {
@@ -576,12 +595,12 @@ pub async fn delete_profile(state: &mut AppState, id: i64) {
     state.log_trace("info", "tui", "Profile deleted");
     state.confirmation = None;
     state.multi_select.remove(&id);
-    state.profile_gen = state.profile_gen.wrapping_add(1);
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
 
 pub async fn clone_profile(state: &mut AppState, id: i64) {
-    let found = state.profiles.iter().find(|r| r.endpoint.id == id);
+    let found = state.endpoints.iter().find(|r| r.endpoint.id == id);
     if found.is_none() {
         state.log_trace(
             "error",
@@ -591,7 +610,7 @@ pub async fn clone_profile(state: &mut AppState, id: i64) {
         return;
     }
     state.log_trace("info", "tui", "Profile cloned");
-    state.profile_gen = state.profile_gen.wrapping_add(1);
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
 
@@ -689,7 +708,7 @@ pub async fn move_profile_up(state: &mut AppState) {
         Some(id) => id,
         None => return,
     };
-    let filtered: Vec<&ProfileRow> = filtered_profiles(state).collect();
+    let filtered: Vec<&EndpointRow> = filtered_profiles(state).collect();
     let idx = filtered.iter().position(|r| r.endpoint.id == id);
     let _idx = match idx {
         Some(i) if i > 0 => i,
@@ -697,7 +716,7 @@ pub async fn move_profile_up(state: &mut AppState) {
     };
     drop(filtered);
     state.log_trace("info", "tui", "Profile moved up");
-    state.profile_gen = state.profile_gen.wrapping_add(1);
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
 
@@ -706,14 +725,14 @@ pub async fn move_profile_down(state: &mut AppState) {
         Some(id) => id,
         None => return,
     };
-    let filtered: Vec<&ProfileRow> = filtered_profiles(state).collect();
+    let filtered: Vec<&EndpointRow> = filtered_profiles(state).collect();
     let _idx = match filtered.iter().position(|r| r.endpoint.id == id) {
         Some(i) if i < filtered.len() - 1 => i,
         _ => return,
     };
     drop(filtered);
     state.log_trace("info", "tui", "Profile moved down");
-    state.profile_gen = state.profile_gen.wrapping_add(1);
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
 
@@ -724,7 +743,7 @@ pub async fn set_active(state: &mut AppState, id: &str) {
         state.log_trace("error", "tui", &format!("Failed to set active: {e}"));
         return;
     }
-    state.profile_gen = state.profile_gen.wrapping_add(1);
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
 
@@ -735,6 +754,15 @@ pub fn upsert_profile_row(
     _stat: Option<ServerStat>,
     _group_id: Option<String>,
 ) {
-    state.profile_gen = state.profile_gen.wrapping_add(1);
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
+}
+
+/// Cycle purgatory view: Active → Stale → All → Active
+pub const fn cycle_purgatory_view(state: &mut AppState) {
+    state.purgatory_view = match state.purgatory_view {
+        PurgatoryView::Active => PurgatoryView::Stale,
+        PurgatoryView::Stale => PurgatoryView::All,
+        PurgatoryView::All => PurgatoryView::Active,
+    };
 }

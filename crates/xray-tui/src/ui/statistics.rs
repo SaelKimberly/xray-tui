@@ -13,13 +13,13 @@ use xray_tui_proto::proto_spec::ProtoSpec;
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
     let connected = state.connected_core.is_some();
-    let has_profile = !state.profiles.is_empty() && state.selected_index < state.profiles.len();
+    let has_profile = !state.endpoints.is_empty() && state.selected_index < state.endpoints.len();
 
     if !connected || !has_profile {
         render_placeholder(frame, area, &palette);
         return;
     }
-    let profile = &state.profiles[state.selected_index];
+    let profile = &state.endpoints[state.selected_index];
     let active_proto = profile.active_protocol();
     let profile_name = profile_config(&xray_tui_config::import_export::Profile {
         id: active_proto.id,

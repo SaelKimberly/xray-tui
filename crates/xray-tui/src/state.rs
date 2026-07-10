@@ -15,7 +15,7 @@ use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{CoreType, resolve_core};
 use xray_tui_db::models::{
-    Endpoint, Group, PingResultUpdate, ProfileExtension, ProtocolRow, RoutingRule,
+    Endpoint, Group, PingResultUpdate, ProfileExtension, ProtocolRow, PurgatoryView, RoutingRule,
 };
 use xray_tui_db::{Database, stable_hash};
 
@@ -23,7 +23,7 @@ use crate::BackendUpdateStatus;
 use crate::format_now;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
 use crate::types::{
-    AppMode, ConfirmAction, CoreEvent, LogLine, ProfileRow, SettingsSection, SortColumn,
+    AppMode, ConfirmAction, CoreEvent, EndpointRow, LogLine, SettingsSection, SortColumn,
     SplitRightPane, Tab,
 };
 use crate::ui::settings::PROTOCOL_CORE_DEFS;
@@ -34,15 +34,21 @@ pub struct AppState {
     /// Currently selected theme name from config or UI selection.
     pub theme_name: ratatui_themes::ThemeName,
     pub current_tab: Tab,
-    pub profiles: Vec<ProfileRow>,
+    pub endpoints: Vec<EndpointRow>,
     /// Cached filtered/sorted profile indices for performance.
     pub cached_filtered_indices: RefCell<Vec<usize>>,
     pub filter_cache_valid: Cell<bool>,
     /// Generation counter bumped on every profile mutation.
     /// Used to skip redundant reloads.
-    pub profile_gen: u64,
+    pub endpoints_gen: u64,
     pub groups: Vec<Group>,
     pub selected_group_id: Option<String>,
+    /// Current purgatory filter view: Active / Stale / All.
+    pub purgatory_view: PurgatoryView,
+    /// Purgatory TTL in seconds (default 7 days).
+    pub purgatory_ttl_secs: i64,
+    /// Purgatory retention in seconds (default 30 days).
+    pub purgatory_retention_secs: i64,
     pub selected_index: usize,
     /// Scroll offset from the bottom of the log buffer (0 = newest visible).
     pub log_scroll: usize,
@@ -166,17 +172,22 @@ impl AppState {
     pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
         let theme_name = config.theme_name;
         let (core_tx, core_rx) = tokio::sync::mpsc::channel(65536);
+        let purgatory_ttl_secs = (config.purgatory.ttl_days * 86400) as i64;
+        let purgatory_retention_secs = (config.purgatory.retention_days * 86400) as i64;
         let mut state = Self {
             db,
             config,
             theme_name,
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),
-            profiles: Vec::new(),
+            endpoints: Vec::new(),
             cached_filtered_indices: RefCell::new(Vec::new()),
             filter_cache_valid: Cell::new(true),
-            profile_gen: 0,
+            endpoints_gen: 0,
             groups: Vec::new(),
+            purgatory_view: PurgatoryView::Active,
+            purgatory_ttl_secs,
+            purgatory_retention_secs,
             selected_group_id: None,
             selected_index: 0,
             log_scroll: 0,
@@ -281,13 +292,13 @@ impl AppState {
         profiles::reload_routing_rules(self).await;
     }
 
-    pub fn filtered_profiles(&self) -> impl Iterator<Item = &ProfileRow> {
+    pub fn filtered_profiles(&self) -> impl Iterator<Item = &EndpointRow> {
         profiles::filtered_profiles(self)
     }
 
     fn compute_filtered_indices(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = self
-            .profiles
+            .endpoints
             .iter()
             .enumerate()
             .filter(|(_, row)| {
@@ -309,8 +320,8 @@ impl AppState {
 
         let asc = self.sort_ascending;
         indices.sort_by(|&a, &b| {
-            let a_row = &self.profiles[a];
-            let b_row = &self.profiles[b];
+            let a_row = &self.endpoints[a];
+            let b_row = &self.endpoints[b];
             let cmp = match self.sort_column {
                 SortColumn::ConfigType => a_row
                     .active_protocol()
@@ -361,7 +372,7 @@ impl AppState {
                     ta.cmp(&tb)
                 }
                 SortColumn::Core => {
-                    let resolve = |row: &ProfileRow| -> String {
+                    let resolve = |row: &EndpointRow| -> String {
                         let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
                             .unwrap_or(Protocol::Custom);
                         let core = resolve_core(
@@ -388,6 +399,9 @@ impl AppState {
     pub fn cycle_group(&mut self, _dir: i8) {
         profiles::cycle_group(self, _dir);
     }
+    pub const fn cycle_purgatory_view(&mut self) {
+        profiles::cycle_purgatory_view(self);
+    }
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
     pub fn log_trace(&mut self, level: &str, _target: &str, message: &str) {
         match level {
@@ -405,7 +419,7 @@ impl AppState {
     /// 1. Per-profile override (`row.active_protocol().core_type`)
     /// 2. Per-protocol config override (`config.core.protocol_core_overrides`)
     /// 3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
-    pub fn resolved_core(&self, row: &ProfileRow) -> CoreType {
+    pub fn resolved_core(&self, row: &EndpointRow) -> CoreType {
         profiles::resolved_core(self, row)
     }
     // ── CRUD operations ──────────────────────────────────────────────────
@@ -552,7 +566,7 @@ impl AppState {
             address,
             port,
             transport: network.clone(),
-            network: network,
+            network,
             security,
             created_at: now as i64,
             remarks: remarks.clone(),

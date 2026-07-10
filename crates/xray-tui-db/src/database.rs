@@ -342,11 +342,11 @@ impl Database {
             .bind(&ep.host)
             .bind(&ep.host_type)
             .bind(ep.port)
-            .bind(ep.port_spec_str.as_deref())
-            .bind(ep.parent_id)
-            .bind(ep.last_source.as_deref())
+            .bind(ep.port_spec_str.as_deref().unwrap_or(""))
+            .bind(ep.parent_id.unwrap_or(0))
+            .bind(ep.last_source.as_deref().unwrap_or(""))
             .bind(ep.created_at)
-            .bind(ep.manual_protocol_override)
+            .bind(ep.manual_protocol_override.unwrap_or(0))
             .exec(&mut tx)
             .await?;
 
@@ -371,27 +371,28 @@ impl Database {
                 .bind_typed(p.spec_blob.clone(), DbType::Blob)
                 .bind(p.config_type)
                 .bind(&p.core_type)
-                .bind(p.transport.as_deref())
-                .bind(p.security.as_deref())
-                .bind(p.remarks.as_deref())
+                .bind(p.transport.as_deref().unwrap_or(""))
+                .bind(p.security.as_deref().unwrap_or(""))
+                .bind(p.remarks.as_deref().unwrap_or(""))
                 .bind(p.created_at)
                 .bind(p.last_seen_at)
                 .exec(&mut tx)
                 .await?;
             }
 
-            // Upsert endpoint-group link
+            // Upsert endpoint-group link: deterministic id = group_id:ep.id
+            let eg_id = format!("{group_id}:{}", ep.id);
             toasty::sql::statement(
                 "INSERT INTO endpoint_groups (id, endpoint_id, group_id, last_seen_at, sort_order) \
                  VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(endpoint_id, group_id) DO UPDATE SET \
+                 ON CONFLICT(id) DO UPDATE SET \
                  last_seen_at=excluded.last_seen_at, sort_order=excluded.sort_order",
             )
-            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&eg_id)
             .bind(ep.id)
             .bind(group_id)
             .bind(now)
-            .bind(None::<i32>)
+            .bind(0i32)
             .exec(&mut tx)
             .await?;
         }
@@ -423,11 +424,11 @@ impl Database {
         .bind(&endpoint.host)
         .bind(&endpoint.host_type)
         .bind(endpoint.port)
-        .bind(endpoint.port_spec_str.as_deref())
-        .bind(endpoint.parent_id)
-        .bind(endpoint.last_source.as_deref())
+        .bind(endpoint.port_spec_str.as_deref().unwrap_or(""))
+        .bind(endpoint.parent_id.unwrap_or(0))
+        .bind(endpoint.last_source.as_deref().unwrap_or(""))
         .bind(endpoint.created_at)
-        .bind(endpoint.manual_protocol_override)
+        .bind(endpoint.manual_protocol_override.unwrap_or(0))
         .exec(&mut tx)
         .await?;
 
@@ -444,9 +445,9 @@ impl Database {
         .bind_typed(protocol.spec_blob.clone(), DbType::Blob)
         .bind(protocol.config_type)
         .bind(&protocol.core_type)
-        .bind(protocol.transport.as_deref())
-        .bind(protocol.security.as_deref())
-        .bind(protocol.remarks.as_deref())
+        .bind(protocol.transport.as_deref().unwrap_or(""))
+        .bind(protocol.security.as_deref().unwrap_or(""))
+        .bind(protocol.remarks.as_deref().unwrap_or(""))
         .bind(protocol.created_at)
         .bind(protocol.last_seen_at)
         .exec(&mut tx)
@@ -460,7 +461,7 @@ impl Database {
         .bind(endpoint.id)
         .bind(group_id)
         .bind(now)
-        .bind(None::<i32>)
+        .bind(0i32)
         .exec(&mut tx)
         .await?;
 
@@ -728,10 +729,10 @@ impl Database {
              sort_order=excluded.sort_order, ip_info=excluded.ip_info",
         )
         .bind(ext.protocol_id)
-        .bind(ext.delay)
-        .bind(ext.speed)
-        .bind(ext.sort_order)
-        .bind(ext.ip_info.as_deref())
+        .bind(ext.delay.unwrap_or(0))
+        .bind(ext.speed.unwrap_or(0))
+        .bind(ext.sort_order.unwrap_or(0))
+        .bind(ext.ip_info.as_deref().unwrap_or(""))
         .exec(&mut conn)
         .await?;
         Ok(())
@@ -748,11 +749,11 @@ impl Database {
              last_updated=excluded.last_updated",
         )
         .bind(stats.protocol_id)
-        .bind(stats.today_up)
-        .bind(stats.today_down)
-        .bind(stats.total_up)
-        .bind(stats.total_down)
-        .bind(stats.last_updated.as_deref())
+        .bind(stats.today_up.unwrap_or(0))
+        .bind(stats.today_down.unwrap_or(0))
+        .bind(stats.total_up.unwrap_or(0))
+        .bind(stats.total_down.unwrap_or(0))
+        .bind(stats.last_updated.as_deref().unwrap_or(""))
         .exec(&mut conn)
         .await?;
         Ok(())
@@ -1111,8 +1112,8 @@ impl Database {
             )
             .bind(&r.status)
             .bind(r.latency_ms)
-            .bind(r.speed_bps)
-            .bind(r.ip_info.as_deref())
+            .bind(r.speed_bps.unwrap_or(0))
+            .bind(r.ip_info.as_deref().unwrap_or(""))
             .bind(r.error.as_deref())
             .bind(&r.session_id)
             .bind(batch_id)
@@ -1231,10 +1232,10 @@ impl Database {
                  sort_order=excluded.sort_order, ip_info=excluded.ip_info",
             )
             .bind(ext.protocol_id)
-            .bind(ext.delay)
-            .bind(ext.speed)
-            .bind(ext.sort_order)
-            .bind(ext.ip_info.as_deref())
+            .bind(ext.delay.unwrap_or(0))
+            .bind(ext.speed.unwrap_or(0))
+            .bind(ext.sort_order.unwrap_or(0))
+            .bind(ext.ip_info.as_deref().unwrap_or(""))
             .exec(&mut tx)
             .await?;
         }
@@ -1260,8 +1261,8 @@ impl Database {
             )
             .bind(&r.status)
             .bind(r.latency_ms)
-            .bind(r.speed_bps)
-            .bind(r.ip_info.as_deref())
+            .bind(r.speed_bps.unwrap_or(0))
+            .bind(r.ip_info.as_deref().unwrap_or(""))
             .bind(r.error.as_deref())
             .bind(&r.session_id)
             .bind(batch_id)
@@ -1278,10 +1279,10 @@ impl Database {
                  sort_order=excluded.sort_order, ip_info=excluded.ip_info",
             )
             .bind(ext.protocol_id)
-            .bind(ext.delay)
-            .bind(ext.speed)
-            .bind(ext.sort_order)
-            .bind(ext.ip_info.as_deref())
+            .bind(ext.delay.unwrap_or(0))
+            .bind(ext.speed.unwrap_or(0))
+            .bind(ext.sort_order.unwrap_or(0))
+            .bind(ext.ip_info.as_deref().unwrap_or(""))
             .exec(&mut tx)
             .await?;
         }

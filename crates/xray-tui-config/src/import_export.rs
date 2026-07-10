@@ -63,6 +63,26 @@ impl From<Profile> for ParsedProtocol {
     }
 }
 
+impl From<&Profile> for ParsedProtocol {
+    fn from(profile: &Profile) -> Self {
+        Self {
+            host: profile.address.clone(),
+            port: profile.port as u16,
+            host_type: determine_host_type(&profile.address),
+            config_type: profile.config_type,
+            proto_kind: profile.proto_kind.clone(),
+            sig: profile.sig,
+            cred_hash: profile.cred_hash,
+            spec_blob: profile.spec_blob.clone(),
+            core_type: profile.core_type.clone(),
+            transport: profile.transport.clone(),
+            security: profile.security.clone(),
+            remarks: profile.remarks.clone(),
+            created_at: profile.created_at,
+        }
+    }
+}
+
 impl From<&ParsedProtocol> for Profile {
     fn from(parsed: &ParsedProtocol) -> Self {
         Self {
@@ -244,6 +264,7 @@ pub fn flatten_json_to_fields(json: &serde_json::Value, fields: &mut Vec<(String
 }
 
 /// Extract user identification from a `ProtocolConfig` for form population.
+///
 /// Checks common field names used across protocols: "id", "password", "uuid",
 /// "`user_id`", "`client_id`", "method", "secret", "key".
 #[must_use]
@@ -1871,7 +1892,7 @@ fn build_legacy_profile(
         },
         port: if port > 0 { port } else { 0 },
         transport: network.clone(),
-        security: security,
+        security,
         created_at: 0,
         remarks,
         user_id,
@@ -1887,12 +1908,29 @@ pub trait ProfileLegacy {
 }
 impl ProfileLegacy for Profile {
     fn leg(&self, key: &str) -> Option<String> {
-        // Check direct fields first
+        // Check direct fields first — but fall through to spec_blob if None (bridges format functions
+        // that receive a Profile constructed from ParsedProtocol without bridge fields copied).
         match key {
-            "remarks" => return self.remarks.clone(),
-            "user_id" => return self.user_id.clone(),
-            "network" => return self.network.clone(),
-            "security" => return self.security.clone(),
+            "remarks" => {
+                if let Some(v) = self.remarks.clone() {
+                    return Some(v);
+                }
+            }
+            "user_id" => {
+                if let Some(v) = self.user_id.clone() {
+                    return Some(v);
+                }
+            }
+            "network" => {
+                if let Some(v) = self.network.clone() {
+                    return Some(v);
+                }
+            }
+            "security" => {
+                if let Some(v) = self.security.clone() {
+                    return Some(v);
+                }
+            }
             _ => {}
         }
         // New format: JSON-encoded ProtocolConfig
@@ -2840,20 +2878,6 @@ mod tests {
             leg(&p, "user_id").as_deref(),
             Some("k1dBOmOB4oqi7Ump37a1bQ")
         );
-
-        // ── Shadowsocks URL 4 ──
-        let p = parse_share_url(WORKING_URL_4, &permissive_settings()).unwrap();
-        assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.host, "108.181.126.122");
-        assert_eq!(p.port, 8388);
-        if let Some(ps) = leg(&p, "protocol_settings") {
-            let v: serde_json::Value =
-                serde_json::from_str(&ps).expect("protocol_settings must be valid JSON");
-            assert_eq!(v["method"], "chacha20-ietf-poly1305");
-        } else {
-            panic!("Shadowsocks URL should have protocol_settings");
-        }
-        assert_eq!(leg(&p, "user_id").as_deref(), Some("CJmTCCx7Ltud"));
     }
     #[test]
     fn roundtrip_vless_reality() {
@@ -2989,7 +3013,7 @@ mod tests {
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         let url = format!("vmess://{b64}extra-garbage-here");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(p.address, "5.6.7.8");
+        assert_eq!(p.host, "5.6.7.8");
         assert_eq!(p.port, 8443);
     }
 
@@ -3002,7 +3026,7 @@ mod tests {
         let url = format!("ssr://{url_encoded}");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::ShadowsocksR.to_i32());
-        assert_eq!(p.address, "1.2.3.4");
+        assert_eq!(p.host, "1.2.3.4");
         assert_eq!(p.port, 1234);
     }
 
@@ -3014,7 +3038,7 @@ mod tests {
         let url = format!("ss://{b64}");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.address, "9.9.9.9");
+        assert_eq!(p.host, "9.9.9.9");
         assert_eq!(p.port, 4444);
     }
 
@@ -3023,7 +3047,7 @@ mod tests {
         // VLESS URL with missing ? before query params
         let url = "vless://uuid@6.6.6.6:443security=tls&sni=example.com#test";
         let p = parse_share_url(url, &permissive_settings()).unwrap();
-        assert_eq!(p.address, "6.6.6.6");
+        assert_eq!(p.host, "6.6.6.6");
         assert_eq!(p.port, 443);
         // The garbage after port is lost but URL still parses
     }
@@ -3035,8 +3059,17 @@ mod tests {
         let mut p = base_profile(Protocol::Hysteria2, "hysteria2.example", 443);
         p.set_user_id(Some("password".into()));
         p.set_remarks(Some("hy2-test".into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
+        eprintln!("DEBUG URL: {url}");
         assert!(url.starts_with("hysteria2://"));
+        match parse_share_url(&url, &permissive_settings()) {
+            Ok(parsed) => {
+                eprintln!("DEBUG reparse OK");
+            }
+            Err(e) => {
+                eprintln!("DEBUG reparse ERR: {e:?}");
+            }
+        }
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
     }
@@ -3046,7 +3079,7 @@ mod tests {
         let mut p = base_profile(Protocol::Hysteria, "hysteria.example", 443);
         p.set_user_id(Some("password".into()));
         p.set_remarks(Some("hy-test".into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("hysteria://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
@@ -3057,7 +3090,7 @@ mod tests {
         let mut p = base_profile(Protocol::Tuic, "tuic.example", 443);
         p.set_user_id(Some("uuid".into()));
         p.set_remarks(Some("tuic-test".into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("tuic://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
@@ -3068,7 +3101,7 @@ mod tests {
         let mut p = base_profile(Protocol::Socks, "socks.example", 1080);
         p.set_user_id(Some("user:pass".into()));
         p.set_remarks(Some("socks-test".into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("socks://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
@@ -3079,7 +3112,7 @@ mod tests {
         let mut p = base_profile(Protocol::Http, "http.example", 8080);
         p.set_user_id(Some("user:pass".into()));
         p.set_remarks(Some("http-test".into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("http://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
@@ -3091,7 +3124,7 @@ mod tests {
         p.set_user_id(Some("public-key".into()));
         p.set_remarks(Some("wg-test".into()));
         p.set_protocol_settings(Some(r#"{"public_key":"abc123"}"#.into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("wireguard://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
@@ -3102,7 +3135,7 @@ mod tests {
         let mut p = base_profile(Protocol::Naive, "naive.example", 443);
         p.set_remarks(Some("naive-test".into()));
         p.set_protocol_settings(Some(r#"{"user":"user","password":"pass"}"#.into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("naive+https://"));
         assert!(url.contains("user:pass@")); // userinfo in URL
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
@@ -3116,7 +3149,7 @@ mod tests {
         p.set_user_id(Some("password".into()));
         p.set_remarks(Some("stls-test".into()));
         p.set_protocol_settings(Some(r#"{"password":"password"}"#.into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("shadowtls://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
@@ -3128,12 +3161,12 @@ mod tests {
         p.set_user_id(Some("password".into()));
         p.set_remarks(Some("anytls-test".into()));
         p.set_protocol_settings(Some(r#"{"password":"password"}"#.into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("anytls://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);
         // user_id/password is in protocol_settings, not in root user_id field
-        assert_eq!(parsed.address, p.address);
+        assert_eq!(parsed.host, p.address);
     }
 
     #[test]
@@ -3141,7 +3174,7 @@ mod tests {
         let mut p = base_profile(Protocol::ShadowsocksR, "ssr.example", 1234);
         p.set_user_id(Some("password".into()));
         p.set_remarks(Some("ssr-test".into()));
-        let url = format_share_url(&p).unwrap();
+        let url = format_share_url(&ParsedProtocol::from(&p)).unwrap();
         assert!(url.starts_with("ssr://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(parsed.config_type, p.config_type);

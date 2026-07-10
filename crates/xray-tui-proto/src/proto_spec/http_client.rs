@@ -155,22 +155,22 @@ impl ProtoSpec for HttpClientConfig {
 
         let query_string = {
             let mut parts: Vec<String> = Vec::new();
-            if let Some(tls_config) = &self.security.tls {
-                if let TlsConfig::Tls(opts) = tls_config {
-                    if opts.sni.is_some() || opts.alpn.is_some() || opts.fp.is_some() {
-                        parts.push("security=tls".to_string());
-                    }
-                    if let Some(v) = &opts.sni
-                        && !super::common::should_skip_param(&self.host, v)
-                    {
-                        parts.push(format!("sni={}", urlencoding::encode(v)));
-                    }
-                    if let Some(v) = &opts.alpn {
-                        parts.push(format!("alpn={}", urlencoding::encode(v)));
-                    }
-                    if let Some(v) = &opts.fp {
-                        parts.push(format!("fp={}", urlencoding::encode(v)));
-                    }
+            if let Some(tls_config) = &self.security.tls
+                && let TlsConfig::Tls(opts) = tls_config
+            {
+                if opts.sni.is_some() || opts.alpn.is_some() || opts.fp.is_some() {
+                    parts.push("security=tls".to_string());
+                }
+                if let Some(v) = &opts.sni
+                    && !super::common::should_skip_param(&self.host, v)
+                {
+                    parts.push(format!("sni={}", urlencoding::encode(v)));
+                }
+                if let Some(v) = &opts.alpn {
+                    parts.push(format!("alpn={}", urlencoding::encode(v)));
+                }
+                if let Some(v) = &opts.fp {
+                    parts.push(format!("fp={}", urlencoding::encode(v)));
                 }
             }
             if parts.is_empty() {

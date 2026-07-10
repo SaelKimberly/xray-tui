@@ -12,7 +12,7 @@ use xray_tui_db::models::{DnsSetting, PingResultUpdate, ProfileExtension};
 
 use crate::AppState;
 use crate::try_send_or_warn;
-use crate::types::{CoreEvent, ProfileRow};
+use crate::types::{CoreEvent, EndpointRow};
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
@@ -21,7 +21,11 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
         return;
     }
     // Find the profile and extract address:port
-    let row = if let Some(r) = state.profiles.iter().find(|r| r.endpoint.id == protocol_id) {
+    let row = if let Some(r) = state
+        .endpoints
+        .iter()
+        .find(|r| r.endpoint.id == protocol_id)
+    {
         r
     } else {
         state.log_trace("error", "tui", "Profile not found for TCP ping");
@@ -81,7 +85,11 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
 
     // Find profile row and resolve core
     let endpoint;
-    let protocol = if let Some(r) = state.profiles.iter().find(|r| r.endpoint.id == protocol_id) {
+    let protocol = if let Some(r) = state
+        .endpoints
+        .iter()
+        .find(|r| r.endpoint.id == protocol_id)
+    {
         endpoint = r.endpoint.clone();
         r.active_protocol().clone()
     } else {
@@ -410,7 +418,7 @@ async fn batch_upsert_buffer(
 /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
 #[allow(clippy::needless_collect)]
 pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
-    let visible: Vec<&ProfileRow> = state.filtered_profiles().collect();
+    let visible: Vec<&EndpointRow> = state.filtered_profiles().collect();
     if visible.is_empty() {
         state.log_trace(
             "info",
@@ -721,7 +729,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
 /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
 pub async fn remove_failed_servers(state: &mut AppState) {
     let to_remove: Vec<i64> = state
-        .profiles
+        .endpoints
         .iter()
         .filter(|r| r.extensions.values().any(|e| e.delay == Some(-1)))
         .map(|r| r.endpoint.id)

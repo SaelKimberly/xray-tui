@@ -7,8 +7,8 @@ use xray_tui_core::CoreType;
 use xray_tui_core::grpc_client;
 use xray_tui_core::speed_test::TestType;
 
-/// Re-export `EndpointRow` as `ProfileRow` for backward compatibility.
-pub use xray_tui_db::models::EndpointRow as ProfileRow;
+/// Re-export `EndpointRow` as `EndpointRow` for backward compatibility.
+pub use xray_tui_db::models::EndpointRow;
 
 /// Clash API /traffic response struct.
 #[derive(Debug, Clone, Default, serde::Deserialize)]

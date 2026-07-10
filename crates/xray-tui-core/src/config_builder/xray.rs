@@ -472,6 +472,7 @@ mod tests {
             created_at: 0,
             last_seen_at: 0,
             extension: Default::default(),
+            endpoint: Default::default(),
             server_stat: Default::default(),
         };
         (endpoint, protocol)

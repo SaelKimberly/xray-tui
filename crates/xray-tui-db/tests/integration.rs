@@ -3,11 +3,13 @@
     reason = "test db lifetime is the function scope"
 )]
 
-use serde_json;
-use xray_tui_db::Database;
-use xray_tui_db::models::{Group, Profile};
+use uuid::Uuid;
 
-/// Helper: create an in-memory database for testing.
+use xray_tui_db::Database;
+use xray_tui_db::hash::stable_hash;
+use xray_tui_db::models::{Endpoint, EndpointGroup, Group, ProtocolRow};
+
+/// Helper: create in-memory database.
 async fn test_db() -> Database {
     Database::in_memory().await.expect("open in-memory db")
 }
@@ -15,197 +17,390 @@ async fn test_db() -> Database {
 fn test_group(id: &str) -> Group {
     Group {
         id: id.to_string(),
-        name: Some(id.to_string()),
-        subscription_url: None,
-        subscription_enabled: None,
+        name: Some(format!("group-{id}")),
+        url: None,
+        enabled: Some(1),
         user_agent: None,
         convert_target: None,
         core_type: None,
         sort_order: None,
-        is_system: None,
+        last_refreshed: None,
+        status: Some("ok".to_string()),
+        error_message: None,
+        refresh_interval: None,
     }
 }
 
-fn make_profile(id_counter: i64) -> Profile {
-    let spec_blob = serde_json::to_vec(&serde_json::json!({
-        "remarks": format!("test-{id_counter}"),
-        "user_id": "uuid",
-    }))
-    .unwrap_or_default();
-    Profile {
-        id: id_counter,
-        sig: id_counter,
-        cred_hash: id_counter,
-        proto_kind: "test".to_string(),
-        spec_blob,
-        config_type: 1,
-        core_type: "xray".to_string(),
-        address: "127.0.0.1".to_string(),
-        port: 1080,
-        transport: Some("tcp".to_string()),
-        security: Some("auto".to_string()),
-        created_at: 0,
+fn make_endpoint(host: &str, port: i32) -> Endpoint {
+    let id = stable_hash(host, port);
+    Endpoint {
+        id,
+        host: host.to_string(),
+        host_type: if host.is_empty() {
+            "undefined".to_string()
+        } else {
+            "ipv4".to_string()
+        },
+        port,
+        port_spec_str: None,
+        parent_id: None,
+        last_source: None,
+        created_at: 1000,
+        manual_protocol_override: None,
+    }
+}
+
+fn make_protocol(endpoint_id: i64, proto_kind: &str, sid: i64) -> ProtocolRow {
+    ProtocolRow {
+        id: sid,
+        endpoint_id,
+        sig: sid,
+        cred_hash: 0,
+        proto_kind: proto_kind.to_string(),
+        spec_blob: vec![],
+        config_type: 0,
+        core_type: "auto".to_string(),
+        transport: None,
+        security: None,
+        remarks: Some(format!("{proto_kind}-{sid}")),
+        created_at: 1000,
+        last_seen_at: 1000,
+        endpoint: Default::default(),
         extension: Default::default(),
         server_stat: Default::default(),
     }
 }
 
-fn spec_remarks(blob: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(blob).ok()?;
-    v.get("remarks")?.as_str().map(|s| s.to_string())
+// ── Phase 9 — Basic CRUD ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_insert_endpoint_with_two_protocols() {
+    let db = test_db().await;
+    let gid = "default";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = make_endpoint("1.2.3.4", 443);
+    let proto1 = make_protocol(ep.id, "vmess", 1001);
+    let proto2 = make_protocol(ep.id, "vless", 1002);
+
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto1, proto2])])
+        .await
+        .unwrap();
+
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(row.endpoint.host, "1.2.3.4");
+    assert_eq!(row.protocols.len(), 2);
+    assert_eq!(row.protocols[0].proto_kind, "vmess"); // row order (no sort)
+    assert_eq!(row.protocols[1].proto_kind, "vless");
 }
 
 #[tokio::test]
-async fn test_create_and_read_profile() {
+async fn test_subscription_upsert_idempotent() {
     let db = test_db().await;
-    db.insert_group(&test_group("test-group"))
-        .await
-        .expect("insert group");
-    let p = make_profile(1);
-    db.insert_profile(&p, "test-group")
-        .await
-        .expect("insert profile");
+    let gid = "sub";
+    db.insert_group(&test_group(gid)).await.unwrap();
 
-    let found = db
-        .get_profile(1)
-        .await
-        .expect("get profile")
-        .expect("profile should exist");
+    let ep = make_endpoint("10.0.0.1", 80);
+    let proto = make_protocol(ep.id, "trojan", 2001);
 
-    assert_eq!(found.id, 1);
-    assert_eq!(found.config_type, 1);
-    assert_eq!(spec_remarks(&found.spec_blob).as_deref(), Some("test-1"));
+    // First insert
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
+        .await
+        .unwrap();
+    let row1 = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row1.protocols.len(), 1);
+    let first_seen = row1.protocols[0].last_seen_at;
+
+    // Same subscription again → last_seen_at updated, no new rows
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
+        .await
+        .unwrap();
+    let row2 = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row2.protocols.len(), 1); // no duplicate
+    assert!(row2.protocols[0].last_seen_at >= first_seen); // timestamp bumped
 }
 
 #[tokio::test]
-async fn test_update_profile() {
+async fn test_active_vs_stale() {
     let db = test_db().await;
-    db.insert_group(&test_group("test-group"))
+    let gid = "test";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let now = 5000i64;
+    let ttl_secs = 3600i64; // 1 hour
+
+    // Active endpoint: last_seen_at = now (recent)
+    let active_ep = make_endpoint("5.6.7.8", 443);
+    let active_proto = ProtocolRow {
+        last_seen_at: now,
+        ..make_protocol(active_ep.id, "ss", 3001)
+    };
+    db.subscription_upsert(gid, &[(active_ep.clone(), vec![active_proto])])
         .await
-        .expect("insert group");
-    let p = make_profile(2);
-    db.insert_profile(&p, "test-group").await.expect("insert");
+        .unwrap();
 
-    let mut updated = make_profile(2);
-    updated.address = "192.168.1.1".to_string();
-    updated.port = 2080;
-    db.update_profile(&updated).await.expect("update");
-
-    let found = db
-        .get_profile(2)
+    // Stale endpoint: last_seen_at = now - 2*ttl (old)
+    let stale_ep = make_endpoint("9.10.11.12", 80);
+    let stale_proto = ProtocolRow {
+        last_seen_at: now - 2 * ttl_secs,
+        ..make_protocol(stale_ep.id, "socks", 4001)
+    };
+    db.subscription_upsert(gid, &[(stale_ep.clone(), vec![stale_proto])])
         .await
-        .expect("get profile")
-        .expect("profile should exist after update");
+        .unwrap();
 
-    assert_eq!(found.address, "192.168.1.1");
-    assert_eq!(found.port, 2080);
-}
-
-#[tokio::test]
-async fn test_delete_profile() {
-    let db = test_db().await;
-    db.insert_group(&test_group("test-group"))
-        .await
-        .expect("insert group");
-    let p = make_profile(3);
-    db.insert_profile(&p, "test-group").await.expect("insert");
-
-    assert!(db.get_profile(3).await.expect("get").is_some());
-
-    db.delete_profile(3).await.expect("delete");
-
-    let found = db.get_profile(3).await.expect("get");
-    assert!(found.is_none(), "deleted profile should not exist");
-}
-
-#[tokio::test]
-async fn test_delete_group_cascade() {
-    let db = test_db().await;
-
-    db.insert_group(&test_group("test-group-1"))
-        .await
-        .expect("insert group");
-
-    let p1 = make_profile(10);
-    let p2 = make_profile(11);
-
-    db.insert_profile(&p1, "test-group-1")
-        .await
-        .expect("insert p1");
-    db.insert_profile(&p2, "test-group-1")
-        .await
-        .expect("insert p2");
-
-    let profiles = db
-        .get_profiles_by_group("test-group-1")
-        .await
-        .expect("get profiles by group");
-    assert_eq!(profiles.len(), 2, "two profiles in group");
-
-    db.delete_group("test-group-1").await.expect("delete group");
-
-    let profiles_after = db
-        .get_profiles_by_group("test-group-1")
-        .await
-        .expect("get profiles after delete");
-    assert!(profiles_after.is_empty(), "profiles should be cleaned up");
-
-    let all_groups = db.get_all_groups().await.expect("get all groups");
+    // Active query: should only return active_ep
+    let active_rows = db.get_active_endpoints(now - ttl_secs).await.unwrap();
     assert!(
-        !all_groups.iter().any(|g| g.id == "test-group-1"),
-        "group should be deleted"
+        active_rows.iter().any(|r| r.endpoint.id == active_ep.id),
+        "active endpoint should be in active view"
+    );
+    let stale_rows = db
+        .get_stale_endpoints(now - ttl_secs, -999999)
+        .await
+        .unwrap();
+    assert!(
+        !stale_rows.iter().any(|r| r.endpoint.id == active_ep.id),
+        "active endpoint should NOT be in stale view"
+    );
+
+    let stale_rows = db
+        .get_stale_endpoints(now - ttl_secs, -999999)
+        .await
+        .unwrap();
+    assert!(
+        stale_rows.iter().any(|r| r.endpoint.id == stale_ep.id),
+        "stale endpoint should be in stale view"
+    );
+    assert!(
+        !stale_rows.iter().any(|r| r.endpoint.id == active_ep.id),
+        "active endpoint should NOT be in stale view"
+    );
+
+    // Update stale endpoint → becomes active again
+    db.restore_endpoint(stale_ep.id).await.unwrap();
+    let active_after = db.get_active_endpoints(now - ttl_secs).await.unwrap();
+    assert!(
+        active_after.iter().any(|r| r.endpoint.id == stale_ep.id),
+        "restored endpoint should be in active view"
     );
 }
 
 #[tokio::test]
-async fn test_concurrent_reads() {
-    let db = std::sync::Arc::new(test_db().await);
+async fn test_undefined_endpoint() {
+    let db = test_db().await;
+    let gid = "def";
+    db.insert_group(&test_group(gid)).await.unwrap();
 
-    db.insert_group(&test_group("test-group"))
+    // Exotic config → empty host, port 0, host_type="undefined"
+    let uid = stable_hash("undefined", "exotic-uid-123");
+    let ep = Endpoint {
+        id: uid,
+        host: String::new(),
+        host_type: "undefined".to_string(),
+        port: 0,
+        ..make_endpoint("", 0)
+    };
+    let proto = make_protocol(ep.id, "custom", 5001);
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto])])
         .await
-        .expect("insert group");
+        .unwrap();
 
-    for i in 0..5 {
-        let p = make_profile(100 + i);
-        db.insert_profile(&p, "test-group").await.expect("insert");
-    }
+    let row = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row.endpoint.host_type, "undefined");
+    assert_eq!(row.endpoint.host, "");
+    assert_eq!(row.endpoint.port, 0);
+}
 
-    let mut handles = Vec::new();
-    for _ in 0..5 {
-        let db_clone = std::sync::Arc::clone(&db);
-        handles.push(tokio::spawn(async move {
-            db_clone.get_all_profiles().await.expect("concurrent read")
-        }));
-    }
+#[tokio::test]
+async fn test_two_sources_same_endpoint() {
+    let db = test_db().await;
+    let gid1 = "source-a";
+    let gid2 = "source-b";
+    db.insert_group(&test_group(gid1)).await.unwrap();
+    db.insert_group(&test_group(gid2)).await.unwrap();
 
-    for h in handles {
-        let results = h.await.expect("join");
-        assert_eq!(results.len(), 5, "should see 5 profiles");
+    let ep = make_endpoint("192.168.1.1", 8080);
+    let proto = make_protocol(ep.id, "vmess", 6001);
+
+    // Insert same endpoint from source A
+    db.subscription_upsert(gid1, &[(ep.clone(), vec![proto.clone()])])
+        .await
+        .unwrap();
+
+    // Insert same endpoint from source B
+    db.subscription_upsert(gid2, &[(ep.clone(), vec![proto.clone()])])
+        .await
+        .unwrap();
+
+    // One EndpointRow
+    let row = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row.endpoint.host, "192.168.1.1");
+    assert_eq!(row.protocols.len(), 1);
+
+    // Two EndpointGroup rows
+    let from_a = db
+        .get_active_endpoints_by_group("source-a", 0)
+        .await
+        .unwrap();
+    let from_b = db
+        .get_active_endpoints_by_group("source-b", 0)
+        .await
+        .unwrap();
+    assert!(
+        from_a.iter().any(|r| r.endpoint.id == ep.id),
+        "endpoint in source-a"
+    );
+    assert!(
+        from_b.iter().any(|r| r.endpoint.id == ep.id),
+        "endpoint in source-b"
+    );
+}
+
+#[tokio::test]
+async fn test_manual_override() {
+    let db = test_db().await;
+    let gid = "ovr";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = make_endpoint("10.10.10.10", 53);
+    let proto1 = make_protocol(ep.id, "vmess", 7001);
+    let proto2 = make_protocol(ep.id, "trojan", 7002);
+
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto1, proto2])])
+        .await
+        .unwrap();
+
+    // Auto-select: vmess (rank 1) before trojan (rank 3)
+    let row_before = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row_before.selected_protocol, 0); // first = vmess
+    assert_eq!(
+        row_before.protocols[row_before.selected_protocol].proto_kind,
+        "vmess"
+    );
+
+    // Set manual override to protocol id 7002 (trojan)
+    db.set_protocol_override(ep.id, 7002).await.unwrap();
+    let row_after = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row_after.endpoint.manual_protocol_override, Some(7002));
+
+    // Clear override
+    db.clear_protocol_override(ep.id).await.unwrap();
+    let row_cleared = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row_cleared.endpoint.manual_protocol_override, None);
+}
+
+#[tokio::test]
+async fn test_hard_delete_cascade() {
+    let db = test_db().await;
+    let gid = "purge";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let retention_secs = 86400i64; // 1 day
+    let now = 100_000i64;
+
+    let ep = make_endpoint("1.1.1.1", 1111);
+    let proto = ProtocolRow {
+        last_seen_at: now - 2 * retention_secs, // past retention
+        ..make_protocol(ep.id, "vmess", 8001)
+    };
+    db.insert_manual_endpoint(&ep, &proto, gid).await.unwrap();
+    // Verify endpoint exists
+    assert!(
+        db.get_endpoint(ep.id).await.unwrap().is_some(),
+        "endpoint should exist before purge"
+    );
+
+    // Purge past retention
+    let deleted = db.purge_expired(now - retention_secs).await.unwrap();
+    assert!(deleted > 0, "should delete endpoint past retention");
+
+    // Verify gone
+    assert!(
+        db.get_endpoint(ep.id).await.unwrap().is_none(),
+        "endpoint should be deleted after purge"
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_endpoint_dns() {
+    let db = test_db().await;
+    let gid = "dns";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    // Create a DnsName endpoint
+    let host = "example.com";
+    let dns_id = stable_hash(host, 443);
+    let dns_ep = Endpoint {
+        id: dns_id,
+        host: host.to_string(),
+        host_type: "dns".to_string(),
+        port: 443,
+        parent_id: None,
+        ..make_endpoint(host, 443)
+    };
+    let proto = make_protocol(dns_id, "vmess", 9001);
+    db.insert_manual_endpoint(&dns_ep, &proto, gid)
+        .await
+        .unwrap();
+
+    // Resolve DNS (in test, may fail if no network — still check structure)
+    let resolved = db.resolve_endpoint_dns(dns_id, host).await;
+    match resolved {
+        Ok(ips) => {
+            let row = db.get_endpoint(dns_id).await.unwrap().unwrap();
+            assert_eq!(row.resolved_ips.len(), ips.len());
+            for ip in &ips {
+                assert!(
+                    row.resolved_ips.contains(ip),
+                    "{ip} should be in resolved_ips"
+                );
+            }
+        }
+        Err(_) => {
+            // DNS may fail without network — skip structural assertion
+            eprintln!("DNS resolution failed (expected without network)");
+        }
     }
 }
 
 #[tokio::test]
-async fn test_multi_step_atomicity() {
+async fn test_stale_count_and_view() {
     let db = test_db().await;
+    let gid = "cnt";
+    db.insert_group(&test_group(gid)).await.unwrap();
 
-    db.insert_group(&test_group("test-group"))
-        .await
-        .expect("insert group");
+    let now = 9999i64;
+    let ep1 = make_endpoint("10.0.0.1", 100);
+    let ep2 = make_endpoint("10.0.0.2", 200);
 
-    let p = make_profile(200);
-    db.insert_profile(&p, "test-group")
-        .await
-        .expect("insert valid profile");
+    // ep1 = active, ep2 = stale
+    db.subscription_upsert(
+        gid,
+        &[(
+            ep1.clone(),
+            vec![ProtocolRow {
+                last_seen_at: now,
+                ..make_protocol(ep1.id, "vmess", 101)
+            }],
+        )],
+    )
+    .await
+    .unwrap();
 
-    // Upsert: duplicate id silently succeeds (ON CONFLICT DO UPDATE)
-    let dupe = make_profile(200);
-    let result = db.insert_profile(&dupe, "test-group").await;
-    assert!(result.is_ok(), "upsert duplicate should succeed");
+    db.subscription_upsert(
+        gid,
+        &[(
+            ep2.clone(),
+            vec![ProtocolRow {
+                last_seen_at: now - 7200,
+                ..make_protocol(ep2.id, "ss", 102)
+            }],
+        )],
+    )
+    .await
+    .unwrap();
 
-    let found = db
-        .get_profile(200)
-        .await
-        .expect("get")
-        .expect("original profile should exist");
-    assert_eq!(found.id, 200);
+    let count = db.get_stale_count(now - 3600, 0).await.unwrap();
+    assert_eq!(count, 1, "only ep2 should be stale");
 }

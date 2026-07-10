@@ -22,34 +22,37 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         return;
     }
 
-    let (endpoint, protocol_row, profile, profile_override) =
-        if let Some(r) = state.profiles.iter().find(|r| r.endpoint.id == protocol_id) {
-            let p = r.active_protocol();
-            let profile = Profile {
-                id: p.id,
-                sig: p.sig,
-                cred_hash: p.cred_hash,
-                proto_kind: p.proto_kind.clone(),
-                spec_blob: p.spec_blob.clone(),
-                config_type: p.config_type,
-                core_type: p.core_type.clone(),
-                address: r.endpoint.host.clone(),
-                port: r.endpoint.port,
-                transport: p.transport.clone(),
-                security: p.security.clone(),
-                created_at: p.created_at,
-                remarks: p.remarks.clone(),
-                user_id: None,
-                network: None,
-                protocol_settings: None,
-                stream_settings: None,
-            };
-            let core_override = p.core_type.parse::<CoreType>().ok();
-            (r.endpoint.clone(), p.clone(), profile, core_override)
-        } else {
-            state.log_trace("error", "tui", "Profile not found for connection");
-            return;
+    let (endpoint, protocol_row, profile, profile_override) = if let Some(r) = state
+        .endpoints
+        .iter()
+        .find(|r| r.endpoint.id == protocol_id)
+    {
+        let p = r.active_protocol();
+        let profile = Profile {
+            id: p.id,
+            sig: p.sig,
+            cred_hash: p.cred_hash,
+            proto_kind: p.proto_kind.clone(),
+            spec_blob: p.spec_blob.clone(),
+            config_type: p.config_type,
+            core_type: p.core_type.clone(),
+            address: r.endpoint.host.clone(),
+            port: r.endpoint.port,
+            transport: p.transport.clone(),
+            security: p.security.clone(),
+            created_at: p.created_at,
+            remarks: p.remarks.clone(),
+            user_id: None,
+            network: None,
+            protocol_settings: None,
+            stream_settings: None,
         };
+        let core_override = p.core_type.parse::<CoreType>().ok();
+        (r.endpoint.clone(), p.clone(), profile, core_override)
+    } else {
+        state.log_trace("error", "tui", "Profile not found for connection");
+        return;
+    };
 
     let protocol = if let Some(p) = Protocol::try_from_i32(profile.config_type) {
         p

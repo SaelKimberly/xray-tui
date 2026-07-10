@@ -78,7 +78,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                 }
                 // Update in-memory endpoint row to avoid full reload
                 if let Some(row) = state
-                    .profiles
+                    .endpoints
                     .iter_mut()
                     .find(|r| r.endpoint.id == protocol_id)
                 {
@@ -145,11 +145,9 @@ pub async fn poll_core_events(state: &mut AppState) {
                 state.testing_profiles.remove(&protocol_id);
                 state.testing_details.remove(&protocol_id);
 
-                // Update profile extension and extract name in a scoped block
-                // to drop the mutable borrow before further state-method calls.
                 let name = {
                     let row = state
-                        .profiles
+                        .endpoints
                         .iter_mut()
                         .find(|r| r.endpoint.id == protocol_id);
                     match row {
