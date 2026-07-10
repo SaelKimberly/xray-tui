@@ -28,6 +28,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub parsing: ParsingSettings,
     #[serde(default)]
+    pub geo: GeoConfig,
+    #[serde(default)]
     pub theme_name: ThemeName,
     pub clash_api_port: Option<u16>,
     #[serde(default)]
@@ -526,4 +528,39 @@ fn default_log_ttl_secs() -> crate::DurationOrSecs {
 
 fn default_log_file_path() -> String {
     "xray-tui.log".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoConfig {
+    #[serde(default = "default_geoip_url")]
+    pub geoip_url: String,
+    #[serde(default = "default_geosite_url")]
+    pub geosite_url: String,
+    #[serde(default)]
+    pub auto_update: bool,
+    #[serde(default = "default_geo_update_interval")]
+    pub update_interval_hours: u64,
+}
+
+impl Default for GeoConfig {
+    fn default() -> Self {
+        Self {
+            geoip_url: default_geoip_url(),
+            geosite_url: default_geosite_url(),
+            auto_update: false,
+            update_interval_hours: 24,
+        }
+    }
+}
+
+fn default_geoip_url() -> String {
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat".into()
+}
+
+fn default_geosite_url() -> String {
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat".into()
+}
+
+fn default_geo_update_interval() -> u64 {
+    24
 }

@@ -562,7 +562,13 @@ fn form_field_defs_for_section(
             ("update_interval", "Update Interval", "Duration"),
             ("core_type", "Core Type", "Select:Auto,Xray,SingBox"),
         ],
-        SettingsSection::Updates | SettingsSection::Routing => &[],
+        SettingsSection::Updates => &[
+            ("geoip_url", "GeoIP URL", "Text"),
+            ("geosite_url", "GeoSite URL", "Text"),
+            ("geo_auto_update", "Geo Auto Update", "Boolean"),
+            ("geo_update_interval", "Geo Update Interval Hours", "Number"),
+        ],
+        SettingsSection::Routing => &[],
     }
 }
 const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
