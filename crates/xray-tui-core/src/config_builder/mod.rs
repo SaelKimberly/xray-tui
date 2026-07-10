@@ -20,6 +20,7 @@ pub struct BuildParams {
     pub clash_api_port: Option<u16>,
     pub listen: String,
     pub sniffing: bool,
+    pub skip_cert_verify: bool,
 }
 
 use serde::Serialize;
@@ -129,6 +130,7 @@ mod tests {
             listen: "127.0.0.1".to_string(),
             sniffing: false,
             clash_api_port: None,
+            skip_cert_verify: false,
         };
         let rules = vec![];
         let dns = DnsSetting {

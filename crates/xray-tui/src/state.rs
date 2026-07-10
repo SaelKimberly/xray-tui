@@ -680,6 +680,10 @@ impl AppState {
                             .map_or_else(|| "Auto".into(), |ct| format!("{ct:?}")),
                     ),
                     ("log_level".into(), self.config.core.log_level.clone()),
+                    (
+                        "skip_cert_verify".into(),
+                        self.config.core.skip_cert_verify.to_string(),
+                    ),
                 ]
             }
             Gui => {
@@ -997,6 +1001,8 @@ impl AppState {
                 if !get_str("log_level").is_empty() {
                     self.config.core.log_level = get("log_level");
                 }
+                self.config.core.skip_cert_verify =
+                    get_str("skip_cert_verify") == "true";
             }
             Gui => {
                 self.config.gui.language = get("language");

@@ -94,7 +94,7 @@ impl SingBoxConfigBuilder {
         dns: &DnsSetting,
     ) -> Result<SingBoxConfig, BuildError> {
         let outbounds = vec![
-            build_proxy_outbound(endpoint, protocol)?,
+            build_proxy_outbound(endpoint, protocol, params)?,
             build_direct_outbound(),
             build_block_outbound(),
         ];
@@ -131,7 +131,7 @@ impl SingBoxConfigBuilder {
     }
 }
 
-fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<Value, BuildError> {
+fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) -> Result<Value, BuildError> {
     let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
         BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
     })?;
@@ -337,7 +337,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
             if !username.is_empty() {
                 out["username"] = json!(username);
             }
-            if let Some(tls) = build_tls(endpoint, protocol) {
+            if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
             Ok(out)
@@ -354,7 +354,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
                 "server_port": port,
                 "password": password,
             });
-            if let Some(tls) = build_tls(endpoint, protocol) {
+            if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
             Ok(out)
@@ -382,7 +382,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
                 "password": password,
                 "version": version,
             });
-            if let Some(tls) = build_tls(endpoint, protocol) {
+            if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
             Ok(out)
@@ -475,7 +475,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
                 "uuid": user_id,
                 "security": security,
             });
-            if let Some(tls) = build_tls(endpoint, protocol) {
+            if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
             Ok(out)
@@ -495,7 +495,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
             if !flow.is_empty() {
                 out["flow"] = json!(flow);
             }
-            if let Some(tls) = build_tls(endpoint, protocol) {
+            if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
             Ok(out)
@@ -508,7 +508,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
                 "server_port": port,
                 "password": user_id,
             });
-            if let Some(tls) = build_tls(endpoint, protocol) {
+            if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
             Ok(out)
@@ -750,7 +750,7 @@ fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
     let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
     (p_settings, s_settings)
 }
-fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow) -> Option<Value> {
+fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) -> Option<Value> {
     let (p_settings, s_settings) = parse_settings(protocol);
 
     let enabled = p_settings
@@ -786,11 +786,12 @@ fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow) -> Option<Value> {
         tls.insert("server_name".into(), json!(sni));
     }
 
-    // insecure: protocol.insecure > protocol.allow_insecure > stream.allow_insecure
-    let insecure = p_settings
-        .get("insecure")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+    // insecure: global skip > protocol.insecure > protocol.allow_insecure > stream.allow_insecure
+    let insecure = params.skip_cert_verify
+        || p_settings
+            .get("insecure")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
         || p_settings
             .get("allow_insecure")
             .and_then(serde_json::Value::as_bool)
@@ -986,6 +987,7 @@ mod tests {
             listen: "127.0.0.1".to_string(),
             sniffing: false,
             clash_api_port: None,
+            skip_cert_verify: false,
         };
         let rules = vec![];
         let dns = DnsSetting {

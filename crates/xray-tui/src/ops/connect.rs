@@ -91,6 +91,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         listen: state.config.inbound.listen.clone(),
         sniffing: state.config.inbound.sniffing,
         clash_api_port: state.config.clash_api_port,
+        skip_cert_verify: state.config.core.skip_cert_verify,
     };
 
     // Default DNS and routing for first pass

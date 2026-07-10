@@ -75,6 +75,8 @@ pub struct CoreConfig {
     pub log_level: String,
     #[serde(default)]
     pub protocol_core_overrides: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
 }
 
 impl Default for CoreConfig {
@@ -85,6 +87,7 @@ impl Default for CoreConfig {
             core_type: None,
             log_level: default_log_level(),
             protocol_core_overrides: std::collections::HashMap::new(),
+            skip_cert_verify: false,
         }
     }
 }

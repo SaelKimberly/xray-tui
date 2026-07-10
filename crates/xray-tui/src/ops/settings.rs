@@ -50,6 +50,10 @@ pub async fn build_settings_fields(
                         .map_or_else(|| "Auto".into(), |c| c.to_string()),
                 ),
                 ("log_level".into(), state.config.core.log_level.clone()),
+                (
+                    "skip_cert_verify".into(),
+                    state.config.core.skip_cert_verify.to_string(),
+                ),
             ]
         }
         Gui => {
@@ -341,6 +345,8 @@ fn apply_settings_fields(
             if !get_str("log_level").is_empty() {
                 state.config.core.log_level = get("log_level");
             }
+            state.config.core.skip_cert_verify =
+                get_str("skip_cert_verify") == "true";
         }
         Gui => {
             state.config.gui.language = get("language");
