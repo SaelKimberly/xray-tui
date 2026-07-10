@@ -517,19 +517,40 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
             let private_key = p_settings
                 .get("private_key")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             let public_key = p_settings
                 .get("public_key")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             let allowed_ips = p_settings
                 .get("allowed_ips")
                 .and_then(|v| v.as_str())
-                .unwrap_or("0.0.0.0/0");
+                .unwrap_or("0.0.0.0/0")
+                .to_string();
             let mtu = p_settings
                 .get("mtu")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1420);
+
+            // Address (CIDR) is stored in p_settings for form-created profiles,
+            // or on WireguardConfig.address for URL-imported profiles.
+            let address_str = p_settings
+                .get("address")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("");
+            let address: Vec<String> = if !address_str.is_empty() {
+                address_str.split(',').map(|s| s.trim().to_string()).collect()
+            } else {
+                vec![]
+            };
+
+            // Workers, udp_timeout, system flags
+            let workers = p_settings.get("workers").and_then(serde_json::Value::as_u64);
+            let udp_timeout = p_settings.get("udp_timeout").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok());
+            let system = p_settings.get("system").and_then(serde_json::Value::as_bool).unwrap_or(false);
 
             // Peer endpoint: URL import sets endpoint.host:port; form stores in protocol_settings["endpoint"]
             let endpoint_addr = (!endpoint.host.is_empty()).then_some(endpoint.host.as_str());
@@ -545,22 +566,55 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
                 (String::new(), 0u16)
             };
 
+            // Preshared key and reserved bytes
+            let preshared_key = p_settings.get("preshared_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+            let reserved_str = p_settings.get("reserved").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+            let persistent_keepalive = p_settings.get("persistent_keepalive").and_then(serde_json::Value::as_u64);
+
+            // Build peers array: use JSON override or fall back to single peer
+            let peers_json = p_settings.get("peers").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let peers: Value = if let Some(json_str) = peers_json {
+                serde_json::from_str(json_str).unwrap_or_else(|_| {
+                    // Build single peer from form fields
+                    build_single_wireguard_peer(&peer_addr, peer_port, &public_key, &allowed_ips,
+                        preshared_key.as_deref(), reserved_str.as_deref(), persistent_keepalive)
+                })
+            } else {
+                build_single_wireguard_peer(&peer_addr, peer_port, &public_key, &allowed_ips,
+                    preshared_key.as_deref(), reserved_str.as_deref(), persistent_keepalive)
+            };
+
             let mut out = json!({
                 "tag": "proxy",
                 "type": "wireguard",
                 "private_key": private_key,
-                "address": [],
                 "mtu": mtu,
             });
 
-            if !public_key.is_empty() && !peer_addr.is_empty() {
-                let peer = json!({
-                    "address": peer_addr,
-                    "port": peer_port,
-                    "public_key": public_key,
-                    "allowed_ips": [allowed_ips],
-                });
-                out["peers"] = json!([peer]);
+            // Only emit address if non-empty
+            if !address.is_empty() {
+                out["address"] = json!(address);
+            }
+
+            // Emit optional fields
+            if let Some(w) = workers {
+                out["workers"] = json!(w);
+            }
+            if let Some(t) = udp_timeout {
+                out["udp_timeout"] = json!(t);
+            }
+            if system {
+                out["system"] = json!(true);
+            }
+
+            // Emit peers if any
+            if let Value::Array(arr) = &peers {
+                if !arr.is_empty() {
+                    out["peers"] = peers;
+                }
+            } else {
+                // Single peer serialized as object — wrap in array
+                out["peers"] = json!([peers]);
             }
 
             Ok(out)
@@ -569,6 +623,34 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<V
             "Protocol {protocol:?} not supported for sing-box outbound"
         ))),
     }
+}
+
+/// Build a single WireGuard peer object from form fields.
+fn build_single_wireguard_peer(
+    server: &str,
+    port: u16,
+    public_key: &str,
+    allowed_ips: &str,
+    preshared_key: Option<&str>,
+    reserved: Option<&str>,
+    persistent_keepalive: Option<u64>,
+) -> Value {
+    let mut peer = json!({
+        "address": server,
+        "port": port,
+        "public_key": public_key,
+        "allowed_ips": [allowed_ips],
+    });
+    if let Some(psk) = preshared_key {
+        peer["pre_shared_key"] = json!(psk);
+    }
+    if let Some(r) = reserved {
+        peer["reserved"] = json!(r);
+    }
+    if let Some(k) = persistent_keepalive {
+        peer["persistent_keepalive_interval"] = json!(k);
+    }
+    json!([peer])
 }
 
 fn build_direct_outbound() -> Value {
@@ -1252,7 +1334,7 @@ mod tests {
         let (mut endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::WireGuard.to_i32());
         set_protocol_settings_json(
             &mut protocol,
-            r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820"}"#,
+            r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820","address":"10.0.0.1/24","preshared_key":"psk_value","persistent_keepalive":25,"reserved":"1,2,3","workers":2,"udp_timeout":"30","system":true}"#,
         );
         endpoint.host = String::new();
         endpoint.port = 0;
@@ -1267,6 +1349,13 @@ mod tests {
         assert_eq!(proxy["mtu"], 1380);
         assert_eq!(proxy["peers"][0]["address"], "wg.example.com");
         assert_eq!(proxy["peers"][0]["port"], 51820);
+        assert_eq!(proxy["peers"][0]["pre_shared_key"], "psk_value");
+        assert_eq!(proxy["peers"][0]["persistent_keepalive_interval"], 25);
+        assert_eq!(proxy["peers"][0]["reserved"], "1,2,3");
+        assert_eq!(proxy["address"], json!(["10.0.0.1/24"]));
+        assert_eq!(proxy["workers"], 2);
+        assert_eq!(proxy["udp_timeout"], 30);
+        assert_eq!(proxy["system"], true);
     }
 
     #[test]

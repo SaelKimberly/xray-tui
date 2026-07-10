@@ -414,14 +414,13 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 false,
                 FieldSection::ProtocolSetting,
             ),
-            field(
-                "workers",
-                "Workers",
-                FormFieldType::Number,
-                "4",
-                false,
-                FieldSection::ProtocolSetting,
-            ),
+            field("workers", "Workers", FormFieldType::Number, "4", false, FieldSection::ProtocolSetting),
+            field("preshared_key", "Pre-Shared Key", FormFieldType::Password, "", false, FieldSection::ProtocolSetting),
+            field("reserved", "Reserved", FormFieldType::Text, "", false, FieldSection::ProtocolSetting),
+            field("persistent_keepalive", "Keepalive", FormFieldType::Number, "0", false, FieldSection::ProtocolSetting),
+            field("udp_timeout", "UDP Timeout", FormFieldType::Text, "", false, FieldSection::ProtocolSetting),
+            field("system", "System", FormFieldType::Boolean, "false", false, FieldSection::ProtocolSetting),
+            field("peers", "Peers (JSON)", FormFieldType::Text, "", false, FieldSection::ProtocolSetting),
         ],
         Protocol::Hysteria2 => vec![
             field(
