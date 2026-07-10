@@ -155,16 +155,46 @@ pub struct TunConfig {
     pub mtu: Option<u16>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxConfig {
     #[serde(default)]
     pub enabled: bool,
     pub concurrency: Option<u8>,
+    #[serde(default = "default_mux_protocol")]
+    pub protocol: String,
+    pub max_connections: Option<u8>,
+    pub min_streams: Option<u8>,
+    pub max_streams: Option<u16>,
+    #[serde(default)]
+    pub padding: bool,
     #[serde(default)]
     pub fragment_enabled: bool,
     pub fragment_packets: Option<String>,
     pub fragment_length: Option<String>,
     pub fragment_interval: Option<String>,
+}
+
+fn default_mux_protocol() -> String {
+    "smux".to_owned()
+}
+
+impl Default for MuxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            concurrency: None,
+            protocol: default_mux_protocol(),
+            max_connections: None,
+            min_streams: None,
+            max_streams: None,
+            padding: false,
+            fragment_enabled: false,
+            fragment_packets: None,
+            fragment_length: None,
+            fragment_interval: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

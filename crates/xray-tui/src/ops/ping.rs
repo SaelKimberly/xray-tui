@@ -124,6 +124,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         listen: state.config.inbound.listen.clone(),
         sniffing: false,
         clash_api_port: None,
+            mux: None,
         skip_cert_verify: false,
     };
 

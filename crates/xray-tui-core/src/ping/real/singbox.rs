@@ -45,6 +45,7 @@ pub(super) async fn real_ping(
             listen: proxy_addr.clone(),
             sniffing: false,
             clash_api_port: None,
+            mux: None,
             skip_cert_verify: false,
         };
 

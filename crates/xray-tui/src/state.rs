@@ -846,6 +846,26 @@ impl AppState {
                             .unwrap_or_default(),
                     ),
                     (
+                        "protocol".into(),
+                        self.config.mux.protocol.clone(),
+                    ),
+                    (
+                        "max_connections".into(),
+                        self.config.mux.max_connections.map(|v| v.to_string()).unwrap_or_default(),
+                    ),
+                    (
+                        "min_streams".into(),
+                        self.config.mux.min_streams.map(|v| v.to_string()).unwrap_or_default(),
+                    ),
+                    (
+                        "max_streams".into(),
+                        self.config.mux.max_streams.map(|v| v.to_string()).unwrap_or_default(),
+                    ),
+                    (
+                        "padding".into(),
+                        if self.config.mux.padding { "true".into() } else { "false".into() },
+                    ),
+                    (
                         "fragment_enabled".into(),
                         if self.config.mux.fragment_enabled {
                             "true".into()
@@ -1036,6 +1056,13 @@ impl AppState {
             Mux => {
                 self.config.mux.enabled = get_str("enabled") == "true";
                 self.config.mux.concurrency = get_str("concurrency").parse::<u8>().ok();
+                if !get_str("protocol").is_empty() {
+                    self.config.mux.protocol = get("protocol");
+                }
+                self.config.mux.max_connections = get_str("max_connections").parse::<u8>().ok();
+                self.config.mux.min_streams = get_str("min_streams").parse::<u8>().ok();
+                self.config.mux.max_streams = get_str("max_streams").parse::<u16>().ok();
+                self.config.mux.padding = get_str("padding") == "true";
                 self.config.mux.fragment_enabled = get_str("fragment_enabled") == "true";
                 self.config.mux.fragment_packets = get_opt("fragment_packets");
                 self.config.mux.fragment_length = get_opt("fragment_length");

@@ -135,19 +135,18 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
     let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
         BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
     })?;
-
     let address = endpoint.host.as_str();
     let port = endpoint.port as u16;
     let user_id = ""; // TODO: cached on ProtocolRow
     let (p_settings, _s_settings) = parse_settings(protocol);
 
-    match proto {
+    let mut out = match proto {
         Protocol::Tuic => {
             let password = p_settings
                 .get("password")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            Ok(json!({
+            json!({
                 "tag": "proxy",
                 "type": "tuic",
                 "server": address,
@@ -158,7 +157,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                     "enabled": true,
                     "server_name": address
                 }
-            }))
+            })
         }
         Protocol::Hysteria2 => {
             let password = p_settings
@@ -173,7 +172,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                 .get("down_mbps")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(100);
-            Ok(json!({
+            json!({
                 "tag": "proxy",
                 "type": "hysteria2",
                 "server": address,
@@ -185,21 +184,21 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                     "enabled": true,
                     "server_name": address
                 }
-            }))
+            })
         }
         Protocol::Shadowsocks => {
             let method = p_settings
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("aes-256-gcm");
-            Ok(json!({
+            json!({
                 "tag": "proxy",
                 "type": "shadowsocks",
                 "server": address,
                 "server_port": port,
                 "method": method,
                 "password": user_id
-            }))
+            })
         }
         Protocol::Socks => {
             let mut out = json!({
@@ -224,7 +223,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                     out["password"] = json!(password);
                 }
             }
-            Ok(out)
+            out
         }
         Protocol::Http => {
             let mut out = json!({
@@ -249,14 +248,14 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                     out["password"] = json!(password);
                 }
             }
-            Ok(out)
+            out
         }
         Protocol::ShadowsocksR => {
             let method = p_settings
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("aes-256-cfb");
-            Ok(json!({
+            json!({
                 "tag": "proxy",
                 "type": "shadowsocksr",
                 "server": address,
@@ -267,7 +266,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                 "obfs_param": p_settings.get("obfs_param").and_then(|v| v.as_str()).unwrap_or(""),
                 "protocol": p_settings.get("protocol").and_then(|v| v.as_str()).unwrap_or(""),
                 "protocol_param": p_settings.get("protocol_param").and_then(|v| v.as_str()).unwrap_or(""),
-            }))
+            })
         }
         Protocol::Hysteria => {
             let auth = p_settings
@@ -316,7 +315,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                 tls.insert("insecure".into(), json!(true));
             }
             out["tls"] = json!(tls);
-            Ok(out)
+            out
         }
         Protocol::Naive => {
             let username = p_settings
@@ -340,7 +339,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
-            Ok(out)
+            out
         }
         Protocol::AnyTls => {
             let password = p_settings
@@ -357,7 +356,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
-            Ok(out)
+            out
         }
         Protocol::ShadowTls => {
             let password = p_settings
@@ -385,7 +384,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
-            Ok(out)
+            out
         }
         Protocol::Tor => {
             let mut out = json!({
@@ -399,7 +398,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             {
                 out["data_directory"] = json!(data_dir);
             }
-            Ok(out)
+            out
         }
         Protocol::Ssh => {
             let ssh_host = p_settings
@@ -435,7 +434,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if !private_key.is_empty() {
                 out["private_key"] = json!([private_key]);
             }
-            Ok(out)
+            out
         }
         Protocol::Tailscale => {
             let mut out = json!({
@@ -463,7 +462,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             {
                 out["ephemeral"] = json!(true);
             }
-            Ok(out)
+            out
         }
         Protocol::Vmess => {
             let security = "auto"; // TODO: from ProtocolConfig
@@ -478,7 +477,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
-            Ok(out)
+            out
         }
         Protocol::Vless => {
             let flow = p_settings
@@ -498,7 +497,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
-            Ok(out)
+            out
         }
         Protocol::Trojan => {
             let mut out = json!({
@@ -511,7 +510,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if let Some(tls) = build_tls(endpoint, protocol, params) {
                 out["tls"] = tls;
             }
-            Ok(out)
+            out
         }
         Protocol::WireGuard => {
             let private_key = p_settings
@@ -529,6 +528,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                 .and_then(|v| v.as_str())
                 .unwrap_or("0.0.0.0/0")
                 .to_string();
+
             let mtu = p_settings
                 .get("mtu")
                 .and_then(serde_json::Value::as_u64)
@@ -580,6 +580,7 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                         preshared_key.as_deref(), reserved_str.as_deref(), persistent_keepalive)
                 })
             } else {
+                // Build single peer from form fields
                 build_single_wireguard_peer(&peer_addr, peer_port, &public_key, &allowed_ips,
                     preshared_key.as_deref(), reserved_str.as_deref(), persistent_keepalive)
             };
@@ -587,16 +588,14 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             let mut out = json!({
                 "tag": "proxy",
                 "type": "wireguard",
-                "private_key": private_key,
+                "server": address,
+                "server_port": port,
+                "address": address,
                 "mtu": mtu,
+                "private_key": private_key,
+                "peers": peers,
             });
 
-            // Only emit address if non-empty
-            if !address.is_empty() {
-                out["address"] = json!(address);
-            }
-
-            // Emit optional fields
             if let Some(w) = workers {
                 out["workers"] = json!(w);
             }
@@ -606,23 +605,17 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             if system {
                 out["system"] = json!(true);
             }
-
-            // Emit peers if any
-            if let Value::Array(arr) = &peers {
-                if !arr.is_empty() {
-                    out["peers"] = peers;
-                }
-            } else {
-                // Single peer serialized as object — wrap in array
-                out["peers"] = json!([peers]);
-            }
-
-            Ok(out)
+            out
         }
-        _ => Err(BuildError::InvalidProfile(format!(
-            "Protocol {protocol:?} not supported for sing-box outbound"
+        _ => return Err(BuildError::InvalidProfile(format!(
+            "Protocol {proto:?} not supported for sing-box outbound"
         ))),
+    };
+    // Inject multiplex block if configured
+    if let Some(mux_val) = &params.mux {
+        out["multiplex"] = mux_val.clone();
     }
+    Ok(out)
 }
 
 /// Build a single WireGuard peer object from form fields.
@@ -987,6 +980,7 @@ mod tests {
             listen: "127.0.0.1".to_string(),
             sniffing: false,
             clash_api_port: None,
+            mux: None,
             skip_cert_verify: false,
         };
         let rules = vec![];

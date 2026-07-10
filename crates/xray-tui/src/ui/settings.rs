@@ -534,6 +534,11 @@ fn form_field_defs_for_section(
         SettingsSection::Mux => &[
             ("enabled", "Enabled", "Boolean"),
             ("concurrency", "Concurrency", "Number"),
+            ("protocol", "Protocol", "Select:smux,yamux,h2mux"),
+            ("max_connections", "Max Connections", "Number"),
+            ("min_streams", "Min Streams", "Number"),
+            ("max_streams", "Max Streams", "Number"),
+            ("padding", "Padding", "Boolean"),
             ("fragment_enabled", "Fragment Enabled", "Boolean"),
             ("fragment_packets", "Fragment Packets", "Text"),
             ("fragment_length", "Fragment Length", "Text"),

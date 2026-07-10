@@ -80,7 +80,7 @@
 
 - ✅ Logs tab — wire core stdout/stderr pipeline to TUI display with live scrolling, color-coded log levels, and keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - ✅ Sing-box config builder completeness — config generation for all 17 outbound protocols (ShadowsocksR, Hysteria v1, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, VMess, VLESS, Trojan, WireGuard) via 12 new protocol arms + build_tls helper + protocol code mapping
-- ☐ WireGuard sing-box peer model — complete form fields for multi-peer arrays, pre-shared keys, allowed IPs
+✅ WireGuard sing-box peer model — complete form fields for multi-peer arrays, pre-shared keys, allowed IPs
 - ✅ Sub-healer profile model adoption — uid-based PK (sig ^ cred_hash), spec_blob (postcard-encoded ProtocolConfig) replaces flat fields, Connection table for many-to-many Profile↔Group, bridge traits (ProfileLegacy/ProfileMut) for old parse/format compatibility, xray-tui-proto crate with protocol config types. All 253 workspace tests pass.
 - ☐ Advanced form fields — add multiplex, V2Ray transport (WS/gRPC/QUIC/HTTPUpgrade), TLS options (ECH, uTLS fingerprint, Fragment) to protocol forms
 - ✅ ProfileCore dedup — normalized schema (profile_cores + group_profiles) eliminates redundant storage for shared configs
@@ -112,12 +112,12 @@
 - ☐ man page / --help
 - ☐ CI/CD, packaging
 - ✅ Performance optimization — add_log owned strings (saves 3 allocs/log), get_str closure (saves 5-17 allocs/settings save), parse_core_log_line eq_ignore_ascii_case (removes to_lowercase alloc), BatchImport mutable scroll (avoids Vec clone per keypress), TCP ping spawn no longer clones Vec&lt;Profile&gt;, updater Cow&lt;OsStr&gt; over to_string_lossy
-- ☐ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
-- ☐ Log to file toggle — core log persistence with configurable path
-- ☐ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile
-- ☐ Default skip cert verify — global security toggle in Core settings
-- ☐ Clear all stats — reset traffic counters per profile or globally
-- ☐ Mux protocol selector — per-profile sing-box mux protocol choice
+✅ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
+✅ Log to file toggle — core log persistence with configurable path
+✅ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile
+✅ Default skip cert verify — global security toggle in Core settings
+✅ Clear all stats — reset traffic counters per profile or globally
+✅ Mux protocol selector — per-profile sing-box mux protocol choice
 
 ## Phase 9 — v2rayN Parity
 

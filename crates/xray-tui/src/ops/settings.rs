@@ -158,6 +158,26 @@ pub async fn build_settings_fields(
                         .unwrap_or_default(),
                 ),
                 (
+                    "protocol".into(),
+                    state.config.mux.protocol.clone(),
+                ),
+                (
+                    "max_connections".into(),
+                    state.config.mux.max_connections.map(|c| c.to_string()).unwrap_or_default(),
+                ),
+                (
+                    "min_streams".into(),
+                    state.config.mux.min_streams.map(|c| c.to_string()).unwrap_or_default(),
+                ),
+                (
+                    "max_streams".into(),
+                    state.config.mux.max_streams.map(|c| c.to_string()).unwrap_or_default(),
+                ),
+                (
+                    "padding".into(),
+                    state.config.mux.padding.to_string(),
+                ),
+                (
                     "fragment_enabled".into(),
                     state.config.mux.fragment_enabled.to_string(),
                 ),
@@ -380,6 +400,13 @@ fn apply_settings_fields(
         Mux => {
             state.config.mux.enabled = get_str("enabled") == "true";
             state.config.mux.concurrency = get_str("concurrency").parse::<u8>().ok();
+            if !get_str("protocol").is_empty() {
+                state.config.mux.protocol = get("protocol");
+            }
+            state.config.mux.max_connections = get_str("max_connections").parse::<u8>().ok();
+            state.config.mux.min_streams = get_str("min_streams").parse::<u8>().ok();
+            state.config.mux.max_streams = get_str("max_streams").parse::<u16>().ok();
+            state.config.mux.padding = get_str("padding") == "true";
             state.config.mux.fragment_enabled = get_str("fragment_enabled") == "true";
             state.config.mux.fragment_packets = get_opt("fragment_packets");
             state.config.mux.fragment_length = get_opt("fragment_length");
