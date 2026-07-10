@@ -14,47 +14,111 @@ use crate::ui::widgets::data_table::{
     Column, ColumnWidth, DataTable, DataTableRow, DataTableState, SortDirection,
 };
 use crate::{AppState, ConfirmAction, EndpointRow};
-use ratatui_cheese::theme::Palette;
 
-// ── DataTable row wrapper ───────────────────────────────────────────────
-
-struct ProfileTableRowData {
-    indicator: String,
-    indicator_fg: Style,
-    idx_str: String,
-    type_str: String,
-    remarks_str: String,
-    group_str: String,
-    address_str: String,
-    port_str: String,
-    delay_str: String,
-    speed_str: String,
-    ip_info_str: String,
-    traffic_str: String,
-    row_style: Style,
-    id: String,
+/// A row displayed in the profile DataTable — either an endpoint header or a protocol sub-row.
+enum DisplayRowData {
+    Endpoint {
+        id: String,
+        indicator: String,
+        indicator_fg: Style,
+        idx_str: String,
+        type_str: String,
+        remarks_str: String,
+        address_str: String,
+        port_str: String,
+        delay_str: String,
+        speed_str: String,
+        ip_info_str: String,
+        traffic_str: String,
+        has_sub_rows: bool,
+        expanded: bool,
+        row_style: Style,
+    },
+    ProtocolSub {
+        id: String,
+        proto_kind: String,
+        transport: String,
+        security: String,
+        remarks: String,
+        is_active: bool,
+        is_manual: bool,
+        row_style: Style,
+    },
 }
 
-impl DataTableRow for ProfileTableRowData {
+impl DataTableRow for DisplayRowData {
     fn render(&self, col_xs: &[u16], col_widths: &[u16], buf: &mut Buffer, y: u16) {
-        for (i, &x) in col_xs.iter().enumerate() {
-            let (text, style) = match i {
-                0 => (self.indicator.as_str(), self.indicator_fg),
-                1 => (self.idx_str.as_str(), self.row_style),
-                2 => (self.type_str.as_str(), self.row_style),
-                3 => (self.remarks_str.as_str(), self.row_style),
-                4 => (self.group_str.as_str(), self.row_style),
-                5 => (self.address_str.as_str(), self.row_style),
-                6 => (self.port_str.as_str(), self.row_style),
-                7 => ("│", self.row_style),
-                8 => (self.delay_str.as_str(), self.row_style),
-                9 => (self.speed_str.as_str(), self.row_style),
-                10 => (self.ip_info_str.as_str(), self.row_style),
-                11 => (self.traffic_str.as_str(), self.row_style),
-                _ => ("", self.row_style),
-            };
-            let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
-            buf.set_stringn(x, y, text, max_w, style);
+        match self {
+            Self::Endpoint {
+                indicator,
+                indicator_fg,
+                idx_str,
+                type_str,
+                remarks_str,
+                address_str,
+                port_str,
+                delay_str,
+                speed_str,
+                ip_info_str,
+                traffic_str,
+                has_sub_rows,
+                expanded,
+                row_style,
+                ..
+            } => {
+                for (i, &x) in col_xs.iter().enumerate() {
+                    let tree_marker = if *has_sub_rows {
+                        if *expanded { "▾" } else { "▶" }
+                    } else {
+                        ""
+                    };
+                    let (text, style) = match i {
+                        0 => (indicator.as_str(), *indicator_fg),
+                        1 => (idx_str.as_str(), *row_style),
+                        2 => (type_str.as_str(), *row_style),
+                        3 => (remarks_str.as_str(), *row_style),
+                        4 => (address_str.as_str(), *row_style),
+                        5 => (port_str.as_str(), *row_style),
+                        6 => ("│", *row_style),
+                        7 => (delay_str.as_str(), *row_style),
+                        8 => (speed_str.as_str(), *row_style),
+                        9 => (ip_info_str.as_str(), *row_style),
+                        10 => (traffic_str.as_str(), *row_style),
+                        11 => (tree_marker, *row_style),
+                        _ => ("", *row_style),
+                    };
+                    let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
+                    buf.set_stringn(x, y, text, max_w, style);
+                }
+            }
+            Self::ProtocolSub {
+                proto_kind,
+                transport,
+                security,
+                remarks,
+                is_active,
+                is_manual,
+                row_style,
+                ..
+            } => {
+                let active_mark = if *is_active { "●" } else { "○" };
+                let manual_label = if *is_manual { " (u)" } else { "" };
+                let sub_remarks = crate::ui::profiles::truncate_pad(remarks, 20);
+                for (i, &x) in col_xs.iter().enumerate() {
+                    let (text, style) = match i {
+                        0 => (active_mark, *row_style),
+                        1 => ("  └", *row_style),
+                        2 => (proto_kind.as_str(), *row_style),
+                        3 => (sub_remarks.as_str(), *row_style),
+                        5 => (transport.as_str(), *row_style),
+                        6 => (security.as_str(), *row_style),
+                        7 => (manual_label, *row_style),
+                        _ => ("", *row_style),
+                    };
+                    let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
+                    buf.set_stringn(x, y, text, max_w, style);
+                }
+            }
         }
     }
 }
@@ -91,39 +155,160 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    render_data_grid(frame, chunks[1], &rows, selected, state, &palette);
+    // Build display rows with optional sub-rows for expanded endpoints
+    let display_rows = build_display_rows(&rows, selected, state, &palette);
+    let display_selected = resolve_display_selected(&display_rows, selected);
+
+    render_data_grid(frame, chunks[1], &display_rows, display_selected, state, &palette);
     render_footer(frame, chunks[2], state, &palette);
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
-fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
-    let view_label = match state.purgatory_view {
-        xray_tui_db::models::PurgatoryView::Active => "Active",
-        xray_tui_db::models::PurgatoryView::Stale => "Stale",
-        xray_tui_db::models::PurgatoryView::All => "All",
-    };
-    let view_text = format!(" View: {view_label} [P]");
-    let view_span = Span::styled(view_text, ThemeStyles::container_title(palette));
-    let search_text = if state.search_focused {
-        format!("/ {}▉", state.search_query)
-    } else if state.search_query.is_empty() {
-        " /  (press / to search)".to_string()
-    } else {
-        format!("/ {}", state.search_query)
-    };
-    let search_span = Span::styled(search_text, ThemeStyles::warning(palette));
+fn build_display_rows<'a>(
+    rows: &[&'a EndpointRow],
+    _selected: usize,
+    state: &AppState,
+    palette: &ratatui_cheese::theme::Palette,
+) -> Vec<DisplayRowData> {
+    let mut result = Vec::with_capacity(rows.len() + 16);
+    for (i, row) in rows.iter().enumerate() {
+        let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id);
+        let base_style = match (i == _selected, is_connected) {
+            (true, true) => ThemeStyles::table_row_connected(palette)
+                .add_modifier(ratatui::style::Modifier::UNDERLINED),
+            (false, true) => ThemeStyles::table_row_connected(palette),
+            (true, false) => ThemeStyles::table_row_selected(palette),
+            (false, false) if i % 2 == 1 => ThemeStyles::table_row_alt(palette),
+            (false, false) => ThemeStyles::table_row_normal(palette),
+        };
 
-    let line = Line::from(vec![view_span, Span::raw("  "), search_span]);
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+        let (indicator, indicator_fg) = if is_connected {
+            ("●".to_string(), ThemeStyles::success(palette))
+        } else {
+            match state.testing_details.get(&row.endpoint.id) {
+                Some(TestType::TcpPing) => ("↔".to_string(), Style::default()),
+                Some(TestType::RealPing) => ("◎".to_string(), Style::default()),
+                Some(TestType::SpeedTest) => ("⇩".to_string(), Style::default()),
+                Some(TestType::UdpTest) => ("↗".to_string(), Style::default()),
+                None => (String::new(), Style::default()),
+            }
+        };
+
+        let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
+            .unwrap_or(Protocol::Custom);
+        let is_multi = state.multi_select.contains(&row.endpoint.id);
+
+        let idx_str = if is_multi {
+            "  *".to_string()
+        } else {
+            format!("{:>3}", i + 1)
+        };
+
+        let type_str = format!("{protocol:.12}");
+        let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
+        let remarks_str = truncate_pad(&remarks, 24);
+        let address = row.endpoint.host.as_str();
+        let address_str = truncate_pad(address, 30);
+        let port_str = format!("{:>6}", row.endpoint.port);
+        let delay_str = row
+            .extensions
+            .get(&row.active_protocol().id)
+            .and_then(|e| e.delay)
+            .map_or_else(|| "     -".to_string(), |d| format!("{d:>6}"));
+        let speed_str = row
+            .extensions
+            .get(&row.active_protocol().id)
+            .and_then(|e| e.speed)
+            .map_or_else(|| "     -".to_string(), |s| format!("{s:>6}"));
+        let ip_info_str = row
+            .extensions
+            .get(&row.active_protocol().id)
+            .and_then(|e| e.ip_info.as_deref())
+            .map_or_else(|| "     -".to_string(), |ip| truncate_pad(ip, 19));
+        let traffic = row.stats.get(&row.active_protocol().id).map_or_else(
+            || "        -".to_string(),
+            |s| {
+                let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
+                format_traffic(total as u64)
+            },
+        );
+
+        let has_sub_rows = row.protocols.len() > 1;
+
+        result.push(DisplayRowData::Endpoint {
+            id: row.endpoint.id.to_string(),
+            indicator,
+            indicator_fg,
+            idx_str,
+            type_str,
+            remarks_str,
+            address_str,
+            port_str,
+            delay_str,
+            speed_str,
+            ip_info_str,
+            traffic_str: traffic,
+            has_sub_rows,
+            expanded: row.expanded,
+            row_style: base_style,
+        });
+
+        // If expanded, add protocol sub-rows
+        if row.expanded {
+            for (pi, proto) in row.protocols.iter().enumerate() {
+                let is_active = pi == row.selected_protocol;
+                let is_manual = row
+                    .endpoint
+                    .manual_protocol_override
+                    .map_or(false, |oid| oid == proto.id);
+                let proto_kind = &proto.proto_kind;
+                let transport = proto.transport.as_deref().unwrap_or("-");
+                let security = proto.security.as_deref().unwrap_or("-");
+                let proto_remarks = proto.remarks.as_deref().unwrap_or("");
+
+                result.push(DisplayRowData::ProtocolSub {
+                    id: proto.id.to_string(),
+                    proto_kind: format!("  {proto_kind:.10}"),
+                    transport: transport.to_string(),
+                    security: security.to_string(),
+                    remarks: proto_remarks.to_string(),
+                    is_active,
+                    is_manual,
+                    row_style: if is_active {
+                        base_style
+                    } else {
+                        Style::default()
+                    },
+                });
+            }
+        }
+    }
+    result
 }
+
+/// For a given endpoint index, find its position in the display row list (accounts for sub-rows).
+fn resolve_display_selected(display_rows: &[DisplayRowData], endpoint_idx: usize) -> usize {
+    let mut display_pos = 0;
+    let mut ep_count = 0;
+    for row in display_rows {
+        if matches!(row, DisplayRowData::Endpoint { .. }) {
+            if ep_count == endpoint_idx {
+                return display_pos;
+            }
+            ep_count += 1;
+        }
+        display_pos += 1;
+    }
+    0
+}
+
 fn render_data_grid(
     frame: &mut Frame,
     area: Rect,
-    rows: &[&EndpointRow],
-    selected_index: usize,
+    display_rows: &[DisplayRowData],
+    selected_display_idx: usize,
     state: &AppState,
-    palette: &Palette,
+    palette: &ratatui_cheese::theme::Palette,
 ) {
     let block = Block::default()
         .title(" Profiles ")
@@ -131,7 +316,7 @@ fn render_data_grid(
         .border_style(ThemeStyles::container_border(palette))
         .title_style(ThemeStyles::container_title(palette));
 
-    // Map sort state to DataTable indices (fixed 12-column layout)
+    // Map sort state to DataTable indices
     let sort_column = match state.sort_column {
         SortColumn::ConfigType => Some(2),
         SortColumn::Remarks => Some(3),
@@ -165,102 +350,16 @@ fn render_data_grid(
         Column::new("Traffic", ColumnWidth::Fixed(10)),
     ]);
 
-    // Build DataTable rows
-    let data_rows: Vec<ProfileTableRowData> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let is_selected = i == selected_index;
-            let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id);
-            let row_style = match (is_selected, is_connected) {
-                (true, true) => ThemeStyles::table_row_connected(palette)
-                    .add_modifier(ratatui::style::Modifier::UNDERLINED),
-                (false, true) => ThemeStyles::table_row_connected(palette),
-                (true, false) => ThemeStyles::table_row_selected(palette),
-                (false, false) if i % 2 == 1 => ThemeStyles::table_row_alt(palette),
-                (false, false) => ThemeStyles::table_row_normal(palette),
-            };
-
-            let (indicator, indicator_fg) = if is_connected {
-                ("●".to_string(), ThemeStyles::success(palette))
-            } else {
-                match state.testing_details.get(&row.endpoint.id) {
-                    Some(TestType::TcpPing) => ("↔".to_string(), Style::default()),
-                    Some(TestType::RealPing) => ("◎".to_string(), Style::default()),
-                    Some(TestType::SpeedTest) => ("⇩".to_string(), Style::default()),
-                    Some(TestType::UdpTest) => ("↗".to_string(), Style::default()),
-                    None => (String::new(), Style::default()),
-                }
-            };
-
-            let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
-                .unwrap_or(Protocol::Custom);
-            let is_multi = state.multi_select.contains(&row.endpoint.id);
-
-            let idx_str = if is_multi {
-                "  *".to_string()
-            } else {
-                format!("{:>3}", i + 1)
-            };
-
-            let type_str = format!("{protocol:.12}");
-            let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
-            let remarks_str = truncate_pad(&remarks, 24);
-            let group_str = String::new();
-            let address = row.endpoint.host.as_str();
-            let address_str = truncate_pad(address, 30);
-            let port_str = format!("{:>6}", row.endpoint.port);
-            let delay_str = row
-                .extensions
-                .get(&row.active_protocol().id)
-                .and_then(|e| e.delay)
-                .map_or_else(|| "     -".to_string(), |d| format!("{d:>6}"));
-            let speed_str = row
-                .extensions
-                .get(&row.active_protocol().id)
-                .and_then(|e| e.speed)
-                .map_or_else(|| "     -".to_string(), |s| format!("{s:>6}"));
-            let ip_info_str = row
-                .extensions
-                .get(&row.active_protocol().id)
-                .and_then(|e| e.ip_info.as_deref())
-                .map_or_else(|| "     -".to_string(), |ip| truncate_pad(ip, 19));
-            let traffic = row.stats.get(&row.active_protocol().id).map_or_else(
-                || "        -".to_string(),
-                |s| {
-                    let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
-                    format_traffic(total as u64)
-                },
-            );
-
-            ProfileTableRowData {
-                id: row.endpoint.id.to_string(),
-                indicator,
-                indicator_fg,
-                idx_str,
-                type_str,
-                remarks_str,
-                group_str,
-                address_str,
-                port_str,
-                delay_str,
-                speed_str,
-                ip_info_str,
-                traffic_str: traffic,
-                row_style,
-            }
-        })
-        .collect();
     // Scroll offset: keep selected row roughly centered
     let inner_height = area.height.saturating_sub(3) as usize;
-    let data_offset = if selected_index > inner_height / 2 {
-        selected_index
+    let data_offset = if selected_display_idx > inner_height / 2 {
+        selected_display_idx
             .saturating_sub(inner_height / 2)
-            .min(data_rows.len().saturating_sub(inner_height))
+            .min(display_rows.len().saturating_sub(inner_height))
     } else {
         0
     };
-    let data_table = DataTable::new(columns, &data_rows)
+    let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(palette))
         .column_spacing(0)
         .block(block)
@@ -272,19 +371,9 @@ fn render_data_grid(
 
     let mut table_state = DataTableState {
         offset: data_offset,
-        selected: Some(selected_index),
+        selected: Some(selected_display_idx),
         multi_selected: std::collections::HashSet::new(),
     };
-
-    // Populate multi_selected from state.multi_select
-    for (i, row) in data_rows.iter().enumerate() {
-        if state
-            .multi_select
-            .contains(&row.id.parse::<i64>().unwrap_or(0))
-        {
-            table_state.multi_selected.insert(i);
-        }
-    }
 
     frame.render_stateful_widget(data_table, area, &mut table_state);
 }
@@ -319,7 +408,7 @@ pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Palette) {
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &ratatui_cheese::theme::Palette) {
     if area.height < 1 {
         return;
     }
@@ -358,6 +447,28 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
     };
     let footer = Paragraph::new(line).style(ThemeStyles::status_footer(palette));
     frame.render_widget(footer, area);
+}
+
+fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, palette: &ratatui_cheese::theme::Palette) {
+    let view_label = match state.purgatory_view {
+        xray_tui_db::models::PurgatoryView::Active => "Active",
+        xray_tui_db::models::PurgatoryView::Stale => "Stale",
+        xray_tui_db::models::PurgatoryView::All => "All",
+    };
+    let view_text = format!(" View: {view_label} [P]");
+    let view_span = Span::styled(view_text, ThemeStyles::container_title(palette));
+    let search_text = if state.search_focused {
+        format!("/ {}▉", state.search_query)
+    } else if state.search_query.is_empty() {
+        " /  (press / to search)".to_string()
+    } else {
+        format!("/ {}", state.search_query)
+    };
+    let search_span = Span::styled(search_text, ThemeStyles::warning(palette));
+
+    let line = Line::from(vec![view_span, Span::raw("  "), search_span]);
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_confirmation_overlays(

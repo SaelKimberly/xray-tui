@@ -440,7 +440,6 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
     let stop_flag = state.speed_test_stop.clone();
     let batch_id = uuid::Uuid::new_v4().to_string();
     let page_size = state.config.speed_test.batch_page_size.max(1);
-    let group_id = state.selected_group_id.clone();
 
     let fast_timeout = *state.config.speed_test.tcp_timeout_secs;
     let real_ping_timeout = *state.config.speed_test.real_ping_timeout_secs;
@@ -464,7 +463,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
 
     tokio::spawn(async move {
         // 1. Snapshot visible profiles into ping_sessions table
-        let count = db.create_ping_batch(&batch_id, group_id.as_deref()).await;
+        let count = db.create_ping_batch(&batch_id, None).await;
         let count = match count {
             Ok(c) => c,
             Err(e) => {

@@ -305,7 +305,6 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                 KeyCode::Enter => {
                     let gid = state.groups.get(sel).map(|g| g.id.clone());
                     if let Some(id) = gid {
-                        state.selected_group_id = Some(id);
                         state.filter_cache_valid.set(false);
                     }
                     state.mode = AppMode::List;

@@ -41,9 +41,9 @@ pub struct AppState {
     /// Generation counter bumped on every profile mutation.
     /// Used to skip redundant reloads.
     pub endpoints_gen: u64,
+    /// Cached groups for subscriptions/settings UI.
     pub groups: Vec<Group>,
-    pub selected_group_id: Option<String>,
-    /// Current purgatory filter view: Active / Stale / All.
+
     pub purgatory_view: PurgatoryView,
     /// Purgatory TTL in seconds (default 7 days).
     pub purgatory_ttl_secs: i64,
@@ -117,55 +117,75 @@ pub struct AppState {
     pub logs_loaded: bool,
 }
 
-/// Convert a `Profile` from `import_export` into an `Endpoint` + `ProtocolRow` pair
-/// for use with the new database API (`insert_manual_endpoint`, `subscription_upsert`).
+/// Convert a `Profile` to `Endpoint` + `ProtocolRow` (thin wrapper over ParsedProtocol conversion).
 pub fn profile_to_endpoint_protocol(profile: &Profile) -> (Endpoint, ProtocolRow) {
+    let parsed = xray_tui_config::import_export::ParsedProtocol {
+        host: profile.address.clone(),
+        port: profile.port as u16,
+        host_type: if profile.address.parse::<std::net::IpAddr>().is_ok() {
+            if profile.address.contains(':') { "ipv6".into() } else { "ipv4".into() }
+        } else {
+            "dns".into()
+        },
+        config_type: profile.config_type,
+        proto_kind: profile.proto_kind.clone(),
+        sig: profile.sig,
+        cred_hash: profile.cred_hash,
+        spec_blob: profile.spec_blob.clone(),
+        core_type: profile.core_type.clone(),
+        transport: profile.transport.clone(),
+        security: profile.security.clone(),
+        remarks: profile.remarks.clone(),
+        created_at: profile.created_at,
+    };
+    parsed_to_endpoint_protocol(&parsed)
+}
+
+/// Convert a `ParsedProtocol` directly to `Endpoint` + `ProtocolRow` (no Profile intermediary).
+pub fn parsed_to_endpoint_protocol(parsed: &xray_tui_config::import_export::ParsedProtocol) -> (Endpoint, ProtocolRow) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let host_type = if profile.address.parse::<std::net::IpAddr>().is_ok() {
-        if profile.address.contains(':') {
-            "ipv6"
+    let host_type = if parsed.host_type.is_empty() {
+        if parsed.host.parse::<std::net::IpAddr>().is_ok() {
+            if parsed.host.contains(':') { "ipv6" } else { "ipv4" }
         } else {
-            "ipv4"
+            "dns"
         }
     } else {
-        "dns"
+        &parsed.host_type
     }
     .to_string();
-
     let endpoint = Endpoint {
-        id: stable_hash(&profile.address, i64::from(profile.port)),
-        host: profile.address.clone(),
+        id: xray_tui_db::hash::stable_hash(&parsed.host, i64::from(parsed.port)),
+        host: parsed.host.clone(),
         host_type,
-        port: profile.port,
+        port: i32::from(parsed.port),
         port_spec_str: None,
         parent_id: None,
         last_source: None,
         created_at: now,
         manual_protocol_override: None,
     };
-
     let protocol = ProtocolRow {
-        id: profile.id,
+        id: parsed.sig ^ parsed.cred_hash,
         endpoint_id: endpoint.id,
-        sig: profile.sig,
-        cred_hash: profile.cred_hash,
-        proto_kind: profile.proto_kind.clone(),
-        spec_blob: profile.spec_blob.clone(),
-        config_type: profile.config_type,
-        core_type: profile.core_type.clone(),
-        transport: profile.transport.clone(),
-        security: profile.security.clone(),
-        remarks: None,
+        sig: parsed.sig,
+        cred_hash: parsed.cred_hash,
+        proto_kind: parsed.proto_kind.clone(),
+        spec_blob: parsed.spec_blob.clone(),
+        config_type: parsed.config_type,
+        core_type: parsed.core_type.clone(),
+        transport: parsed.transport.clone(),
+        security: parsed.security.clone(),
+        remarks: parsed.remarks.clone(),
         created_at: now,
         last_seen_at: now,
         endpoint: Default::default(),
         extension: Default::default(),
         server_stat: Default::default(),
     };
-
     (endpoint, protocol)
 }
 impl AppState {
@@ -188,7 +208,7 @@ impl AppState {
             purgatory_view: PurgatoryView::Active,
             purgatory_ttl_secs,
             purgatory_retention_secs,
-            selected_group_id: None,
+
             selected_index: 0,
             log_scroll: 0,
             sort_column: SortColumn::Remarks,
@@ -396,12 +416,14 @@ impl AppState {
         profiles::filtered_len(self)
     }
 
-    pub fn cycle_group(&mut self, _dir: i8) {
-        profiles::cycle_group(self, _dir);
-    }
-    pub const fn cycle_purgatory_view(&mut self) {
+    pub fn cycle_purgatory_view(&mut self) {
         profiles::cycle_purgatory_view(self);
     }
+    /// Get the first group ID for new profile assignments (no active group filter).
+    pub fn first_group_id(&self) -> String {
+        self.groups.first().map(|g| g.id.clone()).unwrap_or_default()
+    }
+
     /// Log to the TUI log buffer AND emit a tracing event (target "tui").
     pub fn log_trace(&mut self, level: &str, _target: &str, message: &str) {
         match level {
@@ -433,6 +455,13 @@ impl AppState {
 
     pub fn selected_profile_id(&self) -> Option<i64> {
         profiles::selected_profile_id(self)
+    }
+
+    pub fn toggle_expand(&mut self) {
+        profiles::toggle_expand(self);
+    }
+    pub fn collapse_expand(&mut self) {
+        profiles::collapse_expand(self);
     }
 
     fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
@@ -1199,95 +1228,7 @@ impl AppState {
         subscriptions::update_group_subscriptions(self, group_id);
     }
 
-    async fn do_update_subscription(
-        url: String,
-        user_agent: String,
-        group_id: String,
-        db: Arc<Database>,
-        validation: xray_tui_config::import_export::ValidationSettings,
-    ) -> (String, usize, ValidationSummary, Option<String>) {
-        let client = match reqwest::Client::builder()
-            .user_agent(&user_agent)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    group_id,
-                    0,
-                    ValidationSummary::default(),
-                    Some(e.to_string()),
-                );
-            }
-        };
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    group_id,
-                    0,
-                    ValidationSummary::default(),
-                    Some(format!("HTTP: {e}")),
-                );
-            }
-        };
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return (
-                    group_id,
-                    0,
-                    ValidationSummary::default(),
-                    Some(format!("Body: {e}")),
-                );
-            }
-        };
-        let (profiles, summary) =
-            match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
-                Ok((p, s)) => (p, s),
-                Err(e) => return (group_id, 0, ValidationSummary::default(), Some(e)),
-            };
-        tracing::info!(
-            target: "tui",
-            "Parsed {} profiles, {} errors from subscription",
-            profiles.len(),
-            summary.total_errors,
-        );
-        if profiles.is_empty() {
-            tracing::info!(target: "tui", "Subscription returned 0 usable profiles — all URLs may have failed validation");
-        }
-        let pairs: Vec<(Endpoint, Vec<ProtocolRow>)> = profiles
-            .into_iter()
-            .map(|p| {
-                let profile = Profile::from(&p);
-                let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
-                (endpoint, vec![protocol])
-            })
-            .collect();
-        tracing::info!(
-            target: "tui",
-            "Starting DB upsert for {} profiles",
-            pairs.len()
-        );
-        if let Err(e) = db.subscription_upsert(&group_id, &pairs).await {
-            tracing::error!(target: "tui", "DB upsert failed: {e}");
-            return (group_id, 0, summary, Some(format!("DB upsert: {e}")));
-        }
-        tracing::info!(target: "tui", "DB upsert succeeded");
 
-        // Update group metadata (last_refreshed, status) — merged from old Subscription
-        if let Ok(groups) = db.get_all_groups().await
-            && let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id)
-        {
-            grp.last_refreshed = Some(format_now());
-            grp.status = Some("ok".into());
-            grp.error_message = None;
-            let _ = db.update_group(&grp).await;
-        }
-
-        (group_id, pairs.len(), summary, None)
-    }
 
     pub fn update_all_subscriptions(&mut self) {
         subscriptions::update_all_subscriptions(self);

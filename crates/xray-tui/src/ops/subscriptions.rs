@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use xray_tui_config::import_export::{Profile, ValidationSettings, ValidationSummary};
+use xray_tui_config::import_export::{ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
 use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
 
 use crate::AppState;
-use crate::state::profile_to_endpoint_protocol;
+
 use crate::types::{AppMode, CoreEvent};
 use crate::{format_now, get_field, try_send_or_warn};
 
@@ -130,7 +130,6 @@ pub async fn delete_group(state: &mut AppState, group_id: &str) {
     }
     let _ = state.db.purge_expired(0).await;
     state.log_trace("info", "tui", "Group deleted");
-    state.selected_group_id = None;
     state.confirmation = None;
     state.reload_groups().await;
     state.reload_profiles().await;
@@ -275,8 +274,7 @@ async fn do_update_subscription(
     let pairs: Vec<(Endpoint, Vec<ProtocolRow>)> = profiles
         .into_iter()
         .map(|p| {
-            let profile = Profile::from(&p);
-            let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
+            let (endpoint, protocol) = crate::state::parsed_to_endpoint_protocol(&p);
             (endpoint, vec![protocol])
         })
         .collect();

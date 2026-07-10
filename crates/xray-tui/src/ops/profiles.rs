@@ -176,24 +176,6 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
     indices
 }
 
-pub fn cycle_group(state: &mut AppState, _dir: i8) {
-    if state.groups.is_empty() {
-        return;
-    }
-    let _current_idx = state
-        .selected_group_id
-        .as_ref()
-        .and_then(|id| state.groups.iter().position(|g| g.id == *id));
-    let _len = state.groups.len();
-    if state.log_scroll != 0 {
-        state.log_scroll = state.log_scroll.saturating_add(1);
-    }
-    if state.log_cache.len() > 10000 {
-        let excess = state.log_cache.len() - 10000;
-        state.log_cache.drain(0..excess);
-        state.log_scroll = state.log_scroll.saturating_sub(excess);
-    }
-}
 
 pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
     let protocol =
@@ -241,6 +223,23 @@ pub fn selected_profile_id(state: &AppState) -> Option<i64> {
     filtered_profiles(state)
         .nth(state.selected_index)
         .map(|r| r.endpoint.id)
+}
+
+pub fn toggle_expand(state: &mut AppState) {
+    let ep_id = filtered_profiles(state).nth(state.selected_index).map(|r| r.endpoint.id);
+    if let Some(ep_id) = ep_id {
+        if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
+            ep_row.expanded = !ep_row.expanded;
+        }
+    }
+}
+pub fn collapse_expand(state: &mut AppState) {
+    let ep_id = filtered_profiles(state).nth(state.selected_index).map(|r| r.endpoint.id);
+    if let Some(ep_id) = ep_id {
+        if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
+            ep_row.expanded = false;
+        }
+    }
 }
 
 fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
@@ -450,7 +449,7 @@ pub async fn confirm_add_server(state: &mut AppState) {
     };
 
     let profile = fields_to_profile(protocol, &fields);
-    let group_id = state.selected_group_id.clone().unwrap_or_default();
+    let group_id = state.first_group_id();
     let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
     match state
         .db
@@ -464,7 +463,7 @@ pub async fn confirm_add_server(state: &mut AppState) {
             state.log_trace("info", "tui", &format!("Added server: {remarks}"));
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
-            upsert_profile_row(state, profile, None, None, state.selected_group_id.clone());
+            upsert_profile_row(state, profile, None, None, Some(state.first_group_id()));
         }
         Err(e) => {
             state.log_trace("error", "tui", &format!("Failed to add server: {e}"));
@@ -556,7 +555,7 @@ pub async fn confirm_edit_server(state: &mut AppState) {
     }
     let new_profile = fields_to_profile(protocol, &fields);
     let (endpoint, protocol_row) = profile_to_endpoint_protocol(&new_profile);
-    let group_id = state.selected_group_id.clone().unwrap_or_default();
+    let group_id = state.first_group_id();
     match state
         .db
         .subscription_upsert(&group_id, &[(endpoint, vec![protocol_row])])
@@ -674,7 +673,7 @@ pub async fn confirm_batch_import(state: &mut AppState) {
     };
     let mut imported = 0usize;
     let mut errors = 0usize;
-    let group_id = state.selected_group_id.clone().unwrap_or_default();
+    let group_id = state.first_group_id();
     for item in items {
         if let Some(profile) = item.profile {
             let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
@@ -734,7 +733,7 @@ pub async fn move_profile_down(state: &mut AppState) {
 
 pub async fn set_active(state: &mut AppState, id: &str) {
     let pid: i64 = id.parse().unwrap_or(0);
-    let _group_id = state.selected_group_id.clone().unwrap_or_default();
+    let _group_id = state.first_group_id();
     if let Err(e) = state.db.set_protocol_override(pid, 0).await {
         state.log_trace("error", "tui", &format!("Failed to set active: {e}"));
         return;

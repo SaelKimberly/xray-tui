@@ -522,7 +522,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 state.connect_to_profile(id);
             }
         }
-
+        KeyCode::Right if state.current_tab == Tab::Profiles => {
+            state.toggle_expand();
+        }
+        KeyCode::Left if state.current_tab == Tab::Profiles => {
+            state.collapse_expand();
+        }
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
             if let Some(id) = state.selected_profile_id() {
                 state.set_active(&id.to_string()).await;
@@ -611,15 +616,17 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
             state.mode = AppMode::ManageGroups { selected: 0 };
         }
-        KeyCode::Char('[') if state.current_tab == Tab::Profiles => {
-            state.cycle_group(-1);
-        }
-        KeyCode::Char(']') if state.current_tab == Tab::Profiles => {
-            state.cycle_group(1);
-        }
         KeyCode::Char('p' | 'P') if state.current_tab == Tab::Profiles => {
             state.cycle_purgatory_view();
             state.reload_profiles().await;
+        }
+        KeyCode::Char('r' | 'R') if state.current_tab == Tab::Profiles => {
+            if matches!(state.purgatory_view, xray_tui_db::models::PurgatoryView::Stale) {
+                if let Some(id) = state.selected_profile_id() {
+                    state.db.restore_endpoint(id).await.unwrap_or_default();
+                    state.reload_profiles().await;
+                }
+            }
         }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
             if state.multi_select.len() >= 2 {
@@ -697,7 +704,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             } else if state.confirmation.is_some() {
                 state.confirmation = None;
             } else {
-                state.selected_group_id = None;
                 state.filter_cache_valid.set(false);
             }
         }
