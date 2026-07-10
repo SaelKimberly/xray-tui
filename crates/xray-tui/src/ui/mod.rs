@@ -541,7 +541,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            let ids: Vec<i64> = state.filtered_profiles().map(|r| r.profile.id).collect();
+            let ids: Vec<i64> = state.filtered_profiles().map(|r| r.endpoint.id).collect();
             for id in ids {
                 state.multi_select.insert(id);
             }
@@ -593,7 +593,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.filter_cache_valid.set(false);
             // Restore selection by profile ID
             if let Some(pid) = selected_id {
-                let pos = state.filtered_profiles().position(|r| r.profile.id == pid);
+                let pos = state.filtered_profiles().position(|r| r.endpoint.id == pid);
                 if let Some(pos) = pos {
                     state.selected_index = pos;
                 }
@@ -667,13 +667,25 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && state.current_tab == Tab::Profiles =>
         {
             let url = state.selected_profile_id().and_then(|id| {
-                let row = state.filtered_profiles().find(|r| r.profile.id == id)?;
-                xray_tui_config::import_export::format_share_url(&row.profile).ok()
+                let row = state.filtered_profiles().find(|r| r.endpoint.id == id)?;
+                let active = row.active_protocol();
+                let parsed = xray_tui_config::import_export::ParsedProtocol {
+                    host: row.endpoint.host.clone(),
+                    port: row.endpoint.port as u16,
+                    host_type: row.endpoint.host_type.clone(),
+                    config_type: active.config_type,
+                    proto_kind: active.proto_kind.clone(),
+                    sig: active.sig,
+                    cred_hash: active.cred_hash,
+                    spec_blob: active.spec_blob.clone(),
+                    core_type: active.core_type.clone(),
+                    transport: active.transport.clone(),
+                    security: active.security.clone(),
+                    remarks: active.remarks.clone(),
+                    created_at: active.created_at,
+                };
+                xray_tui_config::import_export::format_share_url(&parsed).ok()
             });
-            if let Some(url) = url {
-                state.clipboard = Some(url);
-                state.log_trace("info", "tui", "Share URL copied to clipboard");
-            }
         }
         KeyCode::Esc => {
             if !state.actions_compact && state.term_height.get() < 20 {
@@ -771,6 +783,7 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Tab::Settings => settings::render(frame, chunks[1], state),
                 Tab::Logs => logs::render(frame, chunks[1], state),
                 Tab::Statistics => statistics::render(frame, chunks[1], state),
+                Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
             }
             render_help_overlay(frame, chunks[1], state);
             if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
@@ -815,6 +828,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         Tab::Settings => settings::render(frame, chunks[1], state),
         Tab::Logs => logs::render(frame, chunks[1], state),
         Tab::Statistics => statistics::render(frame, chunks[1], state),
+        Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
     }
     if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
         render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
@@ -872,6 +886,11 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("q / Ctrl+C", "Quit"),
                 ],
                 Tab::Statistics => vec![
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                Tab::Actions => vec![
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
@@ -1005,6 +1024,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Tab::Settings => " Settings ",
                 Tab::Logs => " Logs ",
                 Tab::Statistics => " Statistics ",
+                Tab::Actions => " Actions ",
             };
             Line::from(Span::styled(
                 name,

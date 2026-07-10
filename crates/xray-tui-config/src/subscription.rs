@@ -3,12 +3,12 @@
 use std::mem::MaybeUninit;
 
 use crate::import_export::{
-    ImportError, ValidationSettings, ValidationSummary, parse_share_url,
+    ImportError, ParsedProtocol, ValidationSettings, ValidationSummary, parse_share_url,
 };
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use xray_tui_proto::proto_spec::ProtocolConfig;
 
-use xray_tui_db::models::Profile;
 
 /// Maximum input chunk size for `StreamingDecoder::feed()`.
 const INPUT_CHUNK_SIZE: usize = 65536;
@@ -386,7 +386,7 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
 pub fn parse_subscription_data(
     data: &[u8],
     settings: &ValidationSettings,
-) -> Result<(Vec<Profile>, ValidationSummary), String> {
+) -> Result<(Vec<ParsedProtocol>, ValidationSummary), String> {
     let mut decoder = StreamingDecoder::new();
     let mut all_urls = Vec::new();
 
@@ -401,7 +401,7 @@ pub fn parse_subscription_data(
     all_urls.extend(urls);
 
     // Parse each URL into a Profile
-    let mut profiles = Vec::new();
+    let mut profiles: Vec<ParsedProtocol> = Vec::new();
     let mut summary = ValidationSummary::default();
     for url in &all_urls {
         match parse_share_url(url, settings) {
@@ -431,7 +431,7 @@ pub fn parse_subscription_data(
     summary.security_warning_count = profiles
         .iter()
         .filter(|p| {
-            if let Some(config) = crate::import_export::profile_config(p) {
+            if let Some(config) = serde_json::from_slice::<ProtocolConfig>(&p.spec_blob).ok() {
                 let (_, s_settings) = config.to_settings();
                 s_settings.get("allow_insecure").and_then(serde_json::Value::as_bool) == Some(true)
             } else {

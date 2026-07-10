@@ -27,6 +27,7 @@ mod ssh;
 mod tailscale;
 mod tor;
 mod shadowtls;
+pub mod security_rank;
 pub use anytls::AnyTlsConfig;
 pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig};
 pub use http_client::HttpClientConfig;
@@ -45,6 +46,7 @@ pub use vless::VlessConfig;
 pub use vmess::VmessConfig;
 pub use wireguard::WireguardConfig;
 pub use shadowtls::ShadowTlsConfig;
+pub use security_rank::protocol_security_rank;
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("invalid host: {0}")]

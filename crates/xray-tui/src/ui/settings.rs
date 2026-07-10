@@ -1051,7 +1051,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Routing form ────────────────────────────────────────────────────────
 
-fn routing_rule_fields(rule: Option<&crate::RoutingRule>) -> Vec<(String, String)> {
+fn routing_rule_fields(rule: Option<&xray_tui_db::models::RoutingRule>) -> Vec<(String, String)> {
     let keys = [
         "type",
         "domain_matcher",

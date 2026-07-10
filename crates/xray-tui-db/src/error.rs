@@ -1,4 +1,3 @@
-use crate::models_toasty::{Profile, ProfileExtension, ServerStat};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
@@ -13,6 +12,3 @@ pub enum DatabaseError {
 }
 
 pub type Result<T, E = DatabaseError> = std::result::Result<T, E>;
-
-/// Result tuple returned by `get_all_profiles_with_details`.
-pub type ProfileWithDetails = (Profile, Option<ProfileExtension>, Option<ServerStat>);

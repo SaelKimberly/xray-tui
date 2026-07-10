@@ -6,11 +6,12 @@ use crate::process::CoreManager;
 use crate::protocol::Protocol;
 use crate::protocol_core_mapping::resolve_core;
 use tokio::sync::mpsc;
-use xray_tui_db::models::{DnsSetting, Profile};
+use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow};
 
 /// Run a real ping through a temp xray-core instance.
-pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingResult {
-    let profile = profile.clone();
+pub(super) async fn real_ping(endpoint: &Endpoint, protocol: &ProtocolRow, ctx: &RealPingManager) -> PingResult {
+    let endpoint = endpoint.clone();
+    let protocol = protocol.clone();
     let proxy_addr = ctx.proxy_addr.clone();
     let ping_url = ctx.ping_url.clone();
     let ip_api_url = ctx.ip_api_url.clone();
@@ -18,15 +19,15 @@ pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingR
     let retries = ctx.retries;
     let bin_dir = ctx.bin_dir.clone();
     let bin_configs_dir = ctx.bin_configs_dir.clone();
-    let r#type = profile.config_type;
+    let r#type = protocol.config_type;
 
     let outcome = async {
         let temp_dir =
             tempfile::TempDir::new_in(&bin_configs_dir).map_err(|e| format!("Temp dir: {e}"))?;
         let temp_dir_path = temp_dir.path().to_path_buf();
 
-        let protocol = Protocol::try_from_i32(r#type).unwrap_or(Protocol::Custom);
-        let resolved_core = resolve_core(protocol, None);
+        let proto = Protocol::try_from_i32(r#type).unwrap_or(Protocol::Custom);
+        let resolved_core = resolve_core(proto, None);
 
         let params = BuildParams {
             v2ray_api_enabled: false,
@@ -50,7 +51,7 @@ pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingR
             client_ip: None,
         };
 
-        let backend_config = ConfigBuilder::build(&profile, resolved_core, &params, &[], &dns)
+        let backend_config = ConfigBuilder::build(&endpoint, &protocol, resolved_core, &params, &[], &dns)
             .map_err(|_| "Build config failed".to_string())?;
 
         let bin_path =
@@ -84,8 +85,8 @@ pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingR
         Ok(rp) => PingResult {
             profile_key: ProfileKey {
                 config_type: r#type,
-                address: profile.address.clone(),
-                port: profile.port as u16,
+                address: endpoint.host.clone(),
+                port: endpoint.port as u16,
             },
             latency_ms: Some(rp.latency_ms),
             ip_info: rp.ip_info,
@@ -94,8 +95,8 @@ pub(super) async fn real_ping(profile: &Profile, ctx: &RealPingManager) -> PingR
         Err(e) => PingResult {
             profile_key: ProfileKey {
                 config_type: r#type,
-                address: profile.address.clone(),
-                port: profile.port as u16,
+                address: endpoint.host.clone(),
+                port: endpoint.port as u16,
             },
             latency_ms: None,
             ip_info: None,

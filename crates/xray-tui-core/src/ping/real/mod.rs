@@ -27,20 +27,20 @@ pub struct RealPingManager {
 
 impl RealPingManager {
     /// Run real ping for a single profile. Builds config for the resolved core,
-    /// launches a temp binary, waits for SOCKS5 proxy, runs HTTP real_ping(), stops.
     pub async fn real_ping(
         &self,
-        profile: &xray_tui_db::models::Profile,
+        endpoint: &xray_tui_db::models::Endpoint,
+        protocol: &xray_tui_db::models::ProtocolRow,
         config_type: i32,
     ) -> PingResult {
-        let protocol = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
-        let core = resolve_core(protocol, None);
+        let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
+        let core = resolve_core(proto, None);
         match core {
-            CoreType::Xray => xray::real_ping(profile, self).await,
-            CoreType::SingBox => singbox::real_ping(profile, self).await,
+            CoreType::Xray => xray::real_ping(endpoint, protocol, self).await,
+            CoreType::SingBox => singbox::real_ping(endpoint, protocol, self).await,
             CoreType::Auto => {
                 tracing::warn!("resolve_core returned Auto, falling back to xray");
-                xray::real_ping(profile, self).await
+                xray::real_ping(endpoint, protocol, self).await
             }
         }
     }

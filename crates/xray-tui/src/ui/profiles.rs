@@ -15,8 +15,6 @@ use crate::ui::widgets::data_table::{
 };
 use crate::{AppState, ConfirmAction, ProfileRow};
 use ratatui_cheese::theme::Palette;
-use xray_tui_config::import_export::profile_config;
-use xray_tui_proto::proto_spec::ProtoSpec;
 
 // ── DataTable row wrapper ───────────────────────────────────────────────
 
@@ -193,7 +191,7 @@ fn render_data_grid(
         .enumerate()
         .map(|(i, row)| {
             let is_selected = i == selected_index;
-            let is_connected = state.connected_profile_id.as_ref() == Some(&row.profile.id);
+            let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id);
             let row_style = match (is_selected, is_connected) {
                 (true, true) => ThemeStyles::table_row_connected(palette)
                     .add_modifier(ratatui::style::Modifier::UNDERLINED),
@@ -206,7 +204,7 @@ fn render_data_grid(
             let (indicator, indicator_fg) = if is_connected {
                 ("●".to_string(), ThemeStyles::success(palette))
             } else {
-                match state.testing_details.get(&row.profile.id) {
+                match state.testing_details.get(&row.endpoint.id) {
                     Some(TestType::TcpPing) => ("↔".to_string(), Style::default()),
                     Some(TestType::RealPing) => ("◎".to_string(), Style::default()),
                     Some(TestType::SpeedTest) => ("⇩".to_string(), Style::default()),
@@ -216,8 +214,8 @@ fn render_data_grid(
             };
 
             let protocol =
-                Protocol::try_from_i32(row.profile.config_type).unwrap_or(Protocol::Custom);
-            let is_multi = state.multi_select.contains(&row.profile.id);
+                Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
+            let is_multi = state.multi_select.contains(&row.endpoint.id);
 
             let idx_str = if is_multi {
                 "  *".to_string()
@@ -226,49 +224,41 @@ fn render_data_grid(
             };
 
             let type_str = format!("{protocol:.12}");
-            let remarks = profile_config(&row.profile)
-                .and_then(|c| c.remarks().map(String::from))
+            let remarks = row
+                .active_protocol()
+                .remarks
+                .clone()
                 .unwrap_or_default();
             let remarks_str = truncate_pad(&remarks, 24);
-            let group_str = row
-                .group_id
-                .as_ref()
-                .and_then(|gid| {
-                    state
-                        .groups
-                        .iter()
-                        .find(|g| g.id == *gid)
-                        .and_then(|g| g.name.as_deref())
-                })
-                .map_or_else(String::new, |name| truncate_pad(name, 12));
-            let address = row.profile.address.as_str();
+            let group_str = String::new();
+            let address = row.endpoint.host.as_str();
             let address_str = truncate_pad(address, 30);
-            let port_str = format!("{:>6}", row.profile.port);
+            let port_str = format!("{:>6}", row.endpoint.port);
             let delay_str = row
-                .extension
-                .as_ref()
+                .extensions
+                .get(&row.active_protocol().id)
                 .and_then(|e| e.delay)
                 .map_or_else(|| "     -".to_string(), |d| format!("{d:>6}"));
             let speed_str = row
-                .extension
-                .as_ref()
+                .extensions
+                .get(&row.active_protocol().id)
                 .and_then(|e| e.speed)
                 .map_or_else(|| "     -".to_string(), |s| format!("{s:>6}"));
             let ip_info_str = row
-                .extension
-                .as_ref()
+                .extensions
+                .get(&row.active_protocol().id)
                 .and_then(|e| e.ip_info.as_deref())
                 .map_or_else(|| "     -".to_string(), |ip| truncate_pad(ip, 19));
-            let traffic = row.stats.as_ref().map_or_else(
-                || "        -".to_string(),
-                |s| {
+            let traffic = row
+                .stats
+                .get(&row.active_protocol().id)
+                .map_or_else(|| "        -".to_string(), |s| {
                     let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
                     format_traffic(total as u64)
-                },
-            );
+                });
 
             ProfileTableRowData {
-                id: row.profile.id.to_string(),
+                id: row.endpoint.id.to_string(),
                 indicator,
                 indicator_fg,
                 idx_str,
@@ -363,15 +353,14 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &Pale
     let line = if has_profile {
         let row = &state.profiles[state.selected_index];
         let core = state.resolved_core(row);
-        let remarks = profile_config(&row.profile)
-            .and_then(|c| c.remarks().map(String::from))
-            .unwrap_or_else(|| "-".to_string());
-        let addr = if row.profile.address.is_empty() {
+        let remarks = row.active_protocol().remarks.clone().unwrap_or_else(|| "-".to_string());
+
+        let addr = if row.endpoint.host.is_empty() {
             "-"
         } else {
-            &row.profile.address
+            &row.endpoint.host
         };
-        let port = row.profile.port.to_string();
+        let port = row.endpoint.port.to_string();
         Line::from(vec![
             Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
             Span::styled(remarks, ThemeStyles::footer_value(palette)),
@@ -401,8 +390,8 @@ fn render_confirmation_overlays(
         Some(ConfirmAction::DeleteProfile(ref delete_id)) => {
             let profile_name = rows
                 .iter()
-                .find(|r| r.profile.id == *delete_id)
-                .and_then(|r| profile_config(&r.profile).and_then(|c| c.remarks().map(String::from)))
+                .find(|r| r.endpoint.id == *delete_id)
+                .and_then(|r| r.active_protocol().remarks.clone())
                 .unwrap_or_default();
             render_confirmation_overlay(
                 frame,

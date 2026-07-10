@@ -9,7 +9,7 @@ pub mod subscription;
 
 pub use app_config::{
     AppConfig, CoreConfig, GuiConfig, InboundConfig, LogConfig, MuxConfig, ParsingSettings,
-    StatisticsConfig, SystemProxyConfig, TunConfig,
+    StatisticsConfig, SystemProxyConfig, TunConfig, UpdateConfig, PurgatoryConfig,
 };
 pub use duration_or_secs::DurationOrSecs;
 pub use import_export::{

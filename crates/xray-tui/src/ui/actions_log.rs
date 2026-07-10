@@ -9,8 +9,6 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
-use xray_tui_config::import_export::profile_config;
-use xray_tui_proto::proto_spec::ProtoSpec;
 
 #[allow(clippy::missing_const_for_fn)]
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
@@ -21,7 +19,7 @@ fn connection_icon(state: &AppState) -> (&'static str, Style) {
         ("●", ThemeStyles::success(&palette))
     } else if state.connection_error.is_some() {
         ("⏹", ThemeStyles::error(&palette))
-    } else if state.connected_profile_id.is_some() {
+    } else if state.connected_protocol_id.is_some() {
         ("⏏", ThemeStyles::warning(&palette))
     } else {
         ("○", ThemeStyles::hint(&palette))
@@ -31,9 +29,9 @@ fn connection_icon(state: &AppState) -> (&'static str, Style) {
 fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
     // Try the connected profile first
     let from_connected = state
-        .connected_profile_id
+        .connected_protocol_id
         .as_ref()
-        .and_then(|id| state.profiles.iter().find(|r| r.profile.id == *id));
+        .and_then(|id| state.profiles.iter().find(|r| r.endpoint.id == *id));
 
     // Fall back to selected profile
     let row = from_connected.or_else(|| {
@@ -55,16 +53,20 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
             )
         },
         |r| {
-            let proto = Protocol::try_from_i32(r.profile.config_type).unwrap_or(Protocol::Custom);
-            let remarks = profile_config(&r.profile)
-                .and_then(|c| c.remarks().map(String::from))
+            let proto = Protocol::try_from_i32(r.active_protocol().config_type).unwrap_or(Protocol::Custom);
+            let remarks = r.active_protocol()
+                .remarks
+                .clone()
                 .unwrap_or_default();
-            let addr = r.profile.address.clone();
-            let port = r.profile.port as u16;
+            let addr = r.endpoint.host.clone();
+            let port = r.endpoint.port as u16;
             let core = state.resolved_core(r).to_string();
             (proto.to_string(), remarks, addr, port, core)
         },
     )
+}
+pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+    render_full(frame, area, state);
 }
 
 // ── Compact render (1-line bar) ────────────────────────────────────────

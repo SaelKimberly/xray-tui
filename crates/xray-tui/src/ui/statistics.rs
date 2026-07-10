@@ -20,7 +20,26 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
     let profile = &state.profiles[state.selected_index];
-    let profile_name = profile_config(&profile.profile)
+    let active_proto = profile.active_protocol();
+    let profile_name = profile_config(&xray_tui_config::import_export::Profile {
+        id: active_proto.id,
+        sig: active_proto.sig,
+        cred_hash: active_proto.cred_hash,
+        proto_kind: active_proto.proto_kind.clone(),
+        spec_blob: active_proto.spec_blob.clone(),
+        config_type: active_proto.config_type,
+        core_type: active_proto.core_type.clone(),
+        address: profile.endpoint.host.clone(),
+        port: profile.endpoint.port,
+        transport: active_proto.transport.clone(),
+        security: active_proto.security.clone(),
+        created_at: active_proto.created_at,
+        remarks: active_proto.remarks.clone(),
+        user_id: None,
+        network: None,
+        protocol_settings: None,
+        stream_settings: None,
+    })
         .and_then(|c| c.remarks().map(String::from))
         .unwrap_or_else(|| "Unknown".to_string());
     let core_type = state.connected_core.map_or("", |c| c.as_str());
@@ -43,7 +62,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(traffic_fieldset, chunks[0]);
 
     let mut traffic_lines: Vec<Line> = Vec::new();
-    if let Some(ref stats) = profile.stats {
+    if let Some(stats) = profile.stats.get(&(profile.active_protocol().id)) {
         let today_up = stats.today_up.unwrap_or(0);
         let today_down = stats.today_down.unwrap_or(0);
         let total_up = stats.total_up.unwrap_or(0);

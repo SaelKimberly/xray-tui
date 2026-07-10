@@ -30,6 +30,32 @@ pub struct AppConfig {
     #[serde(default)]
     pub theme_name: ThemeName,
     pub clash_api_port: Option<u16>,
+    #[serde(default)]
+    pub purgatory: PurgatoryConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgatoryConfig {
+    #[serde(default = "default_purgatory_ttl_days")]
+    pub ttl_days: u64,
+    #[serde(default = "default_purgatory_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_purgatory_enabled")]
+    pub enabled: bool,
+}
+
+const fn default_purgatory_ttl_days() -> u64 { 7 }
+const fn default_purgatory_retention_days() -> u64 { 30 }
+const fn default_purgatory_enabled() -> bool { true }
+
+impl Default for PurgatoryConfig {
+    fn default() -> Self {
+        Self {
+            ttl_days: default_purgatory_ttl_days(),
+            retention_days: default_purgatory_retention_days(),
+            enabled: default_purgatory_enabled(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

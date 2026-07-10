@@ -24,45 +24,28 @@ use xray_tui_db::models::Group;
 
 struct GroupListItem {
     display_name: String,
-    url: String,
-    enabled: String,
     status: String,
-    is_system: bool,
 }
 
 impl ListItem for GroupListItem {
     fn height(&self) -> u16 {
         1
     }
-
     fn render(&self, area: Rect, buf: &mut Buffer, ctx: &ListItemContext) {
         let style = if ctx.selected {
-            if self.is_system {
-                Style::default()
-                    .bg(ctx.palette.highlight)
-                    .fg(ctx.palette.muted)
-            } else {
-                ThemeStyles::table_row_selected(&ctx.palette)
-            }
-        } else if self.is_system {
-            Style::default().fg(ctx.palette.muted)
+            ThemeStyles::table_row_selected(&ctx.palette)
         } else {
             ThemeStyles::table_row_normal(&ctx.palette)
         };
         let text = format!(
-            " {:<27} │ {:<30} │ {} │ {:<10} │ {}",
+            " {:<27} │ {:<10} │ {}",
             truncate_pad(&self.display_name, 27),
-            truncate_pad(&self.url, 30),
-            self.enabled,
             self.status,
             "-",
         );
         buf.set_string(area.x, area.y, &text, style);
     }
 }
-
-// ---------------------------------------------------------------------------
-// render_group_overlay
 // ---------------------------------------------------------------------------
 
 pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -96,38 +79,17 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     // Build sorted group items
     let mut sorted_groups: Vec<(usize, &Group)> = state.groups.iter().enumerate().collect();
     sorted_groups.sort_by_key(|(_, g)| {
-        let is_sys = g.is_system.unwrap_or(0);
-        (1 - is_sys, g.name.as_deref().unwrap_or(""))
+        g.name.as_deref().unwrap_or("").to_string()
     });
 
     let items: Vec<GroupListItem> = sorted_groups
         .iter()
         .map(|(_, g)| {
-            let is_system = g.is_system.unwrap_or(0) == 1;
             let name = g.name.as_deref().unwrap_or("unnamed");
-            let url = g.subscription_url.as_deref().unwrap_or("-");
-            let enabled = if g.subscription_enabled.unwrap_or(0) == 1 {
-                "Y"
-            } else {
-                "N"
-            };
-            let status = state
-                .subscriptions
-                .iter()
-                .find(|s| s.group_id.as_deref() == Some(&g.id))
-                .and_then(|s| s.status.as_deref())
-                .unwrap_or("idle");
-            let display_name = if is_system {
-                format!("[system] {name}")
-            } else {
-                name.to_string()
-            };
+            let status = g.status.as_deref().unwrap_or("idle");
             GroupListItem {
-                display_name,
-                url: url.to_string(),
-                enabled: enabled.to_string(),
+                display_name: name.to_string(),
                 status: status.to_string(),
-                is_system,
             }
         })
         .collect();
@@ -142,95 +104,90 @@ pub fn render_group_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let header = Line::from(vec![
         Span::styled(" Name ", ThemeStyles::table_header(&palette)),
         Span::raw("│"),
-        Span::styled(" URL ", ThemeStyles::table_header(&palette)),
-        Span::raw("│"),
-        Span::styled(" Ena ", ThemeStyles::table_header(&palette)),
-        Span::raw("│"),
         Span::styled(" Status ", ThemeStyles::table_header(&palette)),
-        Span::raw("│"),
-        Span::styled(" Last Updated ", ThemeStyles::table_header(&palette)),
     ]);
     frame.render_widget(header, list_chunks[0]);
-
-    // Group list via List widget
-    let list = List::new(&items)
-        .palette(palette.clone())
-        .show_paginator(false);
-    let mut list_state = ListState::new(items.len());
+    let list_area = list_chunks[1];
+    let list = List::new(&items);
+    let mut list_state = ListState::default();
     list_state.select(selected, items.len());
-    frame.render_stateful_widget(list, list_chunks[1], &mut list_state);
-
-    // Footer
-    let footer = Paragraph::new(Line::from(Span::styled(
-        " [a] Add  [e] Edit  [d] Delete  [c] Clear  [u] Update  [Shift+U] Update All  [Enter] Filter  [Esc] Close ",
-        ThemeStyles::hint(&palette),
-    )));
-    frame.render_widget(footer, chunks[1]);
-
-    // Confirmation overlays using Popup
-    match &state.confirmation {
-        Some(ConfirmAction::DeleteGroup(group_id)) => {
-            let group_name = state
-                .groups
-                .iter()
-                .find(|g| g.id == *group_id)
-                .and_then(|g| g.name.as_deref())
-                .unwrap_or("unknown");
-            let text = format!(" Delete \"{group_name}\"? (y/N) ");
-            let width = text.len();
-            let para = Paragraph::new(text).alignment(Alignment::Center).style(
-                Style::new()
-                    .fg(palette.foreground)
-                    .bg(palette.surface)
-                    .add_modifier(Modifier::BOLD),
-            );
-            let sized = KnownSizeWrapper {
-                inner: para,
-                width,
-                height: 1,
-            };
-            let popup = Popup::new(sized)
-                .title(" Confirm ")
-                .style(Style::new().bg(palette.surface))
-                .border_set(border::ROUNDED)
-                .border_style(Style::new().fg(palette.error).add_modifier(Modifier::BOLD));
-            frame.render_widget(popup, area);
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+    let bottom_chunk = chunks[1];
+    let hints = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("Enter", ThemeStyles::hint(&palette)),
+        Span::styled("=switch  ", ThemeStyles::hint(&palette)),
+        Span::styled("c", ThemeStyles::hint(&palette)),
+        Span::styled("=clear  ", ThemeStyles::hint(&palette)),
+        Span::styled("u", ThemeStyles::hint(&palette)),
+        Span::styled("=update  ", ThemeStyles::hint(&palette)),
+        Span::styled("d", ThemeStyles::hint(&palette)),
+        Span::styled("=delete  ", ThemeStyles::hint(&palette)),
+        Span::styled("Esc", ThemeStyles::hint(&palette)),
+        Span::styled("=back", ThemeStyles::hint(&palette)),
+    ]);
+    frame.render_widget(hints, bottom_chunk);
+    // Confirmation popups
+    if let Some(action) = &state.confirmation {
+        match action {
+            ConfirmAction::DeleteGroup(group_id) => {
+                let group_name = state
+                    .groups
+                    .iter()
+                    .find(|g| g.id == *group_id)
+                    .and_then(|g| g.name.as_deref())
+                    .unwrap_or("unknown");
+                let text = format!(" Delete \"{group_name}\"? (y/N) ");
+                let width = text.len();
+                let para = Paragraph::new(text).alignment(Alignment::Center).style(
+                    Style::new()
+                        .fg(palette.foreground)
+                        .bg(palette.surface)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let sized = KnownSizeWrapper {
+                    inner: para,
+                    width,
+                    height: 1,
+                };
+                let popup = Popup::new(sized)
+                    .title(" Confirm ")
+                    .style(Style::new().bg(palette.surface))
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::new().fg(palette.error).add_modifier(Modifier::BOLD));
+                frame.render_widget(popup, area);
+            }
+            ConfirmAction::ClearGroup(group_id) => {
+                let group_name = state
+                    .groups
+                    .iter()
+                    .find(|g| g.id == *group_id)
+                    .and_then(|g| g.name.as_deref())
+                    .unwrap_or("unknown");
+                let text = format!(" Clear all profiles in \"{group_name}\"? (y/N) ");
+                let width = text.len();
+                let para = Paragraph::new(text).alignment(Alignment::Center).style(
+                    Style::new()
+                        .fg(palette.foreground)
+                        .bg(palette.surface)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let sized = KnownSizeWrapper {
+                    inner: para,
+                    width,
+                    height: 1,
+                };
+                let popup = Popup::new(sized)
+                    .title(" Confirm ")
+                    .style(Style::new().bg(palette.surface))
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::new().fg(palette.error).add_modifier(Modifier::BOLD));
+                frame.render_widget(popup, area);
+            }
+            _ => {}
         }
-        Some(ConfirmAction::ClearGroup(group_id)) => {
-            let group_name = state
-                .groups
-                .iter()
-                .find(|g| g.id == *group_id)
-                .and_then(|g| g.name.as_deref())
-                .unwrap_or("unknown");
-            let text = format!(" Clear all profiles in \"{group_name}\"? (y/N) ");
-            let width = text.len();
-            let para = Paragraph::new(text).alignment(Alignment::Center).style(
-                Style::new()
-                    .fg(palette.foreground)
-                    .bg(palette.surface)
-                    .add_modifier(Modifier::BOLD),
-            );
-            let sized = KnownSizeWrapper {
-                inner: para,
-                width,
-                height: 1,
-            };
-            let popup = Popup::new(sized)
-                .title(" Confirm ")
-                .style(Style::new().bg(palette.surface))
-                .border_set(border::ROUNDED)
-                .border_style(Style::new().fg(palette.error).add_modifier(Modifier::BOLD));
-            frame.render_widget(popup, area);
-        }
-        _ => {}
     }
 }
-
-// ---------------------------------------------------------------------------
-// render_group_form
-// ---------------------------------------------------------------------------
-
 pub fn render_group_form(frame: &mut Frame, area: Rect, state: &AppState, _editing: bool) {
     let palette = state.current_palette();
     let fieldset = Fieldset::new()
@@ -321,85 +278,36 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
                     state.mode = AppMode::ManageGroups { selected: last };
                 }
                 KeyCode::Char('e' | 'E') => {
-                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| {
-                        (
-                            1 - g.is_system.unwrap_or(0),
-                            g.name.as_deref().unwrap_or(""),
-                        )
-                    });
-                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
-                    if !is_system {
-                        let gid = sorted.get(sel).map(|g| g.id.clone());
-                        if let Some(id) = gid {
-                            state.start_edit_group(&id);
-                        }
+                    let gid = state.groups.get(sel).map(|g| g.id.clone());
+                    if let Some(id) = gid {
+                        state.start_edit_group(&id);
                     }
                 }
-                KeyCode::Char('a' | 'A') => {
-                    state.start_add_group();
-                }
                 KeyCode::Char('d' | 'D') => {
-                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| {
-                        (
-                            1 - g.is_system.unwrap_or(0),
-                            g.name.as_deref().unwrap_or(""),
-                        )
-                    });
-                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
-                    if !is_system {
-                        let gid = sorted.get(sel).map(|g| g.id.clone());
-                        if let Some(id) = gid {
-                            state.confirmation = Some(ConfirmAction::DeleteGroup(id));
-                        }
+                    let gid = state.groups.get(sel).map(|g| g.id.clone());
+                    if let Some(id) = gid {
+                        state.confirmation = Some(ConfirmAction::DeleteGroup(id));
                     }
                 }
                 KeyCode::Char('c' | 'C') => {
-                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| {
-                        (
-                            1 - g.is_system.unwrap_or(0),
-                            g.name.as_deref().unwrap_or(""),
-                        )
-                    });
-                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
-                    if !is_system {
-                        let gid = sorted.get(sel).map(|g| g.id.clone());
-                        if let Some(id) = gid {
-                            state.confirmation = Some(ConfirmAction::ClearGroup(id));
-                        }
+                    let gid = state.groups.get(sel).map(|g| g.id.clone());
+                    if let Some(id) = gid {
+                        state.confirmation = Some(ConfirmAction::ClearGroup(id));
                     }
                 }
                 KeyCode::Char('u') => {
-                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| {
-                        (
-                            1 - g.is_system.unwrap_or(0),
-                            g.name.as_deref().unwrap_or(""),
-                        )
-                    });
-                    let is_system = sorted.get(sel).is_some_and(|g| g.is_system == Some(1));
-                    if !is_system {
-                        let gid = sorted.get(sel).map(|g| g.id.clone());
-                        if let Some(id) = gid {
-                            state.update_group_subscriptions(&id);
-                        }
+                    let gid = state.groups.get(sel).map(|g| g.id.clone());
+                    if let Some(id) = gid {
+                        state.update_group_subscriptions(&id);
                     }
                 }
                 KeyCode::Char('U') => {
                     state.update_all_subscriptions();
                 }
                 KeyCode::Enter => {
-                    let mut sorted: Vec<&Group> = state.groups.iter().collect();
-                    sorted.sort_by_key(|g| {
-                        (
-                            1 - g.is_system.unwrap_or(0),
-                            g.name.as_deref().unwrap_or(""),
-                        )
-                    });
-                    if let Some(g) = sorted.get(sel) {
-                        state.selected_group_id = Some(g.id.clone());
+                    let gid = state.groups.get(sel).map(|g| g.id.clone());
+                    if let Some(id) = gid {
+                        state.selected_group_id = Some(id);
                         state.filter_cache_valid.set(false);
                     }
                     state.mode = AppMode::List;

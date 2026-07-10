@@ -419,13 +419,13 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         AppMode::AddServer {
             protocol: Some(p), ..
         } => Some(*p),
-        AppMode::EditServer { profile_id, .. } => state
+        AppMode::EditServer { protocol_id, .. } => state
             .db
-            .get_profile(*profile_id)
+            .get_endpoint(*protocol_id)
             .await
             .ok()
             .flatten()
-            .and_then(|p| Protocol::try_from_i32(p.config_type)),
+            .and_then(|p| Protocol::try_from_i32(p.active_protocol().config_type)),
         _ => None,
     };
 

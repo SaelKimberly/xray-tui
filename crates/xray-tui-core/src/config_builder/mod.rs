@@ -2,7 +2,7 @@ pub mod singbox;
 pub mod xray;
 
 use crate::core_type::CoreType;
-use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
+use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 /// Port for the gRPC Stats API (shared by xray-core and sing-box).
 pub const API_PORT: u16 = 62789;
@@ -52,7 +52,8 @@ pub struct ConfigBuilder;
 
 impl ConfigBuilder {
     pub fn build(
-        profile: &Profile,
+        endpoint: &Endpoint,
+        protocol: &ProtocolRow,
         core_type: CoreType,
         params: &BuildParams,
         routing: &[RoutingRule],
@@ -60,11 +61,11 @@ impl ConfigBuilder {
     ) -> Result<BackendConfig, BuildError> {
         match core_type {
             CoreType::Xray => {
-                let config = xray::XrayConfigBuilder::build(profile, params, routing, dns)?;
+                let config = xray::XrayConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
                 Ok(BackendConfig::Xray(config))
             }
             CoreType::SingBox => {
-                let config = singbox::SingBoxConfigBuilder::build(profile, params, routing, dns)?;
+                let config = singbox::SingBoxConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
                 Ok(BackendConfig::SingBox(config))
             }
             CoreType::Auto => Err(BuildError::InvalidProfile(
@@ -79,30 +80,40 @@ mod tests {
     use super::*;
     use crate::protocol::Protocol;
 
-    fn test_profile(config_type: i32) -> Profile {
-        let mut profile = Profile {
+    fn test_endpoint_and_protocol(config_type: i32) -> (Endpoint, ProtocolRow) {
+        let endpoint = Endpoint {
             id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            spec_blob: Vec::new(),
-            config_type,
-            core_type: String::new(),
-            address: "example.com".to_string(),
+            host: "example.com".to_string(),
+            host_type: "dns".to_string(),
             port: 443,
-            transport: Some("tcp".to_string()),
-            security: Some("auto".to_string()),
+            port_spec_str: None,
+            parent_id: None,
+            last_source: None,
             created_at: 0,
-            extension: Default::default(),
-            server_stat: Default::default(),
+            manual_protocol_override: None,
         };
-        // spec_blob fields via bridge traits
         let extra = serde_json::json!({
             "remarks": "smoke test",
             "user_id": "test-uuid",
         });
-        profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
-        profile
+        let protocol = ProtocolRow {
+            id: 0,
+            endpoint_id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
+            config_type,
+            core_type: String::new(),
+            transport: Some("tcp".to_string()),
+            security: Some("auto".to_string()),
+            remarks: None,
+            created_at: 0,
+            last_seen_at: 0,
+            extension: Default::default(),
+            server_stat: Default::default(),
+        };
+        (endpoint, protocol)
     }
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
@@ -132,36 +143,36 @@ mod tests {
 
     #[test]
     fn build_xray_via_dispatch() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(&profile, CoreType::Xray, &params, &rules, &dns).unwrap();
+        let config = ConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns).unwrap();
         assert!(matches!(config, BackendConfig::Xray(_)));
     }
 
     #[test]
     fn build_singbox_tuic_via_dispatch() {
-        let profile = test_profile(Protocol::Tuic.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
         let (params, rules, dns) = default_params();
         let config =
-            ConfigBuilder::build(&profile, CoreType::SingBox, &params, &rules, &dns).unwrap();
+            ConfigBuilder::build(&endpoint, &protocol, CoreType::SingBox, &params, &rules, &dns).unwrap();
         assert!(matches!(config, BackendConfig::SingBox(_)));
     }
 
     #[test]
     fn build_common_protocol_forced_to_singbox() {
         // Shadowsocks is supported by both xray and sing-box builders
-        let profile = test_profile(Protocol::Shadowsocks.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
         let config =
-            ConfigBuilder::build(&profile, CoreType::SingBox, &params, &rules, &dns).unwrap();
+            ConfigBuilder::build(&endpoint, &protocol, CoreType::SingBox, &params, &rules, &dns).unwrap();
         assert!(matches!(config, BackendConfig::SingBox(_)));
     }
 
     #[test]
     fn build_auto_returns_error() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let result = ConfigBuilder::build(&profile, CoreType::Auto, &params, &rules, &dns);
+        let result = ConfigBuilder::build(&endpoint, &protocol, CoreType::Auto, &params, &rules, &dns);
         assert!(result.is_err());
     }
 }

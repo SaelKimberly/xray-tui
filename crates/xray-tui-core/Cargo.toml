@@ -24,7 +24,7 @@ dirs.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
-tokio.features = ["process", "signal", "sync", "fs", "time", "io-util", "rt", "rt-multi-thread"]
+tokio.features = ["process", "signal", "sync", "fs", "time", "io-util", "rt", "rt-multi-thread", "net"]
 futures-util.workspace = true
 # ============ Protocol ============
 tonic = "0.14"

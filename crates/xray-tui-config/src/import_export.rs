@@ -2,8 +2,90 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
-use xray_tui_db::models::Profile;
 use xray_tui_proto::proto_spec::{PlaceholderConfig, ProtocolConfig};
+
+/// Local helper for URL parsing. Not a toasty model.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub id: i64,
+    pub sig: i64,
+    pub cred_hash: i64,
+    pub proto_kind: String,
+    pub spec_blob: Vec<u8>,
+    pub config_type: i32,
+    pub core_type: String,
+    pub address: String,
+    pub port: i32,
+    pub transport: Option<String>,
+    pub security: Option<String>,
+    pub created_at: i64,
+    pub remarks: Option<String>,
+    pub user_id: Option<String>,
+    pub network: Option<String>,
+    pub protocol_settings: Option<String>,
+    pub stream_settings: Option<String>,
+}
+
+/// Result of parsing a share URL: endpoint info + protocol data.
+pub struct ParsedProtocol {
+    pub host: String,
+    pub port: u16,
+    pub host_type: String,
+    pub config_type: i32,
+    pub proto_kind: String,
+    pub sig: i64,
+    pub cred_hash: i64,
+    pub spec_blob: Vec<u8>,
+    pub core_type: String,
+    pub transport: Option<String>,
+    pub security: Option<String>,
+    pub remarks: Option<String>,
+    pub created_at: i64,
+}
+
+impl From<Profile> for ParsedProtocol {
+    fn from(profile: Profile) -> Self {
+        ParsedProtocol {
+            host: profile.address.clone(),
+            port: profile.port as u16,
+            host_type: determine_host_type(&profile.address),
+            config_type: profile.config_type,
+            proto_kind: profile.proto_kind,
+            sig: profile.sig,
+            cred_hash: profile.cred_hash,
+            spec_blob: profile.spec_blob,
+            core_type: profile.core_type,
+            transport: profile.transport,
+            security: profile.security,
+            remarks: profile.remarks,
+            created_at: profile.created_at,
+        }
+    }
+}
+
+impl From<&ParsedProtocol> for Profile {
+    fn from(parsed: &ParsedProtocol) -> Self {
+        Profile {
+            id: 0,
+            sig: parsed.sig,
+            cred_hash: parsed.cred_hash,
+            proto_kind: parsed.proto_kind.clone(),
+            spec_blob: parsed.spec_blob.clone(),
+            config_type: parsed.config_type,
+            core_type: parsed.core_type.clone(),
+            address: parsed.host.clone(),
+            port: parsed.port as i32,
+            transport: parsed.transport.clone(),
+            security: parsed.security.clone(),
+            created_at: parsed.created_at,
+            remarks: parsed.remarks.clone(),
+            user_id: None,
+            network: None,
+            protocol_settings: None,
+            stream_settings: None,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
@@ -177,15 +259,16 @@ pub fn profile_user_id(config: &ProtocolConfig) -> Option<String> {
     }
     None
 }
-/// Parse a share URL into a Profile.
+/// Parse a share URL into endpoint + protocol data (ParsedProtocol).
 /// Tries the scheme-mapped parser first, then falls back through all other parsers.
 /// Validates the parsed profile against the given settings.
-pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profile> {
+pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<ParsedProtocol> {
     let scheme_end = url.find("://").unwrap_or(url.len());
     let scheme = &url[..scheme_end];
 
     let primary_idx = scheme_primary_index(scheme);
     let has_known_scheme = primary_idx.is_some();
+
 
     // Try primary parser first (if scheme is known)
     if let Some(idx) = primary_idx
@@ -229,7 +312,7 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Profi
 }
 
 /// Convert a legacy-parsed Profile's JSON spec_blob to JSON-encoded ProtocolConfig.
-fn convert_spec_blob(mut profile: Profile, settings: &ValidationSettings) -> Result<Profile> {
+fn convert_spec_blob(mut profile: Profile, settings: &ValidationSettings) -> Result<ParsedProtocol> {
     use xray_tui_core::protocol::Protocol;
     use xray_tui_proto::proto_spec::ProtoSpec;
 
@@ -261,7 +344,7 @@ fn convert_spec_blob(mut profile: Profile, settings: &ValidationSettings) -> Res
         }
     }
 
-    Ok(profile)
+    Ok(profile.into())
 }
 
 /// Validate a parsed profile, normalizing remarks.
@@ -273,25 +356,44 @@ fn validate_profile(mut profile: Profile, _settings: &ValidationSettings) -> Res
     Ok(profile)
 }
 
-/// Format a Profile back into a share URL string.
-pub fn format_share_url(profile: &Profile) -> Result<String> {
+/// Format a ParsedProtocol back into a share URL string.
+pub fn format_share_url(parsed: &ParsedProtocol) -> Result<String> {
+    let profile = Profile {
+        id: 0,
+        sig: parsed.sig,
+        cred_hash: parsed.cred_hash,
+        proto_kind: parsed.proto_kind.clone(),
+        spec_blob: parsed.spec_blob.clone(),
+        config_type: parsed.config_type,
+        core_type: parsed.core_type.clone(),
+        address: parsed.host.clone(),
+        port: parsed.port as i32,
+        transport: parsed.transport.clone(),
+        security: parsed.security.clone(),
+        created_at: parsed.created_at,
+        remarks: parsed.remarks.clone(),
+        user_id: None,
+        network: None,
+        protocol_settings: None,
+        stream_settings: None,
+    };
     let protocol = Protocol::try_from_i32(profile.config_type)
         .ok_or_else(|| ImportError::Parse("unknown config type".into()))?;
     match protocol {
-        Protocol::Vmess => format_vmess(profile),
-        Protocol::Vless => Ok(format_vless(profile)),
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => Ok(format_shadowsocks(profile)),
-        Protocol::Trojan => Ok(format_trojan(profile)),
-        Protocol::Socks => Ok(format_socks(profile)),
-        Protocol::Hysteria2 => Ok(format_hysteria2(profile)),
-        Protocol::Hysteria => Ok(format_hysteria(profile)),
-        Protocol::Tuic => Ok(format_tuic(profile)),
-        Protocol::Naive => Ok(format_naive(profile)),
-        Protocol::AnyTls => Ok(format_anytls(profile)),
-        Protocol::ShadowTls => Ok(format_shadowtls(profile)),
-        Protocol::WireGuard => Ok(format_wireguard(profile)),
-        Protocol::ShadowsocksR => Ok(format_shadowsocksr(profile)),
-        Protocol::Http => Ok(format_http(profile)),
+        Protocol::Vmess => format_vmess(&profile),
+        Protocol::Vless => Ok(format_vless(&profile)),
+        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => Ok(format_shadowsocks(&profile)),
+        Protocol::Trojan => Ok(format_trojan(&profile)),
+        Protocol::Socks => Ok(format_socks(&profile)),
+        Protocol::Hysteria2 => Ok(format_hysteria2(&profile)),
+        Protocol::Hysteria => Ok(format_hysteria(&profile)),
+        Protocol::Tuic => Ok(format_tuic(&profile)),
+        Protocol::Naive => Ok(format_naive(&profile)),
+        Protocol::AnyTls => Ok(format_anytls(&profile)),
+        Protocol::ShadowTls => Ok(format_shadowtls(&profile)),
+        Protocol::WireGuard => Ok(format_wireguard(&profile)),
+        Protocol::ShadowsocksR => Ok(format_shadowsocksr(&profile)),
+        Protocol::Http => Ok(format_http(&profile)),
         _ => Err(ImportError::UnsupportedScheme),
     }
 }
@@ -1698,6 +1800,19 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
     }
     result
 }
+
+fn determine_host_type(host: &str) -> String {
+    if host.is_empty() {
+        return "undefined".to_string();
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return "ipv4".to_string();
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return "ipv6".to_string();
+    }
+    "dns".to_string()
+}
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Build a new-style Profile from legacy parser fields.
@@ -1713,19 +1828,19 @@ fn build_legacy_profile(
     stream_settings: Option<String>,
 ) -> Profile {
     let mut extra = serde_json::Map::new();
-    if let Some(v) = user_id.filter(|s| !s.is_empty()) {
-        extra.insert("user_id".into(), serde_json::Value::String(v));
+    if let Some(v) = user_id.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = remarks.filter(|s| !s.is_empty()) {
-        extra.insert("remarks".into(), serde_json::Value::String(v));
+    if let Some(v) = remarks.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("remarks".into(), serde_json::Value::String(v.clone()));
     }
-    if let Some(v) = protocol_settings.filter(|s| !s.is_empty())
-        && let Ok(val) = serde_json::from_str(&v)
+    if let Some(v) = protocol_settings.as_ref().filter(|s| !s.is_empty())
+        && let Ok(val) = serde_json::from_str(v)
     {
         extra.insert("protocol_settings".into(), val);
     }
-    if let Some(v) = stream_settings.filter(|s| !s.is_empty())
-        && let Ok(val) = serde_json::from_str(&v)
+    if let Some(v) = stream_settings.as_ref().filter(|s| !s.is_empty())
+        && let Ok(val) = serde_json::from_str(v)
     {
         extra.insert("stream_settings".into(), val);
     }
@@ -1744,11 +1859,14 @@ fn build_legacy_profile(
             address.to_string()
         },
         port: if port > 0 { port } else { 0 },
-        transport: network,
-        security,
+        transport: network.clone(),
+        security: security.clone(),
         created_at: 0,
-        extension: Default::default(),
-        server_stat: Default::default(),
+        remarks,
+        user_id,
+        network,
+        protocol_settings,
+        stream_settings,
     }
 }
 
@@ -1758,6 +1876,14 @@ pub trait ProfileLegacy {
 }
 impl ProfileLegacy for Profile {
     fn leg(&self, key: &str) -> Option<String> {
+        // Check direct fields first
+        match key {
+            "remarks" => return self.remarks.clone(),
+            "user_id" => return self.user_id.clone(),
+            "network" => return self.network.clone(),
+            "security" => return self.security.clone(),
+            _ => {}
+        }
         // New format: JSON-encoded ProtocolConfig
         if let Ok(config) = serde_json::from_slice::<ProtocolConfig>(&self.spec_blob) {
             return leg_from_config(&config, key);
@@ -1892,6 +2018,14 @@ fn set_legacy_fields(
     protocol_settings: Option<String>,
     stream_settings: Option<String>,
 ) {
+    // Set direct fields
+    if let Some(v) = user_id.as_ref() { profile.user_id = Some(v.clone()); }
+    if let Some(v) = remarks.as_ref() { profile.remarks = Some(v.clone()); }
+    if let Some(v) = security.as_ref() { profile.security = Some(v.clone()); }
+    if let Some(v) = network.as_ref() { profile.network = Some(v.clone()); }
+    if let Some(v) = protocol_settings.as_ref() { profile.protocol_settings = Some(v.clone()); }
+    if let Some(v) = stream_settings.as_ref() { profile.stream_settings = Some(v.clone()); }
+
     // Try JSON-encoded ProtocolConfig format first
     if let Ok(config) = serde_json::from_slice::<ProtocolConfig>(&profile.spec_blob) {
         // Only stub protocols can be meaningfully patched
@@ -2503,58 +2637,55 @@ mod tests {
     fn normalize_remark_no_change_for_plain_text() {
         assert_eq!(normalize_remark("  My Server 1  "), "My Server 1");
     }
-
     #[test]
     fn roundtrip_vmess() {
         let mut p = base_profile(Protocol::Vmess, "example.com", 443);
         p.set_user_id(Some("uuid-here".into()));
         p.set_network(Some("ws".into()));
         p.set_stream_settings(Some(r#"{"ws.path":"/api","tls.enable":true}"#.into()));
-        let url = format_share_url(&p).unwrap();
+        let pp: ParsedProtocol = p.into();
+        let url = format_share_url(&pp).unwrap();
         assert!(url.starts_with("vmess://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(parsed.config_type, p.config_type);
-        assert_eq!(parsed.address, p.address);
-        assert_eq!(parsed.port, p.port);
+        assert_eq!(parsed.config_type, pp.config_type);
+        assert_eq!(parsed.host, pp.host);
+        assert_eq!(parsed.port, pp.port);
     }
-
     #[test]
     fn roundtrip_vless() {
         let mut p = base_profile(Protocol::Vless, "server.com", 443);
         p.set_user_id(Some("uuid".into()));
         p.set_remarks(Some("my vless".into()));
-        let url = format_share_url(&p).unwrap();
+        let pp: ParsedProtocol = p.into();
+        let url = format_share_url(&pp).unwrap();
         assert!(url.starts_with("vless://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(parsed.config_type, p.config_type);
+        assert_eq!(parsed.config_type, pp.config_type);
     }
-
     #[test]
     fn roundtrip_shadowsocks() {
         let mut p = base_profile(Protocol::Shadowsocks, "ss.example", 1080);
         p.set_user_id(Some("password123".into()));
         let mut ps = serde_json::Map::new();
-        ps.insert(
-            "method".into(),
-            serde_json::Value::String("aes-256-gcm".into()),
-        );
+        ps.insert("method".into(), serde_json::Value::String("aes-256-gcm".into()));
         p.set_protocol_settings(Some(serde_json::to_string(&ps).unwrap()));
         p.set_remarks(Some("myss".into()));
-        let url = format_share_url(&p).unwrap();
+        let pp: ParsedProtocol = p.into();
+        let url = format_share_url(&pp).unwrap();
         assert!(url.starts_with("ss://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(parsed.config_type, p.config_type);
+        assert_eq!(parsed.config_type, pp.config_type);
     }
-
     #[test]
     fn roundtrip_trojan() {
         let mut p = base_profile(Protocol::Trojan, "trojan.example", 443);
         p.set_user_id(Some("password".into()));
         p.set_remarks(Some("troj".into()));
-        let url = format_share_url(&p).unwrap();
+        let pp: ParsedProtocol = p.into();
+        let url = format_share_url(&pp).unwrap();
         assert!(url.starts_with("trojan://"));
         let parsed = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(parsed.config_type, p.config_type);
+        assert_eq!(parsed.config_type, pp.config_type);
     }
 
     #[test]
@@ -2569,7 +2700,7 @@ mod tests {
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         let url = format!("vmess://{b64}");
         let p = parse_share_url(&url, &permissive_settings()).unwrap();
-        assert_eq!(p.address, "1.2.3.4");
+        assert_eq!(p.host, "1.2.3.4");
         assert_eq!(p.port, 443);
     }
 
@@ -2582,23 +2713,25 @@ mod tests {
     const WORKING_URL_1: &str = "vless://a5ea9247-79f3-4655-aece-3fb51e1e669e@146.103.99.45:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=rezerv.yunus.guru&fp=firefox&pbk=S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg&sid=a7ec6c3316eddb11&type=tcp&headerType=none#%5B332ms%20%D0%A4%D0%B8%D0%BD%D0%BB%D1%8F%D0%BD%D0%B4%D0%B8%D1%8F%20FI%20%F0%9F%87%AB%F0%9F%87%AE%20%40vlesstrojan%5D";
     const WORKING_URL_2: &str = "vless://a5ea9247-79f3-4655-aece-3fb51e1e669e@144.124.241.233:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=rezerv1.yunus.guru&fp=firefox&pbk=-X9CZv5MYKivpxPVP1vdgFKf2AJWmZ0Pju-j8LFmlh4&sid=6c88854e73e86773&type=tcp&headerType=none#%5B333ms%20%D0%A4%D0%B8%D0%BD%D0%BB%D1%8F%D0%BD%D0%B4%D0%B8%D1%8F%20FI%20%F0%9F%87%AB%F0%9F%87%AE%20%40vlesstrojan%5D";
     const WORKING_URL_3: &str = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTprMWRCT21PQjRvcWk3VW1wMzdhMWJR@82.38.31.192:8080?#%5B164ms%20%D0%90%D0%B2%D1%81%D1%82%D1%80%D0%B8%D1%8F%20AT%20%F0%9F%87%A6%F0%9F%87%B9%20%40vlesstrojan%5D";
-    const WORKING_URL_4: &str = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpDSm1UQ0N4N0x0dWQ@108.181.126.122:8388?#%5B140ms%20%D0%90%D0%B2%D1%81%D1%82%D1%80%D0%B8%D1%8F%20AT%20%F0%9F%87%A6%F0%9F%87%B9%20%40vlesstrojan%5D";
     #[test]
     fn parse_working_txt_urls() {
+        fn leg(p: &ParsedProtocol, key: &str) -> Option<String> {
+            Profile::from(p).leg(key)
+        }
         // ── VLESS Reality URL 1 ──
         let p = parse_share_url(WORKING_URL_1, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Vless.to_i32());
-        assert_eq!(p.address, "146.103.99.45");
+        assert_eq!(p.host, "146.103.99.45");
         assert_eq!(p.port, 443);
         assert_eq!(
-            p.leg("user_id").as_deref(),
+            leg(&p, "user_id").as_deref(),
             Some("a5ea9247-79f3-4655-aece-3fb51e1e669e")
         );
-        assert_eq!(p.leg("network").as_deref(), Some("tcp"));
-        assert!(p.leg("remarks").unwrap().contains("Финляндия"));
+        assert_eq!(leg(&p, "network").as_deref(), Some("tcp"));
+        assert!(leg(&p, "remarks").unwrap().contains("Финляндия"));
 
         // Reality params now extracted (parser fix applied)
-        if let Some(ss) = p.leg("stream_settings") {
+        if let Some(ss) = leg(&p, "stream_settings") {
             let v: serde_json::Value =
                 serde_json::from_str(&ss).expect("stream_settings must be valid JSON");
             let obj = v.as_object().expect("stream_settings must be an object");
@@ -2622,16 +2755,16 @@ mod tests {
         // ── VLESS Reality URL 2 ──
         let p = parse_share_url(WORKING_URL_2, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Vless.to_i32());
-        assert_eq!(p.address, "144.124.241.233");
+        assert_eq!(p.host, "144.124.241.233");
         assert_eq!(p.port, 443);
         assert_eq!(
-            p.leg("user_id").as_deref(),
+            leg(&p, "user_id").as_deref(),
             Some("a5ea9247-79f3-4655-aece-3fb51e1e669e")
         );
-        assert_eq!(p.leg("network").as_deref(), Some("tcp"));
+        assert_eq!(leg(&p, "network").as_deref(), Some("tcp"));
 
         // Reality params now extracted (parser fix applied)
-        if let Some(ss) = p.leg("stream_settings") {
+        if let Some(ss) = leg(&p, "stream_settings") {
             let v: serde_json::Value =
                 serde_json::from_str(&ss).expect("stream_settings must be valid JSON");
             let obj = v.as_object().expect("stream_settings must be an object");
@@ -2655,33 +2788,32 @@ mod tests {
         // ── Shadowsocks URL 3 ──
         let p = parse_share_url(WORKING_URL_3, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.address, "82.38.31.192");
+        assert_eq!(p.host, "82.38.31.192");
         assert_eq!(p.port, 8080);
-        assert!(p.leg("remarks").unwrap().contains("Австрия"));
-        if let Some(ps) = p.leg("protocol_settings") {
+        assert!(leg(&p, "remarks").unwrap().contains("Австрия"));
+        if let Some(ps) = leg(&p, "protocol_settings") {
             let v: serde_json::Value =
                 serde_json::from_str(&ps).expect("protocol_settings must be valid JSON");
             assert_eq!(v["method"], "chacha20-ietf-poly1305");
         } else {
             panic!("Shadowsocks URL should have protocol_settings");
         }
-        assert_eq!(p.leg("user_id").as_deref(), Some("k1dBOmOB4oqi7Ump37a1bQ"));
+        assert_eq!(leg(&p, "user_id").as_deref(), Some("k1dBOmOB4oqi7Ump37a1bQ"));
 
         // ── Shadowsocks URL 4 ──
         let p = parse_share_url(WORKING_URL_4, &permissive_settings()).unwrap();
         assert_eq!(p.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p.address, "108.181.126.122");
+        assert_eq!(p.host, "108.181.126.122");
         assert_eq!(p.port, 8388);
-        if let Some(ps) = p.leg("protocol_settings") {
+        if let Some(ps) = leg(&p, "protocol_settings") {
             let v: serde_json::Value =
                 serde_json::from_str(&ps).expect("protocol_settings must be valid JSON");
             assert_eq!(v["method"], "chacha20-ietf-poly1305");
         } else {
             panic!("Shadowsocks URL should have protocol_settings");
         }
-        assert_eq!(p.leg("user_id").as_deref(), Some("CJmTCCx7Ltud"));
+        assert_eq!(leg(&p, "user_id").as_deref(), Some("CJmTCCx7Ltud"));
     }
-
     #[test]
     fn roundtrip_vless_reality() {
         // Parse working VLESS Reality URL, format back, re-parse
@@ -2691,13 +2823,16 @@ mod tests {
         // Re-parse should preserve all Reality fields
         let p2 = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p2.config_type, Protocol::Vless.to_i32());
-        assert_eq!(p2.address, p1.address);
+        assert_eq!(p2.host, p1.host);
         assert_eq!(p2.port, p1.port);
-        assert_eq!(p2.leg("user_id"), p1.leg("user_id"));
-        assert_eq!(p2.leg("network"), p1.leg("network"));
+        // Build Profile wrappers for leg() access
+        let pr1 = Profile::from(&p1);
+        let pr2 = Profile::from(&p2);
+        assert_eq!(pr2.leg("user_id"), pr1.leg("user_id"));
+        assert_eq!(pr2.leg("network"), pr1.leg("network"));
         // Compare stream_settings (Reality params)
-        let ss1 = p1.leg("stream_settings");
-        let ss2 = p2.leg("stream_settings");
+        let ss1 = pr1.leg("stream_settings");
+        let ss2 = pr2.leg("stream_settings");
         if let (Some(ss1), Some(ss2)) = (&ss1, &ss2) {
             let v1: serde_json::Value =
                 serde_json::from_str(ss1).expect("stream_settings must be valid JSON");
@@ -2711,7 +2846,6 @@ mod tests {
             panic!("Both profiles should have stream_settings");
         }
     }
-
     #[test]
     fn roundtrip_shadowsocks_real() {
         let p1 = parse_share_url(WORKING_URL_3, &permissive_settings()).unwrap();
@@ -2719,11 +2853,13 @@ mod tests {
         assert!(url.starts_with("ss://"));
         let p2 = parse_share_url(&url, &permissive_settings()).unwrap();
         assert_eq!(p2.config_type, Protocol::Shadowsocks.to_i32());
-        assert_eq!(p2.address, p1.address);
+        assert_eq!(p2.host, p1.host);
         assert_eq!(p2.port, p1.port);
-        assert_eq!(p2.leg("user_id"), p1.leg("user_id"));
-        let ps1 = p1.leg("protocol_settings");
-        let ps2 = p2.leg("protocol_settings");
+        let pr1 = Profile::from(&p1);
+        let pr2 = Profile::from(&p2);
+        assert_eq!(pr2.leg("user_id"), pr1.leg("user_id"));
+        let ps1 = pr1.leg("protocol_settings");
+        let ps2 = pr2.leg("protocol_settings");
         if let (Some(ps1), Some(ps2)) = (&ps1, &ps2) {
             let v1: serde_json::Value =
                 serde_json::from_str(&ps1).expect("protocol_settings must be valid JSON");
@@ -2774,7 +2910,7 @@ mod tests {
             reject_insecure: false,
         };
         let p = parse_share_url(url, &settings).unwrap();
-        assert_eq!(p.address, "127.0.0.1");
+        assert_eq!(p.host, "127.0.0.1");
     }
 
     #[test]

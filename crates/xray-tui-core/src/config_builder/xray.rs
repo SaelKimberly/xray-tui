@@ -1,6 +1,6 @@
 use serde::Serialize;
 use serde_json::{Value, json};
-use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
+use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
 
@@ -88,13 +88,14 @@ pub struct XrayConfigBuilder;
 
 impl XrayConfigBuilder {
     pub fn build(
-        profile: &Profile,
+        endpoint: &Endpoint,
+        protocol: &ProtocolRow,
         params: &BuildParams,
         routing: &[RoutingRule],
         dns: &DnsSetting,
     ) -> Result<XrayConfig, BuildError> {
         let outbounds = vec![
-            build_proxy_outbound(profile)?,
+            build_proxy_outbound(endpoint, protocol)?,
             build_dns_outbound(),
             build_direct_outbound(),
             build_block_outbound(),
@@ -172,19 +173,18 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
 }
 
 // ── Outbound construction ────────────────────────────────────────────
-
-fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
-    let protocol = Protocol::try_from_i32(profile.config_type).ok_or_else(|| {
-        BuildError::InvalidProfile(format!("Unknown config_type: {}", profile.config_type))
+fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow) -> Result<Outbound, BuildError> {
+    let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
+        BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
     })?;
 
-    let address = profile.address.as_str();
-    let port = profile.port as u16;
-    let user_id = ""; // TODO: cached on Profile
+    let address = endpoint.host.as_str();
+    let port = endpoint.port as u16;
+    let user_id = ""; // TODO: cached on ProtocolRow
     let p_settings = serde_json::Value::Null; // TODO: from spec_blob
     let s_settings: Option<serde_json::Value> = None; // TODO: from spec_blob
 
-    match protocol {
+    match proto {
         Protocol::Vmess => Ok(Outbound {
             tag: "proxy".to_string(),
             protocol: "vmess".to_string(),
@@ -194,7 +194,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
                     "port": port,
                     "users": [{
                         "id": user_id,
-                        "security": profile.security.as_deref().unwrap_or("auto")
+                        "security": protocol.security.as_deref().unwrap_or("auto")
                     }]
                 }]
             }),
@@ -306,7 +306,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Outbound, BuildError> {
             })
         }
         _ => Err(BuildError::InvalidProfile(format!(
-            "Protocol {protocol:?} not supported for xray outbound"
+            "Protocol {proto:?} not supported for xray outbound"
         ))),
     }
 }
@@ -436,31 +436,42 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xray_tui_db::models::{DnsSetting, Profile, RoutingRule};
+    use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
-    fn test_profile(config_type: i32) -> Profile {
-        let mut profile = Profile {
+    fn test_endpoint_and_protocol(config_type: i32) -> (Endpoint, ProtocolRow) {
+        let endpoint = Endpoint {
             id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            spec_blob: Vec::new(),
-            config_type,
-            core_type: String::new(),
-            address: "example.com".to_string(),
+            host: "example.com".to_string(),
+            host_type: "dns".to_string(),
             port: 443,
-            transport: Some("tcp".to_string()),
-            security: Some("auto".to_string()),
+            port_spec_str: None,
+            parent_id: None,
+            last_source: None,
             created_at: 0,
-            extension: Default::default(),
-            server_stat: Default::default(),
+            manual_protocol_override: None,
         };
         let extra = serde_json::json!({
             "remarks": "test",
             "user_id": "test-uuid-or-pass",
         });
-        profile.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
-        profile
+        let protocol = ProtocolRow {
+            id: 0,
+            endpoint_id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
+            config_type,
+            core_type: String::new(),
+            transport: Some("tcp".to_string()),
+            security: Some("auto".to_string()),
+            remarks: None,
+            created_at: 0,
+            last_seen_at: 0,
+            extension: Default::default(),
+            server_stat: Default::default(),
+        };
+        (endpoint, protocol)
     }
 
     fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
@@ -526,9 +537,9 @@ mod tests {
 
     #[test]
     fn xray_vmess_config() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "vmess");
@@ -537,9 +548,9 @@ mod tests {
 
     #[test]
     fn xray_vless_config() {
-        let profile = test_profile(Protocol::Vless.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "vless");
@@ -547,9 +558,9 @@ mod tests {
 
     #[test]
     fn xray_shadowsocks_config() {
-        let profile = test_profile(Protocol::Shadowsocks.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
@@ -557,9 +568,9 @@ mod tests {
 
     #[test]
     fn xray_trojan_config() {
-        let profile = test_profile(Protocol::Trojan.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Trojan.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "trojan");
@@ -567,9 +578,9 @@ mod tests {
 
     #[test]
     fn xray_socks_config() {
-        let profile = test_profile(Protocol::Socks.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Socks.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "socks");
@@ -577,9 +588,9 @@ mod tests {
 
     #[test]
     fn xray_http_config() {
-        let profile = test_profile(Protocol::Http.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Http.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "http");
@@ -587,9 +598,9 @@ mod tests {
 
     #[test]
     fn xray_hysteria2_config() {
-        let profile = test_profile(Protocol::Hysteria2.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "hysteria2");
@@ -597,9 +608,9 @@ mod tests {
 
     #[test]
     fn xray_inbounds_default() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 2, "should have 2 inbounds (SOCKS + API)");
@@ -611,10 +622,10 @@ mod tests {
 
     #[test]
     fn xray_inbounds_with_http() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (mut params, rules, dns) = default_params();
         params.http_port = Some(10809);
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
         assert_eq!(
@@ -633,9 +644,9 @@ mod tests {
     #[test]
     fn xray_unknown_protocol_returns_error() {
         // Protocol::WireGuard = 9 — not in our supported list
-        let profile = test_profile(Protocol::WireGuard.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::WireGuard.to_i32());
         let (params, rules, dns) = default_params();
-        let result = XrayConfigBuilder::build(&profile, &params, &rules, &dns);
+        let result = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns);
         assert!(result.is_err(), "unsupported protocol should return error");
         match result {
             Err(BuildError::InvalidProfile(_)) => {} // expected
@@ -645,7 +656,7 @@ mod tests {
 
     #[test]
     fn xray_routing_with_domain_rule() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, _, dns) = default_params();
         let rules = vec![RoutingRule {
             id: "r1".to_string(),
@@ -666,7 +677,7 @@ mod tests {
             rule_set_url: None,
             sort_order: Some(0),
         }];
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let routing_rules = json["routing"]["rules"].as_array().unwrap();
         // First rule is the mandatory API routing rule
@@ -681,9 +692,9 @@ mod tests {
 
     #[test]
     fn xray_stream_settings_passed_through() {
-        let profile = test_profile(Protocol::Vmess.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let outbounds = json["outbounds"].as_array().unwrap();
         let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();
@@ -693,9 +704,9 @@ mod tests {
 
     #[test]
     fn vless_reality_stream_settings_passed_through() {
-        let profile = test_profile(Protocol::Vless.to_i32());
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&profile, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "vless");
