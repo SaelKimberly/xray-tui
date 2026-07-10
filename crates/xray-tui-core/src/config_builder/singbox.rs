@@ -860,6 +860,19 @@ fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow) -> Option<Value> {
         tls.insert("ech".into(), json!(ech));
     }
 
+    // tls.fragment: emit fragment: true + record_fragment when enabled
+    let fragment_enabled = s_settings
+        .get("fragment.enable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || p_settings
+            .get("fragment.enable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if fragment_enabled {
+        tls.insert("fragment".into(), json!(true));
+    }
+
     // reality: check both URL-import (security) and form (reality.show) paths
     let is_reality = s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
         || s_settings

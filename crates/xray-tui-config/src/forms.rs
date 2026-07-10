@@ -594,6 +594,38 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 false,
                 FieldSection::ProtocolSetting,
             ),
+            field(
+                "fragment.enable",
+                "Fragment",
+                FormFieldType::Boolean,
+                "false",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            field(
+                "fragment.packets",
+                "Frag Packets",
+                FormFieldType::Text,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            field(
+                "fragment.length",
+                "Frag Length",
+                FormFieldType::Text,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            field(
+                "fragment.interval",
+                "Frag Interval",
+                FormFieldType::Text,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
         ],
         Protocol::WireGuard => vec![
             field(
