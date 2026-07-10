@@ -737,9 +737,8 @@ pub async fn move_profile_down(state: &mut AppState) {
 
 pub async fn set_active(state: &mut AppState, id: &str) {
     let pid: i64 = id.parse().unwrap_or(0);
-    let _group_id = state.first_group_id();
-    if let Err(e) = state.db.set_protocol_override(pid, 0).await {
-        state.log_trace("error", "tui", &format!("Failed to set active: {e}"));
+    if let Err(e) = state.db.clear_protocol_override(pid).await {
+        state.log_trace("error", "tui", &format!("Failed to clear override: {e}"));
         return;
     }
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
@@ -816,6 +815,7 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
             // Check if previous endpoint is expanded — move to its last sub-row
             if let Some((expanded, len)) = prev_info {
                 if expanded && len > 1 {
+                    state.selected_index = state.selected_index.saturating_sub(1);
                     state.selected_sub = Some(len - 1);
                     return true;
                 }

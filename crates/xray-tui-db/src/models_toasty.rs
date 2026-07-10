@@ -203,9 +203,17 @@ pub struct EndpointRow {
 }
 
 impl EndpointRow {
-    /// Returns the currently selected protocol row.
+    /// Returns the currently active protocol row, respecting manual override.
+    /// Falls back to `selected_protocol` if override is unset or protocol not found.
     #[must_use]
     pub fn active_protocol(&self) -> &ProtocolRow {
+        // Check manual override first
+        if let Some(override_id) = self.endpoint.manual_protocol_override {
+            if let Some(p) = self.protocols.iter().find(|p| p.id == override_id) {
+                return p;
+            }
+        }
+        // Fall back to selected_protocol index
         self.protocols
             .get(self.selected_protocol)
             .unwrap_or_else(|| &self.protocols[0])
