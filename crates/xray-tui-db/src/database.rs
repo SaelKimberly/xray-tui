@@ -738,6 +738,14 @@ impl Database {
         Ok(())
     }
 
+    pub async fn clear_all_stats(&self) -> Result<()> {
+        let mut conn = self.db.connection().await?;
+        toasty::sql::statement("DELETE FROM server_stats")
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_server_stats(&self, stats: &ServerStat) -> Result<()> {
         let mut conn = self.db.connection().await?;
         toasty::sql::statement(

@@ -341,5 +341,6 @@ pub enum ConfirmAction {
     ClearGroup(String),
     ClearLogs,
     PurgeLogsDatabase,
+    ClearStats,
     Quit,
 }

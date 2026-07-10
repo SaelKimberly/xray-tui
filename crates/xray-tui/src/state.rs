@@ -1239,6 +1239,18 @@ impl AppState {
         self.log_trace("info", "tui", "Log database cleared");
     }
 
+    /// Clear all server stats (traffic counters).
+    pub async fn clear_all_stats(&mut self) {
+        if let Err(e) = self.db.clear_all_stats().await {
+            self.log_trace("error", "tui", &format!("Failed to clear stats: {e}"));
+            return;
+        }
+        self.endpoints_gen = self.endpoints_gen.wrapping_add(1);
+        self.filter_cache_valid.set(false);
+        self.confirmation = None;
+        self.log_trace("info", "tui", "All stats cleared");
+    }
+
     // ── Subscription update ──────────────────────────────────────────
 
     pub fn update_group_subscriptions(&mut self, group_id: &str) {

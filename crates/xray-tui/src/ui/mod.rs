@@ -48,6 +48,19 @@ pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
         .style(Style::new().bg(Color::Rgb(40, 20, 20)));
     frame.render_widget(popup, area);
 }
+
+/// Render the correct confirmation text for any `ConfirmAction` variant.
+/// Call once per render path instead of duplicating per-variant checks.
+pub fn render_any_confirmation(frame: &mut Frame, area: Rect, state: &AppState) {
+    let text = match state.confirmation {
+        Some(crate::ConfirmAction::Quit) => " Quit? (y/N) ",
+        Some(crate::ConfirmAction::ClearStats) => " Clear all stats? (y/N) ",
+        Some(crate::ConfirmAction::ClearLogs) => " Clear logs? (y/N) ",
+        Some(crate::ConfirmAction::PurgeLogsDatabase) => " Purge logs database? (y/N) ",
+        _ => return,
+    };
+    render_confirmation_overlay(frame, area, text);
+}
 // ── Entry point ───────────────────────────────────────────────────────
 
 pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
@@ -202,6 +215,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 }
                 Some(ConfirmAction::ClearLogs) => state.clear_logs(),
                 Some(ConfirmAction::PurgeLogsDatabase) => state.purge_logs_database(),
+                Some(ConfirmAction::ClearStats) => state.clear_all_stats().await,
                 None => {}
             },
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
@@ -354,6 +368,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     }
                     10 => {
                         state.stop_speed_test();
+                    }
+                    12 => {
+                        state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
                 }
@@ -740,9 +757,7 @@ fn render(frame: &mut Frame, state: &AppState) {
     if overlay {
         render_tabs(frame, chunks[0], state);
         actions_log::render_full(frame, chunks[1], state);
-        if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
-            render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
-        }
+        render_any_confirmation(frame, chunks[1], state);
         status_bar::render(frame, chunks[3], state);
         return;
     }
@@ -767,9 +782,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {
             profiles::render(frame, chunks[1], state);
             render_speed_test_menu(frame, chunks[1], state);
-            if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
-                render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
-            }
+            render_any_confirmation(frame, chunks[1], state);
             status_bar::render(frame, chunks[3], state);
             return;
         }
@@ -777,9 +790,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         if matches!(&state.mode, crate::AppMode::TargetPicker { .. }) {
             logs::render(frame, chunks[1], state);
             logs::render_target_picker(frame, chunks[1], state);
-            if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
-                render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
-            }
+            render_any_confirmation(frame, chunks[1], state);
             status_bar::render(frame, chunks[3], state);
             return;
         }
@@ -793,9 +804,7 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
             }
             render_help_overlay(frame, chunks[1], state);
-            if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
-                render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
-            }
+            render_any_confirmation(frame, chunks[1], state);
             status_bar::render(frame, chunks[3], state);
             return;
         }
@@ -815,9 +824,7 @@ fn render(frame: &mut Frame, state: &AppState) {
             }
             _ => {}
         }
-        if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
-            render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
-        }
+        render_any_confirmation(frame, chunks[1], state);
         status_bar::render(frame, chunks[3], state);
         return;
     }
@@ -828,9 +835,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         Tab::Statistics => statistics::render(frame, chunks[1], state),
         Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
     }
-    if matches!(state.confirmation, Some(crate::ConfirmAction::Quit)) {
-        render_confirmation_overlay(frame, chunks[1], " Quit? (y/N) ");
-    }
+    render_any_confirmation(frame, chunks[1], state);
     status_bar::render(frame, chunks[3], state);
 }
 fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
@@ -949,6 +954,8 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Stop Testing"),
+    SpeedTestMenuItem::Separator,
+    SpeedTestMenuItem::Item("Clear All Stats"),
 ];
 
 fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
