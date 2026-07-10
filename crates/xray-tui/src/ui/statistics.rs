@@ -35,10 +35,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         security: active_proto.security.clone(),
         created_at: active_proto.created_at,
         remarks: active_proto.remarks.clone(),
-        user_id: None,
-        network: None,
-        protocol_settings: None,
-        stream_settings: None,
     })
     .and_then(|c| c.remarks().map(String::from))
     .unwrap_or_else(|| "Unknown".to_string());

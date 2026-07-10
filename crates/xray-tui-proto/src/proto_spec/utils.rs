@@ -8,6 +8,7 @@ use crate::urlx::{HostSpec, PortSpec, RawUrlX, TinyText};
 
 use super::ParseError;
 
+
 /// Check that a host is not loopback, private, or localhost.
 ///
 /// # Errors
@@ -38,6 +39,7 @@ fn validate_host_not_private(host: &HostSpec) -> Result<(), ParseError> {
     Ok(())
 }
 
+
 /// Parse host:port from a string, returning (`HostSpec`, `PortSpec`)
 ///
 /// # Errors
@@ -50,6 +52,7 @@ pub fn parse_hostport(s: &str) -> Result<(HostSpec, PortSpec), ParseError> {
     let (tail, (host, port)) = crate::utils::host_port_spec(s.as_bytes())
         .map_err(|_| ParseError::InvalidHostPort(format!("Invalid hostport: {s}").into()))?;
     let host = host.to_owned();
+    validate_host_not_private(&host)?;
     if !tail.is_empty() {
         let tail_str = unsafe { std::str::from_utf8_unchecked(tail) };
         // Lenient: if tail contains query-like chars (= or &), strip it
@@ -70,6 +73,7 @@ pub fn parse_host(s: &str) -> Result<HostSpec, ParseError> {
     let (tail, host) = crate::utils::host_port::host(s.as_bytes())
         .map_err(|_| ParseError::InvalidHost(format!("Invalid host: {s}").into()))?;
     let host = host.to_owned();
+    validate_host_not_private(&host)?;
     if !tail.is_empty() {
         return Err(ParseError::InvalidHost(
             format!("Invalid host: {s} (non-empty tail: {})", unsafe {

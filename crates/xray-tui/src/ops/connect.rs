@@ -42,10 +42,6 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
             security: p.security.clone(),
             created_at: p.created_at,
             remarks: p.remarks.clone(),
-            user_id: None,
-            network: None,
-            protocol_settings: None,
-            stream_settings: None,
         };
         let core_override = p.core_type.parse::<CoreType>().ok();
         (r.endpoint.clone(), p.clone(), profile, core_override)

@@ -368,10 +368,6 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
         security,
         created_at: now as i64,
         remarks: remarks.clone(),
-        user_id: user_id.clone(),
-        network,
-        protocol_settings: protocol_settings_str.clone(),
-        stream_settings: stream_settings_str.clone(),
     };
     let mut extra = serde_json::Map::new();
     if let Some(v) = &remarks {

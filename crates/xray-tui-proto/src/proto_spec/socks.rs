@@ -276,10 +276,10 @@ mod tests {
 
     #[test]
     fn test_ipv6() {
-        let url = "socks://[::1]:1080";
+        let url = "socks://[2001:db8::1]:1080";
         let raw = crate::urlx::RawUrlX::from(url);
         let config = Socks5Config::try_parse(&raw).expect("failed to parse");
-        assert_eq!(config.host.to_str(), "::1");
+        assert_eq!(config.host.to_str(), "2001:db8::1");
         assert_eq!(config.port, 1080);
     }
 

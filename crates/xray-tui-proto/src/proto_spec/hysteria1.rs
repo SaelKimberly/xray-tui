@@ -387,10 +387,10 @@ mod tests {
 
     #[test]
     fn test_hysteria1_ipv6() {
-        let url = "hysteria://[::1]:443?protocol=udp";
+        let url = "hysteria://[2001:db8::1]:443?protocol=udp";
         let raw = crate::urlx::RawUrlX::from(url);
         let config = Hysteria1Config::try_parse(&raw).expect("failed to parse");
-        assert_eq!(config.host.to_str(), "::1");
+        assert_eq!(config.host.to_str(), "2001:db8::1");
         assert_eq!(config.port, 443);
     }
 
