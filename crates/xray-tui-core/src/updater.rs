@@ -161,6 +161,39 @@ pub async fn download_release<F: Fn(u64, u64) + Send + 'static>(
     Ok(dest)
 }
 
+
+/// Download a geo file (geoip.dat or geosite.dat) from URL to dest_dir.
+pub async fn download_geo_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest_dir: &Path,
+) -> Result<PathBuf, UpdateError> {
+    let filename = url.rsplit('/').next().unwrap_or("geo.dat");
+    let dest = dest_dir.join(filename);
+
+    std::fs::create_dir_all(dest_dir)?;
+
+    let resp = client
+        .get(url)
+        .header("User-Agent", "xray-tui")
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await
+        .map_err(|e| UpdateError::Http(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(UpdateError::Download(format!("HTTP {}", resp.status())));
+    }
+
+    let mut file = tokio::fs::File::create(&dest).await?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| UpdateError::Download(e.to_string()))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    }
+
+    Ok(dest)
+}
 /// Extract archive, verify binary, install all files to `bin_dir`.
 /// Uses spawn_blocking for synchronous archive extraction and file copy.
 pub async fn install_binary(

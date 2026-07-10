@@ -926,6 +926,22 @@ impl AppState {
                         "tcp_ping_concurrency".into(),
                         self.config.speed_test.tcp_ping_concurrency.to_string(),
                     ),
+                    (
+                        "geoip_url".into(),
+                        self.config.geo.geoip_url.clone(),
+                    ),
+                    (
+                        "geosite_url".into(),
+                        self.config.geo.geosite_url.clone(),
+                    ),
+                    (
+                        "geo_auto_update".into(),
+                        self.config.geo.auto_update.to_string(),
+                    ),
+                    (
+                        "geo_update_interval".into(),
+                        self.config.geo.update_interval_hours.to_string(),
+                    ),
                 ]
             }
             Logging => {
@@ -1058,6 +1074,16 @@ impl AppState {
                 }
                 if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
                     self.config.speed_test.tcp_ping_concurrency = v.max(1);
+                }
+                if !get_str("geoip_url").is_empty() {
+                    self.config.geo.geoip_url = get("geoip_url");
+                }
+                if !get_str("geosite_url").is_empty() {
+                    self.config.geo.geosite_url = get("geosite_url");
+                }
+                self.config.geo.auto_update = get_str("geo_auto_update") == "true";
+                if let Ok(v) = get_str("geo_update_interval").parse::<u64>() {
+                    self.config.geo.update_interval_hours = v;
                 }
             }
             // Dns and Routing are handled separately (DB-backed)

@@ -227,6 +227,22 @@ pub async fn build_settings_fields(
                     "tcp_ping_concurrency".into(),
                     state.config.speed_test.tcp_ping_concurrency.to_string(),
                 ),
+                (
+                    "geoip_url".into(),
+                    state.config.geo.geoip_url.clone(),
+                ),
+                (
+                    "geosite_url".into(),
+                    state.config.geo.geosite_url.clone(),
+                ),
+                (
+                    "geo_auto_update".into(),
+                    state.config.geo.auto_update.to_string(),
+                ),
+                (
+                    "geo_update_interval".into(),
+                    state.config.geo.update_interval_hours.to_string(),
+                ),
             ]
         }
         Dns => {
@@ -404,6 +420,16 @@ fn apply_settings_fields(
             }
             if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
                 state.config.speed_test.tcp_ping_concurrency = v.max(1);
+            }
+            if !get_str("geoip_url").is_empty() {
+                state.config.geo.geoip_url = get("geoip_url");
+            }
+            if !get_str("geosite_url").is_empty() {
+                state.config.geo.geosite_url = get("geosite_url");
+            }
+            state.config.geo.auto_update = get_str("geo_auto_update") == "true";
+            if let Ok(v) = get_str("geo_update_interval").parse::<u64>() {
+                state.config.geo.update_interval_hours = v;
             }
         }
         // Dns and Routing are handled separately (DB-backed)

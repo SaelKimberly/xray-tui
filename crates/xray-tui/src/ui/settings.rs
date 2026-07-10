@@ -548,6 +548,10 @@ fn form_field_defs_for_section(
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
             ("tcp_ping_concurrency", "TCP Ping Concurrency", "Number"),
+            ("geoip_url", "GeoIP URL", "Url"),
+            ("geosite_url", "GeoSite URL", "Url"),
+            ("geo_auto_update", "Geo Auto Update", "Boolean"),
+            ("geo_update_interval", "Geo Update Interval Hours", "Number"),
         ],
         SettingsSection::Logging => &[
             ("log_ttl_secs", "Log Retention", "Duration"),
