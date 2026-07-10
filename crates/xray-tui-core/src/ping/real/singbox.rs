@@ -46,6 +46,7 @@ pub(super) async fn real_ping(
             sniffing: false,
             clash_api_port: None,
             mux: None,
+            clash_mixin: None,
             skip_cert_verify: false,
         };
 
@@ -70,7 +71,7 @@ pub(super) async fn real_ping(
         let (log_line_tx, _log_rx) = mpsc::channel(512);
         let mut manager = CoreManager::with_log_channel(temp_dir_path.clone(), log_line_tx);
         manager
-            .start(resolved_core, &backend_config, &bin_path)
+            .start(resolved_core, &backend_config, &bin_path, None)
             .await
             .map_err(|e| format!("Core start: {e}"))?;
 

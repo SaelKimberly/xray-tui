@@ -107,13 +107,13 @@ impl CoreManager {
             log_tx: Some(log_tx),
         }
     }
-
     /// Start a core process with the given config and binary path.
     pub async fn start(
         &mut self,
         core_type: CoreType,
         config: &BackendConfig,
         binary_path: &Path,
+        clash_mixin: Option<&serde_json::Value>,
     ) -> Result<(), ProcessError> {
         // Stop any running core of a different type
         if let Some(running) = &self.current
@@ -130,6 +130,21 @@ impl CoreManager {
         let json = match config {
             BackendConfig::Xray(c) => serde_json::to_string_pretty(c)?,
             BackendConfig::SingBox(c) => serde_json::to_string_pretty(c)?,
+        };
+        // Apply clash mixin: parse the serialized JSON, merge mixin fields, re-serialize
+        let json = if let Some(mixin_value) = clash_mixin
+            && let Some(mixin_obj) = mixin_value.as_object()
+            && !mixin_obj.is_empty()
+        {
+            let mut root: serde_json::Value = serde_json::from_str(&json)?;
+            if let Some(obj) = root.as_object_mut() {
+                for (key, val) in mixin_obj {
+                    obj.insert(key.clone(), val.clone());
+                }
+            }
+            serde_json::to_string_pretty(&root)?
+        } else {
+            json
         };
         tokio::fs::write(&config_path, &json).await?;
 

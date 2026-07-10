@@ -489,6 +489,7 @@ mod tests {
             sniffing: false,
             clash_api_port: None,
             mux: None,
+            clash_mixin: None,
             skip_cert_verify: false,
         };
         let rules = vec![];

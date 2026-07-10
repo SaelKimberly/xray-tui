@@ -1,6 +1,7 @@
 pub mod singbox;
 pub mod xray;
 
+pub mod clash_mixin;
 use crate::core_type::CoreType;
 use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
@@ -22,6 +23,7 @@ pub struct BuildParams {
     pub sniffing: bool,
     pub skip_cert_verify: bool,
     pub mux: Option<serde_json::Value>,
+    pub clash_mixin: Option<serde_json::Value>,
 }
 
 use serde::Serialize;
@@ -132,6 +134,7 @@ mod tests {
             sniffing: false,
             clash_api_port: None,
             mux: None,
+            clash_mixin: None,
             skip_cert_verify: false,
         };
         let rules = vec![];

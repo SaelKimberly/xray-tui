@@ -684,6 +684,10 @@ impl AppState {
                         "skip_cert_verify".into(),
                         self.config.core.skip_cert_verify.to_string(),
                     ),
+                    (
+                        "clash_mixin".into(),
+                        self.config.clash_mixin.clone().unwrap_or_default(),
+                    ),
                 ]
             }
             Gui => {
@@ -1023,6 +1027,10 @@ impl AppState {
                 }
                 self.config.core.skip_cert_verify =
                     get_str("skip_cert_verify") == "true";
+                self.config.clash_mixin = {
+                    let v = get_str("clash_mixin");
+                    if v.is_empty() { None } else { Some(v.to_owned()) }
+                };
             }
             Gui => {
                 self.config.gui.language = get("language");

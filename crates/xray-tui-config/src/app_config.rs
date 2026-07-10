@@ -33,6 +33,8 @@ pub struct AppConfig {
     pub theme_name: ThemeName,
     pub clash_api_port: Option<u16>,
     #[serde(default)]
+    pub clash_mixin: Option<String>,
+    #[serde(default)]
     pub purgatory: PurgatoryConfig,
 }
 

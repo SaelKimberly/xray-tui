@@ -7,6 +7,7 @@ use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{
     BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core,
+    config_builder::clash_mixin::parse_clash_mixin,
 };
 use xray_tui_db::models::{DnsSetting, RoutingRule};
 
@@ -98,7 +99,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
             "max_streams": state.config.mux.max_streams,
             "padding": state.config.mux.padding,
         })) } else { None },
-
+        clash_mixin: state.config.clash_mixin.as_deref().and_then(parse_clash_mixin),
         skip_cert_verify: state.config.core.skip_cert_verify,
     };
 
@@ -155,10 +156,9 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
             ), "binary_not_found");
             return;
         };
-
         // 3. Start core
         let mut manager = CoreManager::with_log_channel(bin_configs_dir, log_line_tx);
-        if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
+        if let Err(e) = manager.start(core_type, &backend_config, &bin_path, params.clash_mixin.as_ref()).await {
             try_send_or_warn(
                 &tx,
                 CoreEvent::Error(format!("Failed to start core: {e}")),

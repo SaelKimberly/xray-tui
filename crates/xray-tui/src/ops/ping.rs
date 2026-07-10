@@ -125,6 +125,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         sniffing: false,
         clash_api_port: None,
             mux: None,
+            clash_mixin: None,
         skip_cert_verify: false,
     };
 
@@ -216,7 +217,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         // 4. Start core (discard log lines from temp core)
         let (log_line_tx, mut _log_line_rx) = mpsc::channel::<String>(512);
         let mut manager = CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
-        if let Err(e) = manager.start(core_type, &backend_config, &bin_path).await {
+        if let Err(e) = manager.start(core_type, &backend_config, &bin_path, None).await {
             try_send_or_warn(
                 &tx,
                 CoreEvent::SpeedTestResult {
