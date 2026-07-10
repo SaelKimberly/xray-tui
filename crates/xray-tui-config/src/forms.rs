@@ -364,6 +364,14 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 false,
                 FieldSection::ProtocolSetting,
             ),
+            field(
+                "pin_sha256",
+                "Pin SHA256",
+                FormFieldType::Text,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
         ],
         Protocol::WireGuard => vec![
             field(
