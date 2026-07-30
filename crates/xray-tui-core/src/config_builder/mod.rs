@@ -38,7 +38,17 @@ pub(crate) fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
         return config.to_settings();
     }
     let extra: Value = serde_json::from_slice(&protocol.spec_blob).unwrap_or_else(|_| json!({}));
-    let p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
+    let mut p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
+    // Inject `user_id` as `id` into p_settings if absent (legacy parsers store
+    // UUID/PW at top level, not inside protocol_settings).
+    if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str()) {
+        if let Some(obj) = p_settings.as_object_mut() {
+            if !obj.contains_key("id") && !obj.contains_key("uuid") {
+                obj.entry("id".to_string())
+                    .or_insert(serde_json::Value::String(user_id.to_string()));
+            }
+        }
+    }
     let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
     (p_settings, s_settings)
 }

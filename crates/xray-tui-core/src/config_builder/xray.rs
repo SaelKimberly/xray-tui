@@ -134,7 +134,7 @@ impl XrayConfigBuilder {
             },
             inbounds: build_inbounds(params),
             outbounds,
-            routing: build_routing(routing),
+            routing: build_routing(routing, params.v2ray_api_enabled),
             dns: build_dns(dns),
             stats,
             api,
@@ -375,15 +375,17 @@ fn build_block_outbound() -> Outbound {
 
 // ── Routing ──────────────────────────────────────────────────────────
 
-fn build_routing(rules: &[RoutingRule]) -> RoutingConfig {
-    // Mandatory: route API inbound traffic to the internal API handler.
-    // Without this rule, xray-core tunnels gRPC connections through the proxy outbound.
-    let api_rule = json!({
-        "type": "field",
-        "inboundTag": ["api"],
-        "outboundTag": "api"
-    });
-    let mut json_rules: Vec<Value> = vec![api_rule];
+fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfig {
+    let mut json_rules: Vec<Value> = Vec::new();
+    // Only add API routing rule when v2ray_api is enabled.
+    // When disabled (e.g. real ping temp core), no "api" inbound/outbound exist.
+    if v2ray_api_enabled {
+        json_rules.push(json!({
+            "type": "field",
+            "inboundTag": ["api"],
+            "outboundTag": "api"
+        }));
+    }
     json_rules.extend(rules.iter().filter_map(|r| {
         let mut rule = json!({ "type": "field" });
         if let Some(domains) = &r.domains {

@@ -49,7 +49,34 @@ impl Database {
         };
 
         let mut conn = db.connection().await?;
-        db.push_schema().await?;
+
+        // Check schema version before running push_schema.
+        // toasty 0.9 uses CREATE TABLE without IF NOT EXISTS, so we must
+        // only run push_schema on fresh databases.
+        const SCHEMA_VERSION: i64 = 1;
+        let rows = toasty::sql::query("PRAGMA user_version")
+            .exec(&mut conn)
+            .await?;
+        let current_version: i64 = rows
+            .first()
+            .and_then(|v| {
+                if let Value::Record(fields) = v {
+                    fields.first().and_then(|f| match f {
+                        Value::I64(n) => Some(*n),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        if current_version < SCHEMA_VERSION {
+            db.push_schema().await?;
+            toasty::sql::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .exec(&mut conn)
+                .await?;
+        }
 
         toasty::sql::query("PRAGMA journal_mode=WAL")
             .exec(&mut conn)

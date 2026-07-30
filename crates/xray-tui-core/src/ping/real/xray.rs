@@ -67,7 +67,15 @@ pub(super) async fn real_ping(
         let bin_path =
             find_binary(resolved_core, &bin_dir).ok_or_else(|| "Binary not found".to_string())?;
 
-        let (log_line_tx, _log_rx) = mpsc::channel(512);
+        let (log_line_tx, mut log_rx) = mpsc::channel(512);
+        // Spawn reader to capture xray-core stderr for diagnostics
+        // (includes config validation errors on exit code 23)
+        let log_dir = temp_dir_path.clone();
+        tokio::spawn(async move {
+            while let Some(line) = log_rx.recv().await {
+                tracing::warn!(target: "core::real_ping", dir=%log_dir.display(), "{line}");
+            }
+        });
         let mut manager = CoreManager::with_log_channel(temp_dir_path.clone(), log_line_tx);
         manager
             .start(resolved_core, &backend_config, &bin_path, None)

@@ -215,8 +215,14 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
             return;
         };
 
-        // 4. Start core (discard log lines from temp core)
-        let (log_line_tx, mut _log_line_rx) = mpsc::channel::<String>(512);
+        // 4. Start core (capture stderr from temp core for diagnostics)
+        let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
+        let log_dir = temp_dir.clone();
+        tokio::spawn(async move {
+            while let Some(line) = log_line_rx.recv().await {
+                tracing::warn!(target: "core::real_ping", dir=%log_dir.display(), "{line}");
+            }
+        });
         let mut manager = CoreManager::with_log_channel(temp_dir.clone(), log_line_tx);
         if let Err(e) = manager
             .start(core_type, &backend_config, &bin_path, None)

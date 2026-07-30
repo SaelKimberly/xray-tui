@@ -231,10 +231,20 @@ impl ProtocolConfig {
             Self::Redirect(c) | Self::TProxy(c) | Self::Mixed(c) => {
                 let extra: serde_json::Value =
                     serde_json::from_slice(&c.settings_json).unwrap_or_default();
-                let p = extra
+                let mut p = extra
                     .get("protocol_settings")
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                // Inject `user_id` as `id` into p_settings if absent (legacy
+                // parsers store UUID/PW at top level, not inside protocol_settings).
+                if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str()) {
+                    if let Some(obj) = p.as_object_mut() {
+                        if !obj.contains_key("id") && !obj.contains_key("uuid") {
+                            obj.entry("id".to_string())
+                                .or_insert(serde_json::Value::String(user_id.to_string()));
+                        }
+                    }
+                }
                 let s = extra
                     .get("stream_settings")
                     .cloned()
