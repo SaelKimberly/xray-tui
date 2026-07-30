@@ -1069,7 +1069,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
             };
             if let Some(id) = rule_id {
                 let _ = state.db.delete_routing_rule(&id).await;
-                state.log_trace("info", "tui", "Routing rule deleted");
+                state.log_trace("info", "tui::ui::settings", "Routing rule deleted");
                 let new_max = list_len.saturating_sub(2);
                 if let AppMode::Settings {
                     mode:

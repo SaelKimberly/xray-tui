@@ -37,6 +37,7 @@ pub struct AppState {
     pub selected_index: usize,
     pub selected_sub: Option<usize>,
     pub log_scroll: usize,
+    pub log_select_anchor: Option<usize>,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub search_query: String,

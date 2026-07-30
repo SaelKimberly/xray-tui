@@ -91,12 +91,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let active_count = state.selected_targets.len();
-    let filter_text = if active_count > 0 {
+    let sel_active = state.log_select_anchor.is_some();
+    let filter_label = if active_count > 0 {
+        format!("({active_count} active)")
+    } else {
+        "(all)".into()
+    };
+    let filter_text = if sel_active {
         format!(
-            " [T] Filter  ({active_count} active)  \u{2191}\u{2193} Scroll  PgUp/PgDn  Home/End",
+            " [T] Filter {filter_label}  \u{2191}\u{2193} Select  y Copy  Y All  PgUp/PgDn  Home/End  Esc done",
         )
     } else {
-        " [T] Filter  (all)  \u{2191}\u{2193} Scroll  PgUp/PgDn  Home/End".to_string()
+        format!(
+            " [T] Filter {filter_label}  \u{2191}\u{2193} Scroll  y Copy  Shift+\u{2191}\u{2193} Select  PgUp/PgDn  Home/End",
+        )
     };
     let bar = Line::from(Span::styled(filter_text, ThemeStyles::hint(&palette)));
     frame.render_widget(Paragraph::new(bar), filter_area);
@@ -169,20 +177,49 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         Column::new("Message", ColumnWidth::Ratio(4)),
     ];
 
-    // Compute offset from bottom-aligned scroll (0 = newest at bottom)
+    // Compute offset — during selection, pin viewport so entire range is visible
     let approx_visible = (log_area.height as usize).saturating_sub(2);
-    let offset = filtered_count.saturating_sub(state.log_scroll + approx_visible);
+    let offset = if let Some(anchor) = state.log_select_anchor {
+        let oldest_row = filtered_count.saturating_sub(state.log_scroll.max(anchor) + 1);
+        let newest_row = filtered_count.saturating_sub(state.log_scroll.min(anchor) + 1);
+        let range_height = newest_row.saturating_sub(oldest_row).saturating_add(1);
+        if range_height <= approx_visible {
+            oldest_row
+        } else {
+            filtered_count.saturating_sub(state.log_scroll + approx_visible)
+        }
+    } else {
+        filtered_count.saturating_sub(state.log_scroll + approx_visible)
+    };
+
+    // Build multi-selection set from anchor range (offset-from-bottom)
+    let mut multi_selected = HashSet::new();
+    if let Some(anchor) = state.log_select_anchor {
+        let lo = state.log_scroll.min(anchor);
+        let hi = state.log_scroll.max(anchor);
+        // Convert offset-from-bottom to row indices (0 = oldest)
+        let lo_row = filtered_count.saturating_sub(hi + 1);
+        let hi_row = filtered_count.saturating_sub(lo + 1);
+        for i in lo_row..=hi_row {
+            multi_selected.insert(i);
+        }
+    }
+
+    // Cursor row in filtered index space
+    let cursor_row = filtered_count.saturating_sub(state.log_scroll + 1);
+    let selected = cursor_row.checked_sub(offset).filter(|&s| s < log_rows.len());
 
     let data_table = DataTable::new(columns, &log_rows)
         .column_spacing(1)
+        .selection_style(ThemeStyles::table_row_selected(&palette))
         .scrollbar(
             ThemeStyles::scrollbar_thumb(&palette),
             ThemeStyles::scrollbar_track(&palette),
         );
     let mut dt_state = DataTableState {
         offset,
-        selected: None,
-        multi_selected: HashSet::new(),
+        selected,
+        multi_selected,
     };
     frame.render_stateful_widget(data_table, log_area, &mut dt_state);
 
@@ -209,7 +246,17 @@ fn shorten_target(target: &str) -> String {
 /// Handle key events for the Logs tab.
 pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
     let height = state.term_height.get().saturating_sub(5) as usize;
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
+        KeyCode::Up if shift => {
+            state.log_select_anchor.get_or_insert(state.log_scroll);
+            state.log_scroll = state.log_scroll.saturating_add(1);
+            try_load_older(state).await;
+        }
+        KeyCode::Down if shift => {
+            state.log_select_anchor.get_or_insert(state.log_scroll);
+            state.log_scroll = state.log_scroll.saturating_sub(1);
+        }
         KeyCode::Up => {
             state.log_scroll = state.log_scroll.saturating_add(1);
             try_load_older(state).await;
@@ -239,6 +286,19 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Delete => {
             state.confirmation = Some(crate::ConfirmAction::PurgeLogsDatabase);
+        }
+        KeyCode::Char('y') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if state.log_select_anchor.is_some() {
+                copy_selection(state);
+            } else {
+                copy_cursor_line(state);
+            }
+        }
+        KeyCode::Char('Y') => {
+            copy_all_filtered(state);
+        }
+        KeyCode::Esc => {
+            state.log_select_anchor = None;
         }
         _ => {}
     }
@@ -289,6 +349,9 @@ pub(super) async fn try_load_older(state: &mut AppState) {
                 .collect();
             let n = new_lines.len();
             state.log_scroll = state.log_scroll.saturating_add(n);
+            if let Some(ref mut a) = state.log_select_anchor {
+                *a = a.saturating_add(n);
+            }
             new_lines.append(&mut state.log_cache);
             state.log_cache = new_lines;
             let before = state.log_cache.len();
@@ -297,10 +360,13 @@ pub(super) async fn try_load_older(state: &mut AppState) {
             }
             let popped = before - state.log_cache.len();
             state.log_scroll = state.log_scroll.saturating_sub(popped);
+            if let Some(ref mut a) = state.log_select_anchor {
+                *a = a.saturating_sub(popped);
+            }
         }
         Err(e) => {
             state.log_has_older = false;
-            tracing::error!(target: "log_worker", "Failed to load older logs: {e}");
+            tracing::error!(target: "tui::ui::logs::load", "Failed to load older logs: {e}");
         }
     }
 }
@@ -318,7 +384,7 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
     {
         Ok(e) => e,
         Err(e) => {
-            tracing::error!(target: "log_worker", "Failed to poll new logs: {e}");
+            tracing::error!(target: "tui::ui::logs::poll", "Failed to poll new logs: {e}");
             return;
         }
     };
@@ -348,12 +414,18 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
     } else {
         // If not at bottom, adjust scroll by new entries count
         state.log_scroll = state.log_scroll.saturating_add(new_count);
+        if let Some(ref mut a) = state.log_select_anchor {
+            *a = a.saturating_add(new_count);
+        }
     }
     let excess = state.log_cache.len().saturating_sub(10_000);
     if excess > 0 {
         state.log_cache.drain(0..excess);
         if state.log_scroll > 0 {
             state.log_scroll = state.log_scroll.saturating_sub(excess);
+            if let Some(ref mut a) = state.log_select_anchor {
+                *a = a.saturating_sub(excess);
+            }
         }
     }
 }
@@ -469,6 +541,138 @@ pub fn handle_target_picker_key(state: &mut AppState, key: &KeyEvent) {
             state.mode = crate::AppMode::List;
         }
         _ => {}
+    }
+}
+
+// ── Copy —───────────────────────────────────────────────────────────
+
+/// Copy the selected log range to the system clipboard.
+fn copy_selection(state: &AppState) {
+    let Some(anchor) = state.log_select_anchor else {
+        return copy_cursor_line(state);
+    };
+    if state.log_cache.is_empty() {
+        return;
+    }
+    let filtered_indices: Vec<usize> = state
+        .log_cache
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            if state.selected_targets.is_empty()
+                || state.selected_targets.contains(&l.target)
+            {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let filtered_count = filtered_indices.len();
+    if filtered_count == 0 {
+        return;
+    }
+    let lo = state.log_scroll.min(anchor);
+    let hi = state.log_scroll.max(anchor);
+    // Convert offset-from-bottom to filtered indices
+    let lo_fi = filtered_count.saturating_sub(hi + 1);
+    let hi_fi = filtered_count.saturating_sub(lo + 1);
+    if lo_fi > hi_fi || lo_fi >= filtered_count {
+        return;
+    }
+    let hi_fi = hi_fi.min(filtered_count - 1);
+    let lines: Vec<String> = filtered_indices[lo_fi..=hi_fi]
+        .iter()
+        .filter_map(|&ci| state.log_cache.get(ci))
+        .map(|log| {
+            format!(
+                "{} [{}] [{}] {}",
+                fmt_ts(log.timestamp_nanos),
+                log.level,
+                log.target,
+                log.message,
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    let text = lines.join("\n");
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text);
+    }
+}
+
+/// Copy the log line under the cursor to the system clipboard.
+fn copy_cursor_line(state: &AppState) {
+    if state.log_cache.is_empty() {
+        return;
+    }
+    let filtered_indices: Vec<usize> = state
+        .log_cache
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            if state.selected_targets.is_empty()
+                || state.selected_targets.contains(&l.target)
+            {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let filtered_count = filtered_indices.len();
+    if filtered_count == 0 {
+        return;
+    }
+    let cursor_idx = filtered_count.saturating_sub(state.log_scroll + 1);
+    let Some(&cache_idx) = filtered_indices.get(cursor_idx) else {
+        return;
+    };
+    let Some(log) = state.log_cache.get(cache_idx) else {
+        return;
+    };
+    let text = format!(
+        "{} [{}] [{}] {}",
+        fmt_ts(log.timestamp_nanos),
+        log.level,
+        log.target,
+        log.message,
+    );
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text);
+    }
+}
+
+/// Copy ALL filtered log entries to the system clipboard.
+fn copy_all_filtered(state: &AppState) {
+    if state.log_cache.is_empty() {
+        return;
+    }
+    let lines: Vec<String> = state
+        .log_cache
+        .iter()
+        .filter(|l| {
+            state.selected_targets.is_empty()
+                || state.selected_targets.contains(&l.target)
+        })
+        .map(|log| {
+            format!(
+                "{} [{}] [{}] {}",
+                fmt_ts(log.timestamp_nanos),
+                log.level,
+                log.target,
+                log.message,
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    let text = lines.join("\n");
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text);
     }
 }
 

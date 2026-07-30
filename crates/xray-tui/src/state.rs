@@ -54,6 +54,9 @@ pub struct AppState {
     pub selected_sub: Option<usize>,
     /// Scroll offset from the bottom of the log buffer (0 = newest visible).
     pub log_scroll: usize,
+    /// Anchor for multi-line selection in logs tab (offset from bottom).
+    /// `None` = no active selection.
+    pub log_select_anchor: Option<usize>,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub search_query: String,
@@ -224,6 +227,7 @@ impl AppState {
             selected_sub: None,
             selected_index: 0,
             log_scroll: 0,
+            log_select_anchor: None,
             sort_column: SortColumn::Remarks,
             sort_ascending: true,
             search_query: String::new(),
@@ -310,7 +314,7 @@ impl AppState {
                     self.known_targets = targets;
                 }
             }
-            Err(e) => tracing::error!(target: "log_worker", "Failed to load initial logs: {e}"),
+            Err(e) => tracing::error!(target: "tui::state::log_init", "Failed to load initial logs: {e}"),
         }
     }
 
@@ -1337,13 +1341,14 @@ impl AppState {
     pub fn clear_logs(&mut self) {
         self.log_cache.clear();
         self.log_scroll = 0;
+        self.log_select_anchor = None;
         // Set cursor to now so poll_new_logs doesn't re-read old entries
         self.last_seen_log_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         self.confirmation = None;
-        self.log_trace("info", "tui", "Logs cleared");
+        self.log_trace("info", "tui::state", "Logs cleared");
     }
 
     /// Clear entire log database (heed) in addition to the in-memory cache.
@@ -1353,6 +1358,7 @@ impl AppState {
     pub fn purge_logs_database(&mut self) {
         self.log_cache.clear();
         self.log_scroll = 0;
+        self.log_select_anchor = None;
         self.last_seen_log_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1362,24 +1368,24 @@ impl AppState {
             let heed = heed.clone();
             tokio::spawn(async move {
                 if let Err(e) = heed.clear_all_async().await {
-                    tracing::error!(target: "tui", "Failed to clear log database: {e}");
+                    tracing::error!(target: "tui::state", "Failed to clear log database: {e}");
                 }
             });
         }
         self.confirmation = None;
-        self.log_trace("info", "tui", "Log database cleared");
+        self.log_trace("info", "tui::state", "Log database cleared");
     }
 
     /// Clear all server stats (traffic counters).
     pub async fn clear_all_stats(&mut self) {
         if let Err(e) = self.db.clear_all_stats().await {
-            self.log_trace("error", "tui", &format!("Failed to clear stats: {e}"));
+            self.log_trace("error", "tui::state", &format!("Failed to clear stats: {e}"));
             return;
         }
         self.endpoints_gen = self.endpoints_gen.wrapping_add(1);
         self.filter_cache_valid.set(false);
         self.confirmation = None;
-        self.log_trace("info", "tui", "All stats cleared");
+        self.log_trace("info", "tui::state", "All stats cleared");
     }
 
     // ── Subscription update ──────────────────────────────────────────

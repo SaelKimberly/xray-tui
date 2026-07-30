@@ -181,7 +181,7 @@ impl CoreManager {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if log_tx.try_send(line.clone()).is_err() {
-                    warn!(target: "log_worker", "reader channel full, dropping log line");
+                    warn!(target: "core::process::reader", "reader channel full, dropping log line");
                     // Don't exit — keep reading and drop stale lines
                 }
             }
@@ -198,7 +198,7 @@ impl CoreManager {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if log_tx.try_send(line.clone()).is_err() {
-                    warn!(target: "log_worker", "reader channel full, dropping log line");
+                    warn!(target: "core::process::reader", "reader channel full, dropping log line");
                     // Don't exit — keep reading and drop stale lines
                 }
             }

@@ -114,7 +114,7 @@ impl TransportConfig {
                     "type".into(),
                     other.to_string().into(),
                 )), |recovered| {
-                    tracing::warn!(target: "proto_spec", transport = %other, recovered = %recovered, "Recovered transport type");
+                    tracing::warn!(target: "proto_spec::common", transport = %other, recovered = %recovered, "Recovered transport type");
                     Self::from_type_and_path(Some(recovered), path)
                 })
 

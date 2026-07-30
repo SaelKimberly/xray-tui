@@ -32,7 +32,7 @@ use xray_tui_proto::proto_spec::ProtoSpec;
 /// Prevents silent event loss.
 fn try_send_or_warn(tx: &mpsc::Sender<CoreEvent>, event: CoreEvent, label: &'static str) {
     if let Err(_e) = tx.try_send(event) {
-        warn!(target: "log_worker", "try_send dropped {label}: channel full");
+        warn!(target: "tui::events", "try_send dropped {label}: channel full");
     }
 }
 

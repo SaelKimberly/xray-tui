@@ -41,26 +41,26 @@ pub async fn poll_core_events(state: &mut AppState) {
                 state.connected_core = Some(core_type);
                 state.connecting = false;
                 state.connection_error = None;
-                state.log_trace("info", "core", &format!("Connected [{core_type}]"));
+                state.log_trace("info", "core::process", &format!("Connected [{core_type}]"));
             }
             CoreEvent::Disconnected => {
                 // Ignore stale Disconnected if already reconnecting
                 if !state.connecting {
                     state.connected_core = None;
                     state.connected_protocol_id = None;
-                    state.log_trace("info", "core", "Core process stopped");
+                    state.log_trace("info", "core::process", "Core process stopped");
                 }
             }
             CoreEvent::Error(err) => {
                 state.connection_error = Some(err.clone());
                 state.connecting = false;
                 state.connected_core = None;
-                state.log_trace("error", "core", &format!("Connection error: {err}"));
+                state.log_trace("error", "core::process", &format!("Connection error: {err}"));
                 state.connected_protocol_id = None;
             }
             CoreEvent::StatsError(msg) => {
                 state.connection_error = Some(msg.clone());
-                state.log_trace("warning", "core", &format!("Stats error: {msg}"));
+                state.log_trace("warning", "core::process", &format!("Stats error: {msg}"));
             }
             CoreEvent::StatsUpdate {
                 protocol_id,
@@ -80,7 +80,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                     protocol_row: Default::default(),
                 };
                 if let Err(e) = state.db.upsert_server_stats(&stats).await {
-                    state.log_trace("error", "tui", &format!("Failed to save stats: {e}"));
+                    state.log_trace("error", "tui::ops::events", &format!("Failed to save stats: {e}"));
                 }
                 // Update in-memory endpoint row to avoid full reload
                 if let Some(row) = state
@@ -134,18 +134,18 @@ pub async fn poll_core_events(state: &mut AppState) {
                         summary.security_warning_count,
                         summary.other_count,
                     );
-                    state.log_trace("warn", "subscription", &msg);
+                    state.log_trace("warn", "tui::ops::subscriptions", &msg);
                 }
                 if let Some(err) = error {
                     state.log_trace(
                         "error",
-                        "subscription",
+                        "tui::ops::subscriptions",
                         &format!("Subscription update failed: {err}"),
                     );
                 } else {
                     state.log_trace(
                         "info",
-                        "subscription",
+                        "tui::ops::subscriptions",
                         &format!("Subscription updated: {count} profiles"),
                     );
                 }
@@ -213,7 +213,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                 if let Some(ref err) = error {
                     state.log_trace(
                         "warn",
-                        "speedtest",
+                        "tui::ops::speedtest",
                         &format!("{test_type:?} failed for {name}: {err}"),
                     );
                 } else {
@@ -228,7 +228,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                     };
                     state.log_trace(
                         "info",
-                        "speedtest",
+                        "tui::ops::speedtest",
                         &format!("{test_type:?} {name}: {detail}"),
                     );
                 }
@@ -339,7 +339,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                     status.update_available = false;
                     state.log_trace(
                         "info",
-                        "tui",
+                        "tui::ops::events",
                         &format!(
                             "{core_type} updated: {} → {}",
                             old_version.as_deref().unwrap_or("none"),
@@ -350,7 +350,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                     status.error.clone_from(&error);
                     state.log_trace(
                         "error",
-                        "tui",
+                        "tui::ops::events",
                         &format!("{core_type} update failed: {error:?}"),
                     );
                 }

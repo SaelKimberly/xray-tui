@@ -17,7 +17,7 @@ use crate::types::{CoreEvent, EndpointRow};
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
     if state.testing_profiles.contains(&protocol_id) {
-        state.log_trace("warn", "tui", "Test already in progress for this profile");
+        state.log_trace("warn", "tui::ops::ping", "Test already in progress for this profile");
         return;
     }
     // Find the profile and extract address:port
@@ -28,25 +28,25 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
     {
         r
     } else {
-        state.log_trace("error", "tui", "Profile not found for TCP ping");
+        state.log_trace("error", "tui::ops::ping", "Profile not found for TCP ping");
         return;
     };
     if row.endpoint.host.is_empty() {
-        state.log_trace("error", "tui", "Profile has no address");
+        state.log_trace("error", "tui::ops::ping", "Profile has no address");
         return;
     }
     let addr = row.endpoint.host.clone();
     let port = if row.endpoint.port > 0 && row.endpoint.port <= 65535 {
         row.endpoint.port as u16
     } else {
-        state.log_trace("error", "tui", "Profile has invalid port");
+        state.log_trace("error", "tui::ops::ping", "Profile has invalid port");
         return;
     };
 
     let tx = if let Some(tx) = &state.core_event_tx {
         tx.clone()
     } else {
-        state.log_trace("error", "tui", "Core event channel not initialized");
+        state.log_trace("error", "tui::ops::ping", "Core event channel not initialized");
         return;
     };
 
@@ -93,7 +93,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         endpoint = r.endpoint.clone();
         r.active_protocol().clone()
     } else {
-        state.log_trace("error", "tui", "Profile not found for real ping");
+        state.log_trace("error", "tui::ops::ping", "Profile not found for real ping");
         return;
     };
     let p = protocol;
@@ -283,7 +283,7 @@ pub fn start_speed_test(state: &mut AppState, protocol_id: i64) {
     if state.connected_core.is_none() {
         state.log_trace(
             "warn",
-            "tui",
+            "tui::ops::ping",
             "Core not connected — proxy required for speed test",
         );
         return;
@@ -338,7 +338,7 @@ pub fn start_udp_test(state: &mut AppState, protocol_id: i64) {
     if state.connected_core.is_none() {
         state.log_trace(
             "warn",
-            "tui",
+            "tui::ops::ping",
             "Core not connected — proxy required for UDP test",
         );
         return;
@@ -428,7 +428,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
     if visible.is_empty() {
         state.log_trace(
             "info",
-            "tui",
+            "tui::ops::ping",
             if real_ping_enabled {
                 "No profiles to test"
             } else {
@@ -473,13 +473,13 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
         let count = match count {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(target: "tui", "create_ping_batch failed: {e}");
+                tracing::error!(target: "tui::ops::ping", "create_ping_batch failed: {e}");
                 progress.0.store(0, Ordering::Relaxed);
                 return;
             }
         };
         if count == 0 {
-            tracing::warn!(target: "tui", "create_ping_batch returned 0 — no matching profile_cores?");
+            tracing::warn!(target: "tui::ops::ping", "create_ping_batch returned 0 — no matching profile_cores?");
             progress.0.store(0, Ordering::Relaxed);
             return;
         }
@@ -509,7 +509,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                 .get_batch_page_ready_for_fast_ping(&batch_id, page_size)
                 .await;
             let Ok(sessions) = sessions else {
-                tracing::error!(target: "tui", "get_batch_page_ready_for_fast_ping failed");
+                tracing::error!(target: "tui::ops::ping", "get_batch_page_ready_for_fast_ping failed");
                 progress.0.store(0, Ordering::Relaxed);
                 break;
             };
@@ -617,7 +617,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                     .get_batch_page_ready_for_real_ping(&batch_id, page_size)
                     .await;
                 let Ok(sessions) = sessions else {
-                    tracing::error!(target: "tui", "get_batch_page_ready_for_real_ping failed");
+                    tracing::error!(target: "tui::ops::ping", "get_batch_page_ready_for_real_ping failed");
                     progress.0.store(0, Ordering::Relaxed);
                     break;
                 };
@@ -744,5 +744,5 @@ pub async fn remove_failed_servers(state: &mut AppState) {
         crate::ops::profiles::delete_profile(state, id).await;
     }
     state.multi_select.clear();
-    state.log_trace("info", "tui", &format!("Removed {count} failed server(s)"));
+    state.log_trace("info", "tui::ops::ping", &format!("Removed {count} failed server(s)"));
 }

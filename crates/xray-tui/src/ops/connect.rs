@@ -47,7 +47,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         let core_override = p.core_type.parse::<CoreType>().ok();
         (r.endpoint.clone(), p.clone(), profile, core_override)
     } else {
-        state.log_trace("error", "tui", "Profile not found for connection");
+        state.log_trace("error", "tui::ops::connect", "Profile not found for connection");
         return;
     };
 
@@ -56,7 +56,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
     } else {
         state.log_trace(
             "error",
-            "tui",
+            "tui::ops::connect",
             &format!("Unknown protocol: {}", profile.config_type),
         );
         return;
@@ -79,7 +79,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         tx.clone()
     } else {
         state.connecting = false;
-        state.log_trace("error", "tui", "Core event channel not initialized");
+        state.log_trace("error", "tui::ops::connect", "Core event channel not initialized");
         return;
     };
 
@@ -376,5 +376,5 @@ pub fn disconnect(state: &mut AppState) {
     state.connected_core = None;
     state.connected_protocol_id = None;
     state.connecting = false;
-    state.log_trace("info", "core", "Disconnected");
+    state.log_trace("info", "core::process", "Disconnected");
 }

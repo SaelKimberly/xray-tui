@@ -198,7 +198,7 @@ impl ProtoSpec for VlessConfig {
                     xcfg.mode = Some(TinyText::from(mode));
                 } else if let Some(recovered) = recover_xhttp_mode(mode) {
                     tracing::warn!(
-                        target: "proto_spec",
+                        target: "proto_spec::vless",
                         "Recovered XHttp mode from '{}' to '{}'",
                         mode, recovered
                     );

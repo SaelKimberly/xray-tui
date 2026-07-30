@@ -388,7 +388,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
-    // Logs tab: route only scroll and filter keys to logs handler
+    // Logs tab: route logs-specific keys (scroll, filter, copy, selection)
     if state.current_tab == crate::Tab::Logs && matches!(state.mode, crate::AppMode::List) {
         let is_logs_key = matches!(
             key.code,
@@ -399,7 +399,8 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 | KeyCode::Home
                 | KeyCode::End
                 | KeyCode::Delete
-                | KeyCode::Char('c' | 't' | 'T')
+                | KeyCode::Esc
+                | KeyCode::Char('c' | 't' | 'T' | 'y' | 'Y')
         ) && !key.modifiers.contains(KeyModifiers::CONTROL);
         if is_logs_key {
             logs::handle_key(state, key).await;
@@ -538,7 +539,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     if let Err(e) = state.db.set_protocol_override(ep, p).await {
                         state.log_trace(
                             "error",
-                            "tui",
+                            "tui::ui",
                             &format!("Failed to set protocol override: {e}"),
                         );
                     }
@@ -589,7 +590,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if state.current_tab == Tab::Profiles && !state.testing_profiles.is_empty() =>
         {
             state.stop_speed_test();
-            state.log_trace("info", "tui", "Speed test stopped by user");
+            state.log_trace("info", "tui::ui", "Speed test stopped by user");
         }
         // Cycle sort column — preserve selection by profile ID
         KeyCode::Char('o' | 'O') if state.current_tab == Tab::Profiles => {

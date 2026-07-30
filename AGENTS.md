@@ -47,7 +47,7 @@ cargo run
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `settings.rs` — Settings panel with split-pane tree+form view. Left pane: collapsible tree (SPLIT_SETTINGS_TREE const, SettingsSection-navigated). Right pane: Form, UpdateForm, GroupList, Empty. Sections: Core, GUI, Inbound, Routing, DNS, System Proxy, TUN, Mux, Statistics, Protocol Core, Updates, Speed Test, Logging, Subscriptions (14 total). Tree navigation (arrows) + form focus switching (Ctrl+W). Full rewrite. Replaced per-section SettingsMode variants with unified Split { tree, focus, right }.
 - `groups.rs` — system-group-aware management (is_system guard, clear action)
-- `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
+- `logs.rs` — live core log viewer with cursor highlight, scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End), source filtering (t/T), multi-line selection (Shift+Up/Down), copy-to-clipboard (y/Y), confirmation overlays for clear/purge
 - `theme.rs` — central Palette-derived style methods (ThemeStyles struct) — static methods returning Style from a &Palette
 - `statistics.rs` — statistics screen with 3 bordered sections (traffic, system stats, connection info)
 - `actions_log.rs` — live state info panel: connection status, server info, test results, traffic/memory, recent logs
@@ -139,6 +139,14 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 8. Initial log loading is lazy — deferred from startup to first `Tab::Logs` activation (`AppState.logs_loaded` flag).
 9. DEFAULT_MAP_SIZE is 1 GB (was 256 MB) — see `DEFAULT_MAP_SIZE` constant. Runtime resizing doubles up to 8 GB on MapFull.
 10. Error handling: `HeedError::MapFull` variant for discrimination. `mapsize_full_count: AtomicU64` counter tracks MapFull events without emitting `tracing::error!()` (which would re-enter TuiLogLayer).
+
+### Adding log copy and selection features
+1. **Key dispatch whitelist in `mod.rs`**: Logs tab keys are whitelisted at line 402. Any new hotkey (`y`, `Y`, `Esc`, etc.) must be added to the `is_logs_key` pattern — otherwise it silently fall through to the main handler.
+2. **Cursor highlight**: `log_scroll` (offset-from-bottom, 0=newest) doubles as cursor position. Set `DataTableState.selected` in render to highlight cursor line. No separate state needed.
+3. **Selection mode**: Add `log_select_anchor: Option<usize>` to AppState (same offset-from-bottom convention). Shift+Up/Down sets anchor at cursor, then extends range. Selection range computed at render time between anchor and cursor. Viewport pins to show full range when it fits.
+4. **Copy to clipboard**: Use `arboard::Clipboard::new()` (already in deps). `y` copies selection (if active) or cursor line. `Y` copies all filtered logs. Format: `{iso-ts} [{level}] [{target}] {message}`.
+5. **Anchor stability during log mutations**: Adjust `log_select_anchor` by same delta as `log_scroll` when entries are prepended (`try_load_older`), appended (`poll_new_logs`), or evicted — keeps selection pointing at the same logical entries.
+6. **Visual highlight**: Set `selection_style` on DataTable (use `ThemeStyles::table_row_selected`). Populate `DataTableState.multi_selected` with row indices in the selection range.
 
 ### Adding batch import for share URLs
 1. Parse each URL with `parse_share_url(url, &config.validation)` from `xray_tui_config::import_export`

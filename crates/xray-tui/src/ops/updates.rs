@@ -55,7 +55,7 @@ pub fn spawn_update_download(state: &mut AppState, core_type: CoreType) {
     if state.connected_core == Some(core_type) {
         state.log_trace(
             "warn",
-            "tui",
+            "tui::ops::updates",
             &format!("Cannot update {core_type} while it's running. Disconnect first."),
         );
         return;

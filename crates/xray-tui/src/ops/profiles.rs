@@ -40,7 +40,7 @@ pub async fn reload_profiles(state: &mut AppState) {
             state.endpoints = rows;
         }
         Err(e) => {
-            state.log_trace("error", "tui", &format!("Failed to load profiles: {e}"));
+            state.log_trace("error", "tui::ops::profiles", &format!("Failed to load profiles: {e}"));
             state.endpoints.clear();
         }
     }
@@ -51,7 +51,7 @@ pub async fn reload_groups(state: &mut AppState) {
     match state.db.get_all_groups().await {
         Ok(groups) => state.groups = groups,
         Err(e) => {
-            state.log_trace("error", "tui", &format!("Failed to load groups: {e}"));
+            state.log_trace("error", "tui::ops::profiles", &format!("Failed to load groups: {e}"));
             state.groups.clear();
         }
     }
@@ -211,10 +211,10 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
                     form_errors: HashMap::new(),
                 };
             } else {
-                state.log_trace("error", "tui", &format!("Profile {id} not found"));
+                state.log_trace("error", "tui::ops::profiles", &format!("Profile {id} not found"));
             }
         }
-        Err(e) => state.log_trace("error", "tui", &format!("Error loading profile {id}: {e}")),
+        Err(e) => state.log_trace("error", "tui::ops::profiles", &format!("Error loading profile {id}: {e}")),
     }
 }
 
@@ -407,7 +407,7 @@ pub async fn confirm_add_server(state: &mut AppState) {
         {
             (*p, fields)
         } else {
-            state.log_trace("error", "tui", "Cannot confirm: no protocol selected");
+            state.log_trace("error", "tui::ops::profiles", "Cannot confirm: no protocol selected");
             return;
         };
         let addr = fields
@@ -467,13 +467,13 @@ pub async fn confirm_add_server(state: &mut AppState) {
             let remarks = profile_config(&profile)
                 .and_then(|c| c.remarks().map(String::from))
                 .unwrap_or_else(|| "unnamed".to_string());
-            state.log_trace("info", "tui", &format!("Added server: {remarks}"));
+            state.log_trace("info", "tui::ops::profiles", &format!("Added server: {remarks}"));
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             upsert_profile_row(state, profile, None, None, Some(state.first_group_id()));
         }
         Err(e) => {
-            state.log_trace("error", "tui", &format!("Failed to add server: {e}"));
+            state.log_trace("error", "tui::ops::profiles", &format!("Failed to add server: {e}"));
             if let AppMode::AddServer {
                 fields: ref mut f, ..
             } = state.mode
@@ -557,7 +557,7 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         .flatten()
         .is_none()
     {
-        state.log_trace("error", "tui", "Profile not found for edit");
+        state.log_trace("error", "tui::ops::profiles", "Profile not found for edit");
         return;
     }
     let new_profile = fields_to_profile(protocol, &fields);
@@ -572,13 +572,13 @@ pub async fn confirm_edit_server(state: &mut AppState) {
             let remarks = profile_config(&new_profile)
                 .and_then(|c| c.remarks().map(String::from))
                 .unwrap_or_else(|| "unnamed".to_string());
-            state.log_trace("info", "tui", &format!("Updated server: {remarks}"));
+            state.log_trace("info", "tui::ops::profiles", &format!("Updated server: {remarks}"));
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             reload_profiles(state).await;
         }
         Err(e) => {
-            state.log_trace("error", "tui", &format!("Failed to update server: {e}"));
+            state.log_trace("error", "tui::ops::profiles", &format!("Failed to update server: {e}"));
             if let AppMode::EditServer {
                 fields: ref mut f, ..
             } = state.mode
@@ -591,10 +591,10 @@ pub async fn confirm_edit_server(state: &mut AppState) {
 
 pub async fn delete_profile(state: &mut AppState, id: i64) {
     if let Err(e) = state.db.delete_endpoint(id).await {
-        state.log_trace("error", "tui", &format!("Failed to delete profile: {e}"));
+        state.log_trace("error", "tui::ops::profiles", &format!("Failed to delete profile: {e}"));
         return;
     }
-    state.log_trace("info", "tui", "Profile deleted");
+    state.log_trace("info", "tui::ops::profiles", "Profile deleted");
     state.confirmation = None;
     state.multi_select.remove(&id);
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
@@ -606,12 +606,12 @@ pub async fn clone_profile(state: &mut AppState, id: i64) {
     if found.is_none() {
         state.log_trace(
             "error",
-            "tui",
+            "tui::ops::profiles",
             &format!("Profile {id} not found for cloning"),
         );
         return;
     }
-    state.log_trace("info", "tui", "Profile cloned");
+    state.log_trace("info", "tui::ops::profiles", "Profile cloned");
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
@@ -635,7 +635,7 @@ pub fn import_url(state: &mut AppState, url: &str) {
                 focus_index: 0,
                 form_errors: HashMap::new(),
             };
-            state.log_trace("info", "tui", "URL imported successfully");
+            state.log_trace("info", "tui::ops::profiles", "URL imported successfully");
         }
         Err(e) => {
             state.mode = AppMode::ImportUrl {
@@ -698,7 +698,7 @@ pub async fn confirm_batch_import(state: &mut AppState) {
     }
     state.log_trace(
         "info",
-        "tui",
+        "tui::ops::profiles",
         &format!("Batch import: {imported} imported, {errors} errors"),
     );
     state.mode = AppMode::List;
@@ -717,7 +717,7 @@ pub async fn move_profile_up(state: &mut AppState) {
         _ => return,
     };
     drop(filtered);
-    state.log_trace("info", "tui", "Profile moved up");
+    state.log_trace("info", "tui::ops::profiles", "Profile moved up");
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
@@ -733,7 +733,7 @@ pub async fn move_profile_down(state: &mut AppState) {
         _ => return,
     };
     drop(filtered);
-    state.log_trace("info", "tui", "Profile moved down");
+    state.log_trace("info", "tui::ops::profiles", "Profile moved down");
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
@@ -741,7 +741,7 @@ pub async fn move_profile_down(state: &mut AppState) {
 pub async fn set_active(state: &mut AppState, id: &str) {
     let pid: i64 = id.parse().unwrap_or(0);
     if let Err(e) = state.db.clear_protocol_override(pid).await {
-        state.log_trace("error", "tui", &format!("Failed to clear override: {e}"));
+        state.log_trace("error", "tui::ops::profiles", &format!("Failed to clear override: {e}"));
         return;
     }
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);

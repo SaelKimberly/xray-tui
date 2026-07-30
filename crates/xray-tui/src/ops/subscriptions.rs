@@ -37,7 +37,7 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
     let group = if let Some(g) = state.groups.iter().find(|g| g.id == group_id) {
         g.clone()
     } else {
-        state.log_trace("error", "tui", "Group not found");
+        state.log_trace("error", "tui::ops::subscriptions", "Group not found");
         return;
     };
     let update_interval_value = group.refresh_interval.map_or_else(
@@ -98,12 +98,12 @@ pub async fn confirm_add_group(state: &mut AppState) {
         error_message: None,
     };
     if let Err(e) = state.db.insert_group(&group).await {
-        state.log_trace("error", "tui", &format!("Failed to add group: {e}"));
+        state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to add group: {e}"));
         return;
     }
     state.log_trace(
         "info",
-        "tui",
+        "tui::ops::subscriptions",
         &format!(
             "Group '{}' added",
             group.name.as_deref().unwrap_or("unnamed")
@@ -141,7 +141,7 @@ pub async fn confirm_edit_group(state: &mut AppState) {
     let mut group = if let Some(g) = state.groups.iter().find(|g| g.id == group_id) {
         g.clone()
     } else {
-        state.log_trace("error", "tui", "Group not found");
+        state.log_trace("error", "tui::ops::subscriptions", "Group not found");
         return;
     };
     group.name = get_field(&fields, "name");
@@ -153,10 +153,10 @@ pub async fn confirm_edit_group(state: &mut AppState) {
         .map_or(60, |d| (d.as_secs() / 60) as i32);
     group.refresh_interval = Some(interval);
     if let Err(e) = state.db.update_group(&group).await {
-        state.log_trace("error", "tui", &format!("Failed to update group: {e}"));
+        state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to update group: {e}"));
         return;
     }
-    state.log_trace("info", "tui", "Group updated");
+    state.log_trace("info", "tui::ops::subscriptions", "Group updated");
     state.reload_groups().await;
     if let crate::AppMode::Settings {
         mode: crate::SettingsMode::Split { right, .. },
@@ -171,11 +171,11 @@ pub async fn confirm_edit_group(state: &mut AppState) {
 
 pub async fn delete_group(state: &mut AppState, group_id: &str) {
     if let Err(e) = state.db.delete_group(group_id).await {
-        state.log_trace("error", "tui", &format!("Failed to delete group: {e}"));
+        state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to delete group: {e}"));
         return;
     }
     let _ = state.db.purge_expired(0).await;
-    state.log_trace("info", "tui", "Group deleted");
+    state.log_trace("info", "tui::ops::subscriptions", "Group deleted");
     state.confirmation = None;
     state.reload_groups().await;
     state.reload_profiles().await;
@@ -186,12 +186,12 @@ pub async fn clear_group(state: &mut AppState, group_id: &str) {
         Ok(count) => {
             state.log_trace(
                 "info",
-                "tui",
+                "tui::ops::subscriptions",
                 &format!("Cleared {count} profiles from group"),
             );
         }
         Err(e) => {
-            state.log_trace("error", "tui", &format!("Failed to clear group: {e}"));
+            state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to clear group: {e}"));
         }
     }
     state.confirmation = None;
@@ -205,13 +205,13 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let group = if let Some(g) = state.groups.iter().find(|g| g.id == group_id) {
         g.clone()
     } else {
-        state.log_trace("error", "tui", "Group not found");
+        state.log_trace("error", "tui::ops::subscriptions", "Group not found");
         return;
     };
     let url = match &group.url {
         Some(u) if !u.is_empty() => u.clone(),
         _ => {
-            state.log_trace("warn", "tui", "Group has no subscription URL");
+            state.log_trace("warn", "tui::ops::subscriptions", "Group has no subscription URL");
             return;
         }
     };
@@ -242,7 +242,7 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
                 );
             }
         } else {
-            tracing::error!(target: "tui", "Subscription update timed out after 120s");
+            tracing::error!(target: "tui::ops::subscriptions", "Subscription update timed out after 120s");
             if let Some(tx) = &tx {
                 try_send_or_warn(
                     tx,
@@ -309,13 +309,13 @@ async fn do_update_subscription(
             Err(e) => return (group_id, 0, ValidationSummary::default(), Some(e)),
         };
     tracing::info!(
-        target: "tui",
+        target: "tui::ops::subscriptions",
         "Parsed {} profiles, {} errors from subscription",
         profiles.len(),
         summary.total_errors,
     );
     if profiles.is_empty() {
-        tracing::info!(target: "tui", "Subscription returned 0 usable profiles — all URLs may have failed validation");
+        tracing::info!(target: "tui::ops::subscriptions", "Subscription returned 0 usable profiles — all URLs may have failed validation");
     }
     let pairs: Vec<(Endpoint, Vec<ProtocolRow>)> = profiles
         .into_iter()
@@ -325,15 +325,15 @@ async fn do_update_subscription(
         })
         .collect();
     tracing::info!(
-        target: "tui",
+        target: "tui::ops::subscriptions",
         "Starting DB upsert for {} profiles",
         pairs.len()
     );
     if let Err(e) = db.subscription_upsert(&group_id, &pairs).await {
-        tracing::error!(target: "tui", "DB upsert failed: {e}");
+        tracing::error!(target: "tui::ops::subscriptions", "DB upsert failed: {e}");
         return (group_id, 0, summary, Some(format!("DB upsert: {e}")));
     }
-    tracing::info!(target: "tui", "DB upsert succeeded");
+    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded");
 
     // Update group metadata (last_refreshed, status) — merged from old Subscription
     if let Ok(groups) = db.get_all_groups().await
