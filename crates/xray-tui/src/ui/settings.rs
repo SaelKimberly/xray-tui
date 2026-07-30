@@ -1765,7 +1765,13 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
         AppMode::Settings {
             mode:
                 SettingsMode::Split {
-                    right: SplitRightPane::GroupForm { group_id, focus_index, fields, .. },
+                    right:
+                        SplitRightPane::GroupForm {
+                            group_id,
+                            focus_index,
+                            fields,
+                            ..
+                        },
                     ..
                 },
         } => (
@@ -1960,7 +1966,7 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         _ => {}
-}
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

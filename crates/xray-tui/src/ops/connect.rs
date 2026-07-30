@@ -6,8 +6,8 @@ use xray_tui_config::import_export::Profile;
 use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{
-    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType, find_binary, resolve_core,
-    config_builder::clash_mixin::parse_clash_mixin,
+    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType,
+    config_builder::clash_mixin::parse_clash_mixin, find_binary, resolve_core,
 };
 use xray_tui_db::models::{DnsSetting, RoutingRule};
 
@@ -92,14 +92,22 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         listen: state.config.inbound.listen.clone(),
         sniffing: state.config.inbound.sniffing,
         clash_api_port: state.config.clash_api_port,
-        mux: if state.config.mux.enabled { Some(serde_json::json!({
-            "protocol": state.config.mux.protocol,
-            "max_connections": state.config.mux.max_connections,
-            "min_streams": state.config.mux.min_streams,
-            "max_streams": state.config.mux.max_streams,
-            "padding": state.config.mux.padding,
-        })) } else { None },
-        clash_mixin: state.config.clash_mixin.as_deref().and_then(parse_clash_mixin),
+        mux: if state.config.mux.enabled {
+            Some(serde_json::json!({
+                "protocol": state.config.mux.protocol,
+                "max_connections": state.config.mux.max_connections,
+                "min_streams": state.config.mux.min_streams,
+                "max_streams": state.config.mux.max_streams,
+                "padding": state.config.mux.padding,
+            }))
+        } else {
+            None
+        },
+        clash_mixin: state
+            .config
+            .clash_mixin
+            .as_deref()
+            .and_then(parse_clash_mixin),
         skip_cert_verify: state.config.core.skip_cert_verify,
     };
 
@@ -158,7 +166,15 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         };
         // 3. Start core
         let mut manager = CoreManager::with_log_channel(bin_configs_dir, log_line_tx);
-        if let Err(e) = manager.start(core_type, &backend_config, &bin_path, params.clash_mixin.as_ref()).await {
+        if let Err(e) = manager
+            .start(
+                core_type,
+                &backend_config,
+                &bin_path,
+                params.clash_mixin.as_ref(),
+            )
+            .await
+        {
             try_send_or_warn(
                 &tx,
                 CoreEvent::Error(format!("Failed to start core: {e}")),

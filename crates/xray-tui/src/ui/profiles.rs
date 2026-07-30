@@ -159,7 +159,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let display_rows = build_display_rows(&rows, selected, state, &palette);
     let display_selected = resolve_display_selected(&display_rows, selected, state.selected_sub);
 
-    render_data_grid(frame, chunks[1], &display_rows, display_selected, state, &palette);
+    render_data_grid(
+        frame,
+        chunks[1],
+        &display_rows,
+        display_selected,
+        state,
+        &palette,
+    );
     render_footer(frame, chunks[2], state, &palette);
     render_confirmation_overlays(frame, area, &rows, state);
 }
@@ -194,8 +201,8 @@ fn build_display_rows<'a>(
             }
         };
 
-        let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
-            .unwrap_or(Protocol::Custom);
+        let protocol =
+            Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
         let is_multi = state.multi_select.contains(&row.endpoint.id);
 
         let idx_str = if is_multi {
@@ -419,7 +426,12 @@ pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &ratatui_cheese::theme::Palette) {
+fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    palette: &ratatui_cheese::theme::Palette,
+) {
     if area.height < 1 {
         return;
     }
@@ -460,7 +472,12 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, palette: &rata
     frame.render_widget(footer, area);
 }
 
-fn render_filter_strip(frame: &mut Frame, area: Rect, state: &AppState, palette: &ratatui_cheese::theme::Palette) {
+fn render_filter_strip(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    palette: &ratatui_cheese::theme::Palette,
+) {
     let view_label = match state.purgatory_view {
         xray_tui_db::models::PurgatoryView::Active => "Active",
         xray_tui_db::models::PurgatoryView::Stale => "Stale",

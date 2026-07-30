@@ -9,6 +9,11 @@ use crate::AppState;
 use crate::format_now;
 use crate::types::{AppMode, CoreEvent, SettingsMode, SplitRightPane};
 
+/// Format a profile ID as a URL-like hex identifier.
+fn fmt_profile_id(id: i64) -> String {
+    format!("xray-tui://{id:x}")
+}
+
 /// Poll core event channel and update state accordingly.
 pub async fn poll_core_events(state: &mut AppState) {
     // Clean up stale batch_progress when the task has finished silently
@@ -93,7 +98,11 @@ pub async fn poll_core_events(state: &mut AppState) {
                 state.system_stats = Some(stats);
             }
             CoreEvent::LogLine { .. } => {}
-            CoreEvent::TuiLog { target, level, message } => {
+            CoreEvent::TuiLog {
+                target,
+                level,
+                message,
+            } => {
                 let level = level.to_lowercase();
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -195,9 +204,9 @@ pub async fn poll_core_events(state: &mut AppState) {
                             row.active_protocol()
                                 .remarks
                                 .clone()
-                                .unwrap_or_else(|| protocol_id.to_string())
+                                .unwrap_or_else(|| fmt_profile_id(protocol_id))
                         }
-                        None => protocol_id.to_string(),
+                        None => fmt_profile_id(protocol_id),
                     }
                 };
 

@@ -125,7 +125,11 @@ pub fn profile_to_endpoint_protocol(profile: &Profile) -> (Endpoint, ProtocolRow
         host: profile.address.clone(),
         port: profile.port as u16,
         host_type: if profile.address.parse::<std::net::IpAddr>().is_ok() {
-            if profile.address.contains(':') { "ipv6".into() } else { "ipv4".into() }
+            if profile.address.contains(':') {
+                "ipv6".into()
+            } else {
+                "ipv4".into()
+            }
         } else {
             "dns".into()
         },
@@ -144,14 +148,20 @@ pub fn profile_to_endpoint_protocol(profile: &Profile) -> (Endpoint, ProtocolRow
 }
 
 /// Convert a `ParsedProtocol` directly to `Endpoint` + `ProtocolRow` (no Profile intermediary).
-pub fn parsed_to_endpoint_protocol(parsed: &xray_tui_config::import_export::ParsedProtocol) -> (Endpoint, ProtocolRow) {
+pub fn parsed_to_endpoint_protocol(
+    parsed: &xray_tui_config::import_export::ParsedProtocol,
+) -> (Endpoint, ProtocolRow) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let host_type = if parsed.host_type.is_empty() {
         if parsed.host.parse::<std::net::IpAddr>().is_ok() {
-            if parsed.host.contains(':') { "ipv6" } else { "ipv4" }
+            if parsed.host.contains(':') {
+                "ipv6"
+            } else {
+                "ipv4"
+            }
         } else {
             "dns"
         }
@@ -424,16 +434,49 @@ impl AppState {
     }
     /// Get the first group ID for new profile assignments (no active group filter).
     pub fn first_group_id(&self) -> String {
-        self.groups.first().map(|g| g.id.clone()).unwrap_or_default()
+        self.groups
+            .first()
+            .map(|g| g.id.clone())
+            .unwrap_or_default()
     }
 
-    /// Log to the TUI log buffer AND emit a tracing event (target "tui").
-    pub fn log_trace(&mut self, level: &str, _target: &str, message: &str) {
-        match level {
-            "info" => tracing::info!(target: "tui", "{message}"),
-            "error" => tracing::error!(target: "tui", "{message}"),
-            "warn" | "warning" => tracing::warn!(target: "tui", "{message}"),
-            _ => tracing::info!(target: "tui", "{message}"),
+    /// Log to the TUI log buffer AND the actions panel.
+    ///
+    /// Sends directly to the heed storage channel and the TUI event channel,
+    /// bypassing the tracing subscriber (tracing's `target:` requires a
+    /// `&'static str` literal at compile time, so a runtime target parameter
+    /// cannot set event metadata target).
+    pub fn log_trace(&mut self, level: &str, target: &str, message: &str) {
+        use std::time::SystemTime;
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "nanos since epoch fits u64 (584yr range)"
+        )]
+        let timestamp_nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let log_msg = xray_tui_core::log_heed::LogMessage {
+            level: level.to_string(),
+            target: target.to_string(),
+            message: message.to_string(),
+            timestamp_nanos,
+        };
+
+        // Send to heed storage (via background batched writer)
+        if let Some(sender) = &self.log_sender_tx {
+            let _ = sender.send(log_msg);
+        }
+
+        // Send to actions panel
+        if let Some(tx) = &self.core_event_tx {
+            let _ = tx.try_send(crate::CoreEvent::TuiLog {
+                target: target.to_string(),
+                level: level.to_string(),
+                message: message.to_string(),
+            });
         }
     }
     /// Resolve which core a profile row should use, considering (in order):
@@ -849,25 +892,38 @@ impl AppState {
                             .map(|v| v.to_string())
                             .unwrap_or_default(),
                     ),
-                    (
-                        "protocol".into(),
-                        self.config.mux.protocol.clone(),
-                    ),
+                    ("protocol".into(), self.config.mux.protocol.clone()),
                     (
                         "max_connections".into(),
-                        self.config.mux.max_connections.map(|v| v.to_string()).unwrap_or_default(),
+                        self.config
+                            .mux
+                            .max_connections
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
                     ),
                     (
                         "min_streams".into(),
-                        self.config.mux.min_streams.map(|v| v.to_string()).unwrap_or_default(),
+                        self.config
+                            .mux
+                            .min_streams
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
                     ),
                     (
                         "max_streams".into(),
-                        self.config.mux.max_streams.map(|v| v.to_string()).unwrap_or_default(),
+                        self.config
+                            .mux
+                            .max_streams
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
                     ),
                     (
                         "padding".into(),
-                        if self.config.mux.padding { "true".into() } else { "false".into() },
+                        if self.config.mux.padding {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        },
                     ),
                     (
                         "fragment_enabled".into(),
@@ -954,14 +1010,8 @@ impl AppState {
                         "tcp_ping_concurrency".into(),
                         self.config.speed_test.tcp_ping_concurrency.to_string(),
                     ),
-                    (
-                        "geoip_url".into(),
-                        self.config.geo.geoip_url.clone(),
-                    ),
-                    (
-                        "geosite_url".into(),
-                        self.config.geo.geosite_url.clone(),
-                    ),
+                    ("geoip_url".into(), self.config.geo.geoip_url.clone()),
+                    ("geosite_url".into(), self.config.geo.geosite_url.clone()),
                     (
                         "geo_auto_update".into(),
                         self.config.geo.auto_update.to_string(),
@@ -1025,11 +1075,14 @@ impl AppState {
                 if !get_str("log_level").is_empty() {
                     self.config.core.log_level = get("log_level");
                 }
-                self.config.core.skip_cert_verify =
-                    get_str("skip_cert_verify") == "true";
+                self.config.core.skip_cert_verify = get_str("skip_cert_verify") == "true";
                 self.config.clash_mixin = {
                     let v = get_str("clash_mixin");
-                    if v.is_empty() { None } else { Some(v.to_owned()) }
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.to_owned())
+                    }
                 };
             }
             Gui => {
@@ -1334,8 +1387,6 @@ impl AppState {
     pub fn update_group_subscriptions(&mut self, group_id: &str) {
         subscriptions::update_group_subscriptions(self, group_id);
     }
-
-
 
     pub fn update_all_subscriptions(&mut self) {
         subscriptions::update_all_subscriptions(self);

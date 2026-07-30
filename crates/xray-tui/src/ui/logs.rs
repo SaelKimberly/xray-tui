@@ -10,6 +10,7 @@ use crate::AppState;
 use crate::ui::render_confirmation_overlay;
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::{Column, ColumnWidth, DataTable, DataTableRow, DataTableState};
+use tui_popup::{KnownSizeWrapper, Popup};
 
 // ── DataTable row type ────────────────────────────────────────────────
 
@@ -372,7 +373,7 @@ pub(super) fn count_filtered(state: &AppState) -> usize {
 
 // ── Target Picker ────────────────────────────────────────────────────
 
-/// Render the target picker overlay.
+/// Render the target picker overlay as centered popup.
 pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     let selected = match &state.mode {
         crate::AppMode::TargetPicker { selected } => *selected,
@@ -380,20 +381,28 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     };
     let palette = state.current_palette();
 
-    let overlay = Block::default()
-        .title(" Select Targets (t=done, Enter=toggle) ")
-        .borders(Borders::ALL)
-        .border_style(ThemeStyles::container_border(&palette));
-    let inner = overlay.inner(area);
-    frame.render_widget(overlay, area);
-
+    // Empty state: small centered popup
     if state.known_targets.is_empty() {
         let text = Paragraph::new(Line::from(" No targets available"))
             .style(ThemeStyles::hint(&palette))
             .alignment(Alignment::Center);
-        frame.render_widget(text, inner);
+        let sized = KnownSizeWrapper::new(text, 30, 3);
+        let popup = Popup::new(sized)
+            .title(" Select Targets (t=done, Enter=toggle) ")
+            .border_set(ratatui::symbols::border::ROUNDED)
+            .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+        frame.render_widget(popup, area);
         return;
     }
+
+    let max_target_width = state
+        .known_targets
+        .iter()
+        .map(|t| t.len())
+        .max()
+        .unwrap_or(0);
+    let popup_width = (max_target_width + 8).max(36) as u16;
+    let popup_height = (state.known_targets.len() + 2).min(20) as u16;
 
     let items: Vec<Line> = state
         .known_targets
@@ -417,10 +426,13 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    let list = Paragraph::new(items)
-        .block(Block::default())
-        .scroll((selected.saturating_sub(5) as u16, 0));
-    frame.render_widget(list, inner);
+    let para = Paragraph::new(items).scroll((selected.saturating_sub(5) as u16, 0));
+    let sized = KnownSizeWrapper::new(para, popup_width as usize, popup_height as usize);
+    let popup = Popup::new(sized)
+        .title(" Select Targets (t=done, Enter=toggle) ")
+        .border_set(ratatui::symbols::border::ROUNDED)
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+    frame.render_widget(popup, area);
 }
 
 /// Handle key events for the target picker overlay.

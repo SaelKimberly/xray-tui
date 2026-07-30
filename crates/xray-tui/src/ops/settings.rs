@@ -161,26 +161,35 @@ pub async fn build_settings_fields(
                         .map(|c| c.to_string())
                         .unwrap_or_default(),
                 ),
-                (
-                    "protocol".into(),
-                    state.config.mux.protocol.clone(),
-                ),
+                ("protocol".into(), state.config.mux.protocol.clone()),
                 (
                     "max_connections".into(),
-                    state.config.mux.max_connections.map(|c| c.to_string()).unwrap_or_default(),
+                    state
+                        .config
+                        .mux
+                        .max_connections
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
                 ),
                 (
                     "min_streams".into(),
-                    state.config.mux.min_streams.map(|c| c.to_string()).unwrap_or_default(),
+                    state
+                        .config
+                        .mux
+                        .min_streams
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
                 ),
                 (
                     "max_streams".into(),
-                    state.config.mux.max_streams.map(|c| c.to_string()).unwrap_or_default(),
+                    state
+                        .config
+                        .mux
+                        .max_streams
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
                 ),
-                (
-                    "padding".into(),
-                    state.config.mux.padding.to_string(),
-                ),
+                ("padding".into(), state.config.mux.padding.to_string()),
                 (
                     "fragment_enabled".into(),
                     state.config.mux.fragment_enabled.to_string(),
@@ -255,14 +264,8 @@ pub async fn build_settings_fields(
                     "tcp_ping_concurrency".into(),
                     state.config.speed_test.tcp_ping_concurrency.to_string(),
                 ),
-                (
-                    "geoip_url".into(),
-                    state.config.geo.geoip_url.clone(),
-                ),
-                (
-                    "geosite_url".into(),
-                    state.config.geo.geosite_url.clone(),
-                ),
+                ("geoip_url".into(), state.config.geo.geoip_url.clone()),
+                ("geosite_url".into(), state.config.geo.geosite_url.clone()),
                 (
                     "geo_auto_update".into(),
                     state.config.geo.auto_update.to_string(),
@@ -369,11 +372,14 @@ fn apply_settings_fields(
             if !get_str("log_level").is_empty() {
                 state.config.core.log_level = get("log_level");
             }
-            state.config.core.skip_cert_verify =
-                get_str("skip_cert_verify") == "true";
+            state.config.core.skip_cert_verify = get_str("skip_cert_verify") == "true";
             state.config.clash_mixin = {
                 let v = get_str("clash_mixin");
-                if v.is_empty() { None } else { Some(v.to_owned()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_owned())
+                }
             };
         }
         Gui => {

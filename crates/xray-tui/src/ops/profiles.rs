@@ -176,7 +176,6 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
     indices
 }
 
-
 pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
     let protocol =
         Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
@@ -226,7 +225,9 @@ pub fn selected_profile_id(state: &AppState) -> Option<i64> {
 }
 
 pub fn toggle_expand(state: &mut AppState) {
-    let ep_id = filtered_profiles(state).nth(state.selected_index).map(|r| r.endpoint.id);
+    let ep_id = filtered_profiles(state)
+        .nth(state.selected_index)
+        .map(|r| r.endpoint.id);
     if let Some(ep_id) = ep_id {
         if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
             ep_row.expanded = !ep_row.expanded;
@@ -237,7 +238,9 @@ pub fn toggle_expand(state: &mut AppState) {
     }
 }
 pub fn collapse_expand(state: &mut AppState) {
-    let ep_id = filtered_profiles(state).nth(state.selected_index).map(|r| r.endpoint.id);
+    let ep_id = filtered_profiles(state)
+        .nth(state.selected_index)
+        .map(|r| r.endpoint.id);
     if let Some(ep_id) = ep_id {
         if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
             ep_row.expanded = false;

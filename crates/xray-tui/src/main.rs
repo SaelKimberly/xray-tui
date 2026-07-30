@@ -79,7 +79,6 @@ where
             }
         }
 
-
         // Non-blocking send to the log storage channel (batched, async writer).
         // If the channel is closed (writer panicked), silently drop — UI must keep running.
         let _ = self.log_sender.send(xray_tui_core::log_heed::LogMessage {

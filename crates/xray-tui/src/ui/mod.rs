@@ -253,11 +253,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         return;
     }
 
-    // Form mode: route all keys to add_server handler (except Ctrl+C quit, SpeedTestMenu, BatchImport)
+    // Form mode: route all keys to add_server handler (except Ctrl+C quit, SpeedTestMenu, BatchImport, TargetPicker)
     if !matches!(state.mode, crate::AppMode::List)
         && !matches!(&state.mode, crate::AppMode::Help)
         && !matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. })
         && !matches!(&state.mode, crate::AppMode::BatchImport { .. })
+        && !matches!(&state.mode, crate::AppMode::TargetPicker { .. })
     {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -535,7 +536,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 let proto_id = state.selected_sub_protocol_id();
                 if let (Some(ep), Some(p)) = (ep_id, proto_id) {
                     if let Err(e) = state.db.set_protocol_override(ep, p).await {
-                        state.log_trace("error", "tui", &format!("Failed to set protocol override: {e}"));
+                        state.log_trace(
+                            "error",
+                            "tui",
+                            &format!("Failed to set protocol override: {e}"),
+                        );
                     }
                     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
                     state.filter_cache_valid.set(false);
@@ -626,10 +631,13 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char('g' | 'G') if state.current_tab == Tab::Profiles => {
             state.enter_settings();
-            let pane = state.build_right_pane(crate::SettingsSection::Subscriptions).await;
+            let pane = state
+                .build_right_pane(crate::SettingsSection::Subscriptions)
+                .await;
             if let crate::AppMode::Settings {
                 mode: crate::SettingsMode::Split { right, focus, .. },
-            } = &mut state.mode {
+            } = &mut state.mode
+            {
                 *right = pane;
                 *focus = crate::SplitFocus::Right;
             }
@@ -639,7 +647,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.reload_profiles().await;
         }
         KeyCode::Char('r' | 'R') if state.current_tab == Tab::Profiles => {
-            if matches!(state.purgatory_view, xray_tui_db::models::PurgatoryView::Stale) {
+            if matches!(
+                state.purgatory_view,
+                xray_tui_db::models::PurgatoryView::Stale
+            ) {
                 if let Some(id) = state.selected_profile_id() {
                     state.db.restore_endpoint(id).await.unwrap_or_default();
                     state.reload_profiles().await;

@@ -1,7 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::collections::HashMap;
 
 use xray_tui_config::import_export::{ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
@@ -22,7 +22,8 @@ pub fn start_add_group(state: &mut AppState) {
     ];
     if let crate::AppMode::Settings {
         mode: crate::SettingsMode::Split { right, .. },
-    } = &mut state.mode {
+    } = &mut state.mode
+    {
         *right = SplitRightPane::GroupForm {
             group_id: None,
             fields,
@@ -57,7 +58,8 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
     ];
     if let crate::AppMode::Settings {
         mode: crate::SettingsMode::Split { right, .. },
-    } = &mut state.mode {
+    } = &mut state.mode
+    {
         *right = SplitRightPane::GroupForm {
             group_id: Some(group_id.into()),
             fields,
@@ -109,11 +111,9 @@ pub async fn confirm_add_group(state: &mut AppState) {
     );
     state.reload_groups().await;
     if let crate::AppMode::Settings {
-        mode:
-            crate::SettingsMode::Split {
-                right, ..
-            },
-    } = &mut state.mode {
+        mode: crate::SettingsMode::Split { right, .. },
+    } = &mut state.mode
+    {
         *right = SplitRightPane::GroupList {
             selected: 0,
             selected_mask: vec![false; state.groups.len()],
@@ -159,11 +159,9 @@ pub async fn confirm_edit_group(state: &mut AppState) {
     state.log_trace("info", "tui", "Group updated");
     state.reload_groups().await;
     if let crate::AppMode::Settings {
-        mode:
-            crate::SettingsMode::Split {
-                right, ..
-            },
-    } = &mut state.mode {
+        mode: crate::SettingsMode::Split { right, .. },
+    } = &mut state.mode
+    {
         *right = SplitRightPane::GroupList {
             selected: 0,
             selected_mask: vec![false; state.groups.len()],
