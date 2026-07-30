@@ -200,7 +200,7 @@ fn build_display_rows<'a>(
         let (indicator, indicator_fg) = if is_connected {
             ("●".to_string(), ThemeStyles::success(palette))
         } else {
-            match state.testing_details.get(&row.endpoint.id) {
+            match state.testing_details.get(&row.active_protocol().id) {
                 Some(TestType::TcpPing) => ("↔".to_string(), Style::default()),
                 Some(TestType::RealPing) => ("◎".to_string(), Style::default()),
                 Some(TestType::SpeedTest) => ("⇩".to_string(), Style::default()),

@@ -209,6 +209,34 @@ impl Database {
         Ok(all.pop())
     }
 
+    /// Look up endpoint row by protocol row id (p.id not e.id).
+    pub async fn get_endpoint_by_protocol_id(
+        &self,
+        protocol_id: i64,
+    ) -> Result<Option<EndpointRow>> {
+        let mut conn = self.db.connection().await?;
+        let rows = toasty::sql::query(
+            "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, \
+                    e.last_source, e.created_at, e.manual_protocol_override, \
+                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
+                    p.config_type, p.core_type, p.transport, p.security, p.remarks, \
+                    p.created_at, p.last_seen_at, \
+                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
+                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, \
+                    s.last_updated \
+             FROM endpoints e \
+             INNER JOIN protocol_rows p ON p.endpoint_id = e.id \
+             LEFT JOIN profile_extensions ext ON ext.protocol_id = p.id \
+             LEFT JOIN server_stats s ON s.protocol_id = p.id \
+             WHERE p.id = ?1",
+        )
+        .bind(protocol_id)
+        .exec(&mut conn)
+        .await?;
+        let mut all = deserialize_endpoint_rows(rows)?;
+        Ok(all.pop())
+    }
+
     pub async fn get_profile_extension(
         &self,
         protocol_id: i64,
@@ -961,73 +989,109 @@ impl Database {
 // ── Ping batch management ───────────────────────────────────────────────
 
 impl Database {
-    /// Create a ping batch with Rust-side triplet dedup.
-    pub async fn create_ping_batch(&self, batch_id: &str, group_id: Option<&str>) -> Result<usize> {
+    /// Create a ping batch.
+    ///
+    /// `profiles` optionally provides `(protocol_id, sort_order)` pairs — when set,
+    /// only those profiles get sessions and their sort_order replaces `triplet_rank`.
+    /// `group_id` is ignored when `profiles` is `Some`.
+    pub async fn create_ping_batch(
+        &self,
+        batch_id: &str,
+        group_id: Option<&str>,
+        profiles: Option<&[(i64, i32)]>,
+    ) -> Result<usize> {
         let mut conn = self.db.connection().await?;
 
-        // Get protocols, optionally filtered by group
-        let protocol_rows: Vec<(i64, i32, String)> = if let Some(gid) = group_id {
+        // Helper to deserialize protocol rows with endpoint address/port
+        let deserialize = |rows: Vec<Value>| -> Result<Vec<(i64, i32, String, String, i32)>> {
+            let mut out = Vec::with_capacity(rows.len());
+            for value in rows {
+                if let Value::Record(fields) = value {
+                    out.push((
+                        get_i64(&fields, 0)?,
+                        get_i64(&fields, 1)? as i32,
+                        get_string(&fields, 2)?,
+                        get_string(&fields, 3)?,
+                        get_i64(&fields, 4)? as i32,
+                    ));
+                }
+            }
+            Ok(out)
+        };
+
+        // Get protocol rows with endpoint address/port
+        let protocol_rows = if profiles.is_some() {
+            // Profiles provided — ignore group_id, SELECT all with endpoint join
             let rows = toasty::sql::query(
-                "SELECT p.id, p.config_type, p.core_type \
+                "SELECT p.id, p.config_type, p.core_type, e.host, e.port \
+                 FROM protocol_rows p \
+                 JOIN endpoints e ON e.id = p.endpoint_id",
+            )
+            .exec(&mut conn)
+            .await?;
+            deserialize(rows)?
+        } else if let Some(gid) = group_id {
+            // Group filter
+            let rows = toasty::sql::query(
+                "SELECT p.id, p.config_type, p.core_type, e.host, e.port \
                  FROM protocol_rows p \
                  INNER JOIN endpoint_groups eg ON eg.endpoint_id = p.endpoint_id \
+                 JOIN endpoints e ON e.id = p.endpoint_id \
                  WHERE eg.group_id = ?1",
             )
             .bind(gid)
             .exec(&mut conn)
             .await?;
-
-            let mut out = Vec::with_capacity(rows.len());
-            for value in rows {
-                if let Value::Record(fields) = value {
-                    out.push((
-                        get_i64(&fields, 0)?,
-                        get_i64(&fields, 1)? as i32,
-                        get_string(&fields, 2)?,
-                    ));
-                }
-            }
-            out
+            deserialize(rows)?
         } else {
+            // All rows
             let rows = toasty::sql::query(
-                "SELECT p.id, p.config_type, p.core_type \
-                 FROM protocol_rows p",
+                "SELECT p.id, p.config_type, p.core_type, e.host, e.port \
+                 FROM protocol_rows p \
+                 JOIN endpoints e ON e.id = p.endpoint_id",
             )
             .exec(&mut conn)
             .await?;
-
-            let mut out = Vec::with_capacity(rows.len());
-            for value in rows {
-                if let Value::Record(fields) = value {
-                    out.push((
-                        get_i64(&fields, 0)?,
-                        get_i64(&fields, 1)? as i32,
-                        get_string(&fields, 2)?,
-                    ));
-                }
-            }
-            out
+            deserialize(rows)?
         };
 
-        // Dedup by (config_type, core_type) triplet and assign rank
-        let mut seen = HashSet::new();
-        let mut rank = 0i32;
-        let mut items = Vec::with_capacity(protocol_rows.len());
-        for (pid, ct, ct_str) in &protocol_rows {
-            let triplet = (*ct, ct_str.clone());
-            if seen.insert(triplet) {
-                rank += 1;
-            }
-            items.push((*pid, *ct, ct_str.clone(), rank));
+        // Build items with rank and filter
+        let items: Vec<(i64, i32, String, i32, String, i32)>;
+        if let Some(profile_list) = profiles {
+            // Use sort_order from profiles, filter to listed protocol_ids
+            let rank_map: HashMap<i64, i32> = profile_list.iter().copied().collect();
+            items = protocol_rows
+                .into_iter()
+                .filter_map(|(pid, ct, ct_str, addr, port)| {
+                    rank_map
+                        .get(&pid)
+                        .map(|&rank| (pid, ct, ct_str, rank, addr, port))
+                })
+                .collect();
+        } else {
+            // Existing triplet_rank dedup
+            let mut seen = HashSet::new();
+            let mut rank = 0i32;
+            items = protocol_rows
+                .into_iter()
+                .map(|(pid, ct, ct_str, addr, port)| {
+                    let triplet = (ct, ct_str.clone());
+                    if seen.insert(triplet) {
+                        rank += 1;
+                    }
+                    (pid, ct, ct_str, rank, addr, port)
+                })
+                .collect();
         }
 
         let mut tx = conn.transaction().await?;
-        let mut inserted = 0usize;
-        for (pid, ct, ct_str, trank) in &items {
+        let inserted = items.len();
+        for (pid, ct, ct_str, trank, addr, port) in &items {
             toasty::sql::statement(
                 "INSERT INTO ping_sessions \
-                 (id, batch_id, protocol_id, config_type, core_type, ping_type, status, triplet_rank) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'fast', 'queued', ?6)",
+                 (id, batch_id, protocol_id, config_type, core_type, ping_type, status, \
+                  triplet_rank, address, port) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'fast', 'queued', ?6, ?7, ?8)",
             )
             .bind(format!("{batch_id}-{pid}"))
             .bind(batch_id)
@@ -1035,9 +1099,10 @@ impl Database {
             .bind(*ct)
             .bind(ct_str)
             .bind(*trank)
+            .bind(addr)
+            .bind(*port)
             .exec(&mut tx)
             .await?;
-            inserted += 1;
         }
 
         tx.commit().await?;
@@ -1093,10 +1158,10 @@ impl Database {
                  WHERE id=?6 AND batch_id=?7",
             )
             .bind(&r.status)
-            .bind(r.latency_ms)
+            .bind_typed(r.latency_ms, DbType::Integer(4))
             .bind(r.speed_bps.unwrap_or(0))
             .bind(r.ip_info.as_deref().unwrap_or(""))
-            .bind(r.error.as_deref())
+            .bind_typed(r.error.as_deref(), DbType::Text)
             .bind(&r.session_id)
             .bind(batch_id)
             .exec(&mut tx)
@@ -1235,10 +1300,10 @@ impl Database {
                  WHERE id=?6 AND batch_id=?7",
             )
             .bind(&r.status)
-            .bind(r.latency_ms)
+            .bind_typed(r.latency_ms, DbType::Integer(4))
             .bind(r.speed_bps.unwrap_or(0))
             .bind(r.ip_info.as_deref().unwrap_or(""))
-            .bind(r.error.as_deref())
+            .bind_typed(r.error.as_deref(), DbType::Text)
             .bind(&r.session_id)
             .bind(batch_id)
             .exec(&mut tx)

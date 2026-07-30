@@ -394,13 +394,14 @@ pub fn start_batch_then_real_ping(state: &mut AppState) {
 }
 
 /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.
+/// Returns `true` if the flush succeeded, `false` on failure (logged).
 async fn batch_upsert_buffer(
     batch_id: &str,
     db: &Arc<Database>,
     buffer: &mut Vec<PingResultUpdate>,
-) {
+) -> bool {
     if buffer.is_empty() {
-        return;
+        return true;
     }
     let batch = std::mem::take(buffer);
     let extensions: Vec<ProfileExtension> = batch
@@ -416,9 +417,19 @@ async fn batch_upsert_buffer(
             })
         })
         .collect();
-    let _ = db
+    match db
         .batch_flush_ping_buffer(batch_id, &batch, &extensions)
-        .await;
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                target: "tui::ops::ping",
+                "batch_flush_ping_buffer failed: {e}",
+            );
+            false
+        }
+    }
 }
 
 /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
@@ -464,27 +475,40 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
 
     // Set up shared batch progress for status bar display
     let total_count = visible.len() as u16;
+    let profile_order: Vec<(i64, i32)> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.active_protocol().id, i as i32))
+        .collect();
     let progress = Arc::new((AtomicU16::new(total_count), AtomicU16::new(0)));
     state.batch_progress = Some(progress.clone());
 
     tokio::spawn(async move {
         // 1. Snapshot visible profiles into ping_sessions table
-        let count = db.create_ping_batch(&batch_id, None).await;
+        let count = db.create_ping_batch(&batch_id, None, Some(&profile_order)).await;
         let count = match count {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(target: "tui::ops::ping", "create_ping_batch failed: {e}");
                 progress.0.store(0, Ordering::Relaxed);
+                let _ = tx.try_send(CoreEvent::BatchProgress { total: 0, completed: 0 });
                 return;
             }
         };
         if count == 0 {
             tracing::warn!(target: "tui::ops::ping", "create_ping_batch returned 0 — no matching profile_cores?");
             progress.0.store(0, Ordering::Relaxed);
+            let _ = tx.try_send(CoreEvent::BatchProgress { total: 0, completed: 0 });
             return;
+        }
+        // Adjust progress total to match actual inserted count
+        #[allow(clippy::cast_possible_truncation)]
+        if (count as u16) != total_count {
+            progress.0.store(count as u16, Ordering::Relaxed);
         }
 
         let mut buffer: Vec<PingResultUpdate> = Vec::new();
+        let mut stall_count = 0u32;
 
         // 2. Initialize managers
         let fmgr = xray_tui_core::FastPingManager::new(fast_timeout);
@@ -532,7 +556,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                     continue;
                 }
 
-                match fmgr.ping(session.config_type, &addr, port).await {
+                let pushed = match fmgr.ping(session.config_type, &addr, port).await {
                     Ok(dur) => {
                         #[allow(clippy::cast_possible_truncation)]
                         let ms = dur.as_millis() as i32;
@@ -546,13 +570,15 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                             ip_info: None,
                             error: None,
                         });
+                        true
                     }
                     Err(xray_tui_core::ping::PingError::NotSupported) => {
                         if real_ping_enabled {
-                            // Demote to real ping for Phase 2
+                            // Demote to real ping for Phase 2 — no buffer push
                             let _ = db
                                 .update_session_ping_type(&session.id, "real", "queued")
                                 .await;
+                            false
                         } else {
                             // No real ping phase — emit Cancelled immediately
                             buffer.push(PingResultUpdate {
@@ -573,6 +599,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                                 ip_info: None,
                                 error: Some("Not supported by fast ping".to_string()),
                             });
+                            true
                         }
                     }
                     Err(e) => {
@@ -586,24 +613,69 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                             ip_info: None,
                             error: Some(e.to_string()),
                         });
+                        true
                     }
+                };
+                // Send SpeedTestResult if we pushed to buffer (skipped for
+                // NotSupported+real_ping_enabled — those are demoted to Phase 2)
+                if pushed {
+                    let last = buffer.last().unwrap();
+                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                        protocol_id: session.protocol_id,
+                        test_type: TestType::TcpPing,
+                        latency_ms: last.latency_ms.map(|v| v as u64),
+                        speed_bps: None,
+                        ip_info: None,
+                        error: last.error.clone(),
+                    });
                 }
-                // Send SpeedTestResult to TUI for immediate feedback
-                let last = buffer.last().unwrap();
-                let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                    protocol_id: session.protocol_id,
-                    test_type: TestType::TcpPing,
-                    latency_ms: last.latency_ms.map(|v| v as u64),
-                    speed_bps: None,
-                    ip_info: None,
-                    error: last.error.clone(),
-                });
             }
             // Flush buffer at page boundary
             let flushed = buffer.len() as u16;
+            let flush_ok = batch_upsert_buffer(&batch_id, &db, &mut buffer).await;
+            progress.1.fetch_add(flushed, Ordering::Relaxed);
+
+            // Stall guard: break if either (a) too many consecutive empty pages
+            // (all demoted, nothing to flush) or (b) too many consecutive flush
+            // failures (sessions keep getting addressed but DB never persists).
+            if flushed == 0 {
+                stall_count += 1;
+            } else if !flush_ok {
+                stall_count += 1;
+            } else {
+                stall_count = 0;
+            }
+            if stall_count > 3 {
+                tracing::warn!(
+                    target: "tui::ops::ping",
+                    "Phase 1 stall guard triggered after {stall_count} iterations",
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // After Phase 1: mark any remaining 'queued' fast sessions as failed
+        // (orphan profiles with no endpoint or empty address/port)
+        if let Ok(remaining) = db
+            .get_batch_page_ready_for_fast_ping(&batch_id, 65536)
+            .await
+        {
+            for session in &remaining {
+                buffer.push(PingResultUpdate {
+                    session_id: session.id.clone(),
+                    protocol_id: session.protocol_id,
+                    status: "failed".to_string(),
+                    ping_type: "fast".to_string(),
+                    latency_ms: None,
+                    speed_bps: None,
+                    ip_info: None,
+                    error: Some("No address/port".to_string()),
+                });
+            }
+            let flushed = remaining.len() as u16;
             batch_upsert_buffer(&batch_id, &db, &mut buffer).await;
             progress.1.fetch_add(flushed, Ordering::Relaxed);
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         // ── Phase 2: Real Ping (only if enabled) ──
@@ -631,10 +703,31 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    // Load profile for this session
-                    let profile = match db.get_endpoint(session.protocol_id).await {
+                    // Load profile for this session by protocol_id
+                    let profile = match db.get_endpoint_by_protocol_id(session.protocol_id).await {
                         Ok(Some(p)) => p,
-                        _ => continue,
+                        _ => {
+                            // Mark failed so Phase 2 loop doesn't hang on orphaned sessions
+                            buffer.push(PingResultUpdate {
+                                session_id: session.id.clone(),
+                                protocol_id: session.protocol_id,
+                                status: "failed".to_string(),
+                                ping_type: "real".to_string(),
+                                latency_ms: None,
+                                speed_bps: None,
+                                ip_info: None,
+                                error: Some("Endpoint not found".to_string()),
+                            });
+                            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                                protocol_id: session.protocol_id,
+                                test_type: TestType::RealPing,
+                                latency_ms: None,
+                                speed_bps: None,
+                                ip_info: None,
+                                error: Some("Endpoint not found".to_string()),
+                            });
+                            continue;
+                        },
                     };
                     let permit = match Arc::clone(&sem).acquire_owned().await {
                         Ok(p) => p,
@@ -728,6 +821,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
         progress.1.fetch_add(flushed, Ordering::Relaxed);
         let _ = db.cleanup_ping_batch(&batch_id).await;
         progress.0.store(0, Ordering::Relaxed); // signal batch is done; enables stale cleanup
+        let _ = tx.try_send(CoreEvent::BatchProgress { total: 0, completed: 0 });
     });
 }
 

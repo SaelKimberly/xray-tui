@@ -174,7 +174,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                     let row = state
                         .endpoints
                         .iter_mut()
-                        .find(|r| r.endpoint.id == protocol_id);
+                        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id));
                     match row {
                         Some(row) => {
                             let ext = row.extensions.entry(protocol_id).or_insert_with(|| {
@@ -379,7 +379,11 @@ pub async fn poll_core_events(state: &mut AppState) {
                         .unwrap_or_default();
                 }
             }
-            CoreEvent::BatchProgress { .. } => {}
+            CoreEvent::BatchProgress { total, completed: _ } => {
+                if total == 0 {
+                    state.batch_progress = None;
+                }
+            }
         }
     }
 }
