@@ -74,7 +74,8 @@ pub async fn udp_ping(
 }
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
 
 /// Cache of `Client` instances keyed by (proxy, port, socks5h).
 /// Avoids per-call connection pool creation overhead.
@@ -83,14 +84,14 @@ static CLIENT_CACHE: ClientCache = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Create a `reqwest::Client` with SOCKS5 proxy configured, using a cache to
 /// avoid per-call connection pool creation overhead.
-fn create_socks5_client(
+async fn create_socks5_client(
     proxy: &str,
     port: u16,
     socks5h: bool,
     timeout: Duration,
 ) -> Result<reqwest::Client, SpeedTestError> {
     let key = (proxy.to_string(), port, socks5h);
-    if let Some(client) = CLIENT_CACHE.lock().unwrap().get(&key) {
+    if let Some(client) = CLIENT_CACHE.lock().await.get(&key) {
         return Ok(client.clone()); // Client::clone() is cheap (Arc)
     }
     let scheme = if socks5h { "socks5h" } else { "socks5" };
@@ -100,7 +101,7 @@ fn create_socks5_client(
         .timeout(timeout)
         .build()
         .map_err(SpeedTestError::Http)?;
-    CLIENT_CACHE.lock().unwrap().insert(key, client.clone());
+    CLIENT_CACHE.lock().await.insert(key, client.clone());
     Ok(client)
 }
 
@@ -117,7 +118,7 @@ pub async fn real_ping(
     test_timeout: Duration,
     retries: u32,
 ) -> Result<RealPingResult, SpeedTestError> {
-    let client = create_socks5_client(proxy, port, false, test_timeout)?;
+    let client = create_socks5_client(proxy, port, false, test_timeout).await?;
 
     let mut best_latency = None;
     let mut last_error = None;
@@ -184,7 +185,7 @@ pub async fn speed_test(
     min_duration: Duration,
     max_duration: Duration,
 ) -> Result<u64, SpeedTestError> {
-    let client = create_socks5_client(proxy, port, true, max_duration + Duration::from_secs(5))?;
+    let client = create_socks5_client(proxy, port, true, max_duration + Duration::from_secs(5)).await?;
 
     let start = std::time::Instant::now();
     let resp = client.get(url).send().await?;

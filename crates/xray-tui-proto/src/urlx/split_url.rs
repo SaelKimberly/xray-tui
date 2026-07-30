@@ -267,7 +267,7 @@ impl<'a> RawUrlX<'a> {
             Some(_) => match unparsed.split_once('@') {
                 Some((userinfo, "")) => (userinfo, None),
                 Some((userinfo, rest)) => (userinfo, Some(rest)),
-                _ => unreachable!(),
+                None => (unparsed, None),
             },
             _ => (unparsed, None),
         };
@@ -405,7 +405,7 @@ impl<'a> RawUrlX<'a> {
 
 impl<'a> From<&'a str> for RawUrlX<'a> {
     fn from(s: &'a str) -> Self {
-        Self::from_str_impl(s).expect("Schema should be always present")
+        Self::from_str_impl(s).expect("from_str_impl should always succeed for valid URL")
     }
 }
 

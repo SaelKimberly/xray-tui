@@ -4,7 +4,7 @@ use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
 
-use super::{BuildError, BuildParams};
+use super::{BuildError, BuildParams, parse_settings};
 
 // ── Sing-box JSON config structs ──────────────────────────────────
 
@@ -732,17 +732,7 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
         .collect()
 }
 
-fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
-    if let Ok(config) =
-        serde_json::from_slice::<xray_tui_proto::proto_spec::ProtocolConfig>(&protocol.spec_blob)
-    {
-        return config.to_settings();
-    }
-    let extra: Value = serde_json::from_slice(&protocol.spec_blob).unwrap_or_else(|_| json!({}));
-    let p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
-    let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
-    (p_settings, s_settings)
-}
+
 fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) -> Option<Value> {
     let (p_settings, s_settings) = parse_settings(protocol);
 

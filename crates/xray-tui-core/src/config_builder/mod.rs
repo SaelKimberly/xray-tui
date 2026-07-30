@@ -27,6 +27,21 @@ pub struct BuildParams {
 }
 
 use serde::Serialize;
+use serde_json::{Value, json};
+
+/// Shared: extract (p_settings, s_settings) from a protocol row's spec_blob.
+/// Tries typed ProtocolConfig first; falls back to raw JSON extraction.
+pub(crate) fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
+    if let Ok(config) =
+        serde_json::from_slice::<xray_tui_proto::proto_spec::ProtocolConfig>(&protocol.spec_blob)
+    {
+        return config.to_settings();
+    }
+    let extra: Value = serde_json::from_slice(&protocol.spec_blob).unwrap_or_else(|_| json!({}));
+    let p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
+    let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
+    (p_settings, s_settings)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub enum BackendConfig {

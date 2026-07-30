@@ -483,8 +483,10 @@ pub(crate) fn clash_transport_to_transport(
     server: Option<&str>,
 ) -> TransportConfig {
     match network {
-        Some("ws" | "websocket") if ws_opts.is_some() => {
-            let w = ws_opts.as_ref().unwrap();
+        Some("ws" | "websocket") => {
+            let Some(w) = ws_opts else {
+                return TransportConfig::Tcp;
+            };
             TransportConfig::Ws(WebSocketConfig {
                 path: w.path.clone().map(TinyText::from),
                 host: w
@@ -535,8 +537,10 @@ pub(crate) fn clash_transport_to_transport(
                 ping_timeout: None,
             })
         }
-        Some("kcp" | "mkcp") if mkcp_opts.is_some() => {
-            let k = mkcp_opts.as_ref().unwrap();
+        Some("kcp" | "mkcp") => {
+            let Some(k) = mkcp_opts else {
+                return TransportConfig::Tcp;
+            };
             TransportConfig::Kcp(KcpConfig {
                 mtu: k.mtu,
                 tti: k.tti,

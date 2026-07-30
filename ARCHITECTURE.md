@@ -501,8 +501,7 @@ CoreManager::start(core_type, config)
         │
         ▼
 match core_type {
-    Xray    → XrayGrpcClient::connect(api_addr)
-    SingBox → SingBoxGrpcClient::connect(api_addr)
+    Xray | SingBox → GrpcStatsClient::connect(api_addr)
 }
         │
         ▼

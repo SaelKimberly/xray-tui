@@ -22,33 +22,31 @@ pub struct Database {
 // ── Constructors ────────────────────────────────────────────────────────
 
 impl Database {
-    /// Always deletes existing DB, creates fresh. Pre-alpha, no migration.
+    /// Opens existing DB or creates fresh. Recovers from corruption by recreating.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path_str = path
             .as_ref()
             .to_str()
             .ok_or_else(|| DatabaseError::Generic("invalid db path".into()))?;
 
-        // Delete existing DB file so we always start fresh
-        if Path::new(path_str).exists() {
+        // If file is empty (0 bytes), delete so toasty can create it fresh
+        if Path::new(path_str).exists() && std::fs::metadata(path_str)?.len() == 0 {
             std::fs::remove_file(path_str)?;
         }
 
         let driver = toasty_driver_turso::Turso::file(path_str);
-        let db = toasty::Db::builder()
-            .models(toasty::models!(
-                Endpoint,
-                ProtocolRow,
-                EndpointGroup,
-                Group,
-                ProfileExtension,
-                ServerStat,
-                PingSession,
-                RoutingRule,
-                DnsSetting
-            ))
-            .build(driver)
-            .await?;
+        let db = match Self::try_open_db(driver).await {
+            Ok(db) => db,
+            Err(e) => {
+                // DB might be corrupted — log warning, delete, recreate
+                tracing::warn!(error = %e, "DB open failed, attempting recovery by recreating");
+                if Path::new(path_str).exists() {
+                    std::fs::remove_file(path_str)?;
+                }
+                let driver = toasty_driver_turso::Turso::file(path_str);
+                Self::try_open_db(driver).await?
+            }
+        };
 
         let mut conn = db.connection().await?;
         db.push_schema().await?;
@@ -65,6 +63,25 @@ impl Database {
 
         Self::init_default_groups(&mut conn).await?;
         Ok(Self { db })
+    }
+
+    /// Open a toasty DB by constructing builder. Separate for recovery logic.
+    async fn try_open_db(driver: toasty_driver_turso::Turso) -> Result<toasty::Db> {
+        let db = toasty::Db::builder()
+            .models(toasty::models!(
+                Endpoint,
+                ProtocolRow,
+                EndpointGroup,
+                Group,
+                ProfileExtension,
+                ServerStat,
+                PingSession,
+                RoutingRule,
+                DnsSetting
+            ))
+            .build(driver)
+            .await?;
+        Ok(db)
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -1406,7 +1423,7 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         .or_insert_with(|| ProfileExtension {
                             protocol_id: ext_pid,
                             delay: get_opt_i64(&fields, 23).map(|v| v as i32),
-                            speed: get_opt_i64(&fields, 24).map(|v| v as i32),
+                            speed: get_opt_i64(&fields, 24),
                             sort_order: get_opt_i64(&fields, 25).map(|v| v as i32),
                             ip_info: get_opt_string(&fields, 26),
                             protocol_row: Default::default(),
@@ -1450,7 +1467,7 @@ fn deserialize_ping_sessions(rows: Vec<Value>) -> Result<Vec<PingSession>> {
                 ping_type: get_string(&fields, 8)?,
                 status: get_string(&fields, 9)?,
                 latency_ms: get_opt_i64(&fields, 10).map(|v| v as i32),
-                speed_bps: get_opt_i64(&fields, 11).map(|v| v as i32),
+                speed_bps: get_opt_i64(&fields, 11),
                 ip_info: get_opt_string(&fields, 12),
                 error: get_opt_string(&fields, 13),
                 created_at: get_opt_string(&fields, 14),

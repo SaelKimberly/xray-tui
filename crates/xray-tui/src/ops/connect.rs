@@ -240,7 +240,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
 
         if core_type == CoreType::Xray {
             // === gRPC polling loop (xray-core) ===
-            let provider = match grpc_client::create_stats_provider(CoreType::Xray).await {
+            let provider = match grpc_client::create_stats_provider().await {
                 Ok(p) => Some(p),
                 Err(e) => {
                     try_send_or_warn(

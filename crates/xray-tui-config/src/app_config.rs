@@ -474,16 +474,10 @@ pub struct SpeedTestConfig {
     pub real_ping_timeout_secs: crate::DurationOrSecs,
     #[serde(default = "default_batch_page_size")]
     pub batch_page_size: usize,
-    #[serde(default = "default_tcp_ping_concurrency")]
-    pub tcp_ping_concurrency: usize,
     #[serde(default = "default_real_ping_retries")]
     pub real_ping_retries: u32,
     #[serde(default = "default_real_ping_concurrency")]
     pub real_ping_concurrency: usize,
-}
-
-const fn default_tcp_ping_concurrency() -> usize {
-    20
 }
 
 fn default_ping_url() -> String {
@@ -491,7 +485,7 @@ fn default_ping_url() -> String {
 }
 
 fn default_ip_api_url() -> String {
-    "http://ip-api.com/json/".to_string()
+    "https://ip-api.com/json/".to_string()
 }
 
 fn default_tcp_timeout_secs() -> crate::DurationOrSecs {
@@ -524,7 +518,6 @@ impl Default for SpeedTestConfig {
             batch_page_size: default_batch_page_size(),
             real_ping_retries: default_real_ping_retries(),
             real_ping_concurrency: default_real_ping_concurrency(),
-            tcp_ping_concurrency: default_tcp_ping_concurrency(),
         }
     }
 }

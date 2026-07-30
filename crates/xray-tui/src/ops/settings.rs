@@ -260,10 +260,6 @@ pub async fn build_settings_fields(
                     "real_ping_concurrency".into(),
                     state.config.speed_test.real_ping_concurrency.to_string(),
                 ),
-                (
-                    "tcp_ping_concurrency".into(),
-                    state.config.speed_test.tcp_ping_concurrency.to_string(),
-                ),
                 ("geoip_url".into(), state.config.geo.geoip_url.clone()),
                 ("geosite_url".into(), state.config.geo.geosite_url.clone()),
                 (
@@ -464,9 +460,6 @@ fn apply_settings_fields(
             }
             if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                 state.config.speed_test.real_ping_retries = v;
-            }
-            if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
-                state.config.speed_test.tcp_ping_concurrency = v.max(1);
             }
             if !get_str("geoip_url").is_empty() {
                 state.config.geo.geoip_url = get("geoip_url");

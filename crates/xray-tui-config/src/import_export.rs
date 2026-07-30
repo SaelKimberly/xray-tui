@@ -4,6 +4,17 @@ use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_proto::proto_spec::{ParseResult, PlaceholderConfig, ProtocolConfig};
 
+/// Maximum length for protocol settings JSON from untrusted sources.
+const MAX_SETTINGS_LEN: usize = 65536;
+
+/// Parse JSON from untrusted input, rejecting payloads over `MAX_SETTINGS_LEN`.
+fn safe_parse_json(s: &str) -> Result<serde_json::Value> {
+    if s.len() > MAX_SETTINGS_LEN {
+        return Err(ImportError::Parse("protocol_settings too large (max 64KB)".into()));
+    }
+    serde_json::from_str(s).map_err(|e| ImportError::Parse(format!("invalid JSON: {e}")))
+}
+
 /// Local helper for URL parsing. Not a toasty model.
 #[derive(Debug, Clone)]
 pub struct Profile {

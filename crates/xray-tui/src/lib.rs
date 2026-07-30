@@ -94,23 +94,33 @@ pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
 }
 
 pub(crate) fn format_now() -> String {
-    // Simple ISO 8601 without chrono dependency
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    // Format as YYYY-MM-DDTHH:MM:SSZ
-    let year = 1970 + secs / 31_557_600;
-    let remaining = secs % 31_557_600;
-    let month = 1 + remaining / 2_629_800;
-    let remaining = remaining % 2_629_800;
-    let day = 1 + remaining / 86400;
-    let remaining = remaining % 86400;
+    use std::time::SystemTime;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Convert Unix timestamp to civil date using Howard Hinnant's
+    // chrono-compatible algorithm (public domain).
+    let (year, month, day) = civil_from_days(secs / 86400);
+    let remaining = secs % 86400;
     let hour = remaining / 3600;
-    let remaining = remaining % 3600;
-    let minute = remaining / 60;
+    let minute = (remaining % 3600) / 60;
     let second = remaining % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(z: u64) -> (u64, u64, u64) {
+    let z = z as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u64, m as u64, d)
 }
 
 pub(crate) fn parse_core_log_line(

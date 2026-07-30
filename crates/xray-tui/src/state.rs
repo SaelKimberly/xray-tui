@@ -1013,10 +1013,6 @@ impl AppState {
                         "real_ping_concurrency".into(),
                         self.config.speed_test.real_ping_concurrency.to_string(),
                     ),
-                    (
-                        "tcp_ping_concurrency".into(),
-                        self.config.speed_test.tcp_ping_concurrency.to_string(),
-                    ),
                     ("geoip_url".into(), self.config.geo.geoip_url.clone()),
                     ("geosite_url".into(), self.config.geo.geosite_url.clone()),
                     (
@@ -1172,9 +1168,6 @@ impl AppState {
                 }
                 if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                     self.config.speed_test.real_ping_retries = v;
-                }
-                if let Ok(v) = get_str("tcp_ping_concurrency").parse::<usize>() {
-                    self.config.speed_test.tcp_ping_concurrency = v.max(1);
                 }
                 if !get_str("geoip_url").is_empty() {
                     self.config.geo.geoip_url = get("geoip_url");

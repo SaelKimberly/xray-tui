@@ -196,8 +196,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                                     ext.delay = latency_ms.map(|v| v as i32);
                                 }
                                 TestType::SpeedTest => {
-                                    ext.speed =
-                                        speed_bps.map(|v| std::cmp::min(v, i32::MAX as u64) as i32);
+                                    ext.speed = speed_bps.map(|v| v as i64);
                                 }
                             }
                             let _ = state.db.upsert_profile_extension(ext).await;

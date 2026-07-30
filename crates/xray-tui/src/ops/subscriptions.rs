@@ -280,7 +280,16 @@ async fn do_update_subscription(
                 Some(e.to_string()),
             );
         }
-    };
+        };
+
+    // Warn on HTTP (non-HTTPS) subscription URLs
+    if url.starts_with("http://") {
+        tracing::warn!(
+            target: "tui::ops::subscriptions",
+            "Subscription URL uses HTTP, traffic is not encrypted"
+        );
+    }
+
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {

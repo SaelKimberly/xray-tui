@@ -72,9 +72,10 @@ where
         if let Some(ref file_mutex) = self.log_file {
             use std::io::Write;
             if let Ok(mut file) = file_mutex.lock() {
+                let escaped_msg = serde_json::to_string(&message).unwrap_or_else(|_| "null".into());
                 let _ = writeln!(
                     file,
-                    r#"{{"ts":{timestamp_nanos},"level":"{level}","target":"{target}","msg":"{message}"}}"#,
+                    r#"{{"ts":{timestamp_nanos},"level":"{level}","target":"{target}","msg":{escaped_msg}}}"#,
                 );
             }
         }
@@ -177,6 +178,26 @@ async fn main() -> Result<()> {
     // 3c. Capture log config before moving config into AppState
     let log_to_file = config.logging.log_to_file;
     let log_file_path = config.logging.log_file_path.clone();
+
+    // Canonicalize log file path to prevent path traversal
+    let log_file_path = if log_to_file {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
+            .join("xray-tui");
+        let p = Path::new(&log_file_path);
+        // Reject any path with parent-dir traversal (`..`)
+        if p.components().any(|c| c == std::path::Component::ParentDir) {
+            tracing::warn!("log file path contains '..', falling back to default");
+            config_dir.join("xray-tui.log")
+        } else if p.is_relative() {
+            config_dir.join(&log_file_path)
+        } else {
+            p.to_path_buf()
+        }
+    } else {
+        Path::new(&log_file_path).to_path_buf()
+    };
+
     let mut state = AppState::new(Arc::new(db), config).await;
     state.heed_storage = Some(heed.clone());
     state.log_sender_tx = Some(log_sender_tx.clone());

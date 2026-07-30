@@ -4,7 +4,7 @@ use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
 
-use super::{BuildError, BuildParams};
+use super::{BuildError, BuildParams, parse_settings};
 
 // ── Xray JSON config structs ────────────────────────────────────────
 
@@ -16,9 +16,12 @@ pub struct XrayConfig {
     pub outbounds: Vec<Outbound>,
     pub routing: RoutingConfig,
     pub dns: DnsConfig,
-    pub stats: StatsConfig,
-    pub api: ApiConfig,
-    pub policy: PolicyConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<StatsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +104,30 @@ impl XrayConfigBuilder {
             build_block_outbound(),
         ];
 
+        let (stats, api, policy) = if params.v2ray_api_enabled {
+            (
+                Some(StatsConfig {}),
+                Some(ApiConfig {
+                    tag: "api",
+                    services: vec!["HandlerService", "LoggerService", "StatsService"],
+                }),
+                Some(PolicyConfig {
+                    levels: json!({
+                        "0": {
+                            "statsUserUplink": true,
+                            "statsUserDownlink": true
+                        }
+                    }),
+                    system: json!({
+                        "statsInboundUplink": true,
+                        "statsOutboundUplink": true
+                    }),
+                }),
+            )
+        } else {
+            (None, None, None)
+        };
+
         Ok(XrayConfig {
             log: LogConfig {
                 loglevel: params.log_level.clone(),
@@ -109,23 +136,9 @@ impl XrayConfigBuilder {
             outbounds,
             routing: build_routing(routing),
             dns: build_dns(dns),
-            stats: StatsConfig {},
-            api: ApiConfig {
-                tag: "api",
-                services: vec!["HandlerService", "LoggerService", "StatsService"],
-            },
-            policy: PolicyConfig {
-                levels: json!({
-                    "0": {
-                        "statsUserUplink": true,
-                        "statsUserDownlink": true
-                    }
-                }),
-                system: json!({
-                    "statsInboundUplink": true,
-                    "statsOutboundUplink": true
-                }),
-            },
+            stats,
+            api,
+            policy,
         })
     }
 }
@@ -160,15 +173,17 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
         });
     }
 
-    // API inbound for gRPC Commander
-    inbounds.push(Inbound {
-        listen: "127.0.0.1".into(),
-        port: super::API_PORT,
-        protocol: "dokodemo-door",
-        settings: json!({ "address": "127.0.0.1" }),
-        sniffing: json!({ "enabled": false, "destOverride": [] }),
-        tag: "api".into(),
-    });
+    // API inbound for gRPC Commander — only when stats/api enabled
+    if params.v2ray_api_enabled {
+        inbounds.push(Inbound {
+            listen: "127.0.0.1".into(),
+            port: super::API_PORT,
+            protocol: "dokodemo-door",
+            settings: json!({ "address": "127.0.0.1" }),
+            sniffing: json!({ "enabled": false, "destOverride": [] }),
+            tag: "api".into(),
+        });
+    }
     inbounds
 }
 
@@ -183,9 +198,21 @@ fn build_proxy_outbound(
 
     let address = endpoint.host.as_str();
     let port = endpoint.port as u16;
-    let user_id = ""; // TODO: cached on ProtocolRow
-    let p_settings = serde_json::Value::Null; // TODO: from spec_blob
-    let s_settings: Option<serde_json::Value> = None; // TODO: from spec_blob
+    let (p_settings, s_settings_raw) = parse_settings(protocol);
+    let user_id = p_settings
+        .get("id")
+        .or_else(|| p_settings.get("uuid"))
+        .or_else(|| p_settings.get("password"))
+        .or_else(|| p_settings.get("pass"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let s_settings = if s_settings_raw.is_null()
+        || s_settings_raw.as_object().map_or(false, |o| o.is_empty())
+    {
+        None
+    } else {
+        Some(s_settings_raw)
+    };
 
     match proto {
         Protocol::Vmess => Ok(Outbound {
@@ -238,18 +265,13 @@ fn build_proxy_outbound(
                         "address": address,
                         "port": port,
                         "method": method,
-                        "password": user_id,
-                        "uot": true
+                        "password": user_id
                     }]
                 }),
                 stream_settings: s_settings.clone(),
             })
         }
         Protocol::Trojan => {
-            let flow = p_settings
-                .get("flow")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             Ok(Outbound {
                 tag: "proxy".to_string(),
                 protocol: "trojan".to_string(),
@@ -257,8 +279,7 @@ fn build_proxy_outbound(
                     "servers": [{
                         "address": address,
                         "port": port,
-                        "password": user_id,
-                        "flow": flow
+                        "password": user_id
                     }]
                 }),
                 stream_settings: s_settings,
@@ -291,19 +312,13 @@ fn build_proxy_outbound(
             })
         }
         Protocol::Hysteria2 => {
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or(user_id);
             Ok(Outbound {
                 tag: "proxy".to_string(),
                 protocol: "hysteria2".to_string(),
                 settings: json!({
-                    "servers": [{
-                        "address": address,
-                        "port": port,
-                        "password": password
-                    }]
+                    "version": 2,
+                    "address": address,
+                    "port": port
                 }),
                 stream_settings: s_settings.clone(),
             })

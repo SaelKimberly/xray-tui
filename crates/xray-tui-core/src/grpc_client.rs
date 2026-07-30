@@ -56,14 +56,15 @@ pub trait StatsProvider: Send + Sync {
     fn api_endpoint(&self) -> &str;
 }
 
-// ── XrayGrpcClient ──────────────────────────────────────────────────
+// ── GrpcStatsClient ────────────────────────────────────────────────
 
-/// gRPC client for xray-core's `StatsService`.
-pub struct XrayGrpcClient {
+/// gRPC client for xray-core and sing-box's shared `StatsService`.
+/// Both backends expose the same V2Ray Stats API on the same endpoint.
+pub struct GrpcStatsClient {
     channel: tonic::transport::Channel,
 }
 
-impl XrayGrpcClient {
+impl GrpcStatsClient {
     pub async fn connect() -> Result<Self, GrpcError> {
         let channel = tonic::transport::Endpoint::new(API_ENDPOINT)
             .expect("valid API_ENDPOINT URI")
@@ -74,7 +75,7 @@ impl XrayGrpcClient {
 }
 
 #[async_trait]
-impl StatsProvider for XrayGrpcClient {
+impl StatsProvider for GrpcStatsClient {
     async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<proto::Stat>, GrpcError> {
         let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
         let response = client
@@ -108,73 +109,13 @@ impl StatsProvider for XrayGrpcClient {
     }
 }
 
-// ── SingBoxGrpcClient ───────────────────────────────────────────────
 
-/// gRPC client for sing-box's `V2Ray` API `StatsService`.
-pub struct SingBoxGrpcClient {
-    channel: tonic::transport::Channel,
-}
-
-impl SingBoxGrpcClient {
-    pub async fn connect() -> Result<Self, GrpcError> {
-        let channel = tonic::transport::Endpoint::new(API_ENDPOINT)
-            .expect("valid API_ENDPOINT URI")
-            .connect()
-            .await?;
-        Ok(Self { channel })
-    }
-}
-
-#[async_trait]
-impl StatsProvider for SingBoxGrpcClient {
-    async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<proto::Stat>, GrpcError> {
-        let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
-        let response = client
-            .query_stats(tonic::Request::new(proto::QueryStatsRequest {
-                pattern: pattern.to_string(),
-                reset,
-                patterns: vec![],
-                regexp: false,
-            }))
-            .await?;
-        Ok(response.into_inner().stat)
-    }
-
-    async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
-        let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
-        let response = client
-            .get_sys_stats(tonic::Request::new(proto::SysStatsRequest {}))
-            .await?;
-        let s = response.into_inner();
-        Ok(SysStats {
-            num_goroutine: s.num_goroutine,
-            alloc: s.alloc,
-            total_alloc: s.total_alloc,
-            sys: s.sys,
-            uptime: s.uptime,
-        })
-    }
-
-    fn api_endpoint(&self) -> &str {
-        API_ENDPOINT
-    }
-}
 
 // ── Factory ─────────────────────────────────────────────────────────
 
-use crate::core_type::CoreType;
-
-/// Create a [`StatsProvider`] for the given resolved core type.
-pub async fn create_stats_provider(
-    core_type: CoreType,
-) -> Result<Box<dyn StatsProvider>, GrpcError> {
-    match core_type {
-        CoreType::Xray => Ok(Box::new(XrayGrpcClient::connect().await?)),
-        CoreType::SingBox => Ok(Box::new(SingBoxGrpcClient::connect().await?)),
-        CoreType::Auto => Err(GrpcError::InvalidResponse(
-            "Auto must be resolved before creating provider".into(),
-        )),
-    }
+/// Create a [`StatsProvider`] for the shared V2Ray Stats API.
+pub async fn create_stats_provider() -> Result<Box<dyn StatsProvider>, GrpcError> {
+    Ok(Box::new(GrpcStatsClient::connect().await?))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

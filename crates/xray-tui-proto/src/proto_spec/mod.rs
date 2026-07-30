@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use smallvec::SmallVec;
 
 use crate::clash::ClashProxy;
@@ -240,11 +241,185 @@ impl ProtocolConfig {
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                 (p, s)
             }
-            // Typed protocols: build from typed config fields (TODO)
-            _ => (
-                serde_json::Value::Object(serde_json::Map::new()),
-                serde_json::Value::Object(serde_json::Map::new()),
+            // Typed protocols: build from typed config fields
+            Self::Vmess(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("id".into(), json!(c.uuid));
+                if let Some(sec) = c.security.type_str() {
+                    p.insert("security".into(), json!(sec));
+                }
+                p.insert("encryption".into(), json!("auto"));
+                (Value::Object(p), json!({}))
+            }
+            Self::Vless(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("id".into(), json!(c.uuid));
+                p.insert("encryption".into(), json!(c.encryption.as_deref().unwrap_or("none")));
+                if let Some(ref flow) = c.flow {
+                    p.insert("flow".into(), json!(flow));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Trojan(c) => (
+                json!({"password": c.password}),
+                json!({}),
             ),
+            Self::Hysteria2(c) => {
+                let mut p = serde_json::Map::new();
+                // Hysteria2 auth token is the password
+                p.insert("password".into(), json!(c.auth));
+                if let Some(ref up) = c.up {
+                    if let Ok(v) = up.as_str().parse::<u64>() {
+                        p.insert("up_mbps".into(), json!(v));
+                    }
+                }
+                if let Some(ref down) = c.down {
+                    if let Ok(v) = down.as_str().parse::<u64>() {
+                        p.insert("down_mbps".into(), json!(v));
+                    }
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Ss(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("password".into(), json!(c.password));
+                p.insert("method".into(), json!(c.method));
+                if let Some(ref plugin) = c.plugin {
+                    p.insert("plugin".into(), json!(plugin.as_str()));
+                }
+                if let Some(ref opts) = c.plugin_opts {
+                    let joined: String = opts.iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    p.insert("plugin_opts".into(), json!(joined));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Ssr(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("password".into(), json!(c.password));
+                p.insert("method".into(), json!(c.method));
+                for (k, v) in &c.params {
+                    p.insert(k.clone(), json!(v));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Tuic(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("uuid".into(), json!(c.uuid));
+                p.insert("password".into(), json!(c.password));
+                if let Some(ref cc) = c.congestion_control {
+                    p.insert("congestion_control".into(), json!(cc.as_str()));
+                }
+                if let Some(ref urm) = c.udp_relay_mode {
+                    p.insert("udp_relay_mode".into(), json!(urm.as_str()));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Wireguard(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("private_key".into(), json!(c.private_key));
+                p.insert("public_key".into(), json!(c.public_key));
+                p.insert("address".into(), json!(c.address.as_str()));
+                if let Some(ref pk) = c.preshared_key {
+                    p.insert("preshared_key".into(), json!(pk));
+                }
+                if let Some(ref r) = c.reserved {
+                    p.insert("reserved".into(), json!(r.as_str()));
+                }
+                if let Some(ref mtu) = c.mtu {
+                    p.insert("mtu".into(), json!(mtu.as_str()));
+                }
+                if let Some(ref k) = c.persistent_keepalive {
+                    p.insert("persistent_keepalive".into(), json!(k));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Socks(c) => {
+                let mut p = serde_json::Map::new();
+                if let Some(ref user) = c.username {
+                    p.insert("username".into(), json!(user));
+                }
+                if let Some(ref pass) = c.password {
+                    p.insert("password".into(), json!(pass));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Http(c) => {
+                let mut p = serde_json::Map::new();
+                if let Some(ref user) = c.username {
+                    p.insert("username".into(), json!(user));
+                }
+                if let Some(ref pass) = c.password {
+                    p.insert("password".into(), json!(pass));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Naive(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("username".into(), json!(c.username));
+                p.insert("password".into(), json!(c.password));
+                (Value::Object(p), json!({}))
+            }
+            Self::AnyTls(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("password".into(), json!(c.password));
+                (Value::Object(p), json!({}))
+            }
+            Self::ShadowTls(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("password".into(), json!(c.password));
+                if let Some(ref ver) = c.version {
+                    p.insert("version".into(), json!(ver.as_str()));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Tor(c) => {
+                let mut p = serde_json::Map::new();
+                if let Some(ref dir) = c.data_directory {
+                    p.insert("data_dir".into(), json!(dir));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Ssh(c) => {
+                let mut p = serde_json::Map::new();
+                if let Some(ref user) = c.user {
+                    p.insert("username".into(), json!(user));
+                }
+                if let Some(ref pass) = c.password {
+                    p.insert("password".into(), json!(pass));
+                }
+                if let Some(ref key) = c.private_key {
+                    p.insert("private_key".into(), json!(key));
+                }
+                (Value::Object(p), json!({}))
+            }
+            Self::Tailscale(c) => {
+                let mut p = serde_json::Map::new();
+                p.insert("auth_key".into(), json!(c.auth_key));
+                if let Some(ref url) = c.control_url {
+                    p.insert("control_url".into(), json!(url));
+                }
+                p.insert("ephemeral".into(), json!(c.ephemeral));
+                (Value::Object(p), json!({}))
+            }
+            Self::Hysteria1(c) => {
+                let mut p = serde_json::Map::new();
+                if let Some(ref a) = c.auth {
+                    p.insert("auth".into(), json!(a));
+                }
+                if let Some(up) = c.up_mbps {
+                    p.insert("up_mbps".into(), json!(up));
+                }
+                if let Some(down) = c.down_mbps {
+                    p.insert("down_mbps".into(), json!(down));
+                }
+                if let Some(ref obfs) = c.obfs {
+                    p.insert("obfs".into(), json!(obfs.as_str()));
+                }
+                (Value::Object(p), json!({}))
+            }
         }
     }
 }

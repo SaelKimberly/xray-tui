@@ -87,7 +87,7 @@ pub struct ProfileExtension {
     pub protocol_id: i64, // was profile_id
 
     pub delay: Option<i32>,
-    pub speed: Option<i32>,
+    pub speed: Option<i64>,
     pub sort_order: Option<i32>,
     pub ip_info: Option<String>,
 
@@ -163,7 +163,7 @@ pub struct PingSession {
     pub ping_type: String,
     pub status: String,
     pub latency_ms: Option<i32>,
-    pub speed_bps: Option<i32>,
+    pub speed_bps: Option<i64>,
     pub ip_info: Option<String>,
     pub error: Option<String>,
     pub created_at: Option<String>,
@@ -180,7 +180,7 @@ pub struct PingResultUpdate {
     pub status: String,
     pub ping_type: String,
     pub latency_ms: Option<i32>,
-    pub speed_bps: Option<i32>,
+    pub speed_bps: Option<i64>,
     pub ip_info: Option<String>,
     pub error: Option<String>,
 }

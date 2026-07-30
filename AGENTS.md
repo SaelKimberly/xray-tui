@@ -22,8 +22,9 @@ cargo run
 - `crates/xray-tui-db/src/database.rs` — Database struct + all public query/write methods (toasty ORM, replaced raw turso SQLite)
 - `crates/xray-tui-proto/src/` — Protocol config types (VMess, VLESS, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard, Hysteria2, Hysteria1, TUIC, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR) with URL parsing/splitting infrastructure + Clash YAML conversion. Adopted from sub-healer project. 94 unit + 3 doc tests.
 - `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Profile, Connection, Group, ProfileExtension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession); non-model types (ProfileWithDetails, PingResultUpdate); constants (GRAVEYARD_GROUP_ID, ALL_GROUP_ID)
+- `crates/xray-tui-core/src/config_builder/mod.rs` — BackendConfig enum, BuildParams, BuildError, ConfigBuilder struct, shared `parse_settings()` (extracts p_settings/s_settings from ProtocolRow spec_blob)
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
-- `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + XrayGrpcClient/SingBoxGrpcClient + factory
+- `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + GrpcStatsClient + factory (unified from former XrayGrpcClient/SingBoxGrpcClient)
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
 - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain) with per-profile validation via ValidationSettings
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
@@ -80,7 +81,7 @@ cargo run
 3. **One core at a time**: Only one backend process runs per connection session. Switching profiles between backends stops current core and starts other. Matches v2rayN.
 4. **SQLite via toasty ORM (async)** — Single DB file for all persistent data. Models defined via `#[derive(toasty::Model)]` in `models_toasty.rs`. Schema auto-managed by toasty's `db.push_schema()`. All DB methods are `async fn` on `Database` struct backed by `toasty::Db`. Database::open() accepts impl AsRef<Path>. System groups (All, Graveyard) created on first open. Toasty v0.7 with `turso` driver for async SQLite.
 5. **Config generation** — Two builders: xray.rs (ports v2rayN's CoreConfigContextBuilder) and singbox.rs (ports sing-box JSON format).
-6. **gRPC stats abstraction**: `StatsProvider` trait with `XrayGrpcClient` (xray-core native gRPC) and `SingBoxGrpcClient` (sing-box V2Ray API experimental).
+6. **gRPC stats abstraction**: `StatsProvider` trait with unified `GrpcStatsClient` (both backends share the same V2Ray Stats gRPC API).
 7. **Sing-box config differs structurally** from xray-core: `type` vs `protocol`, `route` vs `routing`, `experimental.v2ray_api` vs `stats`+`api`+`policy`, different TLS/transport key names.
 8. **Theme system**: `ThemeStyles` struct (in `theme.rs`) provides static methods returning `Style` from a `&Palette`. Palette is constructed from `ratatui_themes::ThemeName` -> `ratatui_themes::Theme` -> `palette_bridge::current_palette()`. AppState::current_palette() is canonical accessor. Every screen accepts `&Palette` and calls `ThemeStyles::*` methods instead of hardcoded colors.
 9. **Sing-box V2Ray API is experimental**: May require build tag `with_v2ray_api`. If unavailable, stats/logs show "not supported by core".
