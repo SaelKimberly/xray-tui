@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
-use xray_tui_proto::proto_spec::{PlaceholderConfig, ProtocolConfig};
+use xray_tui_proto::proto_spec::{ParseResult, PlaceholderConfig, ProtocolConfig};
 
 /// Local helper for URL parsing. Not a toasty model.
 #[derive(Debug, Clone)]
@@ -296,7 +296,7 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
     if let Some(idx) = primary_idx
         && let Ok(profile) = PARSE_ORDER[idx](url)
     {
-        return convert_spec_blob(profile, settings);
+        return convert_spec_blob(profile, url, settings);
     }
 
     // Fallback: try all parsers (skip primary if it was attempted)
@@ -310,7 +310,7 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
         }
         match parser(url) {
             Ok(profile) => match validate_profile(profile, settings) {
-                Ok(validated) => return convert_spec_blob(validated, settings),
+                Ok(validated) => return convert_spec_blob(validated, url, settings),
                 Err(e @ ImportError::Validation(_)) => {
                     if has_known_scheme {
                         return Err(e);
@@ -332,28 +332,45 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
 }
 
 /// Convert a legacy-parsed Profile's JSON `spec_blob` to JSON-encoded `ProtocolConfig`.
+/// 
+/// Keeps `PlaceholderConfig` in `spec_blob` for `to_settings()` backward compatibility
+/// (used by `validate_required_fields`, `format_share_url`, and config builders).
+/// But computes proper `sig`/`cred_hash` by also parsing URL with typed `ProtocolConfig`
+/// (which `PlaceholderConfig` returns as 0).
 fn convert_spec_blob(
     mut profile: Profile,
+    url: &str,
     settings: &ValidationSettings,
 ) -> Result<ParsedProtocol> {
     use xray_tui_core::protocol::Protocol;
     use xray_tui_proto::proto_spec::ProtoSpec;
+    use xray_tui_proto::urlx::RawUrlX;
 
     let proto = Protocol::try_from_i32(profile.config_type).ok_or_else(|| {
         ImportError::Parse(format!("unknown config_type: {}", profile.config_type))
     })?;
     let proto_name = proto.to_string();
 
-    // Copy the legacy JSON blob and wrap it as a ProtocolConfig (PlaceholderConfig variant)
+    // Keep legacy spec_blob wrapped as PlaceholderConfig for to_settings() compat
     let settings_json = std::mem::take(&mut profile.spec_blob);
     let config = ProtocolConfig::from_legacy_parse(&proto_name, settings_json);
-    // JSON-encode into spec_blob
     profile.spec_blob = serde_json::to_vec(&config)
         .map_err(|e| ImportError::Parse(format!("failed to serialize config: {e}")))?;
 
-    profile.id = config.uid() as i64;
-    profile.sig = config.sig() as i64;
-    profile.cred_hash = config.cred_hash() as i64;
+    // Compute proper sig/cred_hash from typed ProtocolConfig parser.
+    // PlaceholderConfig always returns 0 for both, causing uid collision.
+    if let Ok(ParseResult::Direct(typed) | ParseResult::Fallback(typed, _)) =
+        ProtocolConfig::try_parse_detailed(&RawUrlX::from(url))
+    {
+        profile.id = typed.uid() as i64;
+        profile.sig = typed.sig() as i64;
+        profile.cred_hash = typed.cred_hash() as i64;
+    } else {
+        // Fallback to PlaceholderConfig (returns 0 — old behavior, no worse)
+        profile.id = config.uid() as i64;
+        profile.sig = config.sig() as i64;
+        profile.cred_hash = config.cred_hash() as i64;
+    }
 
     // Validate
     validate_required_fields(&profile)?;

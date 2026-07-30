@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
@@ -92,7 +93,22 @@ pub async fn poll_core_events(state: &mut AppState) {
                 state.system_stats = Some(stats);
             }
             CoreEvent::LogLine { .. } => {}
-            CoreEvent::TuiLog { .. } => {}
+            CoreEvent::TuiLog { target, level, message } => {
+                let level = level.to_lowercase();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64;
+                state.log_cache.push_back(crate::LogLine {
+                    level,
+                    target,
+                    message,
+                    timestamp_nanos: now,
+                });
+                if state.log_cache.len() > 10_000 {
+                    state.log_cache.pop_front();
+                }
+            }
             CoreEvent::SubscriptionsUpdated {
                 group_id,
                 count,

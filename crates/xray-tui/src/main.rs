@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
@@ -154,10 +155,23 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // Flush batch when full
+            // Flush batch when full, or flush partial batch after 500ms timeout
             if batch.len() >= 100 {
                 let _ = writer_heed.write_log_batch(&batch);
                 batch.clear();
+            } else if !batch.is_empty() {
+                // Wait up to 500ms for more messages, then flush anyway
+                match log_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(msg) => batch.push(msg),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = writer_heed.write_log_batch(&batch);
+                        batch.clear();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = writer_heed.write_log_batch(&batch);
+                        return;
+                    }
+                }
             }
         }
     });
