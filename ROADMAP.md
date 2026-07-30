@@ -82,7 +82,7 @@
 - ✅ Sing-box config builder completeness — config generation for all 17 outbound protocols (ShadowsocksR, Hysteria v1, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, VMess, VLESS, Trojan, WireGuard) via 12 new protocol arms + build_tls helper + protocol code mapping
 ✅ WireGuard sing-box peer model — complete form fields for multi-peer arrays, pre-shared keys, allowed IPs
 - ✅ Sub-healer profile model adoption — uid-based PK (sig ^ cred_hash), spec_blob (postcard-encoded ProtocolConfig) replaces flat fields, Connection table for many-to-many Profile↔Group, bridge traits (ProfileLegacy/ProfileMut) for old parse/format compatibility, xray-tui-proto crate with protocol config types. All 253 workspace tests pass.
-- ☐ Advanced form fields — add multiplex, V2Ray transport (WS/gRPC/QUIC/HTTPUpgrade), TLS options (ECH, uTLS fingerprint, Fragment) to protocol forms
+- ✅ Advanced form fields — multiplex, V2Ray transport (WS/gRPC/QUIC/HTTPUpgrade), TLS options (ECH, uTLS fingerprint, Fragment) all added to protocol forms
 - ✅ ProfileCore dedup — normalized schema (profile_cores + group_profiles) eliminates redundant storage for shared configs
 - ✅ Version update check — GitHub releases API, download, install with .bak rollback, Updates settings form with per-core status
 - ✅ Batch import — bulk import multiple share URLs at once via AppMode::BatchImport with scrollable results list
@@ -99,6 +99,12 @@
 - ✅ Graveyard orphan promotion — subscription_upsert_profiles promotes re-imported profiles from graveyard
 - ✅ Keybinding harmonization — Ctrl+D disconnect, Ctrl+Shift+S copy share URL, TUI_MANUAL.md updated
 :- ✅ Heed-backed log storage — `logs` LMDB database with postcard-encoded LogMessage entries, `HeedLogStorage` in xray-tui-core::log_heed, non-blocking TuiLogLayer via std::sync::mpsc channel, background batched heed writer (spawn_blocking, batch up to 100), MapFull→auto-resize (1 GB default, doubles up to 8 GB, atomic fail counter), async heed read wrappers (spawn_blocking), lazy log loading on first Logs tab access
+- ✅ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
+- ✅ Log to file toggle — core log persistence with configurable path
+- ✅ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile
+- ✅ Default skip cert verify — global security toggle in Core settings
+- ✅ Clear all stats — reset traffic counters per profile or globally
+- ✅ Mux protocol selector — per-profile sing-box mux protocol choice
 
 ## Phase 8 — Polish & Release
 -
@@ -111,13 +117,7 @@
 - ☐ Error handling & recovery flows
 - ☐ man page / --help
 - ☐ CI/CD, packaging
-- ✅ Performance optimization — add_log owned strings (saves 3 allocs/log), get_str closure (saves 5-17 allocs/settings save), parse_core_log_line eq_ignore_ascii_case (removes to_lowercase alloc), BatchImport mutable scroll (avoids Vec clone per keypress), TCP ping spawn no longer clones Vec&lt;Profile&gt;, updater Cow&lt;OsStr&gt; over to_string_lossy
-✅ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
-✅ Log to file toggle — core log persistence with configurable path
-✅ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile
-✅ Default skip cert verify — global security toggle in Core settings
-✅ Clear all stats — reset traffic counters per profile or globally
-✅ Mux protocol selector — per-profile sing-box mux protocol choice
+✅ Performance optimization — add_log owned strings (saves 3 allocs/log), get_str closure (saves 5-17 allocs/settings save), parse_core_log_line eq_ignore_ascii_case (removes to_lowercase alloc), BatchImport mutable scroll (avoids Vec clone per keypress), TCP ping spawn no longer clones Vec<Profile>, updater Cow<OsStr> over to_string_lossy
 
 ## Phase 9 — v2rayN Parity
 
@@ -142,9 +142,9 @@
 ### Clash YAML
 
 - ✅ Clash YAML proto_spec parsing — `clash/mod.rs` with 29 ClashProxy/ClashXxx serde structs, `try_from_clash`/`to_clash` on ProtoSpec trait, per-protocol implementations for all 16 protocols, dispatch macro, roundtrip tests (13/13 passing)
-- ☐ Clash Mixin — YAML overlay injected into sing-box config for Clash-compatible features
 - ☐ Clash API proxies view — real-time proxy group selector TUI tab
 - ☐ Clash API connections view — real-time active connection monitor TUI tab
+- ☐ Clash API providers view — subscription provider management and health TUI tab
 ### Core Management
 
 - ☐ Automatic server failover — health-check based fallback between profiles in a group

@@ -45,10 +45,11 @@ cargo run
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 - `profiles.rs` — profile list DataGrid with connected indicator, IP info column, multi-sort indicators, graveyard group filter; multi-select, delete confirmation, batch import overlay
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
-- `settings.rs` — Settings panel with split-pane tree+form view. Left pane: collapsible tree (SPLIT_SETTINGS_TREE const, SettingsSection-navigated). Right pane: Form, UpdateForm, Empty. Sections: Core, GUI, Inbound, System Proxy, TUN, Mux, Statistics, Protocol Core, SpeedTest, Logging, Routing Rules (list+form, reorder). Tree navigation (arrows) + form focus switching (Ctrl+W). Full rewrite. Replaced per-section SettingsMode variants with unified Split { tree, focus, right }.
+- `settings.rs` — Settings panel with split-pane tree+form view. Left pane: collapsible tree (SPLIT_SETTINGS_TREE const, SettingsSection-navigated). Right pane: Form, UpdateForm, GroupList, Empty. Sections: Core, GUI, Inbound, Routing, DNS, System Proxy, TUN, Mux, Statistics, Protocol Core, Updates, Speed Test, Logging, Subscriptions (14 total). Tree navigation (arrows) + form focus switching (Ctrl+W). Full rewrite. Replaced per-section SettingsMode variants with unified Split { tree, focus, right }.
 - `groups.rs` — system-group-aware management (is_system guard, clear action)
 - `logs.rs` — live core log viewer with scrollable display, color-coded log levels (error/warning/info/debug), keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - `theme.rs` — central Palette-derived style methods (ThemeStyles struct) — static methods returning Style from a &Palette
+- `statistics.rs` — statistics screen with 3 bordered sections (traffic, system stats, connection info)
 - `actions_log.rs` — live state info panel: connection status, server info, test results, traffic/memory, recent logs
 - `palette_bridge.rs` — maps ratatui-themes `ThemePalette` → ratatui-cheese `Palette` (10-to-11 color role mapping)
 - `widgets/` — reusable widgets: `DataTable` (sortable, selectable, multi-select, virtual-scrolled with themed scrollbar, Column/ColumnWidth/SortDirection/DataTableRow trait)
@@ -102,7 +103,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 ## Common Tasks
 
-**Phase overview**: Phases 0-6 (Foundation through Settings) fully implemented. Phase 6 includes split-pane settings refactor (unified SettingsMode::Split replacing per-section form variants). Phase 7 (Advanced Features) completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), **Heed-backed log storage** (HeedLogStorage, LMDB, Settings→Logging form). Phase 8 (Polish) completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. **Log subsystem overhaul** completed: non-blocking TuiLogLayer (std::sync::mpsc channel instead of direct heed writes), background batched heed writer (batch up to 100 messages per transaction, spawn_blocking), MapFull→resize_map with retry (1GB default, doubles up to 8GB, atomic counter instead of tracing events), async heed read wrappers (spawn_blocking for all reads), lazy log loading on first Logs tab access. **Theme system overhaul** completed: integrated ratatui-themes + ratatui-cheese crates, replaced hardcoded Theme Style constants with ThemeStyles + Palette pattern, added palette_bridge, extracted DataTable widget, added mouse support via tui-popup overlays.
+**Phase overview**: Phases 0-6 (Foundation through Settings) fully implemented. Phase 6 includes split-pane settings refactor (unified SettingsMode::Split replacing per-section form variants). Phase 7 (Advanced Features) completed: logs tab, sing-box config builder for all 17 outbound protocols, normalized profile schema, advanced form fields (TLS/ECH/Fragment/uTLS/mux), speed test config with batch-then-real-ping, profiles table redesign (connected indicator, IP info, graveyard filter), Heed-backed log storage (HeedLogStorage, LMDB, Settings→Logging form), Clash Mixin, geo auto-update, log-to-file toggle, certificate pinning UI, default skip cert verify, clear all stats, mux protocol selector. Phase 8 (Polish) completed: confirmation overlay redesign, quit confirmation when connected, form validation with inline errors, empty-state guidance, search cursor, actions panel collapse, consistent form field display, scroll indicators, Home/End in group overlay, PgUp/PgDn in profiles, inverted log scroll, Ctrl+A select-all/deselect-all, connection indicator in tab bar, update indicator styling, statistics screen refactored into bordered sections. **Log subsystem overhaul** completed: non-blocking TuiLogLayer (std::sync::mpsc channel instead of direct heed writes), background batched heed writer (batch up to 100 messages per transaction, spawn_blocking), MapFull→resize_map with retry (1GB default, doubles up to 8GB, atomic counter instead of tracing events), async heed read wrappers (spawn_blocking for all reads), lazy log loading on first Logs tab access. **Theme system overhaul** completed: integrated ratatui-themes + ratatui-cheese crates, replaced hardcoded Theme Style constants with ThemeStyles + Palette pattern, added palette_bridge, extracted DataTable widget, added mouse support via tui-popup overlays.
 
 ### Adding a new protocol form
 1. Add config type enum variant and assign core type in `protocol_core_mapping.rs`
@@ -120,10 +121,10 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 6. Add dispatch arm in `clash_match!` macro in `mod.rs`
 
 ### Adding subscription management features
-1. `confirm_add_group()` / `confirm_edit_group()` in `crates/xray-tui/src/lib.rs` handle form submit
-2. `update_group_subscriptions()` / `do_update_subscription()` in same file handle HTTP fetch + parse + DB upsert
+1. `confirm_add_group()` / `confirm_edit_group()` in `crates/xray-tui/src/ops/settings.rs` handle form submit
+2. `update_group_subscriptions()` / `do_update_subscription()` in `crates/xray-tui/src/ops/subscriptions.rs` handle HTTP fetch + parse + DB upsert
 3. `subscription_upsert_profiles()` in `crates/xray-tui-db/src/lib.rs` handles content-based dedup via `ON CONFLICT(group_id, sub_uid)`
-4. `move_orphans_to_graveyard()` / `purge_graveyard()` handle stale profile cleanup
+4. `move_orphans_to_purgatory()` / `purge_purgatory()` handle stale profile cleanup
 5. `spawn_auto_update()` runs background check at 60s intervals, comparing SQL datetime() arithmetic
 6. `shutdown_token: Arc<AtomicBool>` on `AppState` signals background loop to stop on quit — checked via `token.load()` in each iteration
 
@@ -144,14 +145,14 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 2. Collect results as `Vec<BatchImportItem>` and set `AppMode::BatchImport { results, scroll }`
 3. Render scrollable success/failure list in `profiles.rs` (`render_batch_import()`)
 4. Batch import mode handles keys: Up/Down scroll, Enter saves all successful imports via `db.add_profile()`, Esc cancels
-5. Reference `crates/xray-tui/src/lib.rs` `start_batch_import()` method for pattern
+5. Reference `crates/xray-tui/src/ops/profiles.rs` `start_batch_import()` method for pattern
 6. Refer to `groups.rs` for group management overlay UI patterns (matching `add_server.rs` form conventions)
 
 ### Adding a new speed test type
 1. Add variant to `TestType` enum in `crates/xray-tui-core/src/speed_test.rs`
 2. Implement async function in `speed_test.rs` using tokio timeouts
-3. Add `start_xxx_test()` method in `crates/xray-tui/src/lib.rs` AppState that spawns tokio task calling function
-4. Wire result into `CoreEvent::SpeedTestResult` handler in `poll_core_events()`
+3. Add `start_xxx_test()` method in `crates/xray-tui/src/ops/ping.rs` AppState that spawns tokio task calling function
+4. Wire result into `CoreEvent::SpeedTestResult` handler in `poll_core_events()` in `crates/xray-tui/src/ops/events.rs`
 5. Add menu item in `render_speed_test_menu()` in `crates/xray-tui/src/ui/mod.rs`
 6. Add key handler entry in `handle_key()` menu navigation
 7. Use `create_socks5_client(proxy, port, socks5h, timeout)` helper from `speed_test.rs` to build reqwest::Client with SOCKS5 proxy — reuses connection pool and avoids per-call construction overhead
@@ -179,6 +180,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Reference `thirdparty/Xray-core/proxy/` directory listing for xray-core protocols
 - Update `protocol_core_mapping.rs` with new entry
 - Protocols present in both: prefer xray-core (user can override profile core_type to force sing-box)
+- See `docs/protocols.md` for protocol specifications and `docs/clash.md` for Clash YAML format docs
 
 ### Adding a new gRPC-based feature (stats, logs, routing API)
 1. Add/update proto definition in `crates/xray-tui-core/proto/` and re-run build (auto-compiled via build.rs)

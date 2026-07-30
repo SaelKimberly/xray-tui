@@ -43,6 +43,9 @@ The Core column is color-coded: blue for xray-core, green for sing-box.
 - Multi-select indicator: `*` replaces row number
 - Scrollable via arrow keys, Home/End
 
+**Search:** Press `/` to focus search field, type to filter profiles by name/address/type.
+Search matches are highlighted. `Esc` clears filter and exits search mode.
+
 **Delete confirmation overlay** — centered dialog asking `y/n` when `d` is pressed.
 `y` confirms, `n`/`q`/`Esc` cancels.
 
@@ -50,7 +53,7 @@ The Core column is color-coded: blue for xray-core, green for sing-box.
 
 ### Settings
 
-A settings panel with a menu of 10 sections. Press `Enter` on a section to open its
+A settings panel with a menu of 14 sections. Press `Enter` on a section to open its
 configuration form. A separator line visually groups the first 5 "active" sections
 from the remaining "deferred" sections.
 
@@ -61,11 +64,15 @@ from the remaining "deferred" sections.
 3. Inbound Settings — ports, listen address, sniffing
 4. Routing Rules — add/edit/delete/reorder rules
 5. DNS Settings — servers, hosts, query strategy, cache
-6. System Proxy — enable/disable HTTP_PROXY, ports, bypass
-7. TUN Mode — enabled, interface name, MTU
-8. Mux — multiplexing settings
-9. Statistics — enable/disable stats collection
-10. Updates — check and install backend updates
+6. Protocol Core — per-protocol core override (Auto/Xray/SingBox)
+7. System Proxy — enable/disable HTTP_PROXY, ports, bypass
+8. TUN Mode — enabled, interface name, MTU
+9. Mux — multiplexing settings
+10. Statistics — enable/disable stats collection
+11. Speed Test — ping URL, IP API URL, timeouts, batch concurrency
+12. Logging — log level, log-to-file path, log retention
+13. Subscriptions — group list, add/edit/delete/update
+14. Updates — check and install backend updates
 
 **Form navigation within a section:**
 - `Tab` / `Shift+Tab` — move focus between fields
@@ -144,10 +151,12 @@ with columns:
 | `a`        | Add new group                     |
 | `e`        | Edit selected group               |
 | `d`        | Delete selected group (y/n confirm)|
-| `u`        | Update single group's subscriptions|
-| `Shift+U`  | Update all groups                 |
-| `Enter`    | Filter profiles by selected group |
-| `Esc`      | Close overlay                     |
+|| `u`        | Update single group's subscriptions                          |
+|| `Shift+U`  | Update all groups                                           |
+|| `Enter`    | Filter profiles by selected group                            |
+|| `[`        | Cycle to previous group in filter (wraps, skips purgatory)   |
+|| `]`        | Cycle to next group in filter (wraps, skips purgatory)       |
+|| `Esc`      | Close overlay                                                |
 
 **Group form** — fields: `name`, `subscription_url`, `user_agent`,
 `update_interval`, `core_type`. `Tab`/`Shift+Tab` navigates, `Enter` saves,
@@ -196,6 +205,16 @@ Import URL — Ctrl+V paste, Enter parse, Esc cancel
 - `Esc` — cancel
 - Shows error message in red if parsing fails
 
+### Batch Import Screen
+
+Triggered by pasting multiple share URLs into the Import URL screen and pressing Enter.
+Shows a scrollable list of import results with success/failure per URL.
+
+**Keyboard shortcuts:**
+- `↑/↓` — scroll results list
+- `Enter` — save all successful imports and return to profile list
+- `Esc` — cancel all and return to profile list
+
 ---
 
 ### Speed Test Menu
@@ -211,15 +230,20 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 │  ─────                                                │
 │  Fast Ping (All Visible)                                │
 │  Fast + Real Ping (All Visible)                         │
+│  ─────                                                │
+│  Clear All Stats                                      │
 │  Sort by Delay                                        │
 │  Remove Bad Servers                                   │
+│  ─────                                                │
+│  Stop Testing                                         │
 └───────────────────────────────────────────────────────┘
 ```
 
-- `↑↓` — navigate (skips separator line)
+- `↑↓` — navigate (skips separator lines)
 - `Enter` — run selected test
 - `Esc` — close menu
 - `?` — open help overlay
+- `s` — stop running tests (works when progress shown in status bar)
 
 Progress is shown in the status bar during batch tests (`Testing: {completed}/{total}` or `Testing...`).
 
@@ -343,9 +367,11 @@ appended when updates are available for installed backends.
 | `PgUp` / `PgDn`  | Page up/down in profile list        |
 | `Home` / `End`   | Jump to first/last profile          |
 | `Enter`          | Set as active server                |
-| `Ctrl+Enter`     | Connect to selected server          |
-| `Space`          | Toggle multi-select                 |
-| `a`              | Add new server                      |
+|| `Ctrl+Enter`     | Connect to selected server          |
+|| `Ctrl+G`         | Connect fallback (for terminals without Ctrl+Enter) |
+|| `Space`          | Toggle multi-select                 |
+|| `Ctrl+A`         | Select all / deselect all           |
+|| `a`              | Add new server                      |
 | `e`              | Edit selected server                |
 | `d`              | Delete selected server(s)           |
 | `c`              | Clone selected server               |

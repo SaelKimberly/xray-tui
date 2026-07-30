@@ -6,25 +6,26 @@ Feature parity with v2rayN (C# desktop GUI) for all protocols supported by eithe
 ## Project structure
 
 ```
-xray-tui/
+crates/
 ├── xray-tui/          # Binary: ratatui event loop + all screens
-│   └── src/ui/         # TUI screen modules (profiles, add_server, status_bar, settings, groups, logs, statistics, actions_log, theme, palette_bridge, widgets/)
-├── xray-tui-core/     # Library: business logic, dual-core process mgmt, gRPC client, config builders
-├── xray-tui-db/       # Library: toasty ORM persistence layer + query methods
-├── xray-tui-proto/    # Library: protocol config types, URL parse/format, Clash YAML structs and conversion (16 protocols)
-├── xray-tui-config/   # Library: import/export format parsers, protocol form fields, JSON config management
-├── thirdparty/
-│   ├── Xray-core/         # Source of truth for protocols and behavior
-│   ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
-│   ├── v2rayN/            # Source of truth for UI/UX feature set
-│   ├── shoes/             # Rust proxy - possible protocol reference
-│   ├── leaf/              # Rust proxy framework
-│   └── shadowsocks-rust/  # Shadowsocks protocol in Rust
-├── ROADMAP.md
-├── CONTEXT.md
-├── ARCHITECTURE.md
-├── TUI_MANUAL.md
-└── AGENTS.md
+│   └── src/            # state.rs (AppState), types.rs, ops/ (7 modules), ui/
+├── xray-tui-core/     # Library: process mgmt, gRPC, config builders, ping, updater, log_heed
+├── xray-tui-db/       # Library: toasty ORM persistence layer + Model definitions
+├── xray-tui-proto/    # Library: protocol config types, URL parse/format, Clash YAML (20 protocols)
+├── xray-tui-config/   # Library: import/export parsers, form fields, AppConfig management
+thirdparty/
+├── Xray-core/         # Source of truth for protocols and behavior
+├── sing-box/          # Source of truth for sing-box protocols, config format, and API
+├── v2rayN/            # Source of truth for UI/UX feature set
+├── shoes/             # Rust proxy - possible protocol reference
+├── leaf/              # Rust proxy framework
+└── shadowsocks-rust/  # Shadowsocks protocol in Rust
+ROADMAP.md
+CONTEXT.md
+ARCHITECTURE.md
+TUI_MANUAL.md
+AGENTS.md
+```
 
 :- **LogMessage** | Persisted tracing event — stored in heed (LMDB) with fields `timestamp_nanos`, `level`, `target`, `message`. Written by `TuiLogLayer` via non-blocking `std::sync::mpsc::Sender` channel, batched (up to 100) by background `spawn_blocking` writer, stored via `HeedLogStorage` (two LMDB databases: `logs` + `targets`). Async read wrappers (`read_recent_async`, `read_newer_than_async`, etc.) wrap LMDB reads in `spawn_blocking` for use from async context. No SQLite table, no separate DB connection. |
 
@@ -45,8 +46,11 @@ xray-tui/
 | **Outbound** | Remote proxy server connection (VMess, VLESS, Shadowsocks, etc.) |
 | **Subscription group** | Named group of proxy profiles fetched from a subscription URL |
 | **ALL_GROUP_ID** | Fixed UUID (`00000000-0000-0000-0000-000000000000`) identifying system "All" group for showing every profile across groups |
-| **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update |
-| **Graveyard** | Destination group (`sub-graveyard`) for orphaned subscription profiles; purged after 24h |
+| **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update. URL-imported: `sig ^ cred_hash`. Form-created: random i64. |
+| **Purgatory** | Destination group for orphaned subscription profiles (was "Graveyard"). Default TTL 7 days, retention 30 days. |
+| **PurgatoryView** | Enum controlling which set of profiles to display: None (active only), Graveyard, Purgatory. |
+| **endpoints_gen** | Generation counter bumped on every endpoint mutation. Skips redundant reloads. |
+| **batch_progress** | `Arc<(AtomicU16, AtomicU16)>` shared between ping tasks and status bar — tracks (completed, total) for batch speed tests. |
 | **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
 | **Fast Ping** | Transport-level latency test using TCP handshake (TcpPingAdapter), UDP datagram (UdpPingAdapter), or QUIC handshake (QuicPingAdapter). Dispatched by FastPingManager based on protocol support. |
 | **PingSession** | SQLite record tracking a single ping attempt: batch_id, profile_id, adapter_type (TCP/UDP/QUIC), latency_ms, ip_info, error. Enables persistent history and async progress tracking via AtomicU16 counters. |
@@ -59,7 +63,8 @@ xray-tui/
 
 ## Key design decisions
 
-- **Normalized schema**: Profiles split across `profile_cores` (deduplicated server configs keyed by `sub_uid` hash) and `group_profiles` (per-group profile membership with per-group remarks). Query pattern always JOINs both tables. `ALL_GROUP_ID` system group shows all profiles across groups.
+- **Normalized schema**: Profiles stored as `Endpoint` (server config, dedup key `sub_uid`) + `ProtocolRow` (protocol fields) + `Connection` (M:N Endpoint↔Group). Query pattern JOINs all three tables. `ALL_GROUP_ID` system group shows all endpoints across groups. Purgatory replaces old Graveyard with configurable TTL/retention.
+- **Profile identity**: `sub_uid = sig ^ cred_hash` for URL-imported (deterministic dedup via rapidhash), random i64 for manual form entries. Form profiles set `sig = uid`, `cred_hash = 0` (meaningless, no URL-dedup).
 - **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. Each profile tagged with core type (auto, xray, sing-box). Auto mode resolves based on protocol.
 - **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, Shadowsocks, etc.) → xray-core by default. User can override per-profile.
 - **One core runs at a time**: Switching profiles between backends stops current core process and starts other. Matches v2rayN behavior and avoids port conflicts.
@@ -74,7 +79,56 @@ xray-tui/
 
 ## Key source files
 
-- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 8 tables, ProfileWithDetails, PingResultUpdate, ALL_GROUP_ID constant
+- `crates/xray-tui/src/state.rs` — AppState struct (55+ fields)
+- `crates/xray-tui/src/types.rs` — Tab, SortColumn, SettingsSection (14 variants), AppMode, CoreEvent (13 variants), LogLine, BackendUpdateStatus, ClashTraffic
+- `crates/xray-tui/src/ops/` — extracted AppState methods: connect.rs, ping.rs, events.rs, subscriptions.rs, updates.rs, settings.rs, profiles.rs
+- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Endpoint, Connection, Group, ProtocolRow, Extension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession), EndpointRow, PurgatoryView constants
 - `crates/xray-tui/src/ui/groups.rs` — system-group-aware management (is_system guard, clear action)
-- `crates/xray-tui/src/ui/actions_log.rs` — live event log panel: connection status, speed test results, core/TUI logs, traffic/memory
-- `crates/xray-tui/src/lib.rs` — BatchImport mode, ClearGroup event, start_batch_import method, batch-then-real-ping flow, testing_details HashMap, logs_show_validation toggle, SpeedTestConfig
+- `crates/xray-tui/src/ui/actions_log.rs` — live event log panel
+- `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage (LMDB), LogMessage struct
+- `crates/xray-tui-core/src/ping/mod.rs` — FastPingAdapter trait + FastPingManager
+- `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager
+- `crates/xray-tui-core/src/config_builder/clash_mixin.rs` — Clash YAML overlay
+- `crates/xray-tui-core/src/bin_manager.rs` — binary discovery and archive extraction
+
+## Key Differences from v2rayN
+
+### Storage & Entity Model
+
+| Aspect | v2rayN | xray-tui |
+|--------|--------|----------|
+| Profile storage | Flat `profile` table with all fields inline | Normalized: Endpoint (server config) + ProtocolRow (protocol fields) + Connection (M:N to groups) |
+| Profile identity | Auto-increment PK | `sub_uid = sig ^ cred_hash` (URL-imported, deterministic dedup); random i64 (form entries, no URL-dedup) |
+| Group membership | `Profile.group_id` FK column | `Connection` table: M:N Endpoint↔Group |
+| System groups | "All" + "Graveyard" hardcoded | ALL_GROUP_ID UUID + purgatory system with configurable TTL/retention |
+| Subscription dedup | By URL + name heuristic | By `ON CONFLICT(group_id, sub_uid)` — content-hash based |
+| Log storage | In-memory (recent) + optional file log | LMDB persistent via heed, postcard encoding, auto-resizing, async wrappers |
+| Statistics | SQLite `profile_statistic` table (today/total up/down) | SQLite `server_stats` table — same pattern with i64 PK |
+| Ping history | Transient (not persisted) | PingSession table: batch_id, endpoint_id, adapter_type, latency, ip_info, error |
+| Settings persistence | XML AppConfig file | JSON AppConfig file + SQLite for Routing/DNS |
+| Config generation | C# objects to JSON serialization | config_builder/xray.rs + singbox.rs producing serde_json::Value to file |
+| Binary discovery | Checked process compatibility | bin_manager.rs: searches bin_dir, PATH, extracts archives |
+
+### Display & UX
+
+| Aspect | v2rayN | xray-tui |
+|--------|--------|----------|
+| Display | Desktop GUI (WinForms), multi-window | Terminal TUI (ratatui), single-window tabbed |
+| Profile view | Flat list with sortable columns | Hierarchical: Endpoint rows with expandable Protocol sub-rows |
+| Group view | Dropdown filter | Modal overlay (g key) + Settings section |
+| Settings | Menu-driven dialog boxes | Split-pane: collapsible tree + inline form/routing list |
+| Search | Search box | `/` key focus to inline filter with cursor |
+| Multi-select | Checkbox column + Ctrl+click | Space toggle + Ctrl+A select-all |
+| Connection status | Icon in system tray | Status bar + connected column + tab bar indicator |
+| Speed test | Popup progress dialog | Overlay menu + status bar batch progress + live column updates |
+| Sorting | Click column header | `o` key cycles through 8 sort columns |
+| Routing rules | Separate dialog with up/down | Inline sortable list within Settings split-pane |
+| Logs | Separate window, per-core file viewer | In-TUI tab with source filtering (core/TUI toggle), LMDB persistence |
+| Help | Menu bar About dialog | `?` overlay modal with context-sensitive shortcuts |
+| Drag-drop reorder | Drag column handle | Ctrl+up/down keyboard reorder |
+
+### Feature Parity
+
+**Implemented**: All 20 protocol config types, URL parsing for 14 protocols, Clash YAML conversion for 17 protocols, dual-backend (xray + sing-box), gRPC stats, subscription lifecycle, speed test system (TCP/real/speed/UDP/batch), routing rules CRUD, DNS settings, system proxy (HTTP_PROXY env vars), TUN toggle, theme system, inline form validation, backend auto-updates, geo file updates, Mux config, TLS/REALITY/ECH/Fragment form fields, Clash Mixin.
+
+**Not implemented**: Proxy chain/policy groups, process-based routing, multi-URL subscriptions, SIP008 format, Clash API proxy/connections TUI tabs, PAC mode, WebDAV backup/restore, full TUN config (stack, MTU, route exclude), global hotkeys, i18n system, QR code display, config template editor, auto startup, sudo/polkit integration, drag-drop sort, tray integration.

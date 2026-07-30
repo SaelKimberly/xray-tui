@@ -4,10 +4,11 @@
 
 ```
 xray-tui (bin)
-  ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder)
-  │     └── xray-tui-proto  (ProtocolConfig types, URL parsing)
+  ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder, process, log_heed)
+  │     └── xray-tui-proto  (ProtocolConfig types, URL parsing, Clash YAML)
   ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
-  └── xray-tui-config   (AppConfig load/save, import_export with bridge traits)
+  └── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
+        └── xray-tui-proto  (ProtocolConfig types for import/export round-trip)
 ```
 
 ## Crate Responsibilities
@@ -16,26 +17,25 @@ xray-tui (bin)
 
 Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, initializes all subsystems, enters the ratatui event loop.
 
-**Shared state** (`crates/xray-tui/src/lib.rs`):
+**Shared state** (`crates/xray-tui/src/state.rs`):
 
 ```rust
-pub enum Tab { Profiles, Settings, Logs, Statistics }
-pub enum SortColumn { ConfigType, Remarks, Address, Port, Delay, Speed, Traffic, Core }
-pub struct ProfileRow { profile: Profile, extension: Option<ProfileExtension>, stats: Option<ServerStat>, group_id: Option<String> }
-pub enum AppMode { List, Help, Settings{ mode: SettingsMode }, AddServer{..}, EditServer{..}, ImportUrl{..}, BatchImport{results: Vec<BatchImportItem>, scroll: usize}, ManageGroups{..}, AddGroup{..}, EditGroup{..}, SpeedTestMenu{selected: usize} }
-pub struct LogLine { level: String, message: String, source: String }
-
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
+    /// Currently selected theme name.
+    pub theme_name: ratatui_themes::ThemeName,
     pub current_tab: Tab,
-    pub profiles: Vec<ProfileRow>,
+    pub endpoints: Vec<EndpointRow>,
     pub cached_filtered_indices: RefCell<Vec<usize>>,
     pub filter_cache_valid: Cell<bool>,
+    pub endpoints_gen: u64,
     pub groups: Vec<Group>,
-    pub subscriptions: Vec<Subscription>,
-    pub selected_group_id: Option<String>,
+    pub purgatory_view: PurgatoryView,
+    pub purgatory_ttl_secs: i64,
+    pub purgatory_retention_secs: i64,
     pub selected_index: usize,
+    pub selected_sub: Option<usize>,
     pub log_scroll: usize,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
@@ -44,29 +44,28 @@ pub struct AppState {
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
-    pub log_cache: Vec<LogLine>,
+    pub log_cache: VecDeque<LogLine>,
     pub log_has_older: bool,
     pub log_seek_home: bool,
     pub connection_error: Option<String>,
     pub core_event_rx: Option<mpsc::Receiver<CoreEvent>>,
     pub core_event_tx: Option<mpsc::Sender<CoreEvent>>,
-    pub disconnect_tx: Option<oneshot::Sender<()>>,
+    pub disconnect_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub should_quit: bool,
     pub mode: AppMode,
     pub previous_mode: Option<Box<AppMode>>,
-    pub multi_select: HashSet<String>,
+    pub multi_select: HashSet<i64>,
     pub clipboard: Option<String>,
     pub confirmation: Option<ConfirmAction>,
     pub updating_groups: HashSet<String>,
-    pub testing_profiles: HashSet<String>,
-    pub testing_details: HashMap<uuid::Uuid, TestType>,
-    pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,  // (total, completed) for status bar
+    pub testing_profiles: HashSet<i64>,
+    pub testing_details: HashMap<i64, TestType>,
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub actions_compact: bool,
-    pub connected_profile_id: Option<String>,
-    pub last_core_log: Option<(String, String)>,
-    pub last_tui_log: Option<(String, String, String)>,
+    pub connected_protocol_id: Option<i64>,
+    pub speed_test_stop: Arc<AtomicBool>,
     pub last_test_tcp: Option<u64>,
+    pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
     pub current_traffic_up: i64,
@@ -75,20 +74,14 @@ pub struct AppState {
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
     pub shutdown_token: Arc<AtomicBool>,
-    /// Generation counter bumped on every profile mutation.
-    /// Used to skip redundant reload_profiles() calls.
-    pub profile_gen: u64,
     pub core_task_handle: Option<JoinHandle<()>>,
-    /// Heed-backed persistent log storage.
     pub heed_storage: Option<Arc<HeedLogStorage>>,
     pub last_seen_log_ns: u64,
     pub known_targets: Vec<String>,
     pub selected_targets: Vec<String>,
-    pub last_heed_poll: Instant,
+    pub last_heed_poll: std::time::Instant,
     pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
     pub logs_loaded: bool,
-    /// Theme name from config, used to build Palette via ratatui-themes + palette_bridge.
-    pub theme_name: ratatui_themes::ThemeName,
 }
 
 ### CoreEvent Channel
@@ -99,66 +92,74 @@ pub enum CoreEvent {
     Disconnected,
     Error(String),
     StatsError(String),
-    ClearGroup(String),
     StatsUpdate {
-        profile_id: i64,
+        protocol_id: i64,
         today_up: i64,
         today_down: i64,
         total_up: i64,
         total_down: i64,
     },
+    SysStatsUpdate(grpc_client::SysStats),
+    LogLine {
+        level: String,
+        target: String,
+        message: String,
+        timestamp_nanos: i64,
+    },
+    TuiLog {
+        target: String,
+        level: String,
+        message: String,
+    },
+    SubscriptionsUpdated {
+        group_id: String,
+        count: usize,
+        error: Option<String>,
+        summary: ValidationSummary,
+    },
     SpeedTestResult {
-        profile_id: i64,
+        protocol_id: i64,
         test_type: TestType,
         latency_ms: Option<u64>,
         speed_bps: Option<u64>,
         ip_info: Option<String>,
         error: Option<String>,
     },
-    SubscriptionsUpdated { group_id: String, count: usize, error: Option<String>, summary: String },
-    UpdateCheckResult { core_type: CoreType, current_version: Option<String>, latest_version: Option<String>, error: Option<String> },
-    UpdateCompleted { core_type: CoreType, old_version: Option<String>, new_version: Option<String>, success: bool, error: Option<String> },
-    /// A log line from the core process stdout (xray-core) or stderr (sing-box).
-    LogLine {
-        level: String,
-        message: String,
+    UpdateCheckResult {
+        core_type: CoreType,
+        current_version: Option<String>,
+        latest_version: Option<String>,
+        error: Option<String>,
     },
-    /// A log line from the TUI internals forwarded through tracing subscriber.
-    TuiLog {
-        target: String,
-        level: String,
-        message: String,
+    UpdateDownloadProgress {
+        core_type: CoreType,
+        downloaded: u64,
+        total: u64,
     },
-    /// Update the displayed test type for a profile without triggering cleanup.
-    /// Used by batch_then_real_ping to switch from TcpPing→RealPing emoji.
-    TestTypeUpdate {
-        profile_id: i64,
-        test_type: TestType,
+    UpdateCompleted {
+        core_type: CoreType,
+        old_version: Option<String>,
+        new_version: Option<String>,
+        success: bool,
+        error: Option<String>,
     },
 }
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
 The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
 
-- `import_url()` / `start_batch_import()` — parse share URL(s) and add profile(s)
-- `filtered_profiles()` — group filter + search filter + sort by column
-- `reload_profiles()` / `reload_groups()` — DB reload
-- `add_log()` — appends to in-memory log_cache (Vec<LogLine>, newest at end) and persists to HeedLogStorage via heed_storage.store_entry()
-- `start_add_server()` / `start_edit_profile()` — enter form mode
-- `confirm_add_server()` / `confirm_edit_server()` / `cancel_form()` — form lifecycle
-- `delete_profile()` / `clone_profile()` — CRUD operations
-- `toggle_multi_select()` / `move_profile_up()` / `move_profile_down()` — multi-select + reorder
-- `set_active()` — set default server
-- `import_url()` — parse share URL and add profile
-- `connect_to_profile(&mut self, profile_id: &str)` — spawn async CoreManager task, send CoreEvents
-- `cycle_group(dir: i8)` — cycle to next/previous group, skipping graveyard
-- `resolved_core(row: &ProfileRow) -> CoreType` — 3-level core resolution: profile override → config per-protocol override → auto-detect
-- `disconnect(&mut self)` — send stop signal via disconnect_tx oneshot
-- `poll_core_events(&mut self)` — drain core event channel each frame, update state
+Methods previously in `lib.rs` extracted to `ops/` modules:
+- `ops/connect.rs` — connect_to_profile, disconnect
+- `ops/ping.rs` — start_batch_ping, start_batch_then_real_ping, stop_speed_test
+- `ops/events.rs` — poll_core_events
+- `ops/subscriptions.rs` — update_group_subscriptions, do_update_subscription
+- `ops/updates.rs` — spawn_update_check, spawn_update_download
+- `ops/settings.rs` — confirm_add_server, confirm_edit_server
+- `ops/profiles.rs` — delete_profile, clone_profile, import_url
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
-- `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, or Empty. 12 sections: Core, GUI, Protocol Core, Inbound, Routing Rules (list/add/edit/delete/reorder), DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture.
+- `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, or Empty. 14 sections: Core, GUI, Protocol Core, Inbound, Routing Rules, DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test, Logging, Subscriptions. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
@@ -367,6 +368,13 @@ Key differences from xray-core JSON:
 - `experimental.v2ray_api` block for stats (vs xray-core's `stats` + `api` + `policy`)
 - Transport/TLS config differs: sing-box uses per-protocol `tls` sub-key vs xray-core's `streamSettings.security`
 - No separate `policy` section (stats config lives under `experimental.v2ray_api`)
+
+**`config_builder/clash_mixin.rs`** — Clash YAML overlay injection
+```rust
+pub fn parse_clash_mixin(path: &str) -> Result<serde_json::Value, MixinError>;
+pub fn merge_mixin(config: &mut serde_json::Value, mixin: &serde_json::Value);
+```
+Reads Clash-compatible YAML, parses to JSON, and merges into sing-box config before writing. Supports JSON and YAML input formats (auto-detected by extension). 5 unit tests.
 
 ---
 
