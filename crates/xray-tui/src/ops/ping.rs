@@ -114,12 +114,14 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         .insert(protocol_id, TestType::RealPing);
     state.testing_profiles.insert(protocol_id);
 
+    let proxy_port = state.next_real_ping_port.fetch_add(1, Ordering::Relaxed);
+
     // Build params for the temp core
     let params = BuildParams {
         v2ray_api_enabled: false,
         clash_api_enabled: false,
         log_level: "error".to_string(),
-        socks_port: 0, // overridden by temp allocation
+        socks_port: proxy_port,
         http_port: None,
         listen: state.config.inbound.listen.clone(),
         sniffing: false,
@@ -146,7 +148,6 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
     let bin_dir = config_dir.join("bin");
     let bin_configs_dir = config_dir.join("binConfigs");
     let proxy_addr = state.config.inbound.listen.clone();
-    let proxy_port = state.config.inbound.socks_port;
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_api_url = state.config.speed_test.ip_api_url.clone();
     let timeout_dur = *state.config.speed_test.real_ping_timeout_secs;
@@ -482,6 +483,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
         .collect();
     let progress = Arc::new((AtomicU16::new(total_count), AtomicU16::new(0)));
     state.batch_progress = Some(progress.clone());
+    let ping_port_alloc = state.next_real_ping_port.clone();
 
     tokio::spawn(async move {
         // 1. Snapshot visible profiles into ping_sessions table
@@ -519,6 +521,7 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
             retries,
             proxy_addr,
             base_proxy_port,
+            next_ping_port: ping_port_alloc,
             bin_dir,
             bin_configs_dir,
         };
@@ -570,6 +573,12 @@ pub fn start_batch_sieve(state: &mut AppState, real_ping_enabled: bool) {
                             ip_info: None,
                             error: None,
                         });
+                        // Also demote to real ping for Phase 2
+                        if real_ping_enabled {
+                            let _ = db
+                                .update_session_ping_type(&session.id, "real", "queued")
+                                .await;
+                        }
                         true
                     }
                     Err(xray_tui_core::ping::PingError::NotSupported) => {

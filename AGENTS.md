@@ -36,7 +36,7 @@ cargo run
 - `crates/xray-tui-core/src/ping/adapters/tcp.rs` — TCP handshake ping adapter supporting VMess, VLESS, Shadowsocks, SOCKS, HTTP, Trojan, Naive, AnyTLS, ShadowTLS, Tor, SSH, Redirect, TProxy, Mixed
 - `crates/xray-tui-core/src/ping/adapters/udp.rs` — direct UDP ping adapter for WireGuard and ShadowsocksR endpoints
 - `crates/xray-tui-core/src/ping/adapters/quic.rs` — QUIC handshake ping adapter (quic-ping feature) for QUIC-enabled protocols
-- `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager: launches temp core binary to test profile via SOCKS5 HTTP requests with IP info fetch
+- `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager: launches temp core binary to test profile via SOCKS5 HTTP requests with IP info fetch. Port pool via `next_ping_port: Arc<AtomicU16>` + `allocate_port()` shared across concurrent tasks.
 - `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
 - `crates/xray-tui-proto/src/clash/mod.rs` — Clash YAML proxy structs (ClashProxy enum + 29 per-protocol Clash config structs with kebab-case serde) for bidirectional conversion between Clash YAML and internal ProtocolConfig types

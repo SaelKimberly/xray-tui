@@ -92,6 +92,7 @@ pub struct AppState {
     pub connected_protocol_id: Option<i64>,
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
+    pub next_real_ping_port: Arc<AtomicU16>,
     pub last_test_tcp: Option<u64>,
     /// Shared batch progress (total, completed) displayed in status bar.
     pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
@@ -209,6 +210,7 @@ impl AppState {
         let (core_tx, core_rx) = tokio::sync::mpsc::channel(65536);
         let purgatory_ttl_secs = (config.purgatory.ttl_days * 86400) as i64;
         let purgatory_retention_secs = (config.purgatory.retention_days * 86400) as i64;
+        let base_port = config.inbound.socks_port.saturating_add(1);
         let mut state = Self {
             db,
             config,
@@ -263,6 +265,7 @@ impl AppState {
             core_task_handle: None,
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
+            next_real_ping_port: Arc::new(AtomicU16::new(base_port)),
             batch_progress: None,
             term_height: Cell::new(80),
             heed_storage: None,

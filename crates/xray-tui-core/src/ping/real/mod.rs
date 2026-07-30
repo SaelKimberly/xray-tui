@@ -10,6 +10,8 @@ use crate::core_type::CoreType;
 use crate::protocol::Protocol;
 use crate::protocol_core_mapping::resolve_core;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 /// Configuration and context for running real pings via temporary core instances.
@@ -21,11 +23,19 @@ pub struct RealPingManager {
     pub retries: u32,
     pub proxy_addr: String,
     pub base_proxy_port: u16,
+    pub next_ping_port: Arc<AtomicU16>,
     pub bin_dir: PathBuf,
     pub bin_configs_dir: PathBuf,
 }
 
 impl RealPingManager {
+    /// Allocate next available port for a temp core.
+    /// Starts from `base_proxy_port` and increments atomically.
+    /// Shared across all concurrent tasks via `Arc`.
+    pub fn allocate_port(&self) -> u16 {
+        self.next_ping_port.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Run real ping for a single profile. Builds config for the resolved core,
     pub async fn real_ping(
         &self,

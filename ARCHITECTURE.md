@@ -65,6 +65,7 @@ pub struct AppState {
     pub actions_compact: bool,
     pub connected_protocol_id: Option<i64>,
     pub speed_test_stop: Arc<AtomicBool>,
+    pub next_real_ping_port: Arc<AtomicU16>,
     pub last_test_tcp: Option<u64>,
     pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
     pub last_test_real: Option<u64>,
@@ -189,7 +190,7 @@ which updates the ProfileExtension (delay, ip_info) in memory and persists via u
 
 **Batch-then-real-ping (start_batch_then_real_ping)**: Two-phase pipeline using `ping_sessions` table:
 1. **Phase 1**: Creates ping_sessions records, runs Fast Ping on all visible profiles concurrently. Falls through to RealPingManager for protocols without adapter.
-2. **Phase 2**: Wave-ordered real pings on profiles that succeeded in Phase 1. Wave ordering interleaves profiles from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates. Each profile gets its own **temp core + real ping**. Bounded by `real_ping_concurrency` semaphore.
+2. **Phase 2**: Wave-ordered real pings on ALL profiles from Phase 1. Wave ordering interleaves profiles from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates. Each profile gets its own **temp core + real ping** on a unique port allocated atomically from a shared pool (`RealPingManager.allocate_port()`). Bounded by `real_ping_concurrency` semaphore. Individual Real Ping also uses the pool via `AppState.next_real_ping_port`, sharing the same counter to avoid port collisions between individual and batch flows.
 
 **Stop testing**: `speed_test_stop: Arc<AtomicBool>` on AppState. Set via menu ("Stop Testing" at index 10)
 or hotkey `'s'`. Auto-resets when `testing_profiles` empties. `tested_pids`/`tcp_completed` sets prevent

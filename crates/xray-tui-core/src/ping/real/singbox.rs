@@ -36,11 +36,13 @@ pub(super) async fn real_ping(
         let proto = Protocol::try_from_i32(r#type).unwrap_or(Protocol::Custom);
         let resolved_core = resolve_core(proto, None);
 
+        let proxy_port = ctx.allocate_port();
+
         let params = BuildParams {
             v2ray_api_enabled: false,
             clash_api_enabled: false,
             log_level: "error".to_string(),
-            socks_port: ctx.base_proxy_port,
+            socks_port: proxy_port,
             http_port: None,
             listen: proxy_addr.clone(),
             sniffing: false,
@@ -79,7 +81,7 @@ pub(super) async fn real_ping(
 
         let rp_result = crate::speed_test::real_ping(
             &proxy_addr,
-            ctx.base_proxy_port,
+            proxy_port,
             &ping_url,
             &ip_api_url,
             timeout,
