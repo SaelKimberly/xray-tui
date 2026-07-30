@@ -43,7 +43,7 @@ cargo run
 
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
-- `profiles.rs` — profile list DataGrid with connected indicator, IP info column, multi-sort indicators, graveyard group filter; multi-select, delete confirmation, batch import overlay
+- `profiles.rs` — profile list DataGrid with connected indicator, IP info column, multi-sort indicators, graveyard group filter, tree markers (▶/▾) for expandable endpoints, column separators; sub-row protocol variants with remarks spanning Remarks+Address columns; multi-select, delete confirmation, batch import overlay; expand/collapse (←/→), variant navigation (↑↓), Enter to activate variant
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `settings.rs` — Settings panel with split-pane tree+form view. Left pane: collapsible tree (SPLIT_SETTINGS_TREE const, SettingsSection-navigated). Right pane: Form, UpdateForm, GroupList, Empty. Sections: Core, GUI, Inbound, Routing, DNS, System Proxy, TUN, Mux, Statistics, Protocol Core, Updates, Speed Test, Logging, Subscriptions (14 total). Tree navigation (arrows) + form focus switching (Ctrl+W). Full rewrite. Replaced per-section SettingsMode variants with unified Split { tree, focus, right }.
 - `groups.rs` — system-group-aware management (is_system guard, clear action)

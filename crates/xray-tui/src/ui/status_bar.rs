@@ -212,7 +212,7 @@ const fn build_hints(state: &AppState) -> &'static str {
                     } else if state.connecting {
                         " [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     } else {
-                        " [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
+                        " [→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     }
                 }
                 _ => " [q/Ctrl+C] Quit ",

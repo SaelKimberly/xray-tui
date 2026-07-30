@@ -19,19 +19,25 @@ and starts the other.
 
 The main screen. Shows a table of server profiles with the following columns:
 
-| Column   | Width | Content                              |
-| -------- | ----- | ------------------------------------ |
-| `#`      | 5     | Row number; `*` when multi-selected  |
-| `Type`   | 8     | Protocol type (vmess, trojan, etc.)  |
-| `Remarks`| 24    | Server name / remark                 |
-| `Address`| 30    | Server address or hostname           |
-| `Port`   | 6     | Server port                          |
-| `Delay`  | 6     | Last ping delay in ms (or `-`)       |
-| `Speed`  | 6     | Last speed test result (or `-`)      |
-| `Traffic`| 10    | Total traffic through this profile   |
-| `Core`   | 8     | Assigned core (xray/sing-box)        |
+| Column    | Width | Content                                     |
+| --------- | ----- | ------------------------------------------- |
+| (arrow)   | 1     | Expand/collapse indicator `▶`/`▾`           |
+| (status)  | 2     | Connection status or test indicator          |
+| `#`       | 5     | Row number; `*` when multi-selected         |
+| `Type`    | 12    | Protocol type (vmess, trojan, etc.)         |
+| `Remarks` | 24    | Server name / remark                        |
+| `│`       | 1     | Column separator                            |
+| `Address` | 30    | Server address or hostname                  |
+| `Port`    | 6     | Server port                                 |
+| `│`       | 1     | Column separator                            |
+| `Delay`   | 6     | Last ping delay in ms (or `-`)              |
+| `Speed`   | 6     | Last speed test result (or `-`)             |
+| `IP`      | 20    | Resolved IP info                            |
+| `Traffic` | 10    | Total traffic through this profile          |
 
-The Core column is color-coded: blue for xray-core, green for sing-box.
+The Core type is shown in the status bar footer with color coding: blue for xray-core, green for sing-box.
+
+**Expandable endpoints**: Endpoints with multiple protocol variants show `▶` (collapsed) or `▾` (expanded). Press `→` to expand and see individual protocol sub-rows; `←` to collapse. On expanded sub-rows, `↑`/`↓` navigates between variants and `Enter` sets the active variant. Sub-rows show the protocol's remarks across a wider area since the Address column is repurposed for the variant description.
 
 **Filter strip** above the table shows:
 - Current group filter (if one is active via Groups overlay)

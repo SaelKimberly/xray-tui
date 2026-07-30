@@ -70,21 +70,22 @@ impl DataTableRow for DisplayRowData {
                     let tree_marker = if *has_sub_rows {
                         if *expanded { "▾" } else { "▶" }
                     } else {
-                        ""
+                        " "
                     };
                     let (text, style) = match i {
-                        0 => (indicator.as_str(), *indicator_fg),
-                        1 => (idx_str.as_str(), *row_style),
-                        2 => (type_str.as_str(), *row_style),
-                        3 => (remarks_str.as_str(), *row_style),
-                        4 => (address_str.as_str(), *row_style),
-                        5 => (port_str.as_str(), *row_style),
-                        6 => ("│", *row_style),
-                        7 => (delay_str.as_str(), *row_style),
-                        8 => (speed_str.as_str(), *row_style),
-                        9 => (ip_info_str.as_str(), *row_style),
-                        10 => (traffic_str.as_str(), *row_style),
-                        11 => (tree_marker, *row_style),
+                        0 => (tree_marker, *row_style),
+                        1 => (indicator.as_str(), *indicator_fg),
+                        2 => (idx_str.as_str(), *row_style),
+                        3 => (type_str.as_str(), *row_style),
+                        4 => (remarks_str.as_str(), *row_style),
+                        5 => ("│", *row_style),
+                        6 => (address_str.as_str(), *row_style),
+                        7 => (port_str.as_str(), *row_style),
+                        8 => ("│", *row_style),
+                        9 => (delay_str.as_str(), *row_style),
+                        10 => (speed_str.as_str(), *row_style),
+                        11 => (ip_info_str.as_str(), *row_style),
+                        12 => (traffic_str.as_str(), *row_style),
                         _ => ("", *row_style),
                     };
                     let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
@@ -103,19 +104,26 @@ impl DataTableRow for DisplayRowData {
             } => {
                 let active_mark = if *is_active { "●" } else { "○" };
                 let manual_label = if *is_manual { " (u)" } else { "" };
-                let sub_remarks = crate::ui::profiles::truncate_pad(remarks, 20);
+                let remarks_span_w = col_widths.get(4).copied().unwrap_or(0)
+                    + col_widths.get(5).copied().unwrap_or(0)
+                    + col_widths.get(6).copied().unwrap_or(0);
+                let sub_remarks = crate::ui::profiles::truncate_pad(remarks, remarks_span_w as usize);
                 for (i, &x) in col_xs.iter().enumerate() {
                     let (text, style) = match i {
-                        0 => (active_mark, *row_style),
-                        1 => ("  └", *row_style),
-                        2 => (proto_kind.as_str(), *row_style),
-                        3 => (sub_remarks.as_str(), *row_style),
-                        5 => (transport.as_str(), *row_style),
-                        6 => (security.as_str(), *row_style),
-                        7 => (manual_label, *row_style),
+                        0 => (" ", *row_style),
+                        1 => (active_mark, *row_style),
+                        2 => ("  └", *row_style),
+                        3 => (proto_kind.as_str(), *row_style),
+                        4 => (sub_remarks.as_str(), *row_style),
+                        5 => ("", *row_style),
+                        6 => ("", *row_style),
+                        7 => (transport.as_str(), *row_style),
+                        8 => (security.as_str(), *row_style),
+                        9 => (manual_label, *row_style),
                         _ => ("", *row_style),
                     };
-                    let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
+                    let max_w = if i == 4 { remarks_span_w as usize }
+                               else { col_widths.get(i).copied().unwrap_or(0) as usize };
                     buf.set_stringn(x, y, text, max_w, style);
                 }
             }
@@ -336,13 +344,13 @@ fn render_data_grid(
 
     // Map sort state to DataTable indices
     let sort_column = match state.sort_column {
-        SortColumn::ConfigType => Some(2),
-        SortColumn::Remarks => Some(3),
-        SortColumn::Address => Some(5),
-        SortColumn::Port => Some(6),
-        SortColumn::Delay => Some(8),
-        SortColumn::Speed => Some(9),
-        SortColumn::Traffic => Some(11),
+        SortColumn::ConfigType => Some(3),
+        SortColumn::Remarks => Some(4),
+        SortColumn::Address => Some(6),
+        SortColumn::Port => Some(7),
+        SortColumn::Delay => Some(9),
+        SortColumn::Speed => Some(10),
+        SortColumn::Traffic => Some(12),
         SortColumn::Core => None,
     };
     let sort_direction = if state.sort_ascending {
@@ -353,19 +361,21 @@ fn render_data_grid(
 
     // Build column definitions
     let mut columns = vec![
-        Column::new("", ColumnWidth::Fixed(2)),
-        Column::new("#", ColumnWidth::Fixed(5)),
-        Column::new("Type", ColumnWidth::Fixed(12)),
-        Column::new("Remarks", ColumnWidth::Fixed(24)),
+        Column::new("", ColumnWidth::Fixed(1)),       // 0 — tree marker
+        Column::new("", ColumnWidth::Fixed(2)),       // 1 — indicator
+        Column::new("#", ColumnWidth::Fixed(5)),       // 2 — index
+        Column::new("Type", ColumnWidth::Fixed(12)),   // 3 — type
+        Column::new("Remarks", ColumnWidth::Fixed(24)), // 4 — remarks
+        Column::new("│", ColumnWidth::Fixed(1)),       // 5 — NEW separator
     ];
     columns.extend_from_slice(&[
-        Column::new("Address", ColumnWidth::Fixed(30)),
-        Column::new("Port", ColumnWidth::Fixed(6)),
-        Column::new("│", ColumnWidth::Fixed(1)),
-        Column::new("Delay", ColumnWidth::Fixed(6)),
-        Column::new("Speed", ColumnWidth::Fixed(6)),
-        Column::new("IP", ColumnWidth::Fixed(20)),
-        Column::new("Traffic", ColumnWidth::Fixed(10)),
+        Column::new("Address", ColumnWidth::Fixed(30)), // 6 — address
+        Column::new("Port", ColumnWidth::Fixed(6)),    // 7 — port
+        Column::new("│", ColumnWidth::Fixed(1)),       // 8 — existing separator
+        Column::new("Delay", ColumnWidth::Fixed(6)),   // 9 — delay
+        Column::new("Speed", ColumnWidth::Fixed(6)),   // 10 — speed
+        Column::new("IP", ColumnWidth::Fixed(20)),     // 11 — ip_info
+        Column::new("Traffic", ColumnWidth::Fixed(10)), // 12 — traffic
     ]);
 
     // Scroll offset: keep selected row roughly centered

@@ -861,7 +861,9 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
             AppMode::List => match state.current_tab {
                 Tab::Profiles => vec![
                     ("↑↓ / PgUp PgDn", "Navigate profiles"),
-                    ("Enter", "Set as active server"),
+                    ("← →", "Expand / collapse endpoint"),
+                    ("↑↓ (expanded)", "Navigate protocol variants"),
+                    ("Enter", "Set as active server / Activate variant"),
                     ("Ctrl+Enter", "Connect to selected server"),
                     ("Ctrl+G", "Connect to selected server"),
                     ("Space", "Toggle multi-select"),
