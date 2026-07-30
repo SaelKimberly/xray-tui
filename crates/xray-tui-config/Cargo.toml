@@ -16,21 +16,22 @@ dirs.workspace = true
 
 # ============ Time / Duration Parsing ============
 humantime.workspace = true
+
 # ============ Encoding ============
 base64-simd = "0.8"
-escape8259 = "0.5"
-urlencoding = "2.1"
+escape8259.workspace = true
+urlencoding.workspace = true
 simdutf8 = "0.1"
-url = "2.5"
+url.workspace = true
 
 # ============ Text / Search / Hash ============
 uuid.workspace = true
-aho-corasick = "1.1"
-memchr = "2"
-ratatui-themes = "0.2"
+aho-corasick.workspace = true
+memchr.workspace = true
+ratatui-themes.workspace = true
 
 # ============ Memory ============
-smallvec = { version = "1", features = ["const_new"] }
+smallvec.workspace = true
 
 # ============ Internal ============
 xray-tui-core = { path = "../xray-tui-core" }

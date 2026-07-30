@@ -20,7 +20,7 @@ tracing.workspace = true
 
 # ============ Text / Search / Hash ============
 uuid.workspace = true
-rapidhash = "4.4"
+rapidhash.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true

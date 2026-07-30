@@ -23,7 +23,7 @@ too_many_lines = "allow"
 
 [workspace.dependencies]
 # ============ Async Runtime & I/O ============
-tokio = { version = "1.52" }
+tokio = { version = "1.53" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # ============ Serialization ============
@@ -31,7 +31,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 
 # ============ Error Handling ============
-thiserror = { version = "^2.0.18" }
+thiserror = { version = "2.0.19" }
 yaml-rust2 = "0.11.0"
 
 # ============ Networking ============
@@ -41,12 +41,30 @@ reqwest = { version = "^0.13.4", default-features = false, features = ["rustls"]
 dirs = { version = "^6.0.0" }
 
 # ============ Text / Search / Hash ============
-uuid = { version = "^1.23.4", features = ["v4"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+
+# ============ Encoding ============
+escape8259 = "0.5"
+urlencoding = "2.1"
+aho-corasick = "1.1"
+memchr = "2"
+smallvec = { version = "1", default-features = false, features = ["const_new"] }
+
+# ============ Hashing ============
+rapidhash = { version = "4.5", features = ["std", "unsafe"] }
+
+# ============ TLS ============
+rustls = { version = "0.23", default-features = false }
+
+# ============ TUI ============
+ratatui-themes = "0.2"
 
 # ============ Proto crate ============
 xray-tui-proto = { path = "crates/xray-tui-proto" }
+
 # ============ Logging ============
 tracing = { version = "0.1" }
+
 # ============ Time / Duration Parsing ============
-humantime = "2.1"
+humantime = "2.4.0"
 url = "2"
