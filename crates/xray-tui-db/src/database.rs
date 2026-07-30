@@ -352,32 +352,21 @@ impl Database {
 
             // Upsert each protocol
             for p in protos {
-                toasty::sql::statement(
-                    "INSERT INTO protocol_rows \
-                     (id, endpoint_id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, transport, security, remarks, created_at, last_seen_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-                     ON CONFLICT(id) DO UPDATE SET \
-                     endpoint_id=excluded.endpoint_id, sig=excluded.sig, cred_hash=excluded.cred_hash, \
-                     proto_kind=excluded.proto_kind, spec_blob=excluded.spec_blob, \
-                     config_type=excluded.config_type, core_type=excluded.core_type, \
-                     transport=excluded.transport, security=excluded.security, \
-                     remarks=excluded.remarks, last_seen_at=excluded.last_seen_at",
-                )
-                .bind(p.id)
-                .bind(p.endpoint_id)
-                .bind(p.sig)
-                .bind(p.cred_hash)
-                .bind(&p.proto_kind)
-                .bind_typed(p.spec_blob.clone(), DbType::Blob)
-                .bind(p.config_type)
-                .bind(&p.core_type)
-                .bind(p.transport.as_deref().unwrap_or(""))
-                .bind(p.security.as_deref().unwrap_or(""))
-                .bind(p.remarks.as_deref().unwrap_or(""))
-                .bind(p.created_at)
-                .bind(p.last_seen_at)
-                .exec(&mut tx)
-                .await?;
+                ProtocolRow::upsert_by_id(p.id)
+                    .endpoint_id(p.endpoint_id)
+                    .sig(p.sig)
+                    .cred_hash(p.cred_hash)
+                    .proto_kind(&p.proto_kind)
+                    .spec_blob(p.spec_blob.clone())
+                    .config_type(p.config_type)
+                    .core_type(&p.core_type)
+                    .transport(p.transport.as_deref().unwrap_or(""))
+                    .security(p.security.as_deref().unwrap_or(""))
+                    .remarks(p.remarks.as_deref().unwrap_or(""))
+                    .created_at(p.created_at)
+                    .last_seen_at(p.last_seen_at)
+                    .exec(&mut tx)
+                    .await?;
             }
 
             // Upsert endpoint-group link: deterministic id = group_id:ep.id
@@ -721,20 +710,13 @@ impl Database {
 
     pub async fn upsert_profile_extension(&self, ext: &ProfileExtension) -> Result<()> {
         let mut conn = self.db.connection().await?;
-        toasty::sql::statement(
-            "INSERT INTO profile_extensions (protocol_id, delay, speed, sort_order, ip_info) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(protocol_id) DO UPDATE SET \
-             delay=excluded.delay, speed=excluded.speed, \
-             sort_order=excluded.sort_order, ip_info=excluded.ip_info",
-        )
-        .bind(ext.protocol_id)
-        .bind(ext.delay.unwrap_or(0))
-        .bind(ext.speed.unwrap_or(0))
-        .bind(ext.sort_order.unwrap_or(0))
-        .bind(ext.ip_info.as_deref().unwrap_or(""))
-        .exec(&mut conn)
-        .await?;
+        ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
+            .delay(ext.delay.unwrap_or(0))
+            .speed(ext.speed.unwrap_or(0))
+            .sort_order(ext.sort_order.unwrap_or(0))
+            .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+            .exec(&mut conn)
+            .await?;
         Ok(())
     }
 
@@ -748,22 +730,14 @@ impl Database {
 
     pub async fn upsert_server_stats(&self, stats: &ServerStat) -> Result<()> {
         let mut conn = self.db.connection().await?;
-        toasty::sql::statement(
-            "INSERT INTO server_stats (protocol_id, today_up, today_down, total_up, total_down, last_updated) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(protocol_id) DO UPDATE SET \
-             today_up=excluded.today_up, today_down=excluded.today_down, \
-             total_up=excluded.total_up, total_down=excluded.total_down, \
-             last_updated=excluded.last_updated",
-        )
-        .bind(stats.protocol_id)
-        .bind(stats.today_up.unwrap_or(0))
-        .bind(stats.today_down.unwrap_or(0))
-        .bind(stats.total_up.unwrap_or(0))
-        .bind(stats.total_down.unwrap_or(0))
-        .bind(stats.last_updated.as_deref().unwrap_or(""))
-        .exec(&mut conn)
-        .await?;
+        ServerStat::upsert_by_protocol_id(stats.protocol_id)
+            .today_up(stats.today_up.unwrap_or(0))
+            .today_down(stats.today_down.unwrap_or(0))
+            .total_up(stats.total_up.unwrap_or(0))
+            .total_down(stats.total_down.unwrap_or(0))
+            .last_updated(stats.last_updated.as_deref().unwrap_or(""))
+            .exec(&mut conn)
+            .await?;
         Ok(())
     }
 }
@@ -1232,20 +1206,13 @@ impl Database {
         let mut tx = conn.transaction().await?;
 
         for ext in extensions {
-            toasty::sql::statement(
-                "INSERT INTO profile_extensions (protocol_id, delay, speed, sort_order, ip_info) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(protocol_id) DO UPDATE SET \
-                 delay=excluded.delay, speed=excluded.speed, \
-                 sort_order=excluded.sort_order, ip_info=excluded.ip_info",
-            )
-            .bind(ext.protocol_id)
-            .bind(ext.delay.unwrap_or(0))
-            .bind(ext.speed.unwrap_or(0))
-            .bind(ext.sort_order.unwrap_or(0))
-            .bind(ext.ip_info.as_deref().unwrap_or(""))
-            .exec(&mut tx)
-            .await?;
+            ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
+                .delay(ext.delay.unwrap_or(0))
+                .speed(ext.speed.unwrap_or(0))
+                .sort_order(ext.sort_order.unwrap_or(0))
+                .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+                .exec(&mut tx)
+                .await?;
         }
 
         tx.commit().await?;
@@ -1279,20 +1246,13 @@ impl Database {
         }
 
         for ext in extensions {
-            toasty::sql::statement(
-                "INSERT INTO profile_extensions (protocol_id, delay, speed, sort_order, ip_info) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(protocol_id) DO UPDATE SET \
-                 delay=excluded.delay, speed=excluded.speed, \
-                 sort_order=excluded.sort_order, ip_info=excluded.ip_info",
-            )
-            .bind(ext.protocol_id)
-            .bind(ext.delay.unwrap_or(0))
-            .bind(ext.speed.unwrap_or(0))
-            .bind(ext.sort_order.unwrap_or(0))
-            .bind(ext.ip_info.as_deref().unwrap_or(""))
-            .exec(&mut tx)
-            .await?;
+            ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
+                .delay(ext.delay.unwrap_or(0))
+                .speed(ext.speed.unwrap_or(0))
+                .sort_order(ext.sort_order.unwrap_or(0))
+                .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+                .exec(&mut tx)
+                .await?;
         }
 
         tx.commit().await?;

@@ -5,9 +5,9 @@ edition.workspace = true
 
 [dependencies]
 # ============ ORM ============
-toasty = { version = "0.7", features = ["turso", "serde"] }
-toasty-driver-turso = "0.7"
-toasty-core = "0.7"
+toasty = { version = "0.9", features = ["turso", "serde"] }
+toasty-driver-turso = "0.9"
+toasty-core = "0.9"
 
 # ============ Serialization ============
 serde.workspace = true
