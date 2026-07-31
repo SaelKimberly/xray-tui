@@ -82,7 +82,12 @@ pub(super) async fn real_ping(
             .await
             .map_err(|e| format!("Core start: {e}"))?;
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = crate::speed_test::wait_for_socks5(
+            &proxy_addr,
+            proxy_port,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
 
         let rp_result = crate::speed_test::real_ping(
             &proxy_addr,

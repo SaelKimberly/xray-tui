@@ -201,6 +201,28 @@ async fn main() -> Result<()> {
     let mut state = AppState::new(Arc::new(db), config).await;
     state.heed_storage = Some(heed.clone());
     state.log_sender_tx = Some(log_sender_tx.clone());
+    // Create core process log channel (stdout/stderr lines from xray-core/sing-box subprocesses).
+    let (core_log_tx, mut core_log_rx) = tokio::sync::mpsc::channel::<String>(512);
+    state.core_log_tx = Some(core_log_tx);
+    {
+        let log_sender = log_sender_tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = core_log_rx.recv().await {
+                let (target, level, message, _ts) =
+                    xray_tui::parse_core_log_line(&line, xray_tui_core::CoreType::Auto);
+                let msg = xray_tui_core::log_heed::LogMessage {
+                    timestamp_nanos: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64,
+                    level,
+                    target,
+                    message,
+                };
+                let _ = log_sender.send(msg);
+            }
+        });
+    }
     // 4. Install tracing subscriber with TuiLogLayer (non-blocking channel send).
     //    Do not crash if global subscriber was already set (e.g., in tests)
     let log_file = if log_to_file {

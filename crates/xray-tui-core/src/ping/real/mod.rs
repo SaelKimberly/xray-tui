@@ -2,8 +2,11 @@
 //! Profile config is built via ConfigBuilder, the core runs briefly, then
 //! HTTP requests are sent through the SOCKS5 proxy to measure real latency.
 
+mod pool;
 mod singbox;
 mod xray;
+
+pub use pool::CorePool;
 
 use super::PingResult;
 use crate::core_type::CoreType;

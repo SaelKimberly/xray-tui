@@ -1216,6 +1216,33 @@ impl Database {
         Ok(())
     }
 
+    /// Cancel sessions stranded by the race: demoted to real/queued AFTER the endpoint
+    /// already has a completed real ping in Phase 2. These sessions are invisible to both
+    /// the fast-ping pager (type != 'fast') and the real-ping query (excluded by NOT EXISTS).
+    pub async fn cancel_stranded_real_pings(&self, batch_id: &str) -> Result<usize> {
+        let mut conn = self.db.connection().await?;
+        let updated = toasty::sql::statement(
+            "UPDATE ping_sessions \
+             SET status = 'cancelled', error = 'Endpoint already completed', \
+                 updated_at = datetime('now') \
+             WHERE batch_id = ?1 \
+               AND status = 'queued' \
+               AND ping_type = 'real' \
+               AND EXISTS ( \
+                   SELECT 1 FROM ping_sessions ps_s \
+                   WHERE ps_s.batch_id = ping_sessions.batch_id \
+                     AND ps_s.address = ping_sessions.address \
+                     AND ps_s.port = ping_sessions.port \
+                     AND ps_s.ping_type = 'real' \
+                     AND ps_s.status = 'completed' \
+               )",
+        )
+        .bind(batch_id)
+        .exec(&mut conn)
+        .await?;
+        Ok(updated as usize)
+    }
+
     pub async fn cancel_ping_batch(&self, batch_id: &str) -> Result<usize> {
         let mut conn = self.db.connection().await?;
         let updated = toasty::sql::statement(
@@ -1287,18 +1314,40 @@ impl Database {
         deserialize_ping_sessions(rows)
     }
 
-    pub async fn get_batch_page_ready_for_real_ping(
+    /// Fetch real-ping ready sessions in wave order: first occurrence of each endpoint,
+    /// then second occurrence, etc. Skips endpoints that already have a successful real ping.
+    pub async fn get_batch_for_real_ping_triplet(
         &self,
         batch_id: &str,
         limit: usize,
     ) -> Result<Vec<PingSession>> {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
-            "SELECT id, batch_id, protocol_id, config_type, core_type, address, port, triplet_rank, \
-                    ping_type, status, latency_ms, speed_bps, ip_info, error, created_at, updated_at \
-             FROM ping_sessions \
-             WHERE batch_id = ?1 AND status = 'queued' AND ping_type = 'real' \
-             ORDER BY triplet_rank, id LIMIT ?2",
+            "SELECT sub.id, sub.batch_id, sub.protocol_id, sub.config_type, sub.core_type, \
+                    sub.address, sub.port, sub.triplet_rank, \
+                    sub.ping_type, sub.status, sub.latency_ms, sub.speed_bps, \
+                    sub.ip_info, sub.error, sub.created_at, sub.updated_at \
+             FROM ( \
+                SELECT ps.*, \
+                       COUNT(*) OVER ( \
+                           PARTITION BY ps.address, ps.port \
+                           ORDER BY ps.config_type, ps.protocol_id \
+                       ) AS occurrence \
+                FROM ping_sessions ps \
+                WHERE ps.batch_id = ?1 \
+                  AND ps.status = 'queued' \
+                  AND ps.ping_type = 'real' \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM ping_sessions ps_s \
+                      WHERE ps_s.batch_id = ps.batch_id \
+                        AND ps_s.address = ps.address \
+                        AND ps_s.port = ps.port \
+                        AND ps_s.ping_type = 'real' \
+                        AND ps_s.status = 'completed' \
+                  ) \
+             ) sub \
+             ORDER BY sub.occurrence, sub.id \
+             LIMIT ?2",
         )
         .bind(batch_id)
         .bind(limit as i64)

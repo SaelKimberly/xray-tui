@@ -5,6 +5,7 @@ mod real;
 pub use adapters::QuicPingAdapter;
 pub use adapters::{FastPingAdapter, FastPingManager, TcpPingAdapter, UdpPingAdapter};
 pub use real::RealPingManager;
+pub use real::CorePool;
 
 use std::fmt;
 

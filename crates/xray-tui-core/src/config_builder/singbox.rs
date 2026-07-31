@@ -4,7 +4,7 @@ use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
 
-use super::{BuildError, BuildParams, parse_settings};
+use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
 
 // ── Sing-box JSON config structs ──────────────────────────────────
 
@@ -127,6 +127,61 @@ impl SingBoxConfigBuilder {
                     ),
                 }),
             }),
+        })
+    }
+
+    /// Build a multi-inbound config for batch real ping.
+    pub fn build_multi(
+        items: &[MultiInboundItem],
+        base_params: &BuildParams,
+        dns: &DnsSetting,
+    ) -> Result<SingBoxConfig, BuildError> {
+        let mut inbounds = Vec::with_capacity(items.len());
+        let mut outbounds: Vec<Value> = Vec::with_capacity(items.len() + 2);
+        let mut rules: Vec<Value> = Vec::with_capacity(items.len() + 1);
+
+        for (i, item) in items.iter().enumerate() {
+            let tag = format!("proxy-{i}");
+            let inbound_tag = format!("socks-in-{i}");
+
+            inbounds.push(SingBoxInbound {
+                type_: "socks",
+                tag: inbound_tag.clone(),
+                listen: base_params.listen.clone(),
+                listen_port: item.assigned_port,
+                sniff: false,
+            });
+
+            let mut outbound = build_proxy_outbound(item.endpoint, item.protocol, base_params)?;
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert("tag".to_string(), json!(tag.clone()));
+            }
+            outbounds.push(outbound);
+
+            rules.push(json!({
+                "inbound": [inbound_tag],
+                "outbound": tag
+            }));
+        }
+
+        outbounds.push(build_direct_outbound());
+        outbounds.push(build_block_outbound());
+        // Default: unmatched → direct
+        rules.push(json!({ "outbound": "direct" }));
+
+        Ok(SingBoxConfig {
+            log: SingBoxLogConfig {
+                level: base_params.log_level.clone(),
+            },
+            inbounds,
+            outbounds,
+            route: RouteConfig {
+                rules,
+                rule_set: vec![],
+                final_outbound: "direct".to_string(),
+            },
+            dns: build_dns(dns),
+            experimental: None,
         })
     }
 }

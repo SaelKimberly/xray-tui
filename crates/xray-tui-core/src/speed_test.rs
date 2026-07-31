@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -48,6 +48,38 @@ pub async fn tcp_ping(
         Ok(Ok(_)) => Ok(start.elapsed()),
         Ok(Err(e)) => Err(SpeedTestError::Io(e)),
         Err(_) => Err(SpeedTestError::Timeout(test_timeout)),
+    }
+}
+
+/// Poll a SOCKS5 proxy port until it responds with a valid server-selection
+/// (VER=5, METHOD=0x00), indicating the proxy stack is fully initialized.
+/// Polls every 50ms up to `deadline`. Returns `Ok(())` on success, `Err(())` on timeout.
+///
+/// Pattern from v2rayN's `WaitForProxyPort()` — more reliable than raw TCP connect
+/// because it confirms the SOCKS5 handshake layer is ready, not just the TCP listener.
+pub async fn wait_for_socks5(addr: &str, port: u16, deadline: Duration) -> Result<(), ()> {
+    let start = Instant::now();
+    let greeting: [u8; 3] = [0x05, 0x01, 0x00]; // VER=5, NMETHODS=1, METHOD=0 (no auth)
+    let mut buf = [0u8; 2];
+    loop {
+        match TcpStream::connect((addr, port)).await {
+            Ok(mut stream) => {
+                // Send SOCKS5 greeting and check server selection
+                if stream.write_all(&greeting).await.is_ok()
+                    && stream.read_exact(&mut buf).await.is_ok()
+                    && buf == [0x05, 0x00]
+                {
+                    return Ok(());
+                }
+            }
+            Err(_) if start.elapsed() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => return Err(()),
+        }
+        if start.elapsed() >= deadline {
+            return Err(());
+        }
     }
 }
 
@@ -105,11 +137,17 @@ async fn create_socks5_client(
     Ok(client)
 }
 
-/// Real ping: send HTTP GET requests through SOCKS5 proxy to `url`, measure fastest response time.
+/// Real ping: send HTTP HEAD requests through SOCKS5 proxy to `url`, measure fastest response time.
 ///
 /// Uses `socks5://` (NOT `socks5h://`) — the proxy resolves DNS locally.
-/// Up to `retries` requests are sent; the fastest 2xx response wins.
+/// Up to `retries` requests are sent concurrently; the fastest 2xx response wins.
 /// On success, optionally fetches IP info from `ip_api_url` through the same proxy.
+///
+/// Optimizations (from sing-box/mihomo patterns):
+/// - HEAD instead of GET (avoids downloading response body)
+/// - No redirect following (probe URL doesn't redirect)
+/// - Parallel retries (first success wins, instead of sequential with sleep)
+/// - Pool max idle per host = 0 (no keepalive reuse across measurements)
 pub async fn real_ping(
     proxy: &str,
     port: u16,
@@ -118,61 +156,87 @@ pub async fn real_ping(
     test_timeout: Duration,
     retries: u32,
 ) -> Result<RealPingResult, SpeedTestError> {
-    let client = create_socks5_client(proxy, port, false, test_timeout).await?;
+    let scheme = "socks5";
+    let proxy_url =
+        format!("{scheme}://{proxy}:{port}");
+    let client = reqwest::Client::builder()
+        .proxy(
+            reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?,
+        )
+        .timeout(test_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(SpeedTestError::Http)?;
 
-    let mut best_latency = None;
-    let mut last_error = None;
+    let start = std::time::Instant::now();
+    let mut best_latency: Option<u64> = None;
+    let mut last_error: Option<SpeedTestError> = None;
 
-    for attempt in 0..retries {
-        let start = std::time::Instant::now();
-        match client.get(url).send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        reason = "elapsed ms fits in u64 (max ~584M years)"
-                    )]
-                    let elapsed = start.elapsed().as_millis() as u64;
-                    match best_latency {
-                        None => best_latency = Some(elapsed),
-                        Some(best) if elapsed < best => best_latency = Some(elapsed),
-                        _ => {}
-                    }
-                } else {
-                    last_error = Some(SpeedTestError::Http(resp.error_for_status().unwrap_err()));
+    let retries = retries.max(1);
+    let futs: Vec<_> = (0..retries)
+        .map(|_| client.head(url).send())
+        .collect();
+    let mut stream = futures_util::stream::iter(futs).buffer_unordered(retries as usize);
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "elapsed ms fits in u64 (max ~584M years)"
+                )]
+                let elapsed = start.elapsed().as_millis() as u64;
+                match best_latency {
+                    None => best_latency = Some(elapsed),
+                    Some(best) if elapsed < best => best_latency = Some(elapsed),
+                    _ => {}
                 }
+            }
+            Ok(resp) => {
+                last_error =
+                    Some(SpeedTestError::Http(resp.error_for_status().unwrap_err()));
             }
             Err(e) => {
                 last_error = Some(SpeedTestError::Http(e));
             }
         }
-
-        if attempt + 1 < retries {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
     }
+
     let latency_ms = best_latency.ok_or_else(|| {
         last_error.unwrap_or_else(|| SpeedTestError::Proxy("all retries failed".to_string()))
     })?;
-    // Fetch IP info on success
-    let ip_info = fetch_ip_info(&client, ip_api_url).await;
+
+    // Fetch IP info on success — use separate client with default redirect policy
+    let ip_info = {
+        match reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(&proxy_url)
+                    .map_err(|e| SpeedTestError::Proxy(e.to_string()))?,
+            )
+            .timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .build()
+        {
+            Ok(ip_client) => match ip_client.get(ip_api_url).send().await {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
+                        let country =
+                            json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
+                        Some(format!("{ip} | {country}"))
+                    }
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
 
     Ok(RealPingResult {
         latency_ms,
         ip_info,
     })
-}
-
-/// Fetch IP address and location info through the same SOCKS5 proxy.
-async fn fetch_ip_info(client: &reqwest::Client, ip_api_url: &str) -> Option<String> {
-    match client.get(ip_api_url).send().await {
-        Ok(resp) => resp.json::<serde_json::Value>().await.map_or(None, |json| {
-            let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
-            let country = json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
-            Some(format!("{ip} | {country}"))
-        }),
-        Err(_) => None,
-    }
 }
 
 /// Speed test: download `url` through SOCKS5 proxy, measure throughput.

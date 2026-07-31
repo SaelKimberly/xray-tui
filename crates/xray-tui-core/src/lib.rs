@@ -22,7 +22,7 @@ pub mod updater;
 
 pub use bin_manager::{CoreBinInfo, find_binary, get_core_info};
 
-pub use config_builder::{BackendConfig, BuildError, BuildParams, CLASH_API_PORT, ConfigBuilder};
+pub use config_builder::{BackendConfig, BuildError, BuildParams, CLASH_API_PORT, ConfigBuilder, MultiInboundItem};
 pub use core_type::CoreType;
 pub use grpc_client::{
     API_ENDPOINT, GrpcError, StatsProvider, SysStats, create_stats_provider, format_bytes,
@@ -33,7 +33,7 @@ pub use log_heed::HeedLogStorage;
 pub use ping::QuicPingAdapter;
 pub use ping::{
     FastPingAdapter, FastPingManager, PingCapability, PingError, PingResult, ProfileKey,
-    RealPingManager, TcpPingAdapter, UdpPingAdapter,
+    RealPingManager, CorePool, TcpPingAdapter, UdpPingAdapter,
 };
 pub use process::CoreManager;
 pub use protocol::Protocol;
@@ -41,4 +41,5 @@ pub use protocol::SINGBOX_ONLY_PROTOCOLS;
 pub use protocol_core_mapping::resolve_core;
 pub use speed_test::{
     SpeedTestError, TestType, real_ping, speed_test, tcp_ping, udp_ping, udp_test,
+    wait_for_socks5,
 };

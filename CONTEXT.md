@@ -88,6 +88,7 @@ AGENTS.md
 - `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage (LMDB), LogMessage struct
 - `crates/xray-tui-core/src/ping/mod.rs` — FastPingAdapter trait + FastPingManager
 - `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager
+- `crates/xray-tui-core/src/ping/real/pool.rs` — CorePool: single warm core for single-ping reuse, atomic port allocation, SIGHUP/stop-restart reload
 - `crates/xray-tui-core/src/config_builder/clash_mixin.rs` — Clash YAML overlay
 - `crates/xray-tui-core/src/bin_manager.rs` — binary discovery and archive extraction
 

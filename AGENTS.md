@@ -38,6 +38,7 @@ cargo run
 - `crates/xray-tui-core/src/ping/adapters/udp.rs` — direct UDP ping adapter for WireGuard and ShadowsocksR endpoints
 - `crates/xray-tui-core/src/ping/adapters/quic.rs` — QUIC handshake ping adapter (quic-ping feature) for QUIC-enabled protocols
 - `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager: launches temp core binary to test profile via SOCKS5 HTTP requests with IP info fetch. Port pool via `next_ping_port: Arc<AtomicU16>` + `allocate_port()` shared across concurrent tasks.
+- `crates/xray-tui-core/src/ping/real/pool.rs` — CorePool: single warm core process for single-ping reuse with SIGHUP reload (sing-box) or stop+restart (xray-core). POOL_TTL (30s). Atomic port allocation. Error propagation.
 - `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
 - `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
 - `crates/xray-tui-proto/src/clash/mod.rs` — Clash YAML proxy structs (ClashProxy enum + 29 per-protocol Clash config structs with kebab-case serde) for bidirectional conversion between Clash YAML and internal ProtocolConfig types
@@ -183,6 +184,12 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 5. Create `render_update_form()` and `handle_update_form_key()` in `settings.rs` — C triggers check, D triggers download for all available updates, Esc goes back
 6. Add update-available indicator (colored `[Update: ...]`) to `status_bar.rs`
 7. Add startup check in `ui::run()` gated by `config.updates.check_on_startup`
+
+### Fixing xray-core config build errors ("this rule has no effective fields")
+1. xray-core 26+ rejects routing rules with no match fields (no inboundTag/domain/ip/port/network)
+2. `build_multi()` catch-all `{ "type": "field", "outboundTag": "direct" }` has no matchers
+3. Fix: remove the catch-all — all traffic arrives through specific socks inbounds with explicit routing rules
+4. Single-profile `build()` doesn't add catch-all and works fine
 
 ### Determining which core a protocol belongs to
 - Reference `thirdparty/sing-box/constant/proxy.go` for sing-box protocol type strings

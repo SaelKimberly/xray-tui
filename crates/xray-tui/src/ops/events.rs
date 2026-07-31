@@ -167,7 +167,11 @@ pub async fn poll_core_events(state: &mut AppState) {
                 ip_info,
                 error,
             } => {
-                state.testing_profiles.remove(&protocol_id);
+                // Guard against duplicate events for the same protocol_id
+                if !state.testing_profiles.remove(&protocol_id) {
+                    // Already processed — skip
+                    continue;
+                }
                 state.testing_details.remove(&protocol_id);
 
                 let name = {

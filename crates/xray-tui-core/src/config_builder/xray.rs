@@ -4,7 +4,7 @@ use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
 
-use super::{BuildError, BuildParams, parse_settings};
+use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
 
 // ── Xray JSON config structs ────────────────────────────────────────
 
@@ -139,6 +139,73 @@ impl XrayConfigBuilder {
             stats,
             api,
             policy,
+        })
+    }
+
+    /// Build a multi-inbound config for batch real ping.
+    /// Creates N SOCKS5 inbounds + N proxy outbounds with routing rules
+    /// connecting each inbound to its matching outbound.
+    pub fn build_multi(
+        items: &[MultiInboundItem],
+        base_params: &BuildParams,
+        dns: &DnsSetting,
+    ) -> Result<XrayConfig, BuildError> {
+        let mut inbounds = Vec::with_capacity(items.len());
+        let mut proxy_outbounds = Vec::with_capacity(items.len());
+        let mut routing_rules: Vec<Value> = Vec::with_capacity(items.len());
+
+        for (i, item) in items.iter().enumerate() {
+            let tag = format!("proxy-{i}");
+            let inbound_tag = format!("socks-in-{i}");
+
+            inbounds.push(Inbound {
+                listen: base_params.listen.clone(),
+                port: item.assigned_port,
+                protocol: "socks",
+                settings: json!({
+                    "auth": "noauth",
+                    "udp": false,
+                    "ip": "127.0.0.1"
+                }),
+                sniffing: json!({
+                    "enabled": false,
+                    "destOverride": []
+                }),
+                tag: inbound_tag.clone(),
+            });
+
+            let mut outbound = build_proxy_outbound(item.endpoint, item.protocol)?;
+            outbound.tag = tag.clone();
+            proxy_outbounds.push(outbound);
+
+            routing_rules.push(json!({
+                "type": "field",
+                "inboundTag": [inbound_tag],
+                "outboundTag": tag
+            }));
+        }
+
+        // Standard outbounds
+        let mut outbounds = proxy_outbounds;
+        outbounds.push(build_dns_outbound());
+        outbounds.push(build_direct_outbound());
+        outbounds.push(build_block_outbound());
+
+        Ok(XrayConfig {
+            log: LogConfig {
+                loglevel: base_params.log_level.clone(),
+            },
+            inbounds,
+            outbounds,
+            routing: RoutingConfig {
+                domain_strategy: "AsIs".to_string(),
+                rules: routing_rules,
+                balancers: vec![],
+            },
+            dns: build_dns(dns),
+            stats: None,
+            api: None,
+            policy: None,
         })
     }
 }

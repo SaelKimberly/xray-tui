@@ -461,6 +461,12 @@ fn apply_settings_fields(
             if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                 state.config.speed_test.real_ping_retries = v;
             }
+            if let Ok(v) = get_str("real_ping_concurrency").parse::<usize>() {
+                state.config.speed_test.real_ping_concurrency = v;
+            }
+            if let Ok(v) = get_str("real_ping_window").parse::<usize>() {
+                state.config.speed_test.real_ping_window = v;
+            }
             if !get_str("geoip_url").is_empty() {
                 state.config.geo.geoip_url = get("geoip_url");
             }

@@ -259,6 +259,76 @@ impl CoreManager {
     pub fn log_tx(&self) -> Option<Sender<String>> {
         self.log_tx.clone()
     }
+
+    /// Send SIGHUP to the running core (sing-box only — xray-core ignores it).
+    /// The config file must already be rewritten before calling this.
+    /// sing-box handles SIGHUP as a config reload: validate → shutdown → restart.
+    /// Returns the process PID for external readiness polling.
+    pub fn sighup_reload(&self) -> Result<u32, ProcessError> {
+        let proc = self
+            .current
+            .as_ref()
+            .ok_or_else(|| ProcessError::Startup("No running process".into()))?;
+        let pid = proc
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .ok_or_else(|| ProcessError::Startup("No child PID".into()))?;
+        #[cfg(unix)]
+        {
+            #[allow(clippy::cast_possible_wrap, reason = "PID fits in i32")]
+            unsafe {
+                if libc::kill(pid as i32, libc::SIGHUP) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(ProcessError::Startup(format!("SIGHUP failed: {err}")));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: no SIGHUP — caller should use stop+restart instead
+            return Err(ProcessError::Startup(
+                "SIGHUP not supported on Windows".into(),
+            ));
+        }
+        Ok(pid)
+    }
+
+    /// Write config to the existing temp directory without restarting.
+    pub async fn rewrite_config(
+        &self,
+        config: &BackendConfig,
+        clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError> {
+        let config_path = self.config_dir.path().join("config.json");
+        let json = match config {
+            BackendConfig::Xray(c) => serde_json::to_string_pretty(c)?,
+            BackendConfig::SingBox(c) => serde_json::to_string_pretty(c)?,
+        };
+        // Apply clash mixin: parse the serialized JSON, merge mixin fields, re-serialize
+        let json = if let Some(mixin_value) = clash_mixin
+            && let Some(mixin_obj) = mixin_value.as_object()
+            && !mixin_obj.is_empty()
+        {
+            let mut root: serde_json::Value = serde_json::from_str(&json)?;
+            if let Some(obj) = root.as_object_mut() {
+                for (key, val) in mixin_obj {
+                    obj.insert(key.clone(), val.clone());
+                }
+            }
+            serde_json::to_string_pretty(&root)?
+        } else {
+            json
+        };
+        tokio::fs::write(&config_path, &json).await?;
+        Ok(())
+    }
+
+    /// Get the config directory path (for multi-inbound config writes).
+    #[must_use]
+    pub fn config_dir(&self) -> &std::path::Path {
+        self.config_dir.path()
+    }
 }
 
 impl Drop for CoreManager {

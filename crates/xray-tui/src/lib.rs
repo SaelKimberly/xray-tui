@@ -123,29 +123,84 @@ fn civil_from_days(z: u64) -> (u64, u64, u64) {
     (y as u64, m as u64, d)
 }
 
-pub(crate) fn parse_core_log_line(
+pub fn parse_core_log_line(
     line: &str,
     _core_type: xray_tui_core::CoreType,
 ) -> (String, String, String, Option<i64>) {
-    // Simple log line parser: first []-delimited tokens are timestamp and level, rest is message.
+    // Handle xray-core format: "2024/01/01 12:00:00 [Info] message"
+    // Handle sing-box format: "{\"level\":\"info\",\"msg\":\"...\"}" or "INFO: message"
+    // Handle plain format: "[Info] message"
     let line = line.trim();
-    let parts = line.splitn(4, ' ').collect::<Vec<_>>();
-    let level = if parts.len() >= 2 {
-        let l = parts[0].trim_matches(|c| c == '[' || c == ']' || c == ' ');
-        if l.is_empty() {
-            "info".to_string()
-        } else {
-            l.to_lowercase()
+
+    // Try JSON format (sing-box)
+    if line.starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            let level = val
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("info")
+                .to_lowercase();
+            let message = val
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or(line)
+                .to_string();
+            let target = val
+                .get("logger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("core")
+                .to_string();
+            return (target, level, message, None);
         }
+    }
+
+    let parts: Vec<&str> = line.splitn(5, ' ').collect();
+    if parts.len() < 2 {
+        return ("core".to_string(), "info".to_string(), line.to_string(), None);
+    }
+
+    // Check if parts[0] looks like a date (YYYY/MM/DD or YYYY-MM-DD)
+    // Xray-core: "2024/01/01 12:00:00 [Info] message"  → level at parts[2]
+    // Plain: "[Info] message" → level at parts[0]
+    let (level_str, msg_start) = if parts[0].len() >= 10
+        && parts[0].as_bytes().iter().take(4).all(|b| b.is_ascii_digit())
+        && (parts[0].contains('/') || parts[0].contains('-'))
+    {
+        // Has timestamp prefix: parts[0]=date, parts[1]=time, parts[2]=[Level]
+        if parts.len() > 3 {
+            (parts.get(2).copied().unwrap_or(""), 3)
+        } else {
+            // Timestamp but no level (e.g. "2026/07/31 18:45:48.065654 from tcp:...")
+            ("info", 0)
+        }
+    } else if parts[0].contains('[')
+        || (parts[0].len() > 2 && parts[0].chars().all(|c| c.is_uppercase() || c == ':'))
+    {
+        // Plain "[Level] ..." or "LEVEL: ..."
+        (parts[0], 1)
     } else {
-        "info".to_string()
+        // Banner line or bare text with no recognizable level indicator
+        ("info", 0)
     };
-    let message = if parts.len() >= 2 {
-        parts[1..].join(" ")
+
+    let mut level = level_str
+        .trim_matches(|c| c == '[' || c == ']' || c == ':' || c == ' ')
+        .to_lowercase();
+    if level.is_empty() {
+        level = "info".to_string();
+    } else if level == "failed" {
+        level = "error".to_string();
+    } else if level == "warning" {
+        level = "warn".to_string();
+    }
+
+    let message = if parts.len() > msg_start {
+        parts[msg_start..].join(" ").trim().to_string()
     } else {
         line.to_string()
     };
-    (level, "core".to_string(), message, None)
+
+    ("core".to_string(), level.to_string(), message, None)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

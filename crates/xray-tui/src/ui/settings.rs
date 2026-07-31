@@ -554,6 +554,7 @@ fn form_field_defs_for_section(
             ("batch_page_size", "Batch Page Size", "Number"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
             ("real_ping_concurrency", "Real Ping Concurrency", "Number"),
+            ("real_ping_window", "Real Ping Window", "Number"),
             ("geoip_url", "GeoIP URL", "Url"),
             ("geosite_url", "GeoSite URL", "Url"),
             ("geo_auto_update", "Geo Auto Update", "Boolean"),

@@ -13,7 +13,7 @@ use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{CoreType, resolve_core};
+use xray_tui_core::{CorePool, CoreType, resolve_core};
 use xray_tui_db::models::{
     Endpoint, Group, PingResultUpdate, ProfileExtension, ProtocolRow, PurgatoryView, RoutingRule,
 };
@@ -93,6 +93,8 @@ pub struct AppState {
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
     pub next_real_ping_port: Arc<AtomicU16>,
+    /// Pooled core for single-ping reuse (lazy — created on first single real ping).
+    pub core_pool: Option<Arc<CorePool>>,
     pub last_test_tcp: Option<u64>,
     /// Shared batch progress (total, completed) displayed in status bar.
     pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
@@ -119,6 +121,8 @@ pub struct AppState {
     /// Channel sender for non-blocking log persistence.
     /// `TuiLogLayer` and core log forwarder send `LogMessage` here; background writer batches and writes to heed.
     pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
+    /// Channel sender for core subprocess log lines (String lines from stdout/stderr).
+    pub core_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Whether initial logs have been loaded from heed into `log_cache` yet.
     pub logs_loaded: bool,
 }
@@ -266,6 +270,7 @@ impl AppState {
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
             next_real_ping_port: Arc::new(AtomicU16::new(base_port)),
+            core_pool: None, // lazily created on first single real ping
             batch_progress: None,
             term_height: Cell::new(80),
             heed_storage: None,
@@ -274,6 +279,7 @@ impl AppState {
             selected_targets: Vec::new(),
             last_heed_poll: std::time::Instant::now(),
             log_sender_tx: None,
+            core_log_tx: None,
             logs_loaded: false,
         };
         state.reload_profiles().await;
@@ -1269,7 +1275,7 @@ impl AppState {
     /// Phase 1 drains fast-pingable profiles quickly; Phase 2 handles remaining via temp core.
     #[allow(clippy::needless_collect)]
     pub fn start_batch_sieve(&mut self, real_ping_enabled: bool) {
-        ping::start_batch_sieve(self, real_ping_enabled);
+        ping::start_batch_sieve(self, real_ping_enabled, self.core_log_tx.clone());
     }
 
     /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.
