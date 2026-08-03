@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_db::models::{ProfileExtension, ServerStat};
+use xray_tui_db::models::{EndpointRow, ProfileExtension, ServerStat};
 
 use crate::AppState;
 use crate::format_now;
@@ -12,6 +12,19 @@ use crate::types::{AppMode, CoreEvent, SettingsMode, SplitRightPane};
 /// Format a profile ID as a URL-like hex identifier.
 fn fmt_profile_id(id: i64) -> String {
     format!("xray-tui://{id:x}")
+}
+
+/// Find the endpoint row whose protocols list owns `protocol_id`
+/// (a `ProtocolRow` id). Endpoint ids (stable hashes of host:port) are
+/// unrelated to protocol ids, so the match scans `r.protocols`.
+#[must_use]
+pub(crate) fn endpoint_row_for_protocol<'a>(
+    endpoints: &'a mut [EndpointRow],
+    protocol_id: i64,
+) -> Option<&'a mut EndpointRow> {
+    endpoints
+        .iter_mut()
+        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
 }
 
 /// Poll core event channel and update state accordingly.
@@ -90,12 +103,10 @@ pub async fn poll_core_events(state: &mut AppState) {
                         &format!("Failed to save stats: {e}"),
                     );
                 }
-                // Update in-memory endpoint row to avoid full reload
-                if let Some(row) = state
-                    .endpoints
-                    .iter_mut()
-                    .find(|r| r.endpoint.id == protocol_id)
-                {
+                // Update in-memory endpoint row to avoid full reload.
+                // protocol_id is a ProtocolRow id — match the row whose
+                // protocols list owns it (never the endpoint id).
+                if let Some(row) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id) {
                     row.stats.insert(protocol_id, stats);
                 }
                 state.current_traffic_up = total_up;
@@ -493,5 +504,74 @@ pub async fn poll_core_events(state: &mut AppState) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use toasty::Deferred;
+    use xray_tui_db::models::{Endpoint, ProtocolRow};
+
+    use super::*;
+
+    /// EndpointRow fixture: one endpoint owning one protocol.
+    fn row_with_protocol(endpoint_id: i64, protocol_id: i64) -> EndpointRow {
+        EndpointRow {
+            endpoint: Endpoint {
+                id: endpoint_id,
+                host: format!("h{endpoint_id}.example"),
+                host_type: "ipv4".to_string(),
+                port: 443,
+                port_spec_str: None,
+                parent_id: None,
+                last_source: None,
+                created_at: 0,
+                manual_protocol_override: None,
+                resolved_as: None,
+                resolved_at: None,
+            },
+            protocols: vec![ProtocolRow {
+                id: protocol_id,
+                endpoint_id,
+                sig: 0,
+                cred_hash: 0,
+                proto_kind: String::new(),
+                spec_blob: Vec::new(),
+                config_type: 1,
+                core_type: "xray".to_string(),
+                transport: None,
+                security: None,
+                last_used_at: None,
+                created_at: 0,
+                last_seen_at: 0,
+                endpoint: Deferred::from(None::<Endpoint>),
+                extension: Deferred::from(None::<ProfileExtension>),
+                server_stat: Deferred::from(None::<ServerStat>),
+            }],
+            extensions: HashMap::new(),
+            stats: HashMap::new(),
+            selected_protocol: 0,
+            expanded: false,
+        }
+    }
+
+    #[test]
+    fn endpoint_row_for_protocol_matches_protocol_id_not_endpoint_id() {
+        // endpoint id 100 has protocol id 7; endpoint id 101 has protocol id 9
+        let mut rows = vec![row_with_protocol(100, 7), row_with_protocol(101, 9)];
+
+        assert_eq!(
+            endpoint_row_for_protocol(&mut rows, 9).map(|r| r.endpoint.id),
+            Some(101)
+        );
+        assert_eq!(
+            endpoint_row_for_protocol(&mut rows, 7).map(|r| r.endpoint.id),
+            Some(100)
+        );
+        // Endpoint ids are not protocol ids — the lookup must not match them.
+        assert!(endpoint_row_for_protocol(&mut rows, 100).is_none());
+        assert!(endpoint_row_for_protocol(&mut rows, 999).is_none());
     }
 }
