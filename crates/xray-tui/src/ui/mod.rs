@@ -81,6 +81,10 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     });
     let refresh_interval = *state.config.gui.refresh_interval_secs;
     let mut last_tick = std::time::Instant::now();
+    // Set when a Resize event is drained; forces the next loop iteration to redraw.
+    let mut resize_seen = false;
+    // Set when any other event was handled; renders input changes promptly.
+    let mut events_seen = false;
 
     // (channels already created in AppState::new)
 
@@ -90,6 +94,10 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     }
 
     // Initial logs no longer loaded here — deferred to first Logs tab access (lazy loading).
+    // Draw the first frame now; the gate below would otherwise wait a full
+    // refresh_interval before anything appears on screen.
+    state.term_height.set(ts.height);
+    terminal.draw(|f| render(f, &*state))?;
     while !state.should_quit {
         // Process up to N events per frame to prevent input lag under held keys
         const MAX_EVENTS_PER_FRAME: usize = 100;
@@ -98,11 +106,13 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
                 Ok(ev) => {
                     if matches!(&ev, Event::Resize(_, _)) {
                         // Process resize immediately — keep draining for more
+                        resize_seen = true;
                         handle_event(&ev, state).await;
                         continue;
                     }
                     handle_event(&ev, state).await;
-                    // Non-resize: stop after this event to render promptly
+                    // Non-resize: stop after this event so the events_seen draw fires promptly
+                    events_seen = true;
                     if i < MAX_EVENTS_PER_FRAME - 1 {
                         continue;
                     }
@@ -143,12 +153,18 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
 
-        if last_tick.elapsed() >= refresh_interval {
-            last_tick = std::time::Instant::now();
-        }
         let ts = terminal.size().unwrap_or_default();
         state.term_height.set(ts.height);
-        terminal.draw(|f| render(f, &*state))?;
+        // Draw when events were handled (input stays responsive), when a resize was
+        // seen (immediate redraw), or at the refresh cadence while idle (default 5s —
+        // previously the draw ran every 16ms frame at 60fps).
+        if resize_seen || events_seen || last_tick.elapsed() >= refresh_interval {
+            last_tick = std::time::Instant::now();
+            resize_seen = false;
+            events_seen = false;
+            terminal.draw(|f| render(f, &*state))?;
+        }
+        // Keep the cheap 16ms wakeup so events are serviced promptly.
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
