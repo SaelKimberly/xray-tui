@@ -257,19 +257,43 @@ impl HostFeaturesChecker {
     }
 }
 
-/// Fetch `url` to `path` only if the file is not already present.
+/// Fetch `url` to `path` only if the file is not already present. Download is
+/// bounded (30s) and written atomically (tmp + rename); empty downloads are
+/// rejected so a rate-limit HTML page can never become a permanent tombstone.
 async fn ensure_file(path: &Path, url: &str) -> anyhow::Result<()> {
     if path.is_file() {
         return Ok(());
     }
-    let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let bytes = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    ensure_file_from_bytes(path, &bytes).await
+}
+
+/// Write `bytes` to `path` atomically: a process-unique tmp file in the same
+/// directory is written first, then renamed over `path` (atomic on the same
+/// filesystem), so a crash mid-write can never leave a partial file that
+/// `is_file()` accepts forever. Empty payloads are rejected outright so an
+/// empty download can never become a permanent tombstone.
+async fn ensure_file_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.is_empty() {
+        anyhow::bail!("empty download: refusing to write tombstone file {}", path.display());
+    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let mut f = tokio::fs::File::create(path).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut f, &bytes).await?;
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, path).await?;
     Ok(())
 }
 
@@ -425,6 +449,30 @@ mod tests {
         let checker = make_checker(&["example.com"], &["1.2.3.4"], &["10.0.0.0/8"]);
         let feats = checker.get_host_features(&ServerName::try_from("unknown.example").unwrap());
         assert_eq!(feats, HostFeatures::default());
+    }
+
+    #[tokio::test]
+    async fn ensure_file_from_bytes_rejects_empty_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whitelist.txt");
+        let result = ensure_file_from_bytes(&path, b"").await;
+        assert!(result.is_err(), "empty download must fail");
+        assert!(!path.exists(), "no tombstone file left behind");
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        assert!(!tmp.exists(), "no tmp file left behind");
+    }
+
+    #[tokio::test]
+    async fn ensure_file_from_bytes_writes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whitelist.txt");
+        ensure_file_from_bytes(&path, b"ok-content").await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "ok-content"
+        );
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        assert!(!tmp.exists(), "tmp file must be renamed away");
     }
 
     #[tokio::test]
