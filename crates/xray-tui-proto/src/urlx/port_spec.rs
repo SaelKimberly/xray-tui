@@ -103,7 +103,11 @@ impl PortSpec {
         while idx < arr.len() {
             match &arr[idx] {
                 PortDecl::Single(_) => length += 1,
-                PortDecl::Range(r) => length += (r.end - r.start + 1) as usize,
+                PortDecl::Range(r) => {
+                    #[allow(clippy::cast_lossless)]
+                    let range_len = (r.end as u32 - r.start as u32 + 1) as usize;
+                    length += range_len;
+                }
             }
             idx += 1;
         }
@@ -169,7 +173,7 @@ impl FromStr for PortSpec {
 struct PortSpecIter<'a> {
     spec: &'a PortSpec,
     outer_idx: usize,
-    inner_idx: u16,
+    inner_idx: u32,
 }
 
 impl Iterator for PortSpecIter<'_> {
@@ -182,9 +186,11 @@ impl Iterator for PortSpecIter<'_> {
                 Some(*port)
             }
             PortDecl::Range(r) => {
-                let port = r.start + self.inner_idx;
-                if r.start <= port && port <= r.end {
+                let port = u32::from(r.start) + self.inner_idx;
+                if port <= u32::from(r.end) {
                     self.inner_idx += 1;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let port = port as u16;
                     Some(port)
                 } else {
                     self.outer_idx += 1;
@@ -222,5 +228,27 @@ mod tests {
         assert_eq!(collected.len(), 101);
         assert_eq!(collected[0], 100);
         assert_eq!(collected[100], 200);
+    }
+
+    #[test]
+    fn full_range_ports_do_not_overflow() {
+        let mut spec = PortSpec::new();
+        spec.add_range(1..65535);
+        assert_eq!(spec.length(), 65535);
+        let all: Vec<u16> = spec.iter().collect();
+        assert_eq!(all.len(), 65535);
+        assert_eq!(all[0], 1);
+        assert_eq!(*all.last().unwrap(), 65535);
+    }
+
+    #[test]
+    fn full_u16_range_does_not_wrap() {
+        let mut spec = PortSpec::new();
+        spec.add_range(0..65535);
+        assert_eq!(spec.length(), 65536);
+        let all: Vec<u16> = spec.iter().collect();
+        assert_eq!(all.len(), 65536);
+        assert_eq!(all[0], 0);
+        assert_eq!(*all.last().unwrap(), 65535);
     }
 }
