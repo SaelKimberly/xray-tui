@@ -745,7 +745,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && key.modifiers.contains(KeyModifiers::SHIFT)
                 && state.current_tab == Tab::Profiles =>
         {
-            let _url = state.selected_profile_id().and_then(|id| {
+            if let Some(url) = state.selected_profile_id().and_then(|id| {
                 let row = state.filtered_profiles().find(|r| r.endpoint.id == id)?;
                 let active = row.active_protocol();
                 let parsed = xray_tui_config::import_export::ParsedProtocol {
@@ -764,7 +764,16 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     created_at: active.created_at,
                 };
                 xray_tui_config::import_export::format_share_url(&parsed).ok()
-            });
+            }) {
+                match arboard::Clipboard::new() {
+                    Ok(mut cb) => {
+                        if let Err(e) = cb.set_text(url) {
+                            state.log_trace("error", "tui::ui", &format!("Copy failed: {e}"));
+                        }
+                    }
+                    Err(e) => state.log_trace("error", "tui::ui", &format!("Clipboard unavailable: {e}")),
+                }
+            }
         }
         KeyCode::Esc => {
             if !state.actions_compact && state.term_height.get() < 20 {
