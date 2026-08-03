@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use crate::EndpointRow;
 use xray_tui_config::import_export::{
-    Profile, ValidationSettings, encode_profile_spec, profile_config,
+    Profile, ValidationSettings, encode_profile_spec,
 };
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{CoreType, resolve_core};
@@ -13,7 +13,6 @@ use crate::state::profile_to_endpoint_protocol;
 use crate::types::{AppMode, BatchImportItem, SortColumn};
 use crate::{common_field_defaults, profile_to_fields};
 use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
-use xray_tui_proto::proto_spec::ProtoSpec;
 
 pub async fn reload_profiles(state: &mut AppState) {
     let now = std::time::SystemTime::now()
@@ -49,6 +48,9 @@ pub async fn reload_profiles(state: &mut AppState) {
         }
     }
     state.filter_cache_valid.set(false);
+    // Enrich new endpoints in the background (IP hosts + persisted DNS cache;
+    // no network for fresh entries).
+    crate::ops::enrich::spawn_enrich_ip_hosts(state);
 }
 
 pub async fn reload_groups(state: &mut AppState) {
@@ -99,10 +101,7 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
                 let address = row.endpoint.host.clone();
                 let port = row.endpoint.port.to_string();
                 if !address.to_lowercase().contains(&q) && !port.contains(&q) {
-                    let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
-                    if !remarks.to_lowercase().contains(&q) {
-                        return false;
-                    }
+                    return false;
                 }
             }
             true
@@ -119,11 +118,10 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
                 .active_protocol()
                 .config_type
                 .cmp(&b_row.active_protocol().config_type),
-            SortColumn::Remarks => {
-                let a_rem = a_row.active_protocol().remarks.clone().unwrap_or_default();
-                let b_rem = b_row.active_protocol().remarks.clone().unwrap_or_default();
-                a_rem.cmp(&b_rem)
-            }
+            SortColumn::LastSeen => a_row
+                .active_protocol()
+                .last_seen_at
+                .cmp(&b_row.active_protocol().last_seen_at),
             SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
             SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
             SortColumn::Delay => {
@@ -248,7 +246,11 @@ pub fn toggle_expand(state: &mut AppState) {
         && let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id)
     {
         ep_row.expanded = !ep_row.expanded;
-        if !ep_row.expanded {
+        if ep_row.expanded {
+            // Enter the sub-table on its first row (user decision: expand
+            // lands on the first internal protocol).
+            state.selected_sub = Some(0);
+        } else {
             state.selected_sub = None;
         }
     }
@@ -308,7 +310,6 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
     let mut address = String::new();
     let mut port: i32 = 0;
     let mut user_id: Option<String> = None;
-    let mut remarks: Option<String> = None;
     let mut security: Option<String> = None;
     let mut network: Option<String> = None;
     let mut core_type = "auto".to_string();
@@ -320,9 +321,6 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
             continue;
         }
         match key.as_str() {
-            "remarks" => {
-                remarks = Some(xray_tui_config::import_export::normalize_remark(value));
-            }
             "address" => address = value.clone(),
             "port" => port = value.parse::<i32>().unwrap_or(0),
             "core_type" => core_type.clone_from(value),
@@ -389,12 +387,9 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
         transport: network,
         security,
         created_at: now as i64,
-        remarks: remarks.clone(),
+        remarks: None,
     };
     let mut extra = serde_json::Map::new();
-    if let Some(v) = &remarks {
-        extra.insert("remarks".into(), serde_json::Value::String(v.clone()));
-    }
     if let Some(v) = &user_id {
         extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
     }
@@ -484,17 +479,16 @@ pub async fn confirm_add_server(state: &mut AppState) {
         .await
     {
         Ok(()) => {
-            let remarks = profile_config(&profile)
-                .and_then(|c| c.remarks().map(String::from))
-                .unwrap_or_else(|| "unnamed".to_string());
+            let addr = format!("{}:{}", profile.address, profile.port);
             state.log_trace(
                 "info",
                 "tui::ops::profiles",
-                &format!("Added server: {remarks}"),
+                &format!("Added server: {addr}"),
             );
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             upsert_profile_row(state, profile, None, None, Some(state.first_group_id()));
+            reload_profiles(state).await;
         }
         Err(e) => {
             state.log_trace(
@@ -597,13 +591,11 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         .await
     {
         Ok(_ids) => {
-            let remarks = profile_config(&new_profile)
-                .and_then(|c| c.remarks().map(String::from))
-                .unwrap_or_else(|| "unnamed".to_string());
+            let addr = format!("{}:{}", new_profile.address, new_profile.port);
             state.log_trace(
                 "info",
                 "tui::ops::profiles",
-                &format!("Updated server: {remarks}"),
+                &format!("Updated server: {addr}"),
             );
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
@@ -816,15 +808,24 @@ pub const fn cycle_purgatory_view(state: &mut AppState) {
 /// Returns true if sub-row navigation was handled (caller should stop).
 pub fn nav_protocol_down(state: &mut AppState) -> bool {
     // Extract data before any mutable access.
-    let proto_count = match filtered_profiles(state).nth(state.selected_index) {
-        Some(row) if row.expanded => row.protocols.len(),
-        _ => return false,
+    let expanded_count = filtered_profiles(state)
+        .nth(state.selected_index)
+        .map(|r| if r.expanded { Some(r.protocols.len()) } else { None })
+        .flatten();
+    let Some(proto_count) = expanded_count else {
+        // Not on an expandable endpoint: fall through to endpoint nav and
+        // drop any stale sub-row selection.
+        state.selected_sub = None;
+        return false;
     };
     if proto_count <= 1 {
+        state.selected_sub = None;
         return false;
     }
     match state.selected_sub {
         None => {
+            // Full row of an expanded endpoint (reached via up-overflow):
+            // re-enter the sub-table on its first row.
             state.selected_sub = Some(0);
             true
         }
@@ -833,6 +834,7 @@ pub fn nav_protocol_down(state: &mut AppState) -> bool {
             true
         }
         Some(_) => {
+            // Last sub-row: down overflows to the next profile (full row).
             state.selected_sub = None;
             false
         }
@@ -842,39 +844,25 @@ pub fn nav_protocol_down(state: &mut AppState) -> bool {
 /// Navigate protocol sub-rows when on an expanded endpoint.
 /// Returns true if sub-row navigation was handled (caller should stop).
 pub fn nav_protocol_up(state: &mut AppState) -> bool {
-    // Collect the full state we need before any mutable access.
+    // Sub-rows live inside the expanded endpoint's panel — navigation never
+    // crosses endpoint boundaries. Up at the first sub-row returns to the
+    // endpoint row; Up on the endpoint row falls through to endpoint nav.
     let current_expanded = filtered_profiles(state)
         .nth(state.selected_index)
         .is_some_and(|r| r.expanded && r.protocols.len() > 1);
-    let prev_info: Option<(bool, usize)> = if state.selected_index > 0 {
-        filtered_profiles(state)
-            .nth(state.selected_index - 1)
-            .map(|r| (r.expanded, r.protocols.len()))
-    } else {
-        None
-    };
     if !current_expanded {
+        // Fall through to endpoint nav; drop any stale sub-row selection.
+        state.selected_sub = None;
         return false;
     }
     match state.selected_sub {
-        None => {
-            // Check if previous endpoint is expanded — move to its last sub-row
-            if let Some((expanded, len)) = prev_info
-                && expanded
-                && len > 1
-            {
-                state.selected_index = state.selected_index.saturating_sub(1);
-                state.selected_sub = Some(len - 1);
-                return true;
-            }
-            false
-        }
+        None => false,
         Some(n) if n > 0 => {
             state.selected_sub = Some(n - 1);
             true
         }
         Some(0) => {
-            // Move back to the endpoint row
+            // Up at the first sub-row returns to the endpoint row.
             state.selected_sub = None;
             true
         }
@@ -892,4 +880,128 @@ pub fn selected_sub_protocol_id(state: &AppState) -> Option<i64> {
     let n = state.selected_sub?;
     let row = filtered_profiles(state).nth(state.selected_index)?;
     row.protocols.get(n).map(|p| p.id)
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+    use crate::AppState;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use toasty::Deferred;
+    use xray_tui_config::AppConfig;
+    use xray_tui_db::models::{Endpoint, EndpointRow, ProfileExtension, ProtocolRow, ServerStat};
+
+    fn fake_row(id: i64, host: &str, n_protos: usize) -> EndpointRow {
+        EndpointRow {
+            endpoint: Endpoint {
+                id,
+                host: host.to_string(),
+                host_type: "ipv4".to_string(),
+                port: 443,
+                port_spec_str: None,
+                parent_id: None,
+                last_source: None,
+                created_at: 0,
+                manual_protocol_override: None,
+                resolved_as: None,
+                resolved_at: None,
+            },
+            protocols: (0..n_protos)
+                .map(|i| ProtocolRow {
+                    id: id * 100 + i as i64,
+                    endpoint_id: id,
+                    sig: 0,
+                    cred_hash: 0,
+                    proto_kind: String::new(),
+                    spec_blob: Vec::new(),
+                    config_type: 1,
+                    core_type: "xray".to_string(),
+                    transport: None,
+                    security: None,
+                    last_used_at: None,
+                    created_at: 0,
+                    last_seen_at: 0,
+                    endpoint: Deferred::from(None::<Endpoint>),
+                    extension: Deferred::from(None::<ProfileExtension>),
+                    server_stat: Deferred::from(None::<ServerStat>),
+                })
+                .collect(),
+            extensions: HashMap::new(),
+            stats: HashMap::new(),
+            selected_protocol: 0,
+            expanded: false,
+        }
+    }
+
+    async fn test_state(rows: Vec<EndpointRow>) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        state.endpoints = rows;
+        state.filter_cache_valid.set(false);
+        state.selected_index = 0;
+        state.selected_sub = None;
+        state
+    }
+
+    #[tokio::test]
+    async fn expand_lands_on_first_sub_row() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 3)]).await;
+        toggle_expand(&mut state);
+        assert!(state.endpoints[0].expanded);
+        assert_eq!(state.selected_sub, Some(0));
+    }
+
+    #[tokio::test]
+    async fn down_walks_subs_then_overflows_to_next_profile() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 3), fake_row(2, "b.com", 1)]).await;
+        toggle_expand(&mut state); // sub 0
+        assert!(nav_protocol_down(&mut state));
+        assert_eq!(state.selected_sub, Some(1));
+        assert!(nav_protocol_down(&mut state));
+        assert_eq!(state.selected_sub, Some(2));
+        // Overflow: last sub-row down → full row, caller moves to next profile.
+        assert!(!nav_protocol_down(&mut state));
+        assert_eq!(state.selected_sub, None);
+        assert_eq!(state.selected_index, 0);
+    }
+
+    #[tokio::test]
+    async fn up_at_first_sub_returns_to_full_row() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 3)]).await;
+        toggle_expand(&mut state);
+        assert!(nav_protocol_up(&mut state));
+        assert_eq!(state.selected_sub, None);
+        // Up on the full row falls through to endpoint nav (caller moves up).
+        assert!(!nav_protocol_up(&mut state));
+        assert_eq!(state.selected_sub, None);
+    }
+
+    #[tokio::test]
+    async fn down_from_full_row_reenters_sub_table() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 3)]).await;
+        toggle_expand(&mut state);
+        nav_protocol_up(&mut state); // back to full row
+        assert_eq!(state.selected_sub, None);
+        assert!(nav_protocol_down(&mut state));
+        assert_eq!(state.selected_sub, Some(0));
+    }
+
+    #[tokio::test]
+    async fn collapsed_endpoint_down_moves_directly_and_clears_stale_sub() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 2), fake_row(2, "b.com", 1)]).await;
+        state.selected_sub = Some(1); // stale sub selection
+        assert!(!nav_protocol_down(&mut state));
+        assert_eq!(state.selected_sub, None);
+        assert_eq!(state.selected_index, 0);
+        // Up on collapsed: same, stale cleared.
+        state.selected_sub = Some(0);
+        assert!(!nav_protocol_up(&mut state));
+        assert_eq!(state.selected_sub, None);
+    }
 }

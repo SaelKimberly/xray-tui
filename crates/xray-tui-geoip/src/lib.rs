@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maxminddb::Reader;
 use tokio::io::AsyncWriteExt;
@@ -68,7 +69,14 @@ impl GeoIp {
             "Downloading {GEOLITE_DOWNLOAD} to {}",
             self.db_path.display()
         );
-        let bytes = reqwest::get(GEOLITE_DOWNLOAD)
+        // Hard deadline: a stalled 70MB download must fail (and degrade to
+        // `🏴`) instead of hanging every lookup forever.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        let bytes = client
+            .get(GEOLITE_DOWNLOAD)
+            .send()
             .await?
             .error_for_status()?
             .bytes()

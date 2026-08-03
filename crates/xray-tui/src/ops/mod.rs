@@ -5,6 +5,7 @@
 
 pub mod connect;
 pub mod core;
+pub mod enrich;
 pub mod events;
 pub mod ping;
 pub mod profiles;

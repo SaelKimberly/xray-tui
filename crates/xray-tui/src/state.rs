@@ -22,8 +22,8 @@ use xray_tui_db::models::{
 use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
 use crate::types::{
-    AppMode, ConfirmAction, CoreEvent, EndpointRow, LogLine, SettingsSection, SortColumn,
-    SplitRightPane, Tab,
+    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, SettingsSection,
+    SortColumn, SplitRightPane, Tab,
 };
 use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
@@ -124,6 +124,17 @@ pub struct AppState {
     pub core_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Whether initial logs have been loaded from heed into `log_cache` yet.
     pub logs_loaded: bool,
+
+    /// Geo IP mmdb lookup (None until constructed; construction is cheap, no I/O).
+    pub geo_ip: Option<Arc<xray_tui_geoip::GeoIp>>,
+    /// Cached DNS resolver (construction is cheap, no I/O).
+    pub dns_resolver: Option<Arc<xray_tui_dns::DnsResolver>>,
+    /// Whitelist checker (loaded in background; None until `HostFeaturesLoaded`).
+    pub host_features: Option<Arc<xray_tui_host_features::HostFeaturesChecker>>,
+    /// Per-endpoint enrichment data; survives profile reloads.
+    pub endpoint_info: HashMap<i64, EndpointInfo>,
+    /// TTL (secs) for the DNS-resolution cache; default 300.
+    pub dns_cache_ttl_secs: i64,
 }
 
 /// Convert a `Profile` to `Endpoint` + `ProtocolRow` (thin wrapper over `ParsedProtocol` conversion).
@@ -186,6 +197,8 @@ pub fn parsed_to_endpoint_protocol(
         last_source: None,
         created_at: now,
         manual_protocol_override: None,
+        resolved_as: None,
+        resolved_at: None,
     };
     let protocol = ProtocolRow {
         id: parsed.sig ^ parsed.cred_hash,
@@ -198,7 +211,7 @@ pub fn parsed_to_endpoint_protocol(
         core_type: parsed.core_type.clone(),
         transport: parsed.transport.clone(),
         security: parsed.security.clone(),
-        remarks: parsed.remarks.clone(),
+        last_used_at: None,
         created_at: now,
         last_seen_at: now,
         endpoint: Default::default(),
@@ -233,7 +246,7 @@ impl AppState {
             selected_index: 0,
             log_scroll: 0,
             log_select_anchor: None,
-            sort_column: SortColumn::Remarks,
+            sort_column: SortColumn::Address,
             sort_ascending: true,
             search_query: String::new(),
             search_focused: false,
@@ -280,10 +293,53 @@ impl AppState {
             log_sender_tx: None,
             core_log_tx: None,
             logs_loaded: false,
+            geo_ip: None,
+            dns_resolver: None,
+            host_features: None,
+            endpoint_info: HashMap::new(),
+            dns_cache_ttl_secs: 300,
         };
+        // Cheap constructors — no I/O until first lookup.
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
+            .join("xray-tui");
+        state.geo_ip = Some(Arc::new(xray_tui_geoip::GeoIp::new(
+            config_dir.join("GeoLite2-City.mmdb"),
+        )));
+        state.dns_resolver = Some(Arc::new(xray_tui_dns::DnsResolver::new(
+            config_dir.join("dns-cache"),
+        )));
+        state.dns_cache_ttl_secs = state
+            .db
+            .get_dns_settings()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|d| d.cache_ttl_secs)
+            .unwrap_or(300);
         state.reload_profiles().await;
         state.reload_groups().await;
         state.spawn_auto_update();
+        // Background whitelist load (downloads missing files). Result arrives
+        // via CoreEvent::HostFeaturesLoaded → state.host_features.
+        let tx = state.core_event_tx.clone();
+        tokio::spawn(async move {
+            let w = config_dir.join("whitelist");
+            match xray_tui_host_features::HostFeaturesChecker::load(
+                &w.join("whitelist.txt"),
+                &w.join("ipwhitelist.txt"),
+                &w.join("cidrwhitelist.txt"),
+            )
+            .await
+            {
+                Ok(c) => {
+                    if let Some(t) = tx {
+                        let _ = t.try_send(CoreEvent::HostFeaturesLoaded(Arc::new(c)));
+                    }
+                }
+                Err(e) => tracing::warn!(target: "tui::state", "whitelist load failed: {e}"),
+            }
+        });
         state
     }
     /// Build a ratatui-cheese `Palette` from the currently selected theme.
@@ -354,10 +410,7 @@ impl AppState {
                     let address = row.endpoint.host.clone();
                     let port = row.endpoint.port.to_string();
                     if !address.to_lowercase().contains(&q) && !port.contains(&q) {
-                        let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
-                        if !remarks.to_lowercase().contains(&q) {
-                            return false;
-                        }
+                        return false;
                     }
                 }
                 true
@@ -374,11 +427,10 @@ impl AppState {
                     .active_protocol()
                     .config_type
                     .cmp(&b_row.active_protocol().config_type),
-                SortColumn::Remarks => {
-                    let a_rem = a_row.active_protocol().remarks.clone().unwrap_or_default();
-                    let b_rem = b_row.active_protocol().remarks.clone().unwrap_or_default();
-                    a_rem.cmp(&b_rem)
-                }
+                SortColumn::LastSeen => a_row
+                    .active_protocol()
+                    .last_seen_at
+                    .cmp(&b_row.active_protocol().last_seen_at),
                 SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
                 SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
                 SortColumn::Delay => {
@@ -587,7 +639,6 @@ impl AppState {
         let mut address = String::new();
         let mut port: i32 = 0;
         let mut user_id: Option<String> = None;
-        let mut remarks: Option<String> = None;
         let mut security: Option<String> = None;
         let mut network: Option<String> = None;
         let mut core_type = "auto".to_string();
@@ -599,9 +650,6 @@ impl AppState {
                 continue;
             }
             match key.as_str() {
-                "remarks" => {
-                    remarks = Some(xray_tui_config::import_export::normalize_remark(value));
-                }
                 "address" => address = value.clone(),
                 "port" => port = value.parse::<i32>().unwrap_or(0),
                 "core_type" => core_type.clone_from(value),
@@ -670,12 +718,9 @@ impl AppState {
             transport: network,
             security,
             created_at: now as i64,
-            remarks: remarks.clone(),
+            remarks: None,
         };
         let mut extra = serde_json::Map::new();
-        if let Some(v) = &remarks {
-            extra.insert("remarks".into(), serde_json::Value::String(v.clone()));
-        }
         if let Some(v) = &user_id {
             extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
         }
@@ -820,6 +865,12 @@ impl AppState {
                             },
                         ),
                         ("client_ip".into(), dns.client_ip.unwrap_or_default()),
+                        (
+                            "cache_ttl_secs".into(),
+                            dns.cache_ttl_secs
+                                .map(|v| v.to_string())
+                                .unwrap_or_default(),
+                        ),
                     ]
                 } else {
                     vec![
@@ -1274,9 +1325,23 @@ impl AppState {
     /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
     /// Uses DB-backed `ping_sessions` table for queue management.
     /// Phase 1 drains fast-pingable profiles quickly; Phase 2 handles remaining via temp core.
-    #[allow(clippy::needless_collect)]
     pub fn start_batch_sieve(&mut self, real_ping_enabled: bool) {
-        ping::start_batch_sieve(self, real_ping_enabled, self.core_log_tx.clone());
+        let profile_order = self
+            .filtered_profiles()
+            .enumerate()
+            .map(|(i, r)| (r.active_protocol().id, i as i32))
+            .collect();
+        ping::start_sieve(self, real_ping_enabled, profile_order, true);
+    }
+
+    /// Fast-ping every protocol of the selected endpoint (endpoint-scoped batch).
+    pub fn start_endpoint_batch_ping(&mut self) {
+        ping::start_endpoint_batch_ping(self);
+    }
+
+    /// Real-ping every protocol of the selected endpoint (endpoint-scoped batch).
+    pub fn start_endpoint_batch_real_ping(&mut self) {
+        ping::start_endpoint_batch_real_ping(self);
     }
 
     /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.

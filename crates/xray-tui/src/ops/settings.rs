@@ -630,9 +630,16 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
         disable_cache: Some(i32::from(get_str("disable_cache") == "true")),
         disable_fallback: Some(i32::from(get_str("disable_fallback") == "true")),
         client_ip: get_opt("client_ip"),
+        cache_ttl_secs: get_opt("cache_ttl_secs").and_then(|s| s.parse().ok()),
     };
     match state.db.upsert_dns_settings(&dns).await {
-        Ok(()) => state.log_trace("info", "tui::ops::settings", "DNS settings saved"),
+        Ok(()) => {
+            // Apply immediately: TTL gate reads this on the next resolve.
+            if let Some(ttl) = dns.cache_ttl_secs {
+                state.dns_cache_ttl_secs = ttl;
+            }
+            state.log_trace("info", "tui::ops::settings", "DNS settings saved");
+        }
         Err(e) => state.log_trace(
             "error",
             "tui::ops::settings",

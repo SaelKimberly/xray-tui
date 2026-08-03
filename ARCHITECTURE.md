@@ -7,12 +7,11 @@ xray-tui (bin)
   ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder, process, log_heed)
   │     └── xray-tui-proto  (ProtocolConfig types, URL parsing, Clash YAML)
   ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
-  └── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
-        └── xray-tui-proto  (ProtocolConfig types for import/export round-trip)
-
-xray-tui-dns    (standalone lib — not yet consumed by other crates)
-xray-tui-geoip  (standalone lib — not yet consumed by other crates)
-xray-tui-host-features  (standalone lib — not yet consumed by other crates)
+  ├── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
+  │     └── xray-tui-proto  (ProtocolConfig types for import/export round-trip)
+  ├── xray-tui-dns      (DNSCrypt-stamp DNS resolution — enrichment pipeline)
+  ├── xray-tui-geoip    (GeoLite2-City country/city lookup — enrichment pipeline)
+  └── xray-tui-host-features  (SNI/IP/CIDR whitelist membership — enrichment pipeline)
 ```
 
 ## Crate Responsibilities
@@ -79,6 +78,11 @@ pub struct AppState {
     pub current_memory: u64,
     pub term_height: Cell<u16>,
     pub routing_rules: Vec<RoutingRule>,
+    pub geo_ip: Option<Arc<xray_tui_geoip::GeoIp>>,
+    pub dns_resolver: Option<Arc<xray_tui_dns::DnsResolver>>,
+    pub host_features: Option<Arc<xray_tui_host_features::HostFeaturesChecker>>,
+    pub endpoint_info: HashMap<i64, EndpointInfo>, // enrichment cache, survives reload_profiles
+    pub dns_cache_ttl_secs: i64,                   // TTL for DNS-resolution cache; default 300
     pub shutdown_token: Arc<AtomicBool>,
     pub core_task_handle: Option<JoinHandle<()>>,
     pub heed_storage: Option<Arc<HeedLogStorage>>,
@@ -149,6 +153,11 @@ pub enum CoreEvent {
         success: bool,
         error: Option<String>,
     },
+    HostFeaturesLoaded(Arc<xray_tui_host_features::HostFeaturesChecker>),
+    EndpointInfoUpdated {
+        endpoint_id: i64,
+        info: EndpointInfo,
+    },
 }
 spawned `CoreManager` task and the TUI event loop. `poll_core_events()` is called each frame,
 draining pending events and updating `AppState` fields (`connected_core`, `connecting`, `connection_error`).
@@ -161,10 +170,12 @@ Methods previously in `lib.rs` extracted to `ops/` modules:
 - `ops/subscriptions.rs` — update_group_subscriptions, do_update_subscription
 - `ops/updates.rs` — spawn_update_check, spawn_update_download
 - `ops/settings.rs` — confirm_add_server, confirm_edit_server
-- `ops/profiles.rs` — delete_profile, clone_profile, import_url
+- `ops/profiles.rs` — delete_profile, clone_profile, import_url, nav_protocol_up/down, toggle_expand
+- `ops/enrich.rs` — background enrichment: spawn_dns_resolve (TTL-gated, `x` force), spawn_enrich_ip_hosts (startup seed), spawn_whitelist_pass (on HostFeaturesLoaded), spawn_outbound_enrich (real-ping exit IP), extract_sni, protocol_row_to_profile
 
 **TUI Screens (modules under `crates/xray-tui/src/ui/`):**
 
+- `profiles.rs` — 17-column endpoint rows (tree marker, indicator, #, Last Seen, Type, `[flag address:port][ip-flag sni-flag]=>{config}=>[outbound country]`) over a sortable DataTable; expanding an endpoint renders a rounded panel in the row's own height (IPs line + 10-col per-protocol sub-table: marker, hex id, last seen, last used, config type, delay, speed, traffic, outbound, country). Height-aware scroll offset (`compute_scroll_offset`) keeps expanded rows reachable; `panel_w` is viewport-capped so narrow terminals don't panic. Footer/overlays use `host:port` (remarks removed).
 - `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, or Empty. 14 sections: Core, GUI, Protocol Core, Inbound, Routing Rules, DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test, Logging, Subscriptions. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
@@ -459,7 +470,7 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 - `DnsSetting` — DNS resolver config
 - `PingSession` — ping batch tracking (batch_id, status, ping_type, latency)
 
-**Schema management**: toasty's `db.push_schema()` creates tables on first open. `schema_needed()` helper checks for existing `profiles` table to skip re-push on existing DBs. System groups created by `ensure_system_groups()`. All operations via toasty query API (filter_by_id, create, update, delete) — no raw SQL, no manual column enums.
+**Schema management**: toasty's `db.push_schema()` creates tables on first open — only when `PRAGMA user_version < 1` (toasty 0.9 uses `CREATE TABLE` without `IF NOT EXISTS`). Existing DBs migrate in place: `SCHEMA_VERSION = 2`, `ensure_column()` (pragma_table_info check + idempotent `ALTER TABLE ADD COLUMN`) for `protocol_rows.last_used_at`, `endpoints.resolved_as`/`resolved_at`, `dns_settings.cache_ttl_secs` — all inside one explicit `conn.transaction()` + `tx.commit()` (bare multi-statement DDL on the pooled turso connection silently rolls back at drop). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
 **Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB). Initial log loading is lazy (deferred to first Logs tab access).
 
 ### xray-tui-config (library crate)
@@ -493,7 +504,7 @@ impl DnsResolver {
 }
 ```
 
-`lookup_ip` short-circuits IP literals (no DNS). Otherwise it lazily builds a `hickory_resolver` 0.26 `TokioResolver` configured from the DNSCrypt public-resolver list: `sdns://` stamps parsed by `dns-stamp-parser` (DnsPlain→UDP, DoH→HTTPS, DoT→TLS, DoQ→QUIC), filtered to NO_LOGS+NO_FILTER servers, with the resolver list cached as `dsncrypt.resolvers.txt` under the caller-supplied `cache_dir`. 500ms timeout + RoundRobin ordering (ResolverOpts). TLS cert roots come from hickory's `webpki-roots` feature — no direct rustls dependency. Init uses the OnceCell get-then-set pattern so a failed (offline) first init retries on the next call.
+`lookup_ip` short-circuits IP literals (no DNS). Otherwise it lazily builds a `hickory_resolver` 0.26 `TokioResolver` configured from the DNSCrypt public-resolver list: `sdns://` stamps parsed by `dns-stamp-parser` (DnsPlain→UDP, DoH→HTTPS, DoT→TLS, DoQ→QUIC), filtered to NO_LOGS+NO_FILTER servers, with the resolver list cached as `dsncrypt.resolvers.txt` under the caller-supplied `cache_dir`. 500ms per-attempt timeout + RoundRobin ordering (ResolverOpts); the first-run DNSCrypt list download runs on a 10s reqwest deadline (a blocked network must not hang lookups forever — callers additionally wrap `lookup_ip` in an overall timeout). TLS cert roots come from hickory's `webpki-roots` feature — no direct rustls dependency. Init uses the OnceCell get-then-set pattern so a failed (offline) first init retries on the next call.
 
 ### xray-tui-geoip (library crate)
 
@@ -602,6 +613,39 @@ Send CoreEvent::SubscriptionsUpdated via core_event_tx
         │
         ▼
 Handler: add_log warnings → log_trace success/error → reload_profiles → reload_groups → load_subscriptions
+```
+
+## Data Flow: Endpoint Enrichment (DNS / GeoIP / Whitelist)
+
+```
+AppState::new / reload_profiles
+        │
+        ▼
+spawn_enrich_ip_hosts: seed endpoint_info for IP hosts (host = own address)
+  and DNS hosts with persisted endpoints.resolved_as (no network)
+        │
+        ▼
+x key (force) / connect_to_profile / SpeedTestResult (DNS hosts)
+        │
+        ▼
+spawn_dns_resolve: TTL-gated (dns_cache_ttl_secs, default 300; IP hosts never)
+  → dns_resolver.lookup_ip (8s overall timeout; DNSCrypt list download 10s)
+  → fill_features: mmdb country + host_features ip/cidr + sni
+  → CoreEvent::EndpointInfoUpdated { endpoint_id, info }
+        │
+        ▼
+HostFeaturesLoaded (whitelist files loaded, once per launch)
+  → spawn_whitelist_pass: refresh ip/cidr + SNI flags for every endpoint
+        │
+        ▼
+SpeedTestResult with ip_info (real ping)
+  → spawn_outbound_enrich: parse exit IP → mmdb country → outbound fields
+        │
+        ▼
+poll_core_events EndpointInfoUpdated handler: merge by field group into
+  state.endpoint_info (concurrent events must not clobber); persist DNS
+  resolutions via update_endpoint_resolution (only when resolved_at changed);
+  failed lookups (empty IPs) materialize TTL-gated attempt entries
 ```
 
 ## gRPC API Services

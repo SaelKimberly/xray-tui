@@ -8,6 +8,9 @@ xray-tui-core = { path = "../xray-tui-core" }
 xray-tui-db = { path = "../xray-tui-db" }
 xray-tui-config = { path = "../xray-tui-config" }
 xray-tui-proto = { path = "../xray-tui-proto" }
+xray-tui-geoip = { path = "../xray-tui-geoip" }
+xray-tui-dns = { path = "../xray-tui-dns" }
+xray-tui-host-features = { path = "../xray-tui-host-features" }
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
@@ -54,3 +57,6 @@ url.workspace = true
 
 [lints]
 workspace = true
+[dev-dependencies]
+toasty = "0.9"
+tempfile = "3"

@@ -17,40 +17,54 @@ and starts the other.
 
 ### Profiles
 
-The main screen. Shows a table of server profiles with the following columns:
+The main screen. Shows a table of single-line endpoint rows with the following columns:
 
-| Column    | Width | Content                                     |
-| --------- | ----- | ------------------------------------------- |
-| (arrow)   | 1     | Expand/collapse indicator `▶`/`▾`           |
-| (status)  | 2     | Connection status or test indicator          |
-| `#`       | 5     | Row number; `*` when multi-selected         |
-| `Type`    | 12    | Protocol type (vmess, trojan, etc.)         |
-| `Remarks` | 24    | Server name / remark                        |
-| `│`       | 1     | Column separator                            |
-| `Address` | 30    | Server address or hostname                  |
-| `Port`    | 6     | Server port                                 |
-| `│`       | 1     | Column separator                            |
-| `Delay`   | 6     | Last ping delay in ms (or `-`)              |
-| `Speed`   | 6     | Last speed test result (or `-`)             |
-| `IP`      | 20    | Resolved IP info                            |
-| `Traffic` | 10    | Total traffic through this profile          |
+| Column       | Width | Content                                     |
+| ------------ | ----- | ------------------------------------------- |
+| (arrow)      | 1     | Expand/collapse indicator `▶`/`▾`           |
+| (status)     | 2     | Connection status or test indicator          |
+| `#`          | 5     | Row number; `*` when multi-selected         |
+| `Last Seen`  | 20    | Last seen timestamp (per-config staleness)  |
+| `Type`       | 12    | Protocol type (vmess, trojan, etc.)         |
+| `[`          | 1     | Bracket decoration                          |
+| (country)    | 3     | Inbound country flag (region emoji, `🏴` unknown) |
+| `Address`    | 37    | `host:port` (flag sits inside the brackets) |
+| `][`         | 2     | Bracket decoration                          |
+| `IP`         | 2     | Whitelist feature: `🏁` DNS unresolved, `🏳️` IP/CIDR whitelisted |
+| `SNI`        | 2     | Whitelist feature: `🏳️` SNI whitelisted     |
+| `]=>{`       | 4     | Bracket decoration                          |
+| (config)     | 12    | `transport/security`, center-aligned        |
+| `}=>[`       | 4     | Bracket decoration                          |
+| `Outbound`   | 16    | Exit IP from the last real ping (`—` none)  |
+| `Country`    | 7     | Exit country flag + ISO (`—` none)          |
+| `]`          | 1     | Bracket decoration                          |
 
-The Core type is shown in the status bar footer with color coding: blue for xray-core, green for sing-box.
+Headers carry only descriptive names; decorative separator cells have empty headers.
+Delay/Speed/Traffic/Outbound details live in the expanded panel (below).
 
-**Expandable endpoints**: Endpoints with multiple protocol variants show `▶` (collapsed) or `▾` (expanded). Press `→` to expand and see individual protocol sub-rows; `←` to collapse. On expanded sub-rows, `↑`/`↓` navigates between variants and `Enter` sets the active variant. Sub-rows show the protocol's remarks across a wider area since the Address column is repurposed for the variant description.
+**Expandable endpoints**: Endpoints with multiple protocol variants show `▶`
+(collapsed) or `▾` (expanded). Press `→` to expand: a rounded panel appears
+under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
+`(x resolve)` hint while the DNS name is unresolved) and a per-protocol
+sub-table: active marker, hex profile id, Last Seen, Last Used, config type,
+delay, speed, traffic, outbound address, outbound country. `←` collapses.
+Expanding lands on the **first sub-row**; `↑`/`↓` then walk the variants.
+`↑` at the first sub-row returns to the full endpoint row; `↓` at the last
+sub-row moves to the next profile; `↓` from the full row of an expanded
+endpoint re-enters the sub-table. `Enter` on a sub-row activates that variant
+(manual override).
 
-**Filter strip** above the table shows:
-- Current group filter (if one is active via Groups overlay)
-- Search query when `/` is pressed
+**Enrichment**: inbound country, whitelist features, and outbound info are
+computed in the background. Press `x` to force a DNS resolution of the
+selected endpoint. DNS results are cached (TTL configurable in Settings → DNS)
+and persist across launches, so group updates and restarts do not re-resolve.
 
-**DataGrid features:**
-- Alternating row colors (odd rows have alt background)
-- Selected row highlighted with bold
-- Multi-select indicator: `*` replaces row number
-- Scrollable via arrow keys, Home/End
+**Speed tests**: on a collapsed endpoint row with more than one protocol, the
+speed-test menu pings **all protocols of the endpoint** (endpoint-scoped
+batch); on a panel sub-row it pings the **exact protocol**.
 
-**Search:** Press `/` to focus search field, type to filter profiles by name/address/type.
-Search matches are highlighted. `Esc` clears filter and exits search mode.
+**Search:** Press `/` to focus search field, type to filter profiles by
+address/port. `Esc` clears filter and exits search mode.
 
 **Delete confirmation overlay** — centered dialog asking `y/n` when `d` is pressed.
 `y` confirms, `n`/`q`/`Esc` cancels.
@@ -383,6 +397,7 @@ appended when updates are available for installed backends.
 | `c`              | Clone selected server               |
 | `g`              | Manage subscription groups          |
 | `t`              | Open speed test menu                |
+| `x`              | Resolve DNS of selected endpoint    |
 | `o`              | Cycle sort column (8 columns)       |
 | `/`              | Focus search/filter input           |
 | `Ctrl+V`         | Import share URL                    |
@@ -486,15 +501,19 @@ appended when updates are available for installed backends.
 2. Press `t` to open the speed test menu
 3. Navigate with `↑↓` (skips the separator line)
 4. Press `Enter` on the test type:
-   - **Fast Ping** — auto-selects TCP or UDP/QUIC adapter based on protocol
-   - **Real Ping** — measures response time through the proxy
+   - **Fast Ping** — auto-selects TCP or UDP/QUIC adapter based on protocol.
+     On a collapsed endpoint row with >1 protocols this runs an
+     **endpoint-scoped batch** (all protocols of the endpoint); on an expanded
+     panel sub-row it pings the **exact protocol**
+   - **Real Ping** — measures response time through the proxy (same scoping)
    - **Speed Test** — downloads a test payload to measure throughput
    - **UDP Test** — tests UDP forwarding
    - **Fast Ping (All Visible)** — batch fast pings all visible profiles
    - **Fast + Real Ping (All Visible)** — batch fast ping followed by real ping for unsupported protocols
    - **Sort by Delay** — re-sorts the table by delay ascending
    - **Remove Bad Servers** — removes profiles with failed tests
-5. Results populate the Delay/Speed columns in the table
+5. Results populate the expanded panel's per-protocol sub-table; real-ping
+   exit IPs fill the single-line Outbound/Country columns
 
 ### Connecting/Disconnecting
 

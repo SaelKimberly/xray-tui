@@ -42,7 +42,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
             transport: p.transport.clone(),
             security: p.security.clone(),
             created_at: p.created_at,
-            remarks: p.remarks.clone(),
+            remarks: None,
         };
         let core_override = p.core_type.parse::<CoreType>().ok();
         (r.endpoint.clone(), p.clone(), profile, core_override)
@@ -79,6 +79,33 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
     state.connecting = true;
     state.connected_protocol_id = Some(protocol_id);
     state.connection_error = None;
+
+    // Deferred-resolution trigger: connect does real networking, so resolve
+    // the inbound host now (force — bypasses the TTL cache).
+    crate::ops::enrich::spawn_dns_resolve(state, endpoint.id, true);
+
+    // "Last Used" = connect initiation: DB write + in-memory row so the
+    // sub-table refreshes without a reload.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let lu_protocol_id = protocol_row.id;
+    let lu_db = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = lu_db.update_last_used(lu_protocol_id, now).await {
+            tracing::warn!(target: "tui::ops::connect", "update_last_used failed: {e}");
+        }
+    });
+    if let Some(r) = state
+        .endpoints
+        .iter_mut()
+        .find(|r| r.endpoint.id == endpoint.id)
+    {
+        if let Some(pr) = r.protocols.iter_mut().find(|pr| pr.id == lu_protocol_id) {
+            pr.last_used_at = Some(now);
+        }
+    }
     let tx = if let Some(tx) = &state.core_event_tx {
         tx.clone()
     } else {
@@ -129,6 +156,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         disable_cache: None,
         disable_fallback: None,
         client_ip: None,
+        cache_ttl_secs: None,
     };
     let routing: Vec<RoutingRule> = vec![];
 

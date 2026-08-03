@@ -38,7 +38,6 @@ fn try_send_or_warn(tx: &mpsc::Sender<CoreEvent>, event: CoreEvent, label: &'sta
 
 fn common_field_defaults() -> Vec<(String, String)> {
     vec![
-        ("remarks".to_string(), String::new()),
         ("address".to_string(), String::new()),
         ("port".to_string(), "443".to_string()),
         ("core_type".to_string(), "auto".to_string()),
@@ -48,9 +47,6 @@ fn common_field_defaults() -> Vec<(String, String)> {
 pub(crate) fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
     let mut fields = common_field_defaults();
     if let Some(config) = profile_config(profile) {
-        if let Some(v) = config.remarks() {
-            set_field(&mut fields, "remarks", v);
-        }
         if let Some(v) = xray_tui_config::import_export::profile_user_id(&config) {
             set_field(&mut fields, "user_id", &v);
         }
@@ -121,6 +117,32 @@ const fn civil_from_days(z: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as u64, m, d)
+}
+
+/// Unix seconds → "YYYY-MM-DDTHH:MM:SS" (UTC). Callers render "—" for 0/None.
+pub fn format_ts(secs: i64) -> String {
+    let days = secs.div_euclid(86_400) as u64;
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+/// "US" → "🇺🇸"; anything not exactly 2 ASCII alpha chars → "🏴" (U+1F3F4).
+pub fn iso_to_flag(iso: &str) -> String {
+    let b = iso.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1].is_ascii_alphabetic() {
+        let mut s = String::with_capacity(8);
+        for c in iso.chars() {
+            let regional = u32::from(c) - u32::from('A') + 0x1F1E6;
+            s.push(char::from_u32(regional).unwrap_or('\u{1F3F4}'));
+        }
+        s
+    } else {
+        "\u{1F3F4}".to_string()
+    }
 }
 
 #[must_use]
@@ -228,7 +250,7 @@ mod tests {
         assert!(!fields.is_empty());
         assert!(fields.iter().any(|(k, _)| k == "address"));
         assert!(fields.iter().any(|(k, _)| k == "port"));
-        assert!(fields.iter().any(|(k, _)| k == "remarks"));
+        assert!(!fields.iter().any(|(k, _)| k == "remarks"));
         assert!(fields.iter().any(|(k, _)| k == "core_type"));
     }
 
@@ -250,8 +272,8 @@ mod tests {
     #[test]
     fn test_get_field() {
         let mut fields = common_field_defaults();
-        set_field(&mut fields, "remarks", "my server");
-        assert_eq!(get_field(&fields, "remarks"), Some("my server".to_string()));
+        set_field(&mut fields, "port", "8443");
+        assert_eq!(get_field(&fields, "port"), Some("8443".to_string()));
         // Empty value should return None
         assert_eq!(get_field(&fields, "nonexistent"), None);
     }

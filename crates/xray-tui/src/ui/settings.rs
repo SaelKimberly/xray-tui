@@ -520,6 +520,7 @@ fn form_field_defs_for_section(
             ("disable_cache", "Disable Cache", "Boolean"),
             ("disable_fallback", "Disable Fallback", "Boolean"),
             ("client_ip", "Client IP", "Text"),
+            ("cache_ttl_secs", "DNS Cache TTL (secs)", "Number"),
         ],
         SettingsSection::SystemProxy => &[
             ("enabled", "Enabled", "Boolean"),

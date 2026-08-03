@@ -94,7 +94,14 @@ async fn get_dns_servers(cache_dir: &Path) -> anyhow::Result<ResolverConfig> {
             .filter_map(|url| sdns_to_nsc(&url, false))
             .collect::<Vec<_>>()
     } else {
-        let response = reqwest::get(DNSCRYPT_RESOLVERS_URL)
+        // Hard deadline: first run downloads the DNSCrypt list; without a
+        // timeout a blocked network hangs every lookup forever.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let response = client
+            .get(DNSCRYPT_RESOLVERS_URL)
+            .send()
             .await?
             .error_for_status()?;
         let result: HashSet<url::Url> = response

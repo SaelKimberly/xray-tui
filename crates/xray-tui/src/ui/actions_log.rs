@@ -26,7 +26,7 @@ fn connection_icon(state: &AppState) -> (&'static str, Style) {
     }
 }
 
-fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
+fn server_summary(state: &AppState) -> (String, String, u16, String) {
     // Try the connected profile first
     let from_connected = state
         .connected_protocol_id
@@ -46,7 +46,6 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
         || {
             (
                 "-".to_string(),
-                "No server".to_string(),
                 String::new(),
                 0u16,
                 String::new(),
@@ -55,11 +54,10 @@ fn server_summary(state: &AppState) -> (String, String, String, u16, String) {
         |r| {
             let proto =
                 Protocol::try_from_i32(r.active_protocol().config_type).unwrap_or(Protocol::Custom);
-            let remarks = r.active_protocol().remarks.clone().unwrap_or_default();
             let addr = r.endpoint.host.clone();
             let port = r.endpoint.port as u16;
             let core = state.resolved_core(r).to_string();
-            (proto.to_string(), remarks, addr, port, core)
+            (proto.to_string(), addr, port, core)
         },
     )
 }
@@ -72,13 +70,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
     let (icon, icon_style) = connection_icon(state);
-    let (proto, remarks, addr, port, core) = server_summary(state);
+    let (proto, addr, port, core) = server_summary(state);
 
     // Server info segment
     let server_str = if addr.is_empty() {
-        remarks
+        format!("{proto} [{core}]")
     } else {
-        format!("{proto}/{remarks} {addr}:{port} [{core}]")
+        format!("{proto} {addr}:{port} [{core}]")
     };
 
     // Test results segment
@@ -156,7 +154,7 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
 pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
     let (icon, icon_style) = connection_icon(state);
-    let (proto, remarks, addr, port, core) = server_summary(state);
+    let (proto, addr, port, core) = server_summary(state);
 
     // Row 1: Connection status
     let status_text = if state.connecting {
@@ -172,9 +170,9 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Row 2: Server info
     let server_info = if addr.is_empty() {
-        remarks
+        format!("{proto} [{core}]")
     } else {
-        format!("{proto} {remarks} {addr}:{port} [{core}]")
+        format!("{proto} {addr}:{port} [{core}]")
     };
     let row2 = Line::from(Span::styled(
         if server_info == "No server" || server_info == "- No server" {

@@ -182,6 +182,15 @@ pub async fn poll_core_events(state: &mut AppState) {
                 }
                 state.testing_details.remove(&protocol_id);
 
+                // Capture endpoint context before the mutable row borrow below.
+                let (ep_id, ep_host_is_dns) = state
+                    .endpoints
+                    .iter()
+                    .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
+                    .map(|r| (r.endpoint.id, r.endpoint.host_type == "dns"))
+                    .unwrap_or((0, false));
+                let ip_info_clone = ip_info.clone();
+
                 let name = {
                     let row = state
                         .endpoints
@@ -212,10 +221,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                                 }
                             }
                             let _ = state.db.upsert_profile_extension(ext).await;
-                            row.active_protocol()
-                                .remarks
-                                .clone()
-                                .unwrap_or_else(|| fmt_profile_id(protocol_id))
+                            fmt_profile_id(protocol_id)
                         }
                         None => fmt_profile_id(protocol_id),
                     }
@@ -256,6 +262,16 @@ pub async fn poll_core_events(state: &mut AppState) {
                 if state.testing_profiles.is_empty() {
                     state.speed_test_stop.store(false, Ordering::Relaxed);
                     state.batch_progress = None;
+                }
+
+                // Real ping happened — record the exit IP + country on the
+                // endpoint; DNS-host endpoints get their inbound resolved too
+                // (deferred-resolution trigger: real networking occurred).
+                if ip_info_clone.is_some() {
+                    crate::ops::enrich::spawn_outbound_enrich(state, protocol_id, ip_info_clone);
+                }
+                if ep_host_is_dns {
+                    crate::ops::enrich::spawn_dns_resolve(state, ep_id, false);
                 }
             }
             CoreEvent::UpdateCheckResult {
@@ -396,6 +412,84 @@ pub async fn poll_core_events(state: &mut AppState) {
             } => {
                 if total == 0 {
                     state.batch_progress = None;
+                }
+            }
+            CoreEvent::HostFeaturesLoaded(checker) => {
+                state.host_features = Some(checker);
+                state.log_trace("info", "tui::state", "Whitelist loaded");
+                // Refresh whitelist features for every endpoint (never
+                // persisted — cached entries must track the current files).
+                crate::ops::enrich::spawn_whitelist_pass(state);
+            }
+            CoreEvent::EndpointInfoUpdated { endpoint_id, info } => {
+                // Merge by field group so concurrent enrichment (resolution /
+                // whitelist / outbound) does not clobber each other. Events
+                // with empty resolved_ips (failed lookup) carry nothing
+                // mergable and must NOT materialize an entry — an empty entry
+                // would block the startup seeding pass and make
+                // `should_resolve` treat the endpoint as a never-retried IP
+                // host.
+                let mut persist: Option<(String, Option<i64>)> = None;
+                if !info.resolved_ips.is_empty()
+                    || info.sni_whitelisted.is_some()
+                    || info.outbound_ip.is_some()
+                    || info.resolved_at_secs.is_some()
+                {
+                    let entry = state.endpoint_info.entry(endpoint_id).or_default();
+                    if !info.resolved_ips.is_empty() {
+                        let had_resolved_at = entry.resolved_at_secs;
+                        entry.resolved_ips = info.resolved_ips;
+                        entry.resolved_at_secs = info.resolved_at_secs;
+                        // country is derived (mmdb) — a lookup failure in a
+                        // re-resolution returns None; keep the known value
+                        // rather than clearing it.
+                        entry.country = info.country.or_else(|| entry.country.clone());
+                        entry.host_features = info.host_features;
+                        // Persist only when the resolution itself changed
+                        // (whitelist-pass copies carry the same timestamp and
+                        // must not re-write).
+                        if entry.resolved_at_secs.is_some()
+                            && had_resolved_at != entry.resolved_at_secs
+                        {
+                            persist = Some((
+                                entry
+                                    .resolved_ips
+                                    .iter()
+                                    .map(|ip| ip.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                entry.resolved_at_secs,
+                            ));
+                        }
+                    } else if info.resolved_at_secs.is_some() {
+                        // Failed lookup (empty result): record the attempt so
+                        // re-resolution is TTL-gated instead of re-running on
+                        // every trigger. `x` (force) still re-attempts.
+                        entry.resolved_at_secs = info.resolved_at_secs;
+                    }
+                    if info.sni_whitelisted.is_some() {
+                        entry.sni_whitelisted = info.sni_whitelisted;
+                    }
+                    if info.outbound_ip.is_some() {
+                        entry.outbound_ip = info.outbound_ip;
+                        entry.outbound_country = info.outbound_country;
+                    }
+                }
+                // Persist DNS resolutions (DNS hosts only) so launches don't
+                // re-resolve; the TTL gate applies across restarts.
+                if let Some((resolved_as, resolved_at)) = persist {
+                    let db = state.db.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db
+                            .update_endpoint_resolution(endpoint_id, Some(&resolved_as), resolved_at)
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "tui::ops::events",
+                                "update_endpoint_resolution failed: {e}"
+                            );
+                        }
+                    });
                 }
             }
         }

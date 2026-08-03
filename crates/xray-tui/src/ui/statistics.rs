@@ -6,9 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
-use xray_tui_config::import_export::profile_config;
 use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
-use xray_tui_proto::proto_spec::ProtoSpec;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
@@ -21,23 +19,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     }
     let profile = &state.endpoints[state.selected_index];
     let active_proto = profile.active_protocol();
-    let profile_name = profile_config(&xray_tui_config::import_export::Profile {
-        id: active_proto.id,
-        sig: active_proto.sig,
-        cred_hash: active_proto.cred_hash,
-        proto_kind: active_proto.proto_kind.clone(),
-        spec_blob: active_proto.spec_blob.clone(),
-        config_type: active_proto.config_type,
-        core_type: active_proto.core_type.clone(),
-        address: profile.endpoint.host.clone(),
-        port: profile.endpoint.port,
-        transport: active_proto.transport.clone(),
-        security: active_proto.security.clone(),
-        created_at: active_proto.created_at,
-        remarks: active_proto.remarks.clone(),
-    })
-    .and_then(|c| c.remarks().map(String::from))
-    .unwrap_or_else(|| "Unknown".to_string());
+    let profile_name = format!("{}:{}", profile.endpoint.host, profile.endpoint.port);
     let core_type = state.connected_core.map_or("", |c| c.as_str());
 
     // Split area into 3 sections

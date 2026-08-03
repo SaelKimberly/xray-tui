@@ -47,6 +47,8 @@ fn make_endpoint(host: &str, port: i32) -> Endpoint {
         last_source: None,
         created_at: 1000,
         manual_protocol_override: None,
+        resolved_as: None,
+        resolved_at: None,
     }
 }
 
@@ -62,7 +64,7 @@ fn make_protocol(endpoint_id: i64, proto_kind: &str, sid: i64) -> ProtocolRow {
         core_type: "auto".to_string(),
         transport: None,
         security: None,
-        remarks: Some(format!("{proto_kind}-{sid}")),
+        last_used_at: None,
         created_at: 1000,
         last_seen_at: 1000,
         endpoint: Default::default(),
@@ -348,12 +350,16 @@ async fn test_resolve_endpoint_dns() {
     let resolved = db.resolve_endpoint_dns(dns_id, host).await;
     match resolved {
         Ok(ips) => {
-            let row = db.get_endpoint(dns_id).await.unwrap().unwrap();
-            assert_eq!(row.resolved_ips.len(), ips.len());
+            // Child endpoints (parent_id = dns_id) are created per resolved IP
+            let children = db
+                .endpoints_by_parent(dns_id)
+                .await
+                .expect("query child endpoints");
+            let child_ips: Vec<String> = children.iter().map(|e| e.host.clone()).collect();
             for ip in &ips {
                 assert!(
-                    row.resolved_ips.contains(ip),
-                    "{ip} should be in resolved_ips"
+                    child_ips.contains(&ip.to_string()),
+                    "{ip} should have a child endpoint"
                 );
             }
         }
@@ -501,4 +507,155 @@ async fn test_concurrent_subscription_upsert() {
     // All 10 endpoints exist in the group
     let endpoints = db.get_active_endpoints_by_group(gid, 0).await.unwrap();
     assert_eq!(endpoints.len(), 10, "all 10 endpoints should exist");
+}
+
+// ── last_used_at + DNS resolution columns ──────────────────────────────
+
+/// Gate test for toasty 0.9 upsert semantics: `subscription_upsert` omits
+/// `last_used_at` from the builder, so a re-upsert of the same protocol must
+/// NOT clobber a value written by `update_last_used`.
+#[tokio::test]
+async fn test_last_used_survives_subscription_upsert() {
+    let db = test_db().await;
+    let gid = "gate";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = make_endpoint("192.0.2.10", 443);
+    let proto = make_protocol(ep.id, "vmess", 30001);
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
+        .await
+        .unwrap();
+
+    // Mark as used
+    db.update_last_used(proto.id, 777_000).await.unwrap();
+
+    // Re-upsert from a subscription refresh
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto])])
+        .await
+        .unwrap();
+
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(
+        row.protocols[0].last_used_at,
+        Some(777_000),
+        "subscription re-upsert must not clobber last_used_at"
+    );
+}
+
+#[tokio::test]
+async fn test_update_last_used_roundtrip() {
+    let db = test_db().await;
+    let gid = "lu";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = make_endpoint("192.0.2.11", 443);
+    let proto = make_protocol(ep.id, "trojan", 30002);
+    db.insert_manual_endpoint(&ep, &proto, gid).await.unwrap();
+
+    // Fresh insert leaves last_used_at NULL
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(row.protocols[0].last_used_at, None);
+
+    db.update_last_used(proto.id, 555_000).await.unwrap();
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(row.protocols[0].last_used_at, Some(555_000));
+}
+
+#[tokio::test]
+async fn test_update_endpoint_resolution_roundtrip() {
+    let db = test_db().await;
+    let gid = "res";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = Endpoint {
+        host_type: "dns".to_string(),
+        ..make_endpoint("example.com", 443)
+    };
+    let proto = make_protocol(ep.id, "vmess", 30003);
+    db.insert_manual_endpoint(&ep, &proto, gid).await.unwrap();
+
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(row.endpoint.resolved_as, None);
+
+    db.update_endpoint_resolution(ep.id, Some("1.2.3.4,2606:4700::1"), Some(999_000))
+        .await
+        .unwrap();
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(row.endpoint.resolved_as.as_deref(), Some("1.2.3.4,2606:4700::1"));
+    assert_eq!(row.endpoint.resolved_at, Some(999_000));
+
+    // Clearing (failed lookup) sets both back to NULL
+    db.update_endpoint_resolution(ep.id, None, None).await.unwrap();
+    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    assert_eq!(row.endpoint.resolved_as, None);
+    assert_eq!(row.endpoint.resolved_at, None);
+}
+
+// ── get_batch_for_real_ping dedup flag ─────────────────────────────────
+
+#[tokio::test]
+async fn test_get_batch_for_real_ping_dedup_flag() {
+    let db = test_db().await;
+    let gid = "batch";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = make_endpoint("192.0.2.20", 443);
+    let proto1 = make_protocol(ep.id, "vmess", 30011);
+    let proto2 = make_protocol(ep.id, "vless", 30012);
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto1.clone(), proto2.clone()])])
+        .await
+        .unwrap();
+
+    let batch = "batch-1";
+    let n = db
+        .create_ping_batch(batch, None, Some(&[(proto1.id, 0), (proto2.id, 1)]))
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "both protocols queued");
+
+    // Promote both fast sessions to real (what the sieve does on fast success)
+    let sessions = db.get_ping_sessions(batch).await.unwrap();
+    assert_eq!(sessions.len(), 2);
+    for s in &sessions {
+        db.update_session_ping_type(&s.id, "real", "queued")
+            .await
+            .unwrap();
+    }
+
+    // Mark proto1's session completed (same address+port endpoint)
+    let s1 = sessions
+        .iter()
+        .find(|s| s.protocol_id == proto1.id)
+        .expect("proto1 session");
+    db.batch_flush_ping_buffer(
+        batch,
+        &[xray_tui_db::models::PingResultUpdate {
+            session_id: s1.id.clone(),
+            protocol_id: proto1.id,
+            status: "completed".to_string(),
+            ping_type: "real".to_string(),
+            latency_ms: None,
+            speed_bps: None,
+            ip_info: None,
+            error: None,
+        }],
+        &[],
+    )
+    .await
+    .unwrap();
+
+    // dedup=true: proto2's session is hidden (its endpoint already completed)
+    let with_dedup = db
+        .get_batch_for_real_ping(batch, 10, true)
+        .await
+        .unwrap();
+    assert_eq!(with_dedup.len(), 0, "dedup hides same-endpoint sessions");
+
+    // dedup=false: both sessions visible again (endpoint-scoped batch)
+    let without_dedup = db
+        .get_batch_for_real_ping(batch, 10, false)
+        .await
+        .unwrap();
+    assert_eq!(without_dedup.len(), 1, "no-dedup returns the remaining queued");
+    assert_eq!(without_dedup[0].protocol_id, proto2.id);
 }

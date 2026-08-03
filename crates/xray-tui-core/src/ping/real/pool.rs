@@ -444,6 +444,7 @@ impl CorePool {
             disable_cache: None,
             disable_fallback: None,
             client_ip: None,
+            cache_ttl_secs: None,
         }
     }
 

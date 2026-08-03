@@ -60,6 +60,8 @@ AGENTS.md
 | **Location** | GeoIP lookup result (xray-tui-geoip): country ISO code + optional English city name, from a GeoLite2-City mmdb downloaded on first use. |
 | **HostFeatures** | Whitelist-membership result (xray-tui-host-features): `sni_whitelisted` / `ip_whitelisted` / `cidr_whitelisted` flags for a `ServerName` (DnsName → SNI check, IPv4 → exact-IP + CIDR checks, IPv6 → empty). Whitelists are IPv4-only, sourced from hxehex/russia-mobile-internet-whitelist. |
 | **PingSession** | SQLite record tracking a single ping attempt: batch_id, profile_id, adapter_type (TCP/UDP/QUIC), latency_ms, ip_info, error. Enables persistent history and async progress tracking via AtomicU16 counters. |
+| **EndpointInfo** | In-memory enrichment cache (`AppState.endpoint_info`, keyed by endpoint id): resolved IPs, inbound country (mmdb), ip/cidr + SNI whitelist flags, outbound (egress) IP + country, `resolved_at_secs` (None = IP host, never re-resolves). Updated by background tasks via `CoreEvent::EndpointInfoUpdated`; survives `reload_profiles`. |
+| **resolved_as / resolved_at** | `endpoints` columns persisting a DNS host's resolution (comma-joined IPs + unix secs) so launches don't re-resolve. Set by `update_endpoint_resolution`, seeded into `endpoint_info` at startup. |
 | **Transport** | Network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around transport |
 | **Config Type** | Proxy protocol (VMess, VLESS, Shadowsocks, Trojan, TUIC, etc.) |
@@ -73,11 +75,12 @@ AGENTS.md
 - **Profile identity**: `sub_uid = sig ^ cred_hash` for URL-imported (deterministic dedup via rapidhash), random i64 for manual form entries. Form profiles set `sig = uid`, `cred_hash = 0` (meaningless, no URL-dedup).
 - **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. Each profile tagged with core type (auto, xray, sing-box). Auto mode resolves based on protocol.
 - **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, Shadowsocks, etc.) → xray-core by default. User can override per-profile.
+- **Background enrichment pipeline** (`ops/enrich.rs`): DNS resolution, mmdb country lookups, and whitelist checks run in spawned tokio tasks that report via `CoreEvent::EndpointInfoUpdated` — the UI thread never blocks. `EndpointInfoUpdated` merges by field group (concurrent resolution/whitelist/outbound events must not clobber); failed DNS lookups materialize TTL-gated entries so auto-retriggers don't re-hang; DNS resolutions persist to `endpoints.resolved_as`/`resolved_at`. DNS + mmdb downloads have hard deadlines (10s/8s).
 - **One core runs at a time**: Switching profiles between backends stops current core process and starts other. Matches v2rayN behavior and avoids port conflicts.
 - **Xray-core runs as subprocess**; TUI writes JSON config files and communicates via gRPC API.
 - **Sing-box runs as subprocess**; TUI writes JSON config files and communicates via sing-box's experimental V2Ray API (gRPC compatible).
 - **TUI framework**: **Ratatui + Crossterm** (async via tokio).
-- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `toasty` ORM v0.7 (turso driver) for profiles, subscriptions, routing, DNS, stats.
+- **Storage**: **LMDB** via `heed` for log persistence; **SQLite** via `toasty` ORM v0.9 (turso driver) for profiles, subscriptions, routing, DNS, stats.
 - **Fast Ping architecture**: Transport-level latency tests via FastPingManager with adapter pattern. TcpPingAdapter (handshake), UdpPingAdapter (datagram), QuicPingAdapter (handshake). Protocols map to adapters automatically; unsupported protocols fall through to RealPingManager. PingSession table persists results with batch_id correlation.
 - **Log storage**: `TuiLogLayer` sends tracing events to log channel (non-blocking, `std::sync::mpsc::Sender`), consumed by background `spawn_blocking` batched writer. Uses `heed` (embedded LMDB) in `xray-tui-core::log_heed` with two databases: `logs` (u64 BE → postcard-encoded `LogMessage`) and `targets` (seen target string set). MapFull triggers automatic resize (1 GB default, doubles up to 8 GB). Async wrappers (`read_recent_async`, `read_newer_than_async`, `read_older_than_async`, `get_targets_async`) wrap LMDB reads in `spawn_blocking` for non-blocking async calls from TUI event loop. Initial log loading is lazy (deferred to first Logs tab access).
 - **Theme system**: `ThemeStyles` (in `theme.rs`) replaces hardcoded `Style` constants with static methods taking `&Palette`. `Palette` comes from `ratatui_themes::ThemeName` → `Theme` → `palette_bridge::current_palette()`. Every screen uses `state.current_palette()` and `ThemeStyles::*` instead of bare `Color` values. New dependencies: `ratatui-cheese` (form widgets, `Palette`), `ratatui-themes` (theme definitions), `tui-popup` (overlays), `tui-scrollbar`. New modules: `palette_bridge`, `widgets/` (reusable `DataTable`).
@@ -85,10 +88,11 @@ AGENTS.md
 
 ## Key source files
 
-- `crates/xray-tui/src/state.rs` — AppState struct (55+ fields)
-- `crates/xray-tui/src/types.rs` — Tab, SortColumn, SettingsSection (14 variants), AppMode, CoreEvent (13 variants), LogLine, BackendUpdateStatus, ClashTraffic
-- `crates/xray-tui/src/ops/` — extracted AppState methods: connect.rs, ping.rs, events.rs, subscriptions.rs, updates.rs, settings.rs, profiles.rs
-- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Endpoint, Connection, Group, ProtocolRow, Extension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession), EndpointRow, PurgatoryView constants
+- `crates/xray-tui/src/state.rs` — AppState struct (60+ fields)
+- `crates/xray-tui/src/types.rs` — Tab, SortColumn, SettingsSection (14 variants), AppMode, CoreEvent (15 variants), EndpointInfo, LogLine, BackendUpdateStatus, ClashTraffic
+- `crates/xray-tui/src/ops/` — extracted AppState methods: connect.rs, ping.rs, events.rs, subscriptions.rs, updates.rs, settings.rs, profiles.rs, enrich.rs
+- `crates/xray-tui/src/ops/enrich.rs` — background enrichment: spawn_dns_resolve (TTL-gated), spawn_enrich_ip_hosts, spawn_whitelist_pass, spawn_outbound_enrich, extract_sni, protocol_row_to_profile
+- `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Endpoint with resolved_as/resolved_at, ProtocolRow with last_used_at, Connection, Group, ProtocolRow, Extension, ServerStat, Subscription, RoutingRule, DnsSetting with cache_ttl_secs, PingSession), EndpointRow, PurgatoryView constants
 - `crates/xray-tui/src/ui/groups.rs` — system-group-aware management (is_system guard, clear action)
 - `crates/xray-tui/src/ui/actions_log.rs` — live event log panel
 - `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage (LMDB), LogMessage struct
@@ -124,7 +128,7 @@ AGENTS.md
 | Aspect | v2rayN | xray-tui |
 |--------|--------|----------|
 | Display | Desktop GUI (WinForms), multi-window | Terminal TUI (ratatui), single-window tabbed |
-| Profile view | Flat list with sortable columns | Hierarchical: Endpoint rows with expandable Protocol sub-rows |
+| Profile view | Flat list with sortable columns | 17-column endpoint rows (Last Seen, country flag, whitelist flags, config type, outbound) with expandable rounded panel containing the per-protocol sub-table |
 | Group view | Dropdown filter | Modal overlay (g key) + Settings section |
 | Settings | Menu-driven dialog boxes | Split-pane: collapsible tree + inline form/routing list |
 | Search | Search box | `/` key focus to inline filter with cursor |
@@ -139,6 +143,6 @@ AGENTS.md
 
 ### Feature Parity
 
-**Implemented**: All 20 protocol config types, URL parsing for 14 protocols, Clash YAML conversion for 17 protocols, dual-backend (xray + sing-box), gRPC stats, subscription lifecycle, speed test system (TCP/real/speed/UDP/batch), routing rules CRUD, DNS settings, system proxy (HTTP_PROXY env vars), TUN toggle, theme system, inline form validation, backend auto-updates, geo file updates, Mux config, TLS/REALITY/ECH/Fragment form fields, Clash Mixin.
+**Implemented**: All 20 protocol config types, URL parsing for 14 protocols, Clash YAML conversion for 17 protocols, dual-backend (xray + sing-box), gRPC stats, subscription lifecycle, speed test system (TCP/real/speed/UDP/batch), routing rules CRUD, DNS settings, system proxy (HTTP_PROXY env vars), TUN toggle, theme system, inline form validation, backend auto-updates, geo file updates, Mux config, TLS/REALITY/ECH/Fragment form fields, Clash Mixin. Profiles redesign: 17-column single-line rows + expandable per-protocol panel, DNS endpoint IP resolution with cross-launch persistence, inbound/outbound country flags (geoip), IP/SNI whitelist feature flags (host-features), endpoint-scoped ping batches, Last Used column, `x` resolve key.
 
-**Not implemented**: DNS endpoint IP resolution in TUI and Location Info column (xray-tui-dns + xray-tui-geoip crates adopted and vetted, TUI integration pending), whitelist feature extraction (xray-tui-host-features crate adopted, TUI integration pending), proxy chain/policy groups, process-based routing, multi-URL subscriptions, SIP008 format, Clash API proxy/connections TUI tabs, PAC mode, WebDAV backup/restore, full TUN config (stack, MTU, route exclude), global hotkeys, i18n system, QR code display, config template editor, auto startup, sudo/polkit integration, drag-drop sort, tray integration.
+**Not implemented**: proxy chain/policy groups, process-based routing, multi-URL subscriptions, SIP008 format, Clash API proxy/connections TUI tabs, PAC mode, WebDAV backup/restore, full TUN config (stack, MTU, route exclude), global hotkeys, i18n system, QR code display, config template editor, auto startup, sudo/polkit integration, drag-drop sort, tray integration.

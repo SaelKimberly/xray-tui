@@ -1,9 +1,9 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 
@@ -13,123 +13,185 @@ use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
     Column, ColumnWidth, DataTable, DataTableRow, DataTableState, SortDirection,
 };
-use crate::{AppState, ConfirmAction, EndpointRow};
+use crate::{AppState, ConfirmAction, EndpointRow, format_ts, iso_to_flag};
 
-/// A row displayed in the profile `DataTable` — either an endpoint header or a protocol sub-row.
-enum DisplayRowData {
-    Endpoint {
-        id: String,
-        indicator: String,
-        indicator_fg: Style,
-        idx_str: String,
-        type_str: String,
-        remarks_str: String,
-        address_str: String,
-        port_str: String,
-        delay_str: String,
-        speed_str: String,
-        ip_info_str: String,
-        traffic_str: String,
-        has_sub_rows: bool,
-        expanded: bool,
-        row_style: Style,
-    },
-    ProtocolSub {
-        id: String,
-        proto_kind: String,
-        transport: String,
-        security: String,
-        remarks: String,
-        is_active: bool,
-        is_manual: bool,
-        row_style: Style,
-    },
+/// One row of the expanded per-protocol sub-table inside an endpoint panel.
+struct PanelRow {
+    /// "●" for the active protocol, "○" otherwise.
+    marker: String,
+    proto_id_hex: String,
+    last_seen: String,
+    last_used: String,
+    config_type: String,
+    delay: String,
+    speed: String,
+    traffic: String,
+    outbound: String,
+    outbound_country: String,
+}
+
+/// A single-line endpoint row; the expanded sub-table is drawn inside the
+/// row's own height (`1 + panel_rows + 4`) by `render_expansion_panel`.
+struct DisplayRowData {
+    indicator: String,
+    indicator_fg: Style,
+    idx_str: String,
+    last_seen_str: String,
+    type_str: String,
+    country_flag: String,
+    address_port_str: String,
+    ip_feature: String,
+    sni_feature: String,
+    config_type_str: String,
+    outbound_addr: String,
+    outbound_country: String,
+    has_sub_rows: bool,
+    expanded: bool,
+    row_style: Style,
+    panel_selected_style: Style,
+    panel_selected: Option<usize>,
+    panel_ips: String,
+    panel_resolve_hint: bool,
+    panel_rows: Vec<PanelRow>,
 }
 
 impl DataTableRow for DisplayRowData {
     fn render(&self, col_xs: &[u16], col_widths: &[u16], buf: &mut Buffer, y: u16) {
-        match self {
-            Self::Endpoint {
-                indicator,
-                indicator_fg,
-                idx_str,
-                type_str,
-                remarks_str,
-                address_str,
-                port_str,
-                delay_str,
-                speed_str,
-                ip_info_str,
-                traffic_str,
-                has_sub_rows,
-                expanded,
-                row_style,
-                ..
-            } => {
-                for (i, &x) in col_xs.iter().enumerate() {
-                    let tree_marker = if *has_sub_rows {
-                        if *expanded { "▾" } else { "▶" }
-                    } else {
-                        " "
-                    };
-                    let (text, style) = match i {
-                        0 => (tree_marker, *row_style),
-                        1 => (indicator.as_str(), *indicator_fg),
-                        2 => (idx_str.as_str(), *row_style),
-                        3 => (type_str.as_str(), *row_style),
-                        4 => (remarks_str.as_str(), *row_style),
-                        5 => ("│", *row_style),
-                        6 => (address_str.as_str(), *row_style),
-                        7 => (port_str.as_str(), *row_style),
-                        8 => ("│", *row_style),
-                        9 => (delay_str.as_str(), *row_style),
-                        10 => (speed_str.as_str(), *row_style),
-                        11 => (ip_info_str.as_str(), *row_style),
-                        12 => (traffic_str.as_str(), *row_style),
-                        _ => ("", *row_style),
-                    };
-                    let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
-                    buf.set_stringn(x, y, text, max_w, style);
-                }
-            }
-            Self::ProtocolSub {
-                proto_kind,
-                transport,
-                security,
-                remarks,
-                is_active,
-                is_manual,
-                row_style,
-                ..
-            } => {
-                let active_mark = if *is_active { "●" } else { "○" };
-                let manual_label = if *is_manual { " (u)" } else { "" };
-                let remarks_span_w = col_widths.get(4).copied().unwrap_or(0)
-                    + col_widths.get(5).copied().unwrap_or(0)
-                    + col_widths.get(6).copied().unwrap_or(0);
-                let sub_remarks =
-                    crate::ui::profiles::truncate_pad(remarks, remarks_span_w as usize);
-                for (i, &x) in col_xs.iter().enumerate() {
-                    let (text, style) = match i {
-                        0 => (" ", *row_style),
-                        1 => (active_mark, *row_style),
-                        2 => ("  └", *row_style),
-                        3 => (proto_kind.as_str(), *row_style),
-                        4 => (sub_remarks.as_str(), *row_style),
-                        5 => ("", *row_style),
-                        6 => ("", *row_style),
-                        7 => (transport.as_str(), *row_style),
-                        8 => (security.as_str(), *row_style),
-                        9 => (manual_label, *row_style),
-                        _ => ("", *row_style),
-                    };
-                    let max_w = if i == 4 {
-                        remarks_span_w as usize
-                    } else {
-                        col_widths.get(i).copied().unwrap_or(0) as usize
-                    };
-                    buf.set_stringn(x, y, text, max_w, style);
-                }
+        let tree_marker = if self.has_sub_rows {
+            if self.expanded { "▾" } else { "▶" }
+        } else {
+            " "
+        };
+        for (i, &x) in col_xs.iter().enumerate() {
+            let (text, style) = match i {
+                0 => (tree_marker, self.row_style),
+                1 => (self.indicator.as_str(), self.indicator_fg),
+                2 => (self.idx_str.as_str(), self.row_style),
+                3 => (self.last_seen_str.as_str(), self.row_style),
+                4 => (self.type_str.as_str(), self.row_style),
+                5 => ("[", self.row_style),
+                6 => (self.country_flag.as_str(), self.row_style),
+                7 => (self.address_port_str.as_str(), self.row_style),
+                8 => ("][", self.row_style),
+                9 => (self.ip_feature.as_str(), self.row_style),
+                10 => (self.sni_feature.as_str(), self.row_style),
+                11 => ("]=>{", self.row_style),
+                12 => (self.config_type_str.as_str(), self.row_style),
+                13 => ("}=>[", self.row_style),
+                14 => (self.outbound_addr.as_str(), self.row_style),
+                15 => (self.outbound_country.as_str(), self.row_style),
+                16 => ("]", self.row_style),
+                _ => ("", self.row_style),
+            };
+            let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
+            buf.set_stringn(x, y, text, max_w, style);
+        }
+
+        if self.expanded {
+            let total_w: u16 = col_widths.iter().sum();
+            // Panel is 2 lines shorter than the row: it starts one line below
+            // the endpoint and leaves one blank line (gap) after its bottom
+            // border so it never touches the next row.
+            self.render_expansion_panel(
+                buf,
+                col_xs[0],
+                y + 1,
+                self.height(0) - 2,
+                total_w,
+                self.row_style,
+            );
+        }
+    }
+
+    fn height(&self, _available_width: u16) -> u16 {
+        if self.expanded {
+            // 1 endpoint line + panel (top border + IPs + separator + sub
+            // rows + bottom border = rows + 4) + 1 gap line after the panel.
+            1 + self.panel_rows.len() as u16 + 4 + 1
+        } else {
+            1
+        }
+    }
+}
+
+impl DisplayRowData {
+    /// Rounded panel under the endpoint line: IPs line, separator, sub-table.
+    /// `panel_w` is the table's actual rendered width (viewport-capped) so the
+    /// panel never exceeds the buffer.
+    fn render_expansion_panel(
+        &self,
+        buf: &mut Buffer,
+        x0: u16,
+        y0: u16,
+        panel_height: u16,
+        panel_w: u16,
+        row_style: Style,
+    ) {
+        let rect = Rect {
+            x: x0,
+            y: y0,
+            width: panel_w,
+            height: panel_height,
+        };
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .render(rect, buf);
+
+        let inner_x = x0 + 1;
+        let inner_w = (panel_w - 2) as usize;
+
+        // IPs line (y0+1 is inside the top border)
+        let ips_text = format!(" IPs: {}", self.panel_ips);
+        buf.set_stringn(inner_x, y0 + 1, &ips_text, inner_w, row_style);
+        if self.panel_resolve_hint {
+            let hint = "(x resolve)";
+            let hx = inner_x + (inner_w.saturating_sub(hint.len())) as u16;
+            buf.set_stringn(hx, y0 + 1, hint, hint.len(), row_style);
+        }
+
+        // Separator
+        let sep_x = inner_x;
+        let sep_y = y0 + 2;
+        let sep_line = "─".repeat(inner_w);
+        buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
+
+        // Sub-table rows
+        let cols: [(usize, usize); 10] = [
+            (0, 3),    // marker
+            (3, 10),   // id
+            (13, 20),  // last_seen
+            (33, 20),  // last_used
+            (53, 12),  // config
+            (65, 8),   // delay
+            (73, 8),   // speed
+            (81, 11),  // traffic
+            (92, 16),  // outbound
+            (108, 7),  // country
+        ];
+        for (n, pr) in self.panel_rows.iter().enumerate() {
+            let y = y0 + 3 + n as u16;
+            let style = if Some(n) == self.panel_selected {
+                self.panel_selected_style
+            } else {
+                row_style
+            };
+            let mut x = inner_x;
+            let cell_texts = [
+                pr.marker.as_str(),
+                pr.proto_id_hex.as_str(),
+                pr.last_seen.as_str(),
+                pr.last_used.as_str(),
+                pr.config_type.as_str(),
+                pr.delay.as_str(),
+                pr.speed.as_str(),
+                pr.traffic.as_str(),
+                pr.outbound.as_str(),
+                pr.outbound_country.as_str(),
+            ];
+            for ((_, w), text) in cols.iter().zip(cell_texts.iter()) {
+                buf.set_stringn(x, y, text, *w, style);
+                x += *w as u16;
             }
         }
     }
@@ -161,21 +223,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         };
         let paragraph = Paragraph::new(msg)
             .style(ThemeStyles::hint(&palette))
-            .alignment(ratatui::layout::Alignment::Center);
+            .alignment(Alignment::Center);
         frame.render_widget(paragraph, chunks[1]);
         render_footer(frame, chunks[2], state, &palette);
         return;
     }
 
-    // Build display rows with optional sub-rows for expanded endpoints
+    // One display row per endpoint; the expanded panel lives inside the row.
     let display_rows = build_display_rows(&rows, selected, state, &palette);
-    let display_selected = resolve_display_selected(&display_rows, selected, state.selected_sub);
 
     render_data_grid(
         frame,
         chunks[1],
         &display_rows,
-        display_selected,
+        selected,
         state,
         &palette,
     );
@@ -183,16 +244,25 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
+fn test_glyph(test_type: &TestType) -> &'static str {
+    match test_type {
+        TestType::TcpPing => "↔",
+        TestType::RealPing => "◎",
+        TestType::SpeedTest => "⇩",
+        TestType::UdpTest => "↗",
+    }
+}
+
 fn build_display_rows(
     rows: &[&EndpointRow],
-    _selected: usize,
+    selected: usize,
     state: &AppState,
     palette: &ratatui_cheese::theme::Palette,
 ) -> Vec<DisplayRowData> {
-    let mut result = Vec::with_capacity(rows.len() + 16);
+    let mut result = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id);
-        let base_style = match (i == _selected, is_connected) {
+        let base_style = match (i == selected, is_connected) {
             (true, true) => ThemeStyles::table_row_connected(palette)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED),
             (false, true) => ThemeStyles::table_row_connected(palette),
@@ -201,14 +271,24 @@ fn build_display_rows(
             (false, false) => ThemeStyles::table_row_normal(palette),
         };
 
+        // Indicator: connected → ●; else active protocol's test glyph; else the
+        // first protocol under test (endpoint-scoped batches test non-active
+        // protocols too).
         let (indicator, indicator_fg) = if is_connected {
             ("●".to_string(), ThemeStyles::success(palette))
         } else {
-            match state.testing_details.get(&row.active_protocol().id) {
-                Some(TestType::TcpPing) => ("↔".to_string(), Style::default()),
-                Some(TestType::RealPing) => ("◎".to_string(), Style::default()),
-                Some(TestType::SpeedTest) => ("⇩".to_string(), Style::default()),
-                Some(TestType::UdpTest) => ("↗".to_string(), Style::default()),
+            let active_id = row.active_protocol().id;
+            let glyph = state
+                .testing_details
+                .get(&active_id)
+                .map(test_glyph)
+                .or_else(|| {
+                    row.protocols
+                        .iter()
+                        .find_map(|p| state.testing_details.get(&p.id).map(test_glyph))
+                });
+            match glyph {
+                Some(g) => (g.to_string(), Style::default()),
                 None => (String::new(), Style::default()),
             }
         };
@@ -223,110 +303,167 @@ fn build_display_rows(
             format!("{:>3}", i + 1)
         };
 
+        let info = state.endpoint_info.get(&row.endpoint.id);
+        let resolved = info
+            .map(|i| !i.resolved_ips.is_empty())
+            .unwrap_or(false);
+
         let type_str = format!("{protocol:.12}");
-        let remarks = row.active_protocol().remarks.clone().unwrap_or_default();
-        let remarks_str = truncate_pad(&remarks, 24);
-        let address = row.endpoint.host.as_str();
-        let address_str = truncate_pad(address, 30);
-        let port_str = format!("{:>6}", row.endpoint.port);
-        let delay_str = row
-            .extensions
-            .get(&row.active_protocol().id)
-            .and_then(|e| e.delay)
-            .map_or_else(|| "     -".to_string(), |d| format!("{d:>6}"));
-        let speed_str = row
-            .extensions
-            .get(&row.active_protocol().id)
-            .and_then(|e| e.speed)
-            .map_or_else(|| "     -".to_string(), |s| format!("{s:>6}"));
-        let ip_info_str = row
-            .extensions
-            .get(&row.active_protocol().id)
-            .and_then(|e| e.ip_info.as_deref())
-            .map_or_else(|| "     -".to_string(), |ip| truncate_pad(ip, 19));
-        let traffic = row.stats.get(&row.active_protocol().id).map_or_else(
-            || "        -".to_string(),
-            |s| {
-                let total = s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0);
-                format_traffic(total as u64)
-            },
-        );
+        let last_seen = row.active_protocol().last_seen_at;
+        let last_seen_str = if last_seen > 0 {
+            truncate_pad(&format_ts(last_seen), 20)
+        } else {
+            "—".to_string()
+        };
+        let country_flag = match info.and_then(|i| i.country.as_deref()) {
+            Some(iso) => iso_to_flag(iso),
+            None => "\u{1F3F4}".to_string(),
+        };
+        let address_port_str =
+            truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 36);
+        // IP feature: unresolved DNS → 🏁; whitelisted IP/CIDR → 🏳️; else empty.
+        let ip_feature = if row.endpoint.host_type == "dns" && !resolved {
+            "\u{1F3C1}".to_string()
+        } else if info
+            .map(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
+            .unwrap_or(false)
+        {
+            "\u{1F3F3}\u{FE0F}".to_string()
+        } else {
+            String::new()
+        };
+        let sni_feature = if info
+            .and_then(|i| i.sni_whitelisted)
+            .unwrap_or(false)
+        {
+            "\u{1F3F3}\u{FE0F}".to_string()
+        } else {
+            String::new()
+        };
 
-        let has_sub_rows = row.protocols.len() > 1;
+        let active = row.active_protocol();
+        let t = active.transport.as_deref().filter(|s| !s.is_empty());
+        let s = active.security.as_deref().filter(|s| !s.is_empty());
+        let config_type = match (t, s) {
+            (None, None) => "-".to_string(),
+            (t, s) => format!(
+                "{}/{}",
+                t.unwrap_or("-"),
+                s.unwrap_or("-")
+            ),
+        };
+        let config_type_str = center_pad(&config_type, 12);
 
-        result.push(DisplayRowData::Endpoint {
-            id: row.endpoint.id.to_string(),
+        let outbound_addr = info
+            .and_then(|i| i.outbound_ip.map(|ip| ip.to_string()))
+            .unwrap_or_else(|| "—".to_string());
+        let outbound_country = match info.and_then(|i| i.outbound_country.as_deref()) {
+            Some(iso) => truncate_pad(&format!("{} {iso}", iso_to_flag(iso)), 7),
+            None => "—".to_string(),
+        };
+
+        // Panel content
+        let panel_ips = info
+            .map(|i| {
+                i.resolved_ips
+                    .iter()
+                    .map(|ip| format!("[{}]", ip))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let (panel_ips, panel_resolve_hint) = if panel_ips.is_empty() {
+            if row.endpoint.host_type == "dns" {
+                ("[?]".to_string(), true)
+            } else {
+                (panel_ips, false)
+            }
+        } else {
+            (panel_ips, false)
+        };
+
+        let panel_rows: Vec<PanelRow> = if row.expanded {
+            let active_id = row.active_protocol().id;
+            row.protocols
+                .iter()
+                .map(|p| {
+                    let ext = row.extensions.get(&p.id);
+                    let delay = ext
+                        .and_then(|e| e.delay)
+                        .map_or_else(|| "-".to_string(), |d| format!("{d}ms"));
+                    let speed = ext
+                        .and_then(|e| e.speed)
+                        .map_or_else(|| "-".to_string(), |s| format_traffic(s as u64));
+                    let traffic = row.stats.get(&p.id).map_or_else(
+                        || "-".to_string(),
+                        |st| {
+                            let total = st.total_down.unwrap_or(0) + st.total_up.unwrap_or(0);
+                            format_traffic(total as u64)
+                        },
+                    );
+                    let (outbound, outbound_country) = ext
+                        .and_then(|e| e.ip_info.as_deref())
+                        .and_then(|ip_info| ip_info.split_once('|'))
+                        .map_or(("—".to_string(), "—".to_string()), |(ip, country)| {
+                            (ip.trim().to_string(), truncate_pad(country.trim(), 7))
+                        });
+                    let t = p.transport.as_deref().filter(|s| !s.is_empty());
+                    let s = p.security.as_deref().filter(|s| !s.is_empty());
+                    let config_type = match (t, s) {
+                        (None, None) => "-".to_string(),
+                        (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
+                    };
+                    PanelRow {
+                        marker: if p.id == active_id { "●".to_string() } else { "○".to_string() },
+                        proto_id_hex: format!("{:08x}", p.id as u32),
+                        last_seen: if p.last_seen_at > 0 {
+                            format_ts(p.last_seen_at)
+                        } else {
+                            "—".to_string()
+                        },
+                        last_used: p.last_used_at.map_or_else(
+                            || "—".to_string(),
+                            |ts| {
+                                if ts > 0 { format_ts(ts) } else { "—".to_string() }
+                            },
+                        ),
+                        config_type,
+                        delay,
+                        speed,
+                        traffic,
+                        outbound,
+                        outbound_country,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        result.push(DisplayRowData {
             indicator,
             indicator_fg,
             idx_str,
+            last_seen_str,
             type_str,
-            remarks_str,
-            address_str,
-            port_str,
-            delay_str,
-            speed_str,
-            ip_info_str,
-            traffic_str: traffic,
-            has_sub_rows,
+            country_flag,
+            address_port_str,
+            ip_feature,
+            sni_feature,
+            config_type_str,
+            outbound_addr,
+            outbound_country,
+            has_sub_rows: row.protocols.len() > 1,
             expanded: row.expanded,
             row_style: base_style,
+            panel_selected_style: ThemeStyles::table_row_selected(palette),
+            panel_selected: if i == selected { state.selected_sub } else { None },
+            panel_ips,
+            panel_resolve_hint,
+            panel_rows,
         });
-
-        // If expanded, add protocol sub-rows
-        if row.expanded {
-            for (pi, proto) in row.protocols.iter().enumerate() {
-                let is_active = pi == row.selected_protocol;
-                let is_manual = row.endpoint.manual_protocol_override == Some(proto.id);
-                let proto_kind = &proto.proto_kind;
-                let transport = proto.transport.as_deref().unwrap_or("-");
-                let security = proto.security.as_deref().unwrap_or("-");
-                let proto_remarks = proto.remarks.as_deref().unwrap_or("");
-
-                result.push(DisplayRowData::ProtocolSub {
-                    id: proto.id.to_string(),
-                    proto_kind: format!("  {proto_kind:.10}"),
-                    transport: transport.to_string(),
-                    security: security.to_string(),
-                    remarks: proto_remarks.to_string(),
-                    is_active,
-                    is_manual,
-                    row_style: if is_active {
-                        base_style
-                    } else {
-                        Style::default()
-                    },
-                });
-            }
-        }
     }
     result
-}
-
-/// For a given endpoint index and optional sub-row, find its position in the display row list.
-fn resolve_display_selected(
-    display_rows: &[DisplayRowData],
-    endpoint_idx: usize,
-    selected_sub: Option<usize>,
-) -> usize {
-    let mut display_pos = 0;
-    let mut ep_count = 0;
-    while display_pos < display_rows.len() {
-        let row = &display_rows[display_pos];
-        if matches!(row, DisplayRowData::Endpoint { .. }) {
-            if ep_count == endpoint_idx {
-                // Found the right endpoint — if sub-row selected, advance to it
-                if let Some(sub) = selected_sub {
-                    // Skip the endpoint itself (1) + n sub-rows
-                    display_pos += 1 + sub;
-                    return display_pos.min(display_rows.len().saturating_sub(1));
-                }
-                return display_pos;
-            }
-            ep_count += 1;
-        }
-        display_pos += 1;
-    }
-    0
 }
 
 fn render_data_grid(
@@ -343,16 +480,13 @@ fn render_data_grid(
         .border_style(ThemeStyles::container_border(palette))
         .title_style(ThemeStyles::container_title(palette));
 
-    // Map sort state to DataTable indices
+    // Map sort state to DataTable column indices
     let sort_column = match state.sort_column {
-        SortColumn::ConfigType => Some(3),
-        SortColumn::Remarks => Some(4),
-        SortColumn::Address => Some(6),
+        SortColumn::LastSeen => Some(3),
+        SortColumn::ConfigType => Some(4),
+        SortColumn::Address => Some(7),
         SortColumn::Port => Some(7),
-        SortColumn::Delay => Some(9),
-        SortColumn::Speed => Some(10),
-        SortColumn::Traffic => Some(12),
-        SortColumn::Core => None,
+        SortColumn::Delay | SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
     };
     let sort_direction = if state.sort_ascending {
         SortDirection::Ascending
@@ -360,34 +494,36 @@ fn render_data_grid(
         SortDirection::Descending
     };
 
-    // Build column definitions
-    let mut columns = vec![
-        Column::new("", ColumnWidth::Fixed(1)),      // 0 — tree marker
-        Column::new("", ColumnWidth::Fixed(2)),      // 1 — indicator
-        Column::new("#", ColumnWidth::Fixed(5)),     // 2 — index
-        Column::new("Type", ColumnWidth::Fixed(12)), // 3 — type
-        Column::new("Remarks", ColumnWidth::Fixed(24)), // 4 — remarks
-        Column::new("│", ColumnWidth::Fixed(1)),     // 5 — NEW separator
+    // 17 fixed columns; headers carry only descriptive names (decorative
+    // separator cells have empty headers).
+    let columns = vec![
+        Column::new("", ColumnWidth::Fixed(1)),         // 0 — tree marker
+        Column::new("", ColumnWidth::Fixed(2)),         // 1 — indicator
+        Column::new("#", ColumnWidth::Fixed(5)),        // 2 — index
+        Column::new("Last Seen", ColumnWidth::Fixed(20)), // 3
+        Column::new("Type", ColumnWidth::Fixed(12)),    // 4
+        Column::new("", ColumnWidth::Fixed(1)),         // 5 — [
+        Column::new("", ColumnWidth::Fixed(4)),         // 6 — country flag
+        Column::new("Address", ColumnWidth::Fixed(36)), // 7
+        Column::new("", ColumnWidth::Fixed(2)),         // 8 — ][
+        Column::new("IP", ColumnWidth::Fixed(2)),       // 9
+        Column::new("SNI", ColumnWidth::Fixed(2)),      // 10
+        Column::new("", ColumnWidth::Fixed(4)),         // 11 — ]=>{
+        Column::new("", ColumnWidth::Fixed(12)),        // 12 — config type
+        Column::new("", ColumnWidth::Fixed(4)),         // 13 — }=>[
+        Column::new("Outbound", ColumnWidth::Fixed(16)), // 14
+        Column::new("Country", ColumnWidth::Fixed(7)),  // 15
+        Column::new("", ColumnWidth::Fixed(1)),         // 16 — ]
     ];
-    columns.extend_from_slice(&[
-        Column::new("Address", ColumnWidth::Fixed(30)), // 6 — address
-        Column::new("Port", ColumnWidth::Fixed(6)),     // 7 — port
-        Column::new("│", ColumnWidth::Fixed(1)),        // 8 — existing separator
-        Column::new("Delay", ColumnWidth::Fixed(6)),    // 9 — delay
-        Column::new("Speed", ColumnWidth::Fixed(6)),    // 10 — speed
-        Column::new("IP", ColumnWidth::Fixed(20)),      // 11 — ip_info
-        Column::new("Traffic", ColumnWidth::Fixed(10)), // 12 — traffic
-    ]);
 
-    // Scroll offset: keep selected row roughly centered
-    let inner_height = area.height.saturating_sub(3) as usize;
-    let data_offset = if selected_display_idx > inner_height / 2 {
-        selected_display_idx
-            .saturating_sub(inner_height / 2)
-            .min(display_rows.len().saturating_sub(inner_height))
-    } else {
-        0
-    };
+    // Scroll offset: keep the selected row roughly centered, in line units —
+    // expanded rows are taller than 1, so row-index math would strand the
+    // last rows below the viewport.
+    let heights: Vec<u16> = display_rows
+        .iter()
+        .map(|r| r.height(area.width.saturating_sub(2)))
+        .collect();
+    let data_offset = compute_scroll_offset(&heights, selected_display_idx, area.height);
     let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(palette))
         .column_spacing(0)
@@ -407,6 +543,45 @@ fn render_data_grid(
     frame.render_stateful_widget(data_table, area, &mut table_state);
 }
 
+/// First visible row index that keeps the selected row roughly centered, in
+/// line units. `heights[i]` is row i's height (expanded rows are taller than
+/// 1). Clamped so the last rows still fit the viewport (same math as
+/// `DataTable`'s own offset clamp).
+fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16) -> usize {
+    let inner_height = viewport_height.saturating_sub(3) as usize;
+    if heights.is_empty() {
+        return 0;
+    }
+    let sel_h = heights
+        .get(selected)
+        .copied()
+        .unwrap_or(1) as usize;
+    // Rows above the selection, in lines.
+    let above: usize = heights[..selected].iter().map(|h| *h as usize).sum();
+    // Centering offset: put the selected row's start at mid-viewport.
+    let target_sel_start = (inner_height.saturating_sub(sel_h)) / 2;
+    let ideal = above.saturating_sub(target_sel_start);
+    // Height-aware clamp: earliest offset whose rows still fill the viewport.
+    let mut rows_from_end = 0usize;
+    let mut h_sum = 0u16;
+    for h in heights.iter().rev() {
+        if h_sum + h > inner_height as u16 {
+            break;
+        }
+        h_sum += h;
+        rows_from_end += 1;
+    }
+    let max_offset = heights.len().saturating_sub(rows_from_end);
+    // Minimum offset that still shows the selection's last line: when content
+    // below the selection is taller than the viewport, jump toward the end.
+    let o_min = above
+        .saturating_add(sel_h)
+        .saturating_sub(inner_height);
+    ideal
+        .max(o_min.min(max_offset))
+        .min(max_offset)
+}
+
 fn format_traffic(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:>4.1}GB", bytes as f64 / 1_073_741_824.0)
@@ -419,6 +594,7 @@ fn format_traffic(bytes: u64) -> String {
     }
 }
 
+/// Truncate to `width` (unicode-aware) with space padding, no ellipsis.
 pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
     if unicode_width::UnicodeWidthStr::width(s) > width {
         let mut char_w = 0usize;
@@ -437,6 +613,17 @@ pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
     }
 }
 
+/// Center `s` inside a `width`-wide cell (unicode-aware); truncates when wider.
+fn center_pad(s: &str, width: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(s);
+    if w >= width {
+        return truncate_pad(s, width);
+    }
+    let left = (width - w) / 2;
+    let right = width - w - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+}
+
 fn render_footer(
     frame: &mut Frame,
     area: Rect,
@@ -452,11 +639,6 @@ fn render_footer(
     let line = if has_profile {
         let row = &state.endpoints[state.selected_index];
         let core = state.resolved_core(row);
-        let remarks = row
-            .active_protocol()
-            .remarks
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
 
         let addr = if row.endpoint.host.is_empty() {
             "-"
@@ -466,9 +648,8 @@ fn render_footer(
         let port = row.endpoint.port.to_string();
         Line::from(vec![
             Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
-            Span::styled(remarks, ThemeStyles::footer_value(palette)),
             Span::styled(
-                format!("  {addr}:{port}  "),
+                format!("{addr}:{port}  "),
                 ThemeStyles::footer_value(palette),
             ),
             Span::styled(format!("[{core}] "), ThemeStyles::footer_value(palette)),
@@ -521,7 +702,7 @@ fn render_confirmation_overlays(
             let profile_name = rows
                 .iter()
                 .find(|r| r.endpoint.id == *delete_id)
-                .and_then(|r| r.active_protocol().remarks.clone())
+                .map(|r| format!("{}:{}", r.endpoint.host, r.endpoint.port))
                 .unwrap_or_default();
             render_confirmation_overlay(
                 frame,
@@ -550,5 +731,118 @@ fn render_confirmation_overlays(
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_panel_row(marker: &str) -> PanelRow {
+        PanelRow {
+            marker: marker.to_string(),
+            proto_id_hex: String::new(),
+            last_seen: String::new(),
+            last_used: String::new(),
+            config_type: String::new(),
+            delay: String::new(),
+            speed: String::new(),
+            traffic: String::new(),
+            outbound: String::new(),
+            outbound_country: String::new(),
+        }
+    }
+
+    fn sample_row(expanded: bool, panel_rows: Vec<PanelRow>, idx: &str) -> DisplayRowData {
+        DisplayRowData {
+            indicator: String::new(),
+            indicator_fg: Style::default(),
+            idx_str: idx.to_string(),
+            last_seen_str: String::new(),
+            type_str: String::new(),
+            country_flag: String::new(),
+            address_port_str: String::new(),
+            ip_feature: String::new(),
+            sni_feature: String::new(),
+            config_type_str: String::new(),
+            outbound_addr: String::new(),
+            outbound_country: String::new(),
+            has_sub_rows: !panel_rows.is_empty(),
+            expanded,
+            row_style: Style::default(),
+            panel_selected_style: Style::default(),
+            panel_selected: None,
+            panel_ips: String::new(),
+            panel_resolve_hint: false,
+            panel_rows,
+        }
+    }
+
+    #[test]
+    fn expanded_row_height_includes_gap() {
+        let row = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")], "00");
+        // 1 endpoint + panel (2 rows + 4 border/IPs/sep lines) + 1 gap
+        assert_eq!(row.height(0), 8);
+        let collapsed = sample_row(false, vec![], "11");
+        assert_eq!(collapsed.height(0), 1);
+    }
+
+    #[test]
+    fn panel_bottom_border_does_not_touch_next_row() {
+        let row0 = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")], "00");
+        let row1 = sample_row(false, vec![], "11");
+        let col_xs: Vec<u16> = (0..17).collect();
+        let col_widths = vec![1u16; 17];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
+
+        row0.render(&col_xs, &col_widths, &mut buf, 0);
+        row1.render(&col_xs, &col_widths, &mut buf, 8);
+
+        // Panel (height 6) sits at y=1..6: bottom-left corner at y=6.
+        assert_eq!(buf[(0, 6)].symbol(), "\u{2570}"); // ╰
+        // y=7 is the blank gap line — the next row must not start there.
+        assert_eq!(buf[(0, 7)].symbol(), " ");
+        // Next row's content starts at y=8, untouched by the panel.
+        assert_eq!(buf[(2, 8)].symbol(), "1");
+    }
+
+    #[test]
+    fn scroll_offset_reaches_last_row_when_tail_expanded() {
+        // 30 collapsed + 10 expanded (6 lines), 40-line viewport (37 inner).
+        let mut heights = vec![1u16; 40];
+        for h in heights.iter_mut().skip(30) {
+            *h = 6;
+        }
+        let offset = compute_scroll_offset(&heights, 39, 40);
+        // Rows from the offset must fit the viewport…
+        let fit: u16 = heights[offset..].iter().sum();
+        assert!(fit <= 37);
+        // …and the selected (last) row must be inside it.
+        let sel_start: u16 = heights[offset..39].iter().sum();
+        assert!(sel_start + 6 <= 37);
+    }
+
+    #[test]
+    fn scroll_offset_small_list_stays_top() {
+        let heights = vec![1u16; 5];
+        assert_eq!(compute_scroll_offset(&heights, 4, 40), 0);
+    }
+
+    #[test]
+    fn scroll_offset_centers_mid_list() {
+        // 100 one-line rows, 21-line viewport (18 inner) → row 50 centered
+        // at line 8 → offset 42.
+        let heights = vec![1u16; 100];
+        assert_eq!(compute_scroll_offset(&heights, 50, 21), 42);
+    }
+
+    #[test]
+    fn scroll_offset_does_not_push_selection_offscreen() {
+        // Selection in the middle of a tall list must stay visible.
+        let heights = vec![1u16; 40];
+        let offset = compute_scroll_offset(&heights, 20, 21);
+        assert!(offset <= 20);
+        let sel_start: u16 = heights[offset..20].iter().sum();
+        assert!(sel_start + 1 <= 18);
     }
 }

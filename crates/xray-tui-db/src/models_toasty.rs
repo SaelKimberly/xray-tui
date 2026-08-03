@@ -15,6 +15,12 @@ pub struct Endpoint {
     pub last_source: Option<String>,   // hash of source subscription
     pub created_at: i64,
     pub manual_protocol_override: Option<i64>, // FK -> protocols.id, NULL = auto-select best
+    /// Cached DNS resolution of `host` for `host_type == "dns"`: comma-joined
+    /// IP strings ("1.2.3.4,2606:4700::1"). NULL = not resolved yet (deferred)
+    /// or host is an IP. Persisted so launches do not re-resolve.
+    pub resolved_as: Option<String>,
+    /// Unix secs of the `resolved_as` lookup. NULL = never / IP host.
+    pub resolved_at: Option<i64>,
 }
 
 /// `ProtocolRow`: a protocol configuration. Replaces Profile.
@@ -32,7 +38,7 @@ pub struct ProtocolRow {
     pub core_type: String,
     pub transport: Option<String>,
     pub security: Option<String>,
-    pub remarks: Option<String>,
+    pub last_used_at: Option<i64>, // unix secs of last activation; None = never used
     pub created_at: i64,
     pub last_seen_at: i64, // per-config staleness tracking
 
@@ -145,6 +151,8 @@ pub struct DnsSetting {
     pub disable_cache: Option<i32>,
     pub disable_fallback: Option<i32>,
     pub client_ip: Option<String>,
+    /// TTL (secs) for the TUI-side DNS resolution cache; None = default 300.
+    pub cache_ttl_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -188,16 +196,14 @@ pub struct PingResultUpdate {
 // ── Data-transfer types ──────────────────────────────────────────────────
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 
-/// An endpoint with all its protocols, extensions, stats, and resolution info.
+/// An endpoint with all its protocols, extensions, and stats.
 #[derive(Debug, Clone)]
 pub struct EndpointRow {
     pub endpoint: Endpoint,
     pub protocols: Vec<ProtocolRow>,
     pub extensions: HashMap<i64, ProfileExtension>,
     pub stats: HashMap<i64, ServerStat>,
-    pub resolved_ips: Vec<IpAddr>,
     pub selected_protocol: usize,
     pub expanded: bool,
 }

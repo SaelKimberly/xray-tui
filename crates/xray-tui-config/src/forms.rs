@@ -41,14 +41,6 @@ pub fn form_fields_for(protocol: Protocol) -> Vec<FormField> {
 fn common_fields() -> Vec<FormField> {
     vec![
         FormField {
-            key: "remarks",
-            label: "Remarks",
-            field_type: FormFieldType::Text,
-            default: "",
-            required: false,
-            section: FieldSection::Common,
-        },
-        FormField {
             key: "address",
             label: "Address",
             field_type: FormFieldType::Text,
@@ -1321,8 +1313,8 @@ mod tests {
             assert!(!fields.is_empty(), "{proto} should have fields");
             // Common fields always present
             assert!(
-                fields.iter().any(|f| f.key == "remarks"),
-                "{proto} missing remarks"
+                !fields.iter().any(|f| f.key == "remarks"),
+                "{proto} should not have remarks"
             );
             assert!(
                 fields.iter().any(|f| f.key == "address"),
@@ -1347,10 +1339,10 @@ mod tests {
     #[test]
     fn form_fields_inbound_only_have_common() {
         let tproxy = form_fields_for(Protocol::TProxy);
-        assert_eq!(tproxy.len(), 4); // only common fields
+        assert_eq!(tproxy.len(), 3); // common fields (remarks removed)
         assert!(tproxy.iter().all(|f| f.section == FieldSection::Common));
         let mixed = form_fields_for(Protocol::Mixed);
-        assert_eq!(mixed.len(), 4);
+        assert_eq!(mixed.len(), 3);
         assert!(mixed.iter().all(|f| f.section == FieldSection::Common));
     }
 

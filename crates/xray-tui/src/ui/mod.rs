@@ -332,24 +332,49 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     _ => 0,
                 };
                 state.mode = crate::AppMode::List;
+                // Resolve the target protocol id + row shape before dispatch.
+                // Collapsed endpoint rows with >1 protocols run an
+                // endpoint-scoped batch; sub-rows ping the exact protocol.
+                let on_sub = state.is_on_sub_row();
+                let (proto_id, multi) = {
+                    let ep_id = state.selected_profile_id();
+                    let row = ep_id.and_then(|id| {
+                        state.endpoints.iter().find(|r| r.endpoint.id == id)
+                    });
+                    let multi = row.map_or(false, |r| r.protocols.len() > 1);
+                    let pid = if on_sub {
+                        state.selected_sub_protocol_id()
+                    } else {
+                        row.map(|r| r.active_protocol().id)
+                    };
+                    (pid, multi)
+                };
                 match selected {
                     0 => {
-                        if let Some(id) = state.selected_profile_id() {
-                            state.start_tcp_ping(id);
+                        if on_sub || !multi {
+                            if let Some(id) = proto_id {
+                                state.start_tcp_ping(id);
+                            }
+                        } else {
+                            state.start_endpoint_batch_ping();
                         }
                     }
                     1 => {
-                        if let Some(id) = state.selected_profile_id() {
-                            state.start_real_ping(id);
+                        if on_sub || !multi {
+                            if let Some(id) = proto_id {
+                                state.start_real_ping(id);
+                            }
+                        } else {
+                            state.start_endpoint_batch_real_ping();
                         }
                     }
                     2 => {
-                        if let Some(id) = state.selected_profile_id() {
+                        if let Some(id) = proto_id {
                             state.start_speed_test(id);
                         }
                     }
                     3 => {
-                        if let Some(id) = state.selected_profile_id() {
+                        if let Some(id) = proto_id {
                             state.start_udp_test(id);
                         }
                     }
@@ -596,7 +621,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('o' | 'O') if state.current_tab == Tab::Profiles => {
             let selected_id = state.selected_profile_id();
             let all = &[
-                SortColumn::Remarks,
                 SortColumn::Address,
                 SortColumn::Port,
                 SortColumn::Delay,
@@ -604,6 +628,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 SortColumn::Traffic,
                 SortColumn::ConfigType,
                 SortColumn::Core,
+                SortColumn::LastSeen,
             ];
             let current_idx = all
                 .iter()
@@ -655,6 +680,20 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             {
                 state.db.restore_endpoint(id).await.unwrap_or_default();
                 state.reload_profiles().await;
+            }
+        }
+        KeyCode::Char('x' | 'X') if state.current_tab == Tab::Profiles => {
+            // Manual DNS resolve (force — bypasses the TTL cache). No-op for
+            // IP hosts (their address is already resolved).
+            if let Some(ep_id) = state.selected_profile_id() {
+                let host = state
+                    .endpoints
+                    .iter()
+                    .find(|r| r.endpoint.id == ep_id)
+                    .map(|r| r.endpoint.host.clone())
+                    .unwrap_or_default();
+                crate::ops::enrich::spawn_dns_resolve(state, ep_id, true);
+                state.log_trace("info", "tui::ui", &format!("Resolving {host} …"));
             }
         }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {
@@ -721,7 +760,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     core_type: active.core_type.clone(),
                     transport: active.transport.clone(),
                     security: active.security.clone(),
-                    remarks: active.remarks.clone(),
+                    remarks: None,
                     created_at: active.created_at,
                 };
                 xray_tui_config::import_export::format_share_url(&parsed).ok()
@@ -861,16 +900,17 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                 Tab::Profiles => vec![
                     ("↑↓ / PgUp PgDn", "Navigate profiles"),
                     ("← →", "Expand / collapse endpoint"),
-                    ("↑↓ (expanded)", "Navigate protocol variants"),
+                    ("↑↓ (expanded)", "Navigate protocol variants (panel)"),
                     ("Enter", "Set as active server / Activate variant"),
                     ("Ctrl+Enter", "Connect to selected server"),
                     ("Ctrl+G", "Connect to selected server"),
                     ("Space", "Toggle multi-select"),
+                    ("x", "Resolve DNS of selected endpoint"),
                     ("a", "Add new server"),
                     ("e", "Edit selected server"),
                     ("d", "Delete selected server(s)"),
                     ("g", "Open subscriptions settings"),
-                    ("t", "Open speed test menu"),
+                    ("t", "Open speed test menu (endpoint row = batch)"),
                     ("o", "Cycle sort column"),
                     ("/", "Search/filter"),
                     ("Ctrl+V", "Import share URL"),

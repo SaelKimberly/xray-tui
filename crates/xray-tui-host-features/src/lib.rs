@@ -37,6 +37,7 @@ pub struct HostFeatures {
 /// SNI/exact-IP/CIDR whitelist membership checker backed by bloom filters
 /// (fast-negative guard) plus exact HashSet/interval verification (zero false
 /// positives). IPv4-only; ported from sub-healer's `WhitelistChecker`.
+#[derive(Debug)]
 pub struct HostFeaturesChecker {
     /// SNI whitelist (whitelist.txt) — hostnames
     sni_bloom: BloomFilter,
@@ -116,6 +117,29 @@ impl HostFeaturesChecker {
             // IpAddr::V6 → whitelists are IPv4-only; `ServerName` is #[non_exhaustive] → catch-all
             ServerName::IpAddress(IpAddr::V6(_)) | _ => HostFeatures::default(),
         }
+    }
+
+    /// Whitelist membership for a plain `std::net::IpAddr` (IPv4 checks the
+    /// exact-IP and CIDR lists; IPv6 yields an empty feature set).
+    #[must_use]
+    pub fn ip_features(&self, ip: std::net::IpAddr) -> HostFeatures {
+        match ip {
+            std::net::IpAddr::V4(v4) => HostFeatures {
+                ip_whitelisted: self.is_ip_whitelisted(v4),
+                cidr_whitelisted: self.is_cidr_whitelisted(v4),
+                ..HostFeatures::default()
+            },
+            std::net::IpAddr::V6(_) => HostFeatures::default(),
+        }
+    }
+
+    /// SNI whitelist membership for a hostname string. Returns `None` when the
+    /// string is not a valid DNS name (IP literals, empty, malformed).
+    #[must_use]
+    pub fn sni_features(&self, hostname: &str) -> Option<bool> {
+        ServerName::try_from(hostname)
+            .ok()
+            .map(|sn| self.get_host_features(&sn).sni_whitelisted)
     }
 
     // ── Loaders ──────────────────────────────────────────────────────────

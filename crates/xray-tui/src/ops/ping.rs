@@ -28,15 +28,20 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
         );
         return;
     }
-    // Find the profile and extract address:port
+    // Find the profile and extract address:port. Lookup is by REAL protocol
+    // id so sub-row pings target the exact protocol (not the endpoint).
     let row = if let Some(r) = state
         .endpoints
         .iter()
-        .find(|r| r.endpoint.id == protocol_id)
+        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
     {
         r
     } else {
         state.log_trace("error", "tui::ops::ping", "Profile not found for TCP ping");
+        return;
+    };
+    let Some(proto) = row.protocols.iter().find(|p| p.id == protocol_id) else {
+        state.log_trace("error", "tui::ops::ping", "Protocol not found for TCP ping");
         return;
     };
     if row.endpoint.host.is_empty() {
@@ -64,7 +69,7 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
 
     state.testing_details.insert(protocol_id, TestType::TcpPing);
     state.testing_profiles.insert(protocol_id);
-    let config_type = row.active_protocol().config_type;
+    let config_type = proto.config_type;
     let timeout_dur = *state.config.speed_test.tcp_timeout_secs;
 
     tokio::spawn(async move {
@@ -99,15 +104,21 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         return;
     }
 
-    // Find profile row
+    // Find profile row by REAL protocol id (sub-row pings target the exact
+    // protocol; different credentials → different exits).
     let endpoint;
     let protocol = if let Some(r) = state
         .endpoints
         .iter()
-        .find(|r| r.endpoint.id == protocol_id)
+        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
     {
+        let Some(p) = r.protocols.iter().find(|p| p.id == protocol_id) else {
+            state
+                .log_trace("error", "tui::ops::ping", "Protocol not found for real ping");
+            return;
+        };
         endpoint = r.endpoint.clone();
-        r.active_protocol().clone()
+        p.clone()
     } else {
         state.log_trace("error", "tui::ops::ping", "Profile not found for real ping");
         return;
@@ -288,14 +299,55 @@ pub fn stop_speed_test(state: &mut AppState) {
     state.speed_test_stop.store(true, Ordering::Relaxed);
 }
 
-/// Batch TCP ping all visible (filtered) profiles — delegates to `start_batch_sieve`.
+/// Batch TCP ping all visible (filtered) profiles — delegates to `start_sieve`.
 pub fn start_batch_ping(state: &mut AppState) {
-    start_batch_sieve(state, false, state.core_log_tx.clone());
+    let profile_order = state
+        .filtered_profiles()
+        .enumerate()
+        .map(|(i, r)| (r.active_protocol().id, i as i32))
+        .collect();
+    start_sieve(state, false, profile_order, true);
 }
 
 /// Batch TCP ping all visible profiles, then real ping TCP-successful targets via temp core.
 pub fn start_batch_then_real_ping(state: &mut AppState) {
-    start_batch_sieve(state, true, state.core_log_tx.clone());
+    let profile_order = state
+        .filtered_profiles()
+        .enumerate()
+        .map(|(i, r)| (r.active_protocol().id, i as i32))
+        .collect();
+    start_sieve(state, true, profile_order, true);
+}
+
+/// Fast-ping every protocol of the selected endpoint (endpoint-scoped batch).
+/// Collapsed endpoint rows with >1 protocols dispatch here — different
+/// credentials can route differently, so each protocol gets its own result.
+pub fn start_endpoint_batch_ping(state: &mut AppState) {
+    let profile_order = selected_endpoint_order(state);
+    start_sieve(state, false, profile_order, false);
+}
+
+/// Real-ping every protocol of the selected endpoint. `dedup_endpoints=false`
+/// so all protocols get real-pinged (their exit IPs may differ).
+pub fn start_endpoint_batch_real_ping(state: &mut AppState) {
+    let profile_order = selected_endpoint_order(state);
+    start_sieve(state, true, profile_order, false);
+}
+
+/// `(protocol_id, sort_order)` for every protocol of the currently selected
+/// endpoint row (all of them — not just the active one).
+fn selected_endpoint_order(state: &AppState) -> Vec<(i64, i32)> {
+    let Some(ep_id) = state.selected_profile_id() else {
+        return Vec::new();
+    };
+    let Some(row) = state.endpoints.iter().find(|r| r.endpoint.id == ep_id) else {
+        return Vec::new();
+    };
+    row.protocols
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.id, i as i32))
+        .collect()
 }
 
 /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.
@@ -348,6 +400,7 @@ async fn dispatch_real_ping_batch(
     tx: &tokio::sync::mpsc::Sender<CoreEvent>,
     progress: &(AtomicU16, AtomicU16),
     completed_endpoints: &Arc<std::sync::Mutex<HashSet<(String, u16)>>>,
+    dedup_endpoints: bool,
     batch_id: &str,
     base_proxy_port: u16,
     proxy_addr: &str,
@@ -453,6 +506,7 @@ async fn dispatch_real_ping_batch(
             disable_cache: None,
             disable_fallback: None,
             client_ip: None,
+            cache_ttl_secs: None,
         };
 
         let backend_config =
@@ -575,8 +629,12 @@ async fn dispatch_real_ping_batch(
         for handle in handles {
             match handle.await {
                 Ok((session, Ok(rp_result))) => {
-                    // Endpoint succeeded — mark so Phase 1 and future queries skip remaining profiles on it
-                    if let Some(ref addr) = session.address {
+                    // Endpoint succeeded — mark so Phase 1 and future queries
+                    // skip remaining profiles on it (all-visible batches only;
+                    // endpoint-scoped batches must real-ping every protocol).
+                    if dedup_endpoints
+                        && let Some(ref addr) = session.address
+                    {
                         let ep_port = session.port.unwrap_or(0) as u16;
                         completed_endpoints
                             .lock()
@@ -625,14 +683,18 @@ async fn dispatch_real_ping_batch(
 }
 
 /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
+/// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
+/// `profile_order` is the explicit `(protocol_id, sort_order)` list to test;
+/// `dedup_endpoints` gates the real-ping endpoint dedup (all-visible batches
+/// dedup; endpoint-scoped batches real-ping every protocol of one endpoint).
 #[allow(clippy::needless_collect)]
-pub fn start_batch_sieve(
+pub fn start_sieve(
     state: &mut AppState,
     real_ping_enabled: bool,
-    core_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    profile_order: Vec<(i64, i32)>,
+    dedup_endpoints: bool,
 ) {
-    let visible: Vec<&EndpointRow> = state.filtered_profiles().collect();
-    if visible.is_empty() {
+    if profile_order.is_empty() {
         state.log_trace(
             "info",
             "tui::ops::ping",
@@ -649,6 +711,7 @@ pub fn start_batch_sieve(
         Some(tx) => tx.clone(),
         None => return,
     };
+    let state_log_tx = state.core_log_tx.clone();
     let db = state.db.clone();
     let stop_flag = state.speed_test_stop.clone();
     let batch_id = uuid::Uuid::new_v4().to_string();
@@ -673,12 +736,8 @@ pub fn start_batch_sieve(
     let real_ping_window = state.config.speed_test.real_ping_window.max(1);
 
     // Set up shared batch progress for status bar display
-    let total_count = visible.len() as u16;
-    let profile_order: Vec<(i64, i32)> = visible
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.active_protocol().id, i as i32))
-        .collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let total_count = profile_order.len() as u16;
     let progress = Arc::new((AtomicU16::new(total_count), AtomicU16::new(0)));
     state.batch_progress = Some(progress.clone());
     tokio::spawn(async move {
@@ -751,7 +810,8 @@ pub fn start_batch_sieve(
                 let phase2_configs_dir = bin_configs_dir.clone();
                 let phase2_concurrency = real_ping_concurrency;
                 let phase2_batch_id = batch_id.clone();
-                let phase2_log_tx = core_log_tx.clone();
+                let phase2_dedup_endpoints = dedup_endpoints;
+                let phase2_log_tx = state_log_tx.clone();
 
                 let handle = tokio::spawn(async move {
                     let mut buffer: Vec<PingResultUpdate> = Vec::new();
@@ -766,15 +826,16 @@ pub fn start_batch_sieve(
                                     break;
                                 }
                                 let sessions = match phase2_db
-                                    .get_batch_for_real_ping_triplet(
+                                    .get_batch_for_real_ping(
                                         &phase2_batch_id,
                                         phase2_window,
+                                        phase2_dedup_endpoints,
                                     )
                                     .await
                                 {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        tracing::error!(target: "tui::ops::ping", "get_batch_for_real_ping_triplet failed: {e}");
+                                        tracing::error!(target: "tui::ops::ping", "get_batch_for_real_ping failed: {e}");
                                         break;
                                     }
                                 };
@@ -787,6 +848,7 @@ pub fn start_batch_sieve(
                                     &phase2_tx_ev,
                                     &phase2_progress,
                                     &phase2_completed,
+                                    phase2_dedup_endpoints,
                                     &phase2_batch_id,
                                     phase2_base_port,
                                     &phase2_proxy_addr,
@@ -815,12 +877,16 @@ pub fn start_batch_sieve(
                                 break;
                             }
                             let sessions = match phase2_db
-                                .get_batch_for_real_ping_triplet(&phase2_batch_id, phase2_window)
+                                .get_batch_for_real_ping(
+                                    &phase2_batch_id,
+                                    phase2_window,
+                                    phase2_dedup_endpoints,
+                                )
                                 .await
                             {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    tracing::error!(target: "tui::ops::ping", "get_batch_for_real_ping_triplet failed: {e}");
+                                    tracing::error!(target: "tui::ops::ping", "get_batch_for_real_ping failed: {e}");
                                     break;
                                 }
                             };
@@ -833,6 +899,7 @@ pub fn start_batch_sieve(
                                 &phase2_tx_ev,
                                 &phase2_progress,
                                 &phase2_completed,
+                                phase2_dedup_endpoints,
                                 &phase2_batch_id,
                                 phase2_base_port,
                                 &phase2_proxy_addr,

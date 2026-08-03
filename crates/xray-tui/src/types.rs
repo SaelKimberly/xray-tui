@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ratatui_cheese::tree::TreeState;
 use xray_tui_config::import_export::{Profile, ValidationSummary};
@@ -72,13 +73,13 @@ impl Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
     ConfigType,
-    Remarks,
     Address,
     Port,
     Delay,
     Speed,
     Traffic,
     Core,
+    LastSeen,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +194,26 @@ impl std::fmt::Display for SettingsSection {
             Self::Subscriptions => write!(f, "Subscriptions"),
         }
     }
+}
+
+/// Enrichment data for one endpoint (inbound host), computed lazily in the
+/// background by `ops::enrich`. Survives profile reloads (`AppState.endpoint_info`).
+#[derive(Debug, Clone, Default)]
+pub struct EndpointInfo {
+    /// DNS resolution of the inbound host (or the host itself when it is an IP).
+    pub resolved_ips: Vec<std::net::IpAddr>,
+    /// ISO-3166 alpha-2 country of the inbound IP from mmdb; None = unknown/not found.
+    pub country: Option<String>,
+    /// ip/cidr whitelist membership of the resolved IP (IPv4-only).
+    pub host_features: xray_tui_host_features::HostFeatures,
+    /// None = no SNI in config or checker not loaded.
+    pub sni_whitelisted: Option<bool>,
+    /// Exit IP parsed from real-ping ip_info.
+    pub outbound_ip: Option<std::net::IpAddr>,
+    /// ISO-3166 alpha-2 of outbound_ip.
+    pub outbound_country: Option<String>,
+    /// Unix secs of DNS resolution; None = IP host (static, never expires).
+    pub resolved_at_secs: Option<i64>,
 }
 
 /// Tracks what the UI is currently showing.
@@ -330,6 +351,14 @@ pub enum CoreEvent {
     BatchProgress {
         total: u16,
         completed: u16,
+    },
+    /// Background whitelist files loaded; carries the ready checker.
+    HostFeaturesLoaded(Arc<xray_tui_host_features::HostFeaturesChecker>),
+    /// Background enrichment (DNS resolve / geo lookup / whitelist / outbound)
+    /// produced fresh data for one endpoint.
+    EndpointInfoUpdated {
+        endpoint_id: i64,
+        info: EndpointInfo,
     },
 }
 

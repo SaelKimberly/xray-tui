@@ -531,6 +531,8 @@ mod tests {
             last_source: None,
             created_at: 0,
             manual_protocol_override: None,
+            resolved_as: None,
+            resolved_at: None,
         };
         let extra = serde_json::json!({
             "remarks": "test",
@@ -542,12 +544,12 @@ mod tests {
             sig: 0,
             cred_hash: 0,
             proto_kind: String::new(),
+            last_used_at: None,
             spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
             config_type,
             core_type: String::new(),
             transport: Some("tcp".to_string()),
             security: Some("auto".to_string()),
-            remarks: None,
             created_at: 0,
             last_seen_at: 0,
             extension: Default::default(),
@@ -581,6 +583,7 @@ mod tests {
             disable_cache: None,
             disable_fallback: None,
             client_ip: None,
+            cache_ttl_secs: None,
         };
         (params, rules, dns)
     }

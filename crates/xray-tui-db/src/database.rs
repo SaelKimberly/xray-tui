@@ -9,8 +9,8 @@ use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
 use crate::models_toasty::EndpointRow;
 use crate::models_toasty::{
-    DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession, ProfileExtension,
-    ProtocolRow, RoutingRule, ServerStat,
+    DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession,
+    ProfileExtension, ProtocolRow, RoutingRule, ServerStat,
 };
 
 // ── Database handle ─────────────────────────────────────────────────────
@@ -52,8 +52,10 @@ impl Database {
 
         // Check schema version before running push_schema.
         // toasty 0.9 uses CREATE TABLE without IF NOT EXISTS, so we must
-        // only run push_schema on fresh databases.
-        const SCHEMA_VERSION: i64 = 1;
+        // only run push_schema on fresh databases. Existing databases are
+        // upgraded in place by an explicit transaction of idempotent
+        // ALTER TABLE statements.
+        const SCHEMA_VERSION: i64 = 2;
         let rows = toasty::sql::query("PRAGMA user_version")
             .exec(&mut conn)
             .await?;
@@ -72,13 +74,49 @@ impl Database {
             .unwrap_or(0);
 
         if current_version < SCHEMA_VERSION {
-            db.push_schema().await?;
+            if current_version < 1 {
+                db.push_schema().await?;
+            }
+            // Additive migration for databases created before these columns
+            // existed. push_schema never runs on them, so ALTER in place.
+            // Runs in one transaction so the whole upgrade is atomic and
+            // committed before any other connection sees the schema.
+            let mut tx = conn.transaction().await?;
+            Self::ensure_column(
+                &mut tx,
+                "protocol_rows",
+                "last_used_at",
+                "ALTER TABLE protocol_rows ADD COLUMN last_used_at INTEGER",
+            )
+            .await?;
+            Self::ensure_column(
+                &mut tx,
+                "endpoints",
+                "resolved_as",
+                "ALTER TABLE endpoints ADD COLUMN resolved_as TEXT",
+            )
+            .await?;
+            Self::ensure_column(
+                &mut tx,
+                "endpoints",
+                "resolved_at",
+                "ALTER TABLE endpoints ADD COLUMN resolved_at INTEGER",
+            )
+            .await?;
+            Self::ensure_column(
+                &mut tx,
+                "dns_settings",
+                "cache_ttl_secs",
+                "ALTER TABLE dns_settings ADD COLUMN cache_ttl_secs INTEGER",
+            )
+            .await?;
             toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-                .exec(&mut conn)
+                .exec(&mut tx)
                 .await?;
+            tx.commit().await?;
         }
 
-        toasty::sql::query("PRAGMA journal_mode=WAL")
+        let _ = toasty::sql::query("PRAGMA journal_mode=WAL")
             .exec(&mut conn)
             .await?;
         toasty::sql::query("PRAGMA busy_timeout=5000")
@@ -109,6 +147,41 @@ impl Database {
             .build(driver)
             .await?;
         Ok(db)
+    }
+
+    /// Idempotent additive migration: run `ddl` (an `ALTER TABLE ... ADD
+    /// COLUMN`) only when `table.column` does not exist yet. Existing
+    /// databases never get toasty's `push_schema`, so new columns must be
+    /// added in place.
+    async fn ensure_column(
+        conn: &mut impl toasty::Executor,
+        table: &str,
+        column: &str,
+        ddl: &str,
+    ) -> Result<()> {
+        let rows = toasty::sql::query(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))
+        .bind(column)
+        .exec(conn)
+        .await?;
+        let count: i64 = rows
+            .first()
+            .and_then(|v| {
+                if let Value::Record(fields) = v {
+                    fields.first().and_then(|f| match f {
+                        Value::I64(n) => Some(*n),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if count == 0 {
+            toasty::sql::statement(ddl).exec(conn).await?;
+        }
+        Ok(())
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -165,9 +238,10 @@ impl Database {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
-                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.remarks, p.created_at, p.last_seen_at, \
+                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
                     ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
-                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated \
+                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
+                    e.resolved_as, e.resolved_at \
              FROM endpoints e \
              INNER JOIN protocol_rows p ON p.endpoint_id = e.id \
              LEFT JOIN profile_extensions ext ON ext.protocol_id = p.id \
@@ -189,9 +263,10 @@ impl Database {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
-                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.remarks, p.created_at, p.last_seen_at, \
+                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
                     ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
-                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated \
+                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
+                    e.resolved_as, e.resolved_at \
              FROM endpoints e \
              INNER JOIN protocol_rows p ON p.endpoint_id = e.id \
              INNER JOIN endpoint_groups eg ON eg.endpoint_id = e.id AND eg.group_id = ?2 \
@@ -215,9 +290,10 @@ impl Database {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
-                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.remarks, p.created_at, p.last_seen_at, \
+                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
                     ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
-                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated \
+                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
+                    e.resolved_as, e.resolved_at \
              FROM endpoints e \
              INNER JOIN protocol_rows p ON p.endpoint_id = e.id \
              LEFT JOIN profile_extensions ext ON ext.protocol_id = p.id \
@@ -237,9 +313,10 @@ impl Database {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
-                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.remarks, p.created_at, p.last_seen_at, \
+                    p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
                     ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
-                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated \
+                    s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
+                    e.resolved_as, e.resolved_at \
              FROM endpoints e \
              INNER JOIN protocol_rows p ON p.endpoint_id = e.id \
              LEFT JOIN profile_extensions ext ON ext.protocol_id = p.id \
@@ -263,11 +340,11 @@ impl Database {
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, \
                     e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
-                    p.config_type, p.core_type, p.transport, p.security, p.remarks, \
+                    p.config_type, p.core_type, p.transport, p.security, p.last_used_at, \
                     p.created_at, p.last_seen_at, \
                     ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
                     s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, \
-                    s.last_updated \
+                    s.last_updated, e.resolved_as, e.resolved_at \
              FROM endpoints e \
              INNER JOIN protocol_rows p ON p.endpoint_id = e.id \
              LEFT JOIN profile_extensions ext ON ext.protocol_id = p.id \
@@ -434,7 +511,6 @@ impl Database {
                     .core_type(&p.core_type)
                     .transport(p.transport.as_deref().unwrap_or(""))
                     .security(p.security.as_deref().unwrap_or(""))
-                    .remarks(p.remarks.as_deref().unwrap_or(""))
                     .created_at(p.created_at)
                     .last_seen_at(p.last_seen_at)
                     .exec(&mut tx)
@@ -495,8 +571,8 @@ impl Database {
 
         toasty::sql::statement(
             "INSERT INTO protocol_rows \
-             (id, endpoint_id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, transport, security, remarks, created_at, last_seen_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             (id, endpoint_id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, transport, security, created_at, last_seen_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(protocol.id)
         .bind(protocol.endpoint_id)
@@ -508,7 +584,6 @@ impl Database {
         .bind(&protocol.core_type)
         .bind(protocol.transport.as_deref().unwrap_or(""))
         .bind(protocol.security.as_deref().unwrap_or(""))
-        .bind(protocol.remarks.as_deref().unwrap_or(""))
         .bind(protocol.created_at)
         .bind(protocol.last_seen_at)
         .exec(&mut tx)
@@ -526,6 +601,45 @@ impl Database {
         .exec(&mut tx)
         .await?;
 
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record when a protocol was last activated. ts = unix seconds.
+    /// Runs in an explicit transaction — raw statements on a pooled turso
+    /// connection do not reliably commit in WAL mode.
+    pub async fn update_last_used(&self, protocol_id: i64, ts: i64) -> Result<()> {
+        let mut conn = self.db.connection().await?;
+        let mut tx = conn.transaction().await?;
+        toasty::sql::statement("UPDATE protocol_rows SET last_used_at = ?1 WHERE id = ?2")
+            .bind(ts)
+            .bind(protocol_id)
+            .exec(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist the DNS resolution of an endpoint host (comma-joined IPs +
+    /// unix secs). Both NULL clears the cache (failed lookup). Survives
+    /// launches so the TUI does not re-resolve DNS hosts on startup.
+    /// Explicit transaction — see `update_last_used`.
+    pub async fn update_endpoint_resolution(
+        &self,
+        endpoint_id: i64,
+        resolved_as: Option<&str>,
+        resolved_at: Option<i64>,
+    ) -> Result<()> {
+        let mut conn = self.db.connection().await?;
+        let mut tx = conn.transaction().await?;
+        toasty::sql::statement(
+            "UPDATE endpoints SET resolved_as = ?1, resolved_at = ?2 WHERE id = ?3",
+        )
+        .bind_typed(resolved_as, DbType::Text)
+        .bind_typed(resolved_at, DbType::Integer(8))
+        .bind(endpoint_id)
+        .exec(&mut tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -780,6 +894,39 @@ impl Database {
         Ok(ips)
     }
 
+    /// Endpoints whose `parent_id` references `parent_id` (resolved-IP children
+    /// of a DnsName endpoint). Used by tests; ordered by id.
+    pub async fn endpoints_by_parent(&self, parent_id: i64) -> Result<Vec<Endpoint>> {
+        let mut conn = self.db.connection().await?;
+        let rows = toasty::sql::query(
+            "SELECT id, host, host_type, port, port_spec_str, parent_id, last_source, \
+                    created_at, manual_protocol_override, resolved_as, resolved_at \
+             FROM endpoints WHERE parent_id = ?1 ORDER BY id",
+        )
+        .bind(parent_id)
+        .exec(&mut conn)
+        .await?;
+        let mut out = Vec::new();
+        for value in rows {
+            if let toasty_core::stmt::Value::Record(fields) = value {
+                out.push(Endpoint {
+                    id: get_i64(&fields, 0)?,
+                    host: get_string(&fields, 1)?,
+                    host_type: get_string(&fields, 2)?,
+                    port: get_i64(&fields, 3)? as i32,
+                    port_spec_str: get_opt_string(&fields, 4),
+                    parent_id: get_opt_i64(&fields, 5),
+                    last_source: get_opt_string(&fields, 6),
+                    created_at: get_i64(&fields, 7)?,
+                    manual_protocol_override: get_opt_i64(&fields, 8),
+                    resolved_as: get_opt_string(&fields, 9),
+                    resolved_at: get_opt_i64(&fields, 10),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn upsert_profile_extension(&self, ext: &ProfileExtension) -> Result<()> {
         let mut conn = self.db.connection().await?;
         ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
@@ -1009,12 +1156,13 @@ impl Database {
     pub async fn upsert_dns_settings(&self, dns: &DnsSetting) -> Result<()> {
         let mut conn = self.db.connection().await?;
         toasty::sql::statement(
-            "INSERT INTO dns_settings (id, name, servers, hosts, query_strategy, disable_cache, disable_fallback, client_ip) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+            "INSERT INTO dns_settings (id, name, servers, hosts, query_strategy, disable_cache, disable_fallback, client_ip, cache_ttl_secs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(id) DO UPDATE SET \
              name=excluded.name, servers=excluded.servers, hosts=excluded.hosts, \
              query_strategy=excluded.query_strategy, disable_cache=excluded.disable_cache, \
-             disable_fallback=excluded.disable_fallback, client_ip=excluded.client_ip",
+             disable_fallback=excluded.disable_fallback, client_ip=excluded.client_ip, \
+             cache_ttl_secs=excluded.cache_ttl_secs",
         )
         .bind(&dns.id)
         .bind(dns.name.as_deref())
@@ -1024,6 +1172,7 @@ impl Database {
         .bind(dns.disable_cache)
         .bind(dns.disable_fallback)
         .bind(dns.client_ip.as_deref())
+        .bind(dns.cache_ttl_secs)
         .exec(&mut conn)
         .await?;
         Ok(())
@@ -1315,14 +1464,32 @@ impl Database {
     }
 
     /// Fetch real-ping ready sessions in wave order: first occurrence of each endpoint,
-    /// then second occurrence, etc. Skips endpoints that already have a successful real ping.
-    pub async fn get_batch_for_real_ping_triplet(
+    /// Fetch the next `limit` queued real-ping sessions for `batch_id`.
+    /// When `dedup_endpoints` is true, skips endpoints (address+port) that
+    /// already have a completed real ping — the all-visible batch behavior.
+    /// Endpoint-scoped batches pass `false` so every protocol of one endpoint
+    /// gets real-pinged (different credentials → different exit IPs).
+    pub async fn get_batch_for_real_ping(
         &self,
         batch_id: &str,
         limit: usize,
+        dedup_endpoints: bool,
     ) -> Result<Vec<PingSession>> {
         let mut conn = self.db.connection().await?;
-        let rows = toasty::sql::query(
+        let dedup_sql = if dedup_endpoints {
+            "AND NOT EXISTS ( \
+                      SELECT 1 FROM ping_sessions ps_s \
+                      WHERE ps_s.batch_id = ps.batch_id \
+                        AND ps_s.address = ps.address \
+                        AND ps_s.port = ps.port \
+                        AND ps_s.ping_type = 'real' \
+                        AND ps_s.status = 'completed' \
+                  ) \
+"
+        } else {
+            ""
+        };
+        let query = format!(
             "SELECT sub.id, sub.batch_id, sub.protocol_id, sub.config_type, sub.core_type, \
                     sub.address, sub.port, sub.triplet_rank, \
                     sub.ping_type, sub.status, sub.latency_ms, sub.speed_bps, \
@@ -1337,22 +1504,16 @@ impl Database {
                 WHERE ps.batch_id = ?1 \
                   AND ps.status = 'queued' \
                   AND ps.ping_type = 'real' \
-                  AND NOT EXISTS ( \
-                      SELECT 1 FROM ping_sessions ps_s \
-                      WHERE ps_s.batch_id = ps.batch_id \
-                        AND ps_s.address = ps.address \
-                        AND ps_s.port = ps.port \
-                        AND ps_s.ping_type = 'real' \
-                        AND ps_s.status = 'completed' \
-                  ) \
-             ) sub \
+                  {dedup_sql}         ) sub \
              ORDER BY sub.occurrence, sub.id \
              LIMIT ?2",
-        )
-        .bind(batch_id)
-        .bind(limit as i64)
-        .exec(&mut conn)
-        .await?;
+            dedup_sql = dedup_sql,
+        );
+        let rows = toasty::sql::query(&query)
+            .bind(batch_id)
+            .bind(limit as i64)
+            .exec(&mut conn)
+            .await?;
         deserialize_ping_sessions(rows)
     }
 
@@ -1457,11 +1618,12 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         last_source: get_opt_string(&fields, 6),
                         created_at: get_i64(&fields, 7)?,
                         manual_protocol_override: get_opt_i64(&fields, 8),
+                        resolved_as: get_opt_string(&fields, 33),
+                        resolved_at: get_opt_i64(&fields, 34),
                     },
                     protocols: Vec::new(),
                     extensions: HashMap::new(),
                     stats: HashMap::new(),
-                    resolved_ips: Vec::new(),
                     selected_protocol: 0,
                     expanded: false,
                 });
@@ -1482,7 +1644,7 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         core_type: get_string(&fields, 16)?,
                         transport: get_opt_string(&fields, 17),
                         security: get_opt_string(&fields, 18),
-                        remarks: get_opt_string(&fields, 19),
+                        last_used_at: get_opt_i64(&fields, 19),
                         created_at: get_i64(&fields, 20)?,
                         last_seen_at: get_i64(&fields, 21)?,
                         extension: Default::default(),
@@ -1609,4 +1771,71 @@ fn get_blob(fields: &[Value], idx: usize) -> Vec<u8> {
             }
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simulate a pre-migration database (schema v1: no last_used_at /
+    /// resolved_as / resolved_at / cache_ttl_secs) and prove that
+    /// `Database::open` migrates it in place.
+    #[tokio::test]
+    async fn test_open_migrates_old_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.db");
+
+        // 1. Build the v2 schema, then strip the new columns and rewind
+        //    user_version to 1 — the shape of a pre-migration database.
+        {
+            let driver = toasty_driver_turso::Turso::file(&path);
+            let db = toasty::Db::builder()
+                .models(toasty::models!(
+                    Endpoint,
+                    ProtocolRow,
+                    EndpointGroup,
+                    Group,
+                    ProfileExtension,
+                    ServerStat,
+                    PingSession,
+                    RoutingRule,
+                    DnsSetting
+                ))
+                .build(driver)
+                .await
+                .expect("build db");
+            db.push_schema().await.expect("push schema");
+            let mut conn = db.connection().await.expect("connection");
+            toasty::sql::statement("ALTER TABLE protocol_rows DROP COLUMN last_used_at")
+                .exec(&mut conn)
+                .await
+                .expect("drop last_used_at");
+            toasty::sql::statement("ALTER TABLE endpoints DROP COLUMN resolved_as")
+                .exec(&mut conn)
+                .await
+                .expect("drop resolved_as");
+            toasty::sql::statement("ALTER TABLE endpoints DROP COLUMN resolved_at")
+                .exec(&mut conn)
+                .await
+                .expect("drop resolved_at");
+            toasty::sql::statement("ALTER TABLE dns_settings DROP COLUMN cache_ttl_secs")
+                .exec(&mut conn)
+                .await
+                .expect("drop cache_ttl_secs");
+            toasty::sql::query("PRAGMA user_version = 1")
+                .exec(&mut conn)
+                .await
+                .expect("set version 1");
+        }
+
+        // 2. Reopen through the app's Database — the migration must re-add
+        //    the columns (a SELECT touching last_used_at would otherwise fail).
+        let db = Database::open(&path).await.expect("open migrates schema");
+        let row = db.get_endpoint(0).await.expect("endpoint query uses last_used_at");
+        assert!(row.is_none(), "empty old db has no endpoints");
+
+        // Reopening again must be a no-op (idempotent).
+        let db2 = Database::open(&path).await.expect("reopen");
+        assert!(db2.get_endpoint(0).await.is_ok());
+    }
 }
