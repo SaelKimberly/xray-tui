@@ -205,30 +205,40 @@ pub fn start_add_server(state: &mut AppState) {
     };
 }
 
+/// Resolve an endpoint row for editing: check the currently loaded view
+/// first, then fall back to every endpoint. The profiles list shows rows up
+/// to `purgatory_ttl` old, so a fixed 1-day DB threshold would reject
+/// visible-but-stale profiles ("Profile not found" while on screen).
+async fn find_editable_endpoint(
+    state: &AppState,
+    protocol_id: i64,
+) -> Option<EndpointRow> {
+    if let Some(r) = state.endpoints.iter().find(|r| r.endpoint.id == protocol_id) {
+        return Some(r.clone());
+    }
+    state
+        .db
+        .get_active_endpoints(0)
+        .await
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r.endpoint.id == protocol_id))
+}
+
 pub async fn start_edit_profile(state: &mut AppState, id: &str) {
     let protocol_id: i64 = id.parse().unwrap_or(0);
-    match state.db.get_active_endpoints(86400).await {
-        Ok(rows) => {
-            if let Some(_row) = rows.iter().find(|r| r.endpoint.id == protocol_id) {
-                state.mode = AppMode::EditServer {
-                    protocol_id,
-                    fields: Vec::new(),
-                    focus_index: 0,
-                    form_errors: HashMap::new(),
-                };
-            } else {
-                state.log_trace(
-                    "error",
-                    "tui::ops::profiles",
-                    &format!("Profile {id} not found"),
-                );
-            }
-        }
-        Err(e) => state.log_trace(
+    if find_editable_endpoint(state, protocol_id).await.is_some() {
+        state.mode = AppMode::EditServer {
+            protocol_id,
+            fields: Vec::new(),
+            focus_index: 0,
+            form_errors: HashMap::new(),
+        };
+    } else {
+        state.log_trace(
             "error",
             "tui::ops::profiles",
-            &format!("Error loading profile {id}: {e}"),
-        ),
+            &format!("Profile {id} not found"),
+        );
     }
 }
 
@@ -883,7 +893,7 @@ pub fn selected_sub_protocol_id(state: &AppState) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod nav_tests {
+mod test_support {
     use super::*;
     use crate::AppState;
     use std::collections::HashMap;
@@ -892,7 +902,7 @@ mod nav_tests {
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{Endpoint, EndpointRow, ProfileExtension, ProtocolRow, ServerStat};
 
-    fn fake_row(id: i64, host: &str, n_protos: usize) -> EndpointRow {
+    pub fn fake_row(id: i64, host: &str, n_protos: usize) -> EndpointRow {
         EndpointRow {
             endpoint: Endpoint {
                 id,
@@ -934,7 +944,7 @@ mod nav_tests {
         }
     }
 
-    async fn test_state(rows: Vec<EndpointRow>) -> AppState {
+    pub async fn test_state(rows: Vec<EndpointRow>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
             xray_tui_db::Database::open(dir.path().join("t.db"))
@@ -948,6 +958,12 @@ mod nav_tests {
         state.selected_sub = None;
         state
     }
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+    use super::test_support::{fake_row, test_state};
 
     #[tokio::test]
     async fn expand_lands_on_first_sub_row() {
@@ -1003,5 +1019,101 @@ mod nav_tests {
         state.selected_sub = Some(0);
         assert!(!nav_protocol_up(&mut state));
         assert_eq!(state.selected_sub, None);
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use super::test_support::{fake_row, test_state};
+    use crate::AppState;
+    use std::sync::Arc;
+    use toasty::Deferred;
+    use xray_tui_config::AppConfig;
+    use xray_tui_db::models::{Endpoint, EndpointRow, ProfileExtension, ProtocolRow, ServerStat};
+
+    fn matches_edit_mode(state: &AppState, protocol_id: i64) -> bool {
+        matches!(state.mode, AppMode::EditServer { protocol_id: id, .. } if id == protocol_id)
+    }
+
+    fn assert_not_edit_mode(state: &AppState) {
+        assert!(
+            !matches!(state.mode, AppMode::EditServer { .. }),
+            "expected no EditServer mode, got {:?}",
+            state.mode
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_resolves_against_current_view() {
+        // The profile is on screen (state.endpoints) but absent from the DB —
+        // a visible, manually-added profile that was never re-imported. The
+        // old fixed 1-day DB lookup rejected it; the current view must win.
+        let mut state = test_state(vec![fake_row(7, "visible.example", 1)]).await;
+        start_edit_profile(&mut state, "7").await;
+        assert!(matches_edit_mode(&state, 7));
+    }
+
+    #[tokio::test]
+    async fn edit_falls_back_to_every_endpoint_for_stale_profile() {
+        // Profile not loaded in the current view, but present in the DB with
+        // last_seen_at older than the old 1-day threshold. The fallback must
+        // use scope 0 (everything), not a fixed 86400s window.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let group_id = db.get_all_groups().await.unwrap()[0].id.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let endpoint = Endpoint {
+            id: 42,
+            host: "stale.example".to_string(),
+            host_type: "dns".to_string(),
+            port: 443,
+            port_spec_str: None,
+            parent_id: None,
+            last_source: None,
+            created_at: now - 2 * 86400,
+            manual_protocol_override: None,
+            resolved_as: None,
+            resolved_at: None,
+        };
+        let protocol = ProtocolRow {
+            id: 4200,
+            endpoint_id: 42,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: "vless".to_string(),
+            spec_blob: Vec::new(),
+            config_type: 1,
+            core_type: "xray".to_string(),
+            transport: None,
+            security: None,
+            last_used_at: Some(now - 2 * 86400),
+            created_at: now - 2 * 86400,
+            last_seen_at: now - 2 * 86400,
+            endpoint: Deferred::from(None::<Endpoint>),
+            extension: Deferred::from(None::<ProfileExtension>),
+            server_stat: Deferred::from(None::<ServerStat>),
+        };
+        db.insert_manual_endpoint(&endpoint, &protocol, &group_id)
+            .await
+            .unwrap();
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        state.endpoints = Vec::new(); // profile not loaded in the current view
+        start_edit_profile(&mut state, "42").await;
+        assert!(matches_edit_mode(&state, 42));
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_unknown_profile() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 1)]).await;
+        start_edit_profile(&mut state, "999").await;
+        assert_not_edit_mode(&state);
     }
 }
