@@ -556,6 +556,18 @@ fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfi
         }));
     }
     json_rules.extend(rules.iter().filter_map(|r| {
+        // xray-core 26+ rejects routing rules with no match condition
+        // (domain/ip/inboundTag/port/sourcePort/network/protocol). Skip them.
+        let has_matcher = r.domains.is_some()
+            || r.ips.is_some()
+            || r.inbound_tags.is_some()
+            || r.port.is_some()
+            || r.source_ports.is_some()
+            || r.network.is_some()
+            || r.protocols.is_some();
+        if !has_matcher {
+            return None;
+        }
         let mut rule = json!({ "type": "field" });
         if let Some(domains) = &r.domains {
             rule["domain"] = json!(parse_comma_list(domains));
@@ -574,6 +586,12 @@ fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfi
         }
         if let Some(network) = &r.network {
             rule["network"] = json!(network);
+        }
+        if let Some(protocols) = &r.protocols {
+            rule["protocol"] = json!(parse_comma_list(protocols));
+        }
+        if let Some(matcher) = &r.domain_matcher {
+            rule["domainMatcher"] = json!(matcher);
         }
         // outboundTag or balancerTag
         if let Some(tag) = &r.outbound_tag {
@@ -898,6 +916,58 @@ mod tests {
         assert_eq!(routing_rules[1]["domain"][0], "example.com");
         assert_eq!(routing_rules[1]["network"], "tcp");
         assert_eq!(routing_rules[1]["outboundTag"], "direct");
+    }
+
+    #[test]
+    fn routing_skips_matcher_less_rules() {
+        let rule = RoutingRule {
+            id: "r1".to_string(),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: None,
+            ips: None,
+            inbound_tags: None,
+            port: None,
+            source_ports: None,
+            network: None,
+            protocols: None,
+            domain_strategy: None,
+            outbound_tag: Some("direct".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: None,
+        };
+        let routing = build_routing(&[rule], false);
+        assert!(routing.rules.is_empty());
+    }
+
+    #[test]
+    fn routing_emits_protocols_and_domain_matcher() {
+        let rule = RoutingRule {
+            id: "r2".to_string(),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: Some("linear".to_string()),
+            domains: Some("example.com".to_string()),
+            ips: None,
+            inbound_tags: None,
+            port: None,
+            source_ports: None,
+            network: Some("tcp".to_string()),
+            protocols: Some("http,tls".to_string()),
+            domain_strategy: None,
+            outbound_tag: Some("proxy".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: None,
+        };
+        let routing = build_routing(&[rule], false);
+        let rule_json = &routing.rules[0];
+        assert_eq!(rule_json["domainMatcher"], "linear");
+        assert_eq!(rule_json["protocol"], json!(["http", "tls"]));
     }
 
     #[test]

@@ -583,6 +583,27 @@ pub async fn save_routing_rule(
         rule_set_url: get_opt("rule_set_url"),
         sort_order: None,
     };
+    // rule_set_file/rule_set_url count as match conditions at save time, but
+    // neither core builder emits them yet (xray has no rule-set support;
+    // sing-box rule_set emission is intentionally out of scope for now). The
+    // fields remain persisted for future sing-box rule-set support.
+    let has_matcher = rule.domains.is_some()
+        || rule.ips.is_some()
+        || rule.inbound_tags.is_some()
+        || rule.port.is_some()
+        || rule.source_ports.is_some()
+        || rule.network.is_some()
+        || rule.protocols.is_some()
+        || rule.rule_set_file.is_some()
+        || rule.rule_set_url.is_some();
+    if !has_matcher {
+        state.log_trace(
+            "error",
+            "tui::ops::settings",
+            "Routing rule needs at least one match condition",
+        );
+        return;
+    }
     let result = if rule_id.is_some() {
         state.db.update_routing_rule(&rule).await
     } else {
