@@ -683,7 +683,14 @@ pub fn to_xray_stream_settings(
     transport: &TransportConfig,
 ) -> Option<serde_json::Value> {
     let mut ss = serde_json::Map::new();
-    let network = transport.type_str();
+    // Xray-core calls the XHttp transport "splithttp" (its proto/config name);
+    // `type_str()` returns "xhttp" which xray-core does not recognize as a
+    // network.
+    let network = if matches!(transport, TransportConfig::XHttp(_)) {
+        "splithttp"
+    } else {
+        transport.type_str()
+    };
     if network != "tcp" {
         ss.insert("network".into(), serde_json::Value::String(network.to_string()));
     }
@@ -773,7 +780,9 @@ pub fn to_xray_stream_settings(
                 u.insert("path".into(), serde_json::json!(p.as_str()));
             }
             if let Some(host) = &cfg.host {
-                u.insert("host".into(), serde_json::json!([host.as_str()]));
+                // httpupgradeSettings.host is a single string (unlike
+                // httpSettings.host which is an array).
+                u.insert("host".into(), serde_json::json!(host.as_str()));
             }
             if !u.is_empty() {
                 ss.insert("httpupgradeSettings".into(), serde_json::Value::Object(u));
@@ -817,6 +826,36 @@ mod tests {
         assert_eq!(ss["network"], "ws");
         assert_eq!(ss["security"], "tls");
         assert_eq!(ss["wsSettings"]["path"], "/ws");
+    }
+
+    #[test]
+    fn vless_to_settings_emits_splithttp_network() {
+        let raw = RawUrlX::from(
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?security=tls&type=splithttp&path=%2Fs#r",
+        );
+        let config = VlessConfig::try_parse(&raw).expect("parse vless URL");
+        let (_, s_settings) = ProtocolConfig::Vless(config).to_settings();
+        let ss = s_settings.as_object().expect("streamSettings present");
+        // xray-core only recognizes "splithttp" as the network name.
+        assert_eq!(ss["network"], "splithttp");
+        assert_eq!(ss["splithttpSettings"]["path"], "/s");
+    }
+
+    #[test]
+    fn vless_to_settings_emits_httpupgrade_host_string() {
+        let raw = RawUrlX::from(
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?type=httpupgrade&path=%2Fup&host=cdn.example.com#r",
+        );
+        let config = VlessConfig::try_parse(&raw).expect("parse vless URL");
+        let (_, s_settings) = ProtocolConfig::Vless(config).to_settings();
+        let ss = s_settings.as_object().expect("streamSettings present");
+        assert_eq!(ss["network"], "httpupgrade");
+        let host = &ss["httpupgradeSettings"]["host"];
+        assert!(
+            host.is_string(),
+            "httpupgradeSettings.host must be a string, got {host}"
+        );
+        assert_eq!(host, "cdn.example.com");
     }
 
     #[test]

@@ -437,7 +437,13 @@ fn legacy_stream_settings_to_xray(
     if let Some(v) = get("sni").and_then(|v| v.as_str().map(str::to_string)) {
         tls.insert("serverName".into(), serde_json::json!(v));
     }
-    if let Some(v) = get("tls.allow_insecure").and_then(|v| v.as_bool()) {
+    // Legacy emitters write the plain "allow_insecure" key (vmess QR insecure,
+    // vless allowInsecure query param, forms.rs); "tls.allow_insecure" is the
+    // dotted legacy variant — accept both, preferring the plain key.
+    if let Some(v) = get("allow_insecure")
+        .or_else(|| get("tls.allow_insecure"))
+        .and_then(|v| v.as_bool())
+    {
         tls.insert("allowInsecure".into(), serde_json::json!(v));
     }
     if let Some(v) = get("fingerprint").and_then(|v| v.as_str().map(str::to_string)) {
@@ -452,10 +458,10 @@ fn legacy_stream_settings_to_xray(
         if let Some(rs) = obj.get("realitySettings").cloned() {
             ss.insert("realitySettings".into(), rs);
         }
-        if let Some(server_name) = tls.get("serverName").cloned() {
-            if let Some(rs) = ss.get_mut("realitySettings").and_then(|v| v.as_object_mut()) {
-                rs.insert("serverName".into(), server_name);
-            }
+        if let Some(server_name) = tls.get("serverName").cloned()
+            && let Some(rs) = ss.get_mut("realitySettings").and_then(|v| v.as_object_mut())
+        {
+            rs.insert("serverName".into(), server_name);
         }
     } else if !tls.is_empty() {
         ss.insert("tlsSettings".into(), serde_json::Value::Object(tls));
@@ -680,13 +686,6 @@ mod tests {
             cache_ttl_secs: None,
         };
         (params, rules, dns)
-    }
-
-    fn set_protocol_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
-        let mut extra: serde_json::Value =
-            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["protocol_settings"] = serde_json::from_str(json_str).unwrap_or_default();
-        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
     }
 
     fn set_stream_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
@@ -919,6 +918,25 @@ mod tests {
         assert_eq!(ss["tlsSettings"]["serverName"], "cdn.example.com");
         assert_eq!(ss["wsSettings"]["path"], "/ws");
         assert_eq!(ss["wsSettings"]["headers"]["Host"], "cdn.example.com");
+    }
+
+    #[test]
+    fn legacy_vless_tls_allow_insecure_produces_allow_insecure() {
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+        protocol.transport = Some("tcp".to_string());
+        set_stream_settings_json(
+            &mut protocol,
+            r#"{"tls.enable": true, "sni": "cdn.example.com", "allow_insecure": true}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect("build");
+        let json = serde_json::to_value(&config).unwrap();
+        let outbounds = json["outbounds"].as_array().expect("outbounds");
+        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+        let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+        assert_eq!(ss["security"], "tls");
+        assert_eq!(ss["tlsSettings"]["allowInsecure"], true);
     }
 
     #[test]
