@@ -436,7 +436,10 @@ fn legacy_stream_settings_to_xray(
     if get("security").as_ref().and_then(|v| v.as_str()) == Some("reality") {
         ss.insert("security".into(), serde_json::json!("reality"));
     } else if get("tls.enable").as_ref().and_then(|v| v.as_bool()) == Some(true)
-        || get("tls.enable").as_ref().and_then(|v| v.as_str()).is_some()
+        || get("tls.enable")
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("true"))
     {
         ss.insert("security".into(), serde_json::json!("tls"));
     }
@@ -1031,6 +1034,43 @@ mod tests {
         assert_eq!(ss["tlsSettings"]["serverName"], "cdn.example.com");
         assert_eq!(ss["wsSettings"]["path"], "/ws");
         assert_eq!(ss["wsSettings"]["headers"]["Host"], "cdn.example.com");
+    }
+
+    #[test]
+    fn legacy_tls_enable_string_parsing_is_strict() {
+        // Falsy string values must NOT enable TLS (a blanket
+        // as_str().is_some() branch used to treat "false"/"0" as enabled).
+        for raw in [
+            r#"{"tls.enable": "false", "sni": "cdn.example.com"}"#,
+            r#"{"tls.enable": "0", "sni": "cdn.example.com"}"#,
+        ] {
+            let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+            protocol.transport = Some("tcp".to_string());
+            set_stream_settings_json(&mut protocol, raw);
+            let (params, rules, dns) = default_params();
+            let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+                .expect("build");
+            let json = serde_json::to_value(&config).unwrap();
+            let outbounds = json["outbounds"].as_array().expect("outbounds");
+            let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+            let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+            assert_ne!(ss.get("security").and_then(|v| v.as_str()), Some("tls"));
+        }
+        // The string "true" (case-insensitive) still enables TLS.
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+        protocol.transport = Some("tcp".to_string());
+        set_stream_settings_json(
+            &mut protocol,
+            r#"{"tls.enable": "TRUE", "sni": "cdn.example.com"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect("build");
+        let json = serde_json::to_value(&config).unwrap();
+        let outbounds = json["outbounds"].as_array().expect("outbounds");
+        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+        let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+        assert_eq!(ss["security"], "tls");
     }
 
     #[test]

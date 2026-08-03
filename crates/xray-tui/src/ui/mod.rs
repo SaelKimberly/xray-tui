@@ -126,8 +126,13 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
 
-        // Process core process events (connect/disconnect/error)
-        state.poll_core_events().await;
+        // Process core process events (connect/disconnect/error). When any
+        // event was handled, mark the frame dirty so async state changes
+        // (ping results, connect/disconnect, stats, logs, batch progress)
+        // render immediately instead of waiting for the idle refresh cadence.
+        if state.poll_core_events().await {
+            events_seen = true;
+        }
 
         // Lazy-load initial logs on first Logs tab access
         if !state.logs_loaded && state.current_tab == Tab::Logs {

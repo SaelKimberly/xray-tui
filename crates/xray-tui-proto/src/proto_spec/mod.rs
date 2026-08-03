@@ -739,6 +739,14 @@ impl PlaceholderConfig {
         // so the sig is a deterministic rapidhash over the ENTIRE body
         // (proto_name + settings_json). Same body -> same uid (dedup); never
         // zero (mapped to NonZeroU64::MIN by the macro).
+        //
+        // NOTE: the hashed body INCLUDES the volatile `remarks` field for
+        // placeholder-scheme profiles (set_legacy_fields writes it into the
+        // settings JSON). Renaming a profile's remark therefore changes its
+        // uid, so a subscription refresh treats the row as new and duplicates
+        // it. This is the mandated whole-body-hash design for opaque configs —
+        // the remark is intentionally part of the identity; do NOT special-case
+        // it out of the hash here.
         use rapidhash::v3::{RapidStreamHasherV3, DEFAULT_RAPID_SECRETS};
         let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
         hasher.write(self.proto_name.as_bytes());

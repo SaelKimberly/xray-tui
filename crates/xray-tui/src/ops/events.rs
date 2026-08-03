@@ -28,10 +28,14 @@ pub(crate) fn endpoint_row_for_protocol<'a>(
 }
 
 /// Poll core event channel and update state accordingly.
-pub async fn poll_core_events(state: &mut AppState) {
+///
+/// Returns `true` when anything was handled (an event consumed, or a finished
+/// batch-progress bar cleared), so the caller can trigger an immediate redraw
+/// instead of waiting for the idle refresh cadence.
+pub async fn poll_core_events(state: &mut AppState) -> bool {
     // Clean up stale batch_progress when the task has finished silently
     // (e.g., create_ping_batch returned 0, no TestTypeUpdate events were ever sent).
-    if state.batch_progress.is_some()
+    let mut handled = if state.batch_progress.is_some()
         && state.testing_profiles.is_empty()
         && state
             .batch_progress
@@ -40,7 +44,10 @@ pub async fn poll_core_events(state: &mut AppState) {
             == Some(0)
     {
         state.batch_progress = None;
-    }
+        true
+    } else {
+        false
+    };
     while let Some(rx) = state.core_event_rx.as_mut() {
         let event = match rx.try_recv() {
             Ok(event) => event,
@@ -49,6 +56,7 @@ pub async fn poll_core_events(state: &mut AppState) {
                 | tokio::sync::mpsc::error::TryRecvError::Disconnected,
             ) => break,
         };
+        handled = true;
         match event {
             CoreEvent::Connected(core_type) => {
                 state.connected_core = Some(core_type);
@@ -507,6 +515,7 @@ pub async fn poll_core_events(state: &mut AppState) {
             }
         }
     }
+    handled
 }
 
 /// Merge whitelist feature flags from an `EndpointInfoUpdated` event into the
@@ -531,8 +540,10 @@ pub(crate) fn merge_host_features(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use toasty::Deferred;
+    use xray_tui_config::AppConfig;
     use xray_tui_db::models::{Endpoint, ProtocolRow};
 
     use super::*;
@@ -599,6 +610,31 @@ mod tests {
             cidr_whitelisted: true,
         };
         assert_eq!(merge_host_features(real, other), other);
+    }
+
+    #[tokio::test]
+    async fn poll_core_events_reports_whether_events_were_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        // Isolate from the startup channels (whitelist load, auto-update):
+        // replace the rx so only this test can feed events — deterministic.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        state.core_event_rx = Some(rx);
+        // Idle: no events -> false (keeps the refresh-cadence draw path).
+        assert!(!state.poll_core_events().await);
+        // A real event -> true, and the state change is applied.
+        tx.send(CoreEvent::Connected(CoreType::Xray))
+            .await
+            .unwrap();
+        assert!(state.poll_core_events().await);
+        assert_eq!(state.connected_core, Some(CoreType::Xray));
+        // Drained -> idle again.
+        assert!(!state.poll_core_events().await);
     }
 
     #[test]

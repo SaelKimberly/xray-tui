@@ -1374,8 +1374,12 @@ impl AppState {
     }
 
     /// Poll core event channel and update state accordingly.
-    pub async fn poll_core_events(&mut self) {
-        events::poll_core_events(self).await;
+    ///
+    /// Returns `true` when an event was handled — callers should redraw
+    /// immediately rather than waiting for the idle refresh cadence.
+    #[must_use]
+    pub async fn poll_core_events(&mut self) -> bool {
+        events::poll_core_events(self).await
     }
     // ── Group management ─────────────────────────────────────────────
 
