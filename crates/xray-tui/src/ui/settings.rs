@@ -374,6 +374,13 @@ const fn form_title_for_section(section: SettingsSection) -> &'static str {
 }
 
 async fn handle_tree_key(state: &mut AppState, key: &KeyEvent) {
+    // Esc exits Settings mode — the help overlay advertises "Esc — Close settings",
+    // and previously Esc was a dead key while the tree had focus.
+    if key.code == KeyCode::Esc {
+        state.mode = AppMode::List;
+        return;
+    }
+
     let groups = build_tree_groups();
 
     // Handle Enter separately — needs to release borrow before async call
