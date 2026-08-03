@@ -6630,6 +6630,7 @@ dependencies = [
  "reqwest",
  "tempfile",
  "tokio",
+ "tracing",
  "url",
 ]
 

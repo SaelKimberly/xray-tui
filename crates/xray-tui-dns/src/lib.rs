@@ -99,9 +99,9 @@ fn parse_dnscrypt_lines(text: &str) -> Vec<NameServerConfig> {
 }
 
 /// Reads the cache file, returning the parsed name servers and whether the
-/// file is stale (mtime older than [`DNSCRYPT_CACHE_MAX_AGE`]). Missing,
-/// unreadable, or empty/corrupt caches yield `None` so they get re-downloaded
-/// instead of serving a 0-server config forever.
+/// file is stale (mtime older than [`DNSCRYPT_CACHE_MAX_AGE`], or undatable).
+/// Missing, unreadable, or empty/corrupt caches yield `None` so they get
+/// re-downloaded instead of serving a 0-server config forever.
 async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<Vec<NameServerConfig>>, bool) {
     let Ok(metadata) = tokio::fs::metadata(cache_file).await else {
         return (None, false);
@@ -113,22 +113,23 @@ async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<Vec<NameServerConfig>
     if parsed.is_empty() {
         return (None, false);
     }
+    // A future-dated mtime makes `elapsed()` fail; treat that as stale so an
+    // undatable cache is eventually re-fetched instead of living forever.
     let stale = metadata
         .modified()
         .ok()
-        .and_then(|m| m.elapsed().ok())
-        .is_some_and(|age| age > DNSCRYPT_CACHE_MAX_AGE);
+        .is_some_and(|mtime| mtime.elapsed().map_or(true, |age| age > DNSCRYPT_CACHE_MAX_AGE));
     (Some(parsed), stale)
 }
 
 /// Downloads the `DNSCrypt` public resolver list under a hard 10s deadline;
 /// without the timeout a blocked network hangs every lookup forever.
-async fn download_dnscrypt_resolvers() -> anyhow::Result<String> {
+async fn download_dnscrypt_resolvers(resolvers_url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
     let response = client
-        .get(DNSCRYPT_RESOLVERS_URL)
+        .get(resolvers_url)
         .send()
         .await?
         .error_for_status()?;
@@ -172,20 +173,34 @@ async fn write_dnscrypt_cache(
 }
 
 async fn get_dns_servers(cache_dir: &Path) -> anyhow::Result<ResolverConfig> {
+    get_dns_servers_from(cache_dir, DNSCRYPT_RESOLVERS_URL).await
+}
+
+/// Core implementation of [`get_dns_servers`]; the resolver list URL is a
+/// parameter so tests can exercise the download paths hermetically.
+async fn get_dns_servers_from(
+    cache_dir: &Path,
+    resolvers_url: &str,
+) -> anyhow::Result<ResolverConfig> {
     let cache_file = cache_dir.join(DNSCRYPT_RESOLVERS_CACHE);
     let (cached, cache_stale) = read_dnscrypt_cache(&cache_file).await;
 
     // Re-download when the cache is missing/empty or stale. A failed refresh
-    // keeps the (stale) cache; an empty download is never written and falls
-    // back to the system resolver config below.
+    // keeps the (stale) cache; an empty download is never written; a failed
+    // cache write only costs the next run's refresh, never this lookup.
     let downloaded = if cached.is_none() || cache_stale {
-        match download_dnscrypt_resolvers().await {
+        match download_dnscrypt_resolvers(resolvers_url).await {
             Ok(text) => {
                 let parsed = parse_dnscrypt_lines(&text);
                 if parsed.is_empty() {
                     None
                 } else {
-                    write_dnscrypt_cache(cache_dir, &cache_file, &text).await?;
+                    if let Err(e) = write_dnscrypt_cache(cache_dir, &cache_file, &text).await {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to write DNSCrypt resolver cache; using in-memory list"
+                        );
+                    }
                     Some(parsed)
                 }
             }
@@ -253,60 +268,154 @@ impl DnsResolver {
 mod tests {
     use super::*;
 
+    /// A dns.aa.net.uk `DoH` stamp published with an IPv4 address.
+    const STAMP_IPV4: &str =
+        "sdns://AgcAAAAAAAAADTIxNy4xNjkuMjAuMjIADWRucy5hYS5uZXQudWsKL2Rucy1xdWVyeQ";
+    /// The same resolver published with an IPv6-only address.
+    const STAMP_IPV6: &str =
+        "sdns://AgcAAAAAAAAAEFsyMDAxOjhiMDo6MjAyMl0ADWRucy5hYS5uZXQudWsKL2Rucy1xdWVyeQ";
+    /// Nothing listens here; downloads fail fast (ECONNREFUSED).
+    const UNREACHABLE_URL: &str = "http://127.0.0.1:1/unreachable";
+
+    /// Serves `body` as a single HTTP response on an ephemeral loopback port,
+    /// returning the URL. Lets the download path run without the network.
+    async fn serve(body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::mem::drop(tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0_u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        }));
+        format!("http://{addr}/public-resolvers.md")
+    }
+
+    /// Asserts the result is either a non-empty config, or an error that is
+    /// justified by the host having no OS-level resolver config to fall back
+    /// to. Never tolerates a 0-server Ok config.
+    fn assert_usable(result: anyhow::Result<ResolverConfig>) {
+        match result {
+            Ok(cfg) => assert!(
+                !cfg.name_servers().is_empty(),
+                "resolver config must not have 0 name servers"
+            ),
+            Err(_) => assert!(
+                system_conf::read_system_conf().is_err(),
+                "get_dns_servers must not fail when system resolvers are available"
+            ),
+        }
+    }
+
     #[test]
     fn parse_dnscrypt_lines_skips_garbage_and_ipv6_stamps() {
         // dns.aa.net.uk published as an IPv4 DoH stamp and as an IPv6 DoH
         // stamp; the IPv6-only entry must be filtered out (allow_ipv6=false).
-        let text = concat!(
-            "# DNSCrypt resolver list (markdown header)\n",
-            "sdns://AgcAAAAAAAAADTIxNy4xNjkuMjAuMjIADWRucy5hYS5uZXQudWsKL2Rucy1xdWVyeQ\n",
-            "not a stamp\n",
-            "sdns://AgcAAAAAAAAAEFsyMDAxOjhiMDo6MjAyMl0ADWRucy5hYS5uZXQudWsKL2Rucy1xdWVyeQ\n",
+        let text = format!(
+            "# DNSCrypt resolver list (markdown header)\n{STAMP_IPV4}\nnot a stamp\n{STAMP_IPV6}\n"
         );
-        let parsed = parse_dnscrypt_lines(text);
+        let parsed = parse_dnscrypt_lines(&text);
         assert_eq!(parsed.len(), 1, "only the IPv4 stamp should parse");
         assert!(parsed[0].ip.is_ipv4());
     }
 
     #[tokio::test]
     async fn stale_cache_is_refreshed_or_falls_back_to_stale() -> anyhow::Result<()> {
-        // A cache older than 7 days triggers a refresh attempt; a failed
-        // refresh keeps the stale entries, a successful one rewrites the
-        // cache. Either way a non-empty config must come back.
+        // A cache older than 7 days triggers a refresh attempt; with the list
+        // unreachable the refresh fails and the stale entries must be kept.
         let dir = tempfile::tempdir()?;
         let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
-        tokio::fs::write(
-            &cache,
-            "sdns://AgcAAAAAAAAADTIxNy4xNjkuMjAuMjIADWRucy5hYS5uZXQudWsKL2Rucy1xdWVyeQ\n",
-        )
-        .await?;
+        tokio::fs::write(&cache, format!("{STAMP_IPV4}\n")).await?;
         let file = std::fs::File::options().write(true).open(&cache)?;
-        let eight_days = Duration::from_hours(192);
         file.set_times(
-            std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - eight_days),
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_hours(192)),
         )?;
         drop(file);
 
-        let cfg = get_dns_servers(dir.path()).await?;
-        assert!(
-            !cfg.name_servers().is_empty(),
-            "stale cache must still yield resolvers"
-        );
+        let cfg = get_dns_servers_from(dir.path(), UNREACHABLE_URL)
+            .await
+            .expect("failed refresh must keep the stale cache");
+        assert_eq!(cfg.name_servers().len(), 1, "stale cache entry must be kept");
         Ok(())
     }
 
     #[tokio::test]
     async fn empty_cache_is_not_used() -> anyhow::Result<()> {
         // An empty cache file (e.g. a rate-limit HTML page saved as 200) must
-        // never yield a 0-server config: get_dns_servers re-downloads the
-        // list or falls back to the system resolver config.
+        // never yield a 0-server config: re-download, and if that fails, the
+        // system resolver config.
         let dir = tempfile::tempdir()?;
         let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
         tokio::fs::write(&cache, "").await?;
-        let cfg = get_dns_servers(dir.path()).await.expect("resolver config");
+        let result = get_dns_servers_from(dir.path(), UNREACHABLE_URL).await;
+        assert_usable(result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_download_is_never_written() -> anyhow::Result<()> {
+        // A 200 response without any stamps (e.g. a rate-limit HTML page)
+        // must not be written to the cache and must not yield 0 servers.
+        let url = serve("<html>rate limited</html>".to_string()).await;
+        let dir = tempfile::tempdir()?;
+        let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
+        tokio::fs::write(&cache, "").await?;
+        let result = get_dns_servers_from(dir.path(), &url).await;
+        assert_usable(result);
+        let contents = tokio::fs::read_to_string(&cache).await?;
         assert!(
-            !cfg.name_servers().is_empty(),
-            "empty cache must not yield 0 servers"
+            contents.is_empty(),
+            "empty download must not be written to cache"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_succeeds_writes_cache() -> anyhow::Result<()> {
+        // A successful first download populates the cache (happy path).
+        let url = serve(format!("# DNSCrypt resolver list\n{STAMP_IPV4}\n")).await;
+        let dir = tempfile::tempdir()?;
+        let cache = dir.path().join(DNSCRYPT_RESOLVERS_CACHE);
+        let cfg = get_dns_servers_from(dir.path(), &url).await?;
+        assert_eq!(cfg.name_servers().len(), 1);
+        let contents = tokio::fs::read_to_string(&cache).await?;
+        assert_eq!(
+            contents,
+            format!("{STAMP_IPV4}\n"),
+            "cache must hold the sdns:// lines"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_write_failure_keeps_in_memory_list() -> anyhow::Result<()> {
+        // The cache path is a directory, so the atomic rename fails; the
+        // freshly downloaded list must still be returned — a failed cache
+        // write never fails DNS init.
+        let url = serve(format!("# DNSCrypt resolver list\n{STAMP_IPV4}\n")).await;
+        let dir = tempfile::tempdir()?;
+        tokio::fs::create_dir(dir.path().join(DNSCRYPT_RESOLVERS_CACHE)).await?;
+        let cfg = get_dns_servers_from(dir.path(), &url).await?;
+        assert_eq!(cfg.name_servers().len(), 1);
+
+        let mut entries = tokio::fs::read_dir(dir.path()).await?;
+        let mut count = 0;
+        while entries.next_entry().await?.is_some() {
+            count += 1;
+        }
+        assert_eq!(
+            count, 1,
+            "failed cache write must not leave temp files behind"
         );
         Ok(())
     }

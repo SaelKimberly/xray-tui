@@ -19,6 +19,9 @@ url.workspace = true
 # ============ Error Handling ============
 anyhow.workspace = true
 
+# ============ Observability ============
+tracing.workspace = true
+
 [lints]
 workspace = true
 
