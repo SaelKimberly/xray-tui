@@ -510,10 +510,16 @@ pub(crate) fn clash_transport_to_transport(
             let headers = headers.filter(|h| !h.is_empty());
             TransportConfig::Ws(WebSocketConfig {
                 path: w.path.clone().map(TinyText::from),
+                // Match the strip above case-insensitively, so a lowercase
+                // `host` header key still restores the vhost.
                 host: w
                     .headers
                     .as_ref()
-                    .and_then(|h| h.get("Host").cloned())
+                    .and_then(|h| {
+                        h.iter()
+                            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+                            .map(|(_, value)| value.clone())
+                    })
                     .map(TinyText::from),
                 headers,
                 max_early_data: w.max_early_data,
@@ -959,6 +965,31 @@ mod tests {
         ));
         assert!(!should_skip_param(&host_v6, "::1"));
         assert!(!should_skip_param(&host_v6, "anything"));
+    }
+
+    #[test]
+    fn clash_ws_lowercase_host_header_restores_vhost() {
+        let ws = ClashWSOpts {
+            path: Some("/ws".into()),
+            headers: Some(std::collections::HashMap::from([
+                ("host".to_string(), "cdn.example.com".to_string()),
+                ("X-Test".to_string(), "1".to_string()),
+            ])),
+            ..ClashWSOpts::default()
+        };
+        let t = clash_transport_to_transport(Some("ws"), &Some(ws), &None, &None, &None, &None, None);
+        match t {
+            TransportConfig::Ws(w) => {
+                assert_eq!(w.host.as_deref(), Some("cdn.example.com"));
+                let headers = w.headers.expect("non-host headers survive");
+                assert!(
+                    !headers.keys().any(|k| k.eq_ignore_ascii_case("host")),
+                    "host must not be double-represented: {headers:?}"
+                );
+                assert_eq!(headers.get("X-Test").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected Ws transport, got {other:?}"),
+        }
     }
 
     #[test]
