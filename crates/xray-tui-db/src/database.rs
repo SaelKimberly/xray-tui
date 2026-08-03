@@ -605,13 +605,16 @@ impl Database {
         Ok(())
     }
 
-    /// Record when a protocol was last activated. ts = unix seconds.
-    /// Runs in an explicit transaction — raw statements on a pooled turso
-    /// connection do not reliably commit in WAL mode.
+    /// Record when a protocol was last activated; also refreshes last_seen_at
+    /// so active use keeps a profile out of the Stale/purge lists. ts = unix
+    /// seconds. Runs in an explicit transaction — raw statements on a pooled
+    /// turso connection do not reliably commit in WAL mode.
     pub async fn update_last_used(&self, protocol_id: i64, ts: i64) -> Result<()> {
         let mut conn = self.db.connection().await?;
         let mut tx = conn.transaction().await?;
-        toasty::sql::statement("UPDATE protocol_rows SET last_used_at = ?1 WHERE id = ?2")
+        toasty::sql::statement(
+            "UPDATE protocol_rows SET last_used_at = ?1, last_seen_at = ?1 WHERE id = ?2",
+        )
             .bind(ts)
             .bind(protocol_id)
             .exec(&mut tx)

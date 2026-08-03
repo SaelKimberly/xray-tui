@@ -411,6 +411,43 @@ async fn test_stale_count_and_view() {
     assert_eq!(count, 1, "only ep2 should be stale");
 }
 
+// ── Task 14 — update_last_used refreshes last_seen_at ────────────────────
+
+#[tokio::test]
+async fn test_update_last_used_refreshes_last_seen_at() {
+    let db = test_db().await;
+    let gid = "touch";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let now = 10_000i64;
+    let stale_seen = now - 100_000; // pre-update last_seen_at (7+ days stale)
+
+    let ep = make_endpoint("203.0.113.7", 443);
+    let proto = ProtocolRow {
+        last_seen_at: stale_seen,
+        ..make_protocol(ep.id, "vmess", 7003)
+    };
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
+        .await
+        .unwrap();
+
+    // Threshold just above the pre-update last_seen_at: profile is stale
+    // until a connect refreshes it.
+    let before = db.get_active_endpoints(stale_seen + 1).await.unwrap();
+    assert!(
+        !before.iter().any(|r| r.endpoint.id == ep.id),
+        "untouched profile with stale last_seen_at must NOT be active"
+    );
+
+    // Connect: update_last_used must refresh last_seen_at, not just last_used_at.
+    db.update_last_used(proto.id, now).await.unwrap();
+    let active = db.get_active_endpoints(stale_seen + 1).await.unwrap();
+    assert!(
+        active.iter().any(|r| r.endpoint.id == ep.id),
+        "touched profile must count as active (last_seen_at refreshed)"
+    );
+}
+
 // ── Task 2.2 — Cross-subscription dedup, system groups, concurrent upsert ────
 
 #[tokio::test]
