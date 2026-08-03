@@ -655,6 +655,14 @@ fn center_pad(s: &str, width: usize) -> String {
     format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
 
+/// The row the footer describes: the FILTERED row at `selected_index`.
+/// With a search filter active, `selected_index` indexes the filtered list,
+/// not `state.endpoints` — resolving through `filtered_profiles()` keeps the
+/// footer in sync with the highlighted row (and the none-selected branch).
+pub(crate) fn footer_row(state: &AppState) -> Option<&EndpointRow> {
+    state.filtered_profiles().nth(state.selected_index)
+}
+
 fn render_footer(
     frame: &mut Frame,
     area: Rect,
@@ -665,31 +673,29 @@ fn render_footer(
         return;
     }
 
-    let has_profile = state.selected_index < state.endpoints.len();
+    let line = match footer_row(state) {
+        Some(row) => {
+            let core = state.resolved_core(row);
 
-    let line = if has_profile {
-        let row = &state.endpoints[state.selected_index];
-        let core = state.resolved_core(row);
-
-        let addr = if row.endpoint.host.is_empty() {
-            "-"
-        } else {
-            &row.endpoint.host
-        };
-        let port = row.endpoint.port.to_string();
-        Line::from(vec![
-            Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
-            Span::styled(
-                format!("{addr}:{port}  "),
-                ThemeStyles::footer_value(palette),
-            ),
-            Span::styled(format!("[{core}] "), ThemeStyles::footer_value(palette)),
-        ])
-    } else {
-        Line::from(Span::styled(
+            let addr = if row.endpoint.host.is_empty() {
+                "-"
+            } else {
+                &row.endpoint.host
+            };
+            let port = row.endpoint.port.to_string();
+            Line::from(vec![
+                Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
+                Span::styled(
+                    format!("{addr}:{port}  "),
+                    ThemeStyles::footer_value(palette),
+                ),
+                Span::styled(format!("[{core}] "), ThemeStyles::footer_value(palette)),
+            ])
+        }
+        None => Line::from(Span::styled(
             " Server: (none selected)",
             ThemeStyles::footer_label(palette),
-        ))
+        )),
     };
     let footer = Paragraph::new(line).style(ThemeStyles::status_footer(palette));
     frame.render_widget(footer, area);
@@ -904,5 +910,66 @@ mod tests {
         let heights = vec![1u16, 1, 10, 1, 1];
         let offset = compute_scroll_offset(&heights, 2, 8);
         assert!(offset < heights.len());
+    }
+
+    /// Minimal EndpointRow with just enough to be filtered and described:
+    /// host + port drive the search filter; protocols are irrelevant here.
+    fn endpoint_row(id: i64, host: &str, port: i32) -> EndpointRow {
+        use std::collections::HashMap;
+        use xray_tui_db::models::Endpoint;
+        EndpointRow {
+            endpoint: Endpoint {
+                id,
+                host: host.to_string(),
+                host_type: "ipv4".to_string(),
+                port,
+                port_spec_str: None,
+                parent_id: None,
+                last_source: None,
+                created_at: 0,
+                manual_protocol_override: None,
+                resolved_as: None,
+                resolved_at: None,
+            },
+            protocols: Vec::new(),
+            extensions: HashMap::new(),
+            stats: HashMap::new(),
+            selected_protocol: 0,
+            expanded: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn footer_row_resolves_filtered_row_not_endpoints() {
+        // `selected_index` indexes the FILTERED list. With a search filter
+        // active, the footer must describe the filtered row — NOT
+        // `endpoints[selected_index]`, which would show a different server
+        // than the highlighted row (and wrongly report "none selected").
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, xray_tui_config::AppConfig::default()).await;
+        state.endpoints = vec![
+            endpoint_row(1, "alpha.example", 443),
+            endpoint_row(2, "beta.example", 8443),
+            endpoint_row(3, "gamma.example", 443),
+        ];
+        state.search_query = "beta".to_string();
+        state.filter_cache_valid.set(false);
+        state.selected_index = 0;
+
+        // Only "beta.example" survives the filter, so filtered index 0 is the
+        // row at endpoints[1]; the old code showed alpha.example:443 instead.
+        let row = footer_row(&state).expect("filtered row should exist");
+        assert_eq!(row.endpoint.id, 2);
+        assert_eq!(row.endpoint.host, "beta.example");
+
+        // Selection past the filtered end → none selected, even though
+        // `endpoints.len()` (3) exceeds `selected_index` (1).
+        state.selected_index = 1;
+        assert!(footer_row(&state).is_none());
     }
 }
