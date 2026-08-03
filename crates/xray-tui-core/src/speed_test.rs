@@ -289,6 +289,18 @@ pub async fn speed_test(
     Ok(bits / elapsed.as_secs())
 }
 
+/// Wrap an I/O future in `timeout`; maps timeout to SpeedTestError::Timeout.
+async fn io_timeout<T>(
+    timeout: Duration,
+    fut: impl Future<Output = std::io::Result<T>>,
+) -> Result<T, SpeedTestError> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(SpeedTestError::Io(e)),
+        Err(_) => Err(SpeedTestError::Timeout(timeout)),
+    }
+}
+
 /// UDP test: verify UDP forwarding through SOCKS5 proxy via UDP ASSOCIATE.
 /// Sends a small DNS-like packet to 1.1.1.1:53 and checks for response.
 /// Returns round-trip duration.
@@ -307,9 +319,9 @@ pub async fn udp_test(
     let handshake = [5u8, 1, 0]; // VER=5, NMETHODS=1, METHOD=0(no auth)
     let (mut r, mut w) = tcp.into_split();
 
-    w.write_all(&handshake).await?;
+    io_timeout(test_timeout, w.write_all(&handshake)).await?;
     let mut response = [0u8; 2];
-    r.read_exact(&mut response).await?;
+    io_timeout(test_timeout, r.read_exact(&mut response)).await?;
     if response != [5, 0] {
         return Err(SpeedTestError::Proxy("SOCKS5 handshake failed".into()));
     }
@@ -318,10 +330,10 @@ pub async fn udp_test(
     // VER=5, CMD=3(UDP ASSOCIATE), RSV=0, ATYP=1(IPv4), BND.ADDR=0, BND.PORT=0
     let mut req = Vec::with_capacity(10);
     req.extend_from_slice(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
-    w.write_all(&req).await?;
+    io_timeout(test_timeout, w.write_all(&req)).await?;
 
     let mut header = [0u8; 10];
-    r.read_exact(&mut header).await?;
+    io_timeout(test_timeout, r.read_exact(&mut header)).await?;
     if header[1] != 0 {
         return Err(SpeedTestError::Proxy(
             "SOCKS5 UDP ASSOCIATE rejected".into(),
@@ -339,7 +351,7 @@ pub async fn udp_test(
     } else if atyp == 4 {
         // Read remaining bytes for full IPv6 response (header is only 10 bytes)
         let mut extra = [0u8; 10];
-        r.read_exact(&mut extra).await?;
+        io_timeout(test_timeout, r.read_exact(&mut extra)).await?;
         let mut full = [0u8; 20];
         full[..10].copy_from_slice(&header);
         full[10..].copy_from_slice(&extra);
@@ -354,7 +366,7 @@ pub async fn udp_test(
             u16::from_be_bytes([full[18], full[19]]),
         );
         let mut port_buf = [0u8; 2];
-        r.read_exact(&mut port_buf).await?;
+        io_timeout(test_timeout, r.read_exact(&mut port_buf)).await?;
         let port = u16::from_be_bytes(port_buf);
         (ip.to_string(), port)
     } else {
@@ -384,10 +396,10 @@ pub async fn udp_test(
     let udp_sock = timeout(test_timeout, tokio::net::UdpSocket::bind("0.0.0.0:0"))
         .await
         .map_err(|_| SpeedTestError::Timeout(test_timeout))??;
-    udp_sock.connect((relay_addr.as_str(), relay_port)).await?;
+    io_timeout(test_timeout, udp_sock.connect((relay_addr.as_str(), relay_port))).await?;
 
     let test_start = std::time::Instant::now();
-    udp_sock.send(&udp_packet).await?;
+    io_timeout(test_timeout, udp_sock.send(&udp_packet)).await?;
 
     // 3. Wait for response
     let mut buf = vec![0u8; 1500];
@@ -407,6 +419,30 @@ pub async fn udp_test(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn io_timeout_maps_elapsed_to_timeout_error() {
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok::<_, std::io::Error>(())
+        };
+        let result = io_timeout(Duration::from_millis(50), fut).await;
+        assert!(matches!(result, Err(SpeedTestError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn io_timeout_returns_value_when_fast() {
+        let fut = async { Ok::<_, std::io::Error>(42u32) };
+        let result = io_timeout(Duration::from_millis(100), fut).await;
+        assert!(matches!(result, Ok(42)));
+    }
+
+    #[tokio::test]
+    async fn io_timeout_maps_io_error() {
+        let fut = async { Err::<(), _>(std::io::Error::other("boom")) };
+        let result = io_timeout(Duration::from_millis(100), fut).await;
+        assert!(matches!(result, Err(SpeedTestError::Io(_))));
+    }
 
     #[tokio::test]
     async fn wait_for_socks5_timeout() {
