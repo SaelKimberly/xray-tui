@@ -912,7 +912,7 @@ mod tests {
         assert!(offset < heights.len());
     }
 
-    /// Minimal EndpointRow with just enough to be filtered and described:
+    /// Minimal `EndpointRow` with just enough to be filtered and described:
     /// host + port drive the search filter; protocols are irrelevant here.
     fn endpoint_row(id: i64, host: &str, port: i32) -> EndpointRow {
         use std::collections::HashMap;
