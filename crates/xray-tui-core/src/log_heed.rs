@@ -18,6 +18,10 @@ const LOG_DB_NAME: &str = "logs";
 /// Database name for seen targets (set).
 const TARGETS_DB_NAME: &str = "targets";
 
+/// Maximum resize attempts when LMDB reports MapFull while a reader holds a txn
+/// (EBUSY). The TUI's spawn_blocking readers are brief, so backoff is short.
+const RESIZE_MAX_ATTEMPTS: u32 = 5;
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 /// Big-endian u64 key type for heed — sort order matches chronological order.
@@ -120,8 +124,10 @@ impl HeedLogStorage {
 
     /// Write a batch of log entries in a single transaction.
     ///
-    /// If the map is full, doubles the map size (up to 8 GB max) and retries once.
-    /// On persistent failure, increments [`mapsize_full_count`] instead of emitting tracing events.
+    /// If the map is full, retries doubling the map size (up to 8 GB max) with
+    /// short backoff (resize can fail with EBUSY while a reader holds a txn),
+    /// then retries the batch once. On persistent failure, increments
+    /// [`mapsize_full_count`] instead of emitting tracing events.
     pub fn write_log_batch(&self, messages: &[LogMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -130,17 +136,41 @@ impl HeedLogStorage {
         match self.try_write_batch(messages) {
             Ok(()) => Ok(()),
             Err(HeedError::MapFull) => {
-                // MapFull — try to resize and retry once
+                // MapFull — grow the map with backoff, then retry the batch
                 let current = self.env.info().map_size;
                 let new_size = current.saturating_mul(2).min(8_589_934_592); // cap at 8 GB
                 if new_size <= current {
                     self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
                     return Ok(()); // can't grow further, swallow
                 }
-                // SAFETY: no active transactions at this point (the failed write_txn was
-                // already dropped when `try_write_batch` returned the MapFull error).
-                unsafe { self.env.resize(new_size) }.map_err(|e| HeedError::Env(e.to_string()))?;
-                // Retry once after resize
+                let mut attempt = 0u32;
+                loop {
+                    match resize_backoff(attempt) {
+                        Some(delay) => {
+                            // Readers are brief spawn_blocking reads; give them time to drop.
+                            std::thread::sleep(delay);
+                            // SAFETY: no active transactions at this point (the failed write_txn
+                            // was already dropped when `try_write_batch` returned the MapFull
+                            // error), and no other thread holds a write txn (write_log_batch is
+                            // only called from the single background writer task).
+                            match unsafe { self.env.resize(new_size) } {
+                                Ok(()) => break,
+                                Err(_e) => {
+                                    if attempt + 1 >= RESIZE_MAX_ATTEMPTS {
+                                        self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
+                                        return Ok(()); // swallow after exhaustion (see doc comment)
+                                    }
+                                    attempt += 1;
+                                }
+                            }
+                        }
+                        None => {
+                            self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                    }
+                }
+                // Retry once after resize; keep the batch if it still fails.
                 if self.try_write_batch(messages).is_err() {
                     self.mapsize_full_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -363,6 +393,18 @@ fn decode_entry(key: u64, value: &[u8]) -> Option<LogMessage> {
     Some(msg)
 }
 
+/// Backoff delay before resize attempt `attempt` (0-based), or `None` once the
+/// attempt budget is exhausted. Delays grow 50ms per attempt: 50..=250ms.
+fn resize_backoff(attempt: u32) -> Option<std::time::Duration> {
+    if attempt >= RESIZE_MAX_ATTEMPTS {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(
+            50 * (u64::from(attempt) + 1),
+        ))
+    }
+}
+
 // ── Error type ─────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -396,6 +438,32 @@ mod tests {
             message: format!("message_{}", i),
             timestamp_nanos: ts,
         }
+    }
+
+    #[test]
+    fn resize_retries_until_success_or_exhaustion() {
+        // Pure helper: attempt count / backoff decisions.
+        assert_eq!(
+            resize_backoff(0),
+            Some(std::time::Duration::from_millis(50))
+        );
+        assert_eq!(
+            resize_backoff(1),
+            Some(std::time::Duration::from_millis(100))
+        );
+        assert_eq!(
+            resize_backoff(2),
+            Some(std::time::Duration::from_millis(150))
+        );
+        assert_eq!(
+            resize_backoff(3),
+            Some(std::time::Duration::from_millis(200))
+        );
+        assert_eq!(
+            resize_backoff(4),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(resize_backoff(5), None); // give up after 5
     }
 
     #[test]
