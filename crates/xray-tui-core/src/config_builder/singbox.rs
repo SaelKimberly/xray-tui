@@ -196,8 +196,17 @@ fn build_proxy_outbound(
     })?;
     let address = endpoint.host.as_str();
     let port = endpoint.port as u16;
-    let user_id = ""; // TODO: cached on ProtocolRow
     let (p_settings, _s_settings) = parse_settings(protocol);
+    // Credentials live in p_settings (typed to_settings puts id/uuid/password
+    // there; the legacy path injects user_id as "id"). Same extraction as the
+    // xray builder.
+    let user_id = p_settings
+        .get("id")
+        .or_else(|| p_settings.get("uuid"))
+        .or_else(|| p_settings.get("password"))
+        .or_else(|| p_settings.get("pass"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let mut out = match proto {
         Protocol::Tuic => {
@@ -1130,6 +1139,28 @@ mod tests {
         let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
         assert!(tags.contains(&"direct"), "missing direct");
         assert!(tags.contains(&"block"), "missing block");
+    }
+
+    #[test]
+    fn proxy_outbound_uses_protocol_credentials_not_empty_user_id() {
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
+        // Typed TUIC to_settings puts uuid+password in p_settings.
+        set_protocol_settings_json(
+            &mut protocol,
+            r#"{"uuid": "11111111-2222-3333-4444-555555555555", "password": "sekrit"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        let outbounds = json["outbounds"].as_array().expect("outbounds");
+        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+        assert_eq!(
+            proxy["uuid"].as_str().unwrap(),
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(proxy["password"].as_str().unwrap(), "sekrit");
     }
 
     #[test]
