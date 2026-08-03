@@ -75,7 +75,16 @@ pub trait DataTableRow {
     /// Render row content into the buffer at the given y position.
     /// `col_xs` gives the starting x coordinate of each column.
     /// `col_widths` gives the pixel width of each column.
-    fn render(&self, col_xs: &[u16], col_widths: &[u16], buf: &mut Buffer, y: u16);
+    /// `clip_bottom` is the first line below the visible area; rows taller
+    /// than the viewport MUST NOT write at `y_line >= clip_bottom`.
+    fn render(
+        &self,
+        col_xs: &[u16],
+        col_widths: &[u16],
+        buf: &mut Buffer,
+        y: u16,
+        clip_bottom: u16,
+    );
 
     /// Row height in lines (default 1).
     /// Override for wrapping/multi-line rows such as log messages.
@@ -375,38 +384,40 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             state.offset = max_offset;
         }
 
-        // Render visible rows
+        // Render visible rows. Rows taller than the viewport are clipped at
+        // `bottom` (clip_bottom) instead of being skipped entirely, so a
+        // partially-visible row still draws and never writes past the frame.
+        let bottom = content_inner.bottom();
         let mut y = header_y;
         let mut row_idx = state.offset;
-        while y < content_inner.bottom() && row_idx < total_rows {
+        while y < bottom && row_idx < total_rows {
             let rh = row_heights[row_idx];
             if rh == 0 {
                 row_idx += 1;
                 continue;
             }
-            if y + rh > content_inner.bottom() {
-                break;
-            }
 
             let is_selected = state.selected == Some(row_idx);
             let is_multi = state.multi_selected.contains(&row_idx);
+            // Highlight only the visible part of the row.
+            let row_bottom = y.saturating_add(rh).min(bottom);
 
             // Apply selection/highlight styles via buffer background
             if is_selected {
-                for row_y in y..y + rh {
+                for row_y in y..row_bottom {
                     for x in content_inner.x..content_inner.right() {
                         buf[(x, row_y)].set_style(self.highlight_style);
                     }
                 }
             } else if is_multi {
-                for row_y in y..y + rh {
+                for row_y in y..row_bottom {
                     for x in content_inner.x..content_inner.right() {
                         buf[(x, row_y)].set_style(self.selection_style);
                     }
                 }
             }
 
-            self.rows[row_idx].render(&col_xs, &col_widths, buf, y);
+            self.rows[row_idx].render(&col_xs, &col_widths, buf, y, bottom);
 
             y += rh;
             row_idx += 1;
@@ -444,3 +455,101 @@ impl<R: DataTableRow> Widget for DataTable<'_, R> {
         StatefulWidget::render(self, area, buf, &mut state);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test row that records the `clip_bottom` it received and writes a
+    /// marker cell at its start line, obeying the same no-write-past-
+    /// `clip_bottom` invariant the real row types must follow.
+    struct ClipRow {
+        height: u16,
+        marker: char,
+        clip_seen: std::cell::Cell<u16>,
+    }
+
+    impl DataTableRow for ClipRow {
+        fn render(
+            &self,
+            col_xs: &[u16],
+            col_widths: &[u16],
+            buf: &mut Buffer,
+            y: u16,
+            clip_bottom: u16,
+        ) {
+            self.clip_seen.set(clip_bottom);
+            if y >= clip_bottom {
+                return;
+            }
+            let x = col_xs.first().copied().unwrap_or(0);
+            let w = col_widths.first().copied().unwrap_or(1) as usize;
+            buf.set_stringn(x, y, self.marker.to_string(), w, Style::default());
+        }
+
+        fn height(&self, _available_width: u16) -> u16 {
+            self.height
+        }
+    }
+
+    fn one_column_table(rows: &[ClipRow]) -> DataTable<'_, ClipRow> {
+        DataTable::new(vec![Column::new("h", ColumnWidth::Fixed(10))], rows)
+    }
+
+    #[test]
+    fn rows_taller_than_viewport_are_clipped_not_blank() {
+        // A single expanded-style row (height 10) in a 4-line area: the old
+        // render loop broke out and rendered nothing at all.
+        let rows = vec![ClipRow {
+            height: 10,
+            marker: 'A',
+            clip_seen: std::cell::Cell::new(0),
+        }];
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buf = Buffer::empty(area);
+        let mut state = DataTableState {
+            offset: 0,
+            selected: Some(0),
+            multi_selected: HashSet::new(),
+        };
+        StatefulWidget::render(one_column_table(&rows), area, &mut buf, &mut state);
+
+        // The row must have been told to clip exactly at the area bottom…
+        assert_eq!(rows[0].clip_seen.get(), 4, "clip_bottom must be the area bottom");
+        // …and must have rendered something (no blank table).
+        assert_eq!(buf[(0, 1)].symbol(), "A");
+        // Nothing may be written at or past the clip line.
+        assert_eq!(buf[(0, 3)].symbol(), " ");
+    }
+
+    #[test]
+    fn rows_taller_than_viewport_never_exceed_area_bottom() {
+        // Every row that renders must receive a clip_bottom at or below the
+        // area bottom — never above it.
+        let rows: Vec<ClipRow> = (0..3)
+            .map(|i| ClipRow {
+                height: 10,
+                marker: char::from(b'A' + i),
+                clip_seen: std::cell::Cell::new(0),
+            })
+            .collect();
+        let area = Rect::new(0, 0, 20, 6);
+        let mut buf = Buffer::empty(area);
+        let mut state = DataTableState {
+            offset: 0,
+            selected: None,
+            multi_selected: HashSet::new(),
+        };
+        StatefulWidget::render(one_column_table(&rows), area, &mut buf, &mut state);
+
+        assert!(
+            rows.iter().all(|r| r.clip_seen.get() <= 6),
+            "clip_bottom must never exceed the area bottom"
+        );
+        // First row rendered at y=1; the area below it stays empty.
+        assert_eq!(buf[(0, 1)].symbol(), "A");
+        assert_eq!(buf[(0, 5)].symbol(), " ");
+    }
+}
+
+

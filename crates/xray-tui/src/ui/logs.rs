@@ -31,8 +31,14 @@ impl DataTableRow for LogRow {
         col_widths: &[u16],
         buf: &mut ratatui::buffer::Buffer,
         y: u16,
+        clip_bottom: u16,
     ) {
         if col_xs.len() < 4 {
+            return;
+        }
+        // A multi-line log row may start below the clip line; its first
+        // visible line would be past the frame, so draw nothing.
+        if y >= clip_bottom {
             return;
         }
         buf.set_stringn(

@@ -56,7 +56,18 @@ struct DisplayRowData {
 }
 
 impl DataTableRow for DisplayRowData {
-    fn render(&self, col_xs: &[u16], col_widths: &[u16], buf: &mut Buffer, y: u16) {
+    fn render(
+        &self,
+        col_xs: &[u16],
+        col_widths: &[u16],
+        buf: &mut Buffer,
+        y: u16,
+        clip_bottom: u16,
+    ) {
+        // A row that starts past the clip line has nothing visible to draw.
+        if y >= clip_bottom {
+            return;
+        }
         let tree_marker = if self.has_sub_rows {
             if self.expanded { "▾" } else { "▶" }
         } else {
@@ -99,6 +110,7 @@ impl DataTableRow for DisplayRowData {
                 self.height(0) - 2,
                 total_w,
                 self.row_style,
+                clip_bottom,
             );
         }
     }
@@ -117,7 +129,8 @@ impl DataTableRow for DisplayRowData {
 impl DisplayRowData {
     /// Rounded panel under the endpoint line: IPs line, separator, sub-table.
     /// `panel_w` is the table's actual rendered width (viewport-capped) so the
-    /// panel never exceeds the buffer.
+    /// panel never exceeds the buffer. The panel is clipped to `clip_bottom`:
+    /// an expanded row taller than the viewport must not write past it.
     fn render_expansion_panel(
         &self,
         buf: &mut Buffer,
@@ -126,7 +139,13 @@ impl DisplayRowData {
         panel_height: u16,
         panel_w: u16,
         row_style: Style,
+        clip_bottom: u16,
     ) {
+        let visible_h = clip_bottom.saturating_sub(y0);
+        if visible_h == 0 {
+            return;
+        }
+        let panel_height = panel_height.min(visible_h);
         let rect = Rect {
             x: x0,
             y: y0,
@@ -142,19 +161,23 @@ impl DisplayRowData {
         let inner_w = (panel_w - 2) as usize;
 
         // IPs line (y0+1 is inside the top border)
-        let ips_text = format!(" IPs: {}", self.panel_ips);
-        buf.set_stringn(inner_x, y0 + 1, &ips_text, inner_w, row_style);
-        if self.panel_resolve_hint {
-            let hint = "(x resolve)";
-            let hx = inner_x + (inner_w.saturating_sub(hint.len())) as u16;
-            buf.set_stringn(hx, y0 + 1, hint, hint.len(), row_style);
+        if y0 + 1 < clip_bottom {
+            let ips_text = format!(" IPs: {}", self.panel_ips);
+            buf.set_stringn(inner_x, y0 + 1, &ips_text, inner_w, row_style);
+            if self.panel_resolve_hint {
+                let hint = "(x resolve)";
+                let hx = inner_x + (inner_w.saturating_sub(hint.len())) as u16;
+                buf.set_stringn(hx, y0 + 1, hint, hint.len(), row_style);
+            }
         }
 
         // Separator
-        let sep_x = inner_x;
-        let sep_y = y0 + 2;
-        let sep_line = "─".repeat(inner_w);
-        buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
+        if y0 + 2 < clip_bottom {
+            let sep_x = inner_x;
+            let sep_y = y0 + 2;
+            let sep_line = "─".repeat(inner_w);
+            buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
+        }
 
         // Sub-table rows
         let cols: [(usize, usize); 10] = [
@@ -171,6 +194,9 @@ impl DisplayRowData {
         ];
         for (n, pr) in self.panel_rows.iter().enumerate() {
             let y = y0 + 3 + n as u16;
+            if y >= clip_bottom {
+                break;
+            }
             let style = if Some(n) == self.panel_selected {
                 self.panel_selected_style
             } else {
@@ -571,7 +597,12 @@ fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16)
         h_sum += h;
         rows_from_end += 1;
     }
-    let max_offset = heights.len().saturating_sub(rows_from_end);
+    let mut max_offset = heights.len().saturating_sub(rows_from_end);
+    // A row taller than the viewport leaves nothing to fill it, so
+    // `rows_from_end` is 0 and the raw max_offset would equal `len` — the
+    // table would render nothing. Clamp so the last row is at least
+    // partially (clipped) visible.
+    max_offset = max_offset.min(heights.len().saturating_sub(1));
     // Minimum offset that still shows the selection's last line: when content
     // below the selection is taller than the viewport, jump toward the end.
     let o_min = above
@@ -795,8 +826,8 @@ mod tests {
         let col_widths = vec![1u16; 17];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
 
-        row0.render(&col_xs, &col_widths, &mut buf, 0);
-        row1.render(&col_xs, &col_widths, &mut buf, 8);
+        row0.render(&col_xs, &col_widths, &mut buf, 0, 20);
+        row1.render(&col_xs, &col_widths, &mut buf, 8, 20);
 
         // Panel (height 6) sits at y=1..6: bottom-left corner at y=6.
         assert_eq!(buf[(0, 6)].symbol(), "\u{2570}"); // ╰
@@ -844,5 +875,34 @@ mod tests {
         assert!(offset <= 20);
         let sel_start: u16 = heights[offset..20].iter().sum();
         assert!(sel_start + 1 <= 18);
+    }
+
+    #[test]
+    fn rows_taller_than_viewport_do_not_blank_table() {
+        // heights where the selected (tall) row exceeds the viewport:
+        // old code produced offset == len → nothing rendered.
+        let heights = vec![1u16, 1, 1, 1, 1, 10];
+        let offset = compute_scroll_offset(&heights, 5, 8);
+        assert!(offset < heights.len(), "offset must stay inside the row list");
+    }
+
+    #[test]
+    fn scroll_offset_keeps_tall_last_row_visible() {
+        // The tall selected row's start line must sit inside the viewport,
+        // not be pushed past the end of the row list.
+        let heights = vec![1u16, 1, 1, 1, 1, 10];
+        let offset = compute_scroll_offset(&heights, 5, 8);
+        assert!(offset < heights.len());
+        let sel_start: u16 = heights[offset..5].iter().sum();
+        assert!(sel_start <= 5);
+    }
+
+    #[test]
+    fn scroll_offset_tall_selected_row_mid_list_stays_inside() {
+        // Expanded row in the middle of the list: the offset must never
+        // escape the row list even though the row is taller than the viewport.
+        let heights = vec![1u16, 1, 10, 1, 1];
+        let offset = compute_scroll_offset(&heights, 2, 8);
+        assert!(offset < heights.len());
     }
 }
