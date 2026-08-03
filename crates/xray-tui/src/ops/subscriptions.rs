@@ -186,7 +186,6 @@ pub async fn delete_group(state: &mut AppState, group_id: &str) {
         );
         return;
     }
-    let _ = state.db.purge_expired(0).await;
     state.log_trace("info", "tui::ops::subscriptions", "Group deleted");
     state.confirmation = None;
     state.reload_groups().await;

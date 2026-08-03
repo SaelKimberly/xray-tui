@@ -696,3 +696,100 @@ async fn test_get_batch_for_real_ping_dedup_flag() {
     assert_eq!(without_dedup.len(), 1, "no-dedup returns the remaining queued");
     assert_eq!(without_dedup[0].protocol_id, proto2.id);
 }
+
+// ── Task 16 — delete_group removes orphaned profiles ────────────────────
+
+#[tokio::test]
+async fn test_delete_group_removes_orphaned_profiles() {
+    let db = test_db().await;
+    db.insert_group(&test_group("g1")).await.unwrap();
+    db.insert_group(&test_group("g2")).await.unwrap();
+
+    // g1 owns ep1 (two protocols); g2 owns ep2; ep3 is shared by both.
+    let ep1 = make_endpoint("1.2.3.4", 443);
+    db.subscription_upsert(
+        "g1",
+        &[(
+            ep1.clone(),
+            vec![
+                make_protocol(ep1.id, "vmess", 9001),
+                make_protocol(ep1.id, "vless", 9002),
+            ],
+        )],
+    )
+    .await
+    .unwrap();
+
+    let ep2 = make_endpoint("5.6.7.8", 443);
+    db.subscription_upsert("g2", &[(ep2.clone(), vec![make_protocol(ep2.id, "ss", 9003)])])
+        .await
+        .unwrap();
+
+    let ep3 = make_endpoint("9.9.9.9", 443);
+    db.subscription_upsert("g1", &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])])
+        .await
+        .unwrap();
+    db.subscription_upsert("g2", &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])])
+        .await
+        .unwrap();
+
+    // Delete g1 → ep1 becomes an orphan (no remaining group link), ep2 and
+    // shared ep3 must survive.
+    db.delete_group("g1").await.unwrap();
+
+    let all = db.get_active_endpoints(0).await.unwrap();
+    assert!(
+        !all.iter().any(|r| r.endpoint.id == ep1.id),
+        "g1-only profiles should be purged"
+    );
+    assert!(
+        all.iter().any(|r| r.endpoint.id == ep2.id),
+        "g2 profiles must remain"
+    );
+    assert!(
+        all.iter().any(|r| r.endpoint.id == ep3.id),
+        "profiles shared with another group must survive"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_group_preserves_cleared_group_profiles() {
+    let db = test_db().await;
+    db.insert_group(&test_group("gA")).await.unwrap();
+    db.insert_group(&test_group("gB")).await.unwrap();
+
+    let ep_a = make_endpoint("1.1.1.1", 443);
+    db.subscription_upsert("gA", &[(ep_a.clone(), vec![make_protocol(ep_a.id, "vmess", 9101)])])
+        .await
+        .unwrap();
+    let ep_b = make_endpoint("2.2.2.2", 443);
+    db.subscription_upsert("gB", &[(ep_b.clone(), vec![make_protocol(ep_b.id, "ss", 9102)])])
+        .await
+        .unwrap();
+
+    // clear_group only unlinks — the profile stays in the All view.
+    let cleared = db.clear_group("gA").await.unwrap();
+    assert_eq!(cleared, 1, "one link removed");
+    assert!(
+        db.get_active_endpoints(0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.endpoint.id == ep_a.id),
+        "cleared profile must remain after clear_group"
+    );
+
+    // Deleting an unrelated group must NOT purge the cleared profile (only
+    // endpoints whose sole link was the deleted group are purged).
+    db.delete_group("gB").await.unwrap();
+
+    let all = db.get_active_endpoints(0).await.unwrap();
+    assert!(
+        all.iter().any(|r| r.endpoint.id == ep_a.id),
+        "clear_group survivors must survive deleting another group"
+    );
+    assert!(
+        !all.iter().any(|r| r.endpoint.id == ep_b.id),
+        "deleted group's own profiles are purged"
+    );
+}

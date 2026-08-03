@@ -1013,6 +1013,29 @@ impl Database {
         let mut conn = self.db.connection().await?;
         let mut tx = conn.transaction().await?;
 
+        // Capture this group's endpoints BEFORE unlinking. The orphan purge
+        // below must be scoped to exactly these ids: profiles preserved by
+        // `clear_group` (which unlinks but keeps profiles in the All view)
+        // must survive deleting an unrelated group, so a global zero-link
+        // predicate is not safe.
+        let rows = toasty::sql::query("SELECT endpoint_id FROM endpoint_groups WHERE group_id = ?1")
+            .bind(id)
+            .exec(&mut tx)
+            .await?;
+        let group_endpoints: Vec<i64> = rows
+            .iter()
+            .filter_map(|v| {
+                if let Value::Record(fields) = v {
+                    fields.first().and_then(|f| match f {
+                        Value::I64(n) => Some(*n),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Remove group-endpoint links
         toasty::sql::statement("DELETE FROM endpoint_groups WHERE group_id = ?1")
             .bind(id)
@@ -1025,7 +1048,71 @@ impl Database {
             .exec(&mut tx)
             .await?;
 
+        // Delete profiles of this group's endpoints that now belong to no
+        // group (cascade order: extensions/stats/sessions reference
+        // protocol_rows, protocol_rows reference endpoints). Endpoints still
+        // linked to another group keep an endpoint_groups row and survive.
+        Self::delete_orphaned_profiles(&mut tx, &group_endpoints).await?;
+
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete all data of endpoints in `group_endpoints` that no longer
+    /// belong to ANY group. Scoped to the caller's group so profiles kept by
+    /// `clear_group` or shared with other groups are untouched. Runs inside
+    /// the caller's transaction.
+    async fn delete_orphaned_profiles(
+        tx: &mut dyn toasty::Executor,
+        group_endpoints: &[i64],
+    ) -> Result<()> {
+        if group_endpoints.is_empty() {
+            return Ok(());
+        }
+        let in_list = (1..=group_endpoints.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let orphan_where = format!(
+            "e.id IN ({in_list}) AND e.id NOT IN (SELECT DISTINCT endpoint_id FROM endpoint_groups)"
+        );
+
+        let statements = [
+            format!(
+                "DELETE FROM profile_extensions WHERE protocol_id IN ( \
+                 SELECT p.id FROM protocol_rows p \
+                 INNER JOIN endpoints e ON e.id = p.endpoint_id \
+                 WHERE {orphan_where})"
+            ),
+            format!(
+                "DELETE FROM server_stats WHERE protocol_id IN ( \
+                 SELECT p.id FROM protocol_rows p \
+                 INNER JOIN endpoints e ON e.id = p.endpoint_id \
+                 WHERE {orphan_where})"
+            ),
+            format!(
+                "DELETE FROM ping_sessions WHERE protocol_id IN ( \
+                 SELECT p.id FROM protocol_rows p \
+                 INNER JOIN endpoints e ON e.id = p.endpoint_id \
+                 WHERE {orphan_where})"
+            ),
+            format!(
+                "DELETE FROM protocol_rows WHERE endpoint_id IN ({in_list}) \
+                 AND endpoint_id NOT IN (SELECT DISTINCT endpoint_id FROM endpoint_groups)"
+            ),
+            format!(
+                "DELETE FROM endpoints WHERE id IN ({in_list}) \
+                 AND id NOT IN (SELECT DISTINCT endpoint_id FROM endpoint_groups)"
+            ),
+        ];
+
+        for sql in statements {
+            let mut stmt = toasty::sql::statement(sql);
+            for ep_id in group_endpoints {
+                stmt = stmt.bind(*ep_id);
+            }
+            stmt.exec(tx).await?;
+        }
         Ok(())
     }
 
