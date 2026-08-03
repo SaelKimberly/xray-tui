@@ -94,6 +94,26 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
     });
 }
 
+/// Get the shared core pool, creating it lazily on first use.
+///
+/// Both single real pings and batch phase 2 draw ports from this pool's single
+/// allocator, so a warm pooled core and a batch core can never collide on a port.
+fn get_or_create_pool(state: &mut AppState) -> Arc<CorePool> {
+    if let Some(p) = &state.core_pool {
+        return p.clone();
+    }
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| Path::new(".").to_path_buf())
+        .join("xray-tui");
+    let bin_dir = config_dir.join("bin");
+    let bin_configs_dir = config_dir.join("binConfigs");
+    let proxy_addr = state.config.inbound.listen.clone();
+    let base_port = state.config.inbound.socks_port;
+    let pool = Arc::new(CorePool::new(bin_dir, bin_configs_dir, proxy_addr, base_port));
+    state.core_pool = Some(pool.clone());
+    pool
+}
+
 /// Start real ping (HTTP through proxy) using a pooled warm core for single-ping reuse.
 ///
 /// The pool is created lazily on first use. Subsequent single pings reuse the same core:
@@ -134,25 +154,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
     state.testing_profiles.insert(protocol_id);
 
     // Lazily create the core pool on first use
-    let pool = if let Some(p) = &state.core_pool {
-        p.clone()
-    } else {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| Path::new(".").to_path_buf())
-            .join("xray-tui");
-        let bin_dir = config_dir.join("bin");
-        let bin_configs_dir = config_dir.join("binConfigs");
-        let proxy_addr = state.config.inbound.listen.clone();
-        let base_port = state.config.inbound.socks_port;
-        let pool = Arc::new(CorePool::new(
-            bin_dir,
-            bin_configs_dir,
-            proxy_addr,
-            base_port,
-        ));
-        state.core_pool = Some(pool.clone());
-        pool
-    };
+    let pool = get_or_create_pool(state);
 
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_api_url = state.config.speed_test.ip_api_url.clone();
@@ -389,6 +391,16 @@ async fn batch_upsert_buffer(
     }
 }
 
+/// RAII guard: while phase 2 (batch real ping) is alive, the pool's
+/// `batch_active` flag stays set so concurrent single pings skip pool reuse.
+struct BatchActiveGuard(Arc<AtomicBool>);
+
+impl Drop for BatchActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Dispatch a batch of real-ping sessions through multi-inbound config.
 /// Groups profiles by `core_type` (xray/sing-box), builds multi-inbound config,
 /// starts one core per group, fires concurrent HTTP pings, collects results.
@@ -402,7 +414,7 @@ async fn dispatch_real_ping_batch(
     completed_endpoints: &Arc<std::sync::Mutex<HashSet<(String, u16)>>>,
     dedup_endpoints: bool,
     batch_id: &str,
-    base_proxy_port: u16,
+    port_allocator: Arc<AtomicU16>,
     proxy_addr: &str,
     bin_dir: &std::path::Path,
     bin_configs_dir: &std::path::Path,
@@ -426,7 +438,6 @@ async fn dispatch_real_ping_batch(
         u16,
     )> = Vec::new();
 
-    let mut port_counter = base_proxy_port + 1;
     for session in sessions {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -457,8 +468,9 @@ async fn dispatch_real_ping_batch(
         };
         let proto = Protocol::try_from_i32(session.config_type).unwrap_or(Protocol::Custom);
         let core_type = resolve_core(proto, None);
-        let assigned_port = port_counter;
-        port_counter += 1;
+        // Draw from the pool's shared allocator — batch and single pings can
+        // never collide on a port.
+        let assigned_port = port_allocator.fetch_add(1, Ordering::Relaxed);
 
         match core_type {
             CoreType::Xray => xray_items.push((profile, session.clone(), assigned_port)),
@@ -723,7 +735,6 @@ pub fn start_sieve(
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_api_url = state.config.speed_test.ip_api_url.clone();
     let proxy_addr = state.config.inbound.listen.clone();
-    let base_proxy_port = state.config.inbound.socks_port;
 
     let config_dir_path = dirs::config_dir()
         .unwrap_or_else(|| Path::new(".").to_path_buf())
@@ -731,6 +742,11 @@ pub fn start_sieve(
     let bin_dir = config_dir_path.join("bin");
     let bin_configs_dir = config_dir_path.join("binConfigs");
     let real_ping_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
+
+    // Phase 2 (real ping) draws ports from the pool's shared allocator so batch
+    // cores and a warm pooled core can never collide. Create the pool here
+    // (before the spawn) — `state` isn't available inside the spawned task.
+    let pool = get_or_create_pool(state);
 
     // Phase 2 wave-ordered window: profiles to accumulate before waking Phase 2
     let real_ping_window = state.config.speed_test.real_ping_window.max(1);
@@ -805,7 +821,7 @@ pub fn start_sieve(
                 let phase2_ping_url = ping_url.clone();
                 let phase2_ip_api_url = ip_api_url.clone();
                 let phase2_proxy_addr = proxy_addr.clone();
-                let phase2_base_port = base_proxy_port;
+                let phase2_pool = pool.clone();
                 let phase2_bin_dir = bin_dir.clone();
                 let phase2_configs_dir = bin_configs_dir.clone();
                 let phase2_concurrency = real_ping_concurrency;
@@ -814,6 +830,12 @@ pub fn start_sieve(
                 let phase2_log_tx = state_log_tx.clone();
 
                 let handle = tokio::spawn(async move {
+                    // Keep `batch_active` set for the whole phase-2 task so
+                    // concurrent single pings yield to multi-inbound.
+                    let batch_flag = phase2_pool.batch_active_flag();
+                    batch_flag.store(true, Ordering::Relaxed);
+                    let _batch_active = BatchActiveGuard(batch_flag);
+
                     let mut buffer: Vec<PingResultUpdate> = Vec::new();
 
                     loop {
@@ -850,7 +872,7 @@ pub fn start_sieve(
                                     &phase2_completed,
                                     phase2_dedup_endpoints,
                                     &phase2_batch_id,
-                                    phase2_base_port,
+                                    phase2_pool.port_allocator(),
                                     &phase2_proxy_addr,
                                     &phase2_bin_dir,
                                     &phase2_configs_dir,
@@ -901,7 +923,7 @@ pub fn start_sieve(
                                 &phase2_completed,
                                 phase2_dedup_endpoints,
                                 &phase2_batch_id,
-                                phase2_base_port,
+                                phase2_pool.port_allocator(),
                                 &phase2_proxy_addr,
                                 &phase2_bin_dir,
                                 &phase2_configs_dir,

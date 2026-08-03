@@ -82,6 +82,13 @@ impl CorePool {
         self.batch_active.clone()
     }
 
+    /// Shared monotonically-increasing port allocator. Batch real ping and the
+    /// pool both draw from this counter so they can never collide.
+    #[must_use]
+    pub fn port_allocator(&self) -> Arc<AtomicU16> {
+        self.next_port.clone()
+    }
+
     /// Run a real ping for a single profile, using the pool if possible.
     ///
     /// If a warm core of the correct type exists and is within TTL, reuse it.
@@ -258,7 +265,14 @@ impl CorePool {
                     retries,
                 )
                 .await;
-                self.build_result(config_type, endpoint, rp_result)
+                let result = self.build_result(config_type, endpoint, rp_result);
+
+                // TTL reaper: if this ping alone pushed the pooled core past
+                // POOL_TTL, stop+evict it now so its port is freed promptly
+                // (rather than lingering until the next reuse check).
+                self.reap_stale_core().await;
+
+                result
             } else {
                 // Evict stale or wrong-type core
                 if let Some(mut old) = guard.take() {
@@ -417,6 +431,22 @@ impl CorePool {
         .await
     }
 
+    /// Stop+evict the pooled core if it has been idle past [`POOL_TTL`],
+    /// freeing its port promptly. The under-TTL case leaves the warm core in
+    /// the pool untouched for reuse.
+    async fn reap_stale_core(&self) {
+        let mut guard = self.core.lock().await;
+        // Inspect BEFORE taking — the normal (under-TTL) case must leave the
+        // warm core in the pool for reuse.
+        if guard
+            .as_ref()
+            .is_some_and(|pooled| pooled.last_used.elapsed() >= POOL_TTL)
+            && let Some(mut stale) = guard.take()
+        {
+            let _ = stale.manager.stop().await;
+        }
+    }
+
     /// Build `BuildParams` for a single-profile pool core.
     fn build_single_params(&self, port: u16) -> BuildParams {
         BuildParams {
@@ -490,5 +520,118 @@ impl Drop for CorePool {
         if let Ok(mut guard) = self.core.try_lock() {
             drop(guard.take());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_builder::BackendConfig;
+    use crate::process::ProcessError;
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Records `stop()` calls instead of managing a real core process.
+    struct FakeManager {
+        stopped: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CoreManager for FakeManager {
+        async fn start(
+            &mut self,
+            _core_type: CoreType,
+            _config: &BackendConfig,
+            _binary_path: &std::path::Path,
+            _clash_mixin: Option<&serde_json::Value>,
+        ) -> Result<(), ProcessError> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<(), ProcessError> {
+            self.stopped.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn running_core_type(&self) -> Option<CoreType> {
+            Some(CoreType::Xray)
+        }
+
+        fn sighup_reload(&self) -> Result<u32, ProcessError> {
+            Ok(0)
+        }
+
+        async fn rewrite_config(
+            &self,
+            _config: &BackendConfig,
+            _clash_mixin: Option<&serde_json::Value>,
+        ) -> Result<(), ProcessError> {
+            Ok(())
+        }
+    }
+
+    fn pool_with_core(last_used: Instant) -> (CorePool, Arc<AtomicUsize>) {
+        let pool = CorePool::new(
+            PathBuf::from("/tmp/not-used-bin"),
+            PathBuf::from("/tmp/not-used-configs"),
+            "127.0.0.1".to_string(),
+            10800,
+        );
+        let stopped = Arc::new(AtomicUsize::new(0));
+        {
+            let mut guard = pool.core.try_lock().unwrap();
+            *guard = Some(PooledCore {
+                core_type: CoreType::Xray,
+                port: 10801,
+                manager: Box::new(FakeManager {
+                    stopped: stopped.clone(),
+                }),
+                last_used,
+            });
+        }
+        (pool, stopped)
+    }
+
+    #[tokio::test]
+    async fn port_allocator_is_monotonic_and_shared() {
+        let pool = CorePool::new(
+            PathBuf::from("/tmp/not-used-bin"),
+            PathBuf::from("/tmp/not-used-configs"),
+            "127.0.0.1".to_string(),
+            10800,
+        );
+        let a = pool.port_allocator();
+        let b = pool.port_allocator();
+        assert!(Arc::ptr_eq(&a, &b), "same shared counter");
+        let p1 = a.fetch_add(1, Ordering::Relaxed);
+        let p2 = b.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(p2, p1 + 1);
+    }
+
+    #[tokio::test]
+    async fn reap_keeps_fresh_core_in_pool() {
+        // Regression: an under-TTL pooled core must survive the reaper so a
+        // second reuse doesn't pay the full cold-start cost.
+        let (pool, stopped) = pool_with_core(Instant::now());
+        pool.reap_stale_core().await;
+        let guard = pool.core.lock().await;
+        assert!(guard.is_some(), "under-TTL core must survive the TTL reaper");
+        drop(guard);
+        assert_eq!(stopped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reap_evicts_stale_core() {
+        // An over-TTL core is stopped and evicted, freeing its port promptly.
+        let (pool, stopped) = pool_with_core(Instant::now() - POOL_TTL - Duration::from_secs(1));
+        pool.reap_stale_core().await;
+        let guard = pool.core.lock().await;
+        assert!(guard.is_none(), "over-TTL core must be evicted");
+        drop(guard);
+        assert_eq!(stopped.load(Ordering::Relaxed), 1);
     }
 }
