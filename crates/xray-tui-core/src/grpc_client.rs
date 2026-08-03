@@ -15,6 +15,11 @@ use proto_gen as proto;
 /// Shared gRPC API endpoint on localhost.
 pub const API_ENDPOINT: &str = "http://127.0.0.1:62789";
 
+/// Timeout for establishing the gRPC channel (TCP + HTTP/2 handshake).
+const GRPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Per-call deadline for gRPC stats requests.
+const GRPC_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ── Error type ──────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +30,10 @@ pub enum GrpcError {
     Status(#[from] tonic::Status),
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
+    #[error("gRPC call timed out after {0:?}")]
+    Timeout(std::time::Duration),
+    #[error("gRPC error: {0}")]
+    Other(String),
 }
 
 // ── System stats struct ─────────────────────────────────────────────
@@ -66,8 +75,20 @@ pub struct GrpcStatsClient {
 
 impl GrpcStatsClient {
     pub async fn connect() -> Result<Self, GrpcError> {
-        let channel = tonic::transport::Endpoint::new(API_ENDPOINT)
-            .expect("valid API_ENDPOINT URI")
+        Self::connect_timeout(API_ENDPOINT, GRPC_CONNECT_TIMEOUT).await
+    }
+
+    /// Connect to an arbitrary gRPC endpoint with an explicit connect timeout.
+    async fn connect_timeout(
+        endpoint: &str,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self, GrpcError> {
+        let uri = endpoint
+            .parse::<tonic::transport::Uri>()
+            .map_err(|e| GrpcError::Other(e.to_string()))?;
+        let channel = tonic::transport::Endpoint::from(uri)
+            .connect_timeout(connect_timeout)
+            .timeout(GRPC_CALL_TIMEOUT)
             .connect()
             .await?;
         Ok(Self { channel })
@@ -78,22 +99,28 @@ impl GrpcStatsClient {
 impl StatsProvider for GrpcStatsClient {
     async fn query_stats(&self, pattern: &str, reset: bool) -> Result<Vec<proto::Stat>, GrpcError> {
         let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
-        let response = client
-            .query_stats(tonic::Request::new(proto::QueryStatsRequest {
+        let response = tokio::time::timeout(
+            GRPC_CALL_TIMEOUT,
+            client.query_stats(tonic::Request::new(proto::QueryStatsRequest {
                 pattern: pattern.to_string(),
                 reset,
                 patterns: vec![],
                 regexp: false,
-            }))
-            .await?;
+            })),
+        )
+        .await
+        .map_err(|_| GrpcError::Timeout(GRPC_CALL_TIMEOUT))??;
         Ok(response.into_inner().stat)
     }
 
     async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
         let mut client = proto::stats_service_client::StatsServiceClient::new(self.channel.clone());
-        let response = client
-            .get_sys_stats(tonic::Request::new(proto::SysStatsRequest {}))
-            .await?;
+        let response = tokio::time::timeout(
+            GRPC_CALL_TIMEOUT,
+            client.get_sys_stats(tonic::Request::new(proto::SysStatsRequest {})),
+        )
+        .await
+        .map_err(|_| GrpcError::Timeout(GRPC_CALL_TIMEOUT))??;
         let s = response.into_inner();
         Ok(SysStats {
             num_goroutine: s.num_goroutine,
@@ -265,6 +292,21 @@ mod tests {
         assert_eq!(format_uptime(120), "2m 0s");
         assert_eq!(format_uptime(3600), "1h");
         assert_eq!(format_uptime(3661), "1h 1m 1s");
+    }
+
+    #[tokio::test]
+    async fn connect_to_unreachable_port_times_out_fast() {
+        let t = std::time::Instant::now();
+        let result = GrpcStatsClient::connect_timeout(
+            "http://127.0.0.1:1", // nothing listens here
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "must fail fast"
+        );
     }
 
     #[tokio::test]
