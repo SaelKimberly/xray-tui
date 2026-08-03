@@ -60,26 +60,32 @@ impl PortSpec {
         true
     }
     pub fn add_range(&mut self, range: Range<u16>) {
-        let mut merged = false;
+        // Coalesce every decl that touches the new range into one span: ranges whose
+        // port sets intersect it (end-inclusive touch, so a boundary port shared with
+        // an adjacent range counts) and singles inside it are all removed and re-added
+        // as a single merged range.
+        let mut new_start = range.start;
+        let mut new_end = range.end;
+        let mut removed_len = 0usize;
         self.ports.retain_mut(|decl| match decl {
-            // If single-port entry persist in range, remove
-            &mut PortDecl::Single(p) if range.contains(&p) => false,
-            // If range is fully or partially contained in existing range, merge them into one
-            PortDecl::Range(r) if range.contains(&r.start) || range.contains(&r.end) => {
-                let old_len = r.len();
-                merged = true;
-                r.start = range.start.min(r.start);
-                r.end = range.end.max(r.end);
-                let new_len = r.len();
-                self.total += new_len - old_len;
-                true
+            &mut PortDecl::Single(p) if range.contains(&p) => {
+                removed_len += 1;
+                new_start = new_start.min(p);
+                new_end = new_end.max(p);
+                false
+            }
+            PortDecl::Range(r) if r.start <= range.end && r.end >= range.start => {
+                removed_len += usize::from(r.end) - usize::from(r.start) + 1;
+                new_start = new_start.min(r.start);
+                new_end = new_end.max(r.end);
+                false
             }
             _ => true,
         });
-        if !merged {
-            self.total += range.len();
-            self.ports.push(PortDecl::Range(range));
-        }
+        self.total = self.total.saturating_sub(removed_len);
+        // Range<u16> end is inclusive here: (end - start + 1) ports.
+        self.total += usize::from(new_end) - usize::from(new_start) + 1;
+        self.ports.push(PortDecl::Range(new_start..new_end));
     }
 
     pub const fn contains(&self, port: u16) -> bool {
@@ -239,6 +245,59 @@ mod tests {
         assert_eq!(all.len(), 65535);
         assert_eq!(all[0], 1);
         assert_eq!(*all.last().unwrap(), 65535);
+    }
+
+    #[test]
+    fn add_range_coalesces_overlapping_decls() {
+        let mut spec = PortSpec::new();
+        spec.add_range(10..20);
+        spec.add_range(30..40);
+        spec.add_range(15..35);
+        assert_eq!(spec.length(), 31, "10..=40 is 31 ports, no duplicates");
+        assert_eq!(spec.total, 31, "total must match length");
+        let mut all: Vec<u16> = spec.iter().collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 31);
+        assert_eq!(all.first(), Some(&10));
+        assert_eq!(*all.last().unwrap(), 40);
+    }
+
+    #[test]
+    fn add_range_contained_range_preserves_total() {
+        let mut spec = PortSpec::new();
+        spec.add_range(1..10);
+        spec.add_range(3..5);
+        assert_eq!(spec.length(), 10);
+        assert_eq!(spec.total, 10);
+        assert_eq!(spec.iter().count(), 10);
+        assert!(spec.contains(3));
+        assert!(spec.contains(5));
+        assert!(spec.contains(10));
+    }
+
+    #[test]
+    fn add_range_coalesces_boundary_touching_ranges() {
+        // Low range added first, then higher range sharing the boundary port.
+        let mut a = PortSpec::new();
+        a.add_range(20..30);
+        a.add_range(30..40);
+        assert_eq!(a.length(), 21, "20..=40 is 21 ports");
+        assert_eq!(a.total, 21);
+        assert_eq!(a.iter().count(), 21);
+        assert_eq!(a.iter().filter(|&p| p == 30).count(), 1, "shared port yielded once");
+        assert_eq!(a.iter_raw().count(), 1, "one coalesced span");
+
+        // Higher range added first, then lower range touching at the shared port
+        // (this order slipped through the old half-open predicate).
+        let mut b = PortSpec::new();
+        b.add_range(30..40);
+        b.add_range(20..30);
+        assert_eq!(b.length(), 21);
+        assert_eq!(b.total, 21);
+        assert_eq!(b.iter().count(), 21);
+        assert_eq!(b.iter().filter(|&p| p == 30).count(), 1);
+        assert_eq!(b.iter_raw().count(), 1);
     }
 
     #[test]
