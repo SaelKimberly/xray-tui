@@ -28,6 +28,8 @@ cargo run
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
 - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain) with per-profile validation via ValidationSettings
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
+- `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing (dns-stamp-parser) → hickory-resolver 0.26 config, cached resolver list, panic-free async OnceCell init
+- `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup (maxminddb 0.30)
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting
@@ -214,6 +216,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Tests go next to code in same file (unit) or `tests/` (integration)
 - Use `thiserror` for error types
 - Use `anyhow` for error propagation where appropriate
+- Dependency organization: root `[workspace.dependencies]` holds only deps used by 2+ crates or architecture-driving crates; single-crate deps are declared in the crate's own manifest with a minor-version bound pinned to the latest release (transitive deps named directly: minor bound if upstream allows, else `*`)
 - Use `semver` for version parsing and comparison (backend updater)
 - Use `serde` for JSON serialization
 - Use `tokio` for async runtime

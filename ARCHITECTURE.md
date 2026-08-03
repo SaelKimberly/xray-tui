@@ -9,6 +9,9 @@ xray-tui (bin)
   ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
   └── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
         └── xray-tui-proto  (ProtocolConfig types for import/export round-trip)
+
+xray-tui-dns    (standalone lib — not yet consumed by other crates)
+xray-tui-geoip  (standalone lib — not yet consumed by other crates)
 ```
 
 ## Crate Responsibilities
@@ -476,6 +479,35 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 - `socks://`, `http://`, `hysteria2://`, `hysteria://`, `tuic://`, `naive://`, `anytls://`, `shadowtls://`, `wireguard://` — Various URI schemes
 - Subscription format auto-detection (base64 list, plain list, v2rayN, sing-box)
 - Export share URL generation (mirrors `Fmt/*.cs` in v2rayN)
+
+### xray-tui-dns (library crate)
+
+`crates/xray-tui-dns/src/lib.rs` — secure DNS resolution through the DNSCrypt public resolver list.
+
+```rust
+pub struct DnsResolver { cache_dir: PathBuf, resolver: tokio::sync::OnceCell<TokioResolver> }
+impl DnsResolver {
+    pub fn new(cache_dir: impl Into<PathBuf>) -> Self;
+    pub async fn lookup_ip(&self, hostname: &str, allow_ipv6: bool) -> anyhow::Result<Vec<IpAddr>>;
+}
+```
+
+`lookup_ip` short-circuits IP literals (no DNS). Otherwise it lazily builds a `hickory_resolver` 0.26 `TokioResolver` configured from the DNSCrypt public-resolver list: `sdns://` stamps parsed by `dns-stamp-parser` (DnsPlain→UDP, DoH→HTTPS, DoT→TLS, DoQ→QUIC), filtered to NO_LOGS+NO_FILTER servers, with the resolver list cached as `dsncrypt.resolvers.txt` under the caller-supplied `cache_dir`. 500ms timeout + RoundRobin ordering (ResolverOpts). TLS cert roots come from hickory's `webpki-roots` feature — no direct rustls dependency. Init uses the OnceCell get-then-set pattern so a failed (offline) first init retries on the next call.
+
+### xray-tui-geoip (library crate)
+
+`crates/xray-tui-geoip/src/lib.rs` — IP → country/city lookup from a GeoLite2-City mmdb.
+
+```rust
+pub struct Location { pub country: String, pub city_en: Option<String> }
+pub struct GeoIp { db_path: PathBuf, reader: tokio::sync::OnceCell<Arc<Reader<Vec<u8>>>> }
+impl GeoIp {
+    pub fn new(db_path: impl Into<PathBuf>) -> Self;
+    pub async fn location_by_ip(&self, ip: IpAddr) -> anyhow::Result<Option<Location>>;
+}
+```
+
+On first use downloads the mmdb (P3TERX GeoLite mirror) to `db_path` via reqwest (partial-file cleanup on failure), opens it with `maxminddb::Reader::open_readfile` (whole DB in RAM), and runs lookups + `decode_path` inside `spawn_blocking` (LookupResult borrows the Reader, so `Arc<Reader>` moves into the closure). Country is required; missing city yields `city_en: None`.
 
 ## Data Flow: Connect to Proxy
 

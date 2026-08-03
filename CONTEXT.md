@@ -13,6 +13,8 @@ crates/
 ├── xray-tui-db/       # Library: toasty ORM persistence layer + Model definitions
 ├── xray-tui-proto/    # Library: protocol config types, URL parse/format, Clash YAML (20 protocols)
 ├── xray-tui-config/   # Library: import/export parsers, form fields, AppConfig management
+├── xray-tui-dns/      # Library: secure DNS resolution via DNSCrypt stamps (DOH/DOT/DOQ)
+├── xray-tui-geoip/    # Library: country/city lookup by IP (GeoLite2-City mmdb)
 thirdparty/
 ├── Xray-core/         # Source of truth for protocols and behavior
 ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
@@ -53,6 +55,8 @@ AGENTS.md
 | **batch_progress** | `Arc<(AtomicU16, AtomicU16)>` shared between ping tasks and status bar — tracks (completed, total) for batch speed tests. |
 | **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
 | **Fast Ping** | Transport-level latency test using TCP handshake (TcpPingAdapter), UDP datagram (UdpPingAdapter), or QUIC handshake (QuicPingAdapter). Dispatched by FastPingManager based on protocol support. |
+| **DnsResolver** | Per-instance resolver (xray-tui-dns): resolves hostnames through the DNSCrypt public resolver list (DOH/DOT/DOQ stamps), with on-disk resolver cache in a caller-supplied directory. IP literals short-circuit. |
+| **Location** | GeoIP lookup result (xray-tui-geoip): country ISO code + optional English city name, from a GeoLite2-City mmdb downloaded on first use. |
 | **PingSession** | SQLite record tracking a single ping attempt: batch_id, profile_id, adapter_type (TCP/UDP/QUIC), latency_ms, ip_info, error. Enables persistent history and async progress tracking via AtomicU16 counters. |
 | **Transport** | Network layer used for outbound connections (TCP, WebSocket, gRPC, QUIC, etc.) |
 | **Stream Security** | TLS/REALITY/None wrapper around transport |
@@ -91,6 +95,8 @@ AGENTS.md
 - `crates/xray-tui-core/src/ping/real/pool.rs` — CorePool: single warm core for single-ping reuse, atomic port allocation, SIGHUP/stop-restart reload
 - `crates/xray-tui-core/src/config_builder/clash_mixin.rs` — Clash YAML overlay
 - `crates/xray-tui-core/src/bin_manager.rs` — binary discovery and archive extraction
+- `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing → hickory-resolver 0.26 config, cached resolver list, panic-free async init
+- `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup
 
 ## Key Differences from v2rayN
 
@@ -132,4 +138,4 @@ AGENTS.md
 
 **Implemented**: All 20 protocol config types, URL parsing for 14 protocols, Clash YAML conversion for 17 protocols, dual-backend (xray + sing-box), gRPC stats, subscription lifecycle, speed test system (TCP/real/speed/UDP/batch), routing rules CRUD, DNS settings, system proxy (HTTP_PROXY env vars), TUN toggle, theme system, inline form validation, backend auto-updates, geo file updates, Mux config, TLS/REALITY/ECH/Fragment form fields, Clash Mixin.
 
-**Not implemented**: Proxy chain/policy groups, process-based routing, multi-URL subscriptions, SIP008 format, Clash API proxy/connections TUI tabs, PAC mode, WebDAV backup/restore, full TUN config (stack, MTU, route exclude), global hotkeys, i18n system, QR code display, config template editor, auto startup, sudo/polkit integration, drag-drop sort, tray integration.
+**Not implemented**: DNS endpoint IP resolution in TUI and Location Info column (xray-tui-dns + xray-tui-geoip crates adopted and vetted, TUI integration pending), proxy chain/policy groups, process-based routing, multi-URL subscriptions, SIP008 format, Clash API proxy/connections TUI tabs, PAC mode, WebDAV backup/restore, full TUN config (stack, MTU, route exclude), global hotkeys, i18n system, QR code display, config template editor, auto startup, sudo/polkit integration, drag-drop sort, tray integration.

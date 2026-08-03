@@ -1,0 +1,28 @@
+[package]
+name = "xray-tui-geoip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# ============ Geo ============
+maxminddb = { version = "0.30", features = ["simdutf8"] }
+
+# ============ Async Runtime & I/O ============
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt"] }
+
+# ============ Networking ============
+reqwest.workspace = true
+
+# ============ Error Handling ============
+anyhow.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,27 @@
+[package]
+name = "xray-tui-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# ============ DNS ============
+hickory-resolver = { version = "0.26", features = ["tls-ring", "https-ring", "quic-ring", "webpki-roots"] }
+dns-stamp-parser = "3.0.1"
+
+# ============ Async Runtime & I/O ============
+tokio = { workspace = true, features = ["sync", "fs", "io-util"] }
+
+# ============ Networking ============
+reqwest.workspace = true
+url.workspace = true
+
+# ============ Error Handling ============
+anyhow.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -165,3 +165,9 @@
 - ☐ Config backup/restore — WebDAV cloud backup with scheduled auto-backup
 - ☐ JSON config import/export — export full profile as JSON, import auto-detect format
 - ☐ QR code display — render share URL as ANSI QR code in terminal
+
+## Phase 10 — DNS & GeoIP
+
+- ✅ xray-tui-dns + xray-tui-geoip crates adopted — DNSCrypt-stamp DNS resolution (DOH/DOT/DOQ via hickory-resolver 0.26) and GeoLite2-City IP → country/city lookup (maxminddb 0.30). Panic-free async init, per-instance cache dirs, workspace style clean (fmt/clippy/tests). Not yet wired into TUI.
+- ☐ Resolve actual IP addresses of DNS-based endpoints in TUI
+- ☐ Location Info column — inbound IP country/city + outbound IP country/city with fancy look
