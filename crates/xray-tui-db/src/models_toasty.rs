@@ -26,6 +26,7 @@ pub struct Endpoint {
 /// `ProtocolRow`: a protocol configuration. Replaces Profile.
 /// PK = uid = sig ^ `cred_hash` (same as old Profile.id).
 #[derive(Debug, Clone, toasty::Model)]
+#[index(endpoint_id)]
 pub struct ProtocolRow {
     #[key]
     pub id: i64, // = uid = sig ^ cred_hash (same as old Profile.id)

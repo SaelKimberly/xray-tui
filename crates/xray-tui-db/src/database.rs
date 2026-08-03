@@ -54,8 +54,8 @@ impl Database {
         // toasty 0.9 uses CREATE TABLE without IF NOT EXISTS, so we must
         // only run push_schema on fresh databases. Existing databases are
         // upgraded in place by an explicit transaction of idempotent
-        // ALTER TABLE statements.
-        const SCHEMA_VERSION: i64 = 2;
+        // ALTER TABLE / CREATE INDEX statements.
+        const SCHEMA_VERSION: i64 = 3;
         let rows = toasty::sql::query("PRAGMA user_version")
             .exec(&mut conn)
             .await?;
@@ -109,6 +109,18 @@ impl Database {
                 "cache_ttl_secs",
                 "ALTER TABLE dns_settings ADD COLUMN cache_ttl_secs INTEGER",
             )
+            .await?;
+            // get_active_endpoints' correlated MAX(last_seen_at) subquery
+            // needs an index on protocol_rows(endpoint_id) or it full-scans
+            // per endpoint. push_schema only runs on fresh databases, so
+            // existing ones get the index here. The name matches toasty's
+            // generated `index_protocol_rows_by_endpoint_id`, keeping the
+            // migration idempotent with push_schema-created databases.
+            toasty::sql::statement(
+                "CREATE INDEX IF NOT EXISTS index_protocol_rows_by_endpoint_id \
+                 ON protocol_rows (endpoint_id)",
+            )
+            .exec(&mut tx)
             .await?;
             toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                 .exec(&mut tx)
@@ -1927,5 +1939,93 @@ mod tests {
         // Reopening again must be a no-op (idempotent).
         let db2 = Database::open(&path).await.expect("reopen");
         assert!(db2.get_endpoint(0).await.is_ok());
+    }
+
+    /// `get_active_endpoints` runs a correlated subquery
+    /// `(SELECT COALESCE(MAX(p2.last_seen_at), 0) FROM protocol_rows p2
+    /// WHERE p2.endpoint_id = e.id)` once per endpoint. Without an index on
+    /// `protocol_rows(endpoint_id)` every subquery is a full table scan, so
+    /// profile lists degrade quadratically. Prove the schema (created by
+    /// toasty's `push_schema` from the model) has an index covering it.
+    #[tokio::test]
+    async fn protocol_rows_are_indexed_by_endpoint_id() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.db.connection().await.expect("connection");
+
+        // sqlite_master records every CREATE INDEX; the autoindex behind the
+        // PRIMARY KEY has NULL sql and never matches. Assert a real index on
+        // protocol_rows references the endpoint_id column.
+        let rows = toasty::sql::query(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'protocol_rows' \
+               AND sql LIKE '%endpoint_id%'",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("query sqlite_master for protocol_rows indexes");
+        assert!(
+            !rows.is_empty(),
+            "protocol_rows has no index on endpoint_id; \
+             get_active_endpoints' correlated MAX(last_seen_at) subquery \
+             full-scans the table once per endpoint"
+        );
+    }
+
+    /// Simulate a database created before the endpoint_id index existed
+    /// (schema version 2, index dropped) and prove that `Database::open`
+    /// recreates the index in place — push_schema never runs on existing
+    /// databases, so the migration transaction must.
+    #[tokio::test]
+    async fn test_open_migrates_adds_endpoint_id_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("indexless.db");
+
+        // 1. Build the current schema, then drop the endpoint_id index and
+        //    rewind user_version to 2 — the shape of a pre-index database.
+        {
+            let driver = toasty_driver_turso::Turso::file(&path);
+            let db = toasty::Db::builder()
+                .models(toasty::models!(
+                    Endpoint,
+                    ProtocolRow,
+                    EndpointGroup,
+                    Group,
+                    ProfileExtension,
+                    ServerStat,
+                    PingSession,
+                    RoutingRule,
+                    DnsSetting
+                ))
+                .build(driver)
+                .await
+                .expect("build db");
+            db.push_schema().await.expect("push schema");
+            let mut conn = db.connection().await.expect("connection");
+            toasty::sql::statement("DROP INDEX IF EXISTS index_protocol_rows_by_endpoint_id")
+                .exec(&mut conn)
+                .await
+                .expect("drop endpoint_id index");
+            toasty::sql::query("PRAGMA user_version = 2")
+                .exec(&mut conn)
+                .await
+                .expect("set version 2");
+        }
+
+        // 2. Reopen through the app's Database — the migration must recreate
+        //    the index (a query touching endpoint_id would otherwise scan).
+        let db = Database::open(&path).await.expect("open migrates index");
+        let mut conn = db.db.connection().await.expect("connection");
+        let rows = toasty::sql::query(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'protocol_rows' \
+               AND sql LIKE '%endpoint_id%'",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("query sqlite_master for protocol_rows indexes");
+        assert!(
+            !rows.is_empty(),
+            "open() migration did not recreate the protocol_rows(endpoint_id) index"
+        );
     }
 }
