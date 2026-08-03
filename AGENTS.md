@@ -20,11 +20,11 @@ cargo run
 - `crates/xray-tui-db/src/lib.rs` — re-export hub; Database, DatabaseError, Result public
 - `crates/xray-tui-db/src/error.rs` — DatabaseError, Result, ProfileWithDetails
 - `crates/xray-tui-db/src/database.rs` — Database struct + all public query/write methods (toasty ORM, replaced raw turso SQLite)
-- `crates/xray-tui-proto/src/` — Protocol config types (VMess, VLESS, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard, Hysteria2, Hysteria1, TUIC, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR) with URL parsing/splitting infrastructure + Clash YAML conversion. Adopted from sub-healer project. 94 unit + 3 doc tests.
+- `crates/xray-tui-proto/src/` — Protocol config types (VMess, VLESS, Trojan, Shadowsocks, SOCKS, HTTP, WireGuard, Hysteria2, Hysteria1, TUIC, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR) with URL parsing/splitting infrastructure + Clash YAML conversion. Adopted from sub-healer project. 137 unit + 3 doc tests.
 - `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Profile, Connection, Group, ProfileExtension, ServerStat, Subscription, RoutingRule, DnsSetting, PingSession); non-model types (ProfileWithDetails, PingResultUpdate); constants (GRAVEYARD_GROUP_ID, ALL_GROUP_ID)
 - `crates/xray-tui-core/src/config_builder/mod.rs` — BackendConfig enum, BuildParams, BuildError, ConfigBuilder struct, shared `parse_settings()` (extracts p_settings/s_settings from ProtocolRow spec_blob)
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
-- `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + GrpcStatsClient + factory (unified from former XrayGrpcClient/SingBoxGrpcClient)
+- `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + GrpcStatsClient + MockStatsProvider (test double) + factory (unified from former XrayGrpcClient/SingBoxGrpcClient)
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
 - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain) with per-profile validation via ValidationSettings
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
@@ -40,7 +40,7 @@ cargo run
 - `crates/xray-tui-core/src/ping/real/mod.rs` — RealPingManager: launches temp core binary to test profile via SOCKS5 HTTP requests with IP info fetch. Port pool via `next_ping_port: Arc<AtomicU16>` + `allocate_port()` shared across concurrent tasks.
 - `crates/xray-tui-core/src/ping/real/pool.rs` — CorePool: single warm core process for single-ping reuse with SIGHUP reload (sing-box) or stop+restart (xray-core). POOL_TTL (30s). Atomic port allocation. Error propagation.
 - `crates/xray-tui-core/src/log_heed.rs` — HeedLogStorage: LMDB-backed persistent log storage (postcard-encoded LogMessage entries, two databases for logs + targets)
-- `crates/xray-tui-core/src/process.rs` — CoreManager subprocess lifecycle, stdout/stderr capture via log channel
+- `crates/xray-tui-core/src/process.rs` — CoreManager trait (start/stop/is_running/running_core_type/sighup_reload/rewrite_config) + RealCoreManager (subprocess lifecycle, stdout/stderr capture via required log_tx: Sender<String>) + MockCoreManager (test double)
 - `crates/xray-tui-proto/src/clash/mod.rs` — Clash YAML proxy structs (ClashProxy enum + 29 per-protocol Clash config structs with kebab-case serde) for bidirectional conversion between Clash YAML and internal ProtocolConfig types
 
 ### TUI screens (crates/xray-tui/src/ui/)

@@ -55,7 +55,11 @@ pub async fn poll_core_events(state: &mut AppState) {
                 state.connection_error = Some(err.clone());
                 state.connecting = false;
                 state.connected_core = None;
-                state.log_trace("error", "core::process", &format!("Connection error: {err}"));
+                state.log_trace(
+                    "error",
+                    "core::process",
+                    &format!("Connection error: {err}"),
+                );
                 state.connected_protocol_id = None;
             }
             CoreEvent::StatsError(msg) => {
@@ -80,7 +84,11 @@ pub async fn poll_core_events(state: &mut AppState) {
                     protocol_row: Default::default(),
                 };
                 if let Err(e) = state.db.upsert_server_stats(&stats).await {
-                    state.log_trace("error", "tui::ops::events", &format!("Failed to save stats: {e}"));
+                    state.log_trace(
+                        "error",
+                        "tui::ops::events",
+                        &format!("Failed to save stats: {e}"),
+                    );
                 }
                 // Update in-memory endpoint row to avoid full reload
                 if let Some(row) = state
@@ -382,7 +390,10 @@ pub async fn poll_core_events(state: &mut AppState) {
                         .unwrap_or_default();
                 }
             }
-            CoreEvent::BatchProgress { total, completed: _ } => {
+            CoreEvent::BatchProgress {
+                total,
+                completed: _,
+            } => {
                 if total == 0 {
                     state.batch_progress = None;
                 }

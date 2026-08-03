@@ -73,7 +73,7 @@ impl Database {
 
         if current_version < SCHEMA_VERSION {
             db.push_schema().await?;
-            toasty::sql::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                 .exec(&mut conn)
                 .await?;
         }
@@ -1036,7 +1036,7 @@ impl Database {
     /// Create a ping batch.
     ///
     /// `profiles` optionally provides `(protocol_id, sort_order)` pairs — when set,
-    /// only those profiles get sessions and their sort_order replaces `triplet_rank`.
+    /// only those profiles get sessions and their `sort_order` replaces `triplet_rank`.
     /// `group_id` is ignored when `profiles` is `Some`.
     pub async fn create_ping_batch(
         &self,

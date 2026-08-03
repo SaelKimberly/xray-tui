@@ -34,7 +34,7 @@
 - ✅ Set default server, move/reorder servers
 ## Phase 3 — Core Integration
 
-- ✅ **Dual-backend CoreManager** — common trait with xray and sing-box implementations
+- ✅ **Dual-backend CoreManager** — `CoreManager` is a Rust trait (start/stop/is_running/running_core_type/sighup_reload/rewrite_config); `RealCoreManager` spawns xray or sing-box subprocesses (requires `log_tx: Sender<String>`), `MockCoreManager` is a test double with `Option<String>` error fields
 - ✅ `CoreProcess` for xray-core (spawn `xray run -c <path>`)
 - ✅ `SingBoxProcess` for sing-box (spawn `sing-box run -c <path>`)
 - ✅ Config builder split: `config_builder_xray.rs` (xray-core JSON) + `config_builder_singbox.rs` (sing-box JSON)
@@ -81,7 +81,7 @@
 - ✅ Logs tab — wire core stdout/stderr pipeline to TUI display with live scrolling, color-coded log levels, and keyboard navigation (Up/Down/PgUp/PgDn/Home/End)
 - ✅ Sing-box config builder completeness — config generation for all 17 outbound protocols (ShadowsocksR, Hysteria v1, Naive, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, VMess, VLESS, Trojan, WireGuard) via 12 new protocol arms + build_tls helper + protocol code mapping
 ✅ WireGuard sing-box peer model — complete form fields for multi-peer arrays, pre-shared keys, allowed IPs
-- ✅ Sub-healer profile model adoption — uid-based PK (sig ^ cred_hash), spec_blob (postcard-encoded ProtocolConfig) replaces flat fields, Connection table for many-to-many Profile↔Group, bridge traits (ProfileLegacy/ProfileMut) for old parse/format compatibility, xray-tui-proto crate with protocol config types. All 253 workspace tests pass.
+- ✅ Sub-healer profile model adoption — uid-based PK (sig ^ cred_hash), spec_blob (postcard-encoded ProtocolConfig) replaces flat fields, Connection table for many-to-many Profile↔Group, bridge traits (ProfileLegacy/ProfileMut) for old parse/format compatibility, xray-tui-proto crate with protocol config types. All 401 workspace tests pass.
 - ✅ Advanced form fields — multiplex, V2Ray transport (WS/gRPC/QUIC/HTTPUpgrade), TLS options (ECH, uTLS fingerprint, Fragment) all added to protocol forms
 - ✅ ProfileCore dedup — normalized schema (profile_cores + group_profiles) eliminates redundant storage for shared configs
 - ✅ Version update check — GitHub releases API, download, install with .bak rollback, Updates settings form with per-core status

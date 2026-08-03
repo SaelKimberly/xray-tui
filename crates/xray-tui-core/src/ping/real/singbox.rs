@@ -2,7 +2,7 @@ use super::super::{PingResult, ProfileKey};
 use super::RealPingManager;
 use crate::bin_manager::find_binary;
 use crate::config_builder::{BuildParams, ConfigBuilder};
-use crate::process::CoreManager;
+use crate::process::RealCoreManager;
 use crate::protocol::Protocol;
 use crate::protocol_core_mapping::resolve_core;
 use tokio::sync::mpsc;
@@ -76,7 +76,7 @@ pub(super) async fn real_ping(
                 tracing::warn!(target: "core::real_ping::singbox", "{line}");
             }
         });
-        let mut manager = CoreManager::with_log_channel(temp_dir_path.clone(), log_line_tx);
+        let mut manager = RealCoreManager::new(temp_dir_path.clone(), log_line_tx);
         manager
             .start(resolved_core, &backend_config, &bin_path, None)
             .await

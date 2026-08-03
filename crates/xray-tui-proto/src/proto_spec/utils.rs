@@ -8,7 +8,6 @@ use crate::urlx::{HostSpec, PortSpec, RawUrlX, TinyText};
 
 use super::ParseError;
 
-
 /// Check that a host is not loopback, private, or localhost.
 ///
 /// # Errors
@@ -38,7 +37,6 @@ fn validate_host_not_private(host: &HostSpec) -> Result<(), ParseError> {
     }
     Ok(())
 }
-
 
 /// Parse host:port from a string, returning (`HostSpec`, `PortSpec`)
 ///

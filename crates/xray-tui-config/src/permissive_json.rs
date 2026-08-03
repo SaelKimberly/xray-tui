@@ -898,4 +898,139 @@ mod tests {
         assert_eq!(v["c"], "d");
         assert_eq!(v["e"], "f");
     }
+
+    // ── Truncated strings (lone backslash before end of input) ──
+
+    #[test]
+    fn test_truncated_lone_backslash_in_string() {
+        // A string ending with a lone backslash (no escape char follow)
+        // The parser should error rather than loop or produce garbage
+        assert!(permissive_json_core(b"{\"key\": \"trailing-backslash\\").is_err());
+    }
+
+    #[test]
+    fn test_truncated_backslash_before_quote() {
+        // Backslash before closing quote: "key\" without end
+        assert!(permissive_json_core(b"{\"key\": \"val\\").is_err());
+    }
+
+    #[test]
+    fn test_escaped_quote_in_string() {
+        // Valid escaped quote: "key\"mid"
+        let (_, v) = permissive_json_core(b"{\"key\": \"val\\\"mid\"}").unwrap();
+        assert_eq!(v["key"], "val\"mid");
+    }
+
+    // ── Unicode escape sequences (\\uXXXX) ──
+
+    #[test]
+    fn test_unicode_escape_basic() {
+        // \u0041 = 'A'
+        let (_, v) = permissive_json_core(b"{\"key\": \"\\u0041\"}").unwrap();
+        assert_eq!(v["key"], "A");
+    }
+
+    #[test]
+    fn test_unicode_escape_accented() {
+        // \u00e9 = '\u00e9'
+        let (_, v) = permissive_json_core(b"{\"key\": \"caf\\u00e9\"}").unwrap();
+        assert_eq!(v["key"], "caf\u{00e9}");
+    }
+
+    #[test]
+    fn test_unicode_escape_lowercase_hex() {
+        // \u0041 = 'A', lowercase hex digits
+        let (_, v) = permissive_json_core(b"{\"key\": \"\\u0041\"}").unwrap();
+        assert_eq!(v["key"], "A");
+    }
+
+    #[test]
+    fn test_multiple_unicode_escapes() {
+        // Multiple \uXXXX in one string
+        let (_, v) = permissive_json_core(b"\"\\u0048\\u0065\\u006c\\u006c\\u006f\"").unwrap();
+        assert_eq!(v, "Hello");
+    }
+
+    // ── Deeply nested structures ──
+
+    #[test]
+    fn test_deeply_nested_arrays() {
+        // 10 levels of nested arrays — must not stack overflow
+        let mut input = b"[".repeat(10);
+        input.extend(b"1");
+        input.extend(b"]".repeat(10));
+        let (_, v) = permissive_json_core(&input).unwrap();
+        // Unwrap to verify depth
+        let mut current = &v;
+        for _ in 0..10 {
+            current = &current[0];
+        }
+        assert_eq!(current, 1);
+    }
+
+    #[test]
+    fn test_deeply_nested_objects() {
+        // 10 levels of nested objects — must not stack overflow
+        let mut input = b"{\"a\":".repeat(10);
+        input.extend(b"1");
+        input.extend(b"}".repeat(10));
+        let (_, v) = permissive_json_core(&input).unwrap();
+        let mut current = &v;
+        for _ in 0..10 {
+            current = &current["a"];
+        }
+        assert_eq!(current, 1);
+    }
+
+    #[test]
+    fn test_deeply_nested_mixed() {
+        // Alternating object/array nesting
+        let mut input = b"{\"a\":[".repeat(5);
+        input.extend(b"1");
+        input.extend(b"]}".repeat(5));
+        let (_, v) = permissive_json_core(&input).unwrap();
+        let mut current = &v;
+        for _ in 0..5 {
+            current = &current["a"][0];
+        }
+        assert_eq!(current, 1);
+    }
+
+    // ── Empty keys/values ──
+
+    #[test]
+    fn test_empty_key() {
+        let (_, v) = permissive_json_core(b"{\"\": \"value\"}").unwrap();
+        assert_eq!(v[""], "value");
+    }
+
+    #[test]
+    fn test_empty_value() {
+        let (_, v) = permissive_json_core(b"{\"key\": \"\"}").unwrap();
+        assert_eq!(v["key"], "");
+    }
+
+    #[test]
+    fn test_empty_key_and_value() {
+        let (_, v) = permissive_json_core(b"{\"\": \"\"}").unwrap();
+        assert_eq!(v[""], "");
+    }
+
+    #[test]
+    fn test_empty_key_single_quotes() {
+        let (_, v) = permissive_json_core(b"{'' : 'value'}").unwrap();
+        assert_eq!(v[""], "value");
+    }
+
+    #[test]
+    fn test_empty_value_single_quotes() {
+        let (_, v) = permissive_json_core(b"{'key' : ''}").unwrap();
+        assert_eq!(v["key"], "");
+    }
+
+    #[test]
+    fn test_empty_nested_object() {
+        let (_, v) = permissive_json_core(b"{\"a\": {\"\": \"inner\"}}").unwrap();
+        assert_eq!(v["a"][""], "inner");
+    }
 }

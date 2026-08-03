@@ -41,13 +41,13 @@ pub(crate) fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
     let mut p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
     // Inject `user_id` as `id` into p_settings if absent (legacy parsers store
     // UUID/PW at top level, not inside protocol_settings).
-    if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str()) {
-        if let Some(obj) = p_settings.as_object_mut() {
-            if !obj.contains_key("id") && !obj.contains_key("uuid") {
-                obj.entry("id".to_string())
-                    .or_insert(serde_json::Value::String(user_id.to_string()));
-            }
-        }
+    if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str())
+        && let Some(obj) = p_settings.as_object_mut()
+        && !obj.contains_key("id")
+        && !obj.contains_key("uuid")
+    {
+        obj.entry("id".to_string())
+            .or_insert(serde_json::Value::String(user_id.to_string()));
     }
     let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
     (p_settings, s_settings)
@@ -134,8 +134,7 @@ impl ConfigBuilder {
                 Ok(BackendConfig::Xray(config))
             }
             CoreType::SingBox => {
-                let config =
-                    singbox::SingBoxConfigBuilder::build_multi(items, base_params, dns)?;
+                let config = singbox::SingBoxConfigBuilder::build_multi(items, base_params, dns)?;
                 Ok(BackendConfig::SingBox(config))
             }
             CoreType::Auto => Err(BuildError::InvalidProfile(
@@ -265,5 +264,122 @@ mod tests {
         let result =
             ConfigBuilder::build(&endpoint, &protocol, CoreType::Auto, &params, &rules, &dns);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_settings_empty_blob() {
+        let protocol = ProtocolRow {
+            spec_blob: vec![],
+            config_type: 0,
+            id: 0,
+            endpoint_id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            core_type: String::new(),
+            transport: None,
+            security: None,
+            remarks: None,
+            created_at: 0,
+            last_seen_at: 0,
+            endpoint: Default::default(),
+            extension: Default::default(),
+            server_stat: Default::default(),
+        };
+        let (p, s) = parse_settings(&protocol);
+        assert_eq!(p, serde_json::json!({}));
+        assert_eq!(s, serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_settings_legacy_format() {
+        let blob = serde_json::to_vec(&serde_json::json!({
+            "user_id": "some-uuid",
+            "stream_settings": {"network": "ws"}
+        }))
+        .unwrap();
+        let protocol = ProtocolRow {
+            spec_blob: blob,
+            config_type: 0,
+            id: 0,
+            endpoint_id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            core_type: String::new(),
+            transport: None,
+            security: None,
+            remarks: None,
+            created_at: 0,
+            last_seen_at: 0,
+            endpoint: Default::default(),
+            extension: Default::default(),
+            server_stat: Default::default(),
+        };
+        let (p, s) = parse_settings(&protocol);
+        assert_eq!(s.get("network").and_then(|v| v.as_str()), Some("ws"));
+        assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("some-uuid"));
+    }
+
+    #[test]
+    fn build_xray_vmess_json_structure() {
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
+        let (params, rules, dns) = default_params();
+        let config =
+            ConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+                .unwrap();
+        match config {
+            BackendConfig::Xray(xray_config) => {
+                let json = serde_json::to_value(&xray_config).unwrap();
+                assert!(
+                    json.get("outbounds").is_some(),
+                    "xray config missing outbounds"
+                );
+                assert!(
+                    json.get("inbounds").is_some(),
+                    "xray config missing inbounds"
+                );
+                assert!(json.get("routing").is_some(), "xray config missing routing");
+                assert!(json.get("dns").is_some(), "xray config missing dns");
+                // Verify outbounds is a non-empty array
+                let outbounds = json.get("outbounds").and_then(|v| v.as_array()).unwrap();
+                assert!(!outbounds.is_empty(), "outbounds should not be empty");
+            }
+            _ => panic!("expected BackendConfig::Xray"),
+        }
+    }
+
+    #[test]
+    fn build_singbox_tuic_json_structure() {
+        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
+        let (params, rules, dns) = default_params();
+        let config = ConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            CoreType::SingBox,
+            &params,
+            &rules,
+            &dns,
+        )
+        .unwrap();
+        match config {
+            BackendConfig::SingBox(singbox_config) => {
+                let json = serde_json::to_value(&singbox_config).unwrap();
+                assert!(
+                    json.get("outbounds").is_some(),
+                    "singbox config missing outbounds"
+                );
+                assert!(
+                    json.get("inbounds").is_some(),
+                    "singbox config missing inbounds"
+                );
+                assert!(json.get("route").is_some(), "singbox config missing route");
+                assert!(json.get("dns").is_some(), "singbox config missing dns");
+                // Verify outbounds is a non-empty array
+                let outbounds = json.get("outbounds").and_then(|v| v.as_array()).unwrap();
+                assert!(!outbounds.is_empty(), "outbounds should not be empty");
+            }
+            _ => panic!("expected BackendConfig::SingBox"),
+        }
     }
 }

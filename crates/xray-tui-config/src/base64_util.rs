@@ -114,4 +114,96 @@ mod tests {
         assert_eq!(result.len(), 6);
         assert!(result.starts_with(b"hel"));
     }
+
+    #[test]
+    fn test_url_safe_vs_standard_auto_detect_ambiguous() {
+        // String valid in both URL-safe and standard: alphanumeric only
+        let result = decode_base64("aGVsbG8").unwrap(); // "hello" in both encodings
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_url_safe_vs_standard_auto_detect_standard_specific() {
+        // Contains '+' (standard-only): must auto-detect as standard
+        // base64(">\xff\xff") in standard = Pv//, but we need '+'
+        // '>' = 0x3E = 62 in base64 = '+' in standard
+        // Let's use a string whose standard encoding contains '+'
+        let data = [0xFB, 0xFB, 0xFB]; // 3 bytes that produce base62 values
+        let std_b64 = base64_simd::STANDARD_NO_PAD.encode_to_string(data);
+        assert!(
+            std_b64.contains('+') || std_b64.contains('/'),
+            "must contain standard-only chars: {std_b64}"
+        );
+        let result = decode_base64(&std_b64).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_percent_encoded_plus_sign() {
+        // %2B is '+' (standard base64 char). The decoder percent-decodes then
+        // tries to decode as base64. Standard decode should work.
+        let data = b"hello+world";
+        let std_b64 = base64_simd::STANDARD_NO_PAD.encode_to_string(data);
+        // Double-encode: percent-encode the '+' in the base64
+        let double_encoded = std_b64.replace('+', "%2B");
+        let result = decode_base64(&double_encoded).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_trailing_annotation_single_pad() {
+        // String with single = padding and trailing annotation text
+        let result = decode_base64("aGVsbG8=Irancell").unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_trailing_annotation_double_pad() {
+        // String with double == padding and trailing annotation
+        // "hm" base64 = "aG0=" (1 pad), "hma" base64 = "aG1h" (no pad), "hmab" base64 = "aG1hYg==" (2 pads)
+        let result = decode_base64("aG1hYg==annotation").unwrap();
+        assert_eq!(result, b"hmab");
+    }
+
+    #[test]
+    fn test_trailing_annotation_no_pad() {
+        // No padding, annotation separated by space (acts as delimiter)
+        let result = decode_base64("aGVsbG8= annotation").unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_mixed_padding_single_eq() {
+        // Single = padding
+        let result = decode_base64("aGVsbG8=").unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_mixed_padding_double_eq() {
+        // Double == padding — base64 of 1 byte = 2 base64 chars + "=="
+        // 'h' = 0x68 = 01101000 -> 011010 000000 -> aA==
+        let result = decode_base64("aA==").unwrap();
+        assert_eq!(result, b"h");
+    }
+
+    #[test]
+    fn test_trailing_annotation_truncated_pad() {
+        // Annotation containing '=' after padding — '=' in annotation doesn't break
+        // because the decoder stops at the first non-base64 delimiter after padding
+        let result = decode_base64("aGVsbG8= foo=bar").unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_very_long_base64() {
+        // Generate a 20KB base64 string, verify decode succeeds
+        let large_data: Vec<u8> = (0..15000usize)
+            .map(|i| (i as u8).wrapping_mul(17))
+            .collect();
+        let b64 = base64_simd::STANDARD_NO_PAD.encode_to_string(&large_data);
+        assert!(b64.len() > 10000, "should be a long string: {}", b64.len());
+        let result = decode_base64(&b64).unwrap();
+        assert_eq!(result, large_data);
+    }
 }

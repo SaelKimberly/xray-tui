@@ -4,8 +4,8 @@ mod real;
 #[cfg(feature = "quic-ping")]
 pub use adapters::QuicPingAdapter;
 pub use adapters::{FastPingAdapter, FastPingManager, TcpPingAdapter, UdpPingAdapter};
-pub use real::RealPingManager;
 pub use real::CorePool;
+pub use real::RealPingManager;
 
 use std::fmt;
 

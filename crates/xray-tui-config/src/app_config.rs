@@ -157,7 +157,6 @@ pub struct TunConfig {
     pub mtu: Option<u16>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxConfig {
     #[serde(default)]
@@ -596,6 +595,6 @@ fn default_geosite_url() -> String {
     "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat".into()
 }
 
-fn default_geo_update_interval() -> u64 {
+const fn default_geo_update_interval() -> u64 {
     24
 }

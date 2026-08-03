@@ -186,7 +186,11 @@ impl SingBoxConfigBuilder {
     }
 }
 
-fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) -> Result<Value, BuildError> {
+fn build_proxy_outbound(
+    endpoint: &Endpoint,
+    protocol: &ProtocolRow,
+    params: &BuildParams,
+) -> Result<Value, BuildError> {
     let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
         BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
     })?;
@@ -597,15 +601,26 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
                 .filter(|s| !s.is_empty())
                 .unwrap_or("");
             let address: Vec<String> = if !address_str.is_empty() {
-                address_str.split(',').map(|s| s.trim().to_string()).collect()
+                address_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
             } else {
                 vec![]
             };
 
             // Workers, udp_timeout, system flags
-            let workers = p_settings.get("workers").and_then(serde_json::Value::as_u64);
-            let udp_timeout = p_settings.get("udp_timeout").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok());
-            let system = p_settings.get("system").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let workers = p_settings
+                .get("workers")
+                .and_then(serde_json::Value::as_u64);
+            let udp_timeout = p_settings
+                .get("udp_timeout")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok());
+            let system = p_settings
+                .get("system")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
 
             // Peer endpoint: URL import sets endpoint.host:port; form stores in protocol_settings["endpoint"]
             let endpoint_addr = (!endpoint.host.is_empty()).then_some(endpoint.host.as_str());
@@ -622,22 +637,49 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             };
 
             // Preshared key and reserved bytes
-            let preshared_key = p_settings.get("preshared_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
-            let reserved_str = p_settings.get("reserved").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
-            let persistent_keepalive = p_settings.get("persistent_keepalive").and_then(serde_json::Value::as_u64);
+            let preshared_key = p_settings
+                .get("preshared_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let reserved_str = p_settings
+                .get("reserved")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let persistent_keepalive = p_settings
+                .get("persistent_keepalive")
+                .and_then(serde_json::Value::as_u64);
 
             // Build peers array: use JSON override or fall back to single peer
-            let peers_json = p_settings.get("peers").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let peers_json = p_settings
+                .get("peers")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             let peers: Value = if let Some(json_str) = peers_json {
                 serde_json::from_str(json_str).unwrap_or_else(|_| {
                     // Build single peer from form fields
-                    build_single_wireguard_peer(&peer_addr, peer_port, &public_key, &allowed_ips,
-                        preshared_key.as_deref(), reserved_str.as_deref(), persistent_keepalive)
+                    build_single_wireguard_peer(
+                        &peer_addr,
+                        peer_port,
+                        &public_key,
+                        &allowed_ips,
+                        preshared_key.as_deref(),
+                        reserved_str.as_deref(),
+                        persistent_keepalive,
+                    )
                 })
             } else {
                 // Build single peer from form fields
-                build_single_wireguard_peer(&peer_addr, peer_port, &public_key, &allowed_ips,
-                    preshared_key.as_deref(), reserved_str.as_deref(), persistent_keepalive)
+                build_single_wireguard_peer(
+                    &peer_addr,
+                    peer_port,
+                    &public_key,
+                    &allowed_ips,
+                    preshared_key.as_deref(),
+                    reserved_str.as_deref(),
+                    persistent_keepalive,
+                )
             };
 
             let mut out = json!({
@@ -662,9 +704,11 @@ fn build_proxy_outbound(endpoint: &Endpoint, protocol: &ProtocolRow, params: &Bu
             }
             out
         }
-        _ => return Err(BuildError::InvalidProfile(format!(
-            "Protocol {proto:?} not supported for sing-box outbound"
-        ))),
+        _ => {
+            return Err(BuildError::InvalidProfile(format!(
+                "Protocol {proto:?} not supported for sing-box outbound"
+            )));
+        }
     };
     // Inject multiplex block if configured
     if let Some(mux_val) = &params.mux {
@@ -786,7 +830,6 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
         .filter(|part| !part.is_empty())
         .collect()
 }
-
 
 fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) -> Option<Value> {
     let (p_settings, s_settings) = parse_settings(protocol);

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use smallvec::SmallVec;
 
 use crate::clash::ClashProxy;
@@ -237,13 +237,13 @@ impl ProtocolConfig {
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                 // Inject `user_id` as `id` into p_settings if absent (legacy
                 // parsers store UUID/PW at top level, not inside protocol_settings).
-                if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str()) {
-                    if let Some(obj) = p.as_object_mut() {
-                        if !obj.contains_key("id") && !obj.contains_key("uuid") {
-                            obj.entry("id".to_string())
-                                .or_insert(serde_json::Value::String(user_id.to_string()));
-                        }
-                    }
+                if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str())
+                    && let Some(obj) = p.as_object_mut()
+                    && !obj.contains_key("id")
+                    && !obj.contains_key("uuid")
+                {
+                    obj.entry("id".to_string())
+                        .or_insert(serde_json::Value::String(user_id.to_string()));
                 }
                 let s = extra
                     .get("stream_settings")
@@ -264,29 +264,29 @@ impl ProtocolConfig {
             Self::Vless(c) => {
                 let mut p = serde_json::Map::new();
                 p.insert("id".into(), json!(c.uuid));
-                p.insert("encryption".into(), json!(c.encryption.as_deref().unwrap_or("none")));
+                p.insert(
+                    "encryption".into(),
+                    json!(c.encryption.as_deref().unwrap_or("none")),
+                );
                 if let Some(ref flow) = c.flow {
                     p.insert("flow".into(), json!(flow));
                 }
                 (Value::Object(p), json!({}))
             }
-            Self::Trojan(c) => (
-                json!({"password": c.password}),
-                json!({}),
-            ),
+            Self::Trojan(c) => (json!({"password": c.password}), json!({})),
             Self::Hysteria2(c) => {
                 let mut p = serde_json::Map::new();
                 // Hysteria2 auth token is the password
                 p.insert("password".into(), json!(c.auth));
-                if let Some(ref up) = c.up {
-                    if let Ok(v) = up.as_str().parse::<u64>() {
-                        p.insert("up_mbps".into(), json!(v));
-                    }
+                if let Some(ref up) = c.up
+                    && let Ok(v) = up.as_str().parse::<u64>()
+                {
+                    p.insert("up_mbps".into(), json!(v));
                 }
-                if let Some(ref down) = c.down {
-                    if let Ok(v) = down.as_str().parse::<u64>() {
-                        p.insert("down_mbps".into(), json!(v));
-                    }
+                if let Some(ref down) = c.down
+                    && let Ok(v) = down.as_str().parse::<u64>()
+                {
+                    p.insert("down_mbps".into(), json!(v));
                 }
                 (Value::Object(p), json!({}))
             }
@@ -298,7 +298,8 @@ impl ProtocolConfig {
                     p.insert("plugin".into(), json!(plugin.as_str()));
                 }
                 if let Some(ref opts) = c.plugin_opts {
-                    let joined: String = opts.iter()
+                    let joined: String = opts
+                        .iter()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect::<Vec<_>>()
                         .join(";");

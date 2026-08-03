@@ -96,3 +96,57 @@ impl FastPingManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn adapter_for_tcp_protocols() {
+        let fmgr = FastPingManager::new(Duration::from_secs(5));
+        for proto in &[
+            Protocol::Vmess,
+            Protocol::Vless,
+            Protocol::Shadowsocks,
+            Protocol::Socks,
+            Protocol::Http,
+            Protocol::Trojan,
+        ] {
+            let adapter = fmgr.adapter_for(*proto);
+            assert!(adapter.is_some(), "no adapter for {proto:?}");
+            assert_eq!(adapter.unwrap().transport(), PingCapability::Tcp);
+        }
+    }
+
+    #[test]
+    fn adapter_for_udp_protocols() {
+        let fmgr = FastPingManager::new(Duration::from_secs(5));
+        // WireGuard is UDP-only (not in TcpPingAdapter)
+        let adapter = fmgr.adapter_for(Protocol::WireGuard);
+        assert!(adapter.is_some(), "no adapter for WireGuard");
+        assert_eq!(adapter.unwrap().transport(), PingCapability::Udp);
+    }
+
+    #[test]
+    fn adapter_for_unsupported_returns_none() {
+        let fmgr = FastPingManager::new(Duration::from_secs(5));
+        // Freedom, Blackhole, Dns, Loopback, Tailscale have no adapters
+        assert!(fmgr.adapter_for(Protocol::Freedom).is_none());
+    }
+
+    #[test]
+    fn capability_matches_adapter() {
+        let fmgr = FastPingManager::new(Duration::from_secs(5));
+        // config_type 0 -> Protocol::Custom -> TcpPingAdapter
+        assert_eq!(fmgr.capability_for(0), PingCapability::Tcp);
+    }
+
+    #[tokio::test]
+    async fn ping_unsupported_returns_error() {
+        let fmgr = FastPingManager::new(Duration::from_secs(5));
+        // Protocol::Freedom has no adapter
+        let result = fmgr.ping(Protocol::Freedom.to_i32(), "1.2.3.4", 80).await;
+        assert!(matches!(result, Err(PingError::NotSupported)));
+    }
+}

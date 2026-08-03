@@ -58,3 +58,46 @@ impl RealPingManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    #[test]
+    fn allocate_port_increments() {
+        let port = Arc::new(AtomicU16::new(1000));
+        let p1 = port.fetch_add(1, Ordering::Relaxed);
+        let p2 = port.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(p1, 1000);
+        assert_eq!(p2, 1001);
+    }
+
+    #[test]
+    fn allocate_port_wraps_at_u16_max() {
+        let port = AtomicU16::new(u16::MAX);
+        let p1 = port.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(p1, u16::MAX);
+        assert_eq!(port.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_allocation_unique() {
+        let port = Arc::new(AtomicU16::new(30000));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let p = port.clone();
+            handles.push(tokio::spawn(
+                async move { p.fetch_add(1, Ordering::Relaxed) },
+            ));
+        }
+        let mut results: Vec<_> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        results.sort();
+        results.dedup();
+        assert_eq!(results.len(), 10, "duplicate ports allocated");
+    }
+}

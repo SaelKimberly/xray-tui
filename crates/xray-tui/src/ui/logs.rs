@@ -207,7 +207,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Cursor row in filtered index space
     let cursor_row = filtered_count.saturating_sub(state.log_scroll + 1);
-    let selected = cursor_row.checked_sub(offset).filter(|&s| s < log_rows.len());
+    let selected = cursor_row
+        .checked_sub(offset)
+        .filter(|&s| s < log_rows.len());
 
     let data_table = DataTable::new(columns, &log_rows)
         .column_spacing(1)
@@ -470,7 +472,7 @@ pub fn render_target_picker(frame: &mut Frame, area: Rect, state: &AppState) {
     let max_target_width = state
         .known_targets
         .iter()
-        .map(|t| t.len())
+        .map(std::string::String::len)
         .max()
         .unwrap_or(0);
     let popup_width = (max_target_width + 8).max(36) as u16;
@@ -559,9 +561,7 @@ fn copy_selection(state: &AppState) {
         .iter()
         .enumerate()
         .filter_map(|(i, l)| {
-            if state.selected_targets.is_empty()
-                || state.selected_targets.contains(&l.target)
-            {
+            if state.selected_targets.is_empty() || state.selected_targets.contains(&l.target) {
                 Some(i)
             } else {
                 None
@@ -613,9 +613,7 @@ fn copy_cursor_line(state: &AppState) {
         .iter()
         .enumerate()
         .filter_map(|(i, l)| {
-            if state.selected_targets.is_empty()
-                || state.selected_targets.contains(&l.target)
-            {
+            if state.selected_targets.is_empty() || state.selected_targets.contains(&l.target) {
                 Some(i)
             } else {
                 None
@@ -653,10 +651,7 @@ fn copy_all_filtered(state: &AppState) {
     let lines: Vec<String> = state
         .log_cache
         .iter()
-        .filter(|l| {
-            state.selected_targets.is_empty()
-                || state.selected_targets.contains(&l.target)
-        })
+        .filter(|l| state.selected_targets.is_empty() || state.selected_targets.contains(&l.target))
         .map(|log| {
             format!(
                 "{} [{}] [{}] {}",

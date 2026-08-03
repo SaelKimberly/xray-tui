@@ -106,13 +106,23 @@ pub async fn udp_ping(
 }
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
-/// Cache of `Client` instances keyed by (proxy, port, socks5h).
-/// Avoids per-call connection pool creation overhead.
-type ClientCache = LazyLock<Mutex<HashMap<(String, u16, bool), reqwest::Client>>>;
-static CLIENT_CACHE: ClientCache = LazyLock::new(|| Mutex::new(HashMap::new()));
+type ClientCacheInner = HashMap<(String, u16, bool), reqwest::Client>;
+
+fn client_cache() -> &'static Mutex<ClientCacheInner> {
+    static CACHE: OnceLock<Mutex<ClientCacheInner>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reset the client cache — exposed for testing.
+#[doc(hidden)]
+pub fn reset_client_cache() {
+    if let Ok(mut cache) = client_cache().lock() {
+        cache.clear();
+    }
+}
 
 /// Create a `reqwest::Client` with SOCKS5 proxy configured, using a cache to
 /// avoid per-call connection pool creation overhead.
@@ -123,7 +133,7 @@ async fn create_socks5_client(
     timeout: Duration,
 ) -> Result<reqwest::Client, SpeedTestError> {
     let key = (proxy.to_string(), port, socks5h);
-    if let Some(client) = CLIENT_CACHE.lock().await.get(&key) {
+    if let Some(client) = client_cache().lock().unwrap().get(&key) {
         return Ok(client.clone()); // Client::clone() is cheap (Arc)
     }
     let scheme = if socks5h { "socks5h" } else { "socks5" };
@@ -133,7 +143,7 @@ async fn create_socks5_client(
         .timeout(timeout)
         .build()
         .map_err(SpeedTestError::Http)?;
-    CLIENT_CACHE.lock().await.insert(key, client.clone());
+    client_cache().lock().unwrap().insert(key, client.clone());
     Ok(client)
 }
 
@@ -157,12 +167,9 @@ pub async fn real_ping(
     retries: u32,
 ) -> Result<RealPingResult, SpeedTestError> {
     let scheme = "socks5";
-    let proxy_url =
-        format!("{scheme}://{proxy}:{port}");
+    let proxy_url = format!("{scheme}://{proxy}:{port}");
     let client = reqwest::Client::builder()
-        .proxy(
-            reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?,
-        )
+        .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
         .timeout(test_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(0)
@@ -174,9 +181,7 @@ pub async fn real_ping(
     let mut last_error: Option<SpeedTestError> = None;
 
     let retries = retries.max(1);
-    let futs: Vec<_> = (0..retries)
-        .map(|_| client.head(url).send())
-        .collect();
+    let futs: Vec<_> = (0..retries).map(|_| client.head(url).send()).collect();
     let mut stream = futures_util::stream::iter(futs).buffer_unordered(retries as usize);
     while let Some(result) = stream.next().await {
         match result {
@@ -193,8 +198,7 @@ pub async fn real_ping(
                 }
             }
             Ok(resp) => {
-                last_error =
-                    Some(SpeedTestError::Http(resp.error_for_status().unwrap_err()));
+                last_error = Some(SpeedTestError::Http(resp.error_for_status().unwrap_err()));
             }
             Err(e) => {
                 last_error = Some(SpeedTestError::Http(e));
@@ -221,8 +225,7 @@ pub async fn real_ping(
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                     Ok(json) => {
                         let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
-                        let country =
-                            json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
+                        let country = json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
                         Some(format!("{ip} | {country}"))
                     }
                     Err(_) => None,
@@ -249,7 +252,8 @@ pub async fn speed_test(
     min_duration: Duration,
     max_duration: Duration,
 ) -> Result<u64, SpeedTestError> {
-    let client = create_socks5_client(proxy, port, true, max_duration + Duration::from_secs(5)).await?;
+    let client =
+        create_socks5_client(proxy, port, true, max_duration + Duration::from_secs(5)).await?;
 
     let start = std::time::Instant::now();
     let resp = client.get(url).send().await?;
@@ -396,5 +400,24 @@ pub async fn udp_test(
         Ok(Ok(_)) => Err(SpeedTestError::Proxy("UDP response too short".into())),
         Ok(Err(e)) => Err(SpeedTestError::Io(e)),
         Err(_) => Err(SpeedTestError::Timeout(test_timeout)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn wait_for_socks5_timeout() {
+        // Port 1 is privileged — no real service listens there
+        let result = wait_for_socks5("127.0.0.1", 1, Duration::from_millis(100)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn client_cache_reset() {
+        reset_client_cache();
+        assert!(client_cache().lock().unwrap().is_empty());
     }
 }

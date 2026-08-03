@@ -17,7 +17,7 @@ use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
     ping::PingError, BackendUpdateStatus, BuildParams, CLASH_API_PORT, ConfigBuilder,
-    CoreManager, CoreType, find_binary, resolve_core,
+    RealCoreManager, CoreManager, CoreType, find_binary, resolve_core,
 };
 use xray_tui_db::models::{
     DnsSetting, EndpointGroup, Group, PingResultUpdate, PingSession, ProfileExtension, ProtocolRow,

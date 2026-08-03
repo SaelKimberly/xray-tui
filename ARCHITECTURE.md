@@ -222,33 +222,35 @@ pub struct CoreProcess {
     child: Option<Child>,
     config_path: PathBuf,
     pub core_type: CoreType,
-    log_tx: UnboundedSender<String>,  // process stdout/stderr forwarded to TUI
 }
 
-pub enum RunningCore {
-    Xray(CoreProcess),
-    SingBox(CoreProcess),
-}
-
-pub struct CoreManager {
-    current: Option<RunningCore>,
-    config_dir: PathBuf,
-}
-
-impl CoreManager {
-    pub async fn start(
+/// Abstract interface for core process lifecycle.
+#[async_trait]
+pub trait CoreManager: Send + Sync {
+    async fn start(
+        &mut self,
         core_type: CoreType,
-        profile: &Profile,
-        params: &BuildParams,
-        routing: &[RoutingRule],
-        dns: &DnsSetting,
-        tx: UnboundedSender<CoreEvent>,
-        stop_rx: oneshot::Receiver<()>,
-    );
-    pub async fn stop(&mut self);
-    pub fn is_running(&self) -> bool;
-    pub fn running_core_type(&self) -> Option<CoreType>;
+        config: &BackendConfig,
+        binary_path: &Path,
+        clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError>;
+    async fn stop(&mut self) -> Result<(), ProcessError>;
+    fn is_running(&self) -> bool;
+    fn running_core_type(&self) -> Option<CoreType>;
+    fn sighup_reload(&self) -> Result<u32, ProcessError>;
+    async fn rewrite_config(&self, config: &BackendConfig, clash_mixin: Option<&serde_json::Value>) -> Result<(), ProcessError>;
 }
+
+/// Real subprocess-backed implementation. `log_tx: Sender<String>` is required —
+/// callers without a log consumer must pass a drained channel.
+pub struct RealCoreManager {
+    current: Option<CoreProcess>,
+    config_dir: tempfile::TempDir,
+    log_tx: Sender<String>,
+}
+
+/// Test double implementing the same trait (Option<String> error fields).
+pub struct MockCoreManager { /* start_error, stop_error, is_running, ... */ }
 ```
 
 `CoreManager::start` flow:

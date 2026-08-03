@@ -29,24 +29,23 @@ fn yaml_to_value(y: &yaml_rust2::Yaml) -> Option<serde_json::Value> {
         yaml_rust2::Yaml::String(s) => serde_json::json!(s),
         yaml_rust2::Yaml::Boolean(b) => serde_json::json!(b),
         yaml_rust2::Yaml::Array(arr) => {
-            let items: Vec<serde_json::Value> = arr
-                .iter()
-                .filter_map(yaml_to_value)
-                .collect();
+            let items: Vec<serde_json::Value> = arr.iter().filter_map(yaml_to_value).collect();
             serde_json::Value::Array(items)
         }
         yaml_rust2::Yaml::Hash(hash) => {
             let mut map = serde_json::Map::new();
             for (k, v) in hash {
-                if let Some(key) = k.as_str() {
-                    if let Some(val) = yaml_to_value(v) {
-                        map.insert(key.to_string(), val);
-                    }
+                if let Some(key) = k.as_str()
+                    && let Some(val) = yaml_to_value(v)
+                {
+                    map.insert(key.to_string(), val);
                 }
             }
             serde_json::Value::Object(map)
         }
-        yaml_rust2::Yaml::Null | yaml_rust2::Yaml::BadValue | yaml_rust2::Yaml::Alias(_) => return None,
+        yaml_rust2::Yaml::Null | yaml_rust2::Yaml::BadValue | yaml_rust2::Yaml::Alias(_) => {
+            return None;
+        }
     })
 }
 
@@ -70,10 +69,9 @@ mod tests {
 
     #[test]
     fn parse_yaml_list() {
-        let result = parse_clash_mixin(
-            "rules:\n  - DOMAIN-SUFFIX,example.com,Proxy\n  - MATCH,DIRECT\n",
-        )
-        .unwrap();
+        let result =
+            parse_clash_mixin("rules:\n  - DOMAIN-SUFFIX,example.com,Proxy\n  - MATCH,DIRECT\n")
+                .unwrap();
         let rules = result.get("rules").and_then(|v| v.as_array()).unwrap();
         assert_eq!(rules.len(), 2);
     }

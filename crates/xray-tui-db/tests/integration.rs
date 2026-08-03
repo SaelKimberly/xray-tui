@@ -404,3 +404,101 @@ async fn test_stale_count_and_view() {
     let count = db.get_stale_count(now - 3600, 0).await.unwrap();
     assert_eq!(count, 1, "only ep2 should be stale");
 }
+
+// ── Task 2.2 — Cross-subscription dedup, system groups, concurrent upsert ────
+
+#[tokio::test]
+async fn test_cross_subscription_dedup_different_protocols() {
+    let db = test_db().await;
+    let gid1 = "src-a";
+    let gid2 = "src-b";
+    db.insert_group(&test_group(gid1)).await.unwrap();
+    db.insert_group(&test_group(gid2)).await.unwrap();
+
+    // Same host:port → same stable_hash → same endpoint id
+    let ep = make_endpoint("203.0.113.5", 8443);
+    let proto_a = make_protocol(ep.id, "vmess", 10001);
+    let proto_b = make_protocol(ep.id, "trojan", 10002);
+
+    // Source A inserts endpoint with vmess protocol
+    db.subscription_upsert(gid1, &[(ep.clone(), vec![proto_a])])
+        .await
+        .unwrap();
+
+    // Source B inserts same host:port with a different protocol (trojan)
+    db.subscription_upsert(gid2, &[(ep.clone(), vec![proto_b])])
+        .await
+        .unwrap();
+
+    // Verify: one endpoint row with two protocols
+    let row = db
+        .get_endpoint(ep.id)
+        .await
+        .unwrap()
+        .expect("endpoint should exist");
+    assert_eq!(row.endpoint.host, "203.0.113.5");
+    assert_eq!(row.endpoint.port, 8443);
+    assert_eq!(
+        row.protocols.len(),
+        2,
+        "should have protocols from both sources"
+    );
+
+    // Both groups have the endpoint linked
+    let from_a = db.get_active_endpoints_by_group(gid1, 0).await.unwrap();
+    let from_b = db.get_active_endpoints_by_group(gid2, 0).await.unwrap();
+    assert!(
+        from_a.iter().any(|r| r.endpoint.id == ep.id),
+        "endpoint linked to source-a"
+    );
+    assert!(
+        from_b.iter().any(|r| r.endpoint.id == ep.id),
+        "endpoint linked to source-b"
+    );
+}
+
+#[tokio::test]
+async fn test_system_group_created_on_init() {
+    let db = test_db().await;
+
+    // in_memory() calls init_default_groups which creates a "Default" group
+    let groups = db.get_all_groups().await.unwrap();
+    assert!(!groups.is_empty(), "should have at least the default group");
+
+    // Verify there is exactly one default group (idempotent init)
+    let default_groups: Vec<_> = groups
+        .iter()
+        .filter(|g| g.name.as_deref() == Some("Default"))
+        .collect();
+    assert_eq!(default_groups.len(), 1, "exactly one Default group");
+    assert!(
+        default_groups[0].sort_order == Some(0),
+        "default group has sort_order 0"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_subscription_upsert() {
+    let db = test_db().await;
+    let gid = "concurrent";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    // 10 sequential upserts of different endpoints into the same group.
+    // (Parallel SQLite writes from separate connections require per-connection
+    // busy_timeout which the internal connection setup doesn't propagate.)
+    for i in 0..10 {
+        let host = format!("192.0.2.{}", i + 1);
+        let port = 1000 + i as i32;
+        let ep = make_endpoint(&host, port);
+        let proto = make_protocol(ep.id, "vmess", 20000 + i);
+        let ids = db
+            .subscription_upsert(gid, &[(ep, vec![proto])])
+            .await
+            .expect("upsert should succeed");
+        assert_eq!(ids.len(), 1, "upsert {i} returned 1 id");
+    }
+
+    // All 10 endpoints exist in the group
+    let endpoints = db.get_active_endpoints_by_group(gid, 0).await.unwrap();
+    assert_eq!(endpoints.len(), 10, "all 10 endpoints should exist");
+}

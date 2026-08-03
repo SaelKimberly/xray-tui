@@ -3,10 +3,43 @@ use tracing::warn;
 use crate::bin_manager::{BinError, get_core_info};
 use crate::config_builder::BackendConfig;
 use crate::core_type::CoreType;
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::Sender;
+
+/// Abstract interface for core process lifecycle.
+#[async_trait]
+pub trait CoreManager: Send + Sync {
+    /// Start the core process with the given config and binary.
+    async fn start(
+        &mut self,
+        core_type: CoreType,
+        config: &BackendConfig,
+        binary_path: &Path,
+        clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError>;
+
+    /// Gracefully stop the running core process.
+    async fn stop(&mut self) -> Result<(), ProcessError>;
+
+    /// Check if a core process is currently running.
+    fn is_running(&self) -> bool;
+
+    /// Get the type of the currently running core.
+    fn running_core_type(&self) -> Option<CoreType>;
+
+    /// Send SIGHUP to reload config (sing-box only).
+    fn sighup_reload(&self) -> Result<u32, ProcessError>;
+
+    /// Rewrite config file and reload.
+    async fn rewrite_config(
+        &self,
+        config: &BackendConfig,
+        clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError>;
+}
 
 /// Status of a running core process.
 pub struct CoreProcess {
@@ -27,11 +60,9 @@ impl CoreProcess {
     /// Gracefully stop the process: SIGTERM, wait 5s, then SIGKILL.
     async fn graceful_stop(&mut self) -> Result<(), ProcessError> {
         if let Some(child) = self.child.as_mut() {
-            let pid = child
-                .id()
-                .ok_or_else(|| ProcessError::Startup("no child pid".into()))?;
+            // Only try graceful stop on unix
             #[cfg(unix)]
-            {
+            if let Some(pid) = child.id() {
                 // Send SIGTERM for graceful shutdown
                 #[allow(clippy::cast_possible_wrap, reason = "PID always fits in i32")]
                 let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
@@ -73,17 +104,17 @@ impl Drop for CoreProcess {
 }
 
 /// Manages a single core process lifecycle.
-pub struct CoreManager {
+pub struct RealCoreManager {
     config_dir: tempfile::TempDir,
     current: Option<CoreProcess>,
-    log_tx: Option<Sender<String>>,
+    log_tx: Sender<String>,
 }
 
-impl CoreManager {
-    /// Create a new `CoreManager` with a temporary config directory.
+impl RealCoreManager {
+    /// Create a new `CoreManager` with a temporary config directory and log channel.
     /// Falls back to `config_dir` if tempdir creation fails.
     #[must_use]
-    pub fn new(fallback_config_dir: PathBuf) -> Self {
+    pub fn new(fallback_config_dir: PathBuf, log_tx: Sender<String>) -> Self {
         let config_dir = tempfile::Builder::new()
             .prefix("xray-tui-config-")
             .tempdir_in(&fallback_config_dir)
@@ -91,20 +122,7 @@ impl CoreManager {
         Self {
             config_dir,
             current: None,
-            log_tx: None,
-        }
-    }
-
-    #[must_use]
-    pub fn with_log_channel(fallback_config_dir: PathBuf, log_tx: Sender<String>) -> Self {
-        let config_dir = tempfile::Builder::new()
-            .prefix("xray-tui-config-")
-            .tempdir_in(&fallback_config_dir)
-            .unwrap_or_else(|_| tempfile::TempDir::new().expect("tempdir creation failed"));
-        Self {
-            config_dir,
-            current: None,
-            log_tx: Some(log_tx),
+            log_tx,
         }
     }
     /// Start a core process with the given config and binary path.
@@ -175,7 +193,7 @@ impl CoreManager {
             .stderr
             .take()
             .ok_or_else(|| ProcessError::Startup("Failed to capture stderr".to_string()))?;
-        let log_tx = self.log_tx.clone().unwrap();
+        let log_tx = self.log_tx.clone();
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -192,7 +210,7 @@ impl CoreManager {
             .stdout
             .take()
             .ok_or_else(|| ProcessError::Startup("Failed to capture stdout".to_string()))?;
-        let log_tx = self.log_tx.clone().unwrap();
+        let log_tx = self.log_tx.clone();
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -234,7 +252,7 @@ impl CoreManager {
         Ok(())
     }
 
-    /// Stop the running core process (graceful SIGTERM then SIGKILL).
+    /// Gracefully stop the running core process.
     pub async fn stop(&mut self) -> Result<(), ProcessError> {
         if let Some(mut proc) = self.current.take() {
             proc.graceful_stop().await?;
@@ -242,21 +260,21 @@ impl CoreManager {
         Ok(())
     }
 
-    /// Check if a core process is running.
+    /// Check if a core process is currently running.
     #[must_use]
-    pub const fn is_running(&self) -> bool {
+    pub fn is_running(&self) -> bool {
         self.current.is_some()
     }
 
-    /// Get the type of the running core, if any.
+    /// Get the type of the currently running core.
     #[must_use]
     pub fn running_core_type(&self) -> Option<CoreType> {
         self.current.as_ref().map(|p| p.core_type)
     }
 
-    /// Get a reference to the log sender, if set.
+    /// Get a reference to the log sender.
     #[must_use]
-    pub fn log_tx(&self) -> Option<Sender<String>> {
+    pub fn log_tx(&self) -> Sender<String> {
         self.log_tx.clone()
     }
 
@@ -305,7 +323,6 @@ impl CoreManager {
             BackendConfig::Xray(c) => serde_json::to_string_pretty(c)?,
             BackendConfig::SingBox(c) => serde_json::to_string_pretty(c)?,
         };
-        // Apply clash mixin: parse the serialized JSON, merge mixin fields, re-serialize
         let json = if let Some(mixin_value) = clash_mixin
             && let Some(mixin_obj) = mixin_value.as_object()
             && !mixin_obj.is_empty()
@@ -331,10 +348,141 @@ impl CoreManager {
     }
 }
 
-impl Drop for CoreManager {
+impl Drop for RealCoreManager {
     fn drop(&mut self) {
         // Dropping CoreProcess kills child via kill_on_drop + start_kill
         let _ = self.current.take();
+    }
+}
+
+#[async_trait]
+impl CoreManager for RealCoreManager {
+    async fn start(
+        &mut self,
+        core_type: CoreType,
+        config: &BackendConfig,
+        binary_path: &Path,
+        clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError> {
+        RealCoreManager::start(self, core_type, config, binary_path, clash_mixin).await
+    }
+
+    async fn stop(&mut self) -> Result<(), ProcessError> {
+        RealCoreManager::stop(self).await
+    }
+
+    fn is_running(&self) -> bool {
+        RealCoreManager::is_running(self)
+    }
+
+    fn running_core_type(&self) -> Option<CoreType> {
+        RealCoreManager::running_core_type(self)
+    }
+
+    fn sighup_reload(&self) -> Result<u32, ProcessError> {
+        RealCoreManager::sighup_reload(self)
+    }
+
+    async fn rewrite_config(
+        &self,
+        config: &BackendConfig,
+        clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError> {
+        RealCoreManager::rewrite_config(self, config, clash_mixin).await
+    }
+}
+
+/// Mock CoreManager for testing — simulates process lifecycle without real subprocess.
+#[derive(Debug)]
+pub struct MockCoreManager {
+    pub start_error: Option<String>,
+    pub stop_error: Option<String>,
+    pub is_running: bool,
+    pub running_core_type: Option<CoreType>,
+    pub sighup_error: Option<String>,
+    pub rewrite_error: Option<String>,
+    pub call_count: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+}
+
+impl MockCoreManager {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            start_error: None,
+            stop_error: None,
+            is_running: false,
+            running_core_type: None,
+            sighup_error: None,
+            rewrite_error: None,
+            call_count: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+        }
+    }
+
+    fn record_call(&self, name: &str) {
+        if let Ok(mut count) = self.call_count.lock() {
+            *count.entry(name.to_string()).or_insert(0) += 1;
+        }
+    }
+}
+
+impl Default for MockCoreManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl CoreManager for MockCoreManager {
+    async fn start(
+        &mut self,
+        _core_type: CoreType,
+        _config: &BackendConfig,
+        _binary_path: &Path,
+        _clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError> {
+        self.record_call("start");
+        match &self.start_error {
+            Some(msg) => Err(ProcessError::Startup(msg.clone())),
+            None => Ok(()),
+        }
+    }
+
+    async fn stop(&mut self) -> Result<(), ProcessError> {
+        self.record_call("stop");
+        match &self.stop_error {
+            Some(msg) => Err(ProcessError::Startup(msg.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running
+    }
+
+    fn running_core_type(&self) -> Option<CoreType> {
+        self.running_core_type
+    }
+
+    fn sighup_reload(&self) -> Result<u32, ProcessError> {
+        self.record_call("sighup_reload");
+        match &self.sighup_error {
+            Some(msg) => Err(ProcessError::Startup(msg.clone())),
+            None => Ok(0),
+        }
+    }
+
+    async fn rewrite_config(
+        &self,
+        _config: &BackendConfig,
+        _clash_mixin: Option<&serde_json::Value>,
+    ) -> Result<(), ProcessError> {
+        self.record_call("rewrite_config");
+        match &self.rewrite_error {
+            Some(msg) => Err(ProcessError::Startup(msg.clone())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -356,8 +504,47 @@ mod tests {
 
     #[test]
     fn new_manager_is_not_running() {
-        let mgr = CoreManager::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mgr = RealCoreManager::new(PathBuf::from("/tmp"), tx);
         assert!(!mgr.is_running());
         assert!(mgr.running_core_type().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_does_not_panic_without_log_consumer() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut mgr = RealCoreManager::new(PathBuf::from("/tmp"), tx);
+        let result = mgr
+            .start(
+                CoreType::Xray,
+                &BackendConfig::Xray(Default::default()),
+                Path::new("/nonexistent/binary"),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_core_manager_works() {
+        let mut mock = MockCoreManager::new();
+        assert!(!mock.is_running());
+        assert!(mock.running_core_type().is_none());
+
+        mock.is_running = true;
+        mock.running_core_type = Some(CoreType::Xray);
+        assert!(mock.is_running());
+        assert_eq!(mock.running_core_type(), Some(CoreType::Xray));
+
+        mock.start_error = Some("test error".into());
+        let result = mock
+            .start(
+                CoreType::Xray,
+                &BackendConfig::Xray(Default::default()),
+                Path::new("/nonexistent"),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
     }
 }

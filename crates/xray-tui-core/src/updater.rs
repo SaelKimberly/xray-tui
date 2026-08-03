@@ -161,7 +161,6 @@ pub async fn download_release<F: Fn(u64, u64) + Send + 'static>(
     Ok(dest)
 }
 
-
 /// Download a geo file (geoip.dat or geosite.dat) from URL to dest_dir.
 pub async fn download_geo_file(
     client: &reqwest::Client,
@@ -201,7 +200,7 @@ pub async fn install_binary(
     core_type: CoreType,
     bin_dir: &Path,
 ) -> Result<(), UpdateError> {
-    let suffix = match core_type {
+    let _suffix = match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
         CoreType::Auto => return Err(UpdateError::AutoCore),

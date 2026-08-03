@@ -3,11 +3,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{BuildParams, ConfigBuilder, CoreManager, CorePool, CoreType, MultiInboundItem, find_binary, resolve_core, wait_for_socks5};
+use xray_tui_core::{
+    BuildParams, ConfigBuilder, CorePool, CoreType, MultiInboundItem, RealCoreManager, find_binary,
+    resolve_core, wait_for_socks5,
+};
 use xray_tui_db::Database;
 use xray_tui_db::models::{DnsSetting, PingResultUpdate, ProfileExtension};
 
@@ -18,7 +21,11 @@ use crate::types::{CoreEvent, EndpointRow};
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
     if state.testing_profiles.contains(&protocol_id) {
-        state.log_trace("warn", "tui::ops::ping", "Test already in progress for this profile");
+        state.log_trace(
+            "warn",
+            "tui::ops::ping",
+            "Test already in progress for this profile",
+        );
         return;
     }
     // Find the profile and extract address:port
@@ -47,7 +54,11 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
     let tx = if let Some(tx) = &state.core_event_tx {
         tx.clone()
     } else {
-        state.log_trace("error", "tui::ops::ping", "Core event channel not initialized");
+        state.log_trace(
+            "error",
+            "tui::ops::ping",
+            "Core event channel not initialized",
+        );
         return;
     };
 
@@ -112,22 +123,24 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
     state.testing_profiles.insert(protocol_id);
 
     // Lazily create the core pool on first use
-    let pool = match &state.core_pool {
-        Some(p) => p.clone(),
-        None => {
-            let config_dir = dirs::config_dir()
-                .unwrap_or_else(|| Path::new(".").to_path_buf())
-                .join("xray-tui");
-            let bin_dir = config_dir.join("bin");
-            let bin_configs_dir = config_dir.join("binConfigs");
-            let proxy_addr = state.config.inbound.listen.clone();
-            let base_port = state.config.inbound.socks_port;
-            let pool = Arc::new(CorePool::new(
-                bin_dir, bin_configs_dir, proxy_addr, base_port,
-            ));
-            state.core_pool = Some(pool.clone());
-            pool
-        }
+    let pool = if let Some(p) = &state.core_pool {
+        p.clone()
+    } else {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+            .join("xray-tui");
+        let bin_dir = config_dir.join("bin");
+        let bin_configs_dir = config_dir.join("binConfigs");
+        let proxy_addr = state.config.inbound.listen.clone();
+        let base_port = state.config.inbound.socks_port;
+        let pool = Arc::new(CorePool::new(
+            bin_dir,
+            bin_configs_dir,
+            proxy_addr,
+            base_port,
+        ));
+        state.core_pool = Some(pool.clone());
+        pool
     };
 
     let ping_url = state.config.speed_test.ping_url.clone();
@@ -142,7 +155,14 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         });
 
         let result = pool
-            .ping(&endpoint, &protocol, &ping_url, &ip_api_url, timeout, retries)
+            .ping(
+                &endpoint,
+                &protocol,
+                &ping_url,
+                &ip_api_url,
+                timeout,
+                retries,
+            )
             .await;
 
         try_send_or_warn(
@@ -318,7 +338,7 @@ async fn batch_upsert_buffer(
 }
 
 /// Dispatch a batch of real-ping sessions through multi-inbound config.
-/// Groups profiles by core_type (xray/sing-box), builds multi-inbound config,
+/// Groups profiles by `core_type` (xray/sing-box), builds multi-inbound config,
 /// starts one core per group, fires concurrent HTTP pings, collects results.
 /// Tracks `completed_endpoints` for wave-ordering skip logic.
 /// Returns number of flushed results.
@@ -358,29 +378,29 @@ async fn dispatch_real_ping_batch(
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        let profile = match db.get_endpoint_by_protocol_id(session.protocol_id).await {
-            Ok(Some(p)) => p,
-            _ => {
-                buffer.push(PingResultUpdate {
-                    session_id: session.id.clone(),
-                    protocol_id: session.protocol_id,
-                    status: "failed".to_string(),
-                    ping_type: "real".to_string(),
-                    latency_ms: None,
-                    speed_bps: None,
-                    ip_info: None,
-                    error: Some("Endpoint not found".to_string()),
-                });
-                let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                    protocol_id: session.protocol_id,
-                    test_type: TestType::RealPing,
-                    latency_ms: None,
-                    speed_bps: None,
-                    ip_info: None,
-                    error: Some("Endpoint not found".to_string()),
-                });
-                continue;
-            },
+        let profile = if let Ok(Some(p)) = db.get_endpoint_by_protocol_id(session.protocol_id).await
+        {
+            p
+        } else {
+            buffer.push(PingResultUpdate {
+                session_id: session.id.clone(),
+                protocol_id: session.protocol_id,
+                status: "failed".to_string(),
+                ping_type: "real".to_string(),
+                latency_ms: None,
+                speed_bps: None,
+                ip_info: None,
+                error: Some("Endpoint not found".to_string()),
+            });
+            let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                protocol_id: session.protocol_id,
+                test_type: TestType::RealPing,
+                latency_ms: None,
+                speed_bps: None,
+                ip_info: None,
+                error: Some("Endpoint not found".to_string()),
+            });
+            continue;
         };
         let proto = Protocol::try_from_i32(session.config_type).unwrap_or(Protocol::Custom);
         let core_type = resolve_core(proto, None);
@@ -435,53 +455,57 @@ async fn dispatch_real_ping_batch(
             client_ip: None,
         };
 
-        let backend_config = match ConfigBuilder::build_multi(
-            &multi_items, core_type, &base_params, &dns,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                for (_profile, session, _port) in items {
-                    buffer.push(PingResultUpdate {
-                        session_id: session.id.clone(),
-                        protocol_id: session.protocol_id,
-                        status: "failed".to_string(),
-                        ping_type: "real".to_string(),
-                        latency_ms: None,
-                        speed_bps: None,
-                        ip_info: None,
-                        error: Some(format!("Config build: {e}")),
-                    });
+        let backend_config =
+            match ConfigBuilder::build_multi(&multi_items, core_type, &base_params, &dns) {
+                Ok(c) => c,
+                Err(e) => {
+                    for (_profile, session, _port) in items {
+                        buffer.push(PingResultUpdate {
+                            session_id: session.id.clone(),
+                            protocol_id: session.protocol_id,
+                            status: "failed".to_string(),
+                            ping_type: "real".to_string(),
+                            latency_ms: None,
+                            speed_bps: None,
+                            ip_info: None,
+                            error: Some(format!("Config build: {e}")),
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
-        let bin_path = match find_binary(core_type, bin_dir) {
-            Some(p) => p,
-            None => {
-                for (_profile, session, _port) in items {
-                    buffer.push(PingResultUpdate {
-                        session_id: session.id.clone(),
-                        protocol_id: session.protocol_id,
-                        status: "failed".to_string(),
-                        ping_type: "real".to_string(),
-                        latency_ms: None,
-                        speed_bps: None,
-                        ip_info: None,
-                        error: Some("Binary not found".to_string()),
-                    });
-                }
-                continue;
-            }
-        };
-
-        let mut manager = if let Some(ref log) = log_tx {
-            CoreManager::with_log_channel(bin_configs_dir.to_path_buf(), log.clone())
+        let bin_path = if let Some(p) = find_binary(core_type, bin_dir) {
+            p
         } else {
-            CoreManager::new(bin_configs_dir.to_path_buf())
+            for (_profile, session, _port) in items {
+                buffer.push(PingResultUpdate {
+                    session_id: session.id.clone(),
+                    protocol_id: session.protocol_id,
+                    status: "failed".to_string(),
+                    ping_type: "real".to_string(),
+                    latency_ms: None,
+                    speed_bps: None,
+                    ip_info: None,
+                    error: Some("Binary not found".to_string()),
+                });
+            }
+            continue;
         };
 
-        if let Err(e) = manager.start(core_type, &backend_config, &bin_path, None).await {
+        let log_tx = if let Some(ref tx) = log_tx {
+            tx.clone()
+        } else {
+            let (noop_tx, mut noop_rx) = tokio::sync::mpsc::channel::<String>(256);
+            tokio::spawn(async move { while noop_rx.recv().await.is_some() {} });
+            noop_tx
+        };
+        let mut manager = RealCoreManager::new(bin_configs_dir.to_path_buf(), log_tx);
+
+        if let Err(e) = manager
+            .start(core_type, &backend_config, &bin_path, None)
+            .await
+        {
             for (_profile, session, _port) in items {
                 buffer.push(PingResultUpdate {
                     session_id: session.id.clone(),
@@ -525,16 +549,24 @@ async fn dispatch_real_ping_batch(
                     test_type: TestType::RealPing,
                 });
                 let rp_result = xray_tui_core::speed_test::real_ping(
-                    &proxy_addr, port, &ping_url, &ip_api_url,
-                    real_ping_timeout, real_ping_retries,
-                ).await;
+                    &proxy_addr,
+                    port,
+                    &ping_url,
+                    &ip_api_url,
+                    real_ping_timeout,
+                    real_ping_retries,
+                )
+                .await;
                 let _ = tx.try_send(CoreEvent::SpeedTestResult {
                     protocol_id: session.protocol_id,
                     test_type: TestType::RealPing,
                     latency_ms: rp_result.as_ref().ok().map(|r| r.latency_ms),
                     speed_bps: None,
                     ip_info: rp_result.as_ref().ok().and_then(|r| r.ip_info.clone()),
-                    error: rp_result.as_ref().err().map(|e| e.to_string()),
+                    error: rp_result
+                        .as_ref()
+                        .err()
+                        .map(std::string::ToString::to_string),
                 });
                 (session, rp_result)
             }));
@@ -546,7 +578,10 @@ async fn dispatch_real_ping_batch(
                     // Endpoint succeeded — mark so Phase 1 and future queries skip remaining profiles on it
                     if let Some(ref addr) = session.address {
                         let ep_port = session.port.unwrap_or(0) as u16;
-                        completed_endpoints.lock().unwrap().insert((addr.clone(), ep_port));
+                        completed_endpoints
+                            .lock()
+                            .unwrap()
+                            .insert((addr.clone(), ep_port));
                     }
                     buffer.push(PingResultUpdate {
                         session_id: session.id.clone(),
@@ -648,20 +683,28 @@ pub fn start_batch_sieve(
     state.batch_progress = Some(progress.clone());
     tokio::spawn(async move {
         // 1. Snapshot visible profiles into ping_sessions table
-        let count = db.create_ping_batch(&batch_id, None, Some(&profile_order)).await;
+        let count = db
+            .create_ping_batch(&batch_id, None, Some(&profile_order))
+            .await;
         let count = match count {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(target: "tui::ops::ping", "create_ping_batch failed: {e}");
                 progress.0.store(0, Ordering::Relaxed);
-                let _ = tx.try_send(CoreEvent::BatchProgress { total: 0, completed: 0 });
+                let _ = tx.try_send(CoreEvent::BatchProgress {
+                    total: 0,
+                    completed: 0,
+                });
                 return;
             }
         };
         if count == 0 {
             tracing::warn!(target: "tui::ops::ping", "create_ping_batch returned 0 — no matching profile_cores?");
             progress.0.store(0, Ordering::Relaxed);
-            let _ = tx.try_send(CoreEvent::BatchProgress { total: 0, completed: 0 });
+            let _ = tx.try_send(CoreEvent::BatchProgress {
+                total: 0,
+                completed: 0,
+            });
             return;
         }
         // Adjust progress total to match actual inserted count
@@ -673,8 +716,10 @@ pub fn start_batch_sieve(
         let mut buffer: Vec<PingResultUpdate> = Vec::new();
         let mut stall_count = 0u32;
         // Phase 1 dedup cache: key=(addr, port) → (latency_ms, error)
-        let mut fast_cache: std::collections::HashMap<(String, u16), (Option<i32>, Option<String>)> =
-            std::collections::HashMap::new();
+        let mut fast_cache: std::collections::HashMap<
+            (String, u16),
+            (Option<i32>, Option<String>),
+        > = std::collections::HashMap::new();
 
         // 2. Initialize fast ping manager (Phase 2 uses multi-inbound directly, no RealPingManager)
         let fmgr = xray_tui_core::FastPingManager::new(fast_timeout);
@@ -686,41 +731,45 @@ pub fn start_batch_sieve(
         let mut accumulated_successes = 0usize;
 
         // Phase 2 consumer — spawned first so it's ready for wake-up from Phase 1
-        let mut phase2_handle: Option<(mpsc::Sender<()>, tokio::task::JoinHandle<()>)> = if real_ping_enabled {
-            let (phase2_tx, mut phase2_rx) = mpsc::channel::<()>(1);
-            let phase2_completed = completed_endpoints.clone();
-            let phase2_db = db.clone();
-            let phase2_tx_ev = tx.clone();
-            let phase2_stop = stop_flag.clone();
-            let phase2_progress = progress.clone();
-            let phase2_window = real_ping_window;
-            let _phase2_page_size = page_size;
-            let phase2_timeout = real_ping_timeout;
-            let phase2_retries = retries;
-            let phase2_ping_url = ping_url.clone();
-            let phase2_ip_api_url = ip_api_url.clone();
-            let phase2_proxy_addr = proxy_addr.clone();
-            let phase2_base_port = base_proxy_port;
-            let phase2_bin_dir = bin_dir.clone();
-            let phase2_configs_dir = bin_configs_dir.clone();
-            let phase2_concurrency = real_ping_concurrency;
-            let phase2_batch_id = batch_id.clone();
-            let phase2_log_tx = core_log_tx.clone();
+        let mut phase2_handle: Option<(mpsc::Sender<()>, tokio::task::JoinHandle<()>)> =
+            if real_ping_enabled {
+                let (phase2_tx, mut phase2_rx) = mpsc::channel::<()>(1);
+                let phase2_completed = completed_endpoints.clone();
+                let phase2_db = db.clone();
+                let phase2_tx_ev = tx.clone();
+                let phase2_stop = stop_flag.clone();
+                let phase2_progress = progress.clone();
+                let phase2_window = real_ping_window;
+                let _phase2_page_size = page_size;
+                let phase2_timeout = real_ping_timeout;
+                let phase2_retries = retries;
+                let phase2_ping_url = ping_url.clone();
+                let phase2_ip_api_url = ip_api_url.clone();
+                let phase2_proxy_addr = proxy_addr.clone();
+                let phase2_base_port = base_proxy_port;
+                let phase2_bin_dir = bin_dir.clone();
+                let phase2_configs_dir = bin_configs_dir.clone();
+                let phase2_concurrency = real_ping_concurrency;
+                let phase2_batch_id = batch_id.clone();
+                let phase2_log_tx = core_log_tx.clone();
 
-            let handle = tokio::spawn(async move {
-                let mut buffer: Vec<PingResultUpdate> = Vec::new();
+                let handle = tokio::spawn(async move {
+                    let mut buffer: Vec<PingResultUpdate> = Vec::new();
 
-                loop {
-                    match phase2_rx.recv().await {
-                        Some(()) => {
+                    loop {
+                        if phase2_rx.recv().await == Some(()) {
                             // Woken up — fall through to poll
-                        }
-                        None => {
+                        } else {
                             // Sender dropped — final drain
                             loop {
-                                if phase2_stop.load(Ordering::Relaxed) { break; }
+                                if phase2_stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
                                 let sessions = match phase2_db
-                                    .get_batch_for_real_ping_triplet(&phase2_batch_id, phase2_window)
+                                    .get_batch_for_real_ping_triplet(
+                                        &phase2_batch_id,
+                                        phase2_window,
+                                    )
                                     .await
                                 {
                                     Ok(s) => s,
@@ -729,7 +778,9 @@ pub fn start_batch_sieve(
                                         break;
                                     }
                                 };
-                                if sessions.is_empty() { break; }
+                                if sessions.is_empty() {
+                                    break;
+                                }
                                 let flushed = dispatch_real_ping_batch(
                                     &sessions,
                                     &phase2_db,
@@ -749,62 +800,72 @@ pub fn start_batch_sieve(
                                     &phase2_stop,
                                     &mut buffer,
                                     phase2_log_tx.clone(),
-                                ).await;
-                                if flushed == 0 { break; }
+                                )
+                                .await;
+                                if flushed == 0 {
+                                    break;
+                                }
                             }
                             break;
                         }
-                    }
 
-                    // Normal poll (after wake-up)
-                    loop {
-                        if phase2_stop.load(Ordering::Relaxed) { break; }
-                        let sessions = match phase2_db
-                            .get_batch_for_real_ping_triplet(&phase2_batch_id, phase2_window)
-                            .await
-                        {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!(target: "tui::ops::ping", "get_batch_for_real_ping_triplet failed: {e}");
+                        // Normal poll (after wake-up)
+                        loop {
+                            if phase2_stop.load(Ordering::Relaxed) {
                                 break;
                             }
-                        };
-                        if sessions.is_empty() { break; }
-                        let flushed = dispatch_real_ping_batch(
-                            &sessions,
-                            &phase2_db,
-                            &phase2_tx_ev,
-                            &phase2_progress,
-                            &phase2_completed,
-                            &phase2_batch_id,
-                            phase2_base_port,
-                            &phase2_proxy_addr,
-                            &phase2_bin_dir,
-                            &phase2_configs_dir,
-                            phase2_concurrency,
-                            phase2_timeout,
-                            phase2_retries,
-                            &phase2_ping_url,
-                            &phase2_ip_api_url,
-                            &phase2_stop,
-                            &mut buffer,
-                            phase2_log_tx.clone(),
-                        ).await;
-                        if flushed == 0 { break; }
+                            let sessions = match phase2_db
+                                .get_batch_for_real_ping_triplet(&phase2_batch_id, phase2_window)
+                                .await
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!(target: "tui::ops::ping", "get_batch_for_real_ping_triplet failed: {e}");
+                                    break;
+                                }
+                            };
+                            if sessions.is_empty() {
+                                break;
+                            }
+                            let flushed = dispatch_real_ping_batch(
+                                &sessions,
+                                &phase2_db,
+                                &phase2_tx_ev,
+                                &phase2_progress,
+                                &phase2_completed,
+                                &phase2_batch_id,
+                                phase2_base_port,
+                                &phase2_proxy_addr,
+                                &phase2_bin_dir,
+                                &phase2_configs_dir,
+                                phase2_concurrency,
+                                phase2_timeout,
+                                phase2_retries,
+                                &phase2_ping_url,
+                                &phase2_ip_api_url,
+                                &phase2_stop,
+                                &mut buffer,
+                                phase2_log_tx.clone(),
+                            )
+                            .await;
+                            if flushed == 0 {
+                                break;
+                            }
+                        }
                     }
-                }
 
-                // Final buffer flush for any remaining Phase 2 results
-                batch_upsert_buffer(&phase2_batch_id, &phase2_db, &mut buffer).await;
-            });
+                    // Final buffer flush for any remaining Phase 2 results
+                    batch_upsert_buffer(&phase2_batch_id, &phase2_db, &mut buffer).await;
+                });
 
-            Some((phase2_tx, handle))
-        } else {
-            None
-        };
+                Some((phase2_tx, handle))
+            } else {
+                None
+            };
 
         // Sender clone for Phase 1 to wake up Phase 2
-        let phase2_sender: Option<mpsc::Sender<()>> = phase2_handle.as_ref().map(|(tx, _)| tx.clone());
+        let phase2_sender: Option<mpsc::Sender<()>> =
+            phase2_handle.as_ref().map(|(tx, _)| tx.clone());
 
         // ── Phase 1: Fast Ping ──
         loop {
@@ -863,9 +924,7 @@ pub fn start_batch_sieve(
                                     latency_ms: None,
                                     speed_bps: None,
                                     ip_info: None,
-                                    error: Some(
-                                        "Endpoint already tested in Real Ping".to_string(),
-                                    ),
+                                    error: Some("Endpoint already tested in Real Ping".to_string()),
                                 });
                                 let _ = tx.try_send(CoreEvent::SpeedTestResult {
                                     protocol_id: session.protocol_id,
@@ -873,9 +932,7 @@ pub fn start_batch_sieve(
                                     latency_ms: None,
                                     speed_bps: None,
                                     ip_info: None,
-                                    error: Some(
-                                        "Endpoint already tested in Real Ping".to_string(),
-                                    ),
+                                    error: Some("Endpoint already tested in Real Ping".to_string()),
                                 });
                                 demoted_here = false;
                                 false
@@ -923,81 +980,106 @@ pub fn start_batch_sieve(
                     }
                 } else {
                     match fmgr.ping(session.config_type, &addr, port).await {
-                    Ok(dur) => {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let ms = dur.as_millis() as i32;
-                        if real_ping_enabled {
-                            let ep_done = completed_endpoints
-                                .lock()
-                                .unwrap()
-                                .contains(&(addr.clone(), port));
-                            if ep_done {
-                                // Endpoint already succeeded in Phase 2 — cancel
+                        Ok(dur) => {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let ms = dur.as_millis() as i32;
+                            if real_ping_enabled {
+                                let ep_done = completed_endpoints
+                                    .lock()
+                                    .unwrap()
+                                    .contains(&(addr.clone(), port));
+                                if ep_done {
+                                    // Endpoint already succeeded in Phase 2 — cancel
+                                    buffer.push(PingResultUpdate {
+                                        session_id: session.id.clone(),
+                                        protocol_id: session.protocol_id,
+                                        status: "cancelled".to_string(),
+                                        ping_type: "fast".to_string(),
+                                        latency_ms: None,
+                                        speed_bps: None,
+                                        ip_info: None,
+                                        error: Some(
+                                            "Endpoint already tested in Real Ping".to_string(),
+                                        ),
+                                    });
+                                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                                        protocol_id: session.protocol_id,
+                                        test_type: TestType::TcpPing,
+                                        latency_ms: None,
+                                        speed_bps: None,
+                                        ip_info: None,
+                                        error: Some(
+                                            "Endpoint already tested in Real Ping".to_string(),
+                                        ),
+                                    });
+                                    fast_cache.insert(cache_key, (Some(ms), None));
+                                    demoted_here = false;
+                                    false
+                                } else {
+                                    // Demote to real ping
+                                    let _ = db
+                                        .update_session_ping_type(&session.id, "real", "queued")
+                                        .await;
+                                    let _ = tx.try_send(CoreEvent::SpeedTestResult {
+                                        protocol_id: session.protocol_id,
+                                        test_type: TestType::TcpPing,
+                                        latency_ms: Some(ms as u64),
+                                        speed_bps: None,
+                                        ip_info: None,
+                                        error: None,
+                                    });
+                                    fast_cache.insert(cache_key, (Some(ms), None));
+                                    demoted_here = true;
+                                    false
+                                }
+                            } else {
                                 buffer.push(PingResultUpdate {
                                     session_id: session.id.clone(),
                                     protocol_id: session.protocol_id,
-                                    status: "cancelled".to_string(),
+                                    status: "completed".to_string(),
                                     ping_type: "fast".to_string(),
-                                    latency_ms: None,
-                                    speed_bps: None,
-                                    ip_info: None,
-                                    error: Some(
-                                        "Endpoint already tested in Real Ping".to_string(),
-                                    ),
-                                });
-                                let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                                    protocol_id: session.protocol_id,
-                                    test_type: TestType::TcpPing,
-                                    latency_ms: None,
-                                    speed_bps: None,
-                                    ip_info: None,
-                                    error: Some(
-                                        "Endpoint already tested in Real Ping".to_string(),
-                                    ),
-                                });
-                                fast_cache.insert(cache_key, (Some(ms), None));
-                                demoted_here = false;
-                                false
-                            } else {
-                                // Demote to real ping
-                                let _ = db
-                                    .update_session_ping_type(&session.id, "real", "queued")
-                                    .await;
-                                let _ = tx.try_send(CoreEvent::SpeedTestResult {
-                                    protocol_id: session.protocol_id,
-                                    test_type: TestType::TcpPing,
-                                    latency_ms: Some(ms as u64),
+                                    latency_ms: Some(ms),
                                     speed_bps: None,
                                     ip_info: None,
                                     error: None,
                                 });
                                 fast_cache.insert(cache_key, (Some(ms), None));
-                                demoted_here = true;
-                                false
+                                true
                             }
-                        } else {
-                            buffer.push(PingResultUpdate {
-                                session_id: session.id.clone(),
-                                protocol_id: session.protocol_id,
-                                status: "completed".to_string(),
-                                ping_type: "fast".to_string(),
-                                latency_ms: Some(ms),
-                                speed_bps: None,
-                                ip_info: None,
-                                error: None,
-                            });
-                            fast_cache.insert(cache_key, (Some(ms), None));
-                            true
                         }
-                    }
-                    Err(xray_tui_core::ping::PingError::NotSupported) => {
-                        if real_ping_enabled {
-                            // Check if endpoint already completed in Phase 2
-                            let ep_done = completed_endpoints
-                                .lock()
-                                .unwrap()
-                                .contains(&(addr.clone(), port));
-                            if ep_done {
+                        Err(xray_tui_core::ping::PingError::NotSupported) => {
+                            if real_ping_enabled {
+                                // Check if endpoint already completed in Phase 2
+                                let ep_done = completed_endpoints
+                                    .lock()
+                                    .unwrap()
+                                    .contains(&(addr.clone(), port));
+                                if ep_done {
+                                    buffer.push(PingResultUpdate {
+                                        session_id: session.id.clone(),
+                                        protocol_id: session.protocol_id,
+                                        status: "cancelled".to_string(),
+                                        ping_type: "fast".to_string(),
+                                        latency_ms: None,
+                                        speed_bps: None,
+                                        ip_info: None,
+                                        error: Some(
+                                            "Endpoint already tested in Real Ping".to_string(),
+                                        ),
+                                    });
+                                    demoted_here = false;
+                                    false
+                                } else {
+                                    // Demote to real ping for Phase 2 — no buffer push
+                                    let _ = db
+                                        .update_session_ping_type(&session.id, "real", "queued")
+                                        .await;
+                                    // Don't cache — NotSupported is protocol-specific
+                                    demoted_here = true;
+                                    false
+                                }
+                            } else {
+                                // No real ping phase — emit Cancelled immediately
                                 buffer.push(PingResultUpdate {
                                     session_id: session.id.clone(),
                                     protocol_id: session.protocol_id,
@@ -1006,51 +1088,26 @@ pub fn start_batch_sieve(
                                     latency_ms: None,
                                     speed_bps: None,
                                     ip_info: None,
-                                    error: Some(
-                                        "Endpoint already tested in Real Ping".to_string(),
-                                    ),
+                                    error: Some("Not supported by fast ping".to_string()),
                                 });
-                                demoted_here = false;
-                                false
-                            } else {
-                                // Demote to real ping for Phase 2 — no buffer push
-                                let _ = db
-                                    .update_session_ping_type(&session.id, "real", "queued")
-                                    .await;
-                                // Don't cache — NotSupported is protocol-specific
-                                demoted_here = true;
-                                false
+                                true
                             }
-                        } else {
-                            // No real ping phase — emit Cancelled immediately
+                        }
+                        Err(e) => {
                             buffer.push(PingResultUpdate {
                                 session_id: session.id.clone(),
                                 protocol_id: session.protocol_id,
-                                status: "cancelled".to_string(),
+                                status: "failed".to_string(),
                                 ping_type: "fast".to_string(),
                                 latency_ms: None,
                                 speed_bps: None,
                                 ip_info: None,
-                                error: Some("Not supported by fast ping".to_string()),
+                                error: Some(e.to_string()),
                             });
+                            fast_cache.insert(cache_key, (None, Some(e.to_string())));
                             true
                         }
-                    }
-                    Err(e) => {
-                        buffer.push(PingResultUpdate {
-                            session_id: session.id.clone(),
-                            protocol_id: session.protocol_id,
-                            status: "failed".to_string(),
-                            ping_type: "fast".to_string(),
-                            latency_ms: None,
-                            speed_bps: None,
-                            ip_info: None,
-                            error: Some(e.to_string()),
-                        });
-                        fast_cache.insert(cache_key, (None, Some(e.to_string())));
-                        true
-                    }
-                } // end else (non-cached path)
+                    } // end else (non-cached path)
                 };
                 // Send SpeedTestResult if we pushed to buffer
                 // (demoted sessions already emitted above)
@@ -1164,7 +1221,10 @@ pub fn start_batch_sieve(
         progress.1.fetch_add(flushed, Ordering::Relaxed);
         let _ = db.cleanup_ping_batch(&batch_id).await;
         progress.0.store(0, Ordering::Relaxed); // signal batch is done; enables stale cleanup
-        let _ = tx.try_send(CoreEvent::BatchProgress { total: 0, completed: 0 });
+        let _ = tx.try_send(CoreEvent::BatchProgress {
+            total: 0,
+            completed: 0,
+        });
     });
 }
 
@@ -1181,5 +1241,9 @@ pub async fn remove_failed_servers(state: &mut AppState) {
         crate::ops::profiles::delete_profile(state, id).await;
     }
     state.multi_select.clear();
-    state.log_trace("info", "tui::ops::ping", &format!("Removed {count} failed server(s)"));
+    state.log_trace(
+        "info",
+        "tui::ops::ping",
+        &format!("Removed {count} failed server(s)"),
+    );
 }

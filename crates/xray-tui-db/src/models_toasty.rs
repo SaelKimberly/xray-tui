@@ -208,10 +208,10 @@ impl EndpointRow {
     #[must_use]
     pub fn active_protocol(&self) -> &ProtocolRow {
         // Check manual override first
-        if let Some(override_id) = self.endpoint.manual_protocol_override {
-            if let Some(p) = self.protocols.iter().find(|p| p.id == override_id) {
-                return p;
-            }
+        if let Some(override_id) = self.endpoint.manual_protocol_override
+            && let Some(p) = self.protocols.iter().find(|p| p.id == override_id)
+        {
+            return p;
         }
         // Fall back to selected_protocol index
         self.protocols

@@ -14,7 +14,7 @@ use xray_tui_db::Database;
 
 /// Non-blocking tracing layer that sends log events through a channel
 /// instead of writing to heed synchronously under the subscriber lock.
-/// Optionally writes to a file when log_to_file is enabled.
+/// Optionally writes to a file when `log_to_file` is enabled.
 struct TuiLogLayer {
     core_event_tx: tokio::sync::mpsc::Sender<xray_tui::CoreEvent>,
     log_sender: std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>,

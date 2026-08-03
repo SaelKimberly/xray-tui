@@ -8,7 +8,7 @@ use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
 
 // ── Xray JSON config structs ────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct XrayConfig {
     pub log: LogConfig,
@@ -24,7 +24,7 @@ pub struct XrayConfig {
     pub policy: Option<PolicyConfig>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogConfig {
     pub loglevel: String,
@@ -51,7 +51,7 @@ pub struct Outbound {
     pub stream_settings: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingConfig {
     pub domain_strategy: String,
@@ -61,14 +61,14 @@ pub struct RoutingConfig {
     pub balancers: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsConfig {
     pub servers: Vec<Value>,
     pub hosts: Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StatsConfig {}
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,13 +273,12 @@ fn build_proxy_outbound(
         .or_else(|| p_settings.get("pass"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let s_settings = if s_settings_raw.is_null()
-        || s_settings_raw.as_object().map_or(false, |o| o.is_empty())
-    {
-        None
-    } else {
-        Some(s_settings_raw)
-    };
+    let s_settings =
+        if s_settings_raw.is_null() || s_settings_raw.as_object().is_some_and(|o| o.is_empty()) {
+            None
+        } else {
+            Some(s_settings_raw)
+        };
 
     match proto {
         Protocol::Vmess => Ok(Outbound {
@@ -338,20 +337,18 @@ fn build_proxy_outbound(
                 stream_settings: s_settings.clone(),
             })
         }
-        Protocol::Trojan => {
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "trojan".to_string(),
-                settings: json!({
-                    "servers": [{
-                        "address": address,
-                        "port": port,
-                        "password": user_id
-                    }]
-                }),
-                stream_settings: s_settings,
-            })
-        }
+        Protocol::Trojan => Ok(Outbound {
+            tag: "proxy".to_string(),
+            protocol: "trojan".to_string(),
+            settings: json!({
+                "servers": [{
+                    "address": address,
+                    "port": port,
+                    "password": user_id
+                }]
+            }),
+            stream_settings: s_settings,
+        }),
         Protocol::Socks => {
             let mut server = json!({
                 "address": address,
@@ -378,18 +375,16 @@ fn build_proxy_outbound(
                 stream_settings: s_settings.clone(),
             })
         }
-        Protocol::Hysteria2 => {
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "hysteria2".to_string(),
-                settings: json!({
-                    "version": 2,
-                    "address": address,
-                    "port": port
-                }),
-                stream_settings: s_settings.clone(),
-            })
-        }
+        Protocol::Hysteria2 => Ok(Outbound {
+            tag: "proxy".to_string(),
+            protocol: "hysteria2".to_string(),
+            settings: json!({
+                "version": 2,
+                "address": address,
+                "port": port
+            }),
+            stream_settings: s_settings.clone(),
+        }),
         _ => Err(BuildError::InvalidProfile(format!(
             "Protocol {proto:?} not supported for xray outbound"
         ))),

@@ -651,11 +651,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if matches!(
                 state.purgatory_view,
                 xray_tui_db::models::PurgatoryView::Stale
-            ) {
-                if let Some(id) = state.selected_profile_id() {
-                    state.db.restore_endpoint(id).await.unwrap_or_default();
-                    state.reload_profiles().await;
-                }
+            ) && let Some(id) = state.selected_profile_id()
+            {
+                state.db.restore_endpoint(id).await.unwrap_or_default();
+                state.reload_profiles().await;
             }
         }
         KeyCode::Char('d' | 'D') if state.current_tab == Tab::Profiles => {

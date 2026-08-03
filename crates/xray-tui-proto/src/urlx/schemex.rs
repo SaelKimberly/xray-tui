@@ -111,17 +111,31 @@ impl SchemeX {
 
         let mut chunks = Vec::new();
         for m in SCHEMA_AC.find_iter(s) {
-            let schema_area = s.get(m.range()).expect("AhoCorasick range should be valid").split_once("://").expect("schema pattern always contains ://").0;
+            let schema_area = s
+                .get(m.range())
+                .expect("AhoCorasick range should be valid")
+                .split_once("://")
+                .expect("schema pattern always contains ://")
+                .0;
             let Ok(schema) = Self::from_str(schema_area);
 
             if let Some((schema, begin)) = last.replace((schema, m.range().start)) {
                 let end = m.range().start;
-                chunks.push((schema, Cow::Borrowed(s.get(begin..end).expect("contiguous range from AhoCorasick"))));
+                chunks.push((
+                    schema,
+                    Cow::Borrowed(
+                        s.get(begin..end)
+                            .expect("contiguous range from AhoCorasick"),
+                    ),
+                ));
             }
         }
 
         if let Some((schema, begin)) = last.take() {
-            chunks.push((schema, Cow::Borrowed(s.get(begin..).expect("remaining range from AhoCorasick"))));
+            chunks.push((
+                schema,
+                Cow::Borrowed(s.get(begin..).expect("remaining range from AhoCorasick")),
+            ));
         }
         if chunks.is_empty() {
             let s = match s.find("://") {

@@ -6,7 +6,7 @@ use xray_tui_config::import_export::Profile;
 use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{
-    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreManager, CoreType,
+    BuildParams, CLASH_API_PORT, ConfigBuilder, CoreType, RealCoreManager,
     config_builder::clash_mixin::parse_clash_mixin, find_binary, resolve_core,
 };
 use xray_tui_db::models::{DnsSetting, RoutingRule};
@@ -47,7 +47,11 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         let core_override = p.core_type.parse::<CoreType>().ok();
         (r.endpoint.clone(), p.clone(), profile, core_override)
     } else {
-        state.log_trace("error", "tui::ops::connect", "Profile not found for connection");
+        state.log_trace(
+            "error",
+            "tui::ops::connect",
+            "Profile not found for connection",
+        );
         return;
     };
 
@@ -79,7 +83,11 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         tx.clone()
     } else {
         state.connecting = false;
-        state.log_trace("error", "tui::ops::connect", "Core event channel not initialized");
+        state.log_trace(
+            "error",
+            "tui::ops::connect",
+            "Core event channel not initialized",
+        );
         return;
     };
 
@@ -165,7 +173,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
             return;
         };
         // 3. Start core
-        let mut manager = CoreManager::with_log_channel(bin_configs_dir, log_line_tx);
+        let mut manager = RealCoreManager::new(bin_configs_dir, log_line_tx);
         if let Err(e) = manager
             .start(
                 core_type,

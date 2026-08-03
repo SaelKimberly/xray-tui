@@ -14,7 +14,7 @@
 
 use crate::config_builder::{BuildParams, ConfigBuilder};
 use crate::core_type::CoreType;
-use crate::process::CoreManager;
+use crate::process::{CoreManager, RealCoreManager};
 use crate::protocol::Protocol;
 use crate::protocol_core_mapping::resolve_core;
 use crate::speed_test::wait_for_socks5;
@@ -35,7 +35,7 @@ const READY_DEADLINE: Duration = Duration::from_secs(5);
 struct PooledCore {
     core_type: CoreType,
     port: u16,
-    manager: CoreManager,
+    manager: Box<dyn CoreManager>,
     last_used: Instant,
 }
 
@@ -98,9 +98,12 @@ impl CorePool {
     ) -> super::super::PingResult {
         // If batch is active, don't use the pool — batch uses multi-inbound.
         if self.batch_active.load(Ordering::Relaxed) {
-            return self.fresh_ping(endpoint, protocol, ping_url, ip_api_url, timeout, retries).await;
+            return self
+                .fresh_ping(endpoint, protocol, ping_url, ip_api_url, timeout, retries)
+                .await;
         }
-        self.pooled_ping(endpoint, protocol, ping_url, ip_api_url, timeout, retries).await
+        self.pooled_ping(endpoint, protocol, ping_url, ip_api_url, timeout, retries)
+            .await
     }
 
     /// Pool-aware ping: acquire warm core or spawn fresh, reuse after.
@@ -117,14 +120,13 @@ impl CorePool {
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
         let needed_core = resolve_core(proto, None);
 
-        let result = {
+        {
             let mut guard = self.core.lock().await;
 
             // Check if existing pooled core can be reused
-            let should_reuse = guard.as_ref().is_some_and(|c| {
-                c.core_type == needed_core
-                    && c.last_used.elapsed() < POOL_TTL
-            });
+            let should_reuse = guard
+                .as_ref()
+                .is_some_and(|c| c.core_type == needed_core && c.last_used.elapsed() < POOL_TTL);
 
             if should_reuse {
                 let pooled = guard.as_mut().unwrap();
@@ -135,35 +137,38 @@ impl CorePool {
                 // Build single-profile config
                 let params = self.build_single_params(port);
                 let dns = self.default_dns();
-                let backend_config = match ConfigBuilder::build(
-                    endpoint, protocol, core_type, &params, &[], &dns,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Config build failed — evict pooled core and return error
-                        let old = guard.take();
-                        if let Some(mut p) = old {
-                            let _ = p.manager.stop().await;
+                let backend_config =
+                    match ConfigBuilder::build(endpoint, protocol, core_type, &params, &[], &dns) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // Config build failed — evict pooled core and return error
+                            let old = guard.take();
+                            if let Some(mut p) = old {
+                                let _ = p.manager.stop().await;
+                            }
+                            return super::super::PingResult {
+                                profile_key: super::super::ProfileKey {
+                                    config_type,
+                                    address: endpoint.host.clone(),
+                                    port: endpoint.port as u16,
+                                },
+                                latency_ms: None,
+                                ip_info: None,
+                                error: Some(format!("Build config: {e}")),
+                            };
                         }
-                        return super::super::PingResult {
-                            profile_key: super::super::ProfileKey {
-                                config_type,
-                                address: endpoint.host.clone(),
-                                port: endpoint.port as u16,
-                            },
-                            latency_ms: None,
-                            ip_info: None,
-                            error: Some(format!("Build config: {e}")),
-                        };
-                    }
-                };
+                    };
 
                 if core_type == CoreType::SingBox {
                     // SIGHUP reload path
                     if let Err(e) = pooled.manager.rewrite_config(&backend_config, None).await {
                         tracing::warn!(target: "core::pool", "rewrite_config failed: {e}, restarting");
                         let _ = pooled.manager.stop().await;
-                        match pooled.manager.start(core_type, &backend_config, &self.bin_path(core_type), None).await {
+                        match pooled
+                            .manager
+                            .start(core_type, &backend_config, &self.bin_path(core_type), None)
+                            .await
+                        {
                             Ok(()) => {}
                             Err(e2) => {
                                 let _ = guard.take();
@@ -182,7 +187,11 @@ impl CorePool {
                     } else if let Err(e) = pooled.manager.sighup_reload() {
                         tracing::warn!(target: "core::pool", "SIGHUP failed: {e}, restarting");
                         let _ = pooled.manager.stop().await;
-                        match pooled.manager.start(core_type, &backend_config, &self.bin_path(core_type), None).await {
+                        match pooled
+                            .manager
+                            .start(core_type, &backend_config, &self.bin_path(core_type), None)
+                            .await
+                        {
                             Ok(()) => {}
                             Err(e2) => {
                                 let _ = guard.take();
@@ -222,7 +231,10 @@ impl CorePool {
                 }
 
                 // Wait for SOCKS5 readiness — evict core on failure
-                if wait_for_socks5(&self.proxy_addr, port, READY_DEADLINE).await.is_err() {
+                if wait_for_socks5(&self.proxy_addr, port, READY_DEADLINE)
+                    .await
+                    .is_err()
+                {
                     let _ = guard.take();
                     return super::super::PingResult {
                         profile_key: super::super::ProfileKey {
@@ -237,8 +249,15 @@ impl CorePool {
                 }
 
                 drop(guard); // release lock while HTTP ping runs
-                let rp_result =
-                    crate::speed_test::real_ping(&self.proxy_addr, port, ping_url, ip_api_url, timeout, retries).await;
+                let rp_result = crate::speed_test::real_ping(
+                    &self.proxy_addr,
+                    port,
+                    ping_url,
+                    ip_api_url,
+                    timeout,
+                    retries,
+                )
+                .await;
                 self.build_result(config_type, endpoint, rp_result)
             } else {
                 // Evict stale or wrong-type core
@@ -247,11 +266,18 @@ impl CorePool {
                 }
                 drop(guard);
                 // Fall through to fresh ping
-                self.fresh_ping_and_cache(endpoint, protocol, needed_core, ping_url, ip_api_url, timeout, retries).await
+                self.fresh_ping_and_cache(
+                    endpoint,
+                    protocol,
+                    needed_core,
+                    ping_url,
+                    ip_api_url,
+                    timeout,
+                    retries,
+                )
+                .await
             }
-        };
-
-        result
+        }
     }
 
     /// Fresh ping: spawn new core, test, then cache it in the pool.
@@ -274,27 +300,26 @@ impl CorePool {
                 tracing::warn!(target: "core::real_ping::pool", "{line}");
             }
         });
-        let mut manager = CoreManager::with_log_channel(self.bin_configs_dir.clone(), log_line_tx);
+        let mut manager = RealCoreManager::new(self.bin_configs_dir.clone(), log_line_tx);
         let params = self.build_single_params(port);
         let dns = self.default_dns();
 
-        let backend_config = match ConfigBuilder::build(
-            endpoint, protocol, core_type, &params, &[], &dns,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                return super::super::PingResult {
-                    profile_key: super::super::ProfileKey {
-                        config_type,
-                        address: endpoint.host.clone(),
-                        port: endpoint.port as u16,
-                    },
-                    latency_ms: None,
-                    ip_info: None,
-                    error: Some(format!("Build config: {e}")),
-                };
-            }
-        };
+        let backend_config =
+            match ConfigBuilder::build(endpoint, protocol, core_type, &params, &[], &dns) {
+                Ok(c) => c,
+                Err(e) => {
+                    return super::super::PingResult {
+                        profile_key: super::super::ProfileKey {
+                            config_type,
+                            address: endpoint.host.clone(),
+                            port: endpoint.port as u16,
+                        },
+                        latency_ms: None,
+                        ip_info: None,
+                        error: Some(format!("Build config: {e}")),
+                    };
+                }
+            };
 
         let bin_path = match crate::bin_manager::find_binary(core_type, &self.bin_dir) {
             Some(p) => p,
@@ -312,7 +337,10 @@ impl CorePool {
             }
         };
 
-        if let Err(e) = manager.start(core_type, &backend_config, &bin_path, None).await {
+        if let Err(e) = manager
+            .start(core_type, &backend_config, &bin_path, None)
+            .await
+        {
             return super::super::PingResult {
                 profile_key: super::super::ProfileKey {
                     config_type,
@@ -326,7 +354,10 @@ impl CorePool {
         }
 
         // Wait for SOCKS5 readiness — return error on failure
-        if wait_for_socks5(&self.proxy_addr, port, READY_DEADLINE).await.is_err() {
+        if wait_for_socks5(&self.proxy_addr, port, READY_DEADLINE)
+            .await
+            .is_err()
+        {
             return super::super::PingResult {
                 profile_key: super::super::ProfileKey {
                     config_type,
@@ -339,8 +370,15 @@ impl CorePool {
             };
         }
 
-        let rp_result =
-            crate::speed_test::real_ping(&self.proxy_addr, port, ping_url, ip_api_url, timeout, retries).await;
+        let rp_result = crate::speed_test::real_ping(
+            &self.proxy_addr,
+            port,
+            ping_url,
+            ip_api_url,
+            timeout,
+            retries,
+        )
+        .await;
 
         // Cache the core for reuse
         let mut guard = self.core.lock().await;
@@ -349,7 +387,7 @@ impl CorePool {
             *guard = Some(PooledCore {
                 core_type,
                 port,
-                manager,
+                manager: Box::new(manager),
                 last_used: Instant::now(),
             });
         } else {
@@ -373,7 +411,10 @@ impl CorePool {
         let config_type = protocol.config_type;
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
         let core_type = resolve_core(proto, None);
-        self.fresh_ping_and_cache(endpoint, protocol, core_type, ping_url, ip_api_url, timeout, retries).await
+        self.fresh_ping_and_cache(
+            endpoint, protocol, core_type, ping_url, ip_api_url, timeout, retries,
+        )
+        .await
     }
 
     /// Build `BuildParams` for a single-profile pool core.

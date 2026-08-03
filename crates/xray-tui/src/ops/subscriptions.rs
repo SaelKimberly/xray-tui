@@ -98,7 +98,11 @@ pub async fn confirm_add_group(state: &mut AppState) {
         error_message: None,
     };
     if let Err(e) = state.db.insert_group(&group).await {
-        state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to add group: {e}"));
+        state.log_trace(
+            "error",
+            "tui::ops::subscriptions",
+            &format!("Failed to add group: {e}"),
+        );
         return;
     }
     state.log_trace(
@@ -153,7 +157,11 @@ pub async fn confirm_edit_group(state: &mut AppState) {
         .map_or(60, |d| (d.as_secs() / 60) as i32);
     group.refresh_interval = Some(interval);
     if let Err(e) = state.db.update_group(&group).await {
-        state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to update group: {e}"));
+        state.log_trace(
+            "error",
+            "tui::ops::subscriptions",
+            &format!("Failed to update group: {e}"),
+        );
         return;
     }
     state.log_trace("info", "tui::ops::subscriptions", "Group updated");
@@ -171,7 +179,11 @@ pub async fn confirm_edit_group(state: &mut AppState) {
 
 pub async fn delete_group(state: &mut AppState, group_id: &str) {
     if let Err(e) = state.db.delete_group(group_id).await {
-        state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to delete group: {e}"));
+        state.log_trace(
+            "error",
+            "tui::ops::subscriptions",
+            &format!("Failed to delete group: {e}"),
+        );
         return;
     }
     let _ = state.db.purge_expired(0).await;
@@ -191,7 +203,11 @@ pub async fn clear_group(state: &mut AppState, group_id: &str) {
             );
         }
         Err(e) => {
-            state.log_trace("error", "tui::ops::subscriptions", &format!("Failed to clear group: {e}"));
+            state.log_trace(
+                "error",
+                "tui::ops::subscriptions",
+                &format!("Failed to clear group: {e}"),
+            );
         }
     }
     state.confirmation = None;
@@ -211,7 +227,11 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let url = match &group.url {
         Some(u) if !u.is_empty() => u.clone(),
         _ => {
-            state.log_trace("warn", "tui::ops::subscriptions", "Group has no subscription URL");
+            state.log_trace(
+                "warn",
+                "tui::ops::subscriptions",
+                "Group has no subscription URL",
+            );
             return;
         }
     };
@@ -280,7 +300,7 @@ async fn do_update_subscription(
                 Some(e.to_string()),
             );
         }
-        };
+    };
 
     // Warn on HTTP (non-HTTPS) subscription URLs
     if url.starts_with("http://") {

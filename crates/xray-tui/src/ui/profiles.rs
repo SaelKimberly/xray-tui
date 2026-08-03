@@ -15,7 +15,7 @@ use crate::ui::widgets::data_table::{
 };
 use crate::{AppState, ConfirmAction, EndpointRow};
 
-/// A row displayed in the profile DataTable — either an endpoint header or a protocol sub-row.
+/// A row displayed in the profile `DataTable` — either an endpoint header or a protocol sub-row.
 enum DisplayRowData {
     Endpoint {
         id: String,
@@ -107,7 +107,8 @@ impl DataTableRow for DisplayRowData {
                 let remarks_span_w = col_widths.get(4).copied().unwrap_or(0)
                     + col_widths.get(5).copied().unwrap_or(0)
                     + col_widths.get(6).copied().unwrap_or(0);
-                let sub_remarks = crate::ui::profiles::truncate_pad(remarks, remarks_span_w as usize);
+                let sub_remarks =
+                    crate::ui::profiles::truncate_pad(remarks, remarks_span_w as usize);
                 for (i, &x) in col_xs.iter().enumerate() {
                     let (text, style) = match i {
                         0 => (" ", *row_style),
@@ -122,8 +123,11 @@ impl DataTableRow for DisplayRowData {
                         9 => (manual_label, *row_style),
                         _ => ("", *row_style),
                     };
-                    let max_w = if i == 4 { remarks_span_w as usize }
-                               else { col_widths.get(i).copied().unwrap_or(0) as usize };
+                    let max_w = if i == 4 {
+                        remarks_span_w as usize
+                    } else {
+                        col_widths.get(i).copied().unwrap_or(0) as usize
+                    };
                     buf.set_stringn(x, y, text, max_w, style);
                 }
             }
@@ -179,8 +183,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
-fn build_display_rows<'a>(
-    rows: &[&'a EndpointRow],
+fn build_display_rows(
+    rows: &[&EndpointRow],
     _selected: usize,
     state: &AppState,
     palette: &ratatui_cheese::theme::Palette,
@@ -272,10 +276,7 @@ fn build_display_rows<'a>(
         if row.expanded {
             for (pi, proto) in row.protocols.iter().enumerate() {
                 let is_active = pi == row.selected_protocol;
-                let is_manual = row
-                    .endpoint
-                    .manual_protocol_override
-                    .map_or(false, |oid| oid == proto.id);
+                let is_manual = row.endpoint.manual_protocol_override == Some(proto.id);
                 let proto_kind = &proto.proto_kind;
                 let transport = proto.transport.as_deref().unwrap_or("-");
                 let security = proto.security.as_deref().unwrap_or("-");
@@ -361,20 +362,20 @@ fn render_data_grid(
 
     // Build column definitions
     let mut columns = vec![
-        Column::new("", ColumnWidth::Fixed(1)),       // 0 — tree marker
-        Column::new("", ColumnWidth::Fixed(2)),       // 1 — indicator
-        Column::new("#", ColumnWidth::Fixed(5)),       // 2 — index
-        Column::new("Type", ColumnWidth::Fixed(12)),   // 3 — type
+        Column::new("", ColumnWidth::Fixed(1)),      // 0 — tree marker
+        Column::new("", ColumnWidth::Fixed(2)),      // 1 — indicator
+        Column::new("#", ColumnWidth::Fixed(5)),     // 2 — index
+        Column::new("Type", ColumnWidth::Fixed(12)), // 3 — type
         Column::new("Remarks", ColumnWidth::Fixed(24)), // 4 — remarks
-        Column::new("│", ColumnWidth::Fixed(1)),       // 5 — NEW separator
+        Column::new("│", ColumnWidth::Fixed(1)),     // 5 — NEW separator
     ];
     columns.extend_from_slice(&[
         Column::new("Address", ColumnWidth::Fixed(30)), // 6 — address
-        Column::new("Port", ColumnWidth::Fixed(6)),    // 7 — port
-        Column::new("│", ColumnWidth::Fixed(1)),       // 8 — existing separator
-        Column::new("Delay", ColumnWidth::Fixed(6)),   // 9 — delay
-        Column::new("Speed", ColumnWidth::Fixed(6)),   // 10 — speed
-        Column::new("IP", ColumnWidth::Fixed(20)),     // 11 — ip_info
+        Column::new("Port", ColumnWidth::Fixed(6)),     // 7 — port
+        Column::new("│", ColumnWidth::Fixed(1)),        // 8 — existing separator
+        Column::new("Delay", ColumnWidth::Fixed(6)),    // 9 — delay
+        Column::new("Speed", ColumnWidth::Fixed(6)),    // 10 — speed
+        Column::new("IP", ColumnWidth::Fixed(20)),      // 11 — ip_info
         Column::new("Traffic", ColumnWidth::Fixed(10)), // 12 — traffic
     ]);
 

@@ -8,19 +8,18 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use xray_tui_config::AppConfig;
-use xray_tui_config::import_export::{Profile, ValidationSummary, encode_profile_spec};
+use xray_tui_config::import_export::{Profile, encode_profile_spec};
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{CorePool, CoreType, resolve_core};
+use xray_tui_db::Database;
 use xray_tui_db::models::{
     Endpoint, Group, PingResultUpdate, ProfileExtension, ProtocolRow, PurgatoryView, RoutingRule,
 };
-use xray_tui_db::{Database, stable_hash};
 
 use crate::BackendUpdateStatus;
-use crate::format_now;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointRow, LogLine, SettingsSection, SortColumn,
@@ -127,7 +126,7 @@ pub struct AppState {
     pub logs_loaded: bool,
 }
 
-/// Convert a `Profile` to `Endpoint` + `ProtocolRow` (thin wrapper over ParsedProtocol conversion).
+/// Convert a `Profile` to `Endpoint` + `ProtocolRow` (thin wrapper over `ParsedProtocol` conversion).
 pub fn profile_to_endpoint_protocol(profile: &Profile) -> (Endpoint, ProtocolRow) {
     let parsed = xray_tui_config::import_export::ParsedProtocol {
         host: profile.address.clone(),
@@ -323,7 +322,9 @@ impl AppState {
                     self.known_targets = targets;
                 }
             }
-            Err(e) => tracing::error!(target: "tui::state::log_init", "Failed to load initial logs: {e}"),
+            Err(e) => {
+                tracing::error!(target: "tui::state::log_init", "Failed to load initial logs: {e}")
+            }
         }
     }
 
@@ -442,7 +443,7 @@ impl AppState {
         profiles::filtered_len(self)
     }
 
-    pub fn cycle_purgatory_view(&mut self) {
+    pub const fn cycle_purgatory_view(&mut self) {
         profiles::cycle_purgatory_view(self);
     }
     /// Get the first group ID for new profile assignments (no active group filter).
@@ -528,7 +529,7 @@ impl AppState {
     pub fn nav_protocol_up(&mut self) -> bool {
         profiles::nav_protocol_up(self)
     }
-    pub fn is_on_sub_row(&self) -> bool {
+    pub const fn is_on_sub_row(&self) -> bool {
         profiles::is_on_sub_row(self)
     }
     /// Get the protocol ID for the currently selected sub-row.
@@ -666,7 +667,7 @@ impl AppState {
             core_type,
             address,
             port,
-            transport: network.clone(),
+            transport: network,
             security,
             created_at: now as i64,
             remarks: remarks.clone(),
@@ -1381,7 +1382,11 @@ impl AppState {
     /// Clear all server stats (traffic counters).
     pub async fn clear_all_stats(&mut self) {
         if let Err(e) = self.db.clear_all_stats().await {
-            self.log_trace("error", "tui::state", &format!("Failed to clear stats: {e}"));
+            self.log_trace(
+                "error",
+                "tui::state",
+                &format!("Failed to clear stats: {e}"),
+            );
             return;
         }
         self.endpoints_gen = self.endpoints_gen.wrapping_add(1);

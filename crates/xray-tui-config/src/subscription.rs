@@ -506,4 +506,138 @@ mod tests {
         assert_eq!(summary.security_warning_count, 0);
         assert_eq!(summary.other_count, 0);
     }
+
+    #[test]
+    fn test_streaming_decoder_partial_chunks() {
+        // Feed data split at non-4-byte base64 boundary (3 bytes first, rest later)
+        let mut decoder = StreamingDecoder::new();
+        let input = b"vmess://abc123\nvless://def456\n";
+        let b64 = base64_simd::STANDARD.encode_to_string(input);
+
+        let part1 = &b64.as_bytes()[..3];
+        let part2 = &b64.as_bytes()[3..];
+
+        // First feed with 3 bytes: pending only, nothing processed
+        let result1 = decoder.feed(part1).unwrap();
+        assert!(
+            result1.is_empty(),
+            "partial chunk (3 bytes) should yield nothing"
+        );
+
+        // Second feed with remaining + pending 3 = 4-byte aligned, processes both
+        let result2 = decoder.feed(part2).unwrap();
+        let result3 = decoder.finalize().unwrap();
+        let all_urls: Vec<String> = result2.into_iter().chain(result3).collect();
+        assert!(!all_urls.is_empty(), "complete chunk should yield URLs");
+        assert!(all_urls.iter().any(|u| u.starts_with("vmess://")));
+        assert!(all_urls.iter().any(|u| u.starts_with("vless://")));
+    }
+
+    #[test]
+    fn test_streaming_decoder_partial_at_alignment() {
+        // Feed data split exactly at a 4-byte boundary
+        let mut decoder = StreamingDecoder::new();
+        let input = b"vmess://abc123\nvless://def456\n";
+        let b64 = base64_simd::STANDARD.encode_to_string(input);
+
+        let mid = b64.len() / 2;
+        let mid_aligned = (mid / 4) * 4;
+        let (part1, part2) = b64.split_at(mid_aligned);
+
+        let r1 = decoder.feed(part1.as_bytes()).unwrap();
+        let r2 = decoder.feed(part2.as_bytes()).unwrap();
+        let r3 = decoder.finalize().unwrap();
+        let all: Vec<_> = r1.into_iter().chain(r2).chain(r3).collect();
+        assert!(all.iter().any(|u| u.starts_with("vmess://")));
+        assert!(all.iter().any(|u| u.starts_with("vless://")));
+    }
+
+    #[test]
+    fn test_streaming_decoder_encoding_transition_mid_stream() {
+        // Data whose standard base64 contains '/' (standard-only character)
+        // 3 bytes 0x3effff -> standard: Pv//, url-safe: Pv__
+        let data = b"\x3e\xff\xff";
+        let std_b64 = base64_simd::STANDARD_NO_PAD.encode_to_string(data);
+        let url_b64 = base64_simd::URL_SAFE_NO_PAD.encode_to_string(data);
+
+        assert!(
+            std_b64.contains('/'),
+            "std base64 must contain / for test validity"
+        );
+        assert!(
+            url_b64.contains('_'),
+            "url-safe base64 must contain _ for test validity"
+        );
+
+        // Phase 1: lock decoder to StdB64 by feeding standard base64
+        let mut decoder = StreamingDecoder::new();
+        let _r1 = decoder.feed(std_b64.as_bytes()).unwrap();
+
+        // Phase 2: feed URL-safe data — should fail since locked to StdB64
+        let r2 = decoder.feed(url_b64.as_bytes());
+        assert!(
+            r2.is_err(),
+            "URL-safe input after standard lock should fail: {r2:?}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_decoder_encoding_transition_reverse() {
+        // Lock to URL-safe first, then try standard
+        let data = b"\x3e\xff\xff";
+        let url_b64 = base64_simd::URL_SAFE_NO_PAD.encode_to_string(data);
+        let std_b64 = base64_simd::STANDARD_NO_PAD.encode_to_string(data);
+
+        let mut decoder = StreamingDecoder::new();
+        let _r1 = decoder.feed(url_b64.as_bytes()).unwrap();
+
+        let r2 = decoder.feed(std_b64.as_bytes());
+        assert!(
+            r2.is_err(),
+            "standard input after URL-safe lock should fail: {r2:?}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_decoder_whitespace_only_chunks() {
+        let mut decoder = StreamingDecoder::new();
+        let r1 = decoder.feed(b"   \n  \n  ").unwrap();
+        assert!(r1.is_empty());
+        let r2 = decoder.feed(b"\t\n\r\n").unwrap();
+        assert!(r2.is_empty());
+        let r3 = decoder.finalize().unwrap();
+        assert!(r3.is_empty());
+    }
+
+    #[test]
+    fn test_subscription_url_split_empty_input() {
+        let urls = subscription_url_split("");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_subscription_url_split_no_scheme() {
+        let urls = subscription_url_split("just-some-text-without-scheme");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_subscription_url_split_mixed_newlines_and_concatenated() {
+        // Mix of newline-separated and concatenated URLs
+        let input = "vmess://abc\nvless://defvless://ghitrojan://jkl\n";
+        let urls = subscription_url_split(input);
+        assert_eq!(urls.len(), 4);
+        assert!(urls[0].starts_with("vmess://"));
+        assert!(urls[1].starts_with("vless://"));
+        assert!(urls[2].starts_with("vless://"));
+        assert!(urls[3].starts_with("trojan://"));
+    }
+
+    #[test]
+    fn test_subscription_url_split_single_scheme() {
+        // Only a scheme prefix, no meaningful content after it
+        let urls = subscription_url_split("vmess://");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "vmess://");
+    }
 }

@@ -1667,10 +1667,9 @@ async fn handle_group_list_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *selected < selected_mask.len()
             {
-                if *selected < selected_mask.len() {
-                    selected_mask[*selected] = !selected_mask[*selected];
-                }
+                selected_mask[*selected] = !selected_mask[*selected];
             }
         }
         KeyCode::Char('a' | 'A') => {
@@ -1795,10 +1794,9 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *focus_index < max_index
             {
-                if *focus_index < max_index {
-                    *focus_index += 1;
-                }
+                *focus_index += 1;
             }
         }
         KeyCode::BackTab => {
@@ -1813,10 +1811,9 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *focus_index > 0
             {
-                if *focus_index > 0 {
-                    *focus_index -= 1;
-                }
+                *focus_index -= 1;
             }
         }
         KeyCode::Enter => {
@@ -1856,10 +1853,9 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *focus_index > 0
             {
-                if *focus_index > 0 {
-                    *focus_index -= 1;
-                }
+                *focus_index -= 1;
             }
         }
         KeyCode::Down => {
@@ -1874,10 +1870,9 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *focus_index < max_index
             {
-                if *focus_index < max_index {
-                    *focus_index += 1;
-                }
+                *focus_index += 1;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1927,11 +1922,10 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *focus_index < fields.len()
             {
-                if *focus_index < fields.len() {
-                    let (_, ref mut val) = fields[*focus_index];
-                    val.pop();
-                }
+                let (_, ref mut val) = fields[*focus_index];
+                val.pop();
             }
         }
         KeyCode::Right | KeyCode::Left => {
@@ -1948,21 +1942,21 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                         ..
                     },
             } = state.mode
+                && *focus_index == 4
+                && *focus_index < fields.len()
             {
-                if *focus_index == 4 && *focus_index < fields.len() {
-                    const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
-                    let (_, ref mut val) = fields[*focus_index];
-                    let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                    let next = OPTIONS[if key.code == KeyCode::Right {
-                        (idx + 1) % OPTIONS.len()
-                    } else if idx == 0 {
-                        OPTIONS.len() - 1
-                    } else {
-                        idx - 1
-                    }];
-                    val.clear();
-                    val.push_str(next);
-                }
+                const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
+                let (_, ref mut val) = fields[*focus_index];
+                let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
+                let next = OPTIONS[if key.code == KeyCode::Right {
+                    (idx + 1) % OPTIONS.len()
+                } else if idx == 0 {
+                    OPTIONS.len() - 1
+                } else {
+                    idx - 1
+                }];
+                val.clear();
+                val.push_str(next);
             }
         }
         _ => {}

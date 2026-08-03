@@ -40,7 +40,11 @@ pub async fn reload_profiles(state: &mut AppState) {
             state.endpoints = rows;
         }
         Err(e) => {
-            state.log_trace("error", "tui::ops::profiles", &format!("Failed to load profiles: {e}"));
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to load profiles: {e}"),
+            );
             state.endpoints.clear();
         }
     }
@@ -51,7 +55,11 @@ pub async fn reload_groups(state: &mut AppState) {
     match state.db.get_all_groups().await {
         Ok(groups) => state.groups = groups,
         Err(e) => {
-            state.log_trace("error", "tui::ops::profiles", &format!("Failed to load groups: {e}"));
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to load groups: {e}"),
+            );
             state.groups.clear();
         }
     }
@@ -211,10 +219,18 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
                     form_errors: HashMap::new(),
                 };
             } else {
-                state.log_trace("error", "tui::ops::profiles", &format!("Profile {id} not found"));
+                state.log_trace(
+                    "error",
+                    "tui::ops::profiles",
+                    &format!("Profile {id} not found"),
+                );
             }
         }
-        Err(e) => state.log_trace("error", "tui::ops::profiles", &format!("Error loading profile {id}: {e}")),
+        Err(e) => state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            &format!("Error loading profile {id}: {e}"),
+        ),
     }
 }
 
@@ -228,12 +244,12 @@ pub fn toggle_expand(state: &mut AppState) {
     let ep_id = filtered_profiles(state)
         .nth(state.selected_index)
         .map(|r| r.endpoint.id);
-    if let Some(ep_id) = ep_id {
-        if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
-            ep_row.expanded = !ep_row.expanded;
-            if !ep_row.expanded {
-                state.selected_sub = None;
-            }
+    if let Some(ep_id) = ep_id
+        && let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id)
+    {
+        ep_row.expanded = !ep_row.expanded;
+        if !ep_row.expanded {
+            state.selected_sub = None;
         }
     }
 }
@@ -241,10 +257,10 @@ pub fn collapse_expand(state: &mut AppState) {
     let ep_id = filtered_profiles(state)
         .nth(state.selected_index)
         .map(|r| r.endpoint.id);
-    if let Some(ep_id) = ep_id {
-        if let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
-            ep_row.expanded = false;
-        }
+    if let Some(ep_id) = ep_id
+        && let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id)
+    {
+        ep_row.expanded = false;
     }
     state.selected_sub = None;
 }
@@ -370,7 +386,7 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
         core_type,
         address,
         port,
-        transport: network.clone(),
+        transport: network,
         security,
         created_at: now as i64,
         remarks: remarks.clone(),
@@ -407,7 +423,11 @@ pub async fn confirm_add_server(state: &mut AppState) {
         {
             (*p, fields)
         } else {
-            state.log_trace("error", "tui::ops::profiles", "Cannot confirm: no protocol selected");
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                "Cannot confirm: no protocol selected",
+            );
             return;
         };
         let addr = fields
@@ -467,13 +487,21 @@ pub async fn confirm_add_server(state: &mut AppState) {
             let remarks = profile_config(&profile)
                 .and_then(|c| c.remarks().map(String::from))
                 .unwrap_or_else(|| "unnamed".to_string());
-            state.log_trace("info", "tui::ops::profiles", &format!("Added server: {remarks}"));
+            state.log_trace(
+                "info",
+                "tui::ops::profiles",
+                &format!("Added server: {remarks}"),
+            );
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             upsert_profile_row(state, profile, None, None, Some(state.first_group_id()));
         }
         Err(e) => {
-            state.log_trace("error", "tui::ops::profiles", &format!("Failed to add server: {e}"));
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to add server: {e}"),
+            );
             if let AppMode::AddServer {
                 fields: ref mut f, ..
             } = state.mode
@@ -572,13 +600,21 @@ pub async fn confirm_edit_server(state: &mut AppState) {
             let remarks = profile_config(&new_profile)
                 .and_then(|c| c.remarks().map(String::from))
                 .unwrap_or_else(|| "unnamed".to_string());
-            state.log_trace("info", "tui::ops::profiles", &format!("Updated server: {remarks}"));
+            state.log_trace(
+                "info",
+                "tui::ops::profiles",
+                &format!("Updated server: {remarks}"),
+            );
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
             reload_profiles(state).await;
         }
         Err(e) => {
-            state.log_trace("error", "tui::ops::profiles", &format!("Failed to update server: {e}"));
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to update server: {e}"),
+            );
             if let AppMode::EditServer {
                 fields: ref mut f, ..
             } = state.mode
@@ -591,7 +627,11 @@ pub async fn confirm_edit_server(state: &mut AppState) {
 
 pub async fn delete_profile(state: &mut AppState, id: i64) {
     if let Err(e) = state.db.delete_endpoint(id).await {
-        state.log_trace("error", "tui::ops::profiles", &format!("Failed to delete profile: {e}"));
+        state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            &format!("Failed to delete profile: {e}"),
+        );
         return;
     }
     state.log_trace("info", "tui::ops::profiles", "Profile deleted");
@@ -741,7 +781,11 @@ pub async fn move_profile_down(state: &mut AppState) {
 pub async fn set_active(state: &mut AppState, id: &str) {
     let pid: i64 = id.parse().unwrap_or(0);
     if let Err(e) = state.db.clear_protocol_override(pid).await {
-        state.log_trace("error", "tui::ops::profiles", &format!("Failed to clear override: {e}"));
+        state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            &format!("Failed to clear override: {e}"),
+        );
         return;
     }
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
@@ -801,8 +845,7 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
     // Collect the full state we need before any mutable access.
     let current_expanded = filtered_profiles(state)
         .nth(state.selected_index)
-        .map(|r| r.expanded && r.protocols.len() > 1)
-        .unwrap_or(false);
+        .is_some_and(|r| r.expanded && r.protocols.len() > 1);
     let prev_info: Option<(bool, usize)> = if state.selected_index > 0 {
         filtered_profiles(state)
             .nth(state.selected_index - 1)
@@ -816,12 +859,13 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
     match state.selected_sub {
         None => {
             // Check if previous endpoint is expanded — move to its last sub-row
-            if let Some((expanded, len)) = prev_info {
-                if expanded && len > 1 {
-                    state.selected_index = state.selected_index.saturating_sub(1);
-                    state.selected_sub = Some(len - 1);
-                    return true;
-                }
+            if let Some((expanded, len)) = prev_info
+                && expanded
+                && len > 1
+            {
+                state.selected_index = state.selected_index.saturating_sub(1);
+                state.selected_sub = Some(len - 1);
+                return true;
             }
             false
         }
@@ -839,7 +883,7 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
 }
 
 /// Check whether the current selection is on a protocol sub-row.
-pub fn is_on_sub_row(state: &AppState) -> bool {
+pub const fn is_on_sub_row(state: &AppState) -> bool {
     state.selected_sub.is_some()
 }
 

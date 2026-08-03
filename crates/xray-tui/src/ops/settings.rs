@@ -532,7 +532,11 @@ pub fn save_settings_form(
 ) {
     apply_settings_fields(state, section, fields);
     if let Err(e) = state.config.save() {
-        state.log_trace("error", "tui::ops::settings", &format!("Failed to save config: {e}"));
+        state.log_trace(
+            "error",
+            "tui::ops::settings",
+            &format!("Failed to save config: {e}"),
+        );
     } else {
         state.log_trace("info", "tui::ops::settings", "Settings saved");
     }
@@ -586,7 +590,11 @@ pub async fn save_routing_rule(
     };
     match result {
         Ok(()) => state.log_trace("info", "tui::ops::settings", "Routing rule saved"),
-        Err(e) => state.log_trace("error", "tui::ops::settings", &format!("Failed to save routing rule: {e}")),
+        Err(e) => state.log_trace(
+            "error",
+            "tui::ops::settings",
+            &format!("Failed to save routing rule: {e}"),
+        ),
     }
     state.reload_routing_rules().await;
 }
@@ -625,6 +633,10 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
     };
     match state.db.upsert_dns_settings(&dns).await {
         Ok(()) => state.log_trace("info", "tui::ops::settings", "DNS settings saved"),
-        Err(e) => state.log_trace("error", "tui::ops::settings", &format!("Failed to save DNS settings: {e}")),
+        Err(e) => state.log_trace(
+            "error",
+            "tui::ops::settings",
+            &format!("Failed to save DNS settings: {e}"),
+        ),
     }
 }

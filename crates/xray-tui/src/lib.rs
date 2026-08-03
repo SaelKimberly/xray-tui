@@ -109,7 +109,7 @@ pub(crate) fn format_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-fn civil_from_days(z: u64) -> (u64, u64, u64) {
+const fn civil_from_days(z: u64) -> (u64, u64, u64) {
     let z = z as i64 + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
     let doe = (z - era * 146097) as u64;
@@ -120,9 +120,10 @@ fn civil_from_days(z: u64) -> (u64, u64, u64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y as u64, m as u64, d)
+    (y as u64, m, d)
 }
 
+#[must_use]
 pub fn parse_core_log_line(
     line: &str,
     _core_type: xray_tui_core::CoreType,
@@ -133,37 +134,42 @@ pub fn parse_core_log_line(
     let line = line.trim();
 
     // Try JSON format (sing-box)
-    if line.starts_with('{') {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            let level = val
-                .get("level")
-                .and_then(|v| v.as_str())
-                .unwrap_or("info")
-                .to_lowercase();
-            let message = val
-                .get("msg")
-                .and_then(|v| v.as_str())
-                .unwrap_or(line)
-                .to_string();
-            let target = val
-                .get("logger")
-                .and_then(|v| v.as_str())
-                .unwrap_or("core")
-                .to_string();
-            return (target, level, message, None);
-        }
+    if line.starts_with('{')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+    {
+        let level = val
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info")
+            .to_lowercase();
+        let message = val
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or(line)
+            .to_string();
+        let target = val
+            .get("logger")
+            .and_then(|v| v.as_str())
+            .unwrap_or("core")
+            .to_string();
+        return (target, level, message, None);
     }
 
     let parts: Vec<&str> = line.splitn(5, ' ').collect();
     if parts.len() < 2 {
-        return ("core".to_string(), "info".to_string(), line.to_string(), None);
+        return (
+            "core".to_string(),
+            "info".to_string(),
+            line.to_string(),
+            None,
+        );
     }
 
     // Check if parts[0] looks like a date (YYYY/MM/DD or YYYY-MM-DD)
     // Xray-core: "2024/01/01 12:00:00 [Info] message"  → level at parts[2]
     // Plain: "[Info] message" → level at parts[0]
     let (level_str, msg_start) = if parts[0].len() >= 10
-        && parts[0].as_bytes().iter().take(4).all(|b| b.is_ascii_digit())
+        && parts[0].as_bytes().iter().take(4).all(u8::is_ascii_digit)
         && (parts[0].contains('/') || parts[0].contains('-'))
     {
         // Has timestamp prefix: parts[0]=date, parts[1]=time, parts[2]=[Level]
@@ -200,7 +206,7 @@ pub fn parse_core_log_line(
         line.to_string()
     };
 
-    ("core".to_string(), level.to_string(), message, None)
+    ("core".to_string(), level, message, None)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

@@ -109,8 +109,6 @@ impl StatsProvider for GrpcStatsClient {
     }
 }
 
-
-
 // ── Factory ─────────────────────────────────────────────────────────
 
 /// Create a [`StatsProvider`] for the shared V2Ray Stats API.
@@ -152,9 +150,104 @@ pub fn format_uptime(secs: u32) -> String {
     }
 }
 
+/// Mock StatsProvider for testing — returns pre-configured stats without a real gRPC connection.
+#[derive(Debug, Clone)]
+pub struct MockStatsProvider {
+    pub stats: Vec<(String, i64)>,
+    pub sys: SysStats,
+    pub query_error: Option<String>,
+}
+
+impl MockStatsProvider {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stats: Vec::new(),
+            sys: SysStats::default(),
+            query_error: None,
+        }
+    }
+}
+
+impl Default for MockStatsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl StatsProvider for MockStatsProvider {
+    async fn query_stats(
+        &self,
+        _pattern: &str,
+        _reset: bool,
+    ) -> Result<Vec<proto::Stat>, GrpcError> {
+        if let Some(msg) = &self.query_error {
+            return Err(GrpcError::InvalidResponse(msg.clone()));
+        }
+        Ok(self
+            .stats
+            .iter()
+            .map(|(n, v)| proto::Stat {
+                name: n.clone(),
+                value: *v,
+            })
+            .collect())
+    }
+
+    async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
+        if let Some(msg) = &self.query_error {
+            return Err(GrpcError::InvalidResponse(msg.clone()));
+        }
+        Ok(self.sys.clone())
+    }
+
+    fn api_endpoint(&self) -> &str {
+        "http://127.0.0.1:62789"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestStatsProvider {
+        stats: Vec<(String, i64)>,
+        sys: SysStats,
+        err: Option<String>,
+    }
+
+    #[async_trait]
+    impl StatsProvider for TestStatsProvider {
+        async fn query_stats(
+            &self,
+            _pattern: &str,
+            _reset: bool,
+        ) -> Result<Vec<proto::Stat>, GrpcError> {
+            if let Some(msg) = &self.err {
+                return Err(GrpcError::InvalidResponse(msg.clone()));
+            }
+            Ok(self
+                .stats
+                .iter()
+                .map(|(n, v)| proto::Stat {
+                    name: n.clone(),
+                    value: *v,
+                })
+                .collect())
+        }
+
+        async fn get_sys_stats(&self) -> Result<SysStats, GrpcError> {
+            if let Some(msg) = &self.err {
+                return Err(GrpcError::InvalidResponse(msg.clone()));
+            }
+            Ok(self.sys.clone())
+        }
+
+        fn api_endpoint(&self) -> &str {
+            "http://127.0.0.1:62789"
+        }
+    }
 
     #[test]
     fn test_format_bytes() {
@@ -172,5 +265,29 @@ mod tests {
         assert_eq!(format_uptime(120), "2m 0s");
         assert_eq!(format_uptime(3600), "1h");
         assert_eq!(format_uptime(3661), "1h 1m 1s");
+    }
+
+    #[tokio::test]
+    async fn mock_stats_provider_works() {
+        let provider = TestStatsProvider {
+            stats: vec![("inbound>>>test>>>traffic>>>downlink".into(), 1024)],
+            sys: SysStats::default(),
+            err: None,
+        };
+        let result = provider.query_stats("inbound>>>", false).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "inbound>>>test>>>traffic>>>downlink");
+        assert_eq!(result[0].value, 1024);
+    }
+
+    #[tokio::test]
+    async fn mock_stats_provider_error() {
+        let provider = TestStatsProvider {
+            stats: vec![],
+            sys: SysStats::default(),
+            err: Some("not connected".into()),
+        };
+        let result = provider.query_stats("inbound>>>", false).await;
+        assert!(result.is_err());
     }
 }
