@@ -130,6 +130,18 @@ impl TransportConfig {
     ) -> Self {
         let resolved: Option<TinyText> = host.or(sni).or(server_addr).map(TinyText::from);
         match self {
+            Self::Ws(cfg) => Self::Ws(WebSocketConfig {
+                host: cfg.host.or(resolved),
+                ..cfg
+            }),
+            Self::Grpc(cfg) => Self::Grpc(GrpcConfig {
+                authority: cfg.authority.or(resolved),
+                ..cfg
+            }),
+            Self::Http(cfg) => Self::Http(HttpConfig {
+                host: cfg.host.or(resolved),
+                ..cfg
+            }),
             Self::HttpUpgrade(cfg) => Self::HttpUpgrade(HttpUpgradeConfig {
                 host: cfg.host.or(resolved),
                 ..cfg
@@ -487,6 +499,15 @@ pub(crate) fn clash_transport_to_transport(
             let Some(w) = ws_opts else {
                 return TransportConfig::Tcp;
             };
+            // The vhost lives in the dedicated `host` field, not in `headers`;
+            // drop `Host` from the header map so the two never double-represent it.
+            let headers = w.headers.as_ref().map(|h| {
+                h.iter()
+                    .filter(|(key, _)| !key.eq_ignore_ascii_case("host"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<std::collections::HashMap<_, _>>()
+            });
+            let headers = headers.filter(|h| !h.is_empty());
             TransportConfig::Ws(WebSocketConfig {
                 path: w.path.clone().map(TinyText::from),
                 host: w
@@ -494,7 +515,7 @@ pub(crate) fn clash_transport_to_transport(
                     .as_ref()
                     .and_then(|h| h.get("Host").cloned())
                     .map(TinyText::from),
-                headers: w.headers.clone(),
+                headers,
                 max_early_data: w.max_early_data,
                 early_data_header_name: w.early_data_header_name.clone().map(TinyText::from),
                 v2ray_http_upgrade: w.v2ray_http_upgrade,
@@ -570,24 +591,33 @@ pub(crate) fn transport_to_clash(
     Option<ClashKcpOpts>,
 ) {
     match transport {
-        TransportConfig::Ws(w) => (
-            Some("ws".to_string()),
-            Some(ClashWSOpts {
-                path: w.path.as_ref().map(std::string::ToString::to_string),
-                headers: w.headers.clone(),
-                max_early_data: w.max_early_data,
-                early_data_header_name: w
-                    .early_data_header_name
-                    .as_ref()
-                    .map(std::string::ToString::to_string),
-                v2ray_http_upgrade: w.v2ray_http_upgrade,
-                v2ray_http_upgrade_fast_open: w.v2ray_http_upgrade_fast_open,
-            }),
-            None,
-            None,
-            None,
-            None,
-        ),
+        TransportConfig::Ws(w) => {
+            // Clash carries the WS vhost in `headers.Host`; forward `host` so the
+            // Clash -> TransportConfig conversion can restore it.
+            let mut headers = w.headers.clone().unwrap_or_default();
+            if let Some(host) = &w.host {
+                headers.insert("Host".to_string(), host.to_string());
+            }
+            let headers = (!headers.is_empty()).then_some(headers);
+            (
+                Some("ws".to_string()),
+                Some(ClashWSOpts {
+                    path: w.path.as_ref().map(std::string::ToString::to_string),
+                    headers,
+                    max_early_data: w.max_early_data,
+                    early_data_header_name: w
+                        .early_data_header_name
+                        .as_ref()
+                        .map(std::string::ToString::to_string),
+                    v2ray_http_upgrade: w.v2ray_http_upgrade,
+                    v2ray_http_upgrade_fast_open: w.v2ray_http_upgrade_fast_open,
+                }),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
         TransportConfig::Grpc(g) => (
             Some("grpc".to_string()),
             None,
@@ -929,5 +959,24 @@ mod tests {
         ));
         assert!(!should_skip_param(&host_v6, "::1"));
         assert!(!should_skip_param(&host_v6, "anything"));
+    }
+
+    #[test]
+    fn with_host_forwards_host_to_ws_grpc_http() {
+        let cases = vec![
+            TransportConfig::Ws(WebSocketConfig::default()),
+            TransportConfig::Grpc(GrpcConfig::default()),
+            TransportConfig::Http(HttpConfig::default()),
+        ];
+        for t in cases {
+            let t = t.with_host(Some("cdn.example.com".into()), None, None);
+            let host = match &t {
+                TransportConfig::Ws(c) => c.host.as_deref(),
+                TransportConfig::Grpc(c) => c.authority.as_deref(),
+                TransportConfig::Http(c) => c.host.as_deref(),
+                _ => None,
+            };
+            assert_eq!(host, Some("cdn.example.com"), "{t:?} keeps host");
+        }
     }
 }

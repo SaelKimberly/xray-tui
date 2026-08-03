@@ -311,6 +311,27 @@ impl ProtoSpec for VlessConfig {
                 q.append_pair("type", self.transport.type_str());
             }
             match &self.transport {
+                TransportConfig::Ws(cfg) => {
+                    if let Some(host) = &cfg.host
+                        && !should_skip_param(&self.host, host)
+                    {
+                        q.append_pair("host", host);
+                    }
+                }
+                TransportConfig::Grpc(cfg) => {
+                    if let Some(auth) = &cfg.authority
+                        && !should_skip_param(&self.host, auth)
+                    {
+                        q.append_pair("host", auth);
+                    }
+                }
+                TransportConfig::Http(cfg) => {
+                    if let Some(host) = &cfg.host
+                        && !should_skip_param(&self.host, host)
+                    {
+                        q.append_pair("host", host);
+                    }
+                }
                 TransportConfig::HttpUpgrade(cfg) => {
                     if let Some(ref host) = cfg.host
                         && !should_skip_param(&self.host, host)
@@ -765,6 +786,32 @@ mod tests {
             reconstructed.contains("somechannel@"),
             "reconstructed URL after serde should contain original string: {reconstructed}"
         );
+    }
+
+    #[test]
+    fn ws_host_survives_parse_roundtrip() {
+        let url = "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&type=ws&host=cdn.example.com&path=%2Fws#r";
+        let cfg = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url)).expect("parse");
+        let out = cfg.reconstruct().expect("reconstruct");
+        assert!(
+            out.contains("host=cdn.example.com"),
+            "roundtrip keeps ws host: {out}"
+        );
+    }
+
+    #[test]
+    fn grpc_http_host_survives_parse_roundtrip() {
+        for url in [
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&type=grpc&host=cdn.example.com&path=svc#r",
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&type=http&host=cdn.example.com&path=%2Fh#r",
+        ] {
+            let cfg = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url)).expect("parse");
+            let out = cfg.reconstruct().expect("reconstruct");
+            assert!(
+                out.contains("host=cdn.example.com"),
+                "roundtrip keeps host for {url}: {out}"
+            );
+        }
     }
 
     #[test]

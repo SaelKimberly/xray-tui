@@ -312,6 +312,31 @@ impl ProtoSpec for VmessConfig {
         {
             map.insert("type".into(), serde_json::Value::String(mode.to_string()));
         }
+        // Emit transport Host/vhost for CDN-hosted ws/grpc/http transports
+        match &self.transport {
+            TransportConfig::Ws(cfg) => {
+                if let Some(host) = &cfg.host
+                    && !should_skip_param(&self.host, host)
+                {
+                    map.insert("host".into(), serde_json::Value::String(host.to_string()));
+                }
+            }
+            TransportConfig::Grpc(cfg) => {
+                if let Some(auth) = &cfg.authority
+                    && !should_skip_param(&self.host, auth)
+                {
+                    map.insert("host".into(), serde_json::Value::String(auth.to_string()));
+                }
+            }
+            TransportConfig::Http(cfg) => {
+                if let Some(host) = &cfg.host
+                    && !should_skip_param(&self.host, host)
+                {
+                    map.insert("host".into(), serde_json::Value::String(host.to_string()));
+                }
+            }
+            _ => {}
+        }
         if let Some(ref v) = self.path {
             map.insert("path".into(), serde_json::Value::String(v.to_string()));
         }
@@ -595,5 +620,34 @@ mod tests {
         let raw = crate::urlx::RawUrlX::from(url.as_str());
         let config = VmessConfig::try_parse(&raw).expect("trailing ascii after = failed");
         assert_eq!(config.host.to_str(), "192.200.160.16");
+    }
+
+    #[test]
+    fn vmess_ws_host_survives_parse_roundtrip() {
+        use base64::Engine as _;
+        let b64 = "eyJ2IjoiMiIsInBzIjoidGVzdHdzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUiLCJhaWQiOiIwIiwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwiaG9zdCI6ImNkbi5leGFtcGxlLmNvbSIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ";
+        let url = format!("vmess://{b64}");
+        let raw = crate::urlx::RawUrlX::from(url.as_str());
+        let parsed = VmessConfig::try_parse(&raw).expect("vmess ws parse");
+        match &parsed.transport {
+            super::TransportConfig::Ws(ws) => {
+                assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+            }
+            other => panic!("expected ws transport, got {other:?}"),
+        }
+        let reconstructed = parsed.reconstruct().expect("vmess ws reconstruct");
+        // The payload is base64 — decode it to inspect the JSON body
+        let payload = reconstructed.strip_prefix("vmess://").expect("vmess scheme");
+        let decoded = base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("decode vmess payload");
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect("vmess json");
+        assert_eq!(
+            json["host"], "cdn.example.com",
+            "reconstruct keeps ws host in: {reconstructed}"
+        );
+        let reparsed = VmessConfig::try_parse(&crate::urlx::RawUrlX::from(reconstructed.as_str()))
+            .expect("vmess ws reparse");
+        assert_eq!(reparsed, parsed, "vmess ws roundtrip equality");
     }
 }
