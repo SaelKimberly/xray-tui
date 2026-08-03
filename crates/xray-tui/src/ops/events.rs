@@ -455,7 +455,9 @@ pub async fn poll_core_events(state: &mut AppState) {
                         // re-resolution returns None; keep the known value
                         // rather than clearing it.
                         entry.country = info.country.or_else(|| entry.country.clone());
-                        entry.host_features = info.host_features;
+                        // Keep the current flags when the incoming event
+                        // carries defaults (seed pass before whitelist load).
+                        entry.host_features = merge_host_features(entry.host_features, info.host_features);
                         // Persist only when the resolution itself changed
                         // (whitelist-pass copies carry the same timestamp and
                         // must not re-write).
@@ -507,6 +509,25 @@ pub async fn poll_core_events(state: &mut AppState) {
     }
 }
 
+/// Merge whitelist feature flags from an `EndpointInfoUpdated` event into the
+/// cached entry, guarding against a seed phase-2 event clobbering real values.
+///
+/// `spawn_dns_resolve` captures the whitelist checker at spawn time; on first
+/// launch it is `None`, so the seed event carries `HostFeatures::default()`.
+/// If that event lands after the whitelist pass, its default flags would wipe
+/// the real ones for the session — keep the current value in that case.
+#[must_use]
+pub(crate) fn merge_host_features(
+    current: xray_tui_host_features::HostFeatures,
+    incoming: xray_tui_host_features::HostFeatures,
+) -> xray_tui_host_features::HostFeatures {
+    if incoming == xray_tui_host_features::HostFeatures::default() {
+        current
+    } else {
+        incoming
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -555,6 +576,29 @@ mod tests {
             selected_protocol: 0,
             expanded: false,
         }
+    }
+
+    #[test]
+    fn merge_host_features_keeps_existing_when_incoming_is_default() {
+        let real = xray_tui_host_features::HostFeatures {
+            sni_whitelisted: true,
+            ip_whitelisted: true,
+            cidr_whitelisted: false,
+        };
+        // A seed phase-2 event carries `HostFeatures::default()` when the
+        // whitelist checker was not loaded at spawn; it must not clobber the
+        // flags a later whitelist pass already applied.
+        assert_eq!(
+            merge_host_features(real, xray_tui_host_features::HostFeatures::default()),
+            real
+        );
+        // A genuine whitelist-pass event still overwrites with real values.
+        let other = xray_tui_host_features::HostFeatures {
+            sni_whitelisted: false,
+            ip_whitelisted: false,
+            cidr_whitelisted: true,
+        };
+        assert_eq!(merge_host_features(real, other), other);
     }
 
     #[test]
