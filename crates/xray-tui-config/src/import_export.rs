@@ -348,8 +348,9 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
 ///
 /// Keeps `PlaceholderConfig` in `spec_blob` for `to_settings()` backward compatibility
 /// (used by `validate_required_fields`, `format_share_url`, and config builders).
-/// But computes proper `sig`/`cred_hash` by also parsing URL with typed `ProtocolConfig`
-/// (which `PlaceholderConfig` returns as 0).
+/// Computes proper `sig`/`cred_hash` by also parsing URL with typed `ProtocolConfig`;
+/// when the typed parser fails, falls back to `PlaceholderConfig`'s own
+/// deterministic body-hash sig (never zero), so the uid never collapses to 0.
 fn convert_spec_blob(
     mut profile: Profile,
     url: &str,
@@ -371,7 +372,6 @@ fn convert_spec_blob(
         .map_err(|e| ImportError::Parse(format!("failed to serialize config: {e}")))?;
 
     // Compute proper sig/cred_hash from typed ProtocolConfig parser.
-    // PlaceholderConfig always returns 0 for both, causing uid collision.
     if let Ok(ParseResult::Direct(typed) | ParseResult::Fallback(typed, _)) =
         ProtocolConfig::try_parse_detailed(&RawUrlX::from(url))
     {
@@ -379,7 +379,11 @@ fn convert_spec_blob(
         profile.sig = typed.sig() as i64;
         profile.cred_hash = typed.cred_hash() as i64;
     } else {
-        // Fallback to PlaceholderConfig (returns 0 — old behavior, no worse)
+        // Fallback to PlaceholderConfig. Its sig is a deterministic hash of
+        // the opaque body (proto_name + settings_json), so the uid is
+        // non-zero and dedup-preserving: same body -> same uid, different
+        // body -> different uid. cred_hash is 0 (opaque blob has no
+        // extractable credentials), making uid == sig.
         profile.id = config.uid() as i64;
         profile.sig = config.sig() as i64;
         profile.cred_hash = config.cred_hash() as i64;
@@ -2183,10 +2187,7 @@ fn set_legacy_fields(
         );
         let new_sj = serde_json::to_vec(&extra).unwrap_or(sj);
         let pname = stub_name(&config).unwrap_or("socks");
-        let placeholder = PlaceholderConfig {
-            proto_name: pname.to_string(),
-            settings_json: new_sj,
-        };
+        let placeholder = PlaceholderConfig::new(pname.to_string(), new_sj);
         let new_config = match config {
             ProtocolConfig::Redirect(_) => ProtocolConfig::Redirect(placeholder),
             ProtocolConfig::TProxy(_) => ProtocolConfig::TProxy(placeholder),
@@ -2722,6 +2723,26 @@ pub struct ValidationSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostless_typed_parse_failure_gets_deterministic_nonzero_uid() {
+        // Hostless wireguard:// URLs: legacy parser accepts (and stores
+        // `public_key` in protocol_settings), typed parser rejects (MissingHost).
+        // The `address` query param is ignored by the legacy parser, so the
+        // configs differ by their public_key instead.
+        let url = "wireguard://?public_key=abc&address=10.0.0.2/32";
+        let settings = ValidationSettings::default();
+        let a = parse_share_url(url, &settings).expect("legacy parse ok");
+        let b = parse_share_url(url, &settings).expect("legacy parse ok");
+        let uid_a = a.sig ^ a.cred_hash;
+        let uid_b = b.sig ^ b.cred_hash;
+        assert_ne!(uid_a, 0, "uid must never be zero (primary-key collapse)");
+        assert_eq!(uid_a, uid_b, "same URL must dedup to the same uid");
+        let url2 = "wireguard://?public_key=def&address=10.0.0.3/32";
+        let c = parse_share_url(url2, &settings).expect("legacy parse ok");
+        assert_ne!(uid_a, c.sig ^ c.cred_hash, "different configs must differ");
+    }
+
     /// Test settings with private IPs allowed (existing tests use various IPs).
     fn permissive_settings() -> ValidationSettings {
         ValidationSettings {

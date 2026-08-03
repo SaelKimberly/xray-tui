@@ -206,6 +206,7 @@ impl ProtocolConfig {
         let placeholder = |name: &str, json: Vec<u8>| PlaceholderConfig {
             proto_name: name.to_string(),
             settings_json: json,
+            sig_cache: std::sync::OnceLock::new(),
         };
         // Only for protocols that don't have URL format (PlaceholderConfig variants).
         // Full-protocol types must use ProtocolConfig::try_parse().
@@ -686,6 +687,8 @@ pub struct PlaceholderConfig {
     /// Opaque JSON blob containing `protocol_settings/stream_settings` from legacy parsing.
     /// Stored as `{"protocol_settings": {...}, "stream_settings": {...}}` JSON.
     pub settings_json: Vec<u8>,
+    #[serde(skip)]
+    sig_cache: std::sync::OnceLock<std::num::NonZeroU64>,
 }
 
 impl ProtoSpec for PlaceholderConfig {
@@ -710,16 +713,37 @@ impl ProtoSpec for PlaceholderConfig {
     fn cred_hash(&self) -> u64 {
         0
     }
-    fn sig(&self) -> u64 {
-        0
-    }
-    fn set_sig_cache(&self, _v: std::num::NonZeroU64) {}
+    impl_sig_cache!();
     fn set_cred_hash_cache(&self, _v: std::num::NonZeroU64) {}
     fn transport_type(&self) -> Option<&str> {
         None
     }
     fn to_json_config(&self, _core: CoreType) -> Result<serde_json::Value, ProtoSpecError> {
         Err(ProtoSpecError::Unsupported(self.proto_name.clone()))
+    }
+}
+
+impl PlaceholderConfig {
+    /// Construct a placeholder wrapping an opaque legacy JSON body.
+    #[must_use]
+    pub fn new(proto_name: String, settings_json: Vec<u8>) -> Self {
+        Self {
+            proto_name,
+            settings_json,
+            sig_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn compute_sig(&self) -> u64 {
+        // Opaque legacy blob: we cannot decompose semantic fields reliably,
+        // so the sig is a deterministic rapidhash over the ENTIRE body
+        // (proto_name + settings_json). Same body -> same uid (dedup); never
+        // zero (mapped to NonZeroU64::MIN by the macro).
+        use rapidhash::v3::{RapidStreamHasherV3, DEFAULT_RAPID_SECRETS};
+        let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
+        hasher.write(self.proto_name.as_bytes());
+        hasher.write(&self.settings_json);
+        hasher.finish()
     }
 }
 
@@ -758,5 +782,30 @@ pub(crate) mod test_helpers {
         let reparsed = T::try_from_clash(&clash)
             .unwrap_or_else(|e| panic!("try_from_clash failed for {url}: {e}"));
         assert_eq!(parsed, reparsed, "clash roundtrip failed for: {url}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_config_sig_is_deterministic_nonzero_body_hash() {
+        let blob = serde_json::json!({
+            "protocol_settings": {"password": "sekrit"},
+            "stream_settings": {}
+        });
+        let json = serde_json::to_vec(&blob).unwrap();
+        let a = ProtocolConfig::from_legacy_parse("wireguard", json.clone());
+        let b = ProtocolConfig::from_legacy_parse("wireguard", json.clone());
+        let c = ProtocolConfig::from_legacy_parse("wireguard", serde_json::to_vec(&serde_json::json!({
+            "protocol_settings": {"password": "other"},
+            "stream_settings": {}
+        })).unwrap());
+        assert_ne!(a.sig(), 0, "sig must never be zero");
+        assert_eq!(a.sig(), b.sig(), "same body -> same sig (dedup)");
+        assert_ne!(a.sig(), c.sig(), "different body -> different sig");
+        assert_eq!(a.cred_hash(), 0, "opaque blob has no extractable credentials");
+        assert_eq!(a.uid(), a.sig(), "uid == sig when cred_hash is 0");
     }
 }
