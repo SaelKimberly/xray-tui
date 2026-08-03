@@ -13,6 +13,7 @@ use crate::state::profile_to_endpoint_protocol;
 use crate::types::{AppMode, BatchImportItem, SortColumn};
 use crate::{common_field_defaults, profile_to_fields};
 use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
+use xray_tui_db::DatabaseError;
 
 pub async fn reload_profiles(state: &mut AppState) {
     let now = std::time::SystemTime::now()
@@ -206,39 +207,46 @@ pub fn start_add_server(state: &mut AppState) {
 }
 
 /// Resolve an endpoint row for editing: check the currently loaded view
-/// first, then fall back to every endpoint. The profiles list shows rows up
-/// to `purgatory_ttl` old, so a fixed 1-day DB threshold would reject
-/// visible-but-stale profiles ("Profile not found" while on screen).
+/// first, then fall back to every endpoint. `get_active_endpoints` compares
+/// `last_seen_at` against an absolute epoch threshold, so the old fixed 86400
+/// lookup rejected never-seen rows (NULL/very-low `last_seen_at`) that are
+/// visible in the All view; scope 0 includes them.
 async fn find_editable_endpoint(
     state: &AppState,
     protocol_id: i64,
-) -> Option<EndpointRow> {
+) -> Result<Option<EndpointRow>, DatabaseError> {
     if let Some(r) = state.endpoints.iter().find(|r| r.endpoint.id == protocol_id) {
-        return Some(r.clone());
+        return Ok(Some(r.clone()));
     }
-    state
+    Ok(state
         .db
         .get_active_endpoints(0)
-        .await
-        .ok()
-        .and_then(|rows| rows.into_iter().find(|r| r.endpoint.id == protocol_id))
+        .await?
+        .into_iter()
+        .find(|r| r.endpoint.id == protocol_id))
 }
 
 pub async fn start_edit_profile(state: &mut AppState, id: &str) {
     let protocol_id: i64 = id.parse().unwrap_or(0);
-    if find_editable_endpoint(state, protocol_id).await.is_some() {
-        state.mode = AppMode::EditServer {
-            protocol_id,
-            fields: Vec::new(),
-            focus_index: 0,
-            form_errors: HashMap::new(),
-        };
-    } else {
-        state.log_trace(
+    match find_editable_endpoint(state, protocol_id).await {
+        Ok(Some(_row)) => {
+            state.mode = AppMode::EditServer {
+                protocol_id,
+                fields: Vec::new(),
+                focus_index: 0,
+                form_errors: HashMap::new(),
+            };
+        }
+        Ok(None) => state.log_trace(
             "error",
             "tui::ops::profiles",
             &format!("Profile {id} not found"),
-        );
+        ),
+        Err(e) => state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            &format!("Error loading profile {id}: {e}"),
+        ),
     }
 }
 
@@ -1055,10 +1063,12 @@ mod edit_tests {
     }
 
     #[tokio::test]
-    async fn edit_falls_back_to_every_endpoint_for_stale_profile() {
+    async fn edit_falls_back_to_never_seen_profile() {
         // Profile not loaded in the current view, but present in the DB with
-        // last_seen_at older than the old 1-day threshold. The fallback must
-        // use scope 0 (everything), not a fixed 86400s window.
+        // last_seen_at = 0 ("never seen"). get_active_endpoints compares an
+        // ABSOLUTE epoch threshold, so the old fixed 86400 lookup rejected
+        // this row (86400 <= 0 is false) even though it is visible in the All
+        // view; the fallback must use scope 0 (everything), not 86400.
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
             xray_tui_db::Database::open(dir.path().join("t.db"))
@@ -1066,19 +1076,15 @@ mod edit_tests {
                 .unwrap(),
         );
         let group_id = db.get_all_groups().await.unwrap()[0].id.clone();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
         let endpoint = Endpoint {
             id: 42,
-            host: "stale.example".to_string(),
+            host: "never-seen.example".to_string(),
             host_type: "dns".to_string(),
             port: 443,
             port_spec_str: None,
             parent_id: None,
             last_source: None,
-            created_at: now - 2 * 86400,
+            created_at: 0,
             manual_protocol_override: None,
             resolved_as: None,
             resolved_at: None,
@@ -1094,9 +1100,9 @@ mod edit_tests {
             core_type: "xray".to_string(),
             transport: None,
             security: None,
-            last_used_at: Some(now - 2 * 86400),
-            created_at: now - 2 * 86400,
-            last_seen_at: now - 2 * 86400,
+            last_used_at: None,
+            created_at: 0,
+            last_seen_at: 0,
             endpoint: Deferred::from(None::<Endpoint>),
             extension: Deferred::from(None::<ProfileExtension>),
             server_stat: Deferred::from(None::<ServerStat>),
