@@ -259,7 +259,11 @@ impl ProtocolConfig {
                     p.insert("security".into(), json!(sec));
                 }
                 p.insert("encryption".into(), json!("auto"));
-                (Value::Object(p), json!({}))
+                (
+                    Value::Object(p),
+                    common::to_xray_stream_settings(&c.security, &c.transport)
+                        .unwrap_or_else(|| json!({})),
+                )
             }
             Self::Vless(c) => {
                 let mut p = serde_json::Map::new();
@@ -271,9 +275,17 @@ impl ProtocolConfig {
                 if let Some(ref flow) = c.flow {
                     p.insert("flow".into(), json!(flow));
                 }
-                (Value::Object(p), json!({}))
+                (
+                    Value::Object(p),
+                    common::to_xray_stream_settings(&c.security, &c.transport)
+                        .unwrap_or_else(|| json!({})),
+                )
             }
-            Self::Trojan(c) => (json!({"password": c.password}), json!({})),
+            Self::Trojan(c) => (
+                json!({"password": c.password}),
+                common::to_xray_stream_settings(&c.security, &c.transport)
+                    .unwrap_or_else(|| json!({})),
+            ),
             Self::Hysteria2(c) => {
                 let mut p = serde_json::Map::new();
                 // Hysteria2 auth token is the password

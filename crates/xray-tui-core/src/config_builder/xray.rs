@@ -273,12 +273,7 @@ fn build_proxy_outbound(
         .or_else(|| p_settings.get("pass"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let s_settings =
-        if s_settings_raw.is_null() || s_settings_raw.as_object().is_some_and(|o| o.is_empty()) {
-            None
-        } else {
-            Some(s_settings_raw)
-        };
+    let s_settings = build_xray_stream_settings(protocol, s_settings_raw);
 
     match proto {
         Protocol::Vmess => Ok(Outbound {
@@ -388,6 +383,105 @@ fn build_proxy_outbound(
         _ => Err(BuildError::InvalidProfile(format!(
             "Protocol {proto:?} not supported for xray outbound"
         ))),
+    }
+}
+
+/// xray-shaped `streamSettings` for a profile. Typed configs (Vmess/Vless/
+/// Trojan) build from SecurityConfig+TransportConfig; legacy
+/// PlaceholderConfig blobs carry a homegrown dotted-key format
+/// ("ws.path", "tls.enable", "realitySettings.publicKey", ...) that must be
+/// expanded into the xray shape.
+fn build_xray_stream_settings(
+    protocol: &ProtocolRow,
+    s_settings_raw: serde_json::Value,
+) -> Option<serde_json::Value> {
+    use xray_tui_proto::proto_spec::ProtocolConfig;
+    match serde_json::from_slice::<ProtocolConfig>(&protocol.spec_blob) {
+        Ok(ProtocolConfig::Vmess(c)) => {
+            xray_tui_proto::proto_spec::common::to_xray_stream_settings(&c.security, &c.transport)
+        }
+        Ok(ProtocolConfig::Vless(c)) => {
+            xray_tui_proto::proto_spec::common::to_xray_stream_settings(&c.security, &c.transport)
+        }
+        Ok(ProtocolConfig::Trojan(c)) => {
+            xray_tui_proto::proto_spec::common::to_xray_stream_settings(&c.security, &c.transport)
+        }
+        _ => legacy_stream_settings_to_xray(s_settings_raw, protocol.transport.as_deref()),
+    }
+}
+
+/// Expand the legacy dotted-key stream_settings format into xray shape.
+fn legacy_stream_settings_to_xray(
+    raw: serde_json::Value,
+    network: Option<&str>,
+) -> Option<serde_json::Value> {
+    let obj = raw.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut ss: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let get = |k: &str| obj.get(k).cloned();
+
+    if let Some(net) = network.filter(|n| !n.is_empty() && *n != "tcp") {
+        ss.insert("network".into(), serde_json::json!(net));
+    }
+    // Legacy `security` == "reality" (the only value the legacy parser stored).
+    if get("security").as_ref().and_then(|v| v.as_str()) == Some("reality") {
+        ss.insert("security".into(), serde_json::json!("reality"));
+    } else if get("tls.enable").as_ref().and_then(|v| v.as_bool()) == Some(true)
+        || get("tls.enable").as_ref().and_then(|v| v.as_str()).is_some()
+    {
+        ss.insert("security".into(), serde_json::json!("tls"));
+    }
+    let mut tls = serde_json::Map::new();
+    if let Some(v) = get("sni").and_then(|v| v.as_str().map(str::to_string)) {
+        tls.insert("serverName".into(), serde_json::json!(v));
+    }
+    if let Some(v) = get("tls.allow_insecure").and_then(|v| v.as_bool()) {
+        tls.insert("allowInsecure".into(), serde_json::json!(v));
+    }
+    if let Some(v) = get("fingerprint").and_then(|v| v.as_str().map(str::to_string)) {
+        tls.insert("fingerprint".into(), serde_json::json!(v));
+    }
+    if let Some(v) = get("alpn").and_then(|v| v.as_str().map(str::to_string)) {
+        let list: Vec<&str> = v.split(',').map(str::trim).collect();
+        tls.insert("alpn".into(), serde_json::json!(list));
+    }
+    if ss.get("security") == Some(&serde_json::json!("reality")) {
+        // realitySettings already xray-shaped in legacy output
+        if let Some(rs) = obj.get("realitySettings").cloned() {
+            ss.insert("realitySettings".into(), rs);
+        }
+        if let Some(server_name) = tls.get("serverName").cloned() {
+            if let Some(rs) = ss.get_mut("realitySettings").and_then(|v| v.as_object_mut()) {
+                rs.insert("serverName".into(), server_name);
+            }
+        }
+    } else if !tls.is_empty() {
+        ss.insert("tlsSettings".into(), serde_json::Value::Object(tls));
+    }
+    // Transport blocks
+    let mut ws = serde_json::Map::new();
+    if let Some(v) = get("ws.path").and_then(|v| v.as_str().map(str::to_string)) {
+        ws.insert("path".into(), serde_json::json!(v));
+    }
+    if let Some(v) = get("ws.host").and_then(|v| v.as_str().map(str::to_string)) {
+        ws.insert("headers".into(), serde_json::json!({ "Host": v }));
+    }
+    if !ws.is_empty() {
+        ss.insert("wsSettings".into(), serde_json::Value::Object(ws));
+    }
+    let mut grpc = serde_json::Map::new();
+    if let Some(v) = get("grpc.serviceName").and_then(|v| v.as_str().map(str::to_string)) {
+        grpc.insert("serviceName".into(), serde_json::json!(v));
+    }
+    if !grpc.is_empty() {
+        ss.insert("grpcSettings".into(), serde_json::Value::Object(grpc));
+    }
+    if ss.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(ss))
     }
 }
 
@@ -586,6 +680,20 @@ mod tests {
             cache_ttl_secs: None,
         };
         (params, rules, dns)
+    }
+
+    fn set_protocol_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
+        let mut extra: serde_json::Value =
+            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
+        extra["protocol_settings"] = serde_json::from_str(json_str).unwrap_or_default();
+        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
+    }
+
+    fn set_stream_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
+        let mut extra: serde_json::Value =
+            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
+        extra["stream_settings"] = serde_json::from_str(json_str).unwrap_or_default();
+        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
     }
 
     fn assert_xray_top_level(json: &Value) {
@@ -789,6 +897,28 @@ mod tests {
         let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();
         // stream_settings from spec_blob not yet wired up (TODO)
         assert!(proxy.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn legacy_vless_ws_tls_produces_xray_stream_settings() {
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+        protocol.transport = Some("ws".to_string());
+        set_stream_settings_json(
+            &mut protocol,
+            r#"{"tls.enable": true, "sni": "cdn.example.com", "ws.path": "/ws", "ws.host": "cdn.example.com"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect("build");
+        let json = serde_json::to_value(&config).unwrap();
+        let outbounds = json["outbounds"].as_array().expect("outbounds");
+        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+        let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+        assert_eq!(ss["network"], "ws");
+        assert_eq!(ss["security"], "tls");
+        assert_eq!(ss["tlsSettings"]["serverName"], "cdn.example.com");
+        assert_eq!(ss["wsSettings"]["path"], "/ws");
+        assert_eq!(ss["wsSettings"]["headers"]["Host"], "cdn.example.com");
     }
 
     #[test]

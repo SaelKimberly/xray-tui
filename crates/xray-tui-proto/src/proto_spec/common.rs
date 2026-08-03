@@ -676,9 +676,148 @@ pub(crate) fn opt_string_to_tiny(s: Option<String>) -> Option<TinyText> {
     s.map(TinyText::from)
 }
 
+/// Build xray-core `streamSettings` JSON from typed security + transport.
+/// Returns `None` when there is nothing to emit (tcp + no TLS).
+pub fn to_xray_stream_settings(
+    security: &SecurityConfig,
+    transport: &TransportConfig,
+) -> Option<serde_json::Value> {
+    let mut ss = serde_json::Map::new();
+    let network = transport.type_str();
+    if network != "tcp" {
+        ss.insert("network".into(), serde_json::Value::String(network.to_string()));
+    }
+    match &security.tls {
+        Some(TlsConfig::Tls(opts)) => {
+            ss.insert("security".into(), serde_json::json!("tls"));
+            let mut t = serde_json::Map::new();
+            if let Some(sni) = &opts.sni {
+                t.insert("serverName".into(), serde_json::json!(sni.as_str()));
+            }
+            if let Some(insecure) = opts.insecure {
+                t.insert("allowInsecure".into(), serde_json::json!(insecure));
+            }
+            if let Some(fp) = &opts.fp {
+                t.insert("fingerprint".into(), serde_json::json!(fp.as_str()));
+            }
+            if let Some(alpn) = &opts.alpn {
+                let list: Vec<&str> = alpn.split(',').map(str::trim).collect();
+                t.insert("alpn".into(), serde_json::json!(list));
+            }
+            if !t.is_empty() {
+                ss.insert("tlsSettings".into(), serde_json::Value::Object(t));
+            }
+        }
+        Some(TlsConfig::Reality(opts)) => {
+            ss.insert("security".into(), serde_json::json!("reality"));
+            let mut r = serde_json::Map::new();
+            if let Some(sni) = &opts.sni {
+                r.insert("serverName".into(), serde_json::json!(sni.as_str()));
+            }
+            if let Some(pbk) = &opts.pbk {
+                r.insert("publicKey".into(), serde_json::json!(pbk));
+            }
+            if let Some(sid) = &opts.sid {
+                r.insert("shortId".into(), serde_json::json!(sid.as_str()));
+            }
+            if let Some(spx) = &opts.spx {
+                r.insert("spiderX".into(), serde_json::json!(spx.as_str()));
+            }
+            if let Some(fp) = &opts.fp {
+                r.insert("fingerprint".into(), serde_json::json!(fp.as_str()));
+            }
+            ss.insert("realitySettings".into(), serde_json::Value::Object(r));
+        }
+        None => {}
+    }
+    match transport {
+        TransportConfig::Ws(cfg) => {
+            let mut w = serde_json::Map::new();
+            if let Some(p) = &cfg.path {
+                w.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            if let Some(h) = &cfg.host {
+                w.insert(
+                    "headers".into(),
+                    serde_json::json!({ "Host": h.as_str() }),
+                );
+            }
+            if !w.is_empty() {
+                ss.insert("wsSettings".into(), serde_json::Value::Object(w));
+            }
+        }
+        TransportConfig::Grpc(cfg) => {
+            let mut g = serde_json::Map::new();
+            if let Some(sn) = &cfg.service_name {
+                g.insert("serviceName".into(), serde_json::json!(sn.as_str()));
+            }
+            if !g.is_empty() {
+                ss.insert("grpcSettings".into(), serde_json::Value::Object(g));
+            }
+        }
+        TransportConfig::Http(cfg) => {
+            let mut h = serde_json::Map::new();
+            if let Some(p) = &cfg.path {
+                h.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            if let Some(host) = &cfg.host {
+                h.insert("host".into(), serde_json::json!([host.as_str()]));
+            }
+            if !h.is_empty() {
+                ss.insert("httpSettings".into(), serde_json::Value::Object(h));
+            }
+        }
+        TransportConfig::HttpUpgrade(cfg) => {
+            let mut u = serde_json::Map::new();
+            if let Some(p) = &cfg.path {
+                u.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            if let Some(host) = &cfg.host {
+                u.insert("host".into(), serde_json::json!([host.as_str()]));
+            }
+            if !u.is_empty() {
+                ss.insert("httpupgradeSettings".into(), serde_json::Value::Object(u));
+            }
+        }
+        TransportConfig::XHttp(cfg) => {
+            let mut x = serde_json::Map::new();
+            if let Some(p) = &cfg.path {
+                x.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            if let Some(host) = &cfg.host {
+                x.insert("host".into(), serde_json::json!(host.as_str()));
+            }
+            if !x.is_empty() {
+                ss.insert("splithttpSettings".into(), serde_json::Value::Object(x));
+            }
+        }
+        TransportConfig::Tcp | TransportConfig::Quic | TransportConfig::Kcp(_) => {}
+    }
+    if ss.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(ss))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto_spec::{ProtoSpec, ProtocolConfig, VlessConfig};
+    use crate::urlx::RawUrlX;
+
+    #[test]
+    fn vless_to_settings_emits_xray_stream_settings() {
+        let raw = RawUrlX::from(
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?security=tls&type=ws&path=%2Fws&host=cdn.example.com#r",
+        );
+        let config = VlessConfig::try_parse(&raw).expect("parse vless URL");
+        let (_, s_settings) = ProtocolConfig::Vless(config).to_settings();
+        let ss = s_settings.as_object().expect("streamSettings present");
+        assert_eq!(ss["network"], "ws");
+        assert_eq!(ss["security"], "tls");
+        assert_eq!(ss["wsSettings"]["path"], "/ws");
+    }
 
     #[test]
     fn security_config_default_is_empty() {
