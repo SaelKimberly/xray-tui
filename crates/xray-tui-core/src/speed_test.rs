@@ -281,12 +281,20 @@ pub async fn speed_test(
     }
 
     let elapsed = start.elapsed();
-    if elapsed.as_secs() == 0 {
-        return Err(SpeedTestError::Timeout(max_duration));
+    match throughput_bps(total_bytes, elapsed) {
+        Some(bps) => Ok(bps),
+        None => Err(SpeedTestError::Timeout(max_duration)),
     }
-    // bits per second = (bytes * 8) / seconds
-    let bits = total_bytes * 8;
-    Ok(bits / elapsed.as_secs())
+}
+
+/// bits-per-second from bytes and elapsed. Never truncates to whole seconds;
+/// a sub-second elapsed with bytes flowing is NOT a timeout.
+fn throughput_bps(total_bytes: u64, elapsed: std::time::Duration) -> Option<u64> {
+    if total_bytes == 0 {
+        return None; // caller maps None -> Timeout
+    }
+    let secs = elapsed.as_secs_f64().max(0.001);
+    Some((total_bytes as f64 * 8.0 / secs) as u64)
 }
 
 /// Wrap an I/O future in `timeout`; maps timeout to SpeedTestError::Timeout.
@@ -455,5 +463,16 @@ mod tests {
     async fn client_cache_reset() {
         reset_client_cache();
         assert!(client_cache().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn throughput_uses_fractional_seconds() {
+        // 1 MiB in 0.5s → ~16.7 Mbps, NOT a timeout, NOT 2x inflated.
+        let bps = throughput_bps(1024 * 1024, Duration::from_millis(500)).unwrap();
+        assert!(
+            (16_000_000..18_000_000).contains(&bps),
+            "bps={bps}"
+        );
+        assert!(throughput_bps(0, Duration::from_secs(5)).is_none());
     }
 }
