@@ -679,70 +679,135 @@ git commit -m "fix(hysteria2): wire pinSHA256 into TlsOpts so cert pinning works
 
 ## Phase 2: Import / Parse / Dedup
 
-### Task 6: uid=0 fallback → collision-free random uid (C3)
+### Task 6: PlaceholderConfig gets a deterministic non-zero sig — uid never 0 (C3)
 
 **Files:**
-- Modify: `crates/xray-tui-config/src/import_export.rs:376-384` (`convert_spec_blob`)
-- Test: `import_export.rs` tests
+- Modify: `crates/xray-tui-proto/src/proto_spec/mod.rs` (`PlaceholderConfig` + `from_legacy_parse`)
+- Test: `crates/xray-tui-config/src/import_export.rs` tests (behavior via `parse_share_url`) + a proto unit test
 
-- [ ] **Step 1: Write the failing test**
+**Design (user-mandated uid model):** `uid = sig XOR cred_hash`. `sig` = deterministic hash of SEMANTIC identity (protocol, transport, security TYPE — never exact security values like pbk/sid). `cred_hash` = hash of CREDENTIAL values (uuid, pbk+sid, password). When no credentials are extractable, `cred_hash = 0` and `uid == sig`. `sig` must NEVER be zero and must ALWAYS be computable. For opaque/undecomposable configs (e.g. slipnet-enc, and our legacy `PlaceholderConfig`), `sig` = hash of the ENTIRE body. Reference: sub-healer `SlipnetEncConfig` (thirdparty/sub-healer/src/proto_spec/slipnet.rs) — but its current `compute_sig` (hash of just the schema name) is WRONG per the user: the whole body must be hashed.
 
-Find the existing test module in import_export.rs. Add:
+- [ ] **Step 1: Write the failing tests**
+
+proto unit test (mod.rs tests or a dedicated test):
 
 ```rust
 #[test]
-fn hostless_typed_parse_failure_gets_nonzero_uid() {
+fn placeholder_config_sig_is_deterministic_nonzero_body_hash() {
+    let blob = serde_json::json!({
+        "protocol_settings": {"password": "sekrit"},
+        "stream_settings": {}
+    });
+    let json = serde_json::to_vec(&blob).unwrap();
+    let a = ProtocolConfig::from_legacy_parse("wireguard", json.clone());
+    let b = ProtocolConfig::from_legacy_parse("wireguard", json.clone());
+    let c = ProtocolConfig::from_legacy_parse("wireguard", serde_json::to_vec(&serde_json::json!({
+        "protocol_settings": {"password": "other"},
+        "stream_settings": {}
+    })).unwrap());
+    assert_ne!(a.sig(), 0, "sig must never be zero");
+    assert_eq!(a.sig(), b.sig(), "same body -> same sig (dedup)");
+    assert_ne!(a.sig(), c.sig(), "different body -> different sig");
+    assert_eq!(a.cred_hash(), 0, "opaque blob has no extractable credentials");
+    assert_eq!(a.uid(), a.sig(), "uid == sig when cred_hash is 0");
+}
+```
+
+Behavior test (import_export.rs tests):
+
+```rust
+#[test]
+fn hostless_typed_parse_failure_gets_deterministic_nonzero_uid() {
     // Hostless wireguard:// URL: legacy parser accepts, typed parser rejects.
     let url = "wireguard://publickey@?address=10.0.0.2/32";
     let settings = ValidationSettings::default();
     let a = parse_share_url(url, &settings).expect("legacy parse ok");
     let b = parse_share_url(url, &settings).expect("legacy parse ok");
-    assert_ne!(a.id, 0, "fallback uid must not be zero (primary-key collapse)");
-    assert_ne!(a.id, b.id, "two imports of the same URL must not share id 0");
+    let uid_a = a.sig ^ a.cred_hash;
+    let uid_b = b.sig ^ b.cred_hash;
+    assert_ne!(uid_a, 0, "uid must never be zero (primary-key collapse)");
+    assert_eq!(uid_a, uid_b, "same URL must dedup to the same uid");
+    let url2 = "wireguard://publickey@?address=10.0.0.3/32";
+    let c = parse_share_url(url2, &settings).expect("legacy parse ok");
+    assert_ne!(uid_a, c.sig ^ c.cred_hash, "different configs must differ");
 }
 ```
 
-(Check how existing tests call `parse_share_url` and what fields `ParsedProtocol` exposes — `id` may or may not be on ParsedProtocol; if not, assert on the returned protocol's `uid`/`sig` via `ProtocolConfig::from_legacy_parse(...)` or via the DB-level behavior. If `ParsedProtocol` lacks `id`, test `profile_to_endpoint_protocol` output or restructure: call `parse_share_url` twice and check the `sig`/`cred_hash`/derived `uid` — the assertion that matters is "id/uid != 0" and "not identical across imports".)
+(Check the actual `ParsedProtocol` field names — it exposes `sig` and `cred_hash` (used by `format_share_url`); use the real names.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p xray-tui-config hostless_typed_parse_failure_gets_nonzero_uid`
-Expected: FAIL — both imports yield id 0.
+Run: `cargo test -p xray-tui-proto placeholder_config_sig_is_deterministic_nonzero_body_hash`
+Expected: FAIL — PlaceholderConfig sig() returns 0.
+Run: `cargo test -p xray-tui-config hostless_typed_parse_failure_gets_deterministic_nonzero_uid`
+Expected: FAIL — uid is 0.
 
 - [ ] **Step 3: Implement**
 
-Replace the fallback in `convert_spec_blob`:
+`proto_spec/mod.rs` `PlaceholderConfig` — add the cache field and a real sig:
 
 ```rust
-} else {
-    // Typed parser rejected the URL (e.g. hostless wireguard:// the legacy
-    // parser accepts). PlaceholderConfig uid() is always 0 — a 0 primary key
-    // would collapse every such import into one row (upsert_by_id) and make
-    // delete-of-id-0 kill them all. Fall back to a random uid like form
-    // profiles use (ops/profiles.rs `confirm_add_server` pattern).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let rand_bits = RandomState::new().build_hasher().finish();
-    let uid = (now ^ rand_bits) as i64;
-    profile.id = uid;
-    profile.sig = uid;
-    profile.cred_hash = 0;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub struct PlaceholderConfig {
+    pub proto_name: String,
+    /// Opaque JSON blob containing `protocol_settings/stream_settings` from legacy parsing.
+    pub settings_json: Vec<u8>,
+    #[serde(skip)]
+    sig_cache: std::sync::OnceLock<std::num::NonZeroU64>,
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+`impl ProtoSpec for PlaceholderConfig` — replace `fn sig(&self) -> u64 { 0 }` and `fn set_sig_cache(&self, _v) {}` with:
 
-Run: `cargo test -p xray-tui-config hostless_typed_parse_failure_gets_nonzero_uid` — PASS. Run the full import_export test module — all pass.
+```rust
+fn set_sig_cache(&self, v: std::num::NonZeroU64) {
+    _ = self.sig_cache.set(v);
+}
+impl_sig_cache!();
+```
+
+and add a private `compute_sig` on `PlaceholderConfig` (mirror the typed configs' pattern — the `impl_sig_cache!` macro calls `self.compute_sig()`):
+
+```rust
+impl PlaceholderConfig {
+    fn compute_sig(&self) -> u64 {
+        // Opaque legacy blob: we cannot decompose semantic fields reliably,
+        // so the sig is a deterministic rapidhash over the ENTIRE body
+        // (proto_name + settings_json). Same body -> same uid (dedup); never
+        // zero (mapped to NonZeroU64::MIN by the macro).
+        use rapidhash::v3::{RapidStreamHasherV3, DEFAULT_RAPID_SECRETS};
+        use std::hash::Hasher;
+        let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
+        hasher.write(self.proto_name.as_bytes());
+        hasher.write(&self.settings_json);
+        hasher.finish()
+    }
+}
+```
+
+`from_legacy_parse` — the `placeholder` closure must init the new field:
+
+```rust
+let placeholder = |name: &str, json: Vec<u8>| PlaceholderConfig {
+    proto_name: name.to_string(),
+    settings_json: json,
+    sig_cache: std::sync::OnceLock::new(),
+};
+```
+
+`convert_spec_blob` (import_export.rs:376-384) — the fallback code stays as-is (`profile.id = config.uid() as i64; profile.sig = config.sig() as i64; profile.cred_hash = config.cred_hash() as i64;`) — it now yields a non-zero deterministic uid. Update its comment to explain.
+
+- [ ] **Step 4: Run to verify they pass**
+
+Run: `cargo test -p xray-tui-proto placeholder_config_sig_is_deterministic_nonzero_body_hash` — PASS.
+Run: `cargo test -p xray-tui-config hostless_typed_parse_failure_gets_deterministic_nonzero_uid` — PASS. Full proto + config suites — PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/xray-tui-config/src/import_export.rs
-git commit -m "fix(import): never fall back to uid 0 on typed-parse failure (data-loss)"
+git add crates/xray-tui-proto/src/proto_spec/mod.rs crates/xray-tui-config/src/import_export.rs
+git commit -m "fix(import): PlaceholderConfig sig is a deterministic body hash (uid never 0)"
 ```
 
 ### Task 7: Transport host forwarded for Ws/Grpc/Http too (M16)
