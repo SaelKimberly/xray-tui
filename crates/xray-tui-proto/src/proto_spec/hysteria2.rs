@@ -119,9 +119,12 @@ impl ProtoSpec for Hysteria2Config {
         let obfs_password = utils::query_get(&query, "obfs-password").map(TinyText::from);
         // up/down: bandwidth limits (canonical impl doesn't parse these from URL)
         let up = utils::query_get(&query, "up").map(TinyText::from);
+        // pin_sha256: certificate SHA-256 pin (keys: pinSHA256, pin_sha256)
+        let pin_sha256 =
+            utils::query_get_multi(&query, &["pinSHA256", "pin_sha256"]).map(TinyText::from);
         let security = SecurityConfig {
             tls: Some(TlsConfig::Tls(TlsOpts {
-                pin_sha256: None,
+                pin_sha256: pin_sha256.clone(),
                 sni: utils::query_get(&query, "sni").map(TinyText::from),
                 alpn: None,
                 fp: None,
@@ -137,9 +140,6 @@ impl ProtoSpec for Hysteria2Config {
         // hop_interval: port hopping interval in seconds (keys: mportHopInt, hop_interval)
         let hop_interval = utils::query_get_multi(&query, &["mportHopInt", "hop_interval"])
             .and_then(|v| v.parse().ok());
-        // pin_sha256: certificate SHA-256 pin (keys: pinSHA256, pin_sha256)
-        let pin_sha256 =
-            utils::query_get_multi(&query, &["pinSHA256", "pin_sha256"]).map(TinyText::from);
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
@@ -359,6 +359,7 @@ impl Hysteria2Config {
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
+    use super::super::common::TlsConfig;
     use crate::urlx::SchemeX;
 
     #[test]
@@ -428,6 +429,17 @@ mod tests {
         let reparsed = Hysteria2Config::try_parse(&raw2).expect("re-parse");
         assert_eq!(reparsed.hop_interval, Some(10));
         assert_eq!(reparsed.pin_sha256.as_deref(), Some("abc123deadbeef"));
+    }
+
+    #[test]
+    fn test_pin_sha256_lands_in_tls_opts() {
+        let url = "hysteria2://secret@host:443/?pinSHA256=abc123deadbeef&sni=host#r";
+        let raw = crate::urlx::RawUrlX::from(url);
+        let config = Hysteria2Config::try_parse(&raw).expect("failed");
+        let Some(TlsConfig::Tls(opts)) = config.security.tls else {
+            panic!("expected Tls opts");
+        };
+        assert_eq!(opts.pin_sha256.as_deref(), Some("abc123deadbeef"));
     }
     use super::super::test_helpers::check_roundtrip;
     use super::Hysteria2Config;
