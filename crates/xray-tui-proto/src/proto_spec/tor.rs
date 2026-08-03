@@ -37,7 +37,7 @@ pub struct TorConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -84,13 +84,10 @@ impl ProtoSpec for TorConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self
-            .cred_hash_cache
-            .get_or_init(|| NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN));
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| 0)
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -136,12 +133,6 @@ impl TorConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"tor");
-        if let Some(ref v) = self.executable_path {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(ref v) = self.data_directory {
-            hasher.write(v.as_bytes());
-        }
         hasher.finish()
     }
 }

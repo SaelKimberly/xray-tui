@@ -74,7 +74,7 @@ pub struct Hysteria2Config {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     pub auth: String,
     #[serde(with = "host_serde")]
@@ -234,20 +234,15 @@ impl ProtoSpec for Hysteria2Config {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                None,
-                Some(&self.port),
-                &self.auth,
-                &self.auth,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("auth", self.auth.as_str()),
+                ("obfs_password", self.obfs_password.as_deref().unwrap_or("")),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -328,10 +323,9 @@ impl Hysteria2Config {
         hasher.write(b"hysteria2");
         let sec_type = self.security.type_str().unwrap_or("none");
         hasher.write(sec_type.as_bytes());
-        if let Some(ref v) = self.obfs {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(ref v) = self.obfs_password {
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(self.port.to_string().as_bytes());
+        if let Some(v) = &self.obfs {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = self.security.insecure() {
@@ -340,10 +334,10 @@ impl Hysteria2Config {
         if let Some(v) = self.security.sni() {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.up {
+        if let Some(v) = &self.up {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.down {
+        if let Some(v) = &self.down {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = &self.hop_interval {

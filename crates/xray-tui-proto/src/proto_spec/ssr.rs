@@ -61,7 +61,7 @@ pub struct SsrConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -201,20 +201,15 @@ impl ProtoSpec for SsrConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                &self.method,
-                &self.password,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("password", self.password.as_str()),
+                ("method", self.method.as_str()),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -321,10 +316,12 @@ impl SsrConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"ssr");
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(&self.port.to_le_bytes());
         let mut sorted_keys: Vec<&String> = self.params.keys().collect();
         sorted_keys.sort();
         for k in &sorted_keys {
-            if k.as_str() == "remarks" {
+            if k.as_str() == "remarks" || k.as_str() == "password" {
                 continue;
             }
             hasher.write(k.as_bytes());

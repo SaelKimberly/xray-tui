@@ -28,6 +28,7 @@ use crate::clash::{ClashProxy, ClashSsh};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
+use crate::proto_spec::utils;
 use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
 use crate::urlx::HostSpec;
 use crate::urlx::TinyText;
@@ -41,7 +42,7 @@ pub struct SshConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -92,13 +93,15 @@ impl ProtoSpec for SshConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self
-            .cred_hash_cache
-            .get_or_init(|| NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN));
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("password", self.password.as_deref().unwrap_or("")),
+                ("private_key", self.private_key.as_deref().unwrap_or("")),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -155,10 +158,12 @@ impl SshConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"ssh");
-        if let Some(ref v) = self.user {
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(&self.port.to_le_bytes());
+        if let Some(v) = &self.user {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.client_version {
+        if let Some(v) = &self.client_version {
             hasher.write(v.as_bytes());
         }
         hasher.finish()

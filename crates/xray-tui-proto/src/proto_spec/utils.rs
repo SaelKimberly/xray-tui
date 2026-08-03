@@ -169,54 +169,26 @@ pub fn query_get_multi<'a>(params: &'a [(String, String)], keys: &[&str]) -> Opt
     keys.iter().find_map(|key| query_get(params, key))
 }
 
-/// Compute credential hash: streaming rapidhash of "host:port:username:password"
-/// without intermediate String allocation.
+/// Hash credential values in a stable order. Returns 0 when there are no
+/// credentials — the caller's uid then equals its sig.
 #[must_use]
-pub fn compute_cred_hash(
-    host: Option<&HostSpec>,
-    port: Option<u16>,
-    port_spec: Option<&PortSpec>,
-    username: &str,
-    password: &str,
-) -> u64 {
-    if host.is_none()
-        && port.is_none()
-        && port_spec.is_none()
-        && username.is_empty()
-        && password.is_empty()
-    {
+pub fn compute_cred_hash(pairs: &[(&str, &str)]) -> u64 {
+    let mut non_empty: Vec<(&str, &str)> = pairs
+        .iter()
+        .copied()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    if non_empty.is_empty() {
         return 0;
     }
-
+    non_empty.sort_unstable();
     let mut hasher = rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-
-    if let Some(h) = host {
-        hasher.write(h.to_str().as_bytes());
+    for (k, v) in &non_empty {
+        hasher.write(k.as_bytes());
+        hasher.write(b"=");
+        hasher.write(v.as_bytes());
+        hasher.write(b";");
     }
-    hasher.write(b":");
-
-    match (port_spec, port) {
-        (Some(ps), _) => {
-            if ps.length() == 1 {
-                if let Some(p) = ps.first() {
-                    let mut buf = itoa::Buffer::new();
-                    hasher.write(buf.format(p).as_bytes());
-                }
-            } else {
-                hasher.write(ps.to_string().as_bytes());
-            }
-        }
-        (None, Some(p)) => {
-            let mut buf = itoa::Buffer::new();
-            hasher.write(buf.format(p).as_bytes());
-        }
-        (None, None) => {}
-    }
-    hasher.write(b":");
-    hasher.write(username.as_bytes());
-    hasher.write(b":");
-    hasher.write(password.as_bytes());
-
     hasher.finish()
 }
 
@@ -291,4 +263,30 @@ pub fn coerce_u64(val: &serde_json::Value) -> Option<u64> {
                 }
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_cred_hash;
+
+    #[test]
+    fn compute_cred_hash_returns_zero_without_credentials() {
+        assert_eq!(compute_cred_hash(&[]), 0);
+        assert_eq!(compute_cred_hash(&[("uuid", "")]), 0);
+        assert_eq!(
+            compute_cred_hash(&[("uuid", ""), ("password", "")]),
+            0
+        );
+        assert_ne!(compute_cred_hash(&[("uuid", "x")]), 0);
+        // order-independent
+        assert_eq!(
+            compute_cred_hash(&[("a", "1"), ("b", "2")]),
+            compute_cred_hash(&[("b", "2"), ("a", "1")])
+        );
+        // duplicate keys keep all values (different values still differ)
+        assert_ne!(
+            compute_cred_hash(&[("password", "a")]),
+            compute_cred_hash(&[("password", "b")])
+        );
+    }
 }

@@ -57,7 +57,7 @@ pub struct Hysteria1Config {
     sig_cache: std::sync::OnceLock<NonZeroU64>,
 
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -229,24 +229,12 @@ impl ProtoSpec for Hysteria1Config {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let (username, password) = match &self.auth {
-                Some(a) => (a.as_str(), a.as_str()),
-                None => ("", ""),
-            };
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                username,
-                password,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[("auth", self.auth.as_deref().unwrap_or(""))])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -328,8 +316,13 @@ impl Hysteria1Config {
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"hysteria");
         hasher.write(self.host.to_str().as_bytes());
-        hasher.write(self.host.to_str().as_bytes());
         hasher.write(self.port.to_string().as_bytes());
+        if let Some(v) = &self.up_mbps {
+            hasher.write(&v.to_le_bytes());
+        }
+        if let Some(v) = &self.down_mbps {
+            hasher.write(&v.to_le_bytes());
+        }
         if let Some(v) = &self.protocol {
             hasher.write(v.as_bytes());
         }

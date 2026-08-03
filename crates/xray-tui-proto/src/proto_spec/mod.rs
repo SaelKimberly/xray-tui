@@ -464,7 +464,7 @@ pub trait ProtoSpec: Serialize + DeserializeOwned + std::fmt::Debug + Clone {
     fn cred_hash(&self) -> u64;
     fn sig(&self) -> u64;
     fn set_sig_cache(&self, v: std::num::NonZeroU64);
-    fn set_cred_hash_cache(&self, v: std::num::NonZeroU64);
+    fn set_cred_hash_cache(&self, v: u64);
     fn uid(&self) -> u64 {
         self.sig() ^ self.cred_hash()
     }
@@ -614,7 +614,7 @@ impl ProtoSpec for ProtocolConfig {
     fn set_sig_cache(&self, v: std::num::NonZeroU64) {
         dispatch!(self, set_sig_cache, v);
     }
-    fn set_cred_hash_cache(&self, v: std::num::NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         dispatch!(self, set_cred_hash_cache, v);
     }
     fn security(&self) -> Option<&SecurityConfig> {
@@ -714,7 +714,7 @@ impl ProtoSpec for PlaceholderConfig {
         0
     }
     impl_sig_cache!();
-    fn set_cred_hash_cache(&self, _v: std::num::NonZeroU64) {}
+    fn set_cred_hash_cache(&self, _v: u64) {}
     fn transport_type(&self) -> Option<&str> {
         None
     }

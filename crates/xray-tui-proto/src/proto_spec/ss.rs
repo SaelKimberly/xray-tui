@@ -69,7 +69,7 @@ pub struct SsConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     pub method: TinyText,
     pub password: String,
@@ -209,35 +209,15 @@ impl ProtoSpec for SsConfig {
         self.remarks.as_deref()
     }
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let mut val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                &self.method,
-                &self.password,
-            );
-            // Include plugin and plugin_opts in credential hash
-            if let Some(plugin) = &self.plugin {
-                use rapidhash::v3::RapidStreamHasherV3;
-                let mut h = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-                h.write(plugin.as_bytes());
-                if let Some(opts) = &self.plugin_opts {
-                    for (k, v) in opts {
-                        h.write(k.as_bytes());
-                        h.write(b"=");
-                        h.write(v.as_bytes());
-                        h.write(b";");
-                    }
-                }
-                val ^= h.finish();
-            }
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("method", self.method.as_str()),
+                ("password", self.password.as_str()),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -303,7 +283,8 @@ impl SsConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"ss");
-        hasher.write(self.method.as_bytes());
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(&self.port.to_le_bytes());
         if let Some(plugin) = &self.plugin {
             hasher.write(plugin.as_bytes());
         }
@@ -372,6 +353,27 @@ mod tests {
     fn test_clash_roundtrip() {
         use super::super::test_helpers::check_clash_roundtrip;
         check_clash_roundtrip::<SsConfig>("ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080");
+    }
+
+    #[test]
+    fn ss_password_is_credential_not_sig() {
+        let url_a = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080"; // cleof:password
+        let url_b = "ss://Y2xlb2Y6cGFzczEyMw==@1.2.3.4:8080"; // cleof:pass123
+        let a = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
+        let b = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        assert_eq!(a.sig(), b.sig(), "password must not change sig");
+        assert_ne!(a.cred_hash(), b.cred_hash(), "password changes cred_hash");
+        assert_ne!(a.uid(), b.uid());
+    }
+
+    #[test]
+    fn ss_host_port_are_identity_in_sig() {
+        let url_a = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
+        let url_b = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.5:8080";
+        let a = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
+        let b = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        assert_ne!(a.sig(), b.sig(), "different host -> different sig");
+        assert_eq!(a.cred_hash(), b.cred_hash());
     }
 
     #[test]

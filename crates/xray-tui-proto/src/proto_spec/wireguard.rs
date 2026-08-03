@@ -54,7 +54,7 @@ pub struct WireguardConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     pub private_key: String,
     #[serde(with = "host_serde")]
@@ -235,20 +235,16 @@ impl ProtoSpec for WireguardConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                &self.private_key,
-                &self.private_key,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("private_key", self.private_key.as_str()),
+                ("public_key", self.public_key.as_str()),
+                ("preshared_key", self.preshared_key.as_deref().unwrap_or("")),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -327,11 +323,9 @@ impl WireguardConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"wireguard");
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(&self.port.to_le_bytes());
         hasher.write(self.address.as_bytes());
-        hasher.write(self.public_key.as_bytes());
-        if let Some(v) = &self.preshared_key {
-            hasher.write(v.as_bytes());
-        }
         if let Some(v) = &self.reserved {
             hasher.write(v.as_bytes());
         }
@@ -369,6 +363,29 @@ mod tests {
         assert_eq!(config.address, "172.16.0.2/32");
         assert_eq!(config.mtu.as_deref(), Some("1280"));
         assert_eq!(config.remarks, None);
+    }
+
+    #[test]
+    fn wireguard_keys_are_credentials_not_sig() {
+        // Same server/address/mtu, different preshared keys: sig identical,
+        // cred_hash differs (public_key/preshared_key are credentials).
+        let url_a = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=AAA&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
+        let url_b = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=BBB&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
+        let a = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
+        let b = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        assert_eq!(a.sig(), b.sig(), "preshared_key is a credential, not sig");
+        assert_ne!(a.cred_hash(), b.cred_hash());
+        assert_ne!(a.uid(), b.uid());
+    }
+
+    #[test]
+    fn wireguard_host_port_are_identity_in_sig() {
+        let url_a = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D";
+        let url_b = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2409?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
+        let a = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
+        let b = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        assert_ne!(a.sig(), b.sig(), "different port -> different sig");
+        assert_eq!(a.cred_hash(), b.cred_hash());
     }
 
     #[test]

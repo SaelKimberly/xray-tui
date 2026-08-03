@@ -29,6 +29,7 @@ use crate::clash::{ClashProxy, ClashTailscale};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
+use crate::proto_spec::utils;
 use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
 use crate::urlx::HostSpec;
 use crate::urlx::TinyText;
@@ -42,7 +43,7 @@ pub struct TailscaleConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -94,13 +95,12 @@ impl ProtoSpec for TailscaleConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self
-            .cred_hash_cache
-            .get_or_init(|| NonZeroU64::new(0).unwrap_or(NonZeroU64::MIN));
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[("auth_key", self.auth_key.as_deref().unwrap_or(""))])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -162,17 +162,8 @@ impl TailscaleConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"tailscale");
-        if let Some(ref v) = self.hostname {
+        if let Some(v) = &self.control_url {
             hasher.write(v.as_bytes());
-        }
-        if let Some(ref v) = self.control_url {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.ephemeral {
-            hasher.write(if v { b"true" } else { b"false" });
-        }
-        if let Some(v) = self.accept_routes {
-            hasher.write(if v { b"true" } else { b"false" });
         }
         hasher.finish()
     }

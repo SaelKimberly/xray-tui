@@ -44,7 +44,7 @@ pub struct NaiveConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     pub username: String,
     pub password: String,
@@ -130,20 +130,15 @@ impl ProtoSpec for NaiveConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                &self.username,
-                &self.password,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("username", self.username.as_str()),
+                ("password", self.password.as_str()),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 

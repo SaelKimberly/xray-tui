@@ -56,7 +56,7 @@ pub struct TuicConfig {
     sig_cache: std::sync::OnceLock<NonZeroU64>,
 
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     pub uuid: String,
     pub password: String,
@@ -205,20 +205,15 @@ impl ProtoSpec for TuicConfig {
         self.remarks.as_deref()
     }
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                &self.uuid,
-                &self.password,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("uuid", self.uuid.as_str()),
+                ("password", self.password.as_str()),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -303,10 +298,12 @@ impl TuicConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"tuic");
-        if let Some(ref v) = self.congestion_control {
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(&self.port.to_le_bytes());
+        if let Some(v) = &self.congestion_control {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.udp_relay_mode {
+        if let Some(v) = &self.udp_relay_mode {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = self.security.alpn() {

@@ -68,7 +68,7 @@ pub struct VlessConfig {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     pub uuid: String,
     pub uuid_origin: Option<TinyText>,
@@ -374,20 +374,16 @@ impl ProtoSpec for VlessConfig {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                &self.uuid,
-                &self.uuid,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("uuid", self.uuid.as_str()),
+                ("pbk", self.security.pbk().unwrap_or("")),
+                ("sid", self.security.sid().unwrap_or("")),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -491,41 +487,37 @@ impl VlessConfig {
         let sec_type = self.security.type_str().unwrap_or("none");
         hasher.write(sec_type.as_bytes());
         hasher.write(self.transport.type_str().as_bytes());
+        hasher.write(self.host.to_str().as_bytes());
+        hasher.write(&self.port.to_le_bytes());
         match &self.transport {
             TransportConfig::HttpUpgrade(cfg) => {
-                if let Some(ref v) = cfg.host {
+                if let Some(v) = &cfg.host {
                     hasher.write(v.as_bytes());
                 }
             }
             TransportConfig::XHttp(cfg) => {
-                if let Some(ref v) = cfg.host {
+                if let Some(v) = &cfg.host {
                     hasher.write(v.as_bytes());
                 }
             }
             _ => {}
         }
-        if let Some(ref path) = self.path {
+        if let Some(path) = &self.path {
             hasher.write(path.as_bytes());
         }
-        if let Some(ref v) = self.encryption {
+        if let Some(v) = &self.encryption {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = self.security.sni() {
             hasher.write(v.as_bytes());
         }
-        if let Some(ref v) = self.flow {
+        if let Some(v) = &self.flow {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = self.security.alpn() {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = self.security.fp() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.pbk() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.sid() {
             hasher.write(v.as_bytes());
         }
         if let Some(v) = self.splice {
@@ -628,6 +620,25 @@ mod tests {
         check_clash_roundtrip::<VlessConfig>(
             "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws",
         );
+    }
+
+    #[test]
+    fn vless_reality_sig_excludes_pbk_sid_cred_hash_includes_them() {
+        let url_a = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
+        let url_b = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=BBBB&sid=2222&spx=%2F&fp=chrome#r";
+        let url_c = "vless://22222222-3333-4444-5555-666666666666@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
+        let a = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).unwrap();
+        let b = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).unwrap();
+        let c = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_c)).unwrap();
+        assert_eq!(
+            a.sig(),
+            b.sig(),
+            "sig is semantic: pbk/sid values must NOT change it"
+        );
+        assert_ne!(a.cred_hash(), b.cred_hash(), "cred_hash covers pbk/sid");
+        assert_ne!(a.uid(), b.uid());
+        assert_ne!(a.uid(), c.uid(), "different uuid -> different uid");
+        assert_ne!(a.sig(), 0);
     }
 
     #[test]

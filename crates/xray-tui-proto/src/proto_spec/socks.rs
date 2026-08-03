@@ -55,7 +55,7 @@ pub struct Socks5Config {
     #[serde(skip)]
     sig_cache: std::sync::OnceLock<NonZeroU64>,
     #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<NonZeroU64>,
+    cred_hash_cache: std::sync::OnceLock<u64>,
 
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -165,22 +165,15 @@ impl ProtoSpec for Socks5Config {
     }
 
     fn cred_hash(&self) -> u64 {
-        let v = self.cred_hash_cache.get_or_init(|| {
-            let username = self.username.as_deref().unwrap_or("");
-            let password = self.password.as_deref().unwrap_or("");
-            let val = utils::compute_cred_hash(
-                Some(&self.host),
-                Some(self.port),
-                None,
-                username,
-                password,
-            );
-            NonZeroU64::new(val).unwrap_or(NonZeroU64::MIN)
-        });
-        v.get()
+        *self.cred_hash_cache.get_or_init(|| {
+            utils::compute_cred_hash(&[
+                ("username", self.username.as_deref().unwrap_or("")),
+                ("password", self.password.as_deref().unwrap_or("")),
+            ])
+        })
     }
 
-    fn set_cred_hash_cache(&self, v: NonZeroU64) {
+    fn set_cred_hash_cache(&self, v: u64) {
         _ = self.cred_hash_cache.set(v);
     }
 
@@ -272,6 +265,39 @@ mod tests {
         assert_eq!(config.port, 1080);
         assert!(config.username.is_none());
         assert!(config.password.is_none());
+    }
+
+    #[test]
+    fn socks_no_credentials_uid_equals_sig() {
+        // No credentials -> cred_hash is 0 -> uid == sig (per the uid mandate:
+        // "when cred_hash could not be computed, we stay with just sig == uid").
+        let raw = crate::urlx::RawUrlX::from("socks://1.2.3.4:1080");
+        let config = Socks5Config::try_parse(&raw).expect("failed to parse");
+        assert_eq!(config.cred_hash(), 0, "no credentials -> cred_hash 0");
+        assert_eq!(config.uid(), config.sig(), "uid == sig when cred_hash is 0");
+        assert_ne!(config.sig(), 0);
+        assert_ne!(config.uid(), 0, "uid must never be zero");
+    }
+
+    #[test]
+    fn socks_credentials_change_cred_hash_not_sig() {
+        let raw_noauth = crate::urlx::RawUrlX::from("socks://1.2.3.4:1080");
+        let raw_auth = crate::urlx::RawUrlX::from("socks://user:pass@1.2.3.4:1080");
+        let noauth = Socks5Config::try_parse(&raw_noauth).expect("failed to parse");
+        let auth = Socks5Config::try_parse(&raw_auth).expect("failed to parse");
+        assert_eq!(noauth.sig(), auth.sig(), "creds are not part of sig");
+        assert_ne!(noauth.cred_hash(), auth.cred_hash());
+        assert_ne!(noauth.uid(), auth.uid());
+    }
+
+    #[test]
+    fn socks_host_port_are_identity_in_sig() {
+        let raw_a = crate::urlx::RawUrlX::from("socks://1.2.3.4:1080");
+        let raw_b = crate::urlx::RawUrlX::from("socks://1.2.3.4:1081");
+        let a = Socks5Config::try_parse(&raw_a).expect("failed to parse");
+        let b = Socks5Config::try_parse(&raw_b).expect("failed to parse");
+        assert_ne!(a.sig(), b.sig(), "different port -> different sig");
+        assert_eq!(a.cred_hash(), b.cred_hash(), "no creds either way");
     }
 
     #[test]
