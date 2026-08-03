@@ -1518,6 +1518,7 @@ dependencies = [
  "foldhash 0.2.0",
  "libm",
  "portable-atomic",
+ "rand 0.9.5",
  "siphasher",
 ]
 
@@ -6707,6 +6708,19 @@ dependencies = [
  "anyhow",
  "maxminddb",
  "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "xray-tui-host-features"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fastbloom 0.17.0",
+ "reqwest",
+ "rustls",
  "tempfile",
  "tokio",
  "tracing",

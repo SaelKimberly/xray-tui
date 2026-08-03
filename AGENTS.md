@@ -30,6 +30,7 @@ cargo run
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
 - `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing (dns-stamp-parser) → hickory-resolver 0.26 config, cached resolver list, panic-free async OnceCell init
 - `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup (maxminddb 0.30)
+- `crates/xray-tui-host-features/src/lib.rs` — HostFeaturesChecker: SNI/exact-IP/CIDR whitelist membership checks (fastbloom fast-negative guard + exact HashSet/interval verification, IPv4-only), download-if-missing from hxehex/russia-mobile-internet-whitelist, `get_host_features(&ServerName)` main API
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
 - `crates/xray-tui-config/src/subscription.rs` — chunked base64 streaming decoder with URL splitting

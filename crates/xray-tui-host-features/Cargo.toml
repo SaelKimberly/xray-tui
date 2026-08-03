@@ -1,0 +1,33 @@
+[package]
+name = "xray-tui-host-features"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# ============ Whitelist ============
+# Single-crate dependency → crate-local per dependency policy; minor bound at latest.
+# `serde` feature of the source is dropped: bloom filters are never serialized here.
+fastbloom = "0.17"
+
+# ============ TLS ============
+rustls.workspace = true   # only for rustls::pki_types::ServerName
+
+# ============ Networking ============
+reqwest.workspace = true  # download-if-missing of whitelist files
+
+# ============ Async Runtime & I/O ============
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+# ============ Error Handling ============
+anyhow.workspace = true
+
+# ============ Logging ============
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -12,6 +12,7 @@ xray-tui (bin)
 
 xray-tui-dns    (standalone lib — not yet consumed by other crates)
 xray-tui-geoip  (standalone lib — not yet consumed by other crates)
+xray-tui-host-features  (standalone lib — not yet consumed by other crates)
 ```
 
 ## Crate Responsibilities
@@ -508,6 +509,28 @@ impl GeoIp {
 ```
 
 On first use downloads the mmdb (P3TERX GeoLite mirror) to `db_path` via reqwest (partial-file cleanup on failure), opens it with `maxminddb::Reader::open_readfile` (whole DB in RAM), and runs lookups + `decode_path` inside `spawn_blocking` (LookupResult borrows the Reader, so `Arc<Reader>` moves into the closure). Country is required; missing city yields `city_en: None`.
+
+### xray-tui-host-features (library crate)
+
+`crates/xray-tui-host-features/src/lib.rs` — whitelist membership feature extraction, ported from sub-healer's `WhitelistChecker`.
+
+```rust
+pub struct HostFeatures { pub sni_whitelisted: bool, pub ip_whitelisted: bool, pub cidr_whitelisted: bool }
+pub struct HostFeaturesChecker { /* fastbloom BloomFilter + exact HashSet/interval backing */ }
+impl HostFeaturesChecker {
+    pub fn new(sni_path: &Path, ip_path: &Path, cidr_path: &Path) -> anyhow::Result<Self>;
+    pub async fn load(sni_path: &Path, ip_path: &Path, cidr_path: &Path) -> anyhow::Result<Self>;
+    pub async fn ensure_downloaded(sni_path: &Path, ip_path: &Path, cidr_path: &Path) -> anyhow::Result<()>;
+    pub fn get_host_features(&self, server_name: &ServerName<'_>) -> HostFeatures;
+}
+```
+
+`new` reads the three whitelist files (SNI hostnames, exact IPv4s, IPv4 CIDR ranges). `load` first
+downloads any file missing from the hxehex/russia-mobile-internet-whitelist upstream (presence check
+only, never re-downloads), mirroring the geoip/dns download-if-missing convention. Lookups are
+bloom-filter fast-negatives with exact verification (zero false positives): `DnsName` ServerNames →
+SNI check, IPv4 → exact-IP + CIDR checks, IPv6/unknown → empty feature set. `fastbloom` is the only
+crate-local dep (serde feature dropped — filters rebuilt from disk on `new()`).
 
 ## Data Flow: Connect to Proxy
 
