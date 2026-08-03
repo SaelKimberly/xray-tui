@@ -315,26 +315,10 @@ pub async fn install_binary(
 
 /// Build the GitHub release asset URL for the current OS/arch.
 pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, UpdateError> {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => match core_type {
-            CoreType::Xray => "64",
-            CoreType::SingBox => "amd64",
-            CoreType::Auto => return Err(UpdateError::AutoCore),
-        },
-        "aarch64" => match core_type {
-            CoreType::Xray | CoreType::SingBox => "arm64",
-            CoreType::Auto => return Err(UpdateError::AutoCore),
-        },
-        _ => {
-            return Err(UpdateError::UnsupportedPlatform(
-                std::env::consts::ARCH,
-                std::env::consts::OS,
-            ));
-        }
-    };
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let name = asset_name(core_type, version, std::env::consts::ARCH)?;
 
-    let os = std::env::consts::OS;
-    if os != "linux" {
+    if std::env::consts::OS != "linux" {
         return Err(UpdateError::UnsupportedPlatform(
             std::env::consts::ARCH,
             std::env::consts::OS,
@@ -343,17 +327,49 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, U
 
     let url = match core_type {
         CoreType::Xray => format!(
-            "https://github.com/XTLS/Xray-core/releases/download/v{version}/Xray-linux-{arch}.zip",
-            version = version.strip_prefix('v').unwrap_or(version),
+            "https://github.com/XTLS/Xray-core/releases/download/v{version}/{name}"
         ),
         CoreType::SingBox => format!(
-            "https://github.com/SagerNet/sing-box/releases/download/v{version}/sing-box-{version}-linux-{arch}.tar.gz",
-            version = version.strip_prefix('v').unwrap_or(version),
+            "https://github.com/SagerNet/sing-box/releases/download/v{version}/{name}"
         ),
         CoreType::Auto => return Err(UpdateError::AutoCore),
     };
 
     Ok(url)
+}
+
+/// Build the GitHub release asset filename for a core type, version, and Rust
+/// target arch (a `std::env::consts::ARCH` value such as `"aarch64"`).
+fn asset_name(
+    core_type: CoreType,
+    version: &str,
+    arch: &'static str,
+) -> Result<String, UpdateError> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let suffix = match arch {
+        "x86_64" => match core_type {
+            CoreType::Xray => "64",
+            CoreType::SingBox => "amd64",
+            CoreType::Auto => return Err(UpdateError::AutoCore),
+        },
+        "aarch64" => match core_type {
+            CoreType::Xray => "arm64-v8a", // XTLS publishes arm64-v8a, not arm64
+            CoreType::SingBox => "arm64",
+            CoreType::Auto => return Err(UpdateError::AutoCore),
+        },
+        _ => {
+            return Err(UpdateError::UnsupportedPlatform(
+                arch,
+                std::env::consts::OS,
+            ));
+        }
+    };
+    let name = match core_type {
+        CoreType::Xray => format!("Xray-linux-{suffix}.zip"),
+        CoreType::SingBox => format!("sing-box-{version}-linux-{suffix}.tar.gz"),
+        CoreType::Auto => return Err(UpdateError::AutoCore),
+    };
+    Ok(name)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
@@ -440,6 +456,32 @@ mod tests {
 
         let singbox_url = release_asset_url(CoreType::SingBox, "v1.10.3").unwrap();
         assert!(singbox_url.contains("sing-box-1.10.3-linux-amd64.tar.gz"));
+    }
+
+    #[test]
+    fn aarch64_xray_asset_uses_v8a_suffix() {
+        // XTLS publishes arm64-v8a for aarch64 (not arm64); sing-box keeps linux-arm64.
+        assert_eq!(
+            asset_name(CoreType::Xray, "1.8.0", "aarch64").unwrap(),
+            "Xray-linux-arm64-v8a.zip"
+        );
+        assert_eq!(
+            asset_name(CoreType::SingBox, "1.8.0", "aarch64").unwrap(),
+            "sing-box-1.8.0-linux-arm64.tar.gz"
+        );
+        // x86_64 naming and version 'v'-prefix stripping are unchanged.
+        assert_eq!(
+            asset_name(CoreType::Xray, "1.8.0", "x86_64").unwrap(),
+            "Xray-linux-64.zip"
+        );
+        assert_eq!(
+            asset_name(CoreType::SingBox, "v1.8.0", "x86_64").unwrap(),
+            "sing-box-1.8.0-linux-amd64.tar.gz"
+        );
+        assert!(matches!(
+            asset_name(CoreType::Auto, "1.8.0", "aarch64"),
+            Err(UpdateError::AutoCore)
+        ));
     }
 
     #[test]
