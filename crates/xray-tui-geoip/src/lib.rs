@@ -165,10 +165,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn failing_fetcher(msg: &'static str) -> impl Fn() -> FetchResult + Send + Sync {
-        move || Box::pin(async move { Err(anyhow::anyhow!("{msg}")) })
-    }
-
     fn bytes_fetcher(bytes: Vec<u8>) -> impl Fn() -> FetchResult + Send + Sync {
         move || {
             let bytes = bytes.clone();
@@ -211,18 +207,28 @@ mod tests {
             .await
             .unwrap();
 
-        // The re-download fails; the contract is that the corrupt file is
-        // still removed so it can't keep poisoning every lookup.
-        let geo = GeoIp::new_with_fetcher(
-            db_path.as_path(),
-            failing_fetcher("simulated download failure"),
-        );
+        // Count fetches: the corrupt file must be removed and exactly one
+        // re-download attempt made before the error surfaces.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher_calls = Arc::clone(&calls);
+        let geo = GeoIp::new_with_fetcher(db_path.as_path(), move || {
+            let calls = Arc::clone(&fetcher_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("simulated download failure"))
+            })
+        });
 
         let result = geo.location_by_ip("193.29.139.235".parse().unwrap()).await;
         assert!(result.is_err(), "corrupt db must surface an error");
         assert!(
             !db_path.exists(),
             "corrupt db must not remain as a permanent tombstone"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "corrupt db must trigger exactly one re-download attempt"
         );
     }
 
