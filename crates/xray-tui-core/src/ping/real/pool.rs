@@ -127,7 +127,13 @@ impl CorePool {
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
         let needed_core = resolve_core(proto, None);
 
-        {
+        // Hold the pool lock across the entire reuse path — including the HTTP
+        // ping itself. A concurrent single ping must not SIGHUP/reload the
+        // same core while requests are in flight (latency measured against the
+        // wrong server, connection killed), and TTL eviction must not kill it
+        // mid-ping. The guard drops at the end of this block, after the result
+        // is built; only then does the TTL reaper run.
+        let result = {
             let mut guard = self.core.lock().await;
 
             // Check if existing pooled core can be reused
@@ -255,7 +261,10 @@ impl CorePool {
                     };
                 }
 
-                drop(guard); // release lock while HTTP ping runs
+                // The guard is still held here: the HTTP ping runs under the
+                // pool lock, so a concurrent single ping cannot reload this
+                // core mid-flight, and TTL eviction cannot kill it until the
+                // ping completes.
                 let rp_result = crate::speed_test::real_ping(
                     &self.proxy_addr,
                     port,
@@ -265,14 +274,7 @@ impl CorePool {
                     retries,
                 )
                 .await;
-                let result = self.build_result(config_type, endpoint, rp_result);
-
-                // TTL reaper: if this ping alone pushed the pooled core past
-                // POOL_TTL, stop+evict it now so its port is freed promptly
-                // (rather than lingering until the next reuse check).
-                self.reap_stale_core().await;
-
-                result
+                self.build_result(config_type, endpoint, rp_result)
             } else {
                 // Evict stale or wrong-type core
                 if let Some(mut old) = guard.take() {
@@ -291,7 +293,17 @@ impl CorePool {
                 )
                 .await
             }
-        }
+        };
+
+        // TTL reaper: if a reuse ping pushed the pooled core past POOL_TTL,
+        // stop+evict it now so its port is freed promptly (rather than
+        // lingering until the next reuse check). Runs only after the guard
+        // above has been released, so it can never kill a core mid-ping;
+        // after a fresh ping the core was just cached (last_used = now), so
+        // this is a no-op.
+        self.reap_stale_core().await;
+
+        result
     }
 
     /// Fresh ping: spawn new core, test, then cache it in the pool.
@@ -530,6 +542,8 @@ mod tests {
     use crate::process::ProcessError;
     use async_trait::async_trait;
     use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{Notify, watch};
 
     /// Records `stop()` calls instead of managing a real core process.
     struct FakeManager {
@@ -633,5 +647,175 @@ mod tests {
         assert!(guard.is_none(), "over-TTL core must be evicted");
         drop(guard);
         assert_eq!(stopped.load(Ordering::Relaxed), 1);
+    }
+
+    /// Minimal fake SOCKS5 listener for the concurrency regression test.
+    ///
+    /// Answers the SOCKS5 greeting (`[0x05, 0x00]`) so `wait_for_socks5`
+    /// passes, then holds open any connection that sends a CONNECT request
+    /// (the real-ping connection — the readiness probe closes right after the
+    /// greeting reply) without answering, until [`HoldingSocks::release_all`].
+    /// This gives the test a deterministic window during which the pooled
+    /// core is mid-`real_ping`.
+    struct HoldingSocks {
+        /// Signaled once a real-ping connection is being held open.
+        mid_ping: Arc<Notify>,
+        release: watch::Sender<bool>,
+    }
+
+    impl HoldingSocks {
+        /// Bind the fake server on `127.0.0.1:10801` — the port the pooled
+        /// core from [`pool_with_core`] uses.
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 10801))
+                .await
+                .expect("bind fake socks5 server on pool core port");
+            let (release, release_rx) = watch::channel(false);
+            let mid_ping = Arc::new(Notify::new());
+            let mid_ping_task = mid_ping.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut release_rx = release_rx.clone();
+                    let mid_ping = mid_ping_task.clone();
+                    tokio::spawn(async move {
+                        let mut greeting = [0u8; 3];
+                        if stream.read_exact(&mut greeting).await.is_err() {
+                            return;
+                        }
+                        if stream.write_all(&[0x05, 0x00]).await.is_err() {
+                            return;
+                        }
+                        // Read the CONNECT header to tell the real-ping
+                        // connection apart from the readiness probe, which is
+                        // dropped right after the greeting reply.
+                        let mut head = [0u8; 4];
+                        if stream.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        mid_ping.notify_one();
+                        // Hold without answering CONNECT until released.
+                        while !*release_rx.borrow() {
+                            if release_rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self { mid_ping, release }
+        }
+
+        /// Wait until the first real-ping connection is held open — the first
+        /// ping is in flight with the pool lock held.
+        async fn await_mid_ping(&self) {
+            self.mid_ping.notified().await;
+        }
+
+        /// Close every held connection, failing the in-flight pings.
+        fn release_all(&self) {
+            let _ = self.release.send(true);
+        }
+    }
+
+    fn vmess_endpoint_and_protocol() -> (Endpoint, ProtocolRow) {
+        let endpoint = Endpoint {
+            id: 0,
+            host: "example.com".to_string(),
+            host_type: "dns".to_string(),
+            port: 443,
+            port_spec_str: None,
+            parent_id: None,
+            last_source: None,
+            created_at: 0,
+            manual_protocol_override: None,
+            resolved_as: None,
+            resolved_at: None,
+        };
+        let extra = serde_json::json!({
+            "remarks": "pool concurrency test",
+            "user_id": "test-uuid",
+        });
+        let protocol = ProtocolRow {
+            id: 0,
+            endpoint_id: 0,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: String::new(),
+            last_used_at: None,
+            spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
+            config_type: Protocol::Vmess.to_i32(),
+            core_type: String::new(),
+            transport: Some("tcp".to_string()),
+            security: Some("auto".to_string()),
+            created_at: 0,
+            last_seen_at: 0,
+            extension: Default::default(),
+            endpoint: Default::default(),
+            server_stat: Default::default(),
+        };
+        (endpoint, protocol)
+    }
+
+    fn spawn_ping(
+        pool: Arc<CorePool>,
+        endpoint: Arc<Endpoint>,
+        protocol: Arc<ProtocolRow>,
+    ) -> tokio::task::JoinHandle<super::super::super::PingResult> {
+        tokio::spawn(async move {
+            // IP-literal URLs: reqwest's `socks5://` proxy resolves hostnames
+            // client-side, and the test must not depend on DNS.
+            pool.ping(
+                &endpoint,
+                &protocol,
+                "http://127.0.0.1/",
+                "http://127.0.0.1/ip",
+                Duration::from_secs(10),
+                1,
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_pings_do_not_reload_core_mid_ping() {
+        // Regression (M7): with the pool lock held across the HTTP ping, a
+        // concurrent single ping must not be able to reload (stop/restart or
+        // SIGHUP) the same pooled core while the first ping's requests are in
+        // flight. The fake socks server holds the first ping mid-`real_ping`;
+        // if the lock were dropped early, the second ping would reload the
+        // core (a second stop) while the first was still in flight.
+        let server = HoldingSocks::start().await;
+        let (pool, stopped) = pool_with_core(Instant::now());
+        let pool = Arc::new(pool);
+        let (endpoint, protocol) = vmess_endpoint_and_protocol();
+        let endpoint = Arc::new(endpoint);
+        let protocol = Arc::new(protocol);
+
+        let first = spawn_ping(pool.clone(), endpoint.clone(), protocol.clone());
+        tokio::time::timeout(Duration::from_secs(5), server.await_mid_ping())
+            .await
+            .expect("first ping never reached real_ping");
+
+        let second = spawn_ping(pool.clone(), endpoint.clone(), protocol.clone());
+        // Give the second ping time to reach the pool lock. With the fix it
+        // blocks there; without it, it would reload the core immediately.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            stopped.load(Ordering::Relaxed),
+            1,
+            "second ping must not reload the core while the first is in flight"
+        );
+
+        // Fail both in-flight pings, then let the second one run its reload.
+        server.release_all();
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.expect("first ping task panicked");
+        second_result.expect("second ping task panicked");
+
+        // Both pings eventually reloaded the core: exactly 2 stops total.
+        assert_eq!(stopped.load(Ordering::Relaxed), 2);
     }
 }
