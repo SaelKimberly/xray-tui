@@ -370,16 +370,23 @@ fn build_proxy_outbound(
                 stream_settings: s_settings.clone(),
             })
         }
-        Protocol::Hysteria2 => Ok(Outbound {
-            tag: "proxy".to_string(),
-            protocol: "hysteria2".to_string(),
-            settings: json!({
-                "version": 2,
-                "address": address,
-                "port": port
-            }),
-            stream_settings: s_settings.clone(),
-        }),
+        Protocol::Hysteria2 => {
+            let auth = p_settings
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Ok(Outbound {
+                tag: "proxy".to_string(),
+                protocol: "hysteria2".to_string(),
+                settings: json!({
+                    "version": 2,
+                    "address": address,
+                    "port": port,
+                    "auth": auth
+                }),
+                stream_settings: s_settings.clone(),
+            })
+        }
         _ => Err(BuildError::InvalidProfile(format!(
             "Protocol {proto:?} not supported for xray outbound"
         ))),
@@ -695,6 +702,13 @@ mod tests {
         protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
     }
 
+    fn set_protocol_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
+        let mut extra: serde_json::Value =
+            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
+        extra["protocol_settings"] = serde_json::from_str(json_str).unwrap_or_default();
+        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
+    }
+
     fn assert_xray_top_level(json: &Value) {
         assert!(json.get("log").is_some(), "missing log");
         assert!(json.get("inbounds").is_some(), "missing inbounds");
@@ -951,5 +965,22 @@ mod tests {
         let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();
         // stream_settings from spec_blob not yet wired up (TODO)
         assert!(proxy.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_hysteria2_outbound_includes_auth() {
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
+        set_protocol_settings_json(&mut protocol, r#"{"password": "hy2-secret"}"#);
+        let (params, rules, dns) = default_params();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect("build");
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy");
+        assert_eq!(proxy["settings"]["auth"].as_str().unwrap(), "hy2-secret");
     }
 }
