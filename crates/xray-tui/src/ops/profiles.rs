@@ -49,9 +49,34 @@ pub async fn reload_profiles(state: &mut AppState) {
         }
     }
     state.filter_cache_valid.set(false);
+    clamp_selection(state);
     // Enrich new endpoints in the background (IP hosts + persisted DNS cache;
     // no network for fresh entries).
     crate::ops::enrich::spawn_enrich_ip_hosts(state);
+}
+
+/// Clamp a selection index into `[0, len)`, returning 0 for an empty list.
+pub(crate) const fn clamp_index(selected: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else if selected >= len {
+        len - 1
+    } else {
+        selected
+    }
+}
+
+/// Re-clamp the selection after a reload/filter change so the highlighted row
+/// stays inside the (possibly shrunk) filtered list. The `DataTable` clamps its
+/// own selection visually to row 0, but `AppState` keeps the stale index —
+/// which makes `selected_profile_id()` return `None` and Enter/e/d/x/Space
+/// silent no-ops. Drop a `selected_sub` that no longer points at a real row.
+pub(crate) fn clamp_selection(state: &mut AppState) {
+    let len = filtered_len(state);
+    state.selected_index = clamp_index(state.selected_index, len);
+    if state.selected_index >= len || len == 0 {
+        state.selected_sub = None;
+    }
 }
 
 pub async fn reload_groups(state: &mut AppState) {
@@ -1121,5 +1146,92 @@ mod edit_tests {
         let mut state = test_state(vec![fake_row(1, "a.com", 1)]).await;
         start_edit_profile(&mut state, "999").await;
         assert_not_edit_mode(&state);
+    }
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+    use super::test_support::{fake_row, test_state};
+    use std::sync::Arc;
+    use toasty::Deferred;
+    use xray_tui_config::AppConfig;
+    use xray_tui_db::models::{Endpoint, ProtocolRow};
+
+    #[test]
+    fn clamp_index_stays_in_bounds() {
+        assert_eq!(clamp_index(5, 3), 2);
+        assert_eq!(clamp_index(2, 3), 2);
+        assert_eq!(clamp_index(0, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn clamp_selection_fixes_stale_index() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 1), fake_row(2, "b.com", 1)]).await;
+        state.selected_index = 5; // stale: beyond the filtered list
+        clamp_selection(&mut state);
+        assert_eq!(state.selected_index, 1); // len - 1
+        assert_eq!(state.selected_profile_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn clamp_selection_resets_empty_list() {
+        let mut state = test_state(vec![]).await;
+        state.selected_index = 3;
+        state.selected_sub = Some(0);
+        clamp_selection(&mut state);
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.selected_sub, None);
+    }
+
+    #[tokio::test]
+    async fn reload_profiles_clamps_stale_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let group_id = db.get_all_groups().await.unwrap()[0].id.clone();
+        let endpoint = Endpoint {
+            id: 9,
+            host: "clamp.example".to_string(),
+            host_type: "dns".to_string(),
+            port: 443,
+            port_spec_str: None,
+            parent_id: None,
+            last_source: None,
+            created_at: 0,
+            manual_protocol_override: None,
+            resolved_as: None,
+            resolved_at: None,
+        };
+        let protocol = ProtocolRow {
+            id: 900,
+            endpoint_id: 9,
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: "vless".to_string(),
+            spec_blob: Vec::new(),
+            config_type: 1,
+            core_type: "xray".to_string(),
+            transport: None,
+            security: None,
+            last_used_at: None,
+            created_at: 0,
+            last_seen_at: 0,
+            endpoint: Deferred::from(None::<Endpoint>),
+            extension: Deferred::from(None::<xray_tui_db::models::ProfileExtension>),
+            server_stat: Deferred::from(None::<xray_tui_db::models::ServerStat>),
+        };
+        db.insert_manual_endpoint(&endpoint, &protocol, &group_id)
+            .await
+            .unwrap();
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        state.purgatory_view = PurgatoryView::All; // includes never-seen rows
+        state.selected_index = 5; // stale: list reloads to a single row
+        reload_profiles(&mut state).await;
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.selected_profile_id(), Some(9));
     }
 }
