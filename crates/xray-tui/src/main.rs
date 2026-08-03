@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
@@ -131,48 +130,32 @@ async fn main() -> Result<()> {
         let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
         loop {
             // Wait for at least one message
-            if let Ok(msg) = log_rx.recv() {
-                batch.push(msg);
-            } else {
-                // Channel closed (sender dropped) — flush and exit
-                if !batch.is_empty() {
-                    let _ = writer_heed.write_log_batch(&batch);
-                    batch.clear();
-                }
-                return;
-            }
-            // Non-blocking drain to batch up to 100
-            while batch.len() < 100 {
-                match log_rx.try_recv() {
-                    Ok(msg) => batch.push(msg),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        if !batch.is_empty() {
-                            let _ = writer_heed.write_log_batch(&batch);
-                            batch.clear();
-                        }
-                        return;
-                    }
-                }
-            }
-            // Flush batch when full, or flush partial batch after 500ms timeout
-            if batch.len() >= 100 {
-                let _ = writer_heed.write_log_batch(&batch);
-                batch.clear();
-            } else if !batch.is_empty() {
-                // Wait up to 500ms for more messages, then flush anyway
-                match log_rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(msg) => batch.push(msg),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let msg = match log_rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => {
+                    // Channel closed (sender dropped) — flush and exit
+                    if !batch.is_empty() {
                         let _ = writer_heed.write_log_batch(&batch);
-                        batch.clear();
                     }
+                    return;
+                }
+            };
+            let batch_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            batch.push(msg);
+            // Drain until deadline or 100 entries
+            while batch.len() < 100 {
+                let remaining = batch_deadline.saturating_duration_since(std::time::Instant::now());
+                match log_rx.recv_timeout(remaining) {
+                    Ok(msg) => batch.push(msg),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         let _ = writer_heed.write_log_batch(&batch);
                         return;
                     }
                 }
             }
+            let _ = writer_heed.write_log_batch(&batch);
+            batch.clear();
         }
     });
     // 3c. Capture log config before moving config into AppState
