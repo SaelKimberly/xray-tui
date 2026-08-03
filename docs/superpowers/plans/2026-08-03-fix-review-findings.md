@@ -810,6 +810,131 @@ git add crates/xray-tui-proto/src/proto_spec/mod.rs crates/xray-tui-config/src/i
 git commit -m "fix(import): PlaceholderConfig sig is a deterministic body hash (uid never 0)"
 ```
 
+### Task 6b: Retrofit typed sig/cred_hash split to the uid principle (user-mandated)
+
+**Files:**
+- Modify: `crates/xray-tui-proto/src/proto_spec/utils.rs` (`compute_cred_hash` — new credential-pairs API)
+- Modify: all 18 typed protocol files in `crates/xray-tui-proto/src/proto_spec/` (compute_sig / cred_hash)
+- Test: per-protocol uid-split tests in proto
+
+**Design (user-mandated, verbatim intent):**
+- `sig` = deterministic hash of SEMANTIC identity: protocol schema name, security TYPE (`b"none"`/`b"tls"`/`b"reality"` — NEVER the values), transport type, host, port/port_spec, and transport/semantic settings (path, flow, sni, alpn, fp). Excludes exact security VALUES (reality pbk/sid) and credentials.
+- `cred_hash` = hash of CREDENTIAL values: uuid / password / auth / private_key / reality pbk+sid / socks-http username+password. When NO credentials exist → 0 → uid == sig.
+- `uid = sig ^ cred_hash`; sig never zero, always computable.
+- Current deviations to fix: (a) vless compute_sig hashes pbk/sid VALUES (must move to cred_hash); (b) every cred_hash currently folds host+port in via `utils::compute_cred_hash(host, port, ...)` (host/port are identity → sig, not credentials); (c) `compute_cred_hash` early-returns 0 only when everything is empty — the empty-check must be on credentials alone.
+- No DB migration (user: "will just truncate tables later"). Existing uid values WILL change — that is accepted.
+
+**API change:** replace `utils::compute_cred_hash(host, port, port_spec, username, password) -> u64` with a credential-pair API:
+
+```rust
+/// Hash credential values in a stable order. Returns 0 when there are no
+/// credentials — the caller's uid then equals its sig.
+#[must_use]
+pub fn compute_cred_hash(pairs: &[(&str, &str)]) -> u64 {
+    let mut non_empty: Vec<(&str, &str)> = pairs
+        .iter()
+        .copied()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return 0;
+    }
+    non_empty.sort_unstable();
+    let mut hasher = rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
+    for (k, v) in &non_empty {
+        hasher.write(k.as_bytes());
+        hasher.write(b"=");
+        hasher.write(v.as_bytes());
+        hasher.write(b";");
+    }
+    hasher.finish()
+}
+```
+
+- [ ] **Step 1: Write the failing test (vless reality split + hostless cred_hash zero)**
+
+```rust
+// vless.rs tests
+#[test]
+fn vless_reality_sig_excludes_pbk_sid_cred_hash_includes_them() {
+    let url_a = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
+    let url_b = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=BBBB&sid=2222&spx=%2F&fp=chrome#r";
+    let url_c = "vless://22222222-3333-4444-5555-666666666666@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
+    let a = VlessConfig::try_parse(&RawUrlX::from(url_a)).unwrap();
+    let b = VlessConfig::try_parse(&RawUrlX::from(url_b)).unwrap();
+    let c = VlessConfig::try_parse(&RawUrlX::from(url_c)).unwrap();
+    assert_eq!(a.sig(), b.sig(), "sig is semantic: pbk/sid values must NOT change it");
+    assert_ne!(a.cred_hash(), b.cred_hash(), "cred_hash covers pbk/sid");
+    assert_ne!(a.uid(), b.uid());
+    assert_ne!(a.uid(), c.uid(), "different uuid -> different uid");
+    assert_ne!(a.sig(), 0);
+}
+
+// utils.rs tests (or any proto test)
+#[test]
+fn compute_cred_hash_returns_zero_without_credentials() {
+    assert_eq!(utils::compute_cred_hash(&[]), 0);
+    assert_eq!(utils::compute_cred_hash(&[("uuid", "")]), 0);
+    assert_ne!(utils::compute_cred_hash(&[("uuid", "x")]), 0);
+    // order-independent
+    assert_eq!(
+        utils::compute_cred_hash(&[("a", "1"), ("b", "2")]),
+        utils::compute_cred_hash(&[("b", "2"), ("a", "1")])
+    );
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test -p xray-tui-proto vless_reality_sig_excludes_pbk_sid_cred_hash_includes_them`
+Expected: FAIL — a.sig() != b.sig() (pbk/sid currently in sig).
+Run: `cargo test -p xray-tui-proto compute_cred_hash_returns_zero_without_credentials`
+Expected: FAIL — old signature/no such fn.
+
+- [ ] **Step 3: Implement**
+
+Per protocol (all 18 typed configs in proto_spec/), apply the split:
+
+| Protocol | sig semantic fields (add host+port; KEEP security TYPE not values) | cred_hash pairs |
+|---|---|---|
+| vless | schema, security.type_str(), transport.type_str(), host, port, path, flow, sni, alpn, fp, splice, transport host (HttpUpgrade/XHttp) | uuid, reality pbk, reality sid |
+| vmess | schema, security.type_str(), transport.type_str(), host, port, path, sni, alpn, fp, transport host | uuid |
+| trojan | schema, security.type_str(), transport.type_str(), host, port, path, sni, alpn, fp, transport host | password |
+| hysteria2 | schema, security.type_str(), host, port_spec, obfs (type), sni | auth |
+| ss | schema, transport.type_str(), host, port, plugin (type), plugin_opts | method, password |
+| ssr | schema, host, port, obfs (type), protocol (type), params minus password | password, method |
+| tuic | schema, host, port, congestion_control, udp_relay_mode, alpn | uuid, password |
+| wireguard | schema, host, port, address, mtu, reserved | private_key, public_key, preshared_key |
+| socks | schema, host, port | username, password |
+| http_client | schema, host, port | username, password |
+| naive | schema, host, port | username, password |
+| anytls | schema, host, port, sni | password |
+| shadowtls | schema, host, port, sni, version | password |
+| tor | schema (tor has no host/port/creds; keep minimal) | none → 0 |
+| ssh | schema, host, port, username | password, private_key |
+| tailscale | schema, control_url | auth_key |
+| hysteria1 | schema, host, port, up/down, obfs (type), sni | auth |
+
+Rules of thumb for the implementer:
+- host + port ALWAYS go into sig (identity). Remove them from cred_hash calls.
+- security TYPE (e.g. `b"reality"` / `b"tls"` / `b"none"`) goes into sig; security VALUES (pbk, sid) go into cred_hash.
+- uuid/password/auth/private_key/preshared_key → cred_hash.
+- Keep sig deterministic and non-zero (the `impl_sig_cache!` macro already maps 0 → NonZeroU64::MIN).
+- After the split, re-check each protocol's `cred_hash` empty-check: it returns 0 when no credentials → uid == sig.
+- Update every `utils::compute_cred_hash(...)` call site to the new pairs API.
+- Preserve the `sig_cache`/`cred_hash_cache` caching pattern exactly.
+
+- [ ] **Step 4: Run to verify they pass**
+
+Run: `cargo test -p xray-tui-proto` — all pass (add/adjust uid-split tests per protocol where useful; at minimum vless + one credential-less protocol). `cargo test -p xray-tui-config` — pass (import dedup tests still hold).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xray-tui-proto/src/proto_spec/
+git commit -m "refactor(proto): split sig (semantic) from cred_hash (credentials) per uid principle"
+```
+
 ### Task 7: Transport host forwarded for Ws/Grpc/Http too (M16)
 
 **Files:**
