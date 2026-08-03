@@ -776,11 +776,13 @@ fn build_routing(rules: &[RoutingRule]) -> RouteConfig {
         .filter_map(|r| {
             // sing-box rejects rules without any match condition
             // (domain/ip_cidr/inbound/port/network/protocol). Skip them.
+            // NOTE: source_ports is NOT a matcher here — the sing-box builder
+            // does not emit a source_port field, so a source_ports-only rule
+            // would otherwise slip through as a catch-all rule.
             let has_matcher = r.domains.is_some()
                 || r.ips.is_some()
                 || r.inbound_tags.is_some()
                 || r.port.is_some()
-                || r.source_ports.is_some()
                 || r.network.is_some()
                 || r.protocols.is_some();
             if !has_matcher {
@@ -1632,5 +1634,33 @@ mod tests {
         let rule_json = &routing.rules[0];
         assert_eq!(rule_json["domain_matcher"], "linear");
         assert_eq!(rule_json["protocol"], json!(["http", "tls"]));
+    }
+
+    #[test]
+    fn routing_skips_source_ports_only_rules() {
+        // The sing-box builder has no source_port field, so a rule whose only
+        // match condition is source_ports must be skipped (not emitted as a
+        // catch-all rule).
+        let rule = RoutingRule {
+            id: "r3".to_string(),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: None,
+            ips: None,
+            inbound_tags: None,
+            port: None,
+            source_ports: Some("8080".to_string()),
+            network: None,
+            protocols: None,
+            domain_strategy: None,
+            outbound_tag: Some("direct".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: None,
+        };
+        let routing = build_routing(&[rule]);
+        assert!(routing.rules.is_empty());
     }
 }

@@ -971,6 +971,35 @@ mod tests {
     }
 
     #[test]
+    fn routing_emits_source_ports_only_rule() {
+        // xray DOES emit sourcePort, so a source_ports-only rule is a valid
+        // matcher and must not be skipped.
+        let rule = RoutingRule {
+            id: "r3".to_string(),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: None,
+            ips: None,
+            inbound_tags: None,
+            port: None,
+            source_ports: Some("8080".to_string()),
+            network: None,
+            protocols: None,
+            domain_strategy: None,
+            outbound_tag: Some("direct".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: None,
+        };
+        let routing = build_routing(&[rule], false);
+        assert_eq!(routing.rules.len(), 1);
+        assert_eq!(routing.rules[0]["sourcePort"], "8080");
+        assert_eq!(routing.rules[0]["outboundTag"], "direct");
+    }
+
+    #[test]
     fn xray_stream_settings_passed_through() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
         let (params, rules, dns) = default_params();
