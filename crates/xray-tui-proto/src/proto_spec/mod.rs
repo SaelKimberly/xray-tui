@@ -666,22 +666,12 @@ impl ProtoSpec for ProtocolConfig {
 
 // ── Identity container ──────────────────────────────────────────────────
 
-/// Lazily-materialized identity state of a [`Proto`].
-#[derive(Debug)]
-enum Identity {
-    /// Deferred: not yet computed.
-    ///
-    /// The deferred state is represented by the *empty* [`OnceLock`] (a
-    /// `OnceLock::set` on an initialized lock always fails, so the lock can
-    /// never hold `Defer` and transition to `Cache`); the variant documents
-    /// the state and is the value `set_identity` would seed.
-    #[allow(dead_code)] // never stored; the empty OnceLock represents this state
-    Defer,
-    /// Materialized `(sig, cred_hash)` pair. `sig` is guaranteed non-zero.
-    Cache {
-        sig: NonZeroU64,
-        cred_hash: u64,
-    },
+/// Materialized identity of a [`Proto`]: `(sig, cred_hash)` with `sig` never
+/// zero.
+#[derive(Debug, Clone, Copy)]
+struct Identity {
+    sig: NonZeroU64,
+    cred_hash: u64,
 }
 
 /// A [`ProtocolConfig`] paired with its lazily-materialized identity.
@@ -689,7 +679,7 @@ enum Identity {
 /// `sig`/`cred_hash`/`uid` are computed once (atomically, on first access) and
 /// cached. Serializes byte-identical to the wrapped [`ProtocolConfig`]
 /// (spec_blob format), so deserializing a stored spec produces an identical
-/// [`Proto`] whose identity starts deferred.
+/// [`Proto`] whose identity starts deferred (empty `OnceLock`).
 #[derive(Debug)]
 pub struct Proto {
     config: ProtocolConfig,
@@ -701,43 +691,29 @@ impl Proto {
     pub fn new(config: ProtocolConfig) -> Self {
         Self {
             config,
-            // Empty lock == deferred identity. `OnceLock::from(Defer)` cannot
-            // work here: `set` fails on an already-initialized lock, so the
-            // Defer state would be permanent and the cache could never
-            // materialize. The empty state is the deferred state.
+            // Empty lock == deferred identity; materialized on first access.
             identity: std::sync::OnceLock::new(),
         }
     }
 
-    /// Materialize the identity cache if still deferred (empty lock or a
-    /// test-seeded `Defer`). Race-safe: the loser of the `set` race returns
-    /// `Err` with an identical deterministic value.
-    fn materialize(&self) {
-        if !matches!(self.identity.get(), Some(Identity::Cache { .. })) {
-            let id = Identity::Cache {
-                sig: NonZeroU64::new(self.config.compute_sig()).unwrap_or(NonZeroU64::MIN),
-                cred_hash: self.config.compute_cred_hash(),
-            };
-            _ = self.identity.set(id);
-        }
+    /// Materialize the identity cache on first access. Race-safe by
+    /// construction: `get_or_init` runs the closure at most once and stores a
+    /// single deterministic value.
+    fn materialize(&self) -> &Identity {
+        self.identity.get_or_init(|| Identity {
+            sig: NonZeroU64::new(self.config.compute_sig()).unwrap_or(NonZeroU64::MIN),
+            cred_hash: self.config.compute_cred_hash(),
+        })
     }
 
     #[must_use]
     pub fn sig(&self) -> u64 {
-        self.materialize();
-        match self.identity.get() {
-            Some(Identity::Cache { sig, .. }) => sig.get(),
-            Some(Identity::Defer) | None => unreachable!("identity materialized on first access"),
-        }
+        self.materialize().sig.get()
     }
 
     #[must_use]
     pub fn cred_hash(&self) -> u64 {
-        self.materialize();
-        match self.identity.get() {
-            Some(Identity::Cache { cred_hash, .. }) => *cred_hash,
-            Some(Identity::Defer) | None => unreachable!("identity materialized on first access"),
-        }
+        self.materialize().cred_hash
     }
 
     #[must_use]
@@ -982,8 +958,8 @@ mod tests {
         let bytes = serde_json::to_vec(&proto).unwrap();
         let reparsed: Proto = serde_json::from_slice(&bytes).unwrap();
         assert!(
-            !matches!(reparsed.identity.get(), Some(Identity::Cache { .. })),
-            "deserialized Proto must start with deferred identity (empty lock == Identity::Defer)"
+            reparsed.identity.get().is_none(),
+            "deserialized Proto must start with deferred identity (empty OnceLock)"
         );
         assert_eq!(
             serde_json::from_slice::<ProtocolConfig>(&bytes).unwrap(),
@@ -1005,8 +981,8 @@ mod tests {
         assert_eq!(proto.cred_hash(), cred_hash, "cred_hash is stable across calls");
         assert_eq!(proto.uid(), sig ^ cred_hash, "uid is stable across calls");
         assert!(
-            matches!(proto.identity.get(), Some(Identity::Cache { .. })),
-            "identity must materialize to Cache on first access"
+            proto.identity.get().is_some(),
+            "identity must materialize on first access"
         );
     }
 
@@ -1017,7 +993,7 @@ mod tests {
         let proto = Proto::new(config);
         let seeded_sig = std::num::NonZeroU64::new(12_345).unwrap();
         let seeded_cred_hash = 67_890;
-        proto.set_identity(Identity::Cache {
+        proto.set_identity(Identity {
             sig: seeded_sig,
             cred_hash: seeded_cred_hash,
         });
