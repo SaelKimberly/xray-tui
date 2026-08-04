@@ -22,8 +22,8 @@ use xray_tui_db::models::{
 use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
 use crate::types::{
-    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, SettingsSection,
-    SortColumn, SplitRightPane, Tab,
+    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointPingStatus, EndpointRow, LogLine,
+    SettingsSection, SortColumn, SplitRightPane, Tab,
 };
 use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
@@ -132,6 +132,9 @@ pub struct AppState {
     pub host_features: Option<Arc<xray_tui_host_features::HostFeaturesChecker>>,
     /// Per-endpoint enrichment data; survives profile reloads.
     pub endpoint_info: HashMap<i64, EndpointInfo>,
+    /// Per-endpoint per-type ping rounds; drives the red `[fast]`/`[real]`
+    /// labels in the profiles Test column. Session-only.
+    pub ping_status: HashMap<i64, EndpointPingStatus>,
     /// TTL (secs) for the DNS-resolution cache; default 300.
     pub dns_cache_ttl_secs: i64,
 }
@@ -294,6 +297,7 @@ impl AppState {
             dns_resolver: None,
             host_features: None,
             endpoint_info: HashMap::new(),
+            ping_status: HashMap::new(),
             dns_cache_ttl_secs: 300,
         };
         // Cheap constructors — no I/O until first lookup.

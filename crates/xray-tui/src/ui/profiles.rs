@@ -36,13 +36,17 @@ struct DisplayRowData {
     indicator: String,
     indicator_fg: Style,
     idx_str: String,
-    last_seen_str: String,
     type_str: String,
     country_flag: String,
     address_port_str: String,
-    ip_feature: String,
-    sni_feature: String,
+    /// Whitelist feature flags: `🏁` DNS unresolved, `🏳️` IP/CIDR or SNI
+    /// whitelisted (4 cells, one per flag).
+    feat_str: String,
     config_type_str: String,
+    /// `[ 12 ]`-style Test cell: `[value]` where value is 4 cells wide,
+    /// or the red `[name]`/`[fast]`/`[real]` problem labels, or blank.
+    test_str: String,
+    test_style: Style,
     outbound_addr: String,
     outbound_country: String,
     has_sub_rows: bool,
@@ -78,17 +82,17 @@ impl DataTableRow for DisplayRowData {
                 0 => (tree_marker, self.row_style),
                 1 => (self.indicator.as_str(), self.indicator_fg),
                 2 => (self.idx_str.as_str(), self.row_style),
-                3 => (self.last_seen_str.as_str(), self.row_style),
-                4 => (self.type_str.as_str(), self.row_style),
-                5 => ("[", self.row_style),
-                6 => (self.country_flag.as_str(), self.row_style),
-                7 => (self.address_port_str.as_str(), self.row_style),
-                8 => ("][", self.row_style),
-                9 => (self.ip_feature.as_str(), self.row_style),
-                10 => (self.sni_feature.as_str(), self.row_style),
-                11 => ("]=>{", self.row_style),
-                12 => (self.config_type_str.as_str(), self.row_style),
-                13 => ("}=>[", self.row_style),
+                3 => (self.type_str.as_str(), self.row_style),
+                4 => ("[", self.row_style),
+                5 => (self.country_flag.as_str(), self.row_style),
+                6 => (self.address_port_str.as_str(), self.row_style),
+                7 => ("][", self.row_style),
+                8 => (self.feat_str.as_str(), self.row_style),
+                9 => ("]=>{", self.row_style),
+                10 => (self.config_type_str.as_str(), self.row_style),
+                11 => ("}=>", self.row_style),
+                12 => (self.test_str.as_str(), self.test_style),
+                13 => ("[", self.row_style),
                 14 => (self.outbound_addr.as_str(), self.row_style),
                 15 => (self.outbound_country.as_str(), self.row_style),
                 16 => ("]", self.row_style),
@@ -202,6 +206,16 @@ impl DisplayRowData {
             } else {
                 row_style
             };
+            if Some(n) == self.panel_selected {
+                // Reverse highlight across the ENTIRE sub-row width: replace
+                // the panel's highlight background (painted by the DataTable
+                // over the selected endpoint row) with the common background,
+                // not just over written glyphs — column gaps would keep the
+                // highlight otherwise.
+                for x in inner_x..(inner_x + inner_w as u16) {
+                    buf[(x, y)].set_style(style);
+                }
+            }
             let mut x = inner_x;
             let cell_texts = [
                 pr.marker.as_str(),
@@ -279,6 +293,71 @@ fn test_glyph(test_type: &TestType) -> &'static str {
     }
 }
 
+/// Latency thresholds for the Test column: green below the warning threshold,
+/// yellow at/above it, red at/above the error threshold.
+const TEST_WARN_MS: i32 = 500;
+const TEST_BAD_MS: i32 = 1000;
+
+/// Compute the Test cell for one endpoint row: `[value]` with the active
+/// protocol's last measured delay, colored by magnitude, or the red problem
+/// labels — `[name]` when the DNS name could not be resolved, `[fast]`/`[real]`
+/// when every protocol of the endpoint failed that test type in the current
+/// round. Blank when no measurement exists.
+fn compute_test_cell(
+    row: &EndpointRow,
+    resolved: bool,
+    state: &AppState,
+    palette: &ratatui_cheese::theme::Palette,
+) -> (String, Style) {
+    test_cell_content(
+        row.endpoint.host_type == "dns",
+        resolved,
+        state.ping_status.get(&row.endpoint.id),
+        row.protocols.len(),
+        row.extensions
+            .get(&row.active_protocol().id)
+            .and_then(|e| e.delay),
+        palette,
+    )
+}
+
+/// Pure Test-cell logic (no AppState) so the label precedence and color
+/// thresholds are unit-testable.
+fn test_cell_content(
+    host_is_dns: bool,
+    resolved: bool,
+    status: Option<&crate::types::EndpointPingStatus>,
+    protocol_count: usize,
+    active_delay: Option<i32>,
+    palette: &ratatui_cheese::theme::Palette,
+) -> (String, Style) {
+    let bad = ThemeStyles::test_delay_bad(palette);
+    if host_is_dns && !resolved {
+        return (format!("[{}]", center_cell("name", 4)), bad);
+    }
+    if let Some(status) = status {
+        if status.fast.all_unreachable(protocol_count) {
+            return (format!("[{}]", center_cell("fast", 4)), bad);
+        }
+        if status.real.all_unreachable(protocol_count) {
+            return (format!("[{}]", center_cell("real", 4)), bad);
+        }
+    }
+    match active_delay {
+        Some(d) if d >= 0 => {
+            let style = if d >= TEST_BAD_MS {
+                bad
+            } else if d >= TEST_WARN_MS {
+                ThemeStyles::test_delay_warn(palette)
+            } else {
+                ThemeStyles::test_delay_ok(palette)
+            };
+            (format!("[{}]", center_cell(&d.to_string(), 4)), style)
+        }
+        _ => (" ".repeat(6), Style::default()),
+    }
+}
+
 fn build_display_rows(
     rows: &[&EndpointRow],
     selected: usize,
@@ -334,19 +413,14 @@ fn build_display_rows(
             .unwrap_or(false);
 
         let type_str = format!("{protocol:.12}");
-        let last_seen = row.active_protocol().last_seen_at;
-        let last_seen_str = if last_seen > 0 {
-            truncate_pad(&format_ts(last_seen), 20)
-        } else {
-            "—".to_string()
-        };
         let country_flag = match info.and_then(|i| i.country.as_deref()) {
             Some(iso) => iso_to_flag(iso),
             None => "\u{1F3F4}".to_string(),
         };
         let address_port_str =
             truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 36);
-        // IP feature: unresolved DNS → 🏁; whitelisted IP/CIDR → 🏳️; else empty.
+        // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
+        // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
         let ip_feature = if row.endpoint.host_type == "dns" && !resolved {
             "\u{1F3C1}".to_string()
         } else if info
@@ -365,6 +439,12 @@ fn build_display_rows(
         } else {
             String::new()
         };
+        let feat_str = format!(
+            "{}{}",
+            truncate_pad(&ip_feature, 2),
+            truncate_pad(&sni_feature, 2)
+        );
+        let (test_str, test_style) = compute_test_cell(row, resolved, state, palette);
 
         let active = row.active_protocol();
         let t = active.transport.as_deref().filter(|s| !s.is_empty());
@@ -469,13 +549,13 @@ fn build_display_rows(
             indicator,
             indicator_fg,
             idx_str,
-            last_seen_str,
             type_str,
             country_flag,
             address_port_str,
-            ip_feature,
-            sni_feature,
+            feat_str,
             config_type_str,
+            test_str,
+            test_style,
             outbound_addr,
             outbound_country,
             has_sub_rows: row.protocols.len() > 1,
@@ -507,11 +587,12 @@ fn render_data_grid(
 
     // Map sort state to DataTable column indices
     let sort_column = match state.sort_column {
-        SortColumn::LastSeen => Some(3),
-        SortColumn::ConfigType => Some(4),
-        SortColumn::Address => Some(7),
-        SortColumn::Port => Some(7),
-        SortColumn::Delay | SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
+        SortColumn::LastSeen => None,
+        SortColumn::ConfigType => Some(3),
+        SortColumn::Address => Some(6),
+        SortColumn::Port => Some(6),
+        SortColumn::Delay => Some(12),
+        SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
     };
     let sort_direction = if state.sort_ascending {
         SortDirection::Ascending
@@ -525,17 +606,17 @@ fn render_data_grid(
         Column::new("", ColumnWidth::Fixed(1)),         // 0 — tree marker
         Column::new("", ColumnWidth::Fixed(2)),         // 1 — indicator
         Column::new("#", ColumnWidth::Fixed(5)),        // 2 — index
-        Column::new("Last Seen", ColumnWidth::Fixed(20)), // 3
-        Column::new("Type", ColumnWidth::Fixed(12)),    // 4
-        Column::new("", ColumnWidth::Fixed(1)),         // 5 — [
-        Column::new("", ColumnWidth::Fixed(4)),         // 6 — country flag
-        Column::new("Address", ColumnWidth::Fixed(36)), // 7
-        Column::new("", ColumnWidth::Fixed(2)),         // 8 — ][
-        Column::new("IP", ColumnWidth::Fixed(2)),       // 9
-        Column::new("SNI", ColumnWidth::Fixed(2)),      // 10
-        Column::new("", ColumnWidth::Fixed(4)),         // 11 — ]=>{
-        Column::new("", ColumnWidth::Fixed(12)),        // 12 — config type
-        Column::new("", ColumnWidth::Fixed(4)),         // 13 — }=>[
+        Column::new("Type", ColumnWidth::Fixed(12)),    // 3
+        Column::new("", ColumnWidth::Fixed(1)),         // 4 — [
+        Column::new("", ColumnWidth::Fixed(4)),         // 5 — country flag
+        Column::new("Address", ColumnWidth::Fixed(36)), // 6
+        Column::new("", ColumnWidth::Fixed(2)),         // 7 — ][
+        Column::new("Feat", ColumnWidth::Fixed(4)),     // 8 — IP+SNI flags
+        Column::new("", ColumnWidth::Fixed(4)),         // 9 — ]=>{
+        Column::new("", ColumnWidth::Fixed(12)),        // 10 — config type
+        Column::new("", ColumnWidth::Fixed(3)),         // 11 — }=> arrow
+        Column::new("Test", ColumnWidth::Fixed(6)),     // 12 — [delay]/[name]/[fast]/[real]
+        Column::new("", ColumnWidth::Fixed(1)),         // 13 — [ outbound opener
         Column::new("Outbound", ColumnWidth::Fixed(16)), // 14
         Column::new("Country", ColumnWidth::Fixed(7)),  // 15
         Column::new("", ColumnWidth::Fixed(1)),         // 16 — ]
@@ -641,6 +722,19 @@ pub(crate) fn truncate_pad(s: &str, width: usize) -> String {
     } else {
         format!("{s:width$}")
     }
+}
+
+/// Center `s` inside a `width`-wide cell with the extra space on the LEFT for
+/// odd widths: `[ 12 ]`, `[ 123]`, `[1234]` (Test column look). Truncates
+/// when wider.
+fn center_cell(s: &str, width: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(s);
+    if w >= width {
+        return truncate_pad(s, width);
+    }
+    let left = (width - w + 1) / 2;
+    let right = width - w - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
 
 /// Center `s` inside a `width`-wide cell (unicode-aware); truncates when wider.
@@ -794,13 +888,13 @@ mod tests {
             indicator: String::new(),
             indicator_fg: Style::default(),
             idx_str: idx.to_string(),
-            last_seen_str: String::new(),
             type_str: String::new(),
             country_flag: String::new(),
             address_port_str: String::new(),
-            ip_feature: String::new(),
-            sni_feature: String::new(),
+            feat_str: String::new(),
             config_type_str: String::new(),
+            test_str: String::new(),
+            test_style: Style::default(),
             outbound_addr: String::new(),
             outbound_country: String::new(),
             has_sub_rows: !panel_rows.is_empty(),
@@ -824,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_sub_row_renders_with_accent_bg() {
+    fn selected_sub_row_reverse_highlights_full_width() {
         let palette = crate::ui::palette_bridge::palette_from_name(
             &ratatui_themes::ThemeName::TokyoNight,
         );
@@ -840,21 +934,36 @@ mod tests {
         let col_widths = vec![1u16; 17];
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
 
+        // Simulate the DataTable's endpoint-row highlight: the whole row
+        // (including the expanded panel area) sits on `surface`.
+        for x in 0..17u16 {
+            for y in 0..8u16 {
+                buf[(x, y)].set_style(ThemeStyles::table_row_selected(&palette));
+            }
+        }
+
         row.render(&col_xs, &col_widths, &mut buf, 0, 20);
 
         // Panel starts at y=1; sub-rows at y0+3 → sub-row 0 at y=4, sub-row 1
         // at y=5. x=1 is the panel's first inner cell.
-        // Selected sub-row gets the accent bar…
+        // Selected sub-row drops back to the common (terminal-default)
+        // background…
         assert_eq!(
             buf[(1, 4)].style().bg,
-            Some(palette.highlight),
-            "selected sub-row must paint the accent background"
+            Some(ratatui::style::Color::Reset),
+            "selected sub-row must use the common background (reverse highlight)"
         );
-        // …the unselected sub-row below must not.
-        assert_ne!(
+        // …across the ENTIRE row width, not just written glyphs.
+        assert_eq!(
+            buf[(13, 4)].style().bg,
+            Some(ratatui::style::Color::Reset),
+            "reverse highlight must span the full sub-row width"
+        );
+        // …the unselected sub-row keeps the panel's highlight background.
+        assert_eq!(
             buf[(1, 5)].style().bg,
-            Some(palette.highlight),
-            "unselected sub-row must not use the accent background"
+            Some(palette.surface),
+            "unselected sub-row keeps the endpoint highlight background"
         );
     }
 
@@ -1005,5 +1114,85 @@ mod tests {
         // `endpoints.len()` (3) exceeds `selected_index` (1).
         state.selected_index = 1;
         assert!(footer_row(&state).is_none());
+    }
+
+    fn test_palette() -> ratatui_cheese::theme::Palette {
+        crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight)
+    }
+
+    fn round(ids: &[i64]) -> crate::types::PingRound {
+        crate::types::PingRound {
+            seen: ids.iter().copied().collect(),
+            failed: ids.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn test_cell_colors_delay_by_threshold() {
+        let palette = test_palette();
+        let (t, s) = test_cell_content(false, true, None, 1, Some(12), &palette);
+        assert_eq!(t, "[ 12 ]");
+        assert_eq!(s.fg, Some(palette.success));
+        let (t, s) = test_cell_content(false, true, None, 1, Some(612), &palette);
+        assert_eq!(t, "[ 612]");
+        assert_eq!(s.fg, Some(ratatui::style::Color::Yellow));
+        let (t, s) = test_cell_content(false, true, None, 1, Some(1234), &palette);
+        assert_eq!(t, "[1234]");
+        assert_eq!(s.fg, Some(palette.error));
+    }
+
+    #[test]
+    fn test_cell_blank_without_measurement() {
+        let palette = test_palette();
+        let (t, _) = test_cell_content(false, true, None, 1, None, &palette);
+        assert_eq!(t, "      ");
+        // Legacy -1 failure marker never renders as a delay.
+        let (t, _) = test_cell_content(false, true, None, 1, Some(-1), &palette);
+        assert_eq!(t, "      ");
+    }
+
+    #[test]
+    fn test_cell_shows_name_when_dns_unresolved() {
+        let palette = test_palette();
+        let (t, s) = test_cell_content(true, false, None, 1, Some(12), &palette);
+        assert_eq!(t, "[name]");
+        assert_eq!(s.fg, Some(palette.error));
+        // Resolved DNS name behaves like a normal host.
+        let (t, _) = test_cell_content(true, true, None, 1, Some(12), &palette);
+        assert_eq!(t, "[ 12 ]");
+    }
+
+    #[test]
+    fn test_cell_labels_rounds_where_every_protocol_failed() {
+        let palette = test_palette();
+        // Fast round: all 2 protocols failed → [fast], wins over [real].
+        let mut status = crate::types::EndpointPingStatus::default();
+        status.fast = round(&[101, 102]);
+        status.real = round(&[101, 102]);
+        let (t, s) = test_cell_content(false, true, Some(&status), 2, None, &palette);
+        assert_eq!(t, "[fast]");
+        assert_eq!(s.fg, Some(palette.error));
+        // Only the real round all-failed → [real].
+        let mut status = crate::types::EndpointPingStatus::default();
+        status.real = round(&[101, 102]);
+        let (t, _) = test_cell_content(false, true, Some(&status), 2, None, &palette);
+        assert_eq!(t, "[real]");
+    }
+
+    #[test]
+    fn test_cell_partial_round_never_labels() {
+        let palette = test_palette();
+        // 1 of 2 protocols attempted (single ping / cancelled batch) → no
+        // all-unreachable label; the active protocol's delay still shows.
+        let mut status = crate::types::EndpointPingStatus::default();
+        status.fast = round(&[101]);
+        let (t, _) = test_cell_content(false, true, Some(&status), 2, Some(30), &palette);
+        assert_eq!(t, "[ 30 ]");
+        // Success after failure clears the round's failed set → no label.
+        let mut status = crate::types::EndpointPingStatus::default();
+        status.fast.seen = std::collections::HashSet::from([101, 102]);
+        status.fast.failed = std::collections::HashSet::from([101]);
+        let (t, _) = test_cell_content(false, true, Some(&status), 2, Some(30), &palette);
+        assert_eq!(t, "[ 30 ]");
     }
 }

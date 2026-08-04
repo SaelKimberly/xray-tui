@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ratatui_cheese::tree::TreeState;
@@ -194,6 +194,37 @@ impl std::fmt::Display for SettingsSection {
             Self::Subscriptions => write!(f, "Subscriptions"),
         }
     }
+}
+
+/// One test round for an endpoint and ping type: which protocols reported a
+/// result and which of those failed. `seen` starts empty at round start and is
+/// rebuilt as results arrive; a batch resets it, single pings accumulate.
+#[derive(Debug, Clone, Default)]
+pub struct PingRound {
+    /// Protocol ids that reported a result this round.
+    pub seen: HashSet<i64>,
+    /// Protocol ids among `seen` whose ping failed.
+    pub failed: HashSet<i64>,
+}
+
+impl PingRound {
+    /// All protocols of the endpoint were attempted and every attempt failed.
+    /// `protocol_count` is the endpoint's protocol count; a round that only
+    /// covered part of the endpoint (single pings, cancelled batches) never
+    /// reports all-unreachable.
+    pub fn all_unreachable(&self, protocol_count: usize) -> bool {
+        !self.seen.is_empty()
+            && self.seen.len() == protocol_count
+            && self.failed.len() == self.seen.len()
+    }
+}
+
+/// Per-endpoint ping round state driving the red `[fast]`/`[real]` labels in
+/// the profiles Test column. Session-only; reset on batch start.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointPingStatus {
+    pub fast: PingRound,
+    pub real: PingRound,
 }
 
 /// Enrichment data for one endpoint (inbound host), computed lazily in the

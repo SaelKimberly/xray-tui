@@ -16,7 +16,7 @@ use xray_tui_db::models::{DnsSetting, PingResultUpdate, ProfileExtension};
 
 use crate::AppState;
 use crate::try_send_or_warn;
-use crate::types::{CoreEvent, EndpointRow};
+use crate::types::CoreEvent;
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
@@ -303,21 +303,23 @@ pub fn stop_speed_test(state: &mut AppState) {
 
 /// Batch TCP ping all visible (filtered) profiles — delegates to `start_sieve`.
 pub fn start_batch_ping(state: &mut AppState) {
-    let profile_order = state
+    let profile_order: Vec<(i64, i32)> = state
         .filtered_profiles()
         .enumerate()
         .map(|(i, r)| (r.active_protocol().id, i as i32))
         .collect();
+    reset_ping_status_for(state, &profile_order);
     start_sieve(state, false, profile_order, true);
 }
 
 /// Batch TCP ping all visible profiles, then real ping TCP-successful targets via temp core.
 pub fn start_batch_then_real_ping(state: &mut AppState) {
-    let profile_order = state
+    let profile_order: Vec<(i64, i32)> = state
         .filtered_profiles()
         .enumerate()
         .map(|(i, r)| (r.active_protocol().id, i as i32))
         .collect();
+    reset_ping_status_for(state, &profile_order);
     start_sieve(state, true, profile_order, true);
 }
 
@@ -326,6 +328,7 @@ pub fn start_batch_then_real_ping(state: &mut AppState) {
 /// credentials can route differently, so each protocol gets its own result.
 pub fn start_endpoint_batch_ping(state: &mut AppState) {
     let profile_order = selected_endpoint_order(state);
+    reset_ping_status_for(state, &profile_order);
     start_sieve(state, false, profile_order, false);
 }
 
@@ -333,7 +336,23 @@ pub fn start_endpoint_batch_ping(state: &mut AppState) {
 /// so all protocols get real-pinged (their exit IPs may differ).
 pub fn start_endpoint_batch_real_ping(state: &mut AppState) {
     let profile_order = selected_endpoint_order(state);
+    reset_ping_status_for(state, &profile_order);
     start_sieve(state, true, profile_order, false);
+}
+
+/// Start a fresh ping round for the endpoints owning `profile_order` protocols:
+/// the new batch's results rebuild `seen`/`failed` from zero, so stale
+/// all-unreachable labels from a previous round don't linger.
+fn reset_ping_status_for(state: &mut AppState, profile_order: &[(i64, i32)]) {
+    for (pid, _) in profile_order {
+        if let Some(row) = state
+            .endpoints
+            .iter()
+            .find(|r| r.protocols.iter().any(|p| p.id == *pid))
+        {
+            state.ping_status.remove(&row.endpoint.id);
+        }
+    }
 }
 
 /// `(protocol_id, sort_order)` for every protocol of the currently selected

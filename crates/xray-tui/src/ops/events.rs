@@ -210,6 +210,27 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     .unwrap_or((0, false));
                 let ip_info_clone = ip_info.clone();
 
+                // Feed the per-endpoint ping round used by the profiles Test
+                // column `[fast]`/`[real]` labels. A protocol succeeds on any
+                // result without error; failures accumulate per round.
+                let round = match test_type {
+                    TestType::TcpPing => {
+                        Some(&mut state.ping_status.entry(ep_id).or_default().fast)
+                    }
+                    TestType::RealPing => {
+                        Some(&mut state.ping_status.entry(ep_id).or_default().real)
+                    }
+                    TestType::SpeedTest | TestType::UdpTest => None,
+                };
+                if let Some(round) = round {
+                    round.seen.insert(protocol_id);
+                    if error.is_some() {
+                        round.failed.insert(protocol_id);
+                    } else {
+                        round.failed.remove(&protocol_id);
+                    }
+                }
+
                 let name = {
                     let row = state
                         .endpoints

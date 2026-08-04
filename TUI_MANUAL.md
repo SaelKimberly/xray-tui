@@ -24,17 +24,17 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | (arrow)      | 1     | Expand/collapse indicator `▶`/`▾`           |
 | (status)     | 2     | Connection status or test indicator          |
 | `#`          | 5     | Row number; `*` when multi-selected         |
-| `Last Seen`  | 20    | Last seen timestamp (per-config staleness)  |
 | `Type`       | 12    | Protocol type (vmess, trojan, etc.)         |
 | `[`          | 1     | Bracket decoration                          |
 | (country)    | 3     | Inbound country flag (region emoji, `🏴` unknown) |
 | `Address`    | 37    | `host:port` (flag sits inside the brackets) |
 | `][`         | 2     | Bracket decoration                          |
-| `IP`         | 2     | Whitelist feature: `🏁` DNS unresolved, `🏳️` IP/CIDR whitelisted |
-| `SNI`        | 2     | Whitelist feature: `🏳️` SNI whitelisted     |
+| `Feat`       | 4     | Whitelist feature flags: `🏁` DNS unresolved, `🏳️` IP/CIDR whitelisted, `🏳️` SNI whitelisted |
 | `]=>{`       | 4     | Bracket decoration                          |
 | (config)     | 12    | `transport/security`, center-aligned        |
-| `}=>[`       | 4     | Bracket decoration                          |
+| `}=>`        | 3     | Bracket decoration                          |
+| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (every protocol of the endpoint unreachable for that test) |
+| `[`          | 1     | Bracket decoration (Outbound opener)        |
 | `Outbound`   | 16    | Exit IP from the last real ping (`—` none)  |
 | `Country`    | 7     | Exit country flag + ISO (`—` none)          |
 | `]`          | 1     | Bracket decoration                          |

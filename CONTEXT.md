@@ -55,6 +55,7 @@ AGENTS.md
 | **endpoints_gen** | Generation counter bumped on endpoint mutations — write-only, no reader. In-memory `state.endpoints` is rebuilt only by `reload_profiles()` (subscription events); ops that mutate endpoint state (e.g. protocol override) must patch the in-memory row explicitly or the UI shows stale data. |
 | **batch_progress** | `Arc<(AtomicU16, AtomicU16)>` shared between ping tasks and status bar — tracks (completed, total) for batch speed tests. |
 | **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
+| **ping_status** | `HashMap<endpoint_id, EndpointPingStatus>` — session-only per-endpoint ping rounds (`PingRound { seen, failed }` protocol-id sets per test type: fast/real). Updated in the `SpeedTestResult` handler, reset at batch start. Drives the Test column's red `[fast]`/`[real]` labels — fires only when every protocol of the endpoint failed that type in the current round. |
 | **Fast Ping** | Transport-level latency test using TCP handshake (TcpPingAdapter), UDP datagram (UdpPingAdapter), or QUIC handshake (QuicPingAdapter). Dispatched by FastPingManager based on protocol support. |
 | **DnsResolver** | Per-instance resolver (xray-tui-dns): resolves hostnames through the DNSCrypt public resolver list (DOH/DOT/DOQ stamps), with on-disk resolver cache in a caller-supplied directory. IP literals short-circuit. |
 | **Location** | GeoIP lookup result (xray-tui-geoip): country ISO code + optional English city name, from a GeoLite2-City mmdb downloaded on first use. |
@@ -90,7 +91,7 @@ AGENTS.md
 ## Key source files
 
 - `crates/xray-tui/src/state.rs` — AppState struct (60+ fields)
-- `crates/xray-tui/src/types.rs` — Tab, SortColumn, SettingsSection (14 variants), AppMode, CoreEvent (15 variants), EndpointInfo, LogLine, BackendUpdateStatus, ClashTraffic
+- `crates/xray-tui/src/types.rs` — Tab, SortColumn, SettingsSection (14 variants), AppMode, CoreEvent (15 variants), EndpointInfo, PingRound/EndpointPingStatus, LogLine, BackendUpdateStatus, ClashTraffic
 - `crates/xray-tui/src/ops/` — extracted AppState methods: connect.rs, ping.rs, events.rs, subscriptions.rs, updates.rs, settings.rs, profiles.rs, enrich.rs
 - `crates/xray-tui/src/ops/enrich.rs` — background enrichment: spawn_dns_resolve (TTL-gated), spawn_enrich_ip_hosts, spawn_whitelist_pass, spawn_outbound_enrich, extract_sni, protocol_row_to_profile
 - `crates/xray-tui-db/src/models_toasty.rs` — toasty Model definitions for all 9 tables (Endpoint with resolved_as/resolved_at, ProtocolRow with last_used_at/last_seen_at, EndpointGroup, Group, ProfileExtension, ServerStat, RoutingRule, DnsSetting with cache_ttl_secs, PingSession), EndpointRow, PurgatoryView constants
@@ -130,7 +131,7 @@ AGENTS.md
 | Aspect | v2rayN | xray-tui |
 |--------|--------|----------|
 | Display | Desktop GUI (WinForms), multi-window | Terminal TUI (ratatui), single-window tabbed |
-| Profile view | Flat list with sortable columns | 17-column endpoint rows (Last Seen, country flag, whitelist flags, config type, outbound) with expandable rounded panel containing the per-protocol sub-table (sorted newest-first by last_seen_at; Enter on a sub-row pins that protocol as the endpoint default) |
+| Profile view | Flat list with sortable columns | 17-column endpoint rows (Type, country flag, Address, Feat flags, config type, Test delay, Outbound) with expandable rounded panel containing the per-protocol sub-table (sorted newest-first by last_seen_at; Enter on a sub-row pins that protocol as the endpoint default) |
 | Group view | Dropdown filter | Modal overlay (g key) + Settings section |
 | Settings | Menu-driven dialog boxes | Split-pane: collapsible tree + inline form/routing list |
 | Search | Search box | `/` key focus to inline filter with cursor |
@@ -145,6 +146,6 @@ AGENTS.md
 
 ### Feature Parity
 
-**Implemented**: All 20 protocol config types, URL parsing for 14 protocols, Clash YAML conversion for 17 protocols, dual-backend (xray + sing-box), gRPC stats, subscription lifecycle, speed test system (TCP/real/speed/UDP/batch), routing rules CRUD, DNS settings, system proxy (HTTP_PROXY env vars), TUN toggle, theme system, inline form validation, backend auto-updates, geo file updates, Mux config, TLS/REALITY/ECH/Fragment form fields, Clash Mixin. Profiles redesign: 17-column single-line rows + expandable per-protocol panel, DNS endpoint IP resolution with cross-launch persistence, inbound/outbound country flags (geoip), IP/SNI whitelist feature flags (host-features), endpoint-scoped ping batches, Last Used column, `x` resolve key.
+**Implemented**: All 20 protocol config types, URL parsing for 14 protocols, Clash YAML conversion for 17 protocols, dual-backend (xray + sing-box), gRPC stats, subscription lifecycle, speed test system (TCP/real/speed/UDP/batch), routing rules CRUD, DNS settings, system proxy (HTTP_PROXY env vars), TUN toggle, theme system, inline form validation, backend auto-updates, geo file updates, Mux config, TLS/REALITY/ECH/Fragment form fields, Clash Mixin. Profiles redesign: 17-column single-line rows + expandable per-protocol panel, DNS endpoint IP resolution with cross-launch persistence, inbound/outbound country flags (geoip), Feat whitelist flag column (IP/SNI, host-features), Test column with colored delay + `[name]`/`[fast]`/`[real]` labels, endpoint-scoped ping batches, Last Used column, reverse sub-row highlight, `x` resolve key.
 
 **Not implemented**: proxy chain/policy groups, process-based routing, multi-URL subscriptions, SIP008 format, Clash API proxy/connections TUI tabs, PAC mode, WebDAV backup/restore, full TUN config (stack, MTU, route exclude), global hotkeys, i18n system, QR code display, config template editor, auto startup, sudo/polkit integration, drag-drop sort, tray integration.

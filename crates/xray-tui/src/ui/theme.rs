@@ -42,14 +42,33 @@ impl ThemeStyles {
             .bg(palette.highlight)
             .add_modifier(Modifier::BOLD)
     }
-    /// Selected protocol sub-row inside an expanded endpoint panel. Must be
-    /// visually distinct from the endpoint row highlight (`table_row_selected`,
-    /// bg `surface`) that paints the whole expanded panel.
+    /// Selected protocol sub-row inside an expanded endpoint panel — a
+    /// REVERSE highlight. The expanded panel sits on the endpoint row's
+    /// highlight background (`surface`), so the selected sub-row drops back
+    /// to the common top-level table background (explicit `Color::Reset` —
+    /// `Cell::set_style` merges, so a bg-less style would leave `surface`
+    /// in place): the whole expandable reads as a highlighted block with one
+    /// "notch" for the active protocol. Works under every palette (a light
+    /// `on_highlight` would hide light text).
     pub fn panel_row_selected(palette: &Palette) -> Style {
         Style::default()
-            .fg(palette.on_highlight)
-            .bg(palette.highlight)
+            .fg(palette.foreground)
+            .bg(ratatui::style::Color::Reset)
             .add_modifier(Modifier::BOLD)
+    }
+
+    // ── Profiles Test column ────────────────────────────────────────────
+    /// Delay under the warning threshold: reachable, fast server.
+    pub fn test_delay_ok(palette: &Palette) -> Style {
+        Style::default().fg(palette.success)
+    }
+    /// Delay at/above the warning threshold (500ms).
+    pub fn test_delay_warn(_palette: &Palette) -> Style {
+        Style::default().fg(ratatui::style::Color::Yellow)
+    }
+    /// Unreachable / delay at/above the error threshold (1000ms).
+    pub fn test_delay_bad(palette: &Palette) -> Style {
+        Style::default().fg(palette.error)
     }
 
     // ── Containers / borders ────────────────────────────────────────────
