@@ -402,18 +402,30 @@ fn build_xray_stream_settings(
     protocol: &ProtocolRow,
     s_settings_raw: serde_json::Value,
 ) -> Option<serde_json::Value> {
-    use xray_tui_proto::proto_spec::ProtocolConfig;
-    match serde_json::from_slice::<ProtocolConfig>(&protocol.spec_blob) {
-        Ok(ProtocolConfig::Vmess(c)) => {
-            xray_tui_proto::proto_spec::common::to_xray_stream_settings(&c.security, &c.transport)
-        }
-        Ok(ProtocolConfig::Vless(c)) => {
-            xray_tui_proto::proto_spec::common::to_xray_stream_settings(&c.security, &c.transport)
-        }
-        Ok(ProtocolConfig::Trojan(c)) => {
-            xray_tui_proto::proto_spec::common::to_xray_stream_settings(&c.security, &c.transport)
-        }
-        _ => legacy_stream_settings_to_xray(s_settings_raw, protocol.transport.as_deref()),
+    use xray_tui_proto::proto_spec::Proto;
+    match serde_json::from_slice::<Proto>(&protocol.spec_blob) {
+        Ok(proto) => match proto.config() {
+            xray_tui_proto::proto_spec::ProtocolConfig::Vmess(c) => {
+                xray_tui_proto::proto_spec::common::to_xray_stream_settings(
+                    &c.security,
+                    &c.transport,
+                )
+            }
+            xray_tui_proto::proto_spec::ProtocolConfig::Vless(c) => {
+                xray_tui_proto::proto_spec::common::to_xray_stream_settings(
+                    &c.security,
+                    &c.transport,
+                )
+            }
+            xray_tui_proto::proto_spec::ProtocolConfig::Trojan(c) => {
+                xray_tui_proto::proto_spec::common::to_xray_stream_settings(
+                    &c.security,
+                    &c.transport,
+                )
+            }
+            _ => legacy_stream_settings_to_xray(s_settings_raw, protocol.transport.as_deref()),
+        },
+        Err(_) => legacy_stream_settings_to_xray(s_settings_raw, protocol.transport.as_deref()),
     }
 }
 

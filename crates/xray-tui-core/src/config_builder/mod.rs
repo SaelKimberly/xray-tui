@@ -30,12 +30,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 /// Shared: extract (p_settings, s_settings) from a protocol row's spec_blob.
-/// Tries typed ProtocolConfig first; falls back to raw JSON extraction.
+/// Tries typed Proto (transparent to ProtocolConfig) first; falls back to raw
+/// JSON extraction.
 pub(crate) fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
-    if let Ok(config) =
-        serde_json::from_slice::<xray_tui_proto::proto_spec::ProtocolConfig>(&protocol.spec_blob)
+    if let Ok(proto) =
+        serde_json::from_slice::<xray_tui_proto::proto_spec::Proto>(&protocol.spec_blob)
     {
-        return config.to_settings();
+        return proto.config().to_settings();
     }
     let extra: Value = serde_json::from_slice(&protocol.spec_blob).unwrap_or_else(|_| json!({}));
     let mut p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));

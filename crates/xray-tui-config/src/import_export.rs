@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use xray_tui_core::protocol::Protocol;
-use xray_tui_proto::proto_spec::{ParseResult, PlaceholderConfig, ProtocolConfig};
+use xray_tui_proto::proto_spec::{ParseResult, PlaceholderConfig, Proto, ProtocolConfig};
 
 /// Maximum length for protocol settings JSON from untrusted sources.
 const MAX_SETTINGS_LEN: usize = 65536;
@@ -357,7 +357,6 @@ fn convert_spec_blob(
     settings: &ValidationSettings,
 ) -> Result<ParsedProtocol> {
     use xray_tui_core::protocol::Protocol;
-    use xray_tui_proto::proto_spec::ProtoSpec;
     use xray_tui_proto::urlx::RawUrlX;
 
     let proto = Protocol::try_from_i32(profile.config_type).ok_or_else(|| {
@@ -371,22 +370,24 @@ fn convert_spec_blob(
     profile.spec_blob = serde_json::to_vec(&config)
         .map_err(|e| ImportError::Parse(format!("failed to serialize config: {e}")))?;
 
-    // Compute proper sig/cred_hash from typed ProtocolConfig parser.
+    // Compute proper sig/cred_hash from the typed ProtocolConfig parser.
     if let Ok(ParseResult::Direct(typed) | ParseResult::Fallback(typed, _)) =
         ProtocolConfig::try_parse_detailed(&RawUrlX::from(url))
     {
-        profile.id = typed.uid() as i64;
-        profile.sig = typed.sig() as i64;
-        profile.cred_hash = typed.cred_hash() as i64;
+        let typed_proto = Proto::new(typed);
+        profile.id = typed_proto.uid() as i64;
+        profile.sig = typed_proto.sig() as i64;
+        profile.cred_hash = typed_proto.cred_hash() as i64;
     } else {
         // Fallback to PlaceholderConfig. Its sig is a deterministic hash of
         // the opaque body (proto_name + settings_json), so the uid is
         // non-zero and dedup-preserving: same body -> same uid, different
         // body -> different uid. cred_hash is 0 (opaque blob has no
         // extractable credentials), making uid == sig.
-        profile.id = config.uid() as i64;
-        profile.sig = config.sig() as i64;
-        profile.cred_hash = config.cred_hash() as i64;
+        let fallback_proto = Proto::new(config);
+        profile.id = fallback_proto.uid() as i64;
+        profile.sig = fallback_proto.sig() as i64;
+        profile.cred_hash = fallback_proto.cred_hash() as i64;
     }
 
     // Validate
