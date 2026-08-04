@@ -34,31 +34,34 @@ inherent impl; `compute_cred_hash` is the body of today's `cred_hash()` (the
 `utils::compute_cred_hash(&[("uuid", ..), ..])` calls). `PlaceholderConfig`
 implements it with the whole-body rapidhash and `0` respectively.
 
-### 2. `Identity` enum + `Proto` container
+### 2. `Identity` struct + `Proto` container
 
 ```rust
-enum Identity {
-    Defer,
-    Cache { sig: NonZeroU64, cred_hash: u64 },
+struct Identity {
+    sig: NonZeroU64,
+    cred_hash: u64,
 }
 
 pub struct Proto {
     config: ProtocolConfig,
-    identity: OnceLock<Identity>,   // starts `OnceLock::from(Identity::Defer)`
+    identity: OnceLock<Identity>,   // empty = deferred; first access materializes
 }
 ```
 
-Derives: `#[derive(Debug)]` on both `Identity` and `Proto` (`OnceLock<T>` is
-`Debug` when `T: Debug`). Do **not** derive `Clone` — `OnceLock` isn't `Clone`
-and no clone sites exist; none needed.
+Derives: `#[derive(Debug, Clone, Copy)]` on `Identity`; `#[derive(Debug)]` on
+`Proto` (`OnceLock<T>` is `Debug` when `T: Debug`). Do **not** derive `Clone`
+on `Proto` — `OnceLock` isn't `Clone` and no clone sites exist; none needed.
 
 - `Proto` is the new primary public type. `sig()`, `cred_hash()`, `uid()` are
-  inherent members. First call materializes `Cache` atomically:
-  `if matches!(self.identity.get(), Some(Identity::Defer)) { let id = compute…; _ = self.identity.set(id); }`
-  — race-safe (loser's `set` returns `Err` with an identical deterministic
-  value), never blocks.
+  inherent members. First call materializes atomically:
+  `self.identity.get_or_init(|| Identity { sig: NonZeroU64::new(self.config.compute_sig()).unwrap_or(NonZeroU64::MIN), cred_hash: self.config.compute_cred_hash() })`
+  — race-safe by construction, never blocks, no partial states. The empty
+  `OnceLock` IS the deferred state (an explicit `Defer` enum variant was
+  considered and rejected: `OnceLock::set` fails on any initialized cell, so a
+  materialized Defer could never transition; the empty cell encodes the same
+  state with no dead variant).
 - `set_identity` exists only as a `#[cfg(test)]` private method (zero production
-  callers; seeded `Cache` lets tests assert no recompute).
+  callers; seeded `Identity` lets tests assert no recompute).
 - Accessors: `new(config)`, `config(&self)`, `into_config(self)`.
 
 ### 3. `ProtoSpec` trait (sealed)
