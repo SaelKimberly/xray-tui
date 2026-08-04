@@ -182,6 +182,10 @@
 - ✅ 17-column single-line endpoint rows — Last Seen, inbound country flag, IP/SNI whitelist flags, transport/security combo, outbound IP+country; Remarks, Delay, Speed, Traffic, IP-info dropped from the single line (Remarks wiped from TUI and DB)
 - ✅ Expandable rounded panel — `IPs:` line with `(x resolve)` hint + 10-column per-protocol sub-table (marker, hex id, last seen, last used, config type, delay, speed, traffic, outbound, country); panel keeps a 1-line gap below so the bottom border never touches the next row; height-aware scrolling so expanded rows never strand the last profiles
 - ✅ Expansion nav semantics — expand lands on first sub-row; `↑`/`↓` walk variants; `↑` at sub 0 → full row; `↓` at last sub-row → next profile; `↓` from full row of expanded endpoint → re-enter sub 0; collapsed endpoint moves on one `↓`
+- ✅ Sub-table newest-first sort — each endpoint's protocols sorted by `last_seen_at` desc in `deserialize_endpoint_rows` (stable, ties keep insertion order)
+- ✅ Protocol pin via Enter — Enter on a sub-row sets `manual_protocol_override` (`set_protocol_default`), Enter on the endpoint row clears it (`set_active`); both patch the in-memory row so the UI switches without a reload
+- ✅ Sub-row selection feedback — selected sub-row renders as an accent bar (`ThemeStyles::panel_row_selected`: fg on_highlight/bg highlight), distinct from the row highlight that paints the whole expanded panel
+- ✅ Uniform row background — zebra striping removed from the Profiles grid; unselected rows share one background, selection/connected keep their highlights
 - ✅ DNS persistence across launches — `endpoints.resolved_as` (comma-joined IPs) + `resolved_at` (unix secs); schema v1→v3 migration (SCHEMA_VERSION 3, `ensure_column` + explicit transaction + `protocol_rows.endpoint_id` index)
 - ✅ Endpoint-scoped ping batches — Fast/Real Ping on a collapsed multi-protocol endpoint row pings all its protocols; on a sub-row pings the exact protocol (`get_batch_for_real_ping(batch_id, limit, dedup_endpoints)`)
 - ✅ Last Used column — `protocol_rows.last_used_at` set on connect, shown in the panel sub-table

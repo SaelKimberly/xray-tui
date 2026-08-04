@@ -52,7 +52,7 @@ AGENTS.md
 | **sub_uid** | Content-based hash (rapidhash) of profile identity fields — used for dedup during subscription update. URL-imported: `sig ^ cred_hash`, computed by the `Proto` identity container (proto crate) from the protocol's `ProtoIdentity` implementation. Form-created: random i64. |
 | **Purgatory** | Destination group for orphaned subscription profiles (was "Graveyard"). Default TTL 7 days, retention 30 days. |
 | **PurgatoryView** | Enum controlling which set of profiles to display: None (active only), Graveyard, Purgatory. |
-| **endpoints_gen** | Generation counter bumped on every endpoint mutation. Skips redundant reloads. |
+| **endpoints_gen** | Generation counter bumped on endpoint mutations — write-only, no reader. In-memory `state.endpoints` is rebuilt only by `reload_profiles()` (subscription events); ops that mutate endpoint state (e.g. protocol override) must patch the in-memory row explicitly or the UI shows stale data. |
 | **batch_progress** | `Arc<(AtomicU16, AtomicU16)>` shared between ping tasks and status bar — tracks (completed, total) for batch speed tests. |
 | **testing_details** | `HashMap<uuid::Uuid, TestType>` tracking active test type per profile — enables TestTypeUpdate event to switch displayed emoji mid-flow (TcpPing→RealPing) during batch-then-real-ping |
 | **Fast Ping** | Transport-level latency test using TCP handshake (TcpPingAdapter), UDP datagram (UdpPingAdapter), or QUIC handshake (QuicPingAdapter). Dispatched by FastPingManager based on protocol support. |
@@ -75,6 +75,7 @@ AGENTS.md
 - **Profile identity**: `sub_uid = sig ^ cred_hash` for URL-imported (deterministic dedup via rapidhash), random i64 for manual form entries. Form profiles set `sig = uid`, `cred_hash = 0` (meaningless, no URL-dedup). Identity computation is normalized in the proto crate: crate-private `ProtoIdentity` trait (`compute_sig` + `compute_cred_hash`) feeds the `Proto` container's `OnceLock<Identity>` cache; `ProtoSpec: ProtoIdentity` is sealed.
 - **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. Each profile tagged with core type (auto, xray, sing-box). Auto mode resolves based on protocol.
 - **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, Shadowsocks, etc.) → xray-core by default. User can override per-profile.
+- **Protocol sub-table ordering**: Each endpoint's `protocols` are sorted by `last_seen_at` descending in `deserialize_endpoint_rows` (stable — ties keep insertion order), so the expandable sub-table shows the newest variant on top. `active_protocol()` = `manual_protocol_override` if set, else `protocols[0]` — unpinned default is therefore the newest-seen variant. Pin/unpin via Enter on a sub-row / endpoint row (`set_protocol_default`/`set_active` in `ops/profiles.rs`), which write the override to DB AND patch the in-memory row (see `endpoints_gen` glossary entry — no reload happens otherwise).
 - **Background enrichment pipeline** (`ops/enrich.rs`): DNS resolution, mmdb country lookups, and whitelist checks run in spawned tokio tasks that report via `CoreEvent::EndpointInfoUpdated` — the UI thread never blocks. `EndpointInfoUpdated` merges by field group (concurrent resolution/whitelist/outbound events must not clobber); failed DNS lookups materialize TTL-gated entries so auto-retriggers don't re-hang; DNS resolutions persist to `endpoints.resolved_as`/`resolved_at`. DNS + mmdb downloads have hard deadlines (10s/8s).
 - **One core runs at a time**: Switching profiles between backends stops current core process and starts other. Matches v2rayN behavior and avoids port conflicts.
 - **Xray-core runs as subprocess**; TUI writes JSON config files and communicates via gRPC API.
@@ -129,7 +130,7 @@ AGENTS.md
 | Aspect | v2rayN | xray-tui |
 |--------|--------|----------|
 | Display | Desktop GUI (WinForms), multi-window | Terminal TUI (ratatui), single-window tabbed |
-| Profile view | Flat list with sortable columns | 17-column endpoint rows (Last Seen, country flag, whitelist flags, config type, outbound) with expandable rounded panel containing the per-protocol sub-table |
+| Profile view | Flat list with sortable columns | 17-column endpoint rows (Last Seen, country flag, whitelist flags, config type, outbound) with expandable rounded panel containing the per-protocol sub-table (sorted newest-first by last_seen_at; Enter on a sub-row pins that protocol as the endpoint default) |
 | Group view | Dropdown filter | Modal overlay (g key) + Settings section |
 | Settings | Menu-driven dialog boxes | Split-pane: collapsible tree + inline form/routing list |
 | Search | Search box | `/` key focus to inline filter with cursor |
