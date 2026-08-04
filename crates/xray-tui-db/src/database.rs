@@ -9,8 +9,8 @@ use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
 use crate::models_toasty::EndpointRow;
 use crate::models_toasty::{
-    DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession,
-    ProfileExtension, ProtocolRow, RoutingRule, ServerStat,
+    DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession, ProfileExtension,
+    ProtocolRow, RoutingRule, ServerStat,
 };
 
 // ── Database handle ─────────────────────────────────────────────────────
@@ -627,10 +627,10 @@ impl Database {
         toasty::sql::statement(
             "UPDATE protocol_rows SET last_used_at = ?1, last_seen_at = ?1 WHERE id = ?2",
         )
-            .bind(ts)
-            .bind(protocol_id)
-            .exec(&mut tx)
-            .await?;
+        .bind(ts)
+        .bind(protocol_id)
+        .exec(&mut tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1030,10 +1030,11 @@ impl Database {
         // `clear_group` (which unlinks but keeps profiles in the All view)
         // must survive deleting an unrelated group, so a global zero-link
         // predicate is not safe.
-        let rows = toasty::sql::query("SELECT endpoint_id FROM endpoint_groups WHERE group_id = ?1")
-            .bind(id)
-            .exec(&mut tx)
-            .await?;
+        let rows =
+            toasty::sql::query("SELECT endpoint_id FROM endpoint_groups WHERE group_id = ?1")
+                .bind(id)
+                .exec(&mut tx)
+                .await?;
         let group_endpoints: Vec<i64> = rows
             .iter()
             .filter_map(|v| {
@@ -1565,8 +1566,15 @@ impl Database {
         deserialize_ping_sessions(rows)
     }
 
-    /// Fetch real-ping ready sessions in wave order: first occurrence of each endpoint,
-    /// Fetch the next `limit` queued real-ping sessions for `batch_id`.
+    /// Fetch queued real-ping sessions for `wave` (occurrence rank within each
+    /// endpoint, ordered by config_type then protocol_id) of `batch_id`.
+    ///
+    /// Occurrence is computed over ALL `ping_type='real'` rows of the batch
+    /// (status-independent), so wave ranks stay STABLE across dispatches: a
+    /// rank-k row of an endpoint implies its rank-(k-1) row was created first,
+    /// so an empty wave means no queued row at any higher rank either.
+    /// `status = 'queued'` is applied in the outer query.
+    ///
     /// When `dedup_endpoints` is true, skips endpoints (address+port) that
     /// already have a completed real ping — the all-visible batch behavior.
     /// Endpoint-scoped batches pass `false` so every protocol of one endpoint
@@ -1574,6 +1582,7 @@ impl Database {
     pub async fn get_batch_for_real_ping(
         &self,
         batch_id: &str,
+        wave: i64,
         limit: usize,
         dedup_endpoints: bool,
     ) -> Result<Vec<PingSession>> {
@@ -1604,15 +1613,16 @@ impl Database {
                        ) AS occurrence \
                 FROM ping_sessions ps \
                 WHERE ps.batch_id = ?1 \
-                  AND ps.status = 'queued' \
                   AND ps.ping_type = 'real' \
-                  {dedup_sql}         ) sub \
-             ORDER BY sub.occurrence, sub.id \
-             LIMIT ?2",
+                  {dedup_sql}     ) sub \
+             WHERE sub.occurrence = ?2 AND sub.status = 'queued' \
+             ORDER BY sub.id \
+             LIMIT ?3",
             dedup_sql = dedup_sql,
         );
         let rows = toasty::sql::query(&query)
             .bind(batch_id)
+            .bind(wave)
             .bind(limit as i64)
             .exec(&mut conn)
             .await?;
@@ -1941,7 +1951,10 @@ mod tests {
         // 2. Reopen through the app's Database — the migration must re-add
         //    the columns (a SELECT touching last_used_at would otherwise fail).
         let db = Database::open(&path).await.expect("open migrates schema");
-        let row = db.get_endpoint(0).await.expect("endpoint query uses last_used_at");
+        let row = db
+            .get_endpoint(0)
+            .await
+            .expect("endpoint query uses last_used_at");
         assert!(row.is_none(), "empty old db has no endpoints");
 
         // Reopening again must be a no-op (idempotent).
@@ -2035,5 +2048,106 @@ mod tests {
             !rows.is_empty(),
             "open() migration did not recreate the protocol_rows(endpoint_id) index"
         );
+    }
+
+    /// `get_batch_for_real_ping(batch_id, wave, ...)` must return one queued
+    /// session per endpoint at STABLE occurrence ranks: dispatching wave 1
+    /// (even failing it) must NOT re-rank the remaining protocols to 1, and
+    /// the `dedup_endpoints` NOT EXISTS must only skip endpoints with a
+    /// completed real ping.
+    #[tokio::test]
+    async fn test_wave_query_real_ping_stable_ranks() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.db.connection().await.expect("connection");
+        toasty::sql::statement(
+            "INSERT INTO endpoints (id, host, host_type, port, created_at) VALUES \
+             (1001, '1.1.1.1', 'ipv4', 443, 0), \
+             (1002, '2.2.2.2', 'ipv4', 8443, 0)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("insert endpoints");
+        toasty::sql::statement(
+            "INSERT INTO protocol_rows \
+               (id, endpoint_id, sig, cred_hash, proto_kind, spec_blob, config_type, \
+                core_type, created_at, last_seen_at) \
+             VALUES \
+               (2001, 1001, 1, 0, 'vmess', X'', 0, 'xray', 0, 0), \
+               (2002, 1001, 2, 0, 'trojan', X'', 1, 'xray', 0, 0), \
+               (2003, 1002, 3, 0, 'vmess', X'', 0, 'xray', 0, 0), \
+               (2004, 1002, 4, 0, 'socks', X'', 2, 'xray', 0, 0)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("insert protocol_rows");
+
+        let batch_id = "wave-test-batch";
+        let count = db
+            .create_ping_batch(
+                batch_id,
+                None,
+                Some(&[(2001, 0), (2002, 1), (2003, 0), (2004, 1)]),
+            )
+            .await
+            .expect("create batch");
+        assert_eq!(count, 4);
+
+        // Demote all four to real candidates.
+        let sessions = db
+            .get_ping_sessions_by_batch(batch_id, 100, 0)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions.len(), 4);
+        for s in &sessions {
+            db.update_session_ping_type(&s.id, "real", "queued")
+                .await
+                .expect("demote");
+        }
+
+        // Wave 1: exactly one session per endpoint (lowest config_type).
+        let wave1 = db
+            .get_batch_for_real_ping(batch_id, 1, 100, false)
+            .await
+            .expect("wave1");
+        assert_eq!(wave1.len(), 2);
+        let wave1_ids: Vec<i64> = wave1.iter().map(|s| s.protocol_id).collect();
+        assert!(wave1_ids.contains(&2001));
+        assert!(wave1_ids.contains(&2003));
+
+        // Wave 1 fails -> wave 2 still returns the second protocol of each
+        // endpoint at its STABLE rank 2 (never re-ranked to 1).
+        for s in &wave1 {
+            db.update_session_status(&s.id, "failed")
+                .await
+                .expect("fail");
+        }
+        let wave2 = db
+            .get_batch_for_real_ping(batch_id, 2, 100, false)
+            .await
+            .expect("wave2");
+        assert_eq!(wave2.len(), 2);
+        let wave2_ids: Vec<i64> = wave2.iter().map(|s| s.protocol_id).collect();
+        assert!(wave2_ids.contains(&2002));
+        assert!(wave2_ids.contains(&2004));
+
+        // One endpoint completes -> dedup_endpoints=true skips its remaining
+        // protocol; the other endpoint's second protocol still appears.
+        let s2001 = wave1.iter().find(|s| s.protocol_id == 2001).unwrap();
+        db.update_session_status(&s2001.id, "completed")
+            .await
+            .expect("complete");
+        let wave2_dedup = db
+            .get_batch_for_real_ping(batch_id, 2, 100, true)
+            .await
+            .expect("wave2 dedup");
+        let dedup_ids: Vec<i64> = wave2_dedup.iter().map(|s| s.protocol_id).collect();
+        assert_eq!(dedup_ids, vec![2004]);
+
+        // Wave 3 is empty — terminates the pass loop.
+        let wave3 = db
+            .get_batch_for_real_ping(batch_id, 3, 100, false)
+            .await
+            .expect("wave3");
+        assert!(wave3.is_empty());
     }
 }

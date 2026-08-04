@@ -224,7 +224,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 };
                 if let Some(round) = round {
                     round.seen.insert(protocol_id);
-                    if error.is_some() {
+                    // A stopped test is not a failure: the stop path emits
+                    // `error: Some("Cancelled")` for sessions that never ran,
+                    // and counting them failed would paint `[fast]`/`[real]`
+                    // red on endpoints whose tests were merely abandoned.
+                    if error.is_some() && error.as_deref() != Some("Cancelled") {
                         round.failed.insert(protocol_id);
                     } else {
                         round.failed.remove(&protocol_id);
@@ -486,7 +490,8 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         entry.country = info.country.or_else(|| entry.country.clone());
                         // Keep the current flags when the incoming event
                         // carries defaults (seed pass before whitelist load).
-                        entry.host_features = merge_host_features(entry.host_features, info.host_features);
+                        entry.host_features =
+                            merge_host_features(entry.host_features, info.host_features);
                         // Persist only when the resolution itself changed
                         // (whitelist-pass copies carry the same timestamp and
                         // must not re-write).
@@ -523,7 +528,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     let db = state.db.clone();
                     tokio::spawn(async move {
                         if let Err(e) = db
-                            .update_endpoint_resolution(endpoint_id, Some(&resolved_as), resolved_at)
+                            .update_endpoint_resolution(
+                                endpoint_id,
+                                Some(&resolved_as),
+                                resolved_at,
+                            )
                             .await
                         {
                             tracing::warn!(
@@ -649,9 +658,7 @@ mod tests {
         // Idle: no events -> false (keeps the refresh-cadence draw path).
         assert!(!state.poll_core_events().await);
         // A real event -> true, and the state change is applied.
-        tx.send(CoreEvent::Connected(CoreType::Xray))
-            .await
-            .unwrap();
+        tx.send(CoreEvent::Connected(CoreType::Xray)).await.unwrap();
         assert!(state.poll_core_events().await);
         assert_eq!(state.connected_core, Some(CoreType::Xray));
         // Drained -> idle again.

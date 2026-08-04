@@ -642,11 +642,16 @@ async fn test_update_endpoint_resolution_roundtrip() {
         .await
         .unwrap();
     let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(row.endpoint.resolved_as.as_deref(), Some("1.2.3.4,2606:4700::1"));
+    assert_eq!(
+        row.endpoint.resolved_as.as_deref(),
+        Some("1.2.3.4,2606:4700::1")
+    );
     assert_eq!(row.endpoint.resolved_at, Some(999_000));
 
     // Clearing (failed lookup) sets both back to NULL
-    db.update_endpoint_resolution(ep.id, None, None).await.unwrap();
+    db.update_endpoint_resolution(ep.id, None, None)
+        .await
+        .unwrap();
     let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
     assert_eq!(row.endpoint.resolved_as, None);
     assert_eq!(row.endpoint.resolved_at, None);
@@ -707,17 +712,21 @@ async fn test_get_batch_for_real_ping_dedup_flag() {
 
     // dedup=true: proto2's session is hidden (its endpoint already completed)
     let with_dedup = db
-        .get_batch_for_real_ping(batch, 10, true)
+        .get_batch_for_real_ping(batch, 2, 10, true)
         .await
         .unwrap();
     assert_eq!(with_dedup.len(), 0, "dedup hides same-endpoint sessions");
 
     // dedup=false: both sessions visible again (endpoint-scoped batch)
     let without_dedup = db
-        .get_batch_for_real_ping(batch, 10, false)
+        .get_batch_for_real_ping(batch, 2, 10, false)
         .await
         .unwrap();
-    assert_eq!(without_dedup.len(), 1, "no-dedup returns the remaining queued");
+    assert_eq!(
+        without_dedup.len(),
+        1,
+        "no-dedup returns the remaining queued"
+    );
     assert_eq!(without_dedup[0].protocol_id, proto2.id);
 }
 
@@ -745,17 +754,26 @@ async fn test_delete_group_removes_orphaned_profiles() {
     .unwrap();
 
     let ep2 = make_endpoint("5.6.7.8", 443);
-    db.subscription_upsert("g2", &[(ep2.clone(), vec![make_protocol(ep2.id, "ss", 9003)])])
-        .await
-        .unwrap();
+    db.subscription_upsert(
+        "g2",
+        &[(ep2.clone(), vec![make_protocol(ep2.id, "ss", 9003)])],
+    )
+    .await
+    .unwrap();
 
     let ep3 = make_endpoint("9.9.9.9", 443);
-    db.subscription_upsert("g1", &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])])
-        .await
-        .unwrap();
-    db.subscription_upsert("g2", &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])])
-        .await
-        .unwrap();
+    db.subscription_upsert(
+        "g1",
+        &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])],
+    )
+    .await
+    .unwrap();
+    db.subscription_upsert(
+        "g2",
+        &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])],
+    )
+    .await
+    .unwrap();
 
     // Delete g1 → ep1 becomes an orphan (no remaining group link), ep2 and
     // shared ep3 must survive.
@@ -783,13 +801,19 @@ async fn test_delete_group_preserves_cleared_group_profiles() {
     db.insert_group(&test_group("gB")).await.unwrap();
 
     let ep_a = make_endpoint("1.1.1.1", 443);
-    db.subscription_upsert("gA", &[(ep_a.clone(), vec![make_protocol(ep_a.id, "vmess", 9101)])])
-        .await
-        .unwrap();
+    db.subscription_upsert(
+        "gA",
+        &[(ep_a.clone(), vec![make_protocol(ep_a.id, "vmess", 9101)])],
+    )
+    .await
+    .unwrap();
     let ep_b = make_endpoint("2.2.2.2", 443);
-    db.subscription_upsert("gB", &[(ep_b.clone(), vec![make_protocol(ep_b.id, "ss", 9102)])])
-        .await
-        .unwrap();
+    db.subscription_upsert(
+        "gB",
+        &[(ep_b.clone(), vec![make_protocol(ep_b.id, "ss", 9102)])],
+    )
+    .await
+    .unwrap();
 
     // clear_group only unlinks — the profile stays in the All view.
     let cleared = db.clear_group("gA").await.unwrap();

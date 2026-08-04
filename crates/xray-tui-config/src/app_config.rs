@@ -479,6 +479,10 @@ pub struct SpeedTestConfig {
     pub real_ping_concurrency: usize,
     #[serde(default = "default_real_ping_window")]
     pub real_ping_window: usize,
+    #[serde(default = "default_fast_ping_concurrency")]
+    pub fast_ping_concurrency: usize,
+    #[serde(default = "default_real_ping_test_all_protocols")]
+    pub real_ping_test_all_protocols: bool,
 }
 
 fn default_ping_url() -> String {
@@ -506,11 +510,19 @@ const fn default_real_ping_retries() -> u32 {
 }
 
 const fn default_real_ping_concurrency() -> usize {
-    5
+    100
 }
 
 const fn default_real_ping_window() -> usize {
     20
+}
+
+const fn default_fast_ping_concurrency() -> usize {
+    200
+}
+
+const fn default_real_ping_test_all_protocols() -> bool {
+    false
 }
 
 impl Default for SpeedTestConfig {
@@ -524,6 +536,8 @@ impl Default for SpeedTestConfig {
             real_ping_retries: default_real_ping_retries(),
             real_ping_concurrency: default_real_ping_concurrency(),
             real_ping_window: default_real_ping_window(),
+            fast_ping_concurrency: default_fast_ping_concurrency(),
+            real_ping_test_all_protocols: default_real_ping_test_all_protocols(),
         }
     }
 }
