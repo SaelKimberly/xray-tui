@@ -5,10 +5,10 @@
 ```
 xray-tui (bin)
   ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder, process, log_heed)
-  │     └── xray-tui-proto  (ProtocolConfig types, URL parsing, Clash YAML)
+  │     └── xray-tui-proto  (ProtocolConfig types, Proto identity container, URL parsing, Clash YAML)
   ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
   ├── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
-  │     └── xray-tui-proto  (ProtocolConfig types for import/export round-trip)
+  │     └── xray-tui-proto  (ProtocolConfig/Proto types for import/export round-trip)
   ├── xray-tui-dns      (DNSCrypt-stamp DNS resolution — enrichment pipeline)
   ├── xray-tui-geoip    (GeoLite2-City country/city lookup — enrichment pipeline)
   └── xray-tui-host-features  (SNI/IP/CIDR whitelist membership — enrichment pipeline)
@@ -68,7 +68,6 @@ pub struct AppState {
     pub actions_compact: bool,
     pub connected_protocol_id: Option<i64>,
     pub speed_test_stop: Arc<AtomicBool>,
-    pub next_real_ping_port: Arc<AtomicU16>,
     pub last_test_tcp: Option<u64>,
     pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
     pub last_test_real: Option<u64>,
@@ -135,6 +134,10 @@ pub enum CoreEvent {
         ip_info: Option<String>,
         error: Option<String>,
     },
+    TestTypeUpdate {
+        protocol_id: i64,
+        test_type: TestType,
+    },
     UpdateCheckResult {
         core_type: CoreType,
         current_version: Option<String>,
@@ -182,7 +185,7 @@ Methods previously in `lib.rs` extracted to `ops/` modules:
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 - `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
 - `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)
-- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled with themed scrollbar, DataTableRow trait
+- `widgets/data_table.rs` — Reusable DataTable widget: sortable columns, multi-select, virtual-scrolled with themed scrollbar, DataTableRow trait (render takes `clip_bottom` so tall rows clip instead of overflowing)
 
 **`speed_test.rs`** — Async speed test engine:
 ```rust
@@ -205,7 +208,7 @@ which updates the ProfileExtension (delay, ip_info) in memory and persists via u
 
 **Batch-then-real-ping (start_batch_then_real_ping)**: Two-phase pipeline using `ping_sessions` table:
 1. **Phase 1**: Creates ping_sessions records, runs Fast Ping on all visible profiles concurrently. Falls through to RealPingManager for protocols without adapter.
-2. **Phase 2**: Wave-ordered real pings on ALL profiles from Phase 1. Wave ordering interleaves profiles from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates. Each profile gets its own **temp core + real ping** on a unique port allocated atomically from a shared pool (`RealPingManager.allocate_port()`). Bounded by `real_ping_concurrency` semaphore. Individual Real Ping also uses the pool via `AppState.next_real_ping_port`, sharing the same counter to avoid port collisions between individual and batch flows.
+2. **Phase 2**: Wave-ordered real pings on ALL profiles from Phase 1. Wave ordering interleaves profiles from different host:port groups — one profile per unique target first (Wave 1), then remaining duplicates. Each profile gets its own **temp core + real ping** on a unique port allocated atomically from a shared allocator (`CorePool::port_allocator()`, one `Arc<AtomicU16>` exposed from the pool). Bounded by `real_ping_concurrency` semaphore. The same allocator serves both batch Phase 2 and individual real pings (no port collisions between flows); an RAII `BatchActiveGuard` disables warm-core pool reuse while a batch owns the allocator. The former `AppState.next_real_ping_port` field was removed — it duplicated the counter.
 
 **Stop testing**: `speed_test_stop: Arc<AtomicBool>` on AppState. Set via menu ("Stop Testing" at index 10)
 or hotkey `'s'`. Auto-resets when `testing_profiles` empties. `tested_pids`/`tcp_completed` sets prevent
@@ -460,18 +463,18 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 `crates/xray-tui-db/src/lib.rs` — toasty ORM database layer.
 
 **Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
-- `Profile` — proxy server config; `#[unique(group_id, sub_uid)]` for subscription dedup
-- `Connection` — many-to-many Profile↔Group membership; replaces `Profile.group_id`
+- `Endpoint` — server config; dedup key `sub_uid` (uid = sig ^ cred_hash); `resolved_as`/`resolved_at` DNS persistence
+- `ProtocolRow` — per-protocol variant rows (many per endpoint); `last_used_at`/`last_seen_at`, `endpoint_id` index
+- `EndpointGroup` — many-to-many Endpoint↔Group membership
 - `Group` — subscription group with name, URL, sort order, is_system flag
-- `ProfileExtension` — per-profile test results (delay, speed, ip_info)
+- `ProfileExtension` — per-protocol test results (delay, speed, ip_info)
 - `ServerStat` — traffic counters (today/total up/down as i64)
-- `Subscription` — group subscription metadata
 - `RoutingRule` — domain/IP/port matchers with outbound tag; sort-ordered
 - `DnsSetting` — DNS resolver config
 - `PingSession` — ping batch tracking (batch_id, status, ping_type, latency)
 
-**Schema management**: toasty's `db.push_schema()` creates tables on first open — only when `PRAGMA user_version < 1` (toasty 0.9 uses `CREATE TABLE` without `IF NOT EXISTS`). Existing DBs migrate in place: `SCHEMA_VERSION = 2`, `ensure_column()` (pragma_table_info check + idempotent `ALTER TABLE ADD COLUMN`) for `protocol_rows.last_used_at`, `endpoints.resolved_as`/`resolved_at`, `dns_settings.cache_ttl_secs` — all inside one explicit `conn.transaction()` + `tx.commit()` (bare multi-statement DDL on the pooled turso connection silently rolls back at drop). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
-**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB). Initial log loading is lazy (deferred to first Logs tab access).
+**Schema management**: toasty's `db.push_schema()` creates tables on first open — only when `PRAGMA user_version < 1` (toasty 0.9 uses `CREATE TABLE` without `IF NOT EXISTS`). Existing DBs migrate in place: `SCHEMA_VERSION = 3`, `ensure_column()` (pragma_table_info check + idempotent `ALTER TABLE ADD COLUMN`) for `protocol_rows.last_used_at`, `endpoints.resolved_as`/`resolved_at`, `dns_settings.cache_ttl_secs`; v3 adds the `protocol_rows.endpoint_id` index (`CREATE INDEX IF NOT EXISTS`, idempotent). All inside one explicit `conn.transaction()` + `tx.commit()` (bare multi-statement DDL on the pooled turso connection silently rolls back at drop). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
+**Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB) with backoff retry (50ms*(attempt+1), max 5) — the batch is retried after a successful resize, never dropped. Initial log loading is lazy (deferred to first Logs tab access).
 
 ### xray-tui-config (library crate)
 
@@ -479,7 +482,7 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 
 **Modules added in Phase 2:**
 - `forms.rs` — `FormFieldType`, `FormField`, `FieldSection`, `form_fields_for()` (27 protocols)
-- `import_export.rs` — `parse_share_url()`, `format_share_url()` (12 protocol formats)
+- `import_export.rs` — `parse_share_url()`, `format_share_url()` (14 protocol formats)
 
 **App config** (JSON at `~/.config/xray-tui/config.json`): mirrors v2rayN's `Config.cs` fields plus dual-core settings (xray binary path, sing-box binary path, default core type).
 
@@ -519,7 +522,7 @@ impl GeoIp {
 }
 ```
 
-On first use downloads the mmdb (P3TERX GeoLite mirror) to `db_path` via reqwest (partial-file cleanup on failure), opens it with `maxminddb::Reader::open_readfile` (whole DB in RAM), and runs lookups + `decode_path` inside `spawn_blocking` (LookupResult borrows the Reader, so `Arc<Reader>` moves into the closure). Country is required; missing city yields `city_en: None`.
+On first use downloads the mmdb (P3TERX GeoLite mirror) to `db_path` via reqwest — atomic write (tmp file + rename), partial-file cleanup on failure, hard download deadline; a corrupt/unreadable file at open triggers re-download (heal-on-corrupt); init is serialized via the OnceCell — then opens it with `maxminddb::Reader::open_readfile` (whole DB in RAM), and runs lookups + `decode_path` inside `spawn_blocking` (LookupResult borrows the Reader, so `Arc<Reader>` moves into the closure). Country is required; missing city yields `city_en: None`.
 
 ### xray-tui-host-features (library crate)
 
@@ -538,7 +541,8 @@ impl HostFeaturesChecker {
 
 `new` reads the three whitelist files (SNI hostnames, exact IPv4s, IPv4 CIDR ranges). `load` first
 downloads any file missing from the hxehex/russia-mobile-internet-whitelist upstream (presence check
-only, never re-downloads), mirroring the geoip/dns download-if-missing convention. Lookups are
+only, never re-downloads; hard download deadline, atomic tmp+rename write), mirroring the
+geoip/dns download-if-missing convention. Lookups are
 bloom-filter fast-negatives with exact verification (zero false positives): `DnsName` ServerNames →
 SNI check, IPv4 → exact-IP + CIDR checks, IPv6/unknown → empty feature set. `fastbloom` is the only
 crate-local dep (serde feature dropped — filters rebuilt from disk on `new()`).
