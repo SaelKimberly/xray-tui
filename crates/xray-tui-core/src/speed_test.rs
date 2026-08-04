@@ -404,7 +404,11 @@ pub async fn udp_test(
     let udp_sock = timeout(test_timeout, tokio::net::UdpSocket::bind("0.0.0.0:0"))
         .await
         .map_err(|_| SpeedTestError::Timeout(test_timeout))??;
-    io_timeout(test_timeout, udp_sock.connect((relay_addr.as_str(), relay_port))).await?;
+    io_timeout(
+        test_timeout,
+        udp_sock.connect((relay_addr.as_str(), relay_port)),
+    )
+    .await?;
 
     let test_start = std::time::Instant::now();
     io_timeout(test_timeout, udp_sock.send(&udp_packet)).await?;
@@ -469,10 +473,7 @@ mod tests {
     fn throughput_uses_fractional_seconds() {
         // 1 MiB in 0.5s → ~16.7 Mbps, NOT a timeout, NOT 2x inflated.
         let bps = throughput_bps(1024 * 1024, Duration::from_millis(500)).unwrap();
-        assert!(
-            (16_000_000..18_000_000).contains(&bps),
-            "bps={bps}"
-        );
+        assert!((16_000_000..18_000_000).contains(&bps), "bps={bps}");
         assert!(throughput_bps(0, Duration::from_secs(5)).is_none());
     }
 }

@@ -130,8 +130,8 @@ fn render_placeholder(frame: &mut Frame, area: Rect, palette: &ratatui_cheese::t
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::collections::HashMap;
     use std::sync::Arc;
     use toasty::Deferred;

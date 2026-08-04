@@ -45,10 +45,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
+use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
 };
-use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashVless};
@@ -541,7 +541,7 @@ fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Proto, ProtocolConfig, ProtoSpec};
+    use super::super::{Proto, ProtoSpec, ProtocolConfig};
     use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
 

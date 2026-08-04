@@ -55,8 +55,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param};
 use super::ProtoIdentity;
+use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param};
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashVmess};
@@ -618,7 +618,9 @@ mod tests {
         }
         let reconstructed = parsed.reconstruct().expect("vmess ws reconstruct");
         // The payload is base64 — decode it to inspect the JSON body
-        let payload = reconstructed.strip_prefix("vmess://").expect("vmess scheme");
+        let payload = reconstructed
+            .strip_prefix("vmess://")
+            .expect("vmess scheme");
         let decoded = base64::prelude::BASE64_URL_SAFE_NO_PAD
             .decode(payload)
             .expect("decode vmess payload");

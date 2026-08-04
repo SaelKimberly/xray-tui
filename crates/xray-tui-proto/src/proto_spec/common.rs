@@ -728,7 +728,10 @@ pub fn to_xray_stream_settings(
         transport.type_str()
     };
     if network != "tcp" {
-        ss.insert("network".into(), serde_json::Value::String(network.to_string()));
+        ss.insert(
+            "network".into(),
+            serde_json::Value::String(network.to_string()),
+        );
     }
     match &security.tls {
         Some(TlsConfig::Tls(opts)) => {
@@ -780,10 +783,7 @@ pub fn to_xray_stream_settings(
                 w.insert("path".into(), serde_json::json!(p.as_str()));
             }
             if let Some(h) = &cfg.host {
-                w.insert(
-                    "headers".into(),
-                    serde_json::json!({ "Host": h.as_str() }),
-                );
+                w.insert("headers".into(), serde_json::json!({ "Host": h.as_str() }));
             }
             if !w.is_empty() {
                 ss.insert("wsSettings".into(), serde_json::Value::Object(w));
@@ -977,7 +977,8 @@ mod tests {
             ])),
             ..ClashWSOpts::default()
         };
-        let t = clash_transport_to_transport(Some("ws"), &Some(ws), &None, &None, &None, &None, None);
+        let t =
+            clash_transport_to_transport(Some("ws"), &Some(ws), &None, &None, &None, &None, None);
         match t {
             TransportConfig::Ws(w) => {
                 assert_eq!(w.host.as_deref(), Some("cdn.example.com"));

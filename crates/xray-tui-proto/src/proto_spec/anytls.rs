@@ -33,7 +33,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::utils;
-use super::{ParseError, ProtoSpec, ProtoIdentity};
+use super::{ParseError, ProtoIdentity, ProtoSpec};
 use crate::clash::{ClashAnyTls, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};

@@ -481,7 +481,9 @@ fn legacy_stream_settings_to_xray(
             ss.insert("realitySettings".into(), rs);
         }
         if let Some(server_name) = tls.get("serverName").cloned()
-            && let Some(rs) = ss.get_mut("realitySettings").and_then(|v| v.as_object_mut())
+            && let Some(rs) = ss
+                .get_mut("realitySettings")
+                .and_then(|v| v.as_object_mut())
         {
             rs.insert("serverName".into(), server_name);
         }
@@ -1035,12 +1037,17 @@ mod tests {
             r#"{"tls.enable": true, "sni": "cdn.example.com", "ws.path": "/ws", "ws.host": "cdn.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect("build");
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
         let json = serde_json::to_value(&config).unwrap();
         let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
-        let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy");
+        let ss = proxy["streamSettings"]
+            .as_object()
+            .expect("streamSettings present");
         assert_eq!(ss["network"], "ws");
         assert_eq!(ss["security"], "tls");
         assert_eq!(ss["tlsSettings"]["serverName"], "cdn.example.com");
@@ -1064,8 +1071,13 @@ mod tests {
                 .expect("build");
             let json = serde_json::to_value(&config).unwrap();
             let outbounds = json["outbounds"].as_array().expect("outbounds");
-            let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
-            let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+            let proxy = outbounds
+                .iter()
+                .find(|o| o["tag"] == "proxy")
+                .expect("proxy");
+            let ss = proxy["streamSettings"]
+                .as_object()
+                .expect("streamSettings present");
             assert_ne!(ss.get("security").and_then(|v| v.as_str()), Some("tls"));
         }
         // The string "true" (case-insensitive) still enables TLS.
@@ -1076,12 +1088,17 @@ mod tests {
             r#"{"tls.enable": "TRUE", "sni": "cdn.example.com"}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect("build");
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
         let json = serde_json::to_value(&config).unwrap();
         let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
-        let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy");
+        let ss = proxy["streamSettings"]
+            .as_object()
+            .expect("streamSettings present");
         assert_eq!(ss["security"], "tls");
     }
 
@@ -1094,12 +1111,17 @@ mod tests {
             r#"{"tls.enable": true, "sni": "cdn.example.com", "allow_insecure": true}"#,
         );
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect("build");
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
         let json = serde_json::to_value(&config).unwrap();
         let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
-        let ss = proxy["streamSettings"].as_object().expect("streamSettings present");
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy");
+        let ss = proxy["streamSettings"]
+            .as_object()
+            .expect("streamSettings present");
         assert_eq!(ss["security"], "tls");
         assert_eq!(ss["tlsSettings"]["allowInsecure"], true);
     }
@@ -1123,8 +1145,8 @@ mod tests {
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
         set_protocol_settings_json(&mut protocol, r#"{"password": "hy2-secret"}"#);
         let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect("build");
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
         let json = serde_json::to_value(&config).unwrap();
         let proxy = json["outbounds"]
             .as_array()

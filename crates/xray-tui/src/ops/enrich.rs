@@ -12,8 +12,8 @@ use std::time::Duration;
 use xray_tui_db::models::{Endpoint, ProtocolRow};
 
 use crate::AppState;
-use crate::types::{CoreEvent, EndpointInfo};
 use crate::profile_to_fields;
+use crate::types::{CoreEvent, EndpointInfo};
 
 /// Rebuild the same `Profile` connect.rs builds from an endpoint row + protocol.
 pub fn protocol_row_to_profile(
@@ -120,7 +120,11 @@ async fn fill_features(
 /// Results arrive via `CoreEvent::EndpointInfoUpdated`; DNS-host results are
 /// persisted by the event handler so they survive launches.
 pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
-    let Some(row) = state.endpoints.iter().find(|r| r.endpoint.id == endpoint_id) else {
+    let Some(row) = state
+        .endpoints
+        .iter()
+        .find(|r| r.endpoint.id == endpoint_id)
+    else {
         return;
     };
     if !should_resolve(
@@ -146,7 +150,12 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
         let now = unix_now();
         // DNS lookup or direct IP parse
         let (ips, resolved_at) = match host_type.as_str() {
-            "ipv4" | "ipv6" => (host.parse::<IpAddr>().map(|ip| vec![ip]).unwrap_or_default(), None),
+            "ipv4" | "ipv6" => (
+                host.parse::<IpAddr>()
+                    .map(|ip| vec![ip])
+                    .unwrap_or_default(),
+                None,
+            ),
             _ => match &dns {
                 Some(r) => {
                     // Overall deadline: resolver init (DNSCrypt list
@@ -260,9 +269,11 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
             } else {
                 // IP host — its own address is the "resolution".
                 EndpointInfo {
-                    resolved_ips: vec![ep.host.parse().unwrap_or(IpAddr::V4(
-                        std::net::Ipv4Addr::UNSPECIFIED,
-                    ))],
+                    resolved_ips: vec![
+                        ep.host
+                            .parse()
+                            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    ],
                     country: None,
                     host_features: Default::default(),
                     sni_whitelisted: None,
@@ -302,7 +313,11 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
                 r.endpoint.id,
                 r.endpoint.clone(),
                 r.active_protocol().clone(),
-                state.endpoint_info.get(&r.endpoint.id).cloned().unwrap_or_default(),
+                state
+                    .endpoint_info
+                    .get(&r.endpoint.id)
+                    .cloned()
+                    .unwrap_or_default(),
             )
         })
         .collect();
@@ -374,7 +389,9 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
             match geo.location_by_ip(outbound_ip).await {
                 Ok(Some(loc)) => info.outbound_country = Some(loc.country),
                 Ok(None) => {}
-                Err(e) => tracing::warn!(target: "tui::ops::enrich", "outbound geo lookup failed: {e}"),
+                Err(e) => {
+                    tracing::warn!(target: "tui::ops::enrich", "outbound geo lookup failed: {e}")
+                }
             }
         }
         if let Some(t) = tx {

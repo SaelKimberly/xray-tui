@@ -185,16 +185,16 @@ impl DisplayRowData {
 
         // Sub-table rows
         let cols: [(usize, usize); 10] = [
-            (0, 3),    // marker
-            (3, 10),   // id
-            (13, 20),  // last_seen
-            (33, 20),  // last_used
-            (53, 12),  // config
-            (65, 8),   // delay
-            (73, 8),   // speed
-            (81, 11),  // traffic
-            (92, 16),  // outbound
-            (108, 7),  // country
+            (0, 3),   // marker
+            (3, 10),  // id
+            (13, 20), // last_seen
+            (33, 20), // last_used
+            (53, 12), // config
+            (65, 8),  // delay
+            (73, 8),  // speed
+            (81, 11), // traffic
+            (92, 16), // outbound
+            (108, 7), // country
         ];
         for (n, pr) in self.panel_rows.iter().enumerate() {
             let y = y0 + 3 + n as u16;
@@ -272,14 +272,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     // One display row per endpoint; the expanded panel lives inside the row.
     let display_rows = build_display_rows(&rows, selected, state, &palette);
 
-    render_data_grid(
-        frame,
-        chunks[1],
-        &display_rows,
-        selected,
-        state,
-        &palette,
-    );
+    render_data_grid(frame, chunks[1], &display_rows, selected, state, &palette);
     render_footer(frame, chunks[2], state, &palette);
     render_confirmation_overlays(frame, area, &rows, state);
 }
@@ -408,9 +401,7 @@ fn build_display_rows(
         };
 
         let info = state.endpoint_info.get(&row.endpoint.id);
-        let resolved = info
-            .map(|i| !i.resolved_ips.is_empty())
-            .unwrap_or(false);
+        let resolved = info.map(|i| !i.resolved_ips.is_empty()).unwrap_or(false);
 
         let type_str = format!("{protocol:.12}");
         let country_flag = match info.and_then(|i| i.country.as_deref()) {
@@ -431,10 +422,7 @@ fn build_display_rows(
         } else {
             String::new()
         };
-        let sni_feature = if info
-            .and_then(|i| i.sni_whitelisted)
-            .unwrap_or(false)
-        {
+        let sni_feature = if info.and_then(|i| i.sni_whitelisted).unwrap_or(false) {
             "\u{1F3F3}\u{FE0F}".to_string()
         } else {
             String::new()
@@ -451,11 +439,7 @@ fn build_display_rows(
         let s = active.security.as_deref().filter(|s| !s.is_empty());
         let config_type = match (t, s) {
             (None, None) => "-".to_string(),
-            (t, s) => format!(
-                "{}/{}",
-                t.unwrap_or("-"),
-                s.unwrap_or("-")
-            ),
+            (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
         };
         let config_type_str = center_pad(&config_type, 12);
 
@@ -519,7 +503,11 @@ fn build_display_rows(
                         (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
                     };
                     PanelRow {
-                        marker: if p.id == active_id { "●".to_string() } else { "○".to_string() },
+                        marker: if p.id == active_id {
+                            "●".to_string()
+                        } else {
+                            "○".to_string()
+                        },
                         proto_id_hex: format!("{:08x}", p.id as u32),
                         last_seen: if p.last_seen_at > 0 {
                             format_ts(p.last_seen_at)
@@ -529,7 +517,11 @@ fn build_display_rows(
                         last_used: p.last_used_at.map_or_else(
                             || "—".to_string(),
                             |ts| {
-                                if ts > 0 { format_ts(ts) } else { "—".to_string() }
+                                if ts > 0 {
+                                    format_ts(ts)
+                                } else {
+                                    "—".to_string()
+                                }
                             },
                         ),
                         config_type,
@@ -562,7 +554,11 @@ fn build_display_rows(
             expanded: row.expanded,
             row_style: base_style,
             panel_selected_style: ThemeStyles::panel_row_selected(palette),
-            panel_selected: if i == selected { state.selected_sub } else { None },
+            panel_selected: if i == selected {
+                state.selected_sub
+            } else {
+                None
+            },
             panel_ips,
             panel_resolve_hint,
             panel_rows,
@@ -603,23 +599,23 @@ fn render_data_grid(
     // 17 fixed columns; headers carry only descriptive names (decorative
     // separator cells have empty headers).
     let columns = vec![
-        Column::new("", ColumnWidth::Fixed(1)),         // 0 — tree marker
-        Column::new("", ColumnWidth::Fixed(2)),         // 1 — indicator
-        Column::new("#", ColumnWidth::Fixed(5)),        // 2 — index
-        Column::new("Type", ColumnWidth::Fixed(12)),    // 3
-        Column::new("", ColumnWidth::Fixed(1)),         // 4 — [
-        Column::new("", ColumnWidth::Fixed(4)),         // 5 — country flag
+        Column::new("", ColumnWidth::Fixed(1)),      // 0 — tree marker
+        Column::new("", ColumnWidth::Fixed(2)),      // 1 — indicator
+        Column::new("#", ColumnWidth::Fixed(5)),     // 2 — index
+        Column::new("Type", ColumnWidth::Fixed(12)), // 3
+        Column::new("", ColumnWidth::Fixed(1)),      // 4 — [
+        Column::new("", ColumnWidth::Fixed(4)),      // 5 — country flag
         Column::new("Address", ColumnWidth::Fixed(36)), // 6
-        Column::new("", ColumnWidth::Fixed(2)),         // 7 — ][
-        Column::new("Feat", ColumnWidth::Fixed(4)),     // 8 — IP+SNI flags
-        Column::new("", ColumnWidth::Fixed(4)),         // 9 — ]=>{
-        Column::new("", ColumnWidth::Fixed(12)),        // 10 — config type
-        Column::new("", ColumnWidth::Fixed(3)),         // 11 — }=> arrow
-        Column::new("Test", ColumnWidth::Fixed(6)),     // 12 — [delay]/[name]/[fast]/[real]
-        Column::new("", ColumnWidth::Fixed(1)),         // 13 — [ outbound opener
+        Column::new("", ColumnWidth::Fixed(2)),      // 7 — ][
+        Column::new("Feat", ColumnWidth::Fixed(4)),  // 8 — IP+SNI flags
+        Column::new("", ColumnWidth::Fixed(4)),      // 9 — ]=>{
+        Column::new("", ColumnWidth::Fixed(12)),     // 10 — config type
+        Column::new("", ColumnWidth::Fixed(3)),      // 11 — }=> arrow
+        Column::new("Test", ColumnWidth::Fixed(6)),  // 12 — [delay]/[name]/[fast]/[real]
+        Column::new("", ColumnWidth::Fixed(1)),      // 13 — [ outbound opener
         Column::new("Outbound", ColumnWidth::Fixed(16)), // 14
-        Column::new("Country", ColumnWidth::Fixed(7)),  // 15
-        Column::new("", ColumnWidth::Fixed(1)),         // 16 — ]
+        Column::new("Country", ColumnWidth::Fixed(7)), // 15
+        Column::new("", ColumnWidth::Fixed(1)),      // 16 — ]
     ];
 
     // Scroll offset: keep the selected row roughly centered, in line units —
@@ -658,10 +654,7 @@ fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16)
     if heights.is_empty() {
         return 0;
     }
-    let sel_h = heights
-        .get(selected)
-        .copied()
-        .unwrap_or(1) as usize;
+    let sel_h = heights.get(selected).copied().unwrap_or(1) as usize;
     // Rows above the selection, in lines.
     let above: usize = heights[..selected].iter().map(|h| *h as usize).sum();
     // Centering offset: put the selected row's start at mid-viewport.
@@ -685,12 +678,8 @@ fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16)
     max_offset = max_offset.min(heights.len().saturating_sub(1));
     // Minimum offset that still shows the selection's last line: when content
     // below the selection is taller than the viewport, jump toward the end.
-    let o_min = above
-        .saturating_add(sel_h)
-        .saturating_sub(inner_height);
-    ideal
-        .max(o_min.min(max_offset))
-        .min(max_offset)
+    let o_min = above.saturating_add(sel_h).saturating_sub(inner_height);
+    ideal.max(o_min.min(max_offset)).min(max_offset)
 }
 
 fn format_traffic(bytes: u64) -> String {
@@ -910,7 +899,11 @@ mod tests {
 
     #[test]
     fn expanded_row_height_includes_gap() {
-        let row = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")], "00");
+        let row = sample_row(
+            true,
+            vec![sample_panel_row("●"), sample_panel_row("○")],
+            "00",
+        );
         // 1 endpoint + panel (2 rows + 4 border/IPs/sep lines) + 1 gap
         assert_eq!(row.height(0), 8);
         let collapsed = sample_row(false, vec![], "11");
@@ -919,9 +912,8 @@ mod tests {
 
     #[test]
     fn selected_sub_row_reverse_highlights_full_width() {
-        let palette = crate::ui::palette_bridge::palette_from_name(
-            &ratatui_themes::ThemeName::TokyoNight,
-        );
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
         let mut row = sample_row(
             true,
             vec![sample_panel_row("●"), sample_panel_row("○")],
@@ -969,7 +961,11 @@ mod tests {
 
     #[test]
     fn panel_bottom_border_does_not_touch_next_row() {
-        let row0 = sample_row(true, vec![sample_panel_row("●"), sample_panel_row("○")], "00");
+        let row0 = sample_row(
+            true,
+            vec![sample_panel_row("●"), sample_panel_row("○")],
+            "00",
+        );
         let row1 = sample_row(false, vec![], "11");
         let col_xs: Vec<u16> = (0..17).collect();
         let col_widths = vec![1u16; 17];
@@ -1032,7 +1028,10 @@ mod tests {
         // old code produced offset == len → nothing rendered.
         let heights = vec![1u16, 1, 1, 1, 1, 10];
         let offset = compute_scroll_offset(&heights, 5, 8);
-        assert!(offset < heights.len(), "offset must stay inside the row list");
+        assert!(
+            offset < heights.len(),
+            "offset must stay inside the row list"
+        );
     }
 
     #[test]

@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
-use super::common::SecurityConfig;
 use super::ProtoIdentity;
+use super::common::SecurityConfig;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashSocks5};
@@ -220,7 +220,7 @@ impl ProtoIdentity for Socks5Config {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::check_roundtrip;
-    use super::super::{Proto, ProtocolConfig, ProtoSpec};
+    use super::super::{Proto, ProtoSpec, ProtocolConfig};
     use super::Socks5Config;
     use crate::urlx::SchemeX;
 

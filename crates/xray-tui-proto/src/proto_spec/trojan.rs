@@ -40,10 +40,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
+use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
 };
-use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashTrojan};

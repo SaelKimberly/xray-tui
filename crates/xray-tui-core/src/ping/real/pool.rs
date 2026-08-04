@@ -633,7 +633,10 @@ mod tests {
         let (pool, stopped) = pool_with_core(Instant::now());
         pool.reap_stale_core().await;
         let guard = pool.core.lock().await;
-        assert!(guard.is_some(), "under-TTL core must survive the TTL reaper");
+        assert!(
+            guard.is_some(),
+            "under-TTL core must survive the TTL reaper"
+        );
         drop(guard);
         assert_eq!(stopped.load(Ordering::Relaxed), 0);
     }

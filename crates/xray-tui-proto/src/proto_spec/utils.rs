@@ -273,10 +273,7 @@ mod tests {
     fn compute_cred_hash_returns_zero_without_credentials() {
         assert_eq!(compute_cred_hash(&[]), 0);
         assert_eq!(compute_cred_hash(&[("uuid", "")]), 0);
-        assert_eq!(
-            compute_cred_hash(&[("uuid", ""), ("password", "")]),
-            0
-        );
+        assert_eq!(compute_cred_hash(&[("uuid", ""), ("password", "")]), 0);
         assert_ne!(compute_cred_hash(&[("uuid", "x")]), 0);
         // order-independent
         assert_eq!(

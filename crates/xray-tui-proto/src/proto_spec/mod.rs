@@ -872,7 +872,7 @@ impl ProtoIdentity for PlaceholderConfig {
         // it. This is the mandated whole-body-hash design for opaque configs —
         // the remark is intentionally part of the identity; do NOT special-case
         // it out of the hash here.
-        use rapidhash::v3::{RapidStreamHasherV3, DEFAULT_RAPID_SECRETS};
+        use rapidhash::v3::{DEFAULT_RAPID_SECRETS, RapidStreamHasherV3};
         let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
         hasher.write(self.proto_name.as_bytes());
         hasher.write(&self.settings_json);
@@ -934,14 +934,22 @@ mod tests {
         let json = serde_json::to_vec(&blob).unwrap();
         let a = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json.clone()));
         let b = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json.clone()));
-        let c = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", serde_json::to_vec(&serde_json::json!({
-            "protocol_settings": {"password": "other"},
-            "stream_settings": {}
-        })).unwrap()));
+        let c = Proto::new(ProtocolConfig::from_legacy_parse(
+            "wireguard",
+            serde_json::to_vec(&serde_json::json!({
+                "protocol_settings": {"password": "other"},
+                "stream_settings": {}
+            }))
+            .unwrap(),
+        ));
         assert_ne!(a.sig(), 0, "sig must never be zero");
         assert_eq!(a.sig(), b.sig(), "same body -> same sig (dedup)");
         assert_ne!(a.sig(), c.sig(), "different body -> different sig");
-        assert_eq!(a.cred_hash(), 0, "opaque blob has no extractable credentials");
+        assert_eq!(
+            a.cred_hash(),
+            0,
+            "opaque blob has no extractable credentials"
+        );
         assert_eq!(a.uid(), a.sig(), "uid == sig when cred_hash is 0");
     }
 
@@ -978,7 +986,11 @@ mod tests {
         assert_ne!(sig, 0, "sig must never be zero");
         assert_eq!(proto.uid(), sig ^ cred_hash, "uid == sig ^ cred_hash");
         assert_eq!(proto.sig(), sig, "sig is stable across calls");
-        assert_eq!(proto.cred_hash(), cred_hash, "cred_hash is stable across calls");
+        assert_eq!(
+            proto.cred_hash(),
+            cred_hash,
+            "cred_hash is stable across calls"
+        );
         assert_eq!(proto.uid(), sig ^ cred_hash, "uid is stable across calls");
         assert!(
             proto.identity.get().is_some(),

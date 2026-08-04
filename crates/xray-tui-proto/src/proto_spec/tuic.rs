@@ -37,8 +37,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::ProtoIdentity;
+use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashTuic};

@@ -115,10 +115,11 @@ async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<Vec<NameServerConfig>
     }
     // A future-dated mtime makes `elapsed()` fail; treat that as stale so an
     // undatable cache is eventually re-fetched instead of living forever.
-    let stale = metadata
-        .modified()
-        .ok()
-        .is_some_and(|mtime| mtime.elapsed().map_or(true, |age| age > DNSCRYPT_CACHE_MAX_AGE));
+    let stale = metadata.modified().ok().is_some_and(|mtime| {
+        mtime
+            .elapsed()
+            .map_or(true, |age| age > DNSCRYPT_CACHE_MAX_AGE)
+    });
     (Some(parsed), stale)
 }
 
@@ -128,11 +129,7 @@ async fn download_dnscrypt_resolvers(resolvers_url: &str) -> anyhow::Result<Stri
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let response = client
-        .get(resolvers_url)
-        .send()
-        .await?
-        .error_for_status()?;
+    let response = client.get(resolvers_url).send().await?.error_for_status()?;
     Ok(response.text().await?)
 }
 
@@ -345,7 +342,11 @@ mod tests {
         let cfg = get_dns_servers_from(dir.path(), UNREACHABLE_URL)
             .await
             .expect("failed refresh must keep the stale cache");
-        assert_eq!(cfg.name_servers().len(), 1, "stale cache entry must be kept");
+        assert_eq!(
+            cfg.name_servers().len(),
+            1,
+            "stale cache entry must be kept"
+        );
         Ok(())
     }
 

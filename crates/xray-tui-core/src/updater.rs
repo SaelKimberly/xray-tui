@@ -326,12 +326,12 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, U
     }
 
     let url = match core_type {
-        CoreType::Xray => format!(
-            "https://github.com/XTLS/Xray-core/releases/download/v{version}/{name}"
-        ),
-        CoreType::SingBox => format!(
-            "https://github.com/SagerNet/sing-box/releases/download/v{version}/{name}"
-        ),
+        CoreType::Xray => {
+            format!("https://github.com/XTLS/Xray-core/releases/download/v{version}/{name}")
+        }
+        CoreType::SingBox => {
+            format!("https://github.com/SagerNet/sing-box/releases/download/v{version}/{name}")
+        }
         CoreType::Auto => return Err(UpdateError::AutoCore),
     };
 
@@ -358,10 +358,7 @@ fn asset_name(
             CoreType::Auto => return Err(UpdateError::AutoCore),
         },
         _ => {
-            return Err(UpdateError::UnsupportedPlatform(
-                arch,
-                std::env::consts::OS,
-            ));
+            return Err(UpdateError::UnsupportedPlatform(arch, std::env::consts::OS));
         }
     };
     let name = match core_type {

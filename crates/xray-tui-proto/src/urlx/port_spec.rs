@@ -285,7 +285,11 @@ mod tests {
         assert_eq!(a.length(), 21, "20..=40 is 21 ports");
         assert_eq!(a.total, 21);
         assert_eq!(a.iter().count(), 21);
-        assert_eq!(a.iter().filter(|&p| p == 30).count(), 1, "shared port yielded once");
+        assert_eq!(
+            a.iter().filter(|&p| p == 30).count(),
+            1,
+            "shared port yielded once"
+        );
         assert_eq!(a.iter_raw().count(), 1, "one coalesced span");
 
         // Higher range added first, then lower range touching at the shared port

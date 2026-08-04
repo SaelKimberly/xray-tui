@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::EndpointRow;
-use xray_tui_config::import_export::{
-    Profile, ValidationSettings, encode_profile_spec,
-};
+use xray_tui_config::import_export::{Profile, ValidationSettings, encode_profile_spec};
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{CoreType, resolve_core};
 
@@ -12,8 +10,8 @@ use crate::AppState;
 use crate::state::profile_to_endpoint_protocol;
 use crate::types::{AppMode, BatchImportItem, SortColumn};
 use crate::{common_field_defaults, profile_to_fields};
-use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
 use xray_tui_db::DatabaseError;
+use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
 
 pub async fn reload_profiles(state: &mut AppState) {
     let now = std::time::SystemTime::now()
@@ -240,7 +238,11 @@ async fn find_editable_endpoint(
     state: &AppState,
     protocol_id: i64,
 ) -> Result<Option<EndpointRow>, DatabaseError> {
-    if let Some(r) = state.endpoints.iter().find(|r| r.endpoint.id == protocol_id) {
+    if let Some(r) = state
+        .endpoints
+        .iter()
+        .find(|r| r.endpoint.id == protocol_id)
+    {
         return Ok(Some(r.clone()));
     }
     Ok(state
@@ -887,7 +889,13 @@ pub fn nav_protocol_down(state: &mut AppState) -> bool {
     // Extract data before any mutable access.
     let expanded_count = filtered_profiles(state)
         .nth(state.selected_index)
-        .map(|r| if r.expanded { Some(r.protocols.len()) } else { None })
+        .map(|r| {
+            if r.expanded {
+                Some(r.protocols.len())
+            } else {
+                None
+            }
+        })
         .flatten();
     let Some(proto_count) = expanded_count else {
         // Not on an expandable endpoint: fall through to endpoint nav and
@@ -1029,8 +1037,8 @@ mod test_support {
 
 #[cfg(test)]
 mod nav_tests {
-    use super::*;
     use super::test_support::{fake_row, test_state};
+    use super::*;
 
     #[tokio::test]
     async fn expand_lands_on_first_sub_row() {
@@ -1054,7 +1062,10 @@ mod nav_tests {
 
         set_protocol_default(&mut state, 1, pid).await;
 
-        assert_eq!(state.endpoints[0].endpoint.manual_protocol_override, Some(pid));
+        assert_eq!(
+            state.endpoints[0].endpoint.manual_protocol_override,
+            Some(pid)
+        );
         assert_eq!(
             state.endpoints[0].active_protocol().id,
             pid,
@@ -1133,8 +1144,8 @@ mod nav_tests {
 
 #[cfg(test)]
 mod edit_tests {
-    use super::*;
     use super::test_support::{fake_row, test_state};
+    use super::*;
     use crate::AppState;
     use std::sync::Arc;
     use toasty::Deferred;
@@ -1227,8 +1238,8 @@ mod edit_tests {
 
 #[cfg(test)]
 mod clamp_tests {
-    use super::*;
     use super::test_support::{fake_row, test_state};
+    use super::*;
     use std::sync::Arc;
     use toasty::Deferred;
     use xray_tui_config::AppConfig;

@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
-use super::common::SecurityConfig;
 use super::ProtoIdentity;
+use super::common::SecurityConfig;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashWireGuard};
@@ -329,7 +329,7 @@ impl ProtoIdentity for WireguardConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Proto, ProtocolConfig, ProtoSpec};
+    use super::super::{Proto, ProtoSpec, ProtocolConfig};
     use crate::urlx::SchemeX;
 
     #[test]

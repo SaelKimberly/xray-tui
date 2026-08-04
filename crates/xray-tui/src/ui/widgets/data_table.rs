@@ -515,7 +515,11 @@ mod tests {
         StatefulWidget::render(one_column_table(&rows), area, &mut buf, &mut state);
 
         // The row must have been told to clip exactly at the area bottom…
-        assert_eq!(rows[0].clip_seen.get(), 4, "clip_bottom must be the area bottom");
+        assert_eq!(
+            rows[0].clip_seen.get(),
+            4,
+            "clip_bottom must be the area bottom"
+        );
         // …and must have rendered something (no blank table).
         assert_eq!(buf[(0, 1)].symbol(), "A");
         // Nothing may be written at or past the clip line.
@@ -551,5 +555,3 @@ mod tests {
         assert_eq!(buf[(0, 5)].symbol(), " ");
     }
 }
-
-

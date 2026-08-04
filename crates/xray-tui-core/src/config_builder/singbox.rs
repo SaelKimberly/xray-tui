@@ -1175,7 +1175,10 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy");
         assert_eq!(
             proxy["uuid"].as_str().unwrap(),
             "11111111-2222-3333-4444-555555555555"

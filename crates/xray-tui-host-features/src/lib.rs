@@ -19,12 +19,9 @@ use rustls::pki_types::{IpAddr, ServerName};
 
 /// Upstream repository supplying the whitelist files
 /// (https://github.com/hxehex/russia-mobile-internet-whitelist).
-const SNI_WHITELIST_URL: &str =
-    "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/whitelist.txt";
-const IP_WHITELIST_URL: &str =
-    "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/ipwhitelist.txt";
-const CIDR_WHITELIST_URL: &str =
-    "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/cidrwhitelist.txt";
+const SNI_WHITELIST_URL: &str = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/whitelist.txt";
+const IP_WHITELIST_URL: &str = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/ipwhitelist.txt";
+const CIDR_WHITELIST_URL: &str = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/cidrwhitelist.txt";
 
 /// Feature flags describing a server name's relationship to the whitelists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -75,11 +72,7 @@ impl HostFeaturesChecker {
     /// missing, fetching it from the upstream
     /// hxehex/russia-mobile-internet-whitelist repository. Existing files are
     /// never re-downloaded. Errors on download or read failure.
-    pub async fn load(
-        sni_path: &Path,
-        ip_path: &Path,
-        cidr_path: &Path,
-    ) -> anyhow::Result<Self> {
+    pub async fn load(sni_path: &Path, ip_path: &Path, cidr_path: &Path) -> anyhow::Result<Self> {
         Self::ensure_downloaded(sni_path, ip_path, cidr_path).await?;
         Self::new(sni_path, ip_path, cidr_path)
     }
@@ -284,7 +277,10 @@ async fn ensure_file(path: &Path, url: &str) -> anyhow::Result<()> {
 /// empty download can never become a permanent tombstone.
 async fn ensure_file_from_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if bytes.is_empty() {
-        anyhow::bail!("empty download: refusing to write tombstone file {}", path.display());
+        anyhow::bail!(
+            "empty download: refusing to write tombstone file {}",
+            path.display()
+        );
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

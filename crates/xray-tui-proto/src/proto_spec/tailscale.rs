@@ -28,7 +28,7 @@ use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 use crate::proto_spec::utils;
-use crate::proto_spec::{ParseError, ProtoSpec, ProtoIdentity};
+use crate::proto_spec::{ParseError, ProtoIdentity, ProtoSpec};
 use crate::urlx::HostSpec;
 use crate::urlx::TinyText;
 use crate::urlx::{host_serde, port_serde};
