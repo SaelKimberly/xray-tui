@@ -578,19 +578,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Enter if state.current_tab == Tab::Profiles => {
             if state.is_on_sub_row() {
-                // Set manual protocol override on sub-row
+                // Pin the selected protocol as the endpoint's default.
                 let ep_id = state.selected_profile_id();
                 let proto_id = state.selected_sub_protocol_id();
                 if let (Some(ep), Some(p)) = (ep_id, proto_id) {
-                    if let Err(e) = state.db.set_protocol_override(ep, p).await {
-                        state.log_trace(
-                            "error",
-                            "tui::ui",
-                            &format!("Failed to set protocol override: {e}"),
-                        );
-                    }
-                    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
-                    state.filter_cache_valid.set(false);
+                    state.set_protocol_default(ep, p).await;
                 }
             } else if let Some(id) = state.selected_profile_id() {
                 state.set_active(&id.to_string()).await;

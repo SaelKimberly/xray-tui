@@ -1292,6 +1292,9 @@ impl AppState {
     pub async fn set_active(&mut self, id: &str) {
         profiles::set_active(self, id).await;
     }
+    pub async fn set_protocol_default(&mut self, endpoint_id: i64, protocol_id: i64) {
+        profiles::set_protocol_default(self, endpoint_id, protocol_id).await;
+    }
     pub fn connect_to_profile(&mut self, protocol_id: i64) {
         connect::connect_to_profile(self, protocol_id);
     }

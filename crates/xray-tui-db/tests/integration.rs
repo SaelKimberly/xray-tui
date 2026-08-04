@@ -293,6 +293,30 @@ async fn test_manual_override() {
 }
 
 #[tokio::test]
+async fn test_sub_table_sorted_newest_first() {
+    let db = test_db().await;
+    let gid = "sort";
+    db.insert_group(&test_group(gid)).await.unwrap();
+
+    let ep = make_endpoint("10.10.10.11", 443);
+    let mut proto_old = make_protocol(ep.id, "vmess", 8001);
+    let mut proto_new = make_protocol(ep.id, "trojan", 8002);
+    proto_old.last_seen_at = 1000;
+    proto_new.last_seen_at = 9000;
+    db.subscription_upsert(gid, &[(ep.clone(), vec![proto_old, proto_new])])
+        .await
+        .unwrap();
+
+    let row = db.get_endpoint(ep.id).await.unwrap().unwrap();
+    assert_eq!(row.protocols.len(), 2);
+    assert_eq!(
+        row.protocols[0].id, 8002,
+        "newest variant must be on top of the sub-table"
+    );
+    assert_eq!(row.protocols[1].id, 8001);
+}
+
+#[tokio::test]
 async fn test_hard_delete_cascade() {
     let db = test_db().await;
     let gid = "purge";

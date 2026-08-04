@@ -823,6 +823,40 @@ pub async fn set_active(state: &mut AppState, id: &str) {
         );
         return;
     }
+    // The DB write alone never reaches the UI: `state.endpoints` is only
+    // rebuilt by `reload_profiles` (subscription events). Clear the override
+    // in-memory so `active_protocol()` falls back immediately without a
+    // reload (which would also collapse the panel).
+    if let Some(row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == pid) {
+        row.endpoint.manual_protocol_override = None;
+    }
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
+    state.filter_cache_valid.set(false);
+}
+
+/// Pin a specific protocol as the endpoint's default (manual override).
+/// Writes the override to DB and updates the in-memory row so the UI
+/// switches immediately — same rationale as `set_active`: no reload.
+pub async fn set_protocol_default(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
+    if let Err(e) = state
+        .db
+        .set_protocol_override(endpoint_id, protocol_id)
+        .await
+    {
+        state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            &format!("Failed to set protocol override: {e}"),
+        );
+        return;
+    }
+    if let Some(row) = state
+        .endpoints
+        .iter_mut()
+        .find(|r| r.endpoint.id == endpoint_id)
+    {
+        row.endpoint.manual_protocol_override = Some(protocol_id);
+    }
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
@@ -1004,6 +1038,48 @@ mod nav_tests {
         toggle_expand(&mut state);
         assert!(state.endpoints[0].expanded);
         assert_eq!(state.selected_sub, Some(0));
+    }
+
+    #[tokio::test]
+    async fn pin_protocol_switches_active_in_memory() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 3)]).await;
+        state.selected_sub = Some(1);
+        let pid = selected_sub_protocol_id(&state).unwrap();
+        assert_eq!(pid, 101); // fake_row protocol ids: 100, 101, 102
+        assert_ne!(
+            state.endpoints[0].active_protocol().id,
+            pid,
+            "default active must be the first (unsorted) protocol before pinning"
+        );
+
+        set_protocol_default(&mut state, 1, pid).await;
+
+        assert_eq!(state.endpoints[0].endpoint.manual_protocol_override, Some(pid));
+        assert_eq!(
+            state.endpoints[0].active_protocol().id,
+            pid,
+            "active protocol must switch to the pinned variant immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_active_clears_pin_and_falls_back() {
+        let mut state = test_state(vec![fake_row(1, "a.com", 3)]).await;
+        set_protocol_default(&mut state, 1, 101).await;
+        assert_eq!(
+            state.endpoints[0].active_protocol().id,
+            101,
+            "pinned variant is active before clearing"
+        );
+
+        set_active(&mut state, "1").await;
+
+        assert_eq!(state.endpoints[0].endpoint.manual_protocol_override, None);
+        assert_eq!(
+            state.endpoints[0].active_protocol().id,
+            100,
+            "active must fall back to the first protocol after clearing"
+        );
     }
 
     #[tokio::test]

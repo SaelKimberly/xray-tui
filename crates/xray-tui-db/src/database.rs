@@ -1786,6 +1786,14 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
         }
     }
 
+    // Sort each endpoint's protocols by last_seen_at descending — newest
+    // variant on top of the expandable sub-table. Stable sort: ties (e.g.
+    // never-seen protocols) keep insertion order.
+    for row in map.values_mut() {
+        row.protocols
+            .sort_by_key(|p| std::cmp::Reverse(p.last_seen_at));
+    }
+
     // Return in insertion order
     Ok(order.into_iter().filter_map(|id| map.remove(&id)).collect())
 }
