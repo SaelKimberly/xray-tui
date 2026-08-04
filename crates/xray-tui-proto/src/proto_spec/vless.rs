@@ -41,8 +41,6 @@
 //! - v2rayN: `VLESSFmt.cs`
 //! - outbound: `dialer/v2ray/v2ray.go` `ParseVlessURL`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
@@ -50,7 +48,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
 };
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashVless};
@@ -65,11 +63,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct VlessConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub uuid: String,
     pub uuid_origin: Option<TinyText>,
     #[serde(with = "host_serde")]
@@ -234,8 +227,6 @@ impl ProtoSpec for VlessConfig {
         };
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             uuid,
             uuid_origin,
             host: parsed_host,
@@ -394,22 +385,6 @@ impl ProtoSpec for VlessConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("uuid", self.uuid.as_str()),
-                ("pbk", self.security.pbk().unwrap_or("")),
-                ("sid", self.security.sid().unwrap_or("")),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         Some(self.transport.type_str())
     }
@@ -446,8 +421,6 @@ impl ProtoSpec for VlessConfig {
                     _ => None,
                 };
                 Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                     uuid: c.uuid.clone(),
                     uuid_origin: None,
                     host: clash_server_to_host(&c.server)?,
@@ -500,7 +473,7 @@ impl ProtoSpec for VlessConfig {
     }
 }
 
-impl VlessConfig {
+impl ProtoIdentity for VlessConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -546,6 +519,13 @@ impl VlessConfig {
         }
         hasher.finish()
     }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("uuid", self.uuid.as_str()),
+            ("pbk", self.security.pbk().unwrap_or("")),
+            ("sid", self.security.sid().unwrap_or("")),
+        ])
+    }
 }
 
 /// Try to recover a valid `XHttp` mode from an unrecognized mode string
@@ -561,7 +541,7 @@ fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ProtoSpec;
+    use super::super::{Proto, ProtocolConfig, ProtoSpec};
     use crate::urlx::PortSpec;
     use crate::urlx::SchemeX;
 
@@ -648,9 +628,15 @@ mod tests {
         let url_a = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
         let url_b = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=BBBB&sid=2222&spx=%2F&fp=chrome#r";
         let url_c = "vless://22222222-3333-4444-5555-666666666666@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
-        let a = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).unwrap();
-        let b = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).unwrap();
-        let c = VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_c)).unwrap();
+        let a = Proto::new(ProtocolConfig::Vless(
+            VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).unwrap(),
+        ));
+        let b = Proto::new(ProtocolConfig::Vless(
+            VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).unwrap(),
+        ));
+        let c = Proto::new(ProtocolConfig::Vless(
+            VlessConfig::try_parse(&crate::urlx::RawUrlX::from(url_c)).unwrap(),
+        ));
         assert_eq!(
             a.sig(),
             b.sig(),

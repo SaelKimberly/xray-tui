@@ -38,15 +38,13 @@
 //! - subconverter: `subparser.cpp` `explodeSSR()`, `subexport.cpp`
 //! - sing-box: `option/shadowsocksr.go`
 
-use std::num::NonZeroU64;
-
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::SecurityConfig;
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashSSR};
@@ -58,11 +56,6 @@ use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct SsrConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     #[serde(with = "host_serde")]
     pub host: HostSpec,
     #[serde(with = "port_serde")]
@@ -130,8 +123,6 @@ impl ProtoSpec for SsrConfig {
             .map_err(|_| ParseError::InvalidPort(raw_port.to_string().into()))?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             host: parsed_host,
             port: parsed_port,
             security: SecurityConfig::default(),
@@ -200,21 +191,6 @@ impl ProtoSpec for SsrConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("password", self.password.as_str()),
-                ("method", self.method.as_str()),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         None
     }
@@ -244,8 +220,6 @@ impl ProtoSpec for SsrConfig {
                         "" => None,
                         s => Some(TinyText::from(s)),
                     },
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                 })
             }
             _ => Err(ParseError::Unknown("expected ssr clash proxy".into())),
@@ -311,7 +285,7 @@ fn clean_ssr_userinfo(s: &str) -> &str {
     s
 }
 
-impl SsrConfig {
+impl ProtoIdentity for SsrConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -330,6 +304,12 @@ impl SsrConfig {
             }
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("password", self.password.as_str()),
+            ("method", self.method.as_str()),
+        ])
     }
 }
 

@@ -46,7 +46,6 @@
 //! - go-shadowsocks2: `parseURL()` (plain format)
 
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -54,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::SecurityConfig;
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashSS};
@@ -66,11 +65,6 @@ use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct SsConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub method: TinyText,
     pub password: String,
     #[serde(with = "host_serde")]
@@ -143,8 +137,6 @@ impl ProtoSpec for SsConfig {
         });
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             method: TinyText::from(method),
             password: password.to_string(),
             host: parsed_host,
@@ -208,20 +200,6 @@ impl ProtoSpec for SsConfig {
     fn remarks(&self) -> Option<&str> {
         self.remarks.as_deref()
     }
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("method", self.method.as_str()),
-                ("password", self.password.as_str()),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
 
     fn transport_type(&self) -> Option<&str> {
         None
@@ -229,8 +207,6 @@ impl ProtoSpec for SsConfig {
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
             ClashProxy::Shadowsocks(c) => Ok(Self {
-                sig_cache: std::sync::OnceLock::new(),
-                cred_hash_cache: std::sync::OnceLock::new(),
                 method: TinyText::from(c.cipher.as_str()),
                 password: c.password.clone(),
                 host: clash_server_to_host(&c.server)?,
@@ -278,7 +254,7 @@ impl ProtoSpec for SsConfig {
     }
 }
 
-impl SsConfig {
+impl ProtoIdentity for SsConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -298,11 +274,17 @@ impl SsConfig {
         }
         hasher.finish()
     }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("method", self.method.as_str()),
+            ("password", self.password.as_str()),
+        ])
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::ProtoSpec;
+    use super::super::{Proto, ProtocolConfig, ProtoSpec};
     use crate::urlx::SchemeX;
 
     #[test]
@@ -359,8 +341,12 @@ mod tests {
     fn ss_password_is_credential_not_sig() {
         let url_a = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080"; // cleof:password
         let url_b = "ss://Y2xlb2Y6cGFzczEyMw==@1.2.3.4:8080"; // cleof:pass123
-        let a = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
-        let b = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        let a = Proto::new(ProtocolConfig::Ss(
+            SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed"),
+        ));
+        let b = Proto::new(ProtocolConfig::Ss(
+            SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed"),
+        ));
         assert_eq!(a.sig(), b.sig(), "password must not change sig");
         assert_ne!(a.cred_hash(), b.cred_hash(), "password changes cred_hash");
         assert_ne!(a.uid(), b.uid());
@@ -370,8 +356,12 @@ mod tests {
     fn ss_host_port_are_identity_in_sig() {
         let url_a = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
         let url_b = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.5:8080";
-        let a = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
-        let b = SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        let a = Proto::new(ProtocolConfig::Ss(
+            SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed"),
+        ));
+        let b = Proto::new(ProtocolConfig::Ss(
+            SsConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed"),
+        ));
         assert_ne!(a.sig(), b.sig(), "different host -> different sig");
         assert_eq!(a.cred_hash(), b.cred_hash());
     }

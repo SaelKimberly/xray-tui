@@ -26,14 +26,12 @@
 //! - Xray-core: `proxy/http/config.proto`
 //! - subconverter: `subparser.cpp` `explodeHTTP()`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts};
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashHttp, ClashProxy};
@@ -47,11 +45,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct HttpClientConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     #[serde(with = "host_serde")]
     pub host: HostSpec,
     #[serde(with = "port_serde")]
@@ -128,8 +121,6 @@ impl ProtoSpec for HttpClientConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             host: parsed_host,
             port: parsed_port,
             username,
@@ -205,21 +196,6 @@ impl ProtoSpec for HttpClientConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("username", self.username.as_deref().unwrap_or("")),
-                ("password", self.password.as_deref().unwrap_or("")),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         None
     }
@@ -235,8 +211,6 @@ impl ProtoSpec for HttpClientConfig {
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
             ClashProxy::Http(c) => Ok(Self {
-                sig_cache: std::sync::OnceLock::new(),
-                cred_hash_cache: std::sync::OnceLock::new(),
                 host: clash_server_to_host(&c.server)?,
                 port: c.port,
                 username: c.username.clone(),
@@ -275,7 +249,7 @@ impl ProtoSpec for HttpClientConfig {
     }
 }
 
-impl HttpClientConfig {
+impl ProtoIdentity for HttpClientConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -283,6 +257,12 @@ impl HttpClientConfig {
         hasher.write(self.host.to_str().as_bytes());
         hasher.write(&self.port.to_le_bytes());
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("username", self.username.as_deref().unwrap_or("")),
+            ("password", self.password.as_deref().unwrap_or("")),
+        ])
     }
 }
 

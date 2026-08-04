@@ -22,12 +22,11 @@
 //!
 //! - sing-box: `option/naive.go` — `NaiveOutboundOptions`
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
-use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
 use super::common::{SecurityConfig, TlsConfig};
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashNaive, ClashProxy};
@@ -41,11 +40,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct NaiveConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub username: String,
     pub password: String,
     #[serde(with = "host_serde")]
@@ -80,8 +74,6 @@ impl ProtoSpec for NaiveConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             username: username.to_string(),
             password: password.to_string(),
             host: parsed_host,
@@ -129,21 +121,6 @@ impl ProtoSpec for NaiveConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("username", self.username.as_str()),
-                ("password", self.password.as_str()),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn security(&self) -> Option<&SecurityConfig> {
         Some(&self.security)
     }
@@ -155,8 +132,6 @@ impl ProtoSpec for NaiveConfig {
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
             ClashProxy::Naive(c) => Ok(Self {
-                sig_cache: std::sync::OnceLock::new(),
-                cred_hash_cache: std::sync::OnceLock::new(),
                 username: c.username.clone(),
                 password: c.password.clone(),
                 host: clash_server_to_host(&c.server)?,
@@ -194,7 +169,7 @@ impl ProtoSpec for NaiveConfig {
     }
 }
 
-impl NaiveConfig {
+impl ProtoIdentity for NaiveConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -203,6 +178,12 @@ impl NaiveConfig {
         let mut buf = itoa::Buffer::new();
         hasher.write(buf.format(self.port).as_bytes());
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("username", self.username.as_str()),
+            ("password", self.password.as_str()),
+        ])
     }
 }
 

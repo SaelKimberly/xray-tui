@@ -51,14 +51,12 @@
 //! - outbound: `dialer/v2ray/v2ray.go`
 //! - subconverter: `subparser.cpp` `explodeVmessConf()`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param};
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashVmess};
@@ -73,11 +71,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct VmessConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub uuid: String,
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -253,8 +246,6 @@ impl ProtoSpec for VmessConfig {
         };
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             uuid,
             host: parsed_host,
             port: port_val,
@@ -369,17 +360,6 @@ impl ProtoSpec for VmessConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[("uuid", self.uuid.as_str())])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
     fn transport_type(&self) -> Option<&str> {
         Some(self.transport.type_str())
     }
@@ -420,8 +400,6 @@ impl ProtoSpec for VmessConfig {
                     _ => None,
                 };
                 Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                     uuid: c.uuid.clone(),
                     host: clash_server_to_host(&c.server)?,
                     port: c.port,
@@ -474,7 +452,7 @@ impl ProtoSpec for VmessConfig {
     }
 }
 
-impl VmessConfig {
+impl ProtoIdentity for VmessConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -516,6 +494,9 @@ impl VmessConfig {
             hasher.write(v.as_bytes());
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[("uuid", self.uuid.as_str())])
     }
 }
 

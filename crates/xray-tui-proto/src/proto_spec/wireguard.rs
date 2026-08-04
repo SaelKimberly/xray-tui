@@ -32,14 +32,12 @@
 //! - sing-box: `option/wireguard.go`
 //! - wireguard-go: `device/uapi.go`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::SecurityConfig;
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashWireGuard};
@@ -51,11 +49,6 @@ use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct WireguardConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub private_key: String,
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -147,8 +140,6 @@ impl ProtoSpec for WireguardConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             private_key,
             host: parsed_host,
             port: parsed_port,
@@ -234,22 +225,6 @@ impl ProtoSpec for WireguardConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("private_key", self.private_key.as_str()),
-                ("public_key", self.public_key.as_str()),
-                ("preshared_key", self.preshared_key.as_deref().unwrap_or("")),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         None
     }
@@ -270,8 +245,6 @@ impl ProtoSpec for WireguardConfig {
                         .unwrap_or_default();
 
                 Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                     private_key: c.private_key.clone(),
                     host: clash_server_to_host(&c.server)?,
                     port: c.port,
@@ -318,7 +291,7 @@ impl ProtoSpec for WireguardConfig {
         }))
     }
 }
-impl WireguardConfig {
+impl ProtoIdentity for WireguardConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -345,11 +318,18 @@ impl WireguardConfig {
         }
         hasher.finish()
     }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("private_key", self.private_key.as_str()),
+            ("public_key", self.public_key.as_str()),
+            ("preshared_key", self.preshared_key.as_deref().unwrap_or("")),
+        ])
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::ProtoSpec;
+    use super::super::{Proto, ProtocolConfig, ProtoSpec};
     use crate::urlx::SchemeX;
 
     #[test]
@@ -371,8 +351,12 @@ mod tests {
         // cred_hash differs (public_key/preshared_key are credentials).
         let url_a = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=AAA&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
         let url_b = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=BBB&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
-        let a = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
-        let b = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        let a = Proto::new(ProtocolConfig::Wireguard(
+            WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed"),
+        ));
+        let b = Proto::new(ProtocolConfig::Wireguard(
+            WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed"),
+        ));
         assert_eq!(a.sig(), b.sig(), "preshared_key is a credential, not sig");
         assert_ne!(a.cred_hash(), b.cred_hash());
         assert_ne!(a.uid(), b.uid());
@@ -380,10 +364,15 @@ mod tests {
 
     #[test]
     fn wireguard_host_port_are_identity_in_sig() {
-        let url_a = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D";
+        // Both URLs carry the same mtu so the sig assertion isolates host/port.
+        let url_a = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
         let url_b = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2409?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
-        let a = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed");
-        let b = WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed");
+        let a = Proto::new(ProtocolConfig::Wireguard(
+            WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_a)).expect("failed"),
+        ));
+        let b = Proto::new(ProtocolConfig::Wireguard(
+            WireguardConfig::try_parse(&crate::urlx::RawUrlX::from(url_b)).expect("failed"),
+        ));
         assert_ne!(a.sig(), b.sig(), "different port -> different sig");
         assert_eq!(a.cred_hash(), b.cred_hash());
     }

@@ -30,12 +30,10 @@
 //! - mihomo: `adapter/outbound/anytls.go` — `AnyTlsOption`
 //! - subconverter: `subparser.cpp` `explodeAnyTLS()`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use super::utils;
-use super::{ParseError, ProtoSpec, impl_sig_cache};
+use super::{ParseError, ProtoSpec, ProtoIdentity};
 use crate::clash::{ClashAnyTls, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
@@ -45,11 +43,6 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct AnyTlsConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     #[serde(with = "host_serde")]
     pub host: HostSpec,
     #[serde(with = "port_serde")]
@@ -112,8 +105,6 @@ impl ProtoSpec for AnyTlsConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             host: parsed_host,
             port: parsed_port,
             password,
@@ -179,18 +170,6 @@ impl ProtoSpec for AnyTlsConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[("password", self.password.as_deref().unwrap_or(""))])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         None
     }
@@ -198,8 +177,6 @@ impl ProtoSpec for AnyTlsConfig {
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
         match proxy {
             ClashProxy::Anytls(c) => Ok(Self {
-                sig_cache: std::sync::OnceLock::new(),
-                cred_hash_cache: std::sync::OnceLock::new(),
                 host: clash_server_to_host(&c.server)?,
                 port: c.port,
                 password: Some(c.password.clone()),
@@ -230,7 +207,7 @@ impl ProtoSpec for AnyTlsConfig {
     }
 }
 
-impl AnyTlsConfig {
+impl ProtoIdentity for AnyTlsConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -244,6 +221,9 @@ impl AnyTlsConfig {
             hasher.write(b"insecure");
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[("password", self.password.as_deref().unwrap_or(""))])
     }
 }
 

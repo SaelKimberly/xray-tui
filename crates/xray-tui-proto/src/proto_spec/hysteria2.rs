@@ -50,14 +50,12 @@
 //! - Hysteria2: `app/cmd/client.go` `parseURI()`, `app/internal/url/url.go`
 //! - sing-box: `protocol/hysteria2/outbound.go`, `option/hysteria2.go`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, PortSpec, RawUrlX, SchemeX, TinyText, host_serde, port_spec_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashHysteria2, ClashProxy};
@@ -71,11 +69,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct Hysteria2Config {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub auth: String,
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -143,8 +136,6 @@ impl ProtoSpec for Hysteria2Config {
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             auth: auth.to_string(),
             host: parsed_host,
             port: parsed_port,
@@ -233,21 +224,6 @@ impl ProtoSpec for Hysteria2Config {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("auth", self.auth.as_str()),
-                ("obfs_password", self.obfs_password.as_deref().unwrap_or("")),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         Some("quic")
     }
@@ -283,8 +259,6 @@ impl ProtoSpec for Hysteria2Config {
                         s => Some(TinyText::from(s)),
                     },
                     pin_sha256: None,
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                 })
             }
             _ => Err(ParseError::Unknown("expected hysteria2 clash proxy".into())),
@@ -316,7 +290,7 @@ impl ProtoSpec for Hysteria2Config {
     }
 }
 
-impl Hysteria2Config {
+impl ProtoIdentity for Hysteria2Config {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -347,6 +321,12 @@ impl Hysteria2Config {
             hasher.write(v.as_bytes());
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("auth", self.auth.as_str()),
+            ("obfs_password", self.obfs_password.as_deref().unwrap_or("")),
+        ])
     }
 }
 

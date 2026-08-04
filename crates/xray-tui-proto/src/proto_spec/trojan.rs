@@ -36,8 +36,6 @@
 //! - sing-box: `option/trojan.go`
 //! - subconverter: `subparser.cpp` `explodeTrojan()`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
@@ -45,7 +43,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param,
 };
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashTrojan};
@@ -60,11 +58,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct TrojanConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub password: String,
     #[serde(with = "host_serde")]
     pub host: HostSpec,
@@ -171,8 +164,6 @@ impl ProtoSpec for TrojanConfig {
         };
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             password: username.to_string(),
             host: parsed_host,
             port: parsed_port,
@@ -298,18 +289,6 @@ impl ProtoSpec for TrojanConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[("password", self.password.as_str())])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         Some(self.transport.type_str())
     }
@@ -355,8 +334,6 @@ impl ProtoSpec for TrojanConfig {
                     _ => None,
                 };
                 Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                     password: c.password.clone(),
                     host: clash_server_to_host(&c.server)?,
                     port: c.port,
@@ -399,7 +376,7 @@ impl ProtoSpec for TrojanConfig {
     }
 }
 
-impl TrojanConfig {
+impl ProtoIdentity for TrojanConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -435,6 +412,9 @@ impl TrojanConfig {
             hasher.write(v.as_bytes());
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[("password", self.password.as_str())])
     }
 }
 

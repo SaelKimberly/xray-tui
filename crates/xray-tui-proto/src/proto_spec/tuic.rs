@@ -31,14 +31,14 @@
 //! - v2rayN: `TuicFmt.cs`, `BaseFmt.cs`
 //! - sing-box: `option/tuic.go`
 
-use std::{fmt::Write, num::NonZeroU64};
+use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
-use super::impl_sig_cache;
+use super::ProtoIdentity;
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashProxy, ClashTuic};
@@ -52,12 +52,6 @@ use crate::proto_spec::common::{
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct TuicConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     pub uuid: String,
     pub password: String,
     #[serde(with = "host_serde")]
@@ -127,8 +121,6 @@ impl ProtoSpec for TuicConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         Ok(Self {
-            sig_cache: std::sync::OnceLock::new(),
-            cred_hash_cache: std::sync::OnceLock::new(),
             uuid: uuid.to_string(),
             password: password.to_string(),
             host: parsed_host,
@@ -204,20 +196,6 @@ impl ProtoSpec for TuicConfig {
     fn remarks(&self) -> Option<&str> {
         self.remarks.as_deref()
     }
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[
-                ("uuid", self.uuid.as_str()),
-                ("password", self.password.as_str()),
-            ])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
 
     fn transport_type(&self) -> Option<&str> {
         Some("quic")
@@ -235,8 +213,6 @@ impl ProtoSpec for TuicConfig {
                     _ => (c.token.clone(), String::new()),
                 };
                 Ok(Self {
-                    sig_cache: std::sync::OnceLock::new(),
-                    cred_hash_cache: std::sync::OnceLock::new(),
                     uuid,
                     password,
                     host: clash_server_to_host(&c.server)?,
@@ -293,7 +269,7 @@ impl ProtoSpec for TuicConfig {
     }
 }
 
-impl TuicConfig {
+impl ProtoIdentity for TuicConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -316,6 +292,12 @@ impl TuicConfig {
             hasher.write(v.as_bytes());
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[
+            ("uuid", self.uuid.as_str()),
+            ("password", self.password.as_str()),
+        ])
     }
 }
 

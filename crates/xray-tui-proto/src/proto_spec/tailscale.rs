@@ -21,8 +21,6 @@
 //! # References
 //! - sing-box: `option/tailscale.go` — `TailscaleEndpointOptions`
 
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::clash::{ClashProxy, ClashTailscale};
@@ -30,7 +28,7 @@ use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
 use crate::proto_spec::utils;
-use crate::proto_spec::{ParseError, ProtoSpec, impl_sig_cache};
+use crate::proto_spec::{ParseError, ProtoSpec, ProtoIdentity};
 use crate::urlx::HostSpec;
 use crate::urlx::TinyText;
 use crate::urlx::{host_serde, port_serde};
@@ -40,11 +38,6 @@ use crate::urlx::{host_serde, port_serde};
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct TailscaleConfig {
-    #[serde(skip)]
-    sig_cache: std::sync::OnceLock<NonZeroU64>,
-    #[serde(skip)]
-    cred_hash_cache: std::sync::OnceLock<u64>,
-
     #[serde(with = "host_serde")]
     pub host: HostSpec,
     #[serde(with = "port_serde")]
@@ -94,18 +87,6 @@ impl ProtoSpec for TailscaleConfig {
         self.remarks.as_deref()
     }
 
-    fn cred_hash(&self) -> u64 {
-        *self.cred_hash_cache.get_or_init(|| {
-            utils::compute_cred_hash(&[("auth_key", self.auth_key.as_deref().unwrap_or(""))])
-        })
-    }
-
-    fn set_cred_hash_cache(&self, v: u64) {
-        _ = self.cred_hash_cache.set(v);
-    }
-
-    impl_sig_cache!();
-
     fn transport_type(&self) -> Option<&str> {
         None
     }
@@ -132,8 +113,6 @@ impl ProtoSpec for TailscaleConfig {
                     "" => None,
                     s => Some(TinyText::from(s)),
                 },
-                sig_cache: std::sync::OnceLock::new(),
-                cred_hash_cache: std::sync::OnceLock::new(),
             }),
             _ => Err(ParseError::Unknown("expected tailscale clash proxy".into())),
         }
@@ -157,7 +136,7 @@ impl ProtoSpec for TailscaleConfig {
     }
 }
 
-impl TailscaleConfig {
+impl ProtoIdentity for TailscaleConfig {
     fn compute_sig(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
@@ -166,6 +145,9 @@ impl TailscaleConfig {
             hasher.write(v.as_bytes());
         }
         hasher.finish()
+    }
+    fn compute_cred_hash(&self) -> u64 {
+        utils::compute_cred_hash(&[("auth_key", self.auth_key.as_deref().unwrap_or(""))])
     }
 }
 
