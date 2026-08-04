@@ -293,7 +293,6 @@ fn build_display_rows(
                 .add_modifier(ratatui::style::Modifier::UNDERLINED),
             (false, true) => ThemeStyles::table_row_connected(palette),
             (true, false) => ThemeStyles::table_row_selected(palette),
-            (false, false) if i % 2 == 1 => ThemeStyles::table_row_alt(palette),
             (false, false) => ThemeStyles::table_row_normal(palette),
         };
 
@@ -482,7 +481,7 @@ fn build_display_rows(
             has_sub_rows: row.protocols.len() > 1,
             expanded: row.expanded,
             row_style: base_style,
-            panel_selected_style: ThemeStyles::table_row_selected(palette),
+            panel_selected_style: ThemeStyles::panel_row_selected(palette),
             panel_selected: if i == selected { state.selected_sub } else { None },
             panel_ips,
             panel_resolve_hint,
@@ -822,6 +821,41 @@ mod tests {
         assert_eq!(row.height(0), 8);
         let collapsed = sample_row(false, vec![], "11");
         assert_eq!(collapsed.height(0), 1);
+    }
+
+    #[test]
+    fn selected_sub_row_renders_with_accent_bg() {
+        let palette = crate::ui::palette_bridge::palette_from_name(
+            &ratatui_themes::ThemeName::TokyoNight,
+        );
+        let mut row = sample_row(
+            true,
+            vec![sample_panel_row("●"), sample_panel_row("○")],
+            "00",
+        );
+        row.row_style = ThemeStyles::table_row_normal(&palette);
+        row.panel_selected_style = ThemeStyles::panel_row_selected(&palette);
+        row.panel_selected = Some(0);
+        let col_xs: Vec<u16> = (0..17).collect();
+        let col_widths = vec![1u16; 17];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
+
+        row.render(&col_xs, &col_widths, &mut buf, 0, 20);
+
+        // Panel starts at y=1; sub-rows at y0+3 → sub-row 0 at y=4, sub-row 1
+        // at y=5. x=1 is the panel's first inner cell.
+        // Selected sub-row gets the accent bar…
+        assert_eq!(
+            buf[(1, 4)].style().bg,
+            Some(palette.highlight),
+            "selected sub-row must paint the accent background"
+        );
+        // …the unselected sub-row below must not.
+        assert_ne!(
+            buf[(1, 5)].style().bg,
+            Some(palette.highlight),
+            "unselected sub-row must not use the accent background"
+        );
     }
 
     #[test]

@@ -33,15 +33,21 @@ impl ThemeStyles {
             .bg(palette.surface)
             .add_modifier(Modifier::BOLD)
     }
-    pub fn table_row_alt(palette: &Palette) -> Style {
-        Style::default().fg(palette.foreground).bg(palette.surface)
-    }
     pub fn table_row_normal(palette: &Palette) -> Style {
         Style::default().fg(palette.foreground)
     }
     pub fn table_row_connected(palette: &Palette) -> Style {
         Style::default()
             .fg(palette.foreground)
+            .bg(palette.highlight)
+            .add_modifier(Modifier::BOLD)
+    }
+    /// Selected protocol sub-row inside an expanded endpoint panel. Must be
+    /// visually distinct from the endpoint row highlight (`table_row_selected`,
+    /// bg `surface`) that paints the whole expanded panel.
+    pub fn panel_row_selected(palette: &Palette) -> Style {
+        Style::default()
+            .fg(palette.on_highlight)
             .bg(palette.highlight)
             .add_modifier(Modifier::BOLD)
     }
