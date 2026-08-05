@@ -13,7 +13,10 @@ use xray_tui_core::{
     resolve_core, wait_for_socks5,
 };
 use xray_tui_db::Database;
-use xray_tui_db::models::{DnsSetting, PingResultUpdate, PingSession, ProfileExtension};
+use xray_tui_db::models::{
+    DELAY_SOURCE_FAST, DELAY_SOURCE_REAL, DELAY_SOURCE_UDP, DnsSetting, PingResultUpdate,
+    PingSession, ProfileExtension,
+};
 
 use crate::AppState;
 use crate::try_send_or_warn;
@@ -404,7 +407,11 @@ async fn batch_upsert_buffer(
                 speed: None,
                 sort_order: None,
                 ip_info: r.ip_info.clone(),
-                delay_source: None,
+                delay_source: Some(match r.ping_type.as_str() {
+                    "real" => DELAY_SOURCE_REAL,
+                    "udp" => DELAY_SOURCE_UDP,
+                    _ => DELAY_SOURCE_FAST,
+                }),
                 protocol_row: Default::default(),
             })
         })

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use crate::EndpointRow;
@@ -8,7 +8,7 @@ use xray_tui_core::{CoreType, resolve_core};
 
 use crate::AppState;
 use crate::state::profile_to_endpoint_protocol;
-use crate::types::{AppMode, BatchImportItem, SortColumn};
+use crate::types::{AppMode, BatchImportItem, EndpointPingStatus, SortColumn};
 use crate::{common_field_defaults, profile_to_fields};
 use xray_tui_db::DatabaseError;
 use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
@@ -204,6 +204,29 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
         if asc { cmp } else { cmp.reverse() }
     });
     indices
+}
+
+/// Whether the endpoint's DNS host is currently unresolved (no known IPs).
+/// Endpoints without an `endpoint_info` entry count as unresolved.
+pub(crate) fn endpoint_dns_unresolved(state: &AppState, row: &EndpointRow) -> bool {
+    row.endpoint.host_type == "dns"
+        && state
+            .endpoint_info
+            .get(&row.endpoint.id)
+            .is_none_or(|i| i.resolved_ips.is_empty())
+}
+
+/// The endpoint's current ping-round failure sets as `(fast_failed,
+/// real_failed)`. `None` when no round is in flight. Takes the `ping_status`
+/// map (not the whole `AppState`) so callers can hold the returned failure
+/// sets while mutating the disjoint `endpoints` field.
+pub(crate) fn session_rounds<'a>(
+    ping_status: &'a HashMap<i64, EndpointPingStatus>,
+    row: &EndpointRow,
+) -> Option<(&'a HashSet<i64>, &'a HashSet<i64>)> {
+    ping_status
+        .get(&row.endpoint.id)
+        .map(|ps| (&ps.fast.failed, &ps.real.failed))
 }
 
 pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
