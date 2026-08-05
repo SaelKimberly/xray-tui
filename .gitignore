@@ -8,3 +8,4 @@ ralph.yml
 !/thirdparty/*.md
 *.zip
 *.tar.gz
+.worktrees/
