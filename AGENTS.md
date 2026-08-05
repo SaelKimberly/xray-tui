@@ -28,7 +28,7 @@ cargo run
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + GrpcStatsClient + MockStatsProvider (test double) + factory (unified from former XrayGrpcClient/SingBoxGrpcClient)
 - `crates/xray-tui-core/src/updater.rs` — backend auto-update (version check, download, install) for xray-core and sing-box
-- `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (14 protocols + fallback chain) with per-profile validation via ValidationSettings
+**`crates/xray-tui-config/src/import_export.rs`** — share URL parse/format (14 protocols + fallback chain) with per-profile validation via ValidationSettings. `validate_host` hard-rejects unspecified IPs (`0.0.0.0`/`::`, also bracketed `[::]`) regardless of `allow_private_ips`; policy-gated checks (private/loopback/link-local) stay behind the gate
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
 - `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing (dns-stamp-parser) → hickory-resolver 0.26 config, cached resolver list, panic-free async OnceCell init
 - `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup (maxminddb 0.30)

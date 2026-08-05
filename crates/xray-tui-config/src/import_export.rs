@@ -2663,48 +2663,68 @@ fn validate_required_fields(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-/// Validate server address is not private/loopback/link-local.
+/// Validate server address is not unspecified/private/loopback/link-local.
 fn validate_host(profile: &Profile, settings: &ValidationSettings) -> Result<()> {
-    if settings.allow_private_ips {
-        return Ok(());
-    }
-
     let addr = &profile.address;
     if addr.is_empty() {
         return Ok(()); // no address to validate
     }
 
+    // Bracketed IPv6 (e.g. "[::1]") — parse the inner literal.
+    let parse_target: &str = addr
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(addr);
+    let parsed_ip: Option<IpAddr> = parse_target.parse().ok();
+
+    // Hard rule: unspecified addresses (0.0.0.0 / ::) are never valid server
+    // targets — not gated by allow_private_ips.
+    if let Some(ip) = parsed_ip {
+        let unspecified = match ip {
+            IpAddr::V4(v4) => v4.is_unspecified(),
+            IpAddr::V6(v6) => v6.is_unspecified(),
+        };
+        if unspecified {
+            return Err(ImportError::Validation(
+                "unspecified IP address (0.0.0.0/::)".into(),
+            ));
+        }
+    }
+
+    if settings.allow_private_ips {
+        return Ok(());
+    }
+
     // Try parsing as IP address
-    if let Ok(ip) = addr.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => {
-                if v4.is_loopback() {
-                    return Err(ImportError::Validation("loopback IP address".into()));
-                }
-                if v4.is_private() {
-                    return Err(ImportError::Validation("private IP address".into()));
-                }
-                if v4.is_link_local() {
-                    return Err(ImportError::Validation("link-local IP address".into()));
-                }
+    match parsed_ip {
+        Some(IpAddr::V4(v4)) => {
+            if v4.is_loopback() {
+                return Err(ImportError::Validation("loopback IP address".into()));
             }
-            IpAddr::V6(v6) => {
-                if v6.is_loopback() {
-                    return Err(ImportError::Validation("loopback IP address".into()));
-                }
-                if v6.is_unique_local() {
-                    return Err(ImportError::Validation("unique-local IP address".into()));
-                }
-                if v6.is_unicast_link_local() {
-                    return Err(ImportError::Validation("link-local IP address".into()));
-                }
+            if v4.is_private() {
+                return Err(ImportError::Validation("private IP address".into()));
+            }
+            if v4.is_link_local() {
+                return Err(ImportError::Validation("link-local IP address".into()));
             }
         }
-    } else {
-        // DNS name — check for localhost
-        let lower = addr.to_lowercase();
-        if lower == "localhost" || lower.ends_with(".localhost") {
-            return Err(ImportError::Validation("localhost hostname".into()));
+        Some(IpAddr::V6(v6)) => {
+            if v6.is_loopback() {
+                return Err(ImportError::Validation("loopback IP address".into()));
+            }
+            if v6.is_unique_local() {
+                return Err(ImportError::Validation("unique-local IP address".into()));
+            }
+            if v6.is_unicast_link_local() {
+                return Err(ImportError::Validation("link-local IP address".into()));
+            }
+        }
+        None => {
+            // DNS name — check for localhost
+            let lower = addr.to_lowercase();
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                return Err(ImportError::Validation("localhost hostname".into()));
+            }
         }
     }
 
@@ -2750,6 +2770,94 @@ mod tests {
             allow_private_ips: true,
             reject_insecure: false,
         }
+    }
+
+    fn vless_profile(address: &str) -> Profile {
+        let mut profile = base_profile(Protocol::Vless, address, 443);
+        profile.set_user_id(Some("6202b230-417c-4d8e-b624-0f71afa9c75d".into()));
+        profile
+    }
+
+    #[test]
+    fn validate_host_rejects_unspecified_ipv4() {
+        let err = validate_host(&vless_profile("0.0.0.0"), &ValidationSettings::default())
+            .expect_err("0.0.0.0 must be rejected");
+        assert!(
+            err.to_string().contains("unspecified"),
+            "error must mention unspecified: {err}"
+        );
+        // Hard rule — allow_private_ips must not re-admit it.
+        let err = validate_host(&vless_profile("0.0.0.0"), &permissive_settings())
+            .expect_err("0.0.0.0 must be rejected even with allow_private_ips");
+        assert!(
+            err.to_string().contains("unspecified"),
+            "error must mention unspecified: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_host_rejects_unspecified_ipv6() {
+        for addr in ["::", "[::]"] {
+            let err = validate_host(&vless_profile(addr), &ValidationSettings::default())
+                .expect_err("{addr} must be rejected");
+            assert!(
+                err.to_string().contains("unspecified"),
+                "error for {addr} must mention unspecified: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_host_bracketed_ipv6_loopback_rejected() {
+        // Regression guard: the legacy URL parser stores IPv6 hosts in
+        // bracketed form ("[::1]"), which plain IpAddr parsing misses.
+        let err = validate_host(&vless_profile("[::1]"), &ValidationSettings::default())
+            .expect_err("[::1] loopback must be rejected");
+        assert!(
+            err.to_string().contains("loopback"),
+            "error must mention loopback: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_share_url_rejects_unspecified_host() {
+        let settings = ValidationSettings::default();
+        let v4 = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@0.0.0.0:443?type=tcp#r";
+        let err = match parse_share_url(v4, &settings) {
+            Ok(_) => panic!("0.0.0.0 URL must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unspecified"),
+            "error must mention unspecified: {err}"
+        );
+        let v6 = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@[::]:443?type=tcp#r";
+        let err = match parse_share_url(v6, &settings) {
+            Ok(_) => panic!("[::] URL must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unspecified"),
+            "error must mention unspecified: {err}"
+        );
+    }
+
+    #[test]
+    fn subscription_unspecified_host_counts_as_host_validation() {
+        let payload = concat!(
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@0.0.0.0:443?type=tcp#bad\n",
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?type=tcp#ok\n",
+        );
+        let (profiles, summary) = crate::subscription::parse_subscription_data(
+            payload.as_bytes(),
+            &ValidationSettings::default(),
+        )
+        .expect("subscription data must decode");
+        assert_eq!(profiles.len(), 1, "only the valid URL should survive");
+        assert_eq!(
+            summary.host_validation_count, 1,
+            "0.0.0.0 must count as host validation"
+        );
     }
 
     #[test]

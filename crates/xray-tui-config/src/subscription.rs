@@ -414,6 +414,7 @@ pub fn parse_subscription_data(
                     || lower.starts_with("link-local")
                     || lower.starts_with("unique-local")
                     || lower.starts_with("localhost")
+                    || lower.starts_with("unspecified")
                 {
                     summary.host_validation_count += 1;
                 } else {
