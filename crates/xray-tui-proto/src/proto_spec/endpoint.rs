@@ -2,16 +2,15 @@
 //!
 //! Parsing produces a [`ParsedProto`]: 0..N [`EndpointEssentials`] plus one
 //! [`ProtocolEssentials`]. Identity (`sig`/`cred_hash`/`uid`) is computed over
-//! the serialized protocol part ONLY — endpoints (host/port) never influence a
-//! profile's uid, so the same protocol pointed at different servers dedups to
-//! one identity.
+//! the serialized protocol payload only — endpoints (host/port) never
+//! influence a profile's uid, so the same protocol pointed at different
+//! servers dedups to one identity.
 //!
 //! Later tasks (T4/T5) rework every protocol parser to produce this shape; the
 //! db crate (phase B) stores these types.
 
-use crate::proto_spec::common::{SecurityConfig, TransportConfig};
 use crate::proto_spec::utils;
-use crate::proto_spec::{CoreType, ProtocolKind};
+use crate::proto_spec::{CoreType, ProtocolConfig, ProtocolKind};
 use serde::{Deserialize, Serialize};
 
 /// Endpoint host kind. Plain enum (this crate); the db crate has its own
@@ -56,47 +55,31 @@ pub enum ConfigKind {
     Form,
 }
 
-/// Everything that defines *what* a protocol is — kind, config shape, core,
-/// transport, security — explicitly excluding endpoints.
+/// The parse-boundary protocol identity: kind, config shape, core, and the
+/// exact serializable protocol definition (sans host/port).
 ///
-/// Identity (`sig`/`cred_hash`/`uid`) hashes the serialized form of this
-/// struct, so it MUST NOT carry endpoint-derived values. In particular,
-/// transport configs must not store the server host: parsers today call
-/// [`TransportConfig::with_host`], which writes the resolved host into
-/// `WebSocketConfig::host`, `HttpConfig::host`, `HttpUpgradeConfig::host`,
-/// `XHttpConfig::host` and `GrpcConfig::authority` — those fields are part of
-/// the hash today (see `transport_host_field_is_hashed_today`). T4/T5 removes
-/// `with_host` from parse paths so that identity excludes host/port by
-/// construction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `config` is the identity-hashed payload — `sig`/`cred_hash`/`uid` hash its
+/// canonical serialized form — so it MUST NOT carry endpoint-derived values
+/// (host/port). The host-free parse mandate (T4/T5) enforces this: parsers
+/// never call `TransportConfig::with_host`, so the ws/http/grpc host fields
+/// and `SecurityConfig::sni` hold only explicit protocol parameters. The db
+/// crate's cached transport/security columns are derived from `config` at
+/// write time via config accessors, not stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct ProtocolEssentials {
     pub proto_kind: ProtocolKind,
     pub config_type: ConfigKind,
     pub core_type: CoreType,
-    pub transport: TransportEssentials,
-    pub security: SecurityEssentials,
-}
-
-/// Transport half of [`ProtocolEssentials`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransportEssentials {
-    pub r#type: crate::proto_spec::TransportType,
-    pub config: TransportConfig,
-}
-
-/// Security half of [`ProtocolEssentials`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecurityEssentials {
-    pub r#type: crate::proto_spec::SecurityType,
-    pub sni: Option<String>,
-    pub fp: Option<String>,
-    pub insecure: Option<bool>,
-    pub config: SecurityConfig,
+    /// The exact serializable protocol definition (config struct sans
+    /// host/port). This is the identity-hashed payload.
+    pub config: ProtocolConfig,
 }
 
 /// The parse boundary: 0..N endpoints (may be empty for encrypted configs) +
 /// exactly one [`ProtocolEssentials`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct ParsedProto {
     pub endpoints: Vec<EndpointEssentials>,
     pub protocol: ProtocolEssentials,
@@ -170,45 +153,51 @@ impl ParsedProto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto_spec::ProtoSpec;
+    use crate::proto_spec::common::{TransportConfig, WebSocketConfig};
+    use crate::urlx::RawUrlX;
 
-    fn proto(kind: ProtocolKind) -> ProtocolEssentials {
+    const VLESS_WS_URL: &str = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws";
+    const SS_URL: &str = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
+    const TROJAN_URL: &str = "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org";
+    const SOCKS_URL: &str = "socks://user:pass@1.2.3.4:1080";
+    const HY2_URL: &str =
+        "hy2://linux.do@[2a01:4f9:4b:f378::1]:13599?security=tls&insecure=1&sni=www.bing.com";
+
+    fn config_from(url: &str) -> ProtocolConfig {
+        ProtocolConfig::try_parse(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"))
+    }
+
+    fn proto(kind: ProtocolKind, config: ProtocolConfig) -> ProtocolEssentials {
         ProtocolEssentials {
             proto_kind: kind,
             config_type: ConfigKind::ShareUrl,
             core_type: CoreType::Xray,
-            transport: TransportEssentials {
-                r#type: crate::proto_spec::TransportType::Tcp,
-                config: TransportConfig::Tcp,
-            },
-            security: SecurityEssentials {
-                r#type: crate::proto_spec::SecurityType::None,
-                sni: None,
-                fp: None,
-                insecure: None,
-                config: SecurityConfig::default(),
-            },
+            config,
         }
     }
 
-    fn parsed(endpoints: Vec<EndpointEssentials>, kind: ProtocolKind) -> ParsedProto {
+    fn parsed(endpoints: Vec<EndpointEssentials>, protocol: ProtocolEssentials) -> ParsedProto {
         ParsedProto {
             endpoints,
-            protocol: proto(kind),
+            protocol,
         }
     }
 
     #[test]
     fn uid_is_equal_for_identical_protocol_with_different_endpoints() {
+        let protocol = proto(ProtocolKind::Vless, config_from(VLESS_WS_URL));
         let a = parsed(
             vec![EndpointEssentials::new("1.2.3.4", 443)],
-            ProtocolKind::Vmess,
+            protocol.clone(),
         );
         let b = parsed(
             vec![
                 EndpointEssentials::new("example.com", 443),
                 EndpointEssentials::new("10.0.0.1", 8443),
             ],
-            ProtocolKind::Vmess,
+            protocol,
         );
         assert_eq!(a.sig(), b.sig(), "sig ignores endpoints");
         assert_eq!(a.cred_hash(), b.cred_hash(), "cred_hash ignores endpoints");
@@ -216,35 +205,58 @@ mod tests {
     }
 
     #[test]
-    fn different_protocols_produce_different_uid() {
-        let vmess = parsed(vec![], ProtocolKind::Vmess);
-        let vless = parsed(vec![], ProtocolKind::Vless);
-        assert_ne!(vmess.sig(), vless.sig());
-        assert_ne!(vmess.uid(), vless.uid());
+    fn different_config_payloads_produce_different_uid() {
+        // Different vless uuid -> different config payload -> different uid.
+        let uuid_a = parsed(
+            vec![],
+            proto(
+                ProtocolKind::Vless,
+                config_from(
+                    "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?type=tcp",
+                ),
+            ),
+        );
+        let uuid_b = parsed(
+            vec![],
+            proto(
+                ProtocolKind::Vless,
+                config_from(
+                    "vless://22222222-3333-4444-5555-666666666666@159.223.24.65:443?type=tcp",
+                ),
+            ),
+        );
+        assert_ne!(
+            uuid_a.sig(),
+            uuid_b.sig(),
+            "different uuid -> different sig"
+        );
+        assert_ne!(
+            uuid_a.uid(),
+            uuid_b.uid(),
+            "different uuid -> different uid"
+        );
 
         // Same kind, different transport config must also differ.
-        let mut ws = proto(ProtocolKind::Vless);
-        ws.transport = TransportEssentials {
-            r#type: crate::proto_spec::TransportType::Ws,
-            config: TransportConfig::Ws(crate::proto_spec::common::WebSocketConfig::default()),
-        };
-        let ws = ParsedProto {
-            endpoints: vec![],
-            protocol: ws,
-        };
-        assert_ne!(vless.uid(), ws.uid(), "transport config changes uid");
+        let ws = parsed(
+            vec![],
+            proto(ProtocolKind::Vless, config_from(VLESS_WS_URL)),
+        );
+        assert_ne!(uuid_a.uid(), ws.uid(), "transport config changes uid");
     }
 
     #[test]
     fn uid_never_zero() {
-        for kind in [
-            ProtocolKind::Vmess,
-            ProtocolKind::Vless,
-            ProtocolKind::Trojan,
-            ProtocolKind::Socks,
-            ProtocolKind::Hysteria2,
+        for (kind, url) in [
+            (ProtocolKind::Vless, VLESS_WS_URL),
+            (ProtocolKind::Shadowsocks, SS_URL),
+            (ProtocolKind::Trojan, TROJAN_URL),
+            (ProtocolKind::Socks, SOCKS_URL),
+            (ProtocolKind::Hysteria2, HY2_URL),
         ] {
-            let p = parsed(vec![EndpointEssentials::new("1.2.3.4", 443)], kind);
+            let p = parsed(
+                vec![EndpointEssentials::new("1.2.3.4", 443)],
+                proto(kind, config_from(url)),
+            );
             assert_ne!(p.sig(), 0, "sig must never be zero for {kind:?}");
             assert_ne!(p.uid(), 0, "uid must never be zero for {kind:?}");
         }
@@ -252,12 +264,15 @@ mod tests {
 
     #[test]
     fn first_endpoint_none_when_endpoints_empty() {
-        let p = parsed(vec![], ProtocolKind::Vmess);
+        let p = parsed(
+            vec![],
+            proto(ProtocolKind::Vless, config_from(VLESS_WS_URL)),
+        );
         assert_eq!(p.first_endpoint(), None);
 
         let p = parsed(
             vec![EndpointEssentials::new("1.2.3.4", 443)],
-            ProtocolKind::Vmess,
+            proto(ProtocolKind::Vless, config_from(VLESS_WS_URL)),
         );
         let e = p.first_endpoint().expect("first endpoint present");
         assert_eq!(e.host, "1.2.3.4");
@@ -274,31 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn core_type_serde_uses_as_str_dialect() {
-        assert_eq!(serde_json::to_string(&CoreType::Xray).unwrap(), "\"xray\"");
-        assert_eq!(
-            serde_json::to_string(&CoreType::SingBox).unwrap(),
-            "\"sing-box\""
-        );
-        assert_eq!(
-            serde_json::from_str::<CoreType>("\"sing-box\"").unwrap(),
-            CoreType::SingBox
-        );
-        assert_eq!(
-            serde_json::from_str::<CoreType>("\"xray\"").unwrap(),
-            CoreType::Xray
-        );
-    }
-
-    #[test]
-    fn protocol_essentials_serde_roundtrip() {
-        let p = proto(ProtocolKind::Vmess);
-        let bytes = serde_json::to_vec(&p).unwrap();
-        let back: ProtocolEssentials = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, p);
-    }
-
-    #[test]
     fn identity_hash_is_canonical_across_hashmap_insertion_order() {
         // Regression: `TransportConfig` carries `headers: Option<HashMap<..>>`,
         // and serde's direct `to_vec` iterates a HashMap in per-instance
@@ -309,18 +299,18 @@ mod tests {
             for (k, v) in headers {
                 map.insert((*k).to_string(), (*v).to_string());
             }
-            let mut p = proto(ProtocolKind::Vless);
-            p.transport = TransportEssentials {
-                r#type: crate::proto_spec::TransportType::Ws,
-                config: TransportConfig::Ws(crate::proto_spec::common::WebSocketConfig {
-                    headers: Some(map),
-                    ..Default::default()
-                }),
+            let mut cfg = match config_from(VLESS_WS_URL) {
+                ProtocolConfig::Vless(c) => c,
+                _ => unreachable!("vless URL parses to VlessConfig"),
             };
-            ParsedProto {
-                endpoints: vec![],
-                protocol: p,
-            }
+            cfg.transport = TransportConfig::Ws(WebSocketConfig {
+                headers: Some(map),
+                ..Default::default()
+            });
+            parsed(
+                vec![],
+                proto(ProtocolKind::Vless, ProtocolConfig::Vless(cfg)),
+            )
         };
         let a = mk(&[("X-A", "1"), ("X-B", "2")]);
         let b = mk(&[("X-B", "2"), ("X-A", "1")]);
@@ -344,30 +334,46 @@ mod tests {
 
     #[test]
     fn transport_host_field_is_hashed_today() {
-        // Pins current behavior: `TransportConfig::with_host` (called by the
-        // vless/vmess/trojan parsers today) writes the server host into the ws
-        // transport's `host` field, and that field IS part of the hashed
-        // protocol bytes. T4/T5 removes with_host from parse paths so identity
-        // excludes host/port by construction; until then, a host-bearing
-        // transport changes the uid.
+        // Pins current behavior: the ws transport's `host` field — an explicit
+        // URL-level `host=` parameter, which per the host-free parse mandate
+        // IS a protocol parameter that stays in the config — is part of the
+        // hashed payload today, so differing hosts change the uid. T4/T5 only
+        // removes endpoint-derived hosts from parse paths.
         let mk = |host: &str| {
-            let mut p = proto(ProtocolKind::Vless);
-            p.transport = TransportEssentials {
-                r#type: crate::proto_spec::TransportType::Ws,
-                config: TransportConfig::Ws(crate::proto_spec::common::WebSocketConfig {
-                    host: Some(host.into()),
-                    ..Default::default()
-                }),
-            };
-            ParsedProto {
-                endpoints: vec![],
-                protocol: p,
-            }
+            let url = format!(
+                "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?type=ws&security=tls&host={host}&path=%2Fws"
+            );
+            parsed(vec![], proto(ProtocolKind::Vless, config_from(&url)))
         };
         assert_ne!(
             mk("cdn-a.example.com").uid(),
             mk("cdn-b.example.com").uid(),
-            "transport host is part of identity today (T4/T5 removes it)"
+            "transport host is part of identity today"
         );
+    }
+
+    #[test]
+    fn core_type_serde_uses_as_str_dialect() {
+        assert_eq!(serde_json::to_string(&CoreType::Xray).unwrap(), "\"xray\"");
+        assert_eq!(
+            serde_json::to_string(&CoreType::SingBox).unwrap(),
+            "\"sing-box\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CoreType>("\"sing-box\"").unwrap(),
+            CoreType::SingBox
+        );
+        assert_eq!(
+            serde_json::from_str::<CoreType>("\"xray\"").unwrap(),
+            CoreType::Xray
+        );
+    }
+
+    #[test]
+    fn protocol_essentials_serde_roundtrip() {
+        let p = proto(ProtocolKind::Vless, config_from(VLESS_WS_URL));
+        let bytes = serde_json::to_vec(&p).unwrap();
+        let back: ProtocolEssentials = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, p);
     }
 }

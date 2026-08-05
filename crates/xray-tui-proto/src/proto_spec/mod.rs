@@ -10,6 +10,7 @@ use crate::clash::ClashProxy;
 use crate::urlx::{HostSpec, RawUrlX, SchemeX};
 
 pub mod common;
+pub mod core_mapping;
 pub mod endpoint;
 pub mod utils;
 
@@ -35,10 +36,7 @@ mod vmess;
 mod wireguard;
 pub use anytls::AnyTlsConfig;
 pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig};
-pub use endpoint::{
-    ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials, SecurityEssentials,
-    TransportEssentials,
-};
+pub use endpoint::{ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials};
 pub use error::SupportError;
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;

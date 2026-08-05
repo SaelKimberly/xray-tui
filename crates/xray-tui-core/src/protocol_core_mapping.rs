@@ -1,70 +1,58 @@
+//! Core-resolution mapping — canonical logic lives in the proto crate.
+//!
+//! This module is an adapter shim over
+//! `xray_tui_proto::proto_spec::core_mapping`: the shared SS-method
+//! tables/helpers are re-exported verbatim, and [`resolve_core`] adapts the
+//! proto `ProtocolKind`/`CoreType` signature to the core's `Protocol`/
+//! `CoreType` (which carries `Auto`) so all existing callers compile
+//! unchanged.
+
 use crate::core_type::CoreType;
-use crate::protocol::{Protocol, SINGBOX_ONLY_PROTOCOLS};
+use crate::protocol::Protocol;
+use xray_tui_proto::ProtocolKind;
+use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
+use xray_tui_proto::proto_spec::core_mapping;
 
-/// Shadowsocks ciphers xray-core accepts, case-insensitive: the AEAD set from
-/// `CipherType` (proxy/shadowsocks/config.proto) plus the `aead_*` and
-/// `chacha20-poly1305` name aliases of `cipherFromString`
-/// (infra/conf/shadowsocks.go), plus the 2022-blake3 family
-/// (shadowaead_2022.List).
-pub const XRAY_SS_METHODS: &[&str] = &[
-    "aes-128-gcm",
-    "aes-256-gcm",
-    "chacha20-poly1305",
-    "chacha20-ietf-poly1305",
-    "xchacha20-poly1305",
-    "xchacha20-ietf-poly1305",
-    "aead_aes_128_gcm",
-    "aead_aes_256_gcm",
-    "aead_chacha20_poly1305",
-    "aead_xchacha20_poly1305",
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
-];
+#[cfg(test)]
+use crate::protocol::SINGBOX_ONLY_PROTOCOLS;
+pub use xray_tui_proto::proto_spec::core_mapping::{
+    SINGBOX_SS_METHODS, XRAY_SS_METHODS, singbox_supports_ss_method, ss_method_supported,
+    xray_supports_ss_method,
+};
 
-/// Shadowsocks methods sing-box accepts (docs/configuration/outbound/
-/// shadowsocks.md — modern + legacy).
-pub const SINGBOX_SS_METHODS: &[&str] = &[
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
-    "none",
-    "aes-128-gcm",
-    "aes-192-gcm",
-    "aes-256-gcm",
-    "chacha20-ietf-poly1305",
-    "xchacha20-ietf-poly1305",
-    "aes-128-ctr",
-    "aes-192-ctr",
-    "aes-256-ctr",
-    "aes-128-cfb",
-    "aes-192-cfb",
-    "aes-256-cfb",
-    "rc4-md5",
-    "chacha20-ietf",
-    "xchacha20",
-];
-
-/// True when xray-core can build a shadowsocks outbound for `method`.
-#[must_use]
-pub fn xray_supports_ss_method(method: &str) -> bool {
-    XRAY_SS_METHODS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(method))
-}
-
-/// True when sing-box can build a shadowsocks outbound for `method`.
-#[must_use]
-pub fn singbox_supports_ss_method(method: &str) -> bool {
-    SINGBOX_SS_METHODS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(method))
-}
-
-/// True when at least one core can build a shadowsocks outbound for `method`.
-#[must_use]
-pub fn ss_method_supported(method: &str) -> bool {
-    xray_supports_ss_method(method) || singbox_supports_ss_method(method)
+/// Core-side conversion: [`Protocol`] → [`ProtocolKind`].
+impl From<Protocol> for ProtocolKind {
+    fn from(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Vmess => Self::Vmess,
+            Protocol::Vless => Self::Vless,
+            Protocol::Shadowsocks => Self::Shadowsocks,
+            Protocol::Shadowsocks2022 => Self::Shadowsocks2022,
+            Protocol::Socks => Self::Socks,
+            Protocol::Http => Self::Http,
+            Protocol::Trojan => Self::Trojan,
+            Protocol::WireGuard => Self::WireGuard,
+            Protocol::Hysteria2 => Self::Hysteria2,
+            Protocol::DokodemoDoor => Self::DokodemoDoor,
+            Protocol::Freedom => Self::Freedom,
+            Protocol::Blackhole => Self::Blackhole,
+            Protocol::Dns => Self::Dns,
+            Protocol::Loopback => Self::Loopback,
+            Protocol::Custom => Self::Custom,
+            Protocol::Tuic => Self::Tuic,
+            Protocol::Hysteria => Self::Hysteria,
+            Protocol::Naive => Self::Naive,
+            Protocol::AnyTls => Self::AnyTls,
+            Protocol::ShadowTls => Self::ShadowTls,
+            Protocol::Tor => Self::Tor,
+            Protocol::Ssh => Self::Ssh,
+            Protocol::Tailscale => Self::Tailscale,
+            Protocol::ShadowsocksR => Self::ShadowsocksR,
+            Protocol::Redirect => Self::Redirect,
+            Protocol::TProxy => Self::TProxy,
+            Protocol::Mixed => Self::Mixed,
+        }
+    }
 }
 
 /// Resolves which core a given protocol should use.
@@ -84,28 +72,15 @@ pub fn resolve_core(
     profile_override: Option<CoreType>,
     ss_method: Option<&str>,
 ) -> CoreType {
-    match profile_override {
-        Some(CoreType::Auto) | None => core_for_protocol(protocol, ss_method),
-        Some(core_type) => core_type,
-    }
-}
-
-fn core_for_protocol(protocol: Protocol, ss_method: Option<&str>) -> CoreType {
-    if matches!(protocol, Protocol::Shadowsocks | Protocol::Shadowsocks2022) {
-        return match ss_method {
-            Some(method) if xray_supports_ss_method(method) => CoreType::Xray,
-            // Legacy/unknown ciphers: sing-box covers the legacy set; the
-            // builder rejects what neither core can build.
-            Some(_) => CoreType::SingBox,
-            // Method unknown: keep the historical default; the config
-            // builder validates before any core is launched.
-            None => CoreType::Xray,
-        };
-    }
-    if SINGBOX_ONLY_PROTOCOLS.contains(&protocol) {
-        CoreType::SingBox
-    } else {
-        CoreType::Xray
+    let kind = ProtocolKind::from(protocol);
+    let override_ = match profile_override {
+        Some(CoreType::Auto) | None => None,
+        Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
+        Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
+    };
+    match core_mapping::resolve_core(kind, override_, ss_method) {
+        ProtoCoreType::Xray => CoreType::Xray,
+        ProtoCoreType::SingBox => CoreType::SingBox,
     }
 }
 
@@ -294,6 +269,43 @@ mod tests {
                 CoreType::SingBox,
                 "forced SingBox should win for {protocol}"
             );
+        }
+    }
+
+    #[test]
+    fn protocol_to_kind_conversion_is_total() {
+        for protocol in [
+            Protocol::Vmess,
+            Protocol::Vless,
+            Protocol::Shadowsocks,
+            Protocol::Shadowsocks2022,
+            Protocol::Socks,
+            Protocol::Http,
+            Protocol::Trojan,
+            Protocol::WireGuard,
+            Protocol::Hysteria2,
+            Protocol::DokodemoDoor,
+            Protocol::Freedom,
+            Protocol::Blackhole,
+            Protocol::Dns,
+            Protocol::Loopback,
+            Protocol::Custom,
+            Protocol::Tuic,
+            Protocol::Hysteria,
+            Protocol::Naive,
+            Protocol::AnyTls,
+            Protocol::ShadowTls,
+            Protocol::Tor,
+            Protocol::Ssh,
+            Protocol::Tailscale,
+            Protocol::ShadowsocksR,
+            Protocol::Redirect,
+            Protocol::TProxy,
+            Protocol::Mixed,
+        ] {
+            let kind = ProtocolKind::from(protocol);
+            // Every core Protocol maps to a kind; resolve_core must accept it.
+            let _ = core_mapping::resolve_core(kind, None, None);
         }
     }
 }

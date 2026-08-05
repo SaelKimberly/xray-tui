@@ -4,7 +4,7 @@ pub mod urlx;
 pub mod utils;
 pub use proto_spec::{
     ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials, ProtocolKind,
-    SecurityEssentials, SecurityType, TransportEssentials, TransportType,
+    SecurityType, TransportType,
 };
 pub(crate) use urlx::PortSpec;
 pub use urlx::SchemeX;
