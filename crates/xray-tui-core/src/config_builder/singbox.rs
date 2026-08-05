@@ -1277,10 +1277,7 @@ mod tests {
         // sing-box 2022 methods flow through type "shadowsocks".
         let (endpoint, mut protocol) =
             test_endpoint_and_protocol(Protocol::Shadowsocks2022.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"method": "2022-blake3-aes-128-gcm"}"#,
-        );
+        set_protocol_settings_json(&mut protocol, r#"{"method": "2022-blake3-aes-128-gcm"}"#);
         let (params, rules, dns) = default_params();
         let config =
             SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();

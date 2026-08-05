@@ -1,18 +1,23 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
+use toasty::Deferred;
 use toasty::stmt::IntoStatement;
 use toasty_core::schema::db::Type as DbType;
 use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
-use crate::retry_on_busy;
 use crate::models_toasty::EndpointRow;
 use crate::models_toasty::{
     DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession, ProfileExtension,
     ProtocolRow, RoutingRule, ServerStat,
 };
+use crate::retry_on_busy;
+
+/// One protocol-row reference with endpoint address/port, as read by
+/// `create_ping_batch`.
+type PingRow = (i64, i32, String, String, i32);
 
 // ── Database handle ─────────────────────────────────────────────────────
 
@@ -24,7 +29,12 @@ pub struct Database {
 
 impl Database {
     /// Opens existing DB or creates fresh. Recovers from corruption by recreating.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "driver is moved into try_open_db; clippy's drop suggestion is a false positive"
+    )]
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        const SCHEMA_VERSION: i64 = 4;
         let path_str = path
             .as_ref()
             .to_str()
@@ -56,7 +66,6 @@ impl Database {
         // only run push_schema on fresh databases. Existing databases are
         // upgraded in place by an explicit transaction of idempotent
         // ALTER TABLE / CREATE INDEX statements.
-        const SCHEMA_VERSION: i64 = 4;
         let rows = toasty::sql::query("PRAGMA user_version")
             .exec(&mut conn)
             .await?;
@@ -204,7 +213,7 @@ impl Database {
         Ok(())
     }
 
-    /// Acquire a pooled connection with the SQLite busy-wait configured.
+    /// Acquire a pooled connection with the `SQLite` busy-wait configured.
     /// `PRAGMA busy_timeout` is per-connection, so the pragma set in `open()`
     /// never reaches pool-created connections. Without it, concurrent
     /// writers (enrichment resolutions, ping-buffer flushes) fail instantly
@@ -443,15 +452,15 @@ impl Database {
                     id: get_string(&fields, 0)?,
                     name: get_opt_string(&fields, 1),
                     url: get_opt_string(&fields, 2),
-                    enabled: get_opt_i64(&fields, 3).map(|v| v as i32),
+                    enabled: get_opt_i32(&fields, 3),
                     user_agent: get_opt_string(&fields, 4),
-                    convert_target: get_opt_i64(&fields, 5).map(|v| v as i32),
+                    convert_target: get_opt_i32(&fields, 5),
                     core_type: get_opt_string(&fields, 6),
-                    sort_order: get_opt_i64(&fields, 7).map(|v| v as i32),
+                    sort_order: get_opt_i32(&fields, 7),
                     last_refreshed: get_opt_string(&fields, 8),
                     status: get_opt_string(&fields, 9),
                     error_message: get_opt_string(&fields, 10),
-                    refresh_interval: get_opt_i64(&fields, 11).map(|v| v as i32),
+                    refresh_interval: get_opt_i32(&fields, 11),
                 });
             }
         }
@@ -481,7 +490,7 @@ impl Database {
             .and_then(|v| {
                 if let Value::Record(fields) = v {
                     fields.first().and_then(|f| match f {
-                        Value::I64(n) => Some(*n as usize),
+                        Value::I64(n) => usize::try_from(*n).ok(),
                         _ => None,
                     })
                 } else {
@@ -506,7 +515,8 @@ impl Database {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
@@ -582,7 +592,8 @@ impl Database {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
@@ -664,8 +675,8 @@ impl Database {
     pub async fn update_endpoint_resolution(
         &self,
         endpoint_id: i64,
-        resolved_as: Option<&str>,
-        resolved_at: Option<i64>,
+        resolved_ips: Option<&str>,
+        resolved_ts: Option<i64>,
     ) -> Result<()> {
         // Retry on write contention: the enrichment pipeline resolves many
         // endpoints concurrently, and concurrent writers surface SQLite
@@ -678,8 +689,8 @@ impl Database {
                 toasty::sql::statement(
                     "UPDATE endpoints SET resolved_as = ?1, resolved_at = ?2 WHERE id = ?3",
                 )
-                .bind_typed(resolved_as, DbType::Text)
-                .bind_typed(resolved_at, DbType::Integer(8))
+                .bind_typed(resolved_ips, DbType::Text)
+                .bind_typed(resolved_ts, DbType::Integer(8))
                 .bind(endpoint_id)
                 .exec(&mut tx)
                 .await?;
@@ -750,14 +761,17 @@ impl Database {
         .exec(&mut tx)
         .await?;
 
-        let count = toasty::sql::statement(
-            "DELETE FROM endpoints WHERE id IN ( \
-             SELECT e.id FROM endpoints e \
-             WHERE (SELECT COALESCE(MAX(p.last_seen_at), 0) FROM protocol_rows p WHERE p.endpoint_id = e.id) < ?1)",
+        let count = usize::try_from(
+            toasty::sql::statement(
+                "DELETE FROM endpoints WHERE id IN ( \
+                 SELECT e.id FROM endpoints e \
+                 WHERE (SELECT COALESCE(MAX(p.last_seen_at), 0) FROM protocol_rows p WHERE p.endpoint_id = e.id) < ?1)",
+            )
+            .bind(expire_threshold)
+            .exec(&mut tx)
+            .await?,
         )
-        .bind(expire_threshold)
-        .exec(&mut tx)
-        .await? as usize;
+        .map_err(|_| DatabaseError::Generic("purge row count overflow".into()))?;
 
         tx.commit().await?;
         Ok(count)
@@ -768,7 +782,8 @@ impl Database {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
         let mut conn = self.conn().await?;
         toasty::sql::statement("UPDATE protocol_rows SET last_seen_at = ?1 WHERE endpoint_id = ?2")
             .bind(now)
@@ -849,7 +864,8 @@ impl Database {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
         let mut conn = self.conn().await?;
 
         for ip in ips {
@@ -914,7 +930,8 @@ impl Database {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_secs()
+            .cast_signed();
 
         for ip in &ips {
             let eid = stable_hash(ip.to_string(), 0i64);
@@ -960,7 +977,7 @@ impl Database {
                     id: get_i64(&fields, 0)?,
                     host: get_string(&fields, 1)?,
                     host_type: get_string(&fields, 2)?,
-                    port: get_i64(&fields, 3)? as i32,
+                    port: get_i32(&fields, 3)?,
                     port_spec_str: get_opt_string(&fields, 4),
                     parent_id: get_opt_i64(&fields, 5),
                     last_source: get_opt_string(&fields, 6),
@@ -1175,7 +1192,7 @@ impl Database {
             .and_then(|v| {
                 if let Value::Record(fields) = v {
                     fields.first().and_then(|f| match f {
-                        Value::I64(n) => Some(*n as usize),
+                        Value::I64(n) => usize::try_from(*n).ok(),
                         _ => None,
                     })
                 } else {
@@ -1332,16 +1349,16 @@ impl Database {
         let mut conn = self.conn().await?;
 
         // Helper to deserialize protocol rows with endpoint address/port
-        let deserialize = |rows: Vec<Value>| -> Result<Vec<(i64, i32, String, String, i32)>> {
+        let deserialize = |rows: Vec<Value>| -> Result<Vec<PingRow>> {
             let mut out = Vec::with_capacity(rows.len());
             for value in rows {
                 if let Value::Record(fields) = value {
                     out.push((
                         get_i64(&fields, 0)?,
-                        get_i64(&fields, 1)? as i32,
+                        get_i32(&fields, 1)?,
                         get_string(&fields, 2)?,
                         get_string(&fields, 3)?,
-                        get_i64(&fields, 4)? as i32,
+                        get_i32(&fields, 4)?,
                     ));
                 }
             }
@@ -1385,23 +1402,23 @@ impl Database {
         };
 
         // Build items with rank and filter
-        let items: Vec<(i64, i32, String, i32, String, i32)>;
-        if let Some(profile_list) = profiles {
+        let items: Vec<(i64, i32, String, i32, String, i32)> = if let Some(profile_list) = profiles
+        {
             // Use sort_order from profiles, filter to listed protocol_ids
             let rank_map: HashMap<i64, i32> = profile_list.iter().copied().collect();
-            items = protocol_rows
+            protocol_rows
                 .into_iter()
                 .filter_map(|(pid, ct, ct_str, addr, port)| {
                     rank_map
                         .get(&pid)
                         .map(|&rank| (pid, ct, ct_str, rank, addr, port))
                 })
-                .collect();
+                .collect()
         } else {
             // Existing triplet_rank dedup
             let mut seen = HashSet::new();
             let mut rank = 0i32;
-            items = protocol_rows
+            protocol_rows
                 .into_iter()
                 .map(|(pid, ct, ct_str, addr, port)| {
                     let triplet = (ct, ct_str.clone());
@@ -1410,8 +1427,8 @@ impl Database {
                     }
                     (pid, ct, ct_str, rank, addr, port)
                 })
-                .collect();
-        }
+                .collect()
+        };
 
         let mut tx = conn.transaction().await?;
         let inserted = items.len();
@@ -1466,8 +1483,8 @@ impl Database {
              ORDER BY triplet_rank, id LIMIT ?2 OFFSET ?3",
         )
         .bind(batch_id)
-        .bind(limit as i64)
-        .bind(offset as i64)
+        .bind(limit.cast_signed())
+        .bind(offset.cast_signed())
         .exec(&mut conn)
         .await?;
         deserialize_ping_sessions(rows)
@@ -1525,7 +1542,8 @@ impl Database {
         .bind(batch_id)
         .exec(&mut conn)
         .await?;
-        Ok(updated as usize)
+        usize::try_from(updated)
+            .map_err(|_| DatabaseError::Generic("cancelled row count overflow".into()))
     }
 
     pub async fn cancel_ping_batch(&self, batch_id: &str) -> Result<usize> {
@@ -1537,7 +1555,8 @@ impl Database {
         .bind(batch_id)
         .exec(&mut conn)
         .await?;
-        Ok(updated as usize)
+        usize::try_from(updated)
+            .map_err(|_| DatabaseError::Generic("cancelled row count overflow".into()))
     }
 
     pub async fn cleanup_ping_batch(&self, batch_id: &str) -> Result<()> {
@@ -1593,7 +1612,7 @@ impl Database {
              ORDER BY triplet_rank, id LIMIT ?2",
         )
         .bind(batch_id)
-        .bind(limit as i64)
+        .bind(limit.cast_signed())
         .exec(&mut conn)
         .await?;
         deserialize_ping_sessions(rows)
@@ -1655,7 +1674,7 @@ impl Database {
         let rows = toasty::sql::query(&query)
             .bind(batch_id)
             .bind(wave)
-            .bind(limit as i64)
+            .bind(limit.cast_signed())
             .exec(&mut conn)
             .await?;
         deserialize_ping_sessions(rows)
@@ -1768,7 +1787,7 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         id: eid,
                         host: get_string(&fields, 1)?,
                         host_type: get_string(&fields, 2)?,
-                        port: get_i64(&fields, 3)? as i32,
+                        port: get_i32(&fields, 3)?,
                         port_spec_str: get_opt_string(&fields, 4),
                         parent_id: get_opt_i64(&fields, 5),
                         last_source: get_opt_string(&fields, 6),
@@ -1796,16 +1815,16 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         cred_hash: get_i64(&fields, 12)?,
                         proto_kind: get_string(&fields, 13)?,
                         spec_blob: get_blob(&fields, 14),
-                        config_type: get_i64(&fields, 15)? as i32,
+                        config_type: get_i32(&fields, 15)?,
                         core_type: get_string(&fields, 16)?,
                         transport: get_opt_string(&fields, 17),
                         security: get_opt_string(&fields, 18),
                         last_used_at: get_opt_i64(&fields, 19),
                         created_at: get_i64(&fields, 20)?,
                         last_seen_at: get_i64(&fields, 21)?,
-                        extension: Default::default(),
-                        server_stat: Default::default(),
-                        endpoint: Default::default(),
+                        extension: Deferred::default(),
+                        server_stat: Deferred::default(),
+                        endpoint: Deferred::default(),
                     });
                 }
 
@@ -1816,12 +1835,12 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         .entry(ext_pid)
                         .or_insert_with(|| ProfileExtension {
                             protocol_id: ext_pid,
-                            delay: get_opt_i64(&fields, 23).map(|v| v as i32),
+                            delay: get_opt_i32(&fields, 23),
                             speed: get_opt_i64(&fields, 24),
-                            sort_order: get_opt_i64(&fields, 25).map(|v| v as i32),
+                            sort_order: get_opt_i32(&fields, 25),
                             ip_info: get_opt_string(&fields, 26),
-                            delay_source: get_opt_i64(&fields, 27).map(|v| v as i32),
-                            protocol_row: Default::default(),
+                            delay_source: get_opt_i32(&fields, 27),
+                            protocol_row: Deferred::default(),
                         });
                 }
 
@@ -1834,7 +1853,7 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         total_up: get_opt_i64(&fields, 31),
                         total_down: get_opt_i64(&fields, 32),
                         last_updated: get_opt_string(&fields, 33),
-                        protocol_row: Default::default(),
+                        protocol_row: Deferred::default(),
                     });
                 }
             }
@@ -1850,7 +1869,11 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
     // host is unresolved (name tier) until a live resolution event flips it.
     for row in map.values_mut() {
         let dns_unresolved = row.endpoint.host_type == "dns"
-            && row.endpoint.resolved_as.as_deref().is_none_or(str::is_empty);
+            && row
+                .endpoint
+                .resolved_as
+                .as_deref()
+                .is_none_or(str::is_empty);
         row.sort_protocols_by_test_priority(dns_unresolved, None);
     }
 
@@ -1867,14 +1890,14 @@ fn deserialize_ping_sessions(rows: Vec<Value>) -> Result<Vec<PingSession>> {
                 id: get_string(&fields, 0)?,
                 batch_id: get_string(&fields, 1)?,
                 protocol_id: get_i64(&fields, 2)?,
-                config_type: get_i64(&fields, 3)? as i32,
+                config_type: get_i32(&fields, 3)?,
                 core_type: get_string(&fields, 4)?,
                 address: get_opt_string(&fields, 5),
-                port: get_opt_i64(&fields, 6).map(|v| v as i32),
-                triplet_rank: get_i64(&fields, 7)? as i32,
+                port: get_opt_i32(&fields, 6),
+                triplet_rank: get_i32(&fields, 7)?,
                 ping_type: get_string(&fields, 8)?,
                 status: get_string(&fields, 9)?,
-                latency_ms: get_opt_i64(&fields, 10).map(|v| v as i32),
+                latency_ms: get_opt_i32(&fields, 10),
                 speed_bps: get_opt_i64(&fields, 11),
                 ip_info: get_opt_string(&fields, 12),
                 error: get_opt_string(&fields, 13),
@@ -1904,7 +1927,6 @@ fn get_string(fields: &[Value], idx: usize) -> Result<String> {
 fn get_opt_string(fields: &[Value], idx: usize) -> Option<String> {
     fields.get(idx).and_then(|v| match v {
         Value::String(s) => Some(s.clone()),
-        Value::Null => None,
         _ => None,
     })
 }
@@ -1925,9 +1947,19 @@ fn get_i64(fields: &[Value], idx: usize) -> Result<i64> {
 fn get_opt_i64(fields: &[Value], idx: usize) -> Option<i64> {
     fields.get(idx).and_then(|v| match v {
         Value::I64(n) => Some(*n),
-        Value::Null => None,
         _ => None,
     })
+}
+
+fn get_i32(fields: &[Value], idx: usize) -> Result<i32> {
+    get_i64(fields, idx).and_then(|n| {
+        i32::try_from(n)
+            .map_err(|_| DatabaseError::Generic(format!("i64 column {idx} overflows i32")))
+    })
+}
+
+fn get_opt_i32(fields: &[Value], idx: usize) -> Option<i32> {
+    get_opt_i64(fields, idx).and_then(|n| i32::try_from(n).ok())
 }
 
 fn get_blob(fields: &[Value], idx: usize) -> Vec<u8> {
@@ -1947,8 +1979,8 @@ fn get_blob(fields: &[Value], idx: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// Simulate a pre-migration database (schema v1: no last_used_at /
-    /// resolved_as / resolved_at / cache_ttl_secs) and prove that
+    /// Simulate a pre-migration database (schema v1: no `last_used_at` /
+    /// `resolved_as` / `resolved_at` / `cache_ttl_secs`) and prove that
     /// `Database::open` migrates it in place.
     #[tokio::test]
     async fn test_open_migrates_old_schema() {
@@ -2012,8 +2044,8 @@ mod tests {
         assert!(db2.get_endpoint(0).await.is_ok());
     }
 
-    /// Simulate a v3 database (no delay_source column) and prove `Database::open`
-    /// re-adds it in place — push_schema never runs on existing databases.
+    /// Simulate a v3 database (no `delay_source` column) and prove `Database::open`
+    /// re-adds it in place — `push_schema` never runs on existing databases.
     #[tokio::test]
     async fn test_open_adds_delay_source_column() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2046,7 +2078,9 @@ mod tests {
                 .await
                 .expect("set version 3");
         }
-        let db = Database::open(&path).await.expect("open migrates delay_source");
+        let db = Database::open(&path)
+            .await
+            .expect("open migrates delay_source");
         let mut conn = db.db.connection().await.expect("connection");
         let rows = toasty::sql::query(
             "SELECT COUNT(*) FROM pragma_table_info('profile_extensions') WHERE name = 'delay_source'",
@@ -2067,7 +2101,10 @@ mod tests {
                 }
             })
             .unwrap_or(0);
-        assert_eq!(count, 1, "open() did not add profile_extensions.delay_source");
+        assert_eq!(
+            count, 1,
+            "open() did not add profile_extensions.delay_source"
+        );
     }
 
     /// `delay_source` plus the shifted stats/resolved column indices round-trip
@@ -2148,9 +2185,9 @@ mod tests {
         );
     }
 
-    /// Simulate a database created before the endpoint_id index existed
+    /// Simulate a database created before the `endpoint_id` index existed
     /// (schema version 2, index dropped) and prove that `Database::open`
-    /// recreates the index in place — push_schema never runs on existing
+    /// recreates the index in place — `push_schema` never runs on existing
     /// databases, so the migration transaction must.
     #[tokio::test]
     async fn test_open_migrates_adds_endpoint_id_index() {
@@ -2308,11 +2345,11 @@ mod tests {
     }
 
     /// 50 concurrent writers must all succeed. Pooled turso connections are
-    /// created WITHOUT the busy_timeout pragma that `open()` sets on its own
-    /// connection (busy_timeout is per-connection), so the enrichment herd /
+    /// created WITHOUT the `busy_timeout` pragma that `open()` sets on its own
+    /// connection (`busy_timeout` is per-connection), so the enrichment herd /
     /// ping flush used to fail writes instantly with `database is locked`
     /// instead of waiting their turn. Must be multi-threaded — a
-    /// current_thread runtime serializes the spawns and never contends.
+    /// `current_thread` runtime serializes the spawns and never contends.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_writes_no_database_locked() {
         let dir = tempfile::tempdir().expect("tempdir");

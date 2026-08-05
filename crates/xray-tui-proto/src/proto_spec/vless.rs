@@ -154,6 +154,7 @@ impl ProtoSpec for VlessConfig {
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
                         insecure,
+                        ..Default::default()
                     })),
                     enc: None,
                 }
@@ -399,17 +400,17 @@ impl ProtoSpec for VlessConfig {
                     c.tls,
                     c.servername.as_deref(),
                     c.skip_cert_verify,
-                    clash_alpn_as_str(&c.alpn),
+                    clash_alpn_as_str(c.alpn.as_ref()),
                     None,
                     c.reality_opts.as_ref(),
                 );
                 let transport = clash_transport_to_transport(
                     c.network.as_deref(),
-                    &c.ws_opts,
-                    &c.grpc_opts,
-                    &None,
-                    &None,
-                    &None,
+                    c.ws_opts.as_ref(),
+                    c.grpc_opts.as_ref(),
+                    None,
+                    None,
+                    None,
                     Some(&c.server),
                 );
                 let path = match &transport {
@@ -542,7 +543,7 @@ fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::super::{Proto, ProtoSpec, ProtocolConfig};
-    use crate::urlx::PortSpec;
+
     use crate::urlx::SchemeX;
 
     #[test]

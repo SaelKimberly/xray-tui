@@ -115,6 +115,7 @@ impl ProtoSpec for TuicConfig {
                     "0" | "false" => Some(false),
                     _ => None,
                 }),
+                ..Default::default()
             })),
             enc: None,
         };
@@ -223,7 +224,7 @@ impl ProtoSpec for TuicConfig {
                         Some(true),
                         c.servername.as_deref(),
                         c.skip_cert_verify,
-                        clash_alpn_as_str(&c.alpn),
+                        clash_alpn_as_str(c.alpn.as_ref()),
                         None,
                         None,
                     ),
@@ -304,7 +305,7 @@ impl ProtoIdentity for TuicConfig {
 #[cfg(test)]
 mod tests {
     use super::super::{ProtoSpec, ProtocolConfig};
-    use crate::urlx::PortSpec;
+
     use crate::urlx::SchemeX;
 
     #[test]

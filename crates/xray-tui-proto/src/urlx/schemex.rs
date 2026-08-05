@@ -60,8 +60,7 @@ impl SchemeX {
             Self::Ssh => "ssh",
             Self::Tailscale => "tailscale",
             Self::WireGuard => "wireguard",
-            Self::Undefined => return None,
-            Self::Unknown(_) => return None,
+            Self::Undefined | Self::Unknown(_) => return None,
         };
         Some(schema)
     }

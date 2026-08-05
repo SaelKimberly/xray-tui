@@ -30,5 +30,6 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+toasty = { version = "0.9", features = ["turso", "serde"] }
 serde_json = "1"
 tempfile = "3"

@@ -8,6 +8,25 @@ use serde_json::Value;
 
 use crate::urlx::{HostSpec, PortSpec, TinyText};
 
+/// Clash TLS fields as returned by `security_to_clash_tls`.
+type SecurityClashTls = (
+    Option<bool>,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Clash transport fields as returned by `transport_to_clash`.
+type TransportClash = (
+    Option<String>,
+    Option<ClashWSOpts>,
+    Option<ClashGrpcOpts>,
+    Option<ClashH2Opts>,
+    Option<ClashHttpOpts>,
+    Option<ClashKcpOpts>,
+);
+
 // ========================================
 // Transport Configurations
 // ========================================
@@ -379,13 +398,9 @@ pub struct TlsOpts {
     pub alpn: Option<TinyText>,
     pub fp: Option<TinyText>,
     pub insecure: Option<bool>,
-    #[cfg(feature = "experimental")]
     pub pqv: Option<TinyText>,
-    #[cfg(feature = "experimental")]
     pub ech: Option<TinyText>,
-    #[cfg(feature = "experimental")]
     pub vcn: Option<bool>,
-    #[cfg(feature = "experimental")]
     pub pcs: Option<TinyText>,
     pub pin_sha256: Option<TinyText>,
 }
@@ -437,15 +452,7 @@ pub(crate) fn clash_tls_to_security(
 }
 
 /// Convert a `SecurityConfig` back to Clash TLS fields.
-pub(crate) fn security_to_clash_tls(
-    security: &SecurityConfig,
-) -> (
-    Option<bool>,
-    Option<String>,
-    Option<bool>,
-    Option<String>,
-    Option<String>,
-) {
+pub(crate) fn security_to_clash_tls(security: &SecurityConfig) -> SecurityClashTls {
     match &security.tls {
         Some(TlsConfig::Tls(opts)) => (
             Some(true),
@@ -487,11 +494,11 @@ pub(crate) fn clash_server_to_host(server: &str) -> Result<HostSpec, ParseError>
 /// Convert Clash transport fields to a `TransportConfig`.
 pub(crate) fn clash_transport_to_transport(
     network: Option<&str>,
-    ws_opts: &Option<ClashWSOpts>,
-    grpc_opts: &Option<ClashGrpcOpts>,
-    h2_opts: &Option<ClashH2Opts>,
-    _http_opts: &Option<ClashHttpOpts>,
-    mkcp_opts: &Option<ClashKcpOpts>,
+    ws_opts: Option<&ClashWSOpts>,
+    grpc_opts: Option<&ClashGrpcOpts>,
+    h2_opts: Option<&ClashH2Opts>,
+    _http_opts: Option<&ClashHttpOpts>,
+    mkcp_opts: Option<&ClashKcpOpts>,
     server: Option<&str>,
 ) -> TransportConfig {
     match network {
@@ -543,10 +550,10 @@ pub(crate) fn clash_transport_to_transport(
                 .as_ref()
                 .and_then(|g| g.grpc_user_agent.clone())
                 .map(TinyText::from),
-            ping_interval: grpc_opts.as_ref().and_then(|g| g.ping_interval),
+            ping_interval: grpc_opts.and_then(|g| g.ping_interval),
         }),
         Some("h2" | "http") => {
-            let h = h2_opts.as_ref();
+            let h = h2_opts;
             TransportConfig::Http(HttpConfig {
                 path: h.and_then(|h| h.path.clone()).map(TinyText::from),
                 host: h
@@ -585,17 +592,7 @@ pub(crate) fn clash_transport_to_transport(
 }
 
 /// Convert a `TransportConfig` back to Clash transport fields.
-pub(crate) fn transport_to_clash(
-    transport: &TransportConfig,
-    server: &str,
-) -> (
-    Option<String>,
-    Option<ClashWSOpts>,
-    Option<ClashGrpcOpts>,
-    Option<ClashH2Opts>,
-    Option<ClashHttpOpts>,
-    Option<ClashKcpOpts>,
-) {
+pub(crate) fn transport_to_clash(transport: &TransportConfig, server: &str) -> TransportClash {
     match transport {
         TransportConfig::Ws(w) => {
             // Clash carries the WS vhost in `headers.Host`; forward `host` so the
@@ -678,14 +675,12 @@ pub(crate) fn transport_to_clash(
 }
 
 /// Convert a Clash ALPN (Option<Vec<String>>) to Option<&str> for `clash_tls_to_security`.
-pub(crate) fn clash_alpn_as_str(alpn: &Option<Vec<String>>) -> Option<&str> {
-    alpn.as_ref()
-        .and_then(|v| v.first())
+pub(crate) fn clash_alpn_as_str(alpn: Option<&Vec<String>>) -> Option<&str> {
+    alpn.and_then(|v| v.first())
         .map(std::string::String::as_str)
 }
 
 /// Convert a Clash server string to `HostSpec`.
-
 pub(crate) fn host_spec_to_string(h: &HostSpec) -> String {
     match h {
         HostSpec::IpAddress(ip) => match ip {
@@ -697,19 +692,9 @@ pub(crate) fn host_spec_to_string(h: &HostSpec) -> String {
     }
 }
 
-/// Convert a u16 port to `PortSpec` (single-port).
-pub(crate) fn port_spec_from_u16(p: u16) -> PortSpec {
-    PortSpec::new_with(p)
-}
-
 /// Get the first port from `PortSpec`, or default.
 pub(crate) fn port_spec_first(p: &PortSpec) -> u16 {
     p.iter().next().unwrap_or(443)
-}
-
-/// Convert Option<String> to Option<TinyText>.
-pub(crate) fn opt_string_to_tiny(s: Option<String>) -> Option<TinyText> {
-    s.map(TinyText::from)
 }
 
 /// Build xray-core `streamSettings` JSON from typed security + transport.
@@ -986,8 +971,7 @@ mod tests {
             ])),
             ..ClashWSOpts::default()
         };
-        let t =
-            clash_transport_to_transport(Some("ws"), &Some(ws), &None, &None, &None, &None, None);
+        let t = clash_transport_to_transport(Some("ws"), Some(&ws), None, None, None, None, None);
         match t {
             TransportConfig::Ws(w) => {
                 assert_eq!(w.host.as_deref(), Some("cdn.example.com"));

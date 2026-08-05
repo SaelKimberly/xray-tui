@@ -36,7 +36,7 @@ pub use log_heed::HeedLogStorage;
 pub use ping::QuicPingAdapter;
 pub use ping::{
     CorePool, FastPingAdapter, FastPingManager, PingCapability, PingError, PingResult, ProfileKey,
-    RealPingManager, TcpPingAdapter, UdpPingAdapter,
+    RealPingManager, SinglePingReq, TcpPingAdapter, UdpPingAdapter,
 };
 pub use process::{CoreManager, MockCoreManager, ProcessError, RealCoreManager};
 pub use protocol::Protocol;

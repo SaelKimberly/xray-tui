@@ -316,9 +316,7 @@ impl EndpointRow {
     ) -> (u8, i32, i64, i64) {
         self.protocols
             .iter()
-            .map(|p| {
-                Self::protocol_test_key(p, self.extensions.get(&p.id), dns_unresolved, rounds)
-            })
+            .map(|p| Self::protocol_test_key(p, self.extensions.get(&p.id), dns_unresolved, rounds))
             .min()
             .unwrap_or((2, i32::MAX, 0, 0))
     }
@@ -441,10 +439,7 @@ mod tests {
             (20, 2, Some(80), Some(DELAY_SOURCE_FAST)),
             (30, 3, None, None),
         ]);
-        r.sort_protocols_by_test_priority(
-            false,
-            Some((&failed(&[20]), &failed(&[10]))),
-        );
+        r.sort_protocols_by_test_priority(false, Some((&failed(&[20]), &failed(&[10]))));
         assert_eq!(ids(&r), vec![30, 10, 20]);
     }
 
@@ -467,7 +462,11 @@ mod tests {
 
     #[test]
     fn untested_keeps_last_seen_recency_order() {
-        let mut r = row(&[(10, 5, None, None), (20, 9, None, None), (30, 1, None, None)]);
+        let mut r = row(&[
+            (10, 5, None, None),
+            (20, 9, None, None),
+            (30, 1, None, None),
+        ]);
         r.sort_protocols_by_test_priority(false, None);
         assert_eq!(ids(&r), vec![20, 10, 30]); // newest first
     }

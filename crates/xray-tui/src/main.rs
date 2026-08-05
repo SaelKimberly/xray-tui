@@ -130,9 +130,7 @@ async fn main() -> Result<()> {
         let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
         loop {
             // Wait for at least one message
-            let msg = if let Ok(msg) = log_rx.recv() {
-                msg
-            } else {
+            let Ok(msg) = log_rx.recv() else {
                 // Channel closed (sender dropped) — flush and exit
                 if !batch.is_empty() {
                     let _ = writer_heed.write_log_batch(&batch);
@@ -193,10 +191,13 @@ async fn main() -> Result<()> {
                 let (target, level, message, _ts) =
                     xray_tui::parse_core_log_line(&line, xray_tui_core::CoreType::Auto);
                 let msg = xray_tui_core::log_heed::LogMessage {
-                    timestamp_nanos: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64,
+                    timestamp_nanos: u64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos(),
+                    )
+                    .unwrap_or(u64::MAX),
                     level,
                     target,
                     message,

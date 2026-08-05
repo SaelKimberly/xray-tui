@@ -10,10 +10,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use xray_tui_db::models::{Endpoint, ProtocolRow};
+use xray_tui_host_features::HostFeatures;
 
 use crate::AppState;
 use crate::profile_to_fields;
 use crate::types::{CoreEvent, EndpointInfo};
+
+/// One enrichment target: endpoint id, endpoint, its active protocol, a
+/// persisted `resolved_as` string, and the persisted `resolved_at` timestamp.
+type EnrichTarget = (i64, Endpoint, ProtocolRow, Option<String>, Option<i64>);
 
 /// Rebuild the same `Profile` connect.rs builds from an endpoint row + protocol.
 #[must_use]
@@ -50,7 +55,7 @@ fn extract_sni(profile: &xray_tui_config::import_export::Profile) -> Option<Stri
     }
     profile_to_fields(profile)
         .into_iter()
-        .find(|(k, _)| k == "sni" || k.ends_with(".sni"))
+        .find(|(k, _)| k == "sni" || k.rsplit_once('.').is_some_and(|(_, ext)| ext == "sni"))
         .map(|(_, v)| v)
 }
 
@@ -184,16 +189,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                 None,
             ),
             _ => {
-                if !is_resolvable_hostname(&host) {
-                    // Plugin URLs / garbage hostnames can never resolve;
-                    // record a failed attempt (TTL-gated) instead of firing
-                    // hickory parse errors on every refresh.
-                    tracing::debug!(
-                        target: "tui::ops::enrich",
-                        "Skipping DNS lookup for invalid hostname: {host}"
-                    );
-                    (Vec::new(), Some(now))
-                } else {
+                if is_resolvable_hostname(&host) {
                     match &dns {
                         Some(r) => {
                             // Overall deadline: resolver init (DNSCrypt list
@@ -241,14 +237,23 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                         }
                         None => (Vec::new(), None),
                     }
+                } else {
+                    // Plugin URLs / garbage hostnames can never resolve;
+                    // record a failed attempt (TTL-gated) instead of firing
+                    // hickory parse errors on every refresh.
+                    tracing::debug!(
+                        target: "tui::ops::enrich",
+                        "Skipping DNS lookup for invalid hostname: {host}"
+                    );
+                    (Vec::new(), Some(now))
                 }
-            },
+            }
         };
 
         let mut info = EndpointInfo {
             resolved_ips: ips,
             country: None,
-            host_features: Default::default(),
+            host_features: HostFeatures::default(),
             sni_whitelisted: None,
             outbound_ip: None,
             outbound_country: None,
@@ -272,11 +277,12 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 }
 
 /// Startup/refresh pass: seed `endpoint_info` for every endpoint that has no
+///
 /// entry yet — IP hosts (parse host, no DNS) and DNS hosts with a persisted
 /// `resolved_as` (from the endpoints table; no network). Geo + whitelist
 /// features are filled in the same task.
 pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
-    let targets: Vec<(i64, Endpoint, ProtocolRow, Option<String>, Option<i64>)> = state
+    let targets: Vec<EnrichTarget> = state
         .endpoints
         .iter()
         .filter(|r| {
@@ -313,7 +319,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                         .filter_map(|s| s.parse::<IpAddr>().ok())
                         .collect(),
                     country: None,
-                    host_features: Default::default(),
+                    host_features: HostFeatures::default(),
                     sni_whitelisted: None,
                     outbound_ip: None,
                     outbound_country: None,
@@ -328,7 +334,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                     ],
                     country: None,
-                    host_features: Default::default(),
+                    host_features: HostFeatures::default(),
                     sni_whitelisted: None,
                     outbound_ip: None,
                     outbound_country: None,
@@ -352,6 +358,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
 }
 
 /// Refresh whitelist features (ip/cidr + SNI) for every endpoint once the
+///
 /// checker has loaded. Runs on every launch — features are never persisted, so
 /// cached entries get fresh membership. Sends a full copy of each entry.
 pub fn spawn_whitelist_pass(state: &mut AppState) {
@@ -401,6 +408,7 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
 }
 
 /// Record the exit (egress) IP + country of a real ping on the endpoint that
+///
 /// owns `protocol_id`. The IP is parsed from real-ping `ip_info`
 /// (`"{ip} | {country}"`); the country hint string is replaced by the mmdb ISO
 /// code. Sends a full copy of the entry with outbound fields set.
@@ -468,10 +476,7 @@ mod tests {
             "a-b.example.com",
             "example.com.", // trailing-dot FQDN
         ] {
-            assert!(
-                is_resolvable_hostname(host),
-                "{host} should be resolvable"
-            );
+            assert!(is_resolvable_hostname(host), "{host} should be resolvable");
         }
     }
 
@@ -492,10 +497,7 @@ mod tests {
             "exämple.com",
             "foo_com.com",
         ] {
-            assert!(
-                !is_resolvable_hostname(host),
-                "{host:?} should be rejected"
-            );
+            assert!(!is_resolvable_hostname(host), "{host:?} should be rejected");
         }
     }
 

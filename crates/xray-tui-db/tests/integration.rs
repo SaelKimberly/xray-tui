@@ -3,11 +3,10 @@
     reason = "test db lifetime is the function scope"
 )]
 
-use uuid::Uuid;
-
+use toasty::Deferred;
 use xray_tui_db::Database;
 use xray_tui_db::hash::stable_hash;
-use xray_tui_db::models::{Endpoint, EndpointGroup, Group, ProtocolRow};
+use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
 
 /// Helper: create in-memory database.
 async fn test_db() -> Database {
@@ -67,9 +66,9 @@ fn make_protocol(endpoint_id: i64, proto_kind: &str, sid: i64) -> ProtocolRow {
         last_used_at: None,
         created_at: 1000,
         last_seen_at: 1000,
-        endpoint: Default::default(),
-        extension: Default::default(),
-        server_stat: Default::default(),
+        endpoint: Deferred::default(),
+        extension: Deferred::default(),
+        server_stat: Deferred::default(),
     }
 }
 
@@ -158,7 +157,7 @@ async fn test_active_vs_stale() {
         "active endpoint should be in active view"
     );
     let stale_rows = db
-        .get_stale_endpoints(now - ttl_secs, -999999)
+        .get_stale_endpoints(now - ttl_secs, -999_999)
         .await
         .unwrap();
     assert!(
@@ -167,7 +166,7 @@ async fn test_active_vs_stale() {
     );
 
     let stale_rows = db
-        .get_stale_endpoints(now - ttl_secs, -999999)
+        .get_stale_endpoints(now - ttl_secs, -999_999)
         .await
         .unwrap();
     assert!(
@@ -555,7 +554,7 @@ async fn test_concurrent_subscription_upsert() {
     // busy_timeout which the internal connection setup doesn't propagate.)
     for i in 0..10 {
         let host = format!("192.0.2.{}", i + 1);
-        let port = 1000 + i as i32;
+        let port = 1000 + i32::try_from(i).expect("test loop index fits in i32");
         let ep = make_endpoint(&host, port);
         let proto = make_protocol(ep.id, "vmess", 20000 + i);
         let ids = db

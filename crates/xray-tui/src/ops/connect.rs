@@ -66,8 +66,11 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         return;
     };
 
-    let core_type =
-        resolve_core(protocol, profile_override, shadowsocks_method(&protocol_row).as_deref());
+    let core_type = resolve_core(
+        protocol,
+        profile_override,
+        shadowsocks_method(&protocol_row).as_deref(),
+    );
 
     // If already connected/disconnecting, send stop signal first
     if let Some(tx) = state.disconnect_tx.take() {
@@ -301,10 +304,10 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
                     _ = ticker.tick() => {
                         if let Some(ref provider) = provider {
                             match provider.query_stats("outbound>>>*>>>traffic>>>*", true).await {
-                                Ok(stats) => {
+                                Ok(rows) => {
                                     let mut today_up = 0i64;
                                     let mut today_down = 0i64;
-                                    for stat in &stats {
+                                    for stat in &rows {
                                         if stat.name.contains(">>>uplink") {
                                             today_up += stat.value;
                                         } else if stat.name.contains(">>>downlink") {

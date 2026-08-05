@@ -553,13 +553,13 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            state.move_profile_up().await;
+            state.move_profile_up();
         }
         KeyCode::Down
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            state.move_profile_down().await;
+            state.move_profile_down();
         }
         KeyCode::Enter | KeyCode::Char('g')
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -721,7 +721,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && state.current_tab == Tab::Profiles =>
         {
             if let Some(id) = state.selected_profile_id() {
-                state.clone_profile(id).await;
+                state.clone_profile(id);
             }
         }
         KeyCode::Char('v')
@@ -962,12 +962,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
                 ],
-                Tab::Statistics => vec![
-                    ("Tab / Shift+Tab", "Cycle tabs"),
-                    ("?", "Toggle this help"),
-                    ("q / Ctrl+C", "Quit"),
-                ],
-                Tab::Actions => vec![
+                Tab::Statistics | Tab::Actions => vec![
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),

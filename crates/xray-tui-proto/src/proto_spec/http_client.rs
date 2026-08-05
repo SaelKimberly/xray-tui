@@ -111,6 +111,7 @@ impl ProtoSpec for HttpClientConfig {
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
                         insecure,
+                        ..Default::default()
                     })),
                     enc: None,
                 }

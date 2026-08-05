@@ -293,11 +293,12 @@ fn build_proxy_outbound(
             })
         };
         if !has("publicKey") || !has("serverName") {
-            return Err(BuildError::InvalidProfile(format!(
+            return Err(BuildError::InvalidProfile(
                 "REALITY profile is missing required stream settings \
                  (realitySettings.publicKey / serverName); \
                  security is 'reality' but the reality settings are incomplete"
-            )));
+                    .to_string(),
+            ));
         }
     }
 
@@ -878,8 +879,8 @@ mod tests {
             allow_private_ips: false,
             reject_insecure: false,
         };
-        let parsed = xray_tui_config::import_export::parse_share_url(url, &settings)
-            .expect("parse url");
+        let parsed =
+            xray_tui_config::import_export::parse_share_url(url, &settings).expect("parse url");
         let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
         protocol.spec_blob = parsed.spec_blob;
         let (params, rules, dns) = default_params();
@@ -911,13 +912,9 @@ mod tests {
         // xray-core builds 2022-blake3 ciphers under protocol "shadowsocks".
         let (endpoint, mut protocol) =
             test_endpoint_and_protocol(Protocol::Shadowsocks2022.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"method": "2022-blake3-aes-128-gcm"}"#,
-        );
+        set_protocol_settings_json(&mut protocol, r#"{"method": "2022-blake3-aes-128-gcm"}"#);
         let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         let proxy = json["outbounds"]
             .as_array()
@@ -926,7 +923,10 @@ mod tests {
             .find(|o| o["tag"] == "proxy")
             .unwrap();
         assert_eq!(proxy["protocol"], "shadowsocks");
-        assert_eq!(proxy["settings"]["servers"][0]["method"], "2022-blake3-aes-128-gcm");
+        assert_eq!(
+            proxy["settings"]["servers"][0]["method"],
+            "2022-blake3-aes-128-gcm"
+        );
     }
 
     #[test]

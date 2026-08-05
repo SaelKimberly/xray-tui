@@ -95,6 +95,7 @@ impl ProtoSpec for AnyTlsConfig {
                     alpn,
                     fp: None,
                     insecure,
+                    ..Default::default()
                 })),
                 enc: None,
             }

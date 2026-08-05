@@ -118,6 +118,7 @@ impl ProtoSpec for TrojanConfig {
                         alpn: utils::query_get(&query, "alpn").map(TinyText::from),
                         fp: utils::query_get(&query, "fp").map(TinyText::from),
                         insecure,
+                        ..Default::default()
                     })),
                     enc: None,
                 }
@@ -303,7 +304,7 @@ impl ProtoSpec for TrojanConfig {
                     Some(c.tls),
                     c.servername.as_deref(),
                     c.skip_cert_verify,
-                    clash_alpn_as_str(&c.alpn),
+                    clash_alpn_as_str(c.alpn.as_ref()),
                     c.fingerprint.as_deref(),
                     None,
                 );
@@ -317,11 +318,11 @@ impl ProtoSpec for TrojanConfig {
                 };
                 let transport = clash_transport_to_transport(
                     network,
-                    &c.ws_opts,
-                    &c.grpc_opts,
-                    &None,
-                    &None,
-                    &None,
+                    c.ws_opts.as_ref(),
+                    c.grpc_opts.as_ref(),
+                    None,
+                    None,
+                    None,
                     Some(&c.server),
                 );
                 // Derive path from transport (same pattern as try_parse)
@@ -421,7 +422,7 @@ impl ProtoIdentity for TrojanConfig {
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
-    use crate::urlx::PortSpec;
+
     use crate::urlx::SchemeX;
 
     #[test]

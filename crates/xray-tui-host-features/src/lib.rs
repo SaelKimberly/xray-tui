@@ -32,8 +32,10 @@ pub struct HostFeatures {
 }
 
 /// SNI/exact-IP/CIDR whitelist membership checker backed by bloom filters
-/// (fast-negative guard) plus exact HashSet/interval verification (zero false
-/// positives). IPv4-only; ported from sub-healer's `WhitelistChecker`.
+/// (fast-negative guard) plus exact HashSet/interval verification.
+///
+/// Zero false positives. IPv4-only; ported from sub-healer's
+/// `WhitelistChecker`.
 #[derive(Debug)]
 pub struct HostFeaturesChecker {
     /// SNI whitelist (whitelist.txt) — hostnames

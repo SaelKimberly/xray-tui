@@ -234,7 +234,7 @@ impl ProtocolConfig {
                 let mut p = extra
                     .get("protocol_settings")
                     .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
                 // Inject `user_id` as `id` into p_settings if absent (legacy
                 // parsers store UUID/PW at top level, not inside protocol_settings).
                 if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str())
@@ -248,7 +248,7 @@ impl ProtocolConfig {
                 let s = extra
                     .get("stream_settings")
                     .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
                 (p, s)
             }
             // Typed protocols: build from typed config fields
@@ -905,7 +905,7 @@ pub(crate) mod test_helpers {
         assert_eq!(parsed, reparsed, "roundtrip failed for: {url}");
     }
 
-    /// Test Clash roundtrip: parse URL -> config -> to_clash -> try_from_clash -> config
+    /// Test Clash roundtrip: parse URL -> config -> `to_clash` -> `try_from_clash` -> config
     pub fn check_clash_roundtrip<T>(url: &str)
     where
         T: ProtoSpec + std::fmt::Debug + PartialEq,
@@ -933,7 +933,7 @@ mod tests {
         });
         let json = serde_json::to_vec(&blob).unwrap();
         let a = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json.clone()));
-        let b = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json.clone()));
+        let b = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json));
         let c = Proto::new(ProtocolConfig::from_legacy_parse(
             "wireguard",
             serde_json::to_vec(&serde_json::json!({
@@ -1015,6 +1015,6 @@ mod tests {
             67_890,
             "seeded cred_hash returned without recompute"
         );
-        assert_eq!(proto.uid(), 12_345 ^ 67_890, "uid == sig ^ cred_hash");
+        assert_eq!(proto.uid(), 0x3039 ^ 0x1_0932, "uid == sig ^ cred_hash");
     }
 }

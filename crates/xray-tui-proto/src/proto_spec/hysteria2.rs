@@ -126,6 +126,7 @@ impl ProtoSpec for Hysteria2Config {
                     "0" | "false" | "no" => Some(false),
                     _ => None,
                 }),
+                ..Default::default()
             })),
             enc: None,
         };

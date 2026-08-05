@@ -72,18 +72,17 @@ impl ProtoSpec for ShadowTlsConfig {
         let version = utils::query_get(&query, "version").map(TinyText::from);
 
         // Build security config with SNI if present
-        let security = if let Some(sni) = utils::query_get(&query, "sni") {
-            SecurityConfig {
-                tls: Some(TlsConfig::Tls(TlsOpts {
-                    pin_sha256: None,
-                    sni: Some(TinyText::from(sni)),
-                    ..Default::default()
-                })),
-                enc: None,
-            }
-        } else {
-            SecurityConfig::default()
-        };
+        let security =
+            utils::query_get(&query, "sni").map_or_else(SecurityConfig::default, |sni| {
+                SecurityConfig {
+                    tls: Some(TlsConfig::Tls(TlsOpts {
+                        pin_sha256: None,
+                        sni: Some(TinyText::from(sni)),
+                        ..Default::default()
+                    })),
+                    enc: None,
+                }
+            });
 
         Ok(Self {
             password,
@@ -222,7 +221,7 @@ impl ProtoIdentity for ShadowTlsConfig {
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
-    use crate::urlx::PortSpec;
+
     use crate::urlx::SchemeX;
 
     #[test]

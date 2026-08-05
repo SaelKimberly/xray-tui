@@ -204,13 +204,14 @@ impl<'a> RawUrlX<'a> {
     ///
     /// If the fragment is not valid UTF-8, an error is returned.
     pub fn fragment(&self) -> Result<Option<TinyText>, core::str::Utf8Error> {
-        if let Some(fragment) = self.fragment {
-            let fragment = urlencoding::decode_binary(fragment.as_bytes());
-            let s = String::from_utf8_lossy(&fragment);
-            Ok(Some(TinyText::from(s.as_ref())))
-        } else {
-            Ok(None)
-        }
+        self.fragment.as_ref().map_or_else(
+            || Ok(None),
+            |fragment| {
+                let fragment = urlencoding::decode_binary(fragment.as_bytes());
+                let s = String::from_utf8_lossy(&fragment);
+                Ok(Some(TinyText::from(s.as_ref())))
+            },
+        )
     }
 
     #[allow(clippy::too_many_lines)]

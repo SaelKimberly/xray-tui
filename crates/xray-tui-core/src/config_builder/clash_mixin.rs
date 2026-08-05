@@ -82,6 +82,7 @@ mod tests {
         assert!(parse_clash_mixin("  ").is_none());
     }
 
+    #[test]
     fn parse_invalid() {
         // Garbage that's neither valid JSON nor valid YAML
         assert!(parse_clash_mixin("\0\x01\x02").is_none());

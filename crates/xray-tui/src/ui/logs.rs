@@ -185,18 +185,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Compute offset — during selection, pin viewport so entire range is visible
     let approx_visible = (log_area.height as usize).saturating_sub(2);
-    let offset = if let Some(anchor) = state.log_select_anchor {
-        let oldest_row = filtered_count.saturating_sub(state.log_scroll.max(anchor) + 1);
-        let newest_row = filtered_count.saturating_sub(state.log_scroll.min(anchor) + 1);
-        let range_height = newest_row.saturating_sub(oldest_row).saturating_add(1);
-        if range_height <= approx_visible {
-            oldest_row
-        } else {
-            filtered_count.saturating_sub(state.log_scroll + approx_visible)
-        }
-    } else {
-        filtered_count.saturating_sub(state.log_scroll + approx_visible)
-    };
+    let offset = state.log_select_anchor.map_or_else(
+        || filtered_count.saturating_sub(state.log_scroll + approx_visible),
+        |anchor| {
+            let oldest_row = filtered_count.saturating_sub(state.log_scroll.max(anchor) + 1);
+            let newest_row = filtered_count.saturating_sub(state.log_scroll.min(anchor) + 1);
+            let range_height = newest_row.saturating_sub(oldest_row).saturating_add(1);
+            if range_height <= approx_visible {
+                oldest_row
+            } else {
+                filtered_count.saturating_sub(state.log_scroll + approx_visible)
+            }
+        },
+    );
 
     // Build multi-selection set from anchor range (offset-from-bottom)
     let mut multi_selected = HashSet::new();

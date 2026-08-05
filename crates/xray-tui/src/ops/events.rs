@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use toasty::Deferred;
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::models::{
@@ -99,16 +100,16 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 total_down,
             } => {
                 state.connection_error = None;
-                let stats = ServerStat {
+                let record = ServerStat {
                     protocol_id,
                     today_up: Some(today_up),
                     today_down: Some(today_down),
                     total_up: Some(total_up),
                     total_down: Some(total_down),
                     last_updated: Some(format_now()),
-                    protocol_row: Default::default(),
+                    protocol_row: Deferred::default(),
                 };
-                if let Err(e) = state.db.upsert_server_stats(&stats).await {
+                if let Err(e) = state.db.upsert_server_stats(&record).await {
                     state.log_trace(
                         "error",
                         "tui::ops::events",
@@ -119,14 +120,14 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // protocol_id is a ProtocolRow id — match the row whose
                 // protocols list owns it (never the endpoint id).
                 if let Some(row) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id) {
-                    row.stats.insert(protocol_id, stats);
+                    row.stats.insert(protocol_id, record);
                 }
                 state.current_traffic_up = total_up;
                 state.current_traffic_down = total_down;
             }
-            CoreEvent::SysStatsUpdate(stats) => {
-                state.current_memory = stats.alloc;
-                state.system_stats = Some(stats);
+            CoreEvent::SysStatsUpdate(sys_stats) => {
+                state.current_memory = sys_stats.alloc;
+                state.system_stats = Some(sys_stats);
             }
             CoreEvent::LogLine { .. } => {}
             CoreEvent::TuiLog {
@@ -261,7 +262,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                         sort_order: None,
                                         ip_info: None,
                                         delay_source: None,
-                                        protocol_row: Default::default(),
+                                        protocol_row: Deferred::default(),
                                     }
                                 });
                                 match test_type {
@@ -340,11 +341,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .iter()
                         .find(|r| r.endpoint.id == ep_id)
                         .and_then(|r| session_rounds(&state.ping_status, r));
-                    if let Some(row) = state
-                        .endpoints
-                        .iter_mut()
-                        .find(|r| r.endpoint.id == ep_id)
-                    {
+                    if let Some(row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
                         row.sort_protocols_by_test_priority(dns_unresolved, rounds);
                         if let Some(pid) = keep {
                             state.selected_sub = row.protocols.iter().position(|p| p.id == pid);
@@ -665,7 +662,7 @@ mod tests {
 
     use super::*;
 
-    /// EndpointRow fixture: one endpoint owning one protocol.
+    /// `EndpointRow` fixture: one endpoint owning one protocol.
     fn row_with_protocol(endpoint_id: i64, protocol_id: i64) -> EndpointRow {
         EndpointRow {
             endpoint: Endpoint {

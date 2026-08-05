@@ -73,14 +73,13 @@ impl ProtoSpec for Hysteria1Config {
     /// Auth token is in userinfo (optional). Port defaults to 443 when absent.
     /// TLS is always on. `insecure` accepts 3 alias variants for compatibility.
     fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+        let userinfo = raw.userinfo;
         let (auth, hostport) = if let Some(hostport) = raw.hostport {
             // When hostport is present, userinfo equals hostport if no '@' was
             // in the URL (no auth), otherwise userinfo is the auth token.
-            let userinfo = raw.userinfo;
             let auth = (userinfo != hostport).then(|| userinfo.to_string());
             (auth, hostport)
         } else {
-            let userinfo = raw.userinfo;
             let (auth_str, hostport) = userinfo.split_once('@').ok_or_else(|| {
                 ParseError::InvalidUserInfo(format!("{userinfo}: missing hostport").into())
             })?;
@@ -130,6 +129,7 @@ impl ProtoSpec for Hysteria1Config {
                     "0" | "false" | "no" => Some(false),
                     _ => None,
                 }),
+                ..Default::default()
             })),
             enc: None,
         };
@@ -157,10 +157,10 @@ impl ProtoSpec for Hysteria1Config {
             format!("{host}:{}", self.port)
         };
 
-        let mut base = match &self.auth {
-            Some(a) => format!("hysteria://{}@{}", urlencoding::encode(a), hostport),
-            None => format!("hysteria://{hostport}"),
-        };
+        let mut base = self.auth.as_ref().map_or_else(
+            || format!("hysteria://{hostport}"),
+            |a| format!("hysteria://{}@{}", urlencoding::encode(a), hostport),
+        );
 
         let query_string = {
             let mut parts: Vec<String> = Vec::new();
@@ -324,7 +324,7 @@ impl ProtoIdentity for Hysteria1Config {
 mod tests {
     use super::super::ProtoSpec;
     use super::Hysteria1Config;
-    use crate::urlx::PortSpec;
+
     use crate::urlx::SchemeX;
 
     #[test]

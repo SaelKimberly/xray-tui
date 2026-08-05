@@ -13,5 +13,5 @@ pub fn stable_hash(left: impl Hash, right: impl Hash) -> i64 {
     let mut hasher = DefaultHasher::new();
     left.hash(&mut hasher);
     right.hash(&mut hasher);
-    hasher.finish() as i64
+    hasher.finish().cast_signed()
 }

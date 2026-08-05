@@ -49,10 +49,22 @@ pub struct CorePool {
     bin_dir: PathBuf,
     bin_configs_dir: PathBuf,
     proxy_addr: String,
-    base_proxy_port: u16,
     next_port: Arc<AtomicU16>,
     /// Set to `true` when a batch operation is active — pool yields to multi-inbound.
     batch_active: Arc<AtomicBool>,
+}
+
+/// Parameters for one single-ping request, shared by `ping`, `pooled_ping`,
+/// `fresh_ping`, and `fresh_ping_and_cache`.
+pub struct SinglePingReq<'a> {
+    /// URL to fetch through the SOCKS5 proxy to measure latency.
+    pub ping_url: &'a str,
+    /// URL to fetch the exit IP / ISP info from.
+    pub ip_api_url: &'a str,
+    /// Per-request timeout for the HTTP probe.
+    pub timeout: Duration,
+    /// Retry count for the probe.
+    pub retries: u32,
 }
 
 impl CorePool {
@@ -69,7 +81,6 @@ impl CorePool {
             bin_dir,
             bin_configs_dir,
             proxy_addr,
-            base_proxy_port,
             next_port: Arc::new(AtomicU16::new(base_proxy_port + 1)),
             batch_active: Arc::new(AtomicBool::new(false)),
         }
@@ -98,19 +109,13 @@ impl CorePool {
         &self,
         endpoint: &Endpoint,
         protocol: &ProtocolRow,
-        ping_url: &str,
-        ip_api_url: &str,
-        timeout: Duration,
-        retries: u32,
+        req: SinglePingReq<'_>,
     ) -> super::super::PingResult {
         // If batch is active, don't use the pool — batch uses multi-inbound.
         if self.batch_active.load(Ordering::Relaxed) {
-            return self
-                .fresh_ping(endpoint, protocol, ping_url, ip_api_url, timeout, retries)
-                .await;
+            return self.fresh_ping(endpoint, protocol, req).await;
         }
-        self.pooled_ping(endpoint, protocol, ping_url, ip_api_url, timeout, retries)
-            .await
+        self.pooled_ping(endpoint, protocol, req).await
     }
 
     /// Pool-aware ping: acquire warm core or spawn fresh, reuse after.
@@ -118,10 +123,7 @@ impl CorePool {
         &self,
         endpoint: &Endpoint,
         protocol: &ProtocolRow,
-        ping_url: &str,
-        ip_api_url: &str,
-        timeout: Duration,
-        retries: u32,
+        req: SinglePingReq<'_>,
     ) -> super::super::PingResult {
         let config_type = protocol.config_type;
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
@@ -268,10 +270,10 @@ impl CorePool {
                 let rp_result = crate::speed_test::real_ping(
                     &self.proxy_addr,
                     port,
-                    ping_url,
-                    ip_api_url,
-                    timeout,
-                    retries,
+                    req.ping_url,
+                    req.ip_api_url,
+                    req.timeout,
+                    req.retries,
                 )
                 .await;
                 self.build_result(config_type, endpoint, rp_result)
@@ -282,16 +284,8 @@ impl CorePool {
                 }
                 drop(guard);
                 // Fall through to fresh ping
-                self.fresh_ping_and_cache(
-                    endpoint,
-                    protocol,
-                    needed_core,
-                    ping_url,
-                    ip_api_url,
-                    timeout,
-                    retries,
-                )
-                .await
+                self.fresh_ping_and_cache(endpoint, protocol, needed_core, req)
+                    .await
             }
         };
 
@@ -312,10 +306,7 @@ impl CorePool {
         endpoint: &Endpoint,
         protocol: &ProtocolRow,
         core_type: CoreType,
-        ping_url: &str,
-        ip_api_url: &str,
-        timeout: Duration,
-        retries: u32,
+        req: SinglePingReq<'_>,
     ) -> super::super::PingResult {
         let config_type = protocol.config_type;
         let port = self.next_port.fetch_add(1, Ordering::Relaxed);
@@ -399,10 +390,10 @@ impl CorePool {
         let rp_result = crate::speed_test::real_ping(
             &self.proxy_addr,
             port,
-            ping_url,
-            ip_api_url,
-            timeout,
-            retries,
+            req.ping_url,
+            req.ip_api_url,
+            req.timeout,
+            req.retries,
         )
         .await;
 
@@ -429,18 +420,13 @@ impl CorePool {
         &self,
         endpoint: &Endpoint,
         protocol: &ProtocolRow,
-        ping_url: &str,
-        ip_api_url: &str,
-        timeout: Duration,
-        retries: u32,
+        req: SinglePingReq<'_>,
     ) -> super::super::PingResult {
         let config_type = protocol.config_type;
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
         let core_type = resolve_core(proto, None, shadowsocks_method(protocol).as_deref());
-        self.fresh_ping_and_cache(
-            endpoint, protocol, core_type, ping_url, ip_api_url, timeout, retries,
-        )
-        .await
+        self.fresh_ping_and_cache(endpoint, protocol, core_type, req)
+            .await
     }
 
     /// Stop+evict the pooled core if it has been idle past [`POOL_TTL`],
@@ -773,10 +759,12 @@ mod tests {
             pool.ping(
                 &endpoint,
                 &protocol,
-                "http://127.0.0.1/",
-                "http://127.0.0.1/ip",
-                Duration::from_secs(10),
-                1,
+                SinglePingReq {
+                    ping_url: "http://127.0.0.1/",
+                    ip_api_url: "http://127.0.0.1/ip",
+                    timeout: Duration::from_secs(10),
+                    retries: 1,
+                },
             )
             .await
         })

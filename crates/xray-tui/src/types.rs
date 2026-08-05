@@ -197,8 +197,10 @@ impl std::fmt::Display for SettingsSection {
 }
 
 /// One test round for an endpoint and ping type: which protocols reported a
-/// result and which of those failed. `seen` starts empty at round start and is
-/// rebuilt as results arrive; a batch resets it, single pings accumulate.
+/// result and which of those failed.
+///
+/// `seen` starts empty at round start and is rebuilt as results arrive; a
+/// batch resets it, single pings accumulate.
 #[derive(Debug, Clone, Default)]
 pub struct PingRound {
     /// Protocol ids that reported a result this round.

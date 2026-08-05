@@ -326,7 +326,7 @@ pub async fn build_settings_fields(
                 state.config.updates.check_on_startup.to_string(),
             )]
         }
-        Routing => vec![],
+        Routing | Subscriptions => vec![],
         Logging => {
             vec![
                 (
@@ -343,7 +343,6 @@ pub async fn build_settings_fields(
                 ),
             ]
         }
-        Subscriptions => vec![],
     }
 }
 

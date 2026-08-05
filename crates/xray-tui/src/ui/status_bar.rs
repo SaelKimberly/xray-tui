@@ -119,8 +119,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 crate::SplitRightPane::RoutingList { .. }
                 | crate::SplitRightPane::RoutingForm { .. } => " Settings > Routing",
                 crate::SplitRightPane::UpdateForm { .. } => " Settings > Updates",
-                crate::SplitRightPane::GroupList { .. } => " Settings > Subscriptions",
-                crate::SplitRightPane::GroupForm { .. } => " Settings > Subscriptions",
+                crate::SplitRightPane::GroupList { .. }
+                | crate::SplitRightPane::GroupForm { .. } => " Settings > Subscriptions",
             },
         },
         crate::AppMode::AddServer { .. } => " Add Server",
@@ -182,7 +182,8 @@ const fn build_hints(state: &AppState) -> &'static str {
                 }
                 crate::SplitFocus::Right => match right {
                     crate::SplitRightPane::Empty => " [Ctrl+W] Focus Tree ",
-                    crate::SplitRightPane::Form { .. } => {
+                    crate::SplitRightPane::Form { .. }
+                    | crate::SplitRightPane::GroupForm { .. } => {
                         " [Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back "
                     }
                     crate::SplitRightPane::RoutingList { .. } => {
@@ -196,9 +197,6 @@ const fn build_hints(state: &AppState) -> &'static str {
                     }
                     crate::SplitRightPane::GroupList { .. } => {
                         " [↑↓] Navigate  [Space] Select  [A] Add  [E] Edit  [D] Delete  [U] Update  [Ctrl+W] Focus Tree  [Esc] Back "
-                    }
-                    crate::SplitRightPane::GroupForm { .. } => {
-                        " [Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back "
                     }
                 },
             },

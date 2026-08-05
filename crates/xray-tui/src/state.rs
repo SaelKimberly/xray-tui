@@ -6,17 +6,15 @@ use std::sync::atomic::{AtomicBool, AtomicU16};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use toasty::Deferred;
 use xray_tui_config::AppConfig;
-use xray_tui_config::import_export::{Profile, encode_profile_spec};
+use xray_tui_config::import_export::Profile;
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
-use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{CorePool, CoreType};
 use xray_tui_db::Database;
-use xray_tui_db::models::{
-    Endpoint, Group, ProtocolRow, PurgatoryView, RoutingRule,
-};
+use xray_tui_db::models::{Endpoint, Group, ProtocolRow, PurgatoryView, RoutingRule};
 
 use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
@@ -24,8 +22,10 @@ use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointPingStatus, EndpointRow, LogLine,
     SettingsSection, SortColumn, SplitRightPane, Tab,
 };
-use crate::ui::settings::PROTOCOL_CORE_DEFS;
 
+/// Global UI/connection state. The many `bool` fields are orthogonal flags
+/// (one per independent UI behavior); a state machine would obscure them.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
@@ -215,9 +215,9 @@ pub fn parsed_to_endpoint_protocol(
         last_used_at: None,
         created_at: now,
         last_seen_at: now,
-        endpoint: Default::default(),
-        extension: Default::default(),
-        server_stat: Default::default(),
+        endpoint: Deferred::default(),
+        extension: Deferred::default(),
+        server_stat: Deferred::default(),
     };
     (endpoint, protocol)
 }
@@ -454,13 +454,9 @@ impl AppState {
         }
     }
     /// Resolve which core a profile row should use, considering (in order):
-    /// 1. Per-profile override (`row.active_protocol().core_type`)
-    /// 2. Per-protocol config override (`config.core.protocol_core_overrides`)
-    /// 3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
-    /// Resolve which core a profile row should use, considering (in order):
-    /// 1. Per-profile override (`row.active_protocol().core_type`)
-    /// 2. Per-protocol config override (`config.core.protocol_core_overrides`)
-    /// 3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
+    ///   1. Per-profile override (`row.active_protocol().core_type`)
+    ///   2. Per-protocol config override (`config.core.protocol_core_overrides`)
+    ///   3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
     pub fn resolved_core(&self, row: &EndpointRow) -> CoreType {
         profiles::resolved_core(self, row)
     }
@@ -497,156 +493,6 @@ impl AppState {
         profiles::selected_sub_protocol_id(self)
     }
 
-    fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
-        let proto_kind = match protocol {
-            Protocol::Vmess => "vmess",
-            Protocol::Vless => "vless",
-            Protocol::Trojan => "trojan",
-            Protocol::Shadowsocks => "ss",
-            Protocol::Shadowsocks2022 => "ss-2022",
-            Protocol::ShadowsocksR => "ssr",
-            Protocol::Socks => "socks",
-            Protocol::Http => "http",
-            Protocol::WireGuard => "wireguard",
-            Protocol::Hysteria2 => "hysteria2",
-            Protocol::Tuic => "tuic",
-            Protocol::Hysteria => "hysteria",
-            Protocol::Naive => "naive",
-            Protocol::AnyTls => "anytls",
-            Protocol::ShadowTls => "shadowtls",
-            Protocol::Tor => "tor",
-            Protocol::Ssh => "ssh",
-            Protocol::Tailscale => "tailscale",
-            Protocol::Redirect => "redirect",
-            Protocol::TProxy => "tproxy",
-            Protocol::Mixed => "mixed",
-            Protocol::DokodemoDoor => "dokodemo-door",
-            Protocol::Freedom => "freedom",
-            Protocol::Blackhole => "blackhole",
-            Protocol::Dns => "dns",
-            Protocol::Loopback => "loopback",
-            Protocol::Custom => "custom",
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Form-created profiles cannot compute uid via ProtoSpec (no URL was parsed).
-        // Use random i64 PK instead of deterministic sig ^ cred_hash.
-        // This breaks the uid = sig ^ cred_hash convention for form profiles,
-        // but is safe because form profiles never participate in URL-based
-        // dedup (they have no proto_kind matchable to a ProtoSpec variant).
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let rand_bits = RandomState::new().build_hasher().finish();
-        let uid: i64 = (now ^ rand_bits) as i64;
-        // sig and cred_hash are meaningless for form profiles but kept non-zero
-        // to avoid any sentinel-value confusion in DB queries.
-        let sig = uid;
-        let cred_hash = 0;
-        let mut address = String::new();
-        let mut port: i32 = 0;
-        let mut user_id: Option<String> = None;
-        let mut security: Option<String> = None;
-        let mut network: Option<String> = None;
-        let mut core_type = "auto".to_string();
-        let mut stream_map = serde_json::Map::new();
-        let mut proto_map = serde_json::Map::new();
-
-        for (key, value) in fields {
-            if value.is_empty() {
-                continue;
-            }
-            match key.as_str() {
-                "address" => address = value.clone(),
-                "port" => port = value.parse::<i32>().unwrap_or(0),
-                "core_type" => core_type.clone_from(value),
-                "user_id" | "password" | "uuid" => user_id = Some(value.clone()),
-                "security" => security = Some(value.clone()),
-                "network" => network = Some(value.clone()),
-                // Stream settings (dot-separated keys)
-                _ if key.starts_with("tls.")
-                    || key.starts_with("ws.")
-                    || key.starts_with("grpc.")
-                    || key.starts_with("reality.")
-                    || key.starts_with("tcp.")
-                    || *key == "sni"
-                    || *key == "alpn"
-                    || *key == "fingerprint"
-                    || *key == "allow_insecure" =>
-                {
-                    let json_val = if value == "true" {
-                        serde_json::Value::Bool(true)
-                    } else if value == "false" {
-                        serde_json::Value::Bool(false)
-                    } else if let Ok(n) = value.parse::<i64>() {
-                        serde_json::Value::Number(n.into())
-                    } else {
-                        serde_json::Value::String(value.clone())
-                    };
-                    stream_map.insert(key.clone(), json_val);
-                }
-                // Protocol settings fallback
-                _ => {
-                    let json_val = if value == "true" {
-                        serde_json::Value::Bool(true)
-                    } else if value == "false" {
-                        serde_json::Value::Bool(false)
-                    } else if let Ok(n) = value.parse::<i64>() {
-                        serde_json::Value::Number(n.into())
-                    } else {
-                        serde_json::Value::String(value.clone())
-                    };
-                    proto_map.insert(key.clone(), json_val);
-                }
-            }
-        }
-
-        let protocol_settings_str = if proto_map.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&proto_map).unwrap_or_default())
-        };
-        let stream_settings_str = if stream_map.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&stream_map).unwrap_or_default())
-        };
-
-        let mut profile = Profile {
-            id: uid,
-            sig,
-            cred_hash,
-            proto_kind: proto_kind.to_string(),
-            spec_blob: Vec::new(),
-            config_type: protocol.to_i32(),
-            core_type,
-            address,
-            port,
-            transport: network,
-            security,
-            created_at: now as i64,
-            remarks: None,
-        };
-        let mut extra = serde_json::Map::new();
-        if let Some(v) = &user_id {
-            extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
-        }
-        if let Some(v) = &protocol_settings_str
-            && let Ok(val) = serde_json::from_str(v)
-        {
-            extra.insert("protocol_settings".into(), val);
-        }
-        if let Some(v) = &stream_settings_str
-            && let Ok(val) = serde_json::from_str(v)
-        {
-            extra.insert("stream_settings".into(), val);
-        }
-        profile.spec_blob =
-            encode_profile_spec(proto_kind, serde_json::to_vec(&extra).unwrap_or_default());
-        profile
-    }
-
     pub async fn confirm_add_server(&mut self) {
         profiles::confirm_add_server(self).await;
     }
@@ -663,501 +509,6 @@ impl AppState {
 
     pub fn enter_settings(&mut self) {
         settings::enter_settings(self);
-    }
-
-    async fn build_settings_fields(&self, section: SettingsSection) -> Vec<(String, String)> {
-        use crate::SettingsSection::{
-            Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-            Subscriptions, SystemProxy, Tun, Updates,
-        };
-        match section {
-            Core => {
-                vec![
-                    (
-                        "xray_path".into(),
-                        self.config.core.xray_path.clone().unwrap_or_default(),
-                    ),
-                    (
-                        "sing_box_path".into(),
-                        self.config.core.sing_box_path.clone().unwrap_or_default(),
-                    ),
-                    (
-                        "default_core".into(),
-                        self.config
-                            .core
-                            .core_type
-                            .as_ref()
-                            .map_or_else(|| "Auto".into(), |ct| format!("{ct:?}")),
-                    ),
-                    ("log_level".into(), self.config.core.log_level.clone()),
-                    (
-                        "skip_cert_verify".into(),
-                        self.config.core.skip_cert_verify.to_string(),
-                    ),
-                    (
-                        "clash_mixin".into(),
-                        self.config.clash_mixin.clone().unwrap_or_default(),
-                    ),
-                ]
-            }
-            Gui => {
-                vec![
-                    ("language".into(), self.config.gui.language.clone()),
-                    (
-                        "theme".into(),
-                        self.config.gui.theme.clone().unwrap_or_default(),
-                    ),
-                    (
-                        "refresh_interval".into(),
-                        humantime::format_duration(*self.config.gui.refresh_interval_secs)
-                            .to_string(),
-                    ),
-                ]
-            }
-            Inbound => {
-                vec![
-                    (
-                        "socks_port".into(),
-                        self.config.inbound.socks_port.to_string(),
-                    ),
-                    (
-                        "http_port".into(),
-                        self.config
-                            .inbound
-                            .http_port
-                            .map(|p| p.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "mixed_port".into(),
-                        self.config
-                            .inbound
-                            .mixed_port
-                            .map(|p| p.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    ("listen".into(), self.config.inbound.listen.clone()),
-                    (
-                        "sniffing".into(),
-                        if self.config.inbound.sniffing {
-                            "true".into()
-                        } else {
-                            "false".into()
-                        },
-                    ),
-                ]
-            }
-            Dns => {
-                if let Ok(Some(dns)) = self.db.get_dns_settings().await {
-                    vec![
-                        ("servers".into(), dns.servers.unwrap_or_default()),
-                        ("hosts".into(), dns.hosts.unwrap_or_default()),
-                        (
-                            "query_strategy".into(),
-                            dns.query_strategy.unwrap_or_default(),
-                        ),
-                        (
-                            "disable_cache".into(),
-                            if dns.disable_cache.unwrap_or(0) != 0 {
-                                "true".into()
-                            } else {
-                                "false".into()
-                            },
-                        ),
-                        (
-                            "disable_fallback".into(),
-                            if dns.disable_fallback.unwrap_or(0) != 0 {
-                                "true".into()
-                            } else {
-                                "false".into()
-                            },
-                        ),
-                        ("client_ip".into(), dns.client_ip.unwrap_or_default()),
-                        (
-                            "cache_ttl_secs".into(),
-                            dns.cache_ttl_secs
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        ),
-                    ]
-                } else {
-                    vec![
-                        ("servers".into(), String::new()),
-                        ("hosts".into(), String::new()),
-                        ("query_strategy".into(), String::new()),
-                        ("disable_cache".into(), "false".into()),
-                        ("disable_fallback".into(), "false".into()),
-                        ("client_ip".into(), String::new()),
-                    ]
-                }
-            }
-            SystemProxy => {
-                vec![
-                    (
-                        "enabled".into(),
-                        if self.config.system_proxy.enabled {
-                            "true".into()
-                        } else {
-                            "false".into()
-                        },
-                    ),
-                    (
-                        "http_port".into(),
-                        self.config
-                            .system_proxy
-                            .http_port
-                            .map(|p| p.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "socks_port".into(),
-                        self.config
-                            .system_proxy
-                            .socks_port
-                            .map(|p| p.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "bypass".into(),
-                        self.config.system_proxy.bypass.clone().unwrap_or_default(),
-                    ),
-                ]
-            }
-            Tun => {
-                vec![
-                    (
-                        "enabled".into(),
-                        if self.config.tun.enabled {
-                            "true".into()
-                        } else {
-                            "false".into()
-                        },
-                    ),
-                    (
-                        "interface_name".into(),
-                        self.config.tun.interface_name.clone().unwrap_or_default(),
-                    ),
-                    (
-                        "mtu".into(),
-                        self.config
-                            .tun
-                            .mtu
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ),
-                ]
-            }
-            Mux => {
-                vec![
-                    (
-                        "enabled".into(),
-                        if self.config.mux.enabled {
-                            "true".into()
-                        } else {
-                            "false".into()
-                        },
-                    ),
-                    (
-                        "concurrency".into(),
-                        self.config
-                            .mux
-                            .concurrency
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    ("protocol".into(), self.config.mux.protocol.clone()),
-                    (
-                        "max_connections".into(),
-                        self.config
-                            .mux
-                            .max_connections
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "min_streams".into(),
-                        self.config
-                            .mux
-                            .min_streams
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "max_streams".into(),
-                        self.config
-                            .mux
-                            .max_streams
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "padding".into(),
-                        if self.config.mux.padding {
-                            "true".into()
-                        } else {
-                            "false".into()
-                        },
-                    ),
-                    (
-                        "fragment_enabled".into(),
-                        if self.config.mux.fragment_enabled {
-                            "true".into()
-                        } else {
-                            "false".into()
-                        },
-                    ),
-                    (
-                        "fragment_packets".into(),
-                        self.config.mux.fragment_packets.clone().unwrap_or_default(),
-                    ),
-                    (
-                        "fragment_length".into(),
-                        self.config.mux.fragment_length.clone().unwrap_or_default(),
-                    ),
-                    (
-                        "fragment_interval".into(),
-                        self.config
-                            .mux
-                            .fragment_interval
-                            .clone()
-                            .unwrap_or_default(),
-                    ),
-                ]
-            }
-            Stats => {
-                vec![(
-                    "enabled".into(),
-                    if self.config.statistics.enabled {
-                        "true".into()
-                    } else {
-                        "false".into()
-                    },
-                )]
-            }
-            Routing | Updates => {
-                vec![]
-            }
-            ProtocolCore => PROTOCOL_CORE_DEFS
-                .iter()
-                .map(|(key, _label, _)| {
-                    let val = self
-                        .config
-                        .core
-                        .protocol_core_overrides
-                        .get(*key)
-                        .cloned()
-                        .unwrap_or_else(|| "Auto".to_string());
-                    (key.to_string(), val)
-                })
-                .collect(),
-            SpeedTest => {
-                vec![
-                    ("ping_url".into(), self.config.speed_test.ping_url.clone()),
-                    (
-                        "ip_api_url".into(),
-                        self.config.speed_test.ip_api_url.clone(),
-                    ),
-                    (
-                        "tcp_timeout_secs".into(),
-                        humantime::format_duration(*self.config.speed_test.tcp_timeout_secs)
-                            .to_string(),
-                    ),
-                    (
-                        "real_ping_timeout_secs".into(),
-                        humantime::format_duration(*self.config.speed_test.real_ping_timeout_secs)
-                            .to_string(),
-                    ),
-                    (
-                        "batch_page_size".into(),
-                        self.config.speed_test.batch_page_size.to_string(),
-                    ),
-                    (
-                        "real_ping_retries".into(),
-                        self.config.speed_test.real_ping_retries.to_string(),
-                    ),
-                    (
-                        "real_ping_concurrency".into(),
-                        self.config.speed_test.real_ping_concurrency.to_string(),
-                    ),
-                    ("geoip_url".into(), self.config.geo.geoip_url.clone()),
-                    ("geosite_url".into(), self.config.geo.geosite_url.clone()),
-                    (
-                        "geo_auto_update".into(),
-                        self.config.geo.auto_update.to_string(),
-                    ),
-                    (
-                        "geo_update_interval".into(),
-                        self.config.geo.update_interval_hours.to_string(),
-                    ),
-                ]
-            }
-            Logging => {
-                vec![
-                    (
-                        "log_ttl_secs".into(),
-                        humantime::format_duration(*self.config.logging.ttl_secs).to_string(),
-                    ),
-                    (
-                        "log_to_file".into(),
-                        self.config.logging.log_to_file.to_string(),
-                    ),
-                    (
-                        "log_file_path".into(),
-                        self.config.logging.log_file_path.clone(),
-                    ),
-                ]
-            }
-            Subscriptions => vec![],
-        }
-    }
-
-    fn apply_settings_fields(&mut self, section: SettingsSection, fields: &[(String, String)]) {
-        use crate::SettingsSection::{
-            Core, Dns, Gui, Inbound, Logging, Mux, ProtocolCore, Routing, SpeedTest, Stats,
-            Subscriptions, SystemProxy, Tun, Updates,
-        };
-        let get_str = |key: &str| -> &str {
-            fields
-                .iter()
-                .find(|(k, _)| k == key)
-                .map_or("", |(_, v)| v.as_str())
-        };
-        let get = |key: &str| get_str(key).to_owned();
-        let get_opt = |key: &str| {
-            let v = get_str(key);
-            if v.is_empty() {
-                None
-            } else {
-                Some(v.to_owned())
-            }
-        };
-        match section {
-            Core => {
-                self.config.core.xray_path = get_opt("xray_path");
-                self.config.core.sing_box_path = get_opt("sing_box_path");
-                let core_str = get_str("default_core");
-                self.config.core.core_type = if core_str.is_empty() || core_str == "Auto" {
-                    None
-                } else {
-                    core_str.parse::<xray_tui_core::CoreType>().ok()
-                };
-                if !get_str("log_level").is_empty() {
-                    self.config.core.log_level = get("log_level");
-                }
-                self.config.core.skip_cert_verify = get_str("skip_cert_verify") == "true";
-                self.config.clash_mixin = {
-                    let v = get_str("clash_mixin");
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.to_owned())
-                    }
-                };
-            }
-            Gui => {
-                self.config.gui.language = get("language");
-                self.config.gui.theme = get_opt("theme");
-                if let Ok(d) = humantime::parse_duration(get_str("refresh_interval")) {
-                    *self.config.gui.refresh_interval_secs = d;
-                }
-            }
-            Inbound => {
-                if let Ok(v) = get_str("socks_port").parse::<u16>() {
-                    self.config.inbound.socks_port = v;
-                }
-                self.config.inbound.http_port = get_str("http_port").parse::<u16>().ok();
-                self.config.inbound.mixed_port = get_str("mixed_port").parse::<u16>().ok();
-                if !get_str("listen").is_empty() {
-                    self.config.inbound.listen = get("listen");
-                }
-                self.config.inbound.sniffing = get_str("sniffing") == "true";
-            }
-            SystemProxy => {
-                self.config.system_proxy.enabled = get_str("enabled") == "true";
-                self.config.system_proxy.http_port = get_str("http_port").parse::<u16>().ok();
-                self.config.system_proxy.socks_port = get_str("socks_port").parse::<u16>().ok();
-                self.config.system_proxy.bypass = get_opt("bypass");
-            }
-            Tun => {
-                self.config.tun.enabled = get_str("enabled") == "true";
-                self.config.tun.interface_name = get_opt("interface_name");
-                self.config.tun.mtu = get_str("mtu").parse::<u16>().ok();
-            }
-            Mux => {
-                self.config.mux.enabled = get_str("enabled") == "true";
-                self.config.mux.concurrency = get_str("concurrency").parse::<u8>().ok();
-                if !get_str("protocol").is_empty() {
-                    self.config.mux.protocol = get("protocol");
-                }
-                self.config.mux.max_connections = get_str("max_connections").parse::<u8>().ok();
-                self.config.mux.min_streams = get_str("min_streams").parse::<u8>().ok();
-                self.config.mux.max_streams = get_str("max_streams").parse::<u16>().ok();
-                self.config.mux.padding = get_str("padding") == "true";
-                self.config.mux.fragment_enabled = get_str("fragment_enabled") == "true";
-                self.config.mux.fragment_packets = get_opt("fragment_packets");
-                self.config.mux.fragment_length = get_opt("fragment_length");
-                self.config.mux.fragment_interval = get_opt("fragment_interval");
-            }
-            Stats => {
-                self.config.statistics.enabled = get_str("enabled") == "true";
-            }
-            ProtocolCore => {
-                for (key, val) in fields {
-                    if val == "Auto" {
-                        self.config
-                            .core
-                            .protocol_core_overrides
-                            .remove(key.as_str());
-                    } else {
-                        self.config
-                            .core
-                            .protocol_core_overrides
-                            .insert(key.clone(), val.clone());
-                    }
-                }
-            }
-            SpeedTest => {
-                if !get_str("ping_url").is_empty() {
-                    self.config.speed_test.ping_url = get("ping_url");
-                }
-                if !get_str("ip_api_url").is_empty() {
-                    self.config.speed_test.ip_api_url = get("ip_api_url");
-                }
-                if let Ok(d) = humantime::parse_duration(get_str("tcp_timeout_secs")) {
-                    *self.config.speed_test.tcp_timeout_secs = d;
-                }
-                if let Ok(d) = humantime::parse_duration(get_str("real_ping_timeout_secs")) {
-                    *self.config.speed_test.real_ping_timeout_secs = d;
-                }
-                if let Ok(v) = get_str("batch_page_size").parse::<usize>() {
-                    self.config.speed_test.batch_page_size = v;
-                }
-                if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
-                    self.config.speed_test.real_ping_retries = v;
-                }
-                if !get_str("geoip_url").is_empty() {
-                    self.config.geo.geoip_url = get("geoip_url");
-                }
-                if !get_str("geosite_url").is_empty() {
-                    self.config.geo.geosite_url = get("geosite_url");
-                }
-                self.config.geo.auto_update = get_str("geo_auto_update") == "true";
-                if let Ok(v) = get_str("geo_update_interval").parse::<u64>() {
-                    self.config.geo.update_interval_hours = v;
-                }
-            }
-            // Dns and Routing are handled separately (DB-backed)
-            Dns | Routing | Updates | Subscriptions => {}
-            Logging => {
-                if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
-                    *self.config.logging.ttl_secs = d;
-                }
-                self.config.logging.log_to_file = get_str("log_to_file") == "true";
-                if !get_str("log_file_path").is_empty() {
-                    self.config.logging.log_file_path = get("log_file_path");
-                }
-            }
-        }
     }
 
     pub async fn build_right_pane(&mut self, section: SettingsSection) -> SplitRightPane {
@@ -1179,8 +530,8 @@ impl AppState {
     pub async fn delete_profile(&mut self, id: i64) {
         profiles::delete_profile(self, id).await;
     }
-    pub async fn clone_profile(&mut self, id: i64) {
-        profiles::clone_profile(self, id).await;
+    pub fn clone_profile(&mut self, id: i64) {
+        profiles::clone_profile(self, id);
     }
     pub fn toggle_multi_select(&mut self, id: i64) {
         profiles::toggle_multi_select(self, id);
@@ -1194,11 +545,11 @@ impl AppState {
     pub async fn confirm_batch_import(&mut self) {
         profiles::confirm_batch_import(self).await;
     }
-    pub async fn move_profile_up(&mut self) {
-        profiles::move_profile_up(self).await;
+    pub fn move_profile_up(&mut self) {
+        profiles::move_profile_up(self);
     }
-    pub async fn move_profile_down(&mut self) {
-        profiles::move_profile_down(self).await;
+    pub fn move_profile_down(&mut self) {
+        profiles::move_profile_down(self);
     }
     pub async fn set_active(&mut self, id: &str) {
         profiles::set_active(self, id).await;

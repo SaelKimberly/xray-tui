@@ -431,15 +431,13 @@ pub fn parse_subscription_data(
     summary.security_warning_count = profiles
         .iter()
         .filter(|p| {
-            if let Ok(config) = serde_json::from_slice::<ProtocolConfig>(&p.spec_blob) {
+            serde_json::from_slice::<ProtocolConfig>(&p.spec_blob).is_ok_and(|config| {
                 let (_, s_settings) = config.to_settings();
                 s_settings
                     .get("allow_insecure")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
-            } else {
-                false
-            }
+            })
         })
         .count();
 

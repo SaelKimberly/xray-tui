@@ -7,6 +7,7 @@ mod singbox;
 mod xray;
 
 pub use pool::CorePool;
+pub use pool::SinglePingReq;
 
 use super::PingResult;
 use crate::config_builder::shadowsocks_method;

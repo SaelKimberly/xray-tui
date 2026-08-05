@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use futures_util::StreamExt;
+use toasty::Deferred;
 use tokio::sync::{Semaphore, mpsc};
 
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
-    BuildParams, ConfigBuilder, CorePool, CoreType, MultiInboundItem, RealCoreManager, find_binary,
-    resolve_core, shadowsocks_method, wait_for_socks5,
+    BuildParams, ConfigBuilder, CorePool, CoreType, MultiInboundItem, RealCoreManager,
+    SinglePingReq, find_binary, resolve_core, shadowsocks_method, wait_for_socks5,
 };
 use xray_tui_db::Database;
 use xray_tui_db::models::{
@@ -183,10 +184,12 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
             .ping(
                 &endpoint,
                 &protocol,
-                &ping_url,
-                &ip_api_url,
-                timeout,
-                retries,
+                SinglePingReq {
+                    ping_url: &ping_url,
+                    ip_api_url: &ip_api_url,
+                    timeout,
+                    retries,
+                },
             )
             .await;
 
@@ -412,7 +415,7 @@ async fn batch_upsert_buffer(
                     "udp" => DELAY_SOURCE_UDP,
                     _ => DELAY_SOURCE_FAST,
                 }),
-                protocol_row: Default::default(),
+                protocol_row: Deferred::default(),
             })
         })
         .collect();
@@ -440,6 +443,9 @@ impl Drop for BatchActiveGuard {
         self.0.store(false, Ordering::Relaxed);
     }
 }
+
+/// Cross-page fast-ping cache: `(address, port) -> (latency_ms, error)`.
+type FastCache = HashMap<(String, u16), (Option<i32>, Option<String>)>;
 
 /// Outcome of one session's fast ping within a page.
 enum PageOutcome {
@@ -473,7 +479,7 @@ enum PageRole {
 async fn run_page_pings(
     fmgr: &xray_tui_core::FastPingManager,
     sessions: &[PingSession],
-    fast_cache: &HashMap<(String, u16), (Option<i32>, Option<String>)>,
+    fast_cache: &FastCache,
     concurrency: usize,
 ) -> Vec<Option<PageOutcome>> {
     let mut roles: Vec<PageRole> = Vec::with_capacity(sessions.len());
@@ -517,7 +523,7 @@ async fn run_page_pings(
 
     for (i, role) in roles.into_iter().enumerate() {
         match role {
-            PageRole::Skip => {}
+            PageRole::Skip | PageRole::Owner => {}
             PageRole::Cached(key) => {
                 let (ms, err) = fast_cache
                     .get(&key)
@@ -530,7 +536,6 @@ async fn run_page_pings(
                     outcomes[i] = Some(PageOutcome::Pinged(result.clone()));
                 }
             }
-            PageRole::Owner => {}
         }
     }
     outcomes
@@ -590,7 +595,7 @@ impl RealPingBatchCtx<'_> {
                     stack.push(&batch[..mid]);
                 }
                 GroupOutcome::Retryable(err) | GroupOutcome::NotRetryable(err) => {
-                    self.push_failures(batch, &err, buffer);
+                    push_failures(batch, &err, buffer);
                 }
             }
         }
@@ -650,13 +655,14 @@ impl RealPingBatchCtx<'_> {
             None => return GroupOutcome::NotRetryable("Binary not found".to_string()),
         };
 
-        let log_tx = if let Some(tx) = &self.log_tx {
-            tx.clone()
-        } else {
-            let (noop_tx, mut noop_rx) = tokio::sync::mpsc::channel::<String>(256);
-            tokio::spawn(async move { while noop_rx.recv().await.is_some() {} });
-            noop_tx
-        };
+        let log_tx = self.log_tx.as_ref().map_or_else(
+            || {
+                let (noop_tx, mut noop_rx) = tokio::sync::mpsc::channel::<String>(256);
+                tokio::spawn(async move { while noop_rx.recv().await.is_some() {} });
+                noop_tx
+            },
+            Clone::clone,
+        );
         let mut manager = RealCoreManager::new(self.bin_configs_dir.to_path_buf(), log_tx);
 
         if let Err(e) = manager
@@ -674,9 +680,9 @@ impl RealPingBatchCtx<'_> {
         .await;
         let mut ready: Vec<(&xray_tui_db::models::EndpointRow, &PingSession, u16)> =
             Vec::with_capacity(items.len());
-        for ((_profile, session, port), ok) in items.iter().zip(&readiness) {
+        for ((profile, session, port), ok) in items.iter().zip(&readiness) {
             if ok.is_ok() {
-                ready.push((_profile, session, *port));
+                ready.push((profile, session, *port));
             } else {
                 buffer.push(PingResultUpdate {
                     session_id: session.id.clone(),
@@ -715,7 +721,6 @@ impl RealPingBatchCtx<'_> {
             };
             let tx = self.tx.clone();
             let session = session.clone();
-            let port = port;
             let proxy_addr = self.proxy_addr.to_string();
             let ping_url = self.ping_url.to_string();
             let ip_api_url = self.ip_api_url.to_string();
@@ -797,25 +802,25 @@ impl RealPingBatchCtx<'_> {
         let _ = manager.stop().await;
         GroupOutcome::Done
     }
+}
 
-    fn push_failures(
-        &self,
-        items: &[(xray_tui_db::models::EndpointRow, PingSession, u16)],
-        error: &str,
-        buffer: &mut Vec<PingResultUpdate>,
-    ) {
-        for (_profile, session, _port) in items {
-            buffer.push(PingResultUpdate {
-                session_id: session.id.clone(),
-                protocol_id: session.protocol_id,
-                status: "failed".to_string(),
-                ping_type: "real".to_string(),
-                latency_ms: None,
-                speed_bps: None,
-                ip_info: None,
-                error: Some(error.to_string()),
-            });
-        }
+/// Push a `failed` result for every item of a group that failed as a whole.
+fn push_failures(
+    items: &[(xray_tui_db::models::EndpointRow, PingSession, u16)],
+    error: &str,
+    buffer: &mut Vec<PingResultUpdate>,
+) {
+    for (_profile, session, _port) in items {
+        buffer.push(PingResultUpdate {
+            session_id: session.id.clone(),
+            protocol_id: session.protocol_id,
+            status: "failed".to_string(),
+            ping_type: "real".to_string(),
+            latency_ms: None,
+            speed_bps: None,
+            ip_info: None,
+            error: Some(error.to_string()),
+        });
     }
 }
 
@@ -885,16 +890,20 @@ async fn dispatch_real_ping_batch(
             continue;
         };
         let proto = Protocol::try_from_i32(session.config_type).unwrap_or(Protocol::Custom);
-        let core_type =
-            resolve_core(proto, None, shadowsocks_method(profile.active_protocol()).as_deref());
+        let core_type = resolve_core(
+            proto,
+            None,
+            shadowsocks_method(profile.active_protocol()).as_deref(),
+        );
         // Draw from the pool's shared allocator — batch and single pings can
         // never collide on a port.
         let assigned_port = port_allocator.fetch_add(1, Ordering::Relaxed);
 
         match core_type {
-            CoreType::Xray => xray_items.push((profile, session.clone(), assigned_port)),
+            CoreType::Xray | CoreType::Auto => {
+                xray_items.push((profile, session.clone(), assigned_port));
+            }
             CoreType::SingBox => singbox_items.push((profile, session.clone(), assigned_port)),
-            CoreType::Auto => xray_items.push((profile, session.clone(), assigned_port)),
         }
     }
 
@@ -1248,7 +1257,6 @@ pub fn start_sieve(
                                         ),
                                     });
                                     demoted_here = false;
-                                    false
                                 } else {
                                     // Demote to real ping
                                     let _ = db
@@ -1263,8 +1271,8 @@ pub fn start_sieve(
                                         error: None,
                                     });
                                     demoted_here = true;
-                                    false
                                 }
+                                false
                             } else {
                                 buffer.push(PingResultUpdate {
                                     session_id: session.id.clone(),
@@ -1322,7 +1330,6 @@ pub fn start_sieve(
                                 });
                                 fast_cache.insert(cache_key, (Some(ms), None));
                                 demoted_here = false;
-                                false
                             } else {
                                 // Demote to real ping
                                 let _ = db
@@ -1338,8 +1345,8 @@ pub fn start_sieve(
                                 });
                                 fast_cache.insert(cache_key, (Some(ms), None));
                                 demoted_here = true;
-                                false
                             }
+                            false
                         } else {
                             buffer.push(PingResultUpdate {
                                 session_id: session.id.clone(),
@@ -1376,7 +1383,6 @@ pub fn start_sieve(
                                     error: Some("Endpoint already tested in Real Ping".to_string()),
                                 });
                                 demoted_here = false;
-                                false
                             } else {
                                 // Demote to real ping for Phase 2 — no buffer push
                                 let _ = db
@@ -1384,8 +1390,8 @@ pub fn start_sieve(
                                     .await;
                                 // Don't cache — NotSupported is protocol-specific
                                 demoted_here = true;
-                                false
                             }
+                            false
                         } else {
                             // No real ping phase — emit Cancelled immediately
                             buffer.push(PingResultUpdate {
@@ -1442,9 +1448,7 @@ pub fn start_sieve(
 
             // Stall guard: break if too many consecutive iterations with NO work
             // (demoted sessions count as progress — they'll be picked up by Phase 2).
-            if flushed == 0 && demoted_count == 0 {
-                stall_count += 1;
-            } else if !flush_ok {
+            if (flushed == 0 && demoted_count == 0) || !flush_ok {
                 stall_count += 1;
             } else {
                 stall_count = 0;
@@ -1491,8 +1495,8 @@ pub fn start_sieve(
 
         // ── Phase 2: Real Ping — running concurrently as spawned task ──
         // Signal Phase 2 to drain (drop sender) and wait for completion.
-        if let Some((_sender, handle)) = phase2_handle.take() {
-            drop(_sender);
+        if let Some((sender, handle)) = phase2_handle.take() {
+            drop(sender);
             let _ = handle.await;
         }
 
@@ -1569,7 +1573,7 @@ mod tests {
             config_type,
             core_type: "auto".to_string(),
             address: Some(addr),
-            port: Some(port as i32),
+            port: Some(i32::from(port)),
             triplet_rank: 0,
             ping_type: "fast".to_string(),
             status: "queued".to_string(),
@@ -1591,13 +1595,8 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let task_count = count.clone();
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((_stream, _)) => {
-                        task_count.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((_stream, _)) = listener.accept().await {
+                task_count.fetch_add(1, Ordering::SeqCst);
             }
         });
         (port, count)
@@ -1693,7 +1692,7 @@ mod tests {
         let elapsed = start.elapsed();
         // ceil(20/5) × 400ms ≈ 1.6s capped; 20 × 400ms = 8s sequential.
         assert!(
-            elapsed < std::time::Duration::from_millis(3000),
+            elapsed < std::time::Duration::from_secs(3),
             "wall time {elapsed:?} — cap not applied?"
         );
         assert_eq!(outcomes.len(), 20);
@@ -1713,9 +1712,7 @@ mod tests {
             Protocol::Vmess.to_i32(),
         )];
         let cache: HashMap<(String, u16), (Option<i32>, Option<String>)> =
-            [(("127.0.0.1".to_string(), port_a), (Some(12), None))]
-                .into_iter()
-                .collect();
+            std::iter::once((("127.0.0.1".to_string(), port_a), (Some(12), None))).collect();
         let outcomes = run_page_pings(&fmgr, &sessions, &cache, 4).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(

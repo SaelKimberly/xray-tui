@@ -26,7 +26,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
 use serde::{Deserialize, Serialize};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig};
+use super::common::{SecurityConfig, TlsConfig, TlsOpts};
 use super::utils;
 use super::{ParseError, ProtoSpec};
 use crate::clash::{ClashNaive, ClashProxy};
@@ -79,7 +79,7 @@ impl ProtoSpec for NaiveConfig {
             host: parsed_host,
             port: parsed_port,
             security: SecurityConfig {
-                tls: Some(TlsConfig::Tls(Default::default())),
+                tls: Some(TlsConfig::Tls(TlsOpts::default())),
                 enc: None,
             },
             remarks,

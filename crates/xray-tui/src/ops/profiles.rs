@@ -339,6 +339,8 @@ pub fn collapse_expand(state: &mut AppState) {
 }
 
 fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
     let proto_kind = match protocol {
         Protocol::Vmess => "vmess",
         Protocol::Vless => "vless",
@@ -372,8 +374,6 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
     let rand_bits = RandomState::new().build_hasher().finish();
     let uid: i64 = (now ^ rand_bits) as i64;
     let sig = uid;
@@ -392,7 +392,7 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
             continue;
         }
         match key.as_str() {
-            "address" => address = value.clone(),
+            "address" => address.clone_from(value),
             "port" => port = value.parse::<i32>().unwrap_or(0),
             "core_type" => core_type.clone_from(value),
             "user_id" | "password" | "uuid" => user_id = Some(value.clone()),
@@ -704,7 +704,7 @@ pub async fn delete_profile(state: &mut AppState, id: i64) {
     state.filter_cache_valid.set(false);
 }
 
-pub async fn clone_profile(state: &mut AppState, id: i64) {
+pub fn clone_profile(state: &mut AppState, id: i64) {
     let found = state.endpoints.iter().find(|r| r.endpoint.id == id);
     if found.is_none() {
         state.log_trace(
@@ -808,7 +808,7 @@ pub async fn confirm_batch_import(state: &mut AppState) {
     reload_profiles(state).await;
 }
 
-pub async fn move_profile_up(state: &mut AppState) {
+pub fn move_profile_up(state: &mut AppState) {
     let id = match selected_profile_id(state) {
         Some(id) => id,
         None => return,
@@ -825,7 +825,7 @@ pub async fn move_profile_up(state: &mut AppState) {
     state.filter_cache_valid.set(false);
 }
 
-pub async fn move_profile_down(state: &mut AppState) {
+pub fn move_profile_down(state: &mut AppState) {
     let id = match selected_profile_id(state) {
         Some(id) => id,
         None => return,
@@ -966,7 +966,6 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
         return false;
     }
     match state.selected_sub {
-        None => false,
         Some(n) if n > 0 => {
             state.selected_sub = Some(n - 1);
             true
@@ -976,7 +975,7 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
             state.selected_sub = None;
             true
         }
-        Some(_) => false,
+        None | Some(_) => false,
     }
 }
 
@@ -994,7 +993,7 @@ pub fn selected_sub_protocol_id(state: &AppState) -> Option<i64> {
 
 #[cfg(test)]
 mod test_support {
-    use super::*;
+
     use crate::AppState;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1175,7 +1174,7 @@ mod edit_tests {
     use std::sync::Arc;
     use toasty::Deferred;
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{Endpoint, EndpointRow, ProfileExtension, ProtocolRow, ServerStat};
+    use xray_tui_db::models::{Endpoint, ProfileExtension, ProtocolRow, ServerStat};
 
     fn matches_edit_mode(state: &AppState, protocol_id: i64) -> bool {
         matches!(state.mode, AppMode::EditServer { protocol_id: id, .. } if id == protocol_id)

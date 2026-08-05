@@ -209,7 +209,7 @@ pub async fn install_binary(
     let archive_owned = archive.to_path_buf();
     let temp_dir = tempfile::tempdir()
         .map_err(|e| UpdateError::Install(format!("failed to create temp dir: {e}")))?
-        .into_path();
+        .keep();
     let temp_dir_clone = temp_dir.clone();
 
     // Extract archive to temp dir (sync — wrap in spawn_blocking)

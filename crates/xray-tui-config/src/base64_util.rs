@@ -199,7 +199,11 @@ mod tests {
     fn test_very_long_base64() {
         // Generate a 20KB base64 string, verify decode succeeds
         let large_data: Vec<u8> = (0..15000usize)
-            .map(|i| (i as u8).wrapping_mul(17))
+            .map(|i| {
+                u8::try_from(i % 256)
+                    .expect("mod 256 fits u8")
+                    .wrapping_mul(17)
+            })
             .collect();
         let b64 = base64_simd::STANDARD_NO_PAD.encode_to_string(&large_data);
         assert!(b64.len() > 10000, "should be a long string: {}", b64.len());

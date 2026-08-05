@@ -185,6 +185,7 @@ impl ProtoSpec for VmessConfig {
                     alpn,
                     fp,
                     insecure,
+                    ..Default::default()
                 })
             }),
             enc: scy.map(|s| crate::urlx::TinyText::from(s.as_str())),
@@ -375,7 +376,7 @@ impl ProtoSpec for VmessConfig {
                         c.tls,
                         c.servername.as_deref(),
                         c.skip_cert_verify,
-                        clash_alpn_as_str(&c.alpn),
+                        clash_alpn_as_str(c.alpn.as_ref()),
                         c.fingerprint.as_deref(),
                         None,
                     );
@@ -384,11 +385,11 @@ impl ProtoSpec for VmessConfig {
                 };
                 let transport = clash_transport_to_transport(
                     c.network.as_deref(),
-                    &c.ws_opts,
-                    &c.grpc_opts,
-                    &c.h2_opts,
-                    &c.http_opts,
-                    &c.mkcp_opts,
+                    c.ws_opts.as_ref(),
+                    c.grpc_opts.as_ref(),
+                    c.h2_opts.as_ref(),
+                    c.http_opts.as_ref(),
+                    c.mkcp_opts.as_ref(),
                     Some(&c.server),
                 );
                 let path = match &transport {
@@ -503,7 +504,7 @@ impl ProtoIdentity for VmessConfig {
 #[cfg(test)]
 mod tests {
     use super::super::ProtoSpec;
-    use crate::urlx::PortSpec;
+
     use crate::urlx::SchemeX;
 
     #[test]

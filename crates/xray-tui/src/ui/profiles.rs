@@ -83,7 +83,7 @@ impl DataTableRow for DisplayRowData {
                 1 => (self.indicator.as_str(), self.indicator_fg),
                 2 => (self.idx_str.as_str(), self.row_style),
                 3 => (self.type_str.as_str(), self.row_style),
-                4 => ("[", self.row_style),
+                4 | 13 => ("[", self.row_style),
                 5 => (self.country_flag.as_str(), self.row_style),
                 6 => (self.address_port_str.as_str(), self.row_style),
                 7 => ("][", self.row_style),
@@ -92,7 +92,6 @@ impl DataTableRow for DisplayRowData {
                 10 => (self.config_type_str.as_str(), self.row_style),
                 11 => ("}=>", self.row_style),
                 12 => (self.test_str.as_str(), self.test_style),
-                13 => ("[", self.row_style),
                 14 => (self.outbound_addr.as_str(), self.row_style),
                 15 => (self.outbound_country.as_str(), self.row_style),
                 16 => ("]", self.row_style),
@@ -277,7 +276,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
-const fn test_glyph(test_type: &TestType) -> &'static str {
+const fn test_glyph(test_type: TestType) -> &'static str {
     match test_type {
         TestType::TcpPing => "↔",
         TestType::RealPing => "◎",
@@ -378,16 +377,17 @@ fn build_display_rows(
             let glyph = state
                 .testing_details
                 .get(&active_id)
+                .copied()
                 .map(test_glyph)
                 .or_else(|| {
                     row.protocols
                         .iter()
-                        .find_map(|p| state.testing_details.get(&p.id).map(test_glyph))
+                        .find_map(|p| state.testing_details.get(&p.id).copied().map(test_glyph))
                 });
-            match glyph {
-                Some(g) => (g.to_string(), Style::default()),
-                None => (String::new(), Style::default()),
-            }
+            glyph.map_or_else(
+                || (String::new(), Style::default()),
+                |g| (g.to_string(), Style::default()),
+            )
         };
 
         let protocol =
@@ -404,10 +404,9 @@ fn build_display_rows(
         let resolved = info.is_some_and(|i| !i.resolved_ips.is_empty());
 
         let type_str = format!("{protocol:.12}");
-        let country_flag = match info.and_then(|i| i.country.as_deref()) {
-            Some(iso) => iso_to_flag(iso),
-            None => "\u{1F3F4}".to_string(),
-        };
+        let country_flag = info
+            .and_then(|i| i.country.as_deref())
+            .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
         let address_port_str =
             truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 36);
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
@@ -445,10 +444,12 @@ fn build_display_rows(
         let outbound_addr = info
             .and_then(|i| i.outbound_ip.map(|ip| ip.to_string()))
             .unwrap_or_else(|| "—".to_string());
-        let outbound_country = match info.and_then(|i| i.outbound_country.as_deref()) {
-            Some(iso) => truncate_pad(&format!("{} {iso}", iso_to_flag(iso)), 7),
-            None => "—".to_string(),
-        };
+        let outbound_country = info
+            .and_then(|i| i.outbound_country.as_deref())
+            .map_or_else(
+                || "—".to_string(),
+                |iso| truncate_pad(&format!("{} {iso}", iso_to_flag(iso)), 7),
+            );
 
         // Panel content
         let panel_ips = info
@@ -492,9 +493,12 @@ fn build_display_rows(
                     let (outbound, outbound_country) = ext
                         .and_then(|e| e.ip_info.as_deref())
                         .and_then(|ip_info| ip_info.split_once('|'))
-                        .map_or(("—".to_string(), "—".to_string()), |(ip, country)| {
-                            (ip.trim().to_string(), truncate_pad(country.trim(), 7))
-                        });
+                        .map_or_else(
+                            || ("—".to_string(), "—".to_string()),
+                            |(ip, country)| {
+                                (ip.trim().to_string(), truncate_pad(country.trim(), 7))
+                            },
+                        );
                     let t = p.transport.as_deref().filter(|s| !s.is_empty());
                     let s = p.security.as_deref().filter(|s| !s.is_empty());
                     let config_type = match (t, s) {
@@ -582,12 +586,10 @@ fn render_data_grid(
 
     // Map sort state to DataTable column indices
     let sort_column = match state.sort_column {
-        SortColumn::LastSeen => None,
         SortColumn::ConfigType => Some(3),
-        SortColumn::Address => Some(6),
-        SortColumn::Port => Some(6),
+        SortColumn::Address | SortColumn::Port => Some(6),
         SortColumn::Test => Some(12),
-        SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
+        SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
     };
     let sort_direction = if state.sort_ascending {
         SortDirection::Ascending
@@ -754,8 +756,14 @@ fn render_footer(
         return;
     }
 
-    let line = match footer_row(state) {
-        Some(row) => {
+    let line = footer_row(state).map_or_else(
+        || {
+            Line::from(Span::styled(
+                " Server: (none selected)",
+                ThemeStyles::footer_label(palette),
+            ))
+        },
+        |row| {
             let core = state.resolved_core(row);
 
             let addr = if row.endpoint.host.is_empty() {
@@ -772,12 +780,8 @@ fn render_footer(
                 ),
                 Span::styled(format!("[{core}] "), ThemeStyles::footer_value(palette)),
             ])
-        }
-        None => Line::from(Span::styled(
-            " Server: (none selected)",
-            ThemeStyles::footer_label(palette),
-        )),
-    };
+        },
+    );
     let footer = Paragraph::new(line).style(ThemeStyles::status_footer(palette));
     frame.render_widget(footer, area);
 }
@@ -1018,7 +1022,7 @@ mod tests {
         let offset = compute_scroll_offset(&heights, 20, 21);
         assert!(offset <= 20);
         let sel_start: u16 = heights[offset..20].iter().sum();
-        assert!(sel_start + 1 <= 18);
+        assert!(sel_start < 18);
     }
 
     #[test]
@@ -1164,15 +1168,18 @@ mod tests {
     fn test_cell_labels_rounds_where_every_protocol_failed() {
         let palette = test_palette();
         // Fast round: all 2 protocols failed → [fast], wins over [real].
-        let mut status = crate::types::EndpointPingStatus::default();
-        status.fast = round(&[101, 102]);
-        status.real = round(&[101, 102]);
+        let status = crate::types::EndpointPingStatus {
+            fast: round(&[101, 102]),
+            real: round(&[101, 102]),
+        };
         let (t, s) = test_cell_content(false, true, Some(&status), 2, None, &palette);
         assert_eq!(t, "[fast]");
         assert_eq!(s.fg, Some(palette.error));
         // Only the real round all-failed → [real].
-        let mut status = crate::types::EndpointPingStatus::default();
-        status.real = round(&[101, 102]);
+        let status = crate::types::EndpointPingStatus {
+            real: round(&[101, 102]),
+            ..Default::default()
+        };
         let (t, _) = test_cell_content(false, true, Some(&status), 2, None, &palette);
         assert_eq!(t, "[real]");
     }
@@ -1182,8 +1189,10 @@ mod tests {
         let palette = test_palette();
         // 1 of 2 protocols attempted (single ping / cancelled batch) → no
         // all-unreachable label; the active protocol's delay still shows.
-        let mut status = crate::types::EndpointPingStatus::default();
-        status.fast = round(&[101]);
+        let status = crate::types::EndpointPingStatus {
+            fast: round(&[101]),
+            ..Default::default()
+        };
         let (t, _) = test_cell_content(false, true, Some(&status), 2, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
         // Success after failure clears the round's failed set → no label.
