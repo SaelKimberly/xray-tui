@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Protocol kinds. Variants mirror the (being-replaced) `Protocol` enum from
 /// `crates/xray-tui-core/src/protocol.rs` — 27 variants incl. the 7 outbound-only
@@ -9,7 +10,11 @@ use serde::{Deserialize, Serialize};
 /// aliases ("hysteria", "hysteria2", "anytls", "shadowtls", "tproxy",
 /// "hysteria1") that proto identity hashing, security_rank and
 /// fields_to_profile historically wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
+///
+/// Serde serializes via [`as_str`](Self::as_str) and deserializes via
+/// [`FromStr`], so the JSON form is the protocol dialect ("vmess", "ss-2022",
+/// ...) — never the Rust variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum ProtocolKind {
     Vmess,
     Vless,
@@ -81,6 +86,25 @@ impl std::fmt::Display for ProtocolKind {
     }
 }
 
+impl Serialize for ProtocolKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Error returned when a [`ProtocolKind`] string cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid protocol kind: '{0}'")]
@@ -145,17 +169,17 @@ impl std::str::FromStr for ProtocolKind {
 }
 
 /// Transport kinds. Mirrors the `type_str()` outputs of [`TransportConfig`]
-/// for every transport that exists today (Quic has no typed variant yet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
-#[serde(rename_all = "snake_case")]
+/// for every transport that exists today (incl. `Quic`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum TransportType {
     Tcp,
     Ws,
     Grpc,
     Http,
+    Quic,
+    Kcp,
     HttpUpgrade,
     XHttp,
-    Kcp,
 }
 
 impl TransportType {
@@ -166,9 +190,10 @@ impl TransportType {
             Self::Ws => "ws",
             Self::Grpc => "grpc",
             Self::Http => "http",
+            Self::Quic => "quic",
+            Self::Kcp => "kcp",
             Self::HttpUpgrade => "httpupgrade",
             Self::XHttp => "xhttp",
-            Self::Kcp => "kcp",
         }
     }
 }
@@ -176,6 +201,26 @@ impl TransportType {
 impl std::fmt::Display for TransportType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for TransportType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::from_str(&s)
+            .map_err(|_| serde::de::Error::custom(format_args!("invalid transport type: '{s}'")))
     }
 }
 
@@ -188,17 +233,17 @@ impl std::str::FromStr for TransportType {
             "ws" => Ok(Self::Ws),
             "grpc" => Ok(Self::Grpc),
             "http" => Ok(Self::Http),
+            "quic" => Ok(Self::Quic),
+            "kcp" => Ok(Self::Kcp),
             "httpupgrade" => Ok(Self::HttpUpgrade),
             "xhttp" => Ok(Self::XHttp),
-            "kcp" => Ok(Self::Kcp),
             _ => Err(()),
         }
     }
 }
 
 /// Security kinds. Mirrors the `type_str()` outputs of [`SecurityConfig`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum SecurityType {
     None,
     Tls,
@@ -219,6 +264,26 @@ impl SecurityType {
 impl std::fmt::Display for SecurityType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for SecurityType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SecurityType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::from_str(&s)
+            .map_err(|_| serde::de::Error::custom(format_args!("invalid security type: '{s}'")))
     }
 }
 
@@ -269,14 +334,15 @@ mod tests {
         ProtocolKind::Mixed,
     ];
 
-    const ALL_TRANSPORTS: [TransportType; 7] = [
+    const ALL_TRANSPORTS: [TransportType; 8] = [
         TransportType::Tcp,
         TransportType::Ws,
         TransportType::Grpc,
         TransportType::Http,
+        TransportType::Quic,
+        TransportType::Kcp,
         TransportType::HttpUpgrade,
         TransportType::XHttp,
-        TransportType::Kcp,
     ];
 
     const ALL_SECURITIES: [SecurityType; 3] =
@@ -402,23 +468,31 @@ mod tests {
         }
     }
 
-    /// Pin the serde representation so later tasks (DB embeds, JSON columns)
-    /// know exactly what these enums serialize to.
+    /// Pin the serde representation: the JSON form must equal the protocol
+    /// dialect (`as_str()`), never the Rust variant names — Task 3 hashes
+    /// serialized `ProtocolEssentials` for identity, so a second dialect
+    /// would drift identity hashing.
     #[test]
     fn serde_representation_is_stable() {
-        // ProtocolKind uses default unit-variant naming (no rename attribute).
+        assert_eq!(
+            serde_json::to_string(&ProtocolKind::Vmess).expect("serialize"),
+            "\"vmess\""
+        );
         assert_eq!(
             serde_json::to_string(&ProtocolKind::Shadowsocks2022).expect("serialize"),
-            "\"Shadowsocks2022\""
+            "\"ss-2022\""
         );
         assert_eq!(
             serde_json::to_string(&ProtocolKind::Hysteria2).expect("serialize"),
-            "\"Hysteria2\""
+            "\"hy2\""
         );
-        // TransportType/SecurityType use snake_case.
         assert_eq!(
             serde_json::to_string(&TransportType::HttpUpgrade).expect("serialize"),
-            "\"http_upgrade\""
+            "\"httpupgrade\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TransportType::XHttp).expect("serialize"),
+            "\"xhttp\""
         );
         assert_eq!(
             serde_json::to_string(&SecurityType::None).expect("serialize"),
@@ -446,6 +520,11 @@ mod tests {
                 TransportType::Http,
                 TransportConfig::Http(HttpConfig::default()),
             ),
+            (TransportType::Quic, TransportConfig::Quic),
+            (
+                TransportType::Kcp,
+                TransportConfig::Kcp(KcpConfig::default()),
+            ),
             (
                 TransportType::HttpUpgrade,
                 TransportConfig::HttpUpgrade(HttpUpgradeConfig::default()),
@@ -453,10 +532,6 @@ mod tests {
             (
                 TransportType::XHttp,
                 TransportConfig::XHttp(XHttpConfig::default()),
-            ),
-            (
-                TransportType::Kcp,
-                TransportConfig::Kcp(KcpConfig::default()),
             ),
         ];
         for (transport, config) in cases {
