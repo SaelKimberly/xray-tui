@@ -53,29 +53,36 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_param};
+use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig};
+use super::core_mapping;
 use super::utils;
-use super::{ParseError, ProtoSpec};
+use super::{
+    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
+    ProtocolEssentials, ProtocolKind,
+};
 use crate::clash::{ClashProxy, ClashVmess};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{
-    clash_alpn_as_str, clash_server_to_host, clash_tls_to_security, clash_transport_to_transport,
-    host_spec_to_string, security_to_clash_tls, transport_to_clash,
+    clash_alpn_as_str, clash_tls_to_security, clash_to_endpoint, clash_transport_to_transport,
+    host_kind_for, security_to_clash_tls, should_skip_endpoint_param, transport_to_clash,
 };
 
+/// VMess protocol configuration — the identity payload (sans host/port).
+///
+/// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
+/// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
+/// parameters, so the same config pointed at different servers shares one
+/// identity. Host-bearing fields on transports/security hold only EXPLICIT
+/// protocol parameters (the host-free parse mandate) — never the endpoint.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct VmessConfig {
     pub uuid: String,
-    #[serde(with = "host_serde")]
-    pub host: HostSpec,
-    #[serde(with = "port_serde")]
-    pub port: u16,
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
     pub security: SecurityConfig,
     pub transport: TransportConfig,
@@ -84,14 +91,17 @@ pub struct VmessConfig {
     pub remarks: Option<TinyText>,
 }
 
-impl ProtoSpec for VmessConfig {
-    /// Parse a `VMess` URL.
+impl VmessConfig {
+    /// Parse a `VMess` URL into the parse boundary: [`ParsedProto`] with the
+    /// endpoint essentials (host/port) split out and the identity payload
+    /// ([`ProtocolEssentials::config`]) holding only endpoint-free protocol
+    /// parameters.
     ///
     /// Decodes the base64 userinfo → parses lenient JSON with abbreviated v2rayN keys.
     /// Trailing non-base64 annotation (Telegram emoji, Persian text, etc.) is stripped
     /// by `decode_base64` before JSON parsing. Empty/null string fields are filtered.
     #[allow(clippy::too_many_lines)]
-    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+    pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         // VMess userinfo is base64-encoded JSON (v2rayN VmessQRCode format).
         // decode_base64 handles trailing annotation text/emoji and stray backticks.
         let decoded = utils::decode_base64(raw.userinfo)
@@ -117,6 +127,14 @@ impl ProtoSpec for VmessConfig {
                 utils::coerce_u16(v)
                     .ok_or_else(|| ParseError::InvalidPort(format!("cannot parse: {v}").into()))
             })?;
+
+        // Endpoint essentials: host/port live here, never in the config payload.
+        let endpoint = EndpointEssentials {
+            host: parsed_host.to_str().into_owned(),
+            host_type: host_kind_for(&parsed_host),
+            port: port_val,
+            ports: vec![port_val],
+        };
 
         // "id" — UUID v4 string, required
         let uuid = json
@@ -210,14 +228,18 @@ impl ProtoSpec for VmessConfig {
             TransportConfig::from_type_and_path(net_str.as_deref(), path.as_deref())?
                 .unwrap_or(TransportConfig::Tcp);
 
-        // Resolve host for transport (HttpUpgrade/XHttp): host → sni → server address
+        // HOST-FREE PARSE MANDATE (identity invariant): the endpoint host must
+        // never leak into the config payload. Only EXPLICIT `host`/`sni` JSON
+        // fields are protocol parameters and are stored; `with_host` is called
+        // with `None` as the server address, so absent fields leave the
+        // ws/grpc/http host fields unset (the builder injects the endpoint
+        // host at build time in phase D).
         let vmess_host = json
             .get("host")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from);
-        let server_addr = Some(parsed_host.to_str().into_owned());
-        transport = transport.with_host(vmess_host, sni.map(|s| s.to_string()), server_addr);
+        transport = transport.with_host(vmess_host, sni.map(|s| s.to_string()), None);
 
         // For XHttp: mode comes from VMess JSON `type` field
         if let TransportConfig::XHttp(ref mut xcfg) = transport
@@ -246,36 +268,48 @@ impl ProtoSpec for VmessConfig {
             path
         };
 
-        Ok(Self {
+        let config = Self {
             uuid,
-            host: parsed_host,
-            port: port_val,
             security,
             transport,
             alter_id,
             path,
             remarks,
+        };
+        Ok(ParsedProto {
+            endpoints: vec![endpoint],
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Vmess,
+                config_type: ConfigKind::ShareUrl,
+                core_type: core_mapping::resolve_core(ProtocolKind::Vmess, None, None),
+                config: ProtocolConfig::Vmess(config),
+            },
         })
     }
 
-    fn reconstruct(&self) -> Result<String, ParseError> {
+    /// Rebuild the share URL from this endpoint-free config plus the endpoint
+    /// essentials. Endpoint host/port come from `endpoint`; every protocol
+    /// parameter (including explicit transport/security host fields) is taken
+    /// from the config.
+    pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
         use base64::Engine as _;
 
+        let endpoint_host = endpoint.host.as_str();
         let mut map = serde_json::Map::new();
         map.insert(
             "add".into(),
-            serde_json::Value::String(self.host.to_str().into_owned()),
+            serde_json::Value::String(endpoint_host.to_string()),
         );
         map.insert(
             "port".into(),
-            serde_json::Value::String(self.port.to_string()),
+            serde_json::Value::String(endpoint.port.to_string()),
         );
         map.insert("id".into(), serde_json::Value::String(self.uuid.clone()));
 
         if let Some(TlsConfig::Tls(opts)) = &self.security.tls {
             map.insert("tls".into(), serde_json::Value::String("tls".into()));
             if let Some(ref v) = opts.sni
-                && !should_skip_param(&self.host, v)
+                && !should_skip_endpoint_param(endpoint_host, v)
             {
                 map.insert("sni".into(), serde_json::Value::String(v.to_string()));
             }
@@ -308,21 +342,35 @@ impl ProtoSpec for VmessConfig {
         match &self.transport {
             TransportConfig::Ws(cfg) => {
                 if let Some(host) = &cfg.host
-                    && !should_skip_param(&self.host, host)
+                    && !should_skip_endpoint_param(endpoint_host, host)
                 {
                     map.insert("host".into(), serde_json::Value::String(host.to_string()));
                 }
             }
             TransportConfig::Grpc(cfg) => {
                 if let Some(auth) = &cfg.authority
-                    && !should_skip_param(&self.host, auth)
+                    && !should_skip_endpoint_param(endpoint_host, auth)
                 {
                     map.insert("host".into(), serde_json::Value::String(auth.to_string()));
                 }
             }
             TransportConfig::Http(cfg) => {
                 if let Some(host) = &cfg.host
-                    && !should_skip_param(&self.host, host)
+                    && !should_skip_endpoint_param(endpoint_host, host)
+                {
+                    map.insert("host".into(), serde_json::Value::String(host.to_string()));
+                }
+            }
+            TransportConfig::HttpUpgrade(cfg) => {
+                if let Some(host) = &cfg.host
+                    && !should_skip_endpoint_param(endpoint_host, host)
+                {
+                    map.insert("host".into(), serde_json::Value::String(host.to_string()));
+                }
+            }
+            TransportConfig::XHttp(cfg) => {
+                if let Some(host) = &cfg.host
+                    && !should_skip_endpoint_param(endpoint_host, host)
                 {
                     map.insert("host".into(), serde_json::Value::String(host.to_string()));
                 }
@@ -344,83 +392,18 @@ impl ProtoSpec for VmessConfig {
         let encoded = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(json_str.as_bytes());
         Ok(format!("vmess://{encoded}"))
     }
+}
 
-    fn schema(&self) -> SchemeX {
-        SchemeX::Vmess
-    }
-
-    fn host(&self) -> Option<&HostSpec> {
-        Some(&self.host)
-    }
-
-    fn port(&self) -> Option<u16> {
-        Some(self.port)
-    }
-
-    fn remarks(&self) -> Option<&str> {
-        self.remarks.as_deref()
-    }
-
-    fn transport_type(&self) -> Option<&str> {
-        Some(self.transport.type_str())
-    }
-
-    fn security(&self) -> Option<&SecurityConfig> {
-        Some(&self.security)
-    }
-    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
-        match proxy {
-            ClashProxy::Vmess(c) => {
-                let security = {
-                    let mut s = clash_tls_to_security(
-                        c.tls,
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        clash_alpn_as_str(c.alpn.as_ref()),
-                        c.fingerprint.as_deref(),
-                        None,
-                    );
-                    s.enc = Some(TinyText::from(c.cipher.as_str()));
-                    s
-                };
-                let transport = clash_transport_to_transport(
-                    c.network.as_deref(),
-                    c.ws_opts.as_ref(),
-                    c.grpc_opts.as_ref(),
-                    c.h2_opts.as_ref(),
-                    c.http_opts.as_ref(),
-                    c.mkcp_opts.as_ref(),
-                    Some(&c.server),
-                );
-                let path = match &transport {
-                    TransportConfig::Ws(ws) => ws.path.clone(),
-                    TransportConfig::Grpc(g) => g.path.clone(),
-                    TransportConfig::Http(h) => h.path.clone(),
-                    TransportConfig::HttpUpgrade(cfg) => cfg.path.clone(),
-                    TransportConfig::XHttp(cfg) => cfg.path.clone(),
-                    _ => None,
-                };
-                Ok(Self {
-                    uuid: c.uuid.clone(),
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    security,
-                    transport,
-                    alter_id: c.alter_id.map(|v| TinyText::from(v.to_string())),
-                    path,
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
-            _ => Err(ParseError::Unknown("expected vmess clash proxy".into())),
-        }
-    }
-
-    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+impl VmessConfig {
+    /// Serialize this endpoint-free config plus the endpoint to a Clash proxy
+    /// entry. Endpoint host/port are taken from `endpoint` (identity is not
+    /// involved in this direction).
+    pub fn to_clash_proto(
+        &self,
+        endpoint: &EndpointEssentials,
+    ) -> Result<ClashProxy, ProtoSpecError> {
         let name = self.remarks.as_deref().unwrap_or("").to_string();
-        let server = host_spec_to_string(&self.host);
+        let server = endpoint.host.clone();
         let (tls, servername, skip_cert_verify, alpn_str, fingerprint) =
             security_to_clash_tls(&self.security);
         let (network, ws_opts, grpc_opts, h2_opts, http_opts, mkcp_opts) =
@@ -428,7 +411,7 @@ impl ProtoSpec for VmessConfig {
         Ok(ClashProxy::Vmess(ClashVmess {
             name,
             server,
-            port: self.port,
+            port: endpoint.port,
             uuid: self.uuid.clone(),
             cipher: self
                 .security
@@ -451,6 +434,154 @@ impl ProtoSpec for VmessConfig {
             mkcp_opts,
         }))
     }
+
+    /// Parse a Clash proxy entry into the parse boundary: `server`/`port`
+    /// become the endpoint essentials; the config payload is endpoint-free.
+    /// Explicit Clash TLS `servername` and ws `Host` header fields are
+    /// protocol parameters and stay in the config.
+    pub fn try_from_clash_proto(proxy: &ClashProxy) -> Result<ParsedProto, ParseError> {
+        match proxy {
+            ClashProxy::Vmess(c) => {
+                let security = {
+                    let mut s = clash_tls_to_security(
+                        c.tls,
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        clash_alpn_as_str(c.alpn.as_ref()),
+                        c.fingerprint.as_deref(),
+                        None,
+                    );
+                    s.enc = Some(TinyText::from(c.cipher.as_str()));
+                    s
+                };
+                // HOST-FREE: the endpoint server is never copied into
+                // transport host fields (`server = None`).
+                let transport = clash_transport_to_transport(
+                    c.network.as_deref(),
+                    c.ws_opts.as_ref(),
+                    c.grpc_opts.as_ref(),
+                    c.h2_opts.as_ref(),
+                    c.http_opts.as_ref(),
+                    c.mkcp_opts.as_ref(),
+                    None,
+                );
+                let path = match &transport {
+                    TransportConfig::Ws(ws) => ws.path.clone(),
+                    TransportConfig::Grpc(g) => g.path.clone(),
+                    TransportConfig::Http(h) => h.path.clone(),
+                    TransportConfig::HttpUpgrade(cfg) => cfg.path.clone(),
+                    TransportConfig::XHttp(cfg) => cfg.path.clone(),
+                    _ => None,
+                };
+                let config = Self {
+                    uuid: c.uuid.clone(),
+                    security,
+                    transport,
+                    alter_id: c.alter_id.map(|v| TinyText::from(v.to_string())),
+                    path,
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                };
+                Ok(ParsedProto {
+                    endpoints: vec![clash_to_endpoint(&c.server, c.port)],
+                    protocol: ProtocolEssentials {
+                        proto_kind: ProtocolKind::Vmess,
+                        config_type: ConfigKind::ShareUrl,
+                        core_type: core_mapping::resolve_core(ProtocolKind::Vmess, None, None),
+                        config: ProtocolConfig::Vmess(config),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected vmess clash proxy".into())),
+        }
+    }
+}
+
+/// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
+/// other 18 configs) compile unchanged.
+///
+/// DEGRADED PATH (documented): `try_parse`/`try_from_clash` still work by
+/// delegating to the `*_proto` variants and discarding the parsed endpoints;
+/// `to_clash`/`reconstruct` return errors because the config no longer stores
+/// host/port. Import/export rewires to the `*_proto` variants in T11 (phase D
+/// builders take the endpoint separately).
+impl ProtoSpec for VmessConfig {
+    /// # Errors
+    ///
+    /// If either the URL is invalid or the external configuration is invalid.
+    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+        let parsed = Self::try_parse_proto(raw)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Vmess(config) => Ok(config),
+            // Parser invariant: a vmess URL always yields a VmessConfig.
+            _ => Err(ParseError::Unknown(
+                "vmess URL parsed to a non-vmess config".into(),
+            )),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::reconstruct_proto`] with the endpoint.
+    fn reconstruct(&self) -> Result<String, ParseError> {
+        Err(ParseError::InvalidHost(
+            "vmess config no longer stores host/port; use VmessConfig::reconstruct_proto(endpoint)"
+                .into(),
+        ))
+    }
+
+    fn schema(&self) -> SchemeX {
+        SchemeX::Vmess
+    }
+
+    /// `None` — the endpoint host moved to [`EndpointEssentials`] (T4).
+    fn host(&self) -> Option<&HostSpec> {
+        None
+    }
+
+    /// `None` — the endpoint port moved to [`EndpointEssentials`] (T4).
+    fn port(&self) -> Option<u16> {
+        None
+    }
+
+    fn remarks(&self) -> Option<&str> {
+        self.remarks.as_deref()
+    }
+
+    fn transport_type(&self) -> Option<&str> {
+        Some(self.transport.type_str())
+    }
+
+    fn security(&self) -> Option<&SecurityConfig> {
+        Some(&self.security)
+    }
+
+    /// # Errors
+    ///
+    /// If the Clash proxy doesn't match this protocol type.
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        let parsed = Self::try_from_clash_proto(proxy)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Vmess(config) => Ok(config),
+            _ => Err(ParseError::Unknown(
+                "vmess clash proxy parsed to a non-vmess config".into(),
+            )),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::to_clash_proto`] with the endpoint.
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        Err(ProtoSpecError::Unsupported(
+            "vmess config no longer stores host/port; use VmessConfig::to_clash_proto(endpoint)"
+                .into(),
+        ))
+    }
 }
 
 impl ProtoIdentity for VmessConfig {
@@ -464,8 +595,8 @@ impl ProtoIdentity for VmessConfig {
             hasher.write(v.as_bytes());
         }
         hasher.write(self.transport.type_str().as_bytes());
-        hasher.write(self.host.to_str().as_bytes());
-        hasher.write(&self.port.to_le_bytes());
+        // Endpoint (host/port) intentionally absent from the identity — it
+        // lives on the ParsedProto boundary, never in the config payload (T4).
         match &self.transport {
             TransportConfig::HttpUpgrade(cfg) => {
                 if let Some(v) = &cfg.host {
@@ -503,135 +634,409 @@ impl ProtoIdentity for VmessConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ProtoSpec;
+    use base64::Engine as _;
 
-    use crate::urlx::SchemeX;
+    use super::super::{
+        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
+    use super::VmessConfig;
+    use crate::proto_spec::common::TransportConfig;
+    use crate::urlx::{RawUrlX, SchemeX};
+
+    const UUID: &str = "9b4c2eda-341e-488f-a3b2-1dc716b9f36a";
+    const BASIC_B64: &str = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==";
+
+    fn vmess_url(server: &str, port: u16, id: &str, extra: &[(&str, &str)]) -> String {
+        use base64::Engine as _;
+        let mut map = serde_json::Map::new();
+        map.insert("v".into(), serde_json::json!("2"));
+        map.insert("add".into(), serde_json::json!(server));
+        map.insert("port".into(), serde_json::json!(port.to_string()));
+        map.insert("id".into(), serde_json::json!(id));
+        map.insert("aid".into(), serde_json::json!("0"));
+        map.insert("scy".into(), serde_json::json!("auto"));
+        map.insert("net".into(), serde_json::json!("ws"));
+        map.insert("path".into(), serde_json::json!("/"));
+        map.insert("tls".into(), serde_json::json!("tls"));
+        map.insert("sni".into(), serde_json::json!("test.ir"));
+        for (k, v) in extra {
+            map.insert((*k).into(), serde_json::json!(v));
+        }
+        let json = serde_json::Value::Object(map);
+        let encoded = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
+        format!("vmess://{encoded}")
+    }
+
+    fn parse(url: &str) -> ParsedProto {
+        VmessConfig::try_parse_proto(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"))
+    }
+
+    fn config(parsed: ParsedProto) -> VmessConfig {
+        match parsed.protocol.config {
+            ProtocolConfig::Vmess(c) => c,
+            other => panic!("expected VmessConfig, got {other:?}"),
+        }
+    }
+
+    /// The identity payload must be endpoint-free: no top-level `host`/`port`
+    /// keys in the serialized config.
+    fn assert_no_top_level_host_port(cfg: &VmessConfig) {
+        let json = serde_json::to_value(cfg).expect("serialize");
+        let obj = json.as_object().expect("config is an object");
+        assert!(
+            !obj.contains_key("host"),
+            "config payload must not carry a top-level host key: {json}"
+        );
+        assert!(
+            !obj.contains_key("port"),
+            "config payload must not carry a top-level port key: {json}"
+        );
+    }
+
+    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
+    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    fn assert_reconstruct_roundtrip(url: &str) {
+        let parsed = parse(url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed.clone());
+        let out = cfg
+            .reconstruct_proto(&endpoint)
+            .unwrap_or_else(|e| panic!("reconstruct failed for {url}: {e}"));
+        let reparsed = parse(&out);
+        assert_eq!(parsed, reparsed, "reconstruct round-trip failed for: {url}");
+    }
+
+    // ── URL parse: endpoints + config ─────────────────────────────────────
 
     #[test]
     fn test_vmess_basic() {
-        let url = "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = VmessConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.schema(), SchemeX::Vmess);
-        assert_eq!(config.host.to_str(), "192.200.160.16");
+        let url = format!("vmess://{BASIC_B64}");
+        let parsed = parse(&url);
+        assert_eq!(parsed.endpoints.len(), 1);
+        let ep = &parsed.endpoints[0];
+        assert_eq!(ep.host, "192.200.160.16");
+        assert_eq!(ep.host_type, HostKind::Ipv4);
+        assert_eq!(ep.port, 8443);
+        assert_eq!(ep.ports, vec![8443]);
+
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Vmess);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let cfg = config(parsed);
+        assert_eq!(cfg.uuid, UUID);
+        assert_eq!(cfg.transport.type_str(), "ws");
+        assert_eq!(cfg.security.type_str(), Some("tls"));
+        assert_eq!(cfg.security.sni(), Some("steam.avaaaal.ir"));
+        assert_eq!(cfg.security.insecure(), Some(true));
+        assert_eq!(cfg.remarks.as_deref(), Some("@CloudCityy"));
+        assert_no_top_level_host_port(&cfg);
     }
 
     #[test]
-    fn test_reconstruct_roundtrip() {
-        let input = "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==";
-        let raw = crate::urlx::RawUrlX::from(input);
-        let parsed = VmessConfig::try_parse(&raw).expect("failed to parse");
-        let reconstructed = parsed.reconstruct().expect("failed to reconstruct");
+    fn test_vmess_endpoint_host_kinds() {
+        let dns = parse(&vmess_url("example.com", 443, UUID, &[]));
+        assert_eq!(dns.endpoints[0].host, "example.com");
+        assert_eq!(dns.endpoints[0].host_type, HostKind::Dns);
 
-        let raw2 = crate::urlx::RawUrlX::from(reconstructed.as_str());
-        let reparsed = VmessConfig::try_parse(&raw2).expect("failed to re-parse");
-
-        assert_eq!(parsed.host, reparsed.host, "host mismatch");
-        assert_eq!(parsed.port, reparsed.port, "port mismatch");
+        let v6 = parse(&vmess_url("2001:db8::1", 8443, UUID, &[]));
+        assert_eq!(v6.endpoints[0].host, "2001:db8::1");
+        assert_eq!(v6.endpoints[0].host_type, HostKind::Ipv6);
+        assert_eq!(v6.endpoints[0].port, 8443);
     }
 
-    #[test]
-    fn test_serde_roundtrip() {
-        let input = "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==";
-        let raw = crate::urlx::RawUrlX::from(input);
-
-        let parsed = VmessConfig::try_parse(&raw).expect("failed to parse");
-        let json = serde_json::to_string(&parsed).expect("serialize");
-        let deserialized: VmessConfig = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.host, deserialized.host);
-    }
-
-    use super::super::test_helpers::check_roundtrip;
-    use super::VmessConfig;
+    // ── Identity: endpoint-free uid ───────────────────────────────────────
 
     #[test]
-    fn test_roundtrip() {
-        check_roundtrip::<VmessConfig>(
-            "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==",
+    fn uid_identical_across_servers_different_across_uuids() {
+        let url_a = vmess_url("a.example.com", 443, UUID, &[]);
+        let url_b = vmess_url("b.example.com", 8443, UUID, &[]);
+        let url_c = vmess_url(
+            "a.example.com",
+            443,
+            "22222222-3333-4444-5555-666666666666",
+            &[],
         );
-    }
-
-    #[test]
-    fn test_clash_roundtrip() {
-        use super::super::test_helpers::check_clash_roundtrip;
-        check_clash_roundtrip::<VmessConfig>(
-            "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==",
+        let a = parse(&url_a);
+        let b = parse(&url_b);
+        let c = parse(&url_c);
+        assert_eq!(
+            a.uid(),
+            b.uid(),
+            "same protocol on different servers must dedup to one uid"
         );
+        assert_ne!(a.uid(), c.uid(), "different uuid -> different uid");
+        assert_ne!(a.sig(), 0);
+    }
+
+    // ── Reconstruct round-trip via endpoint ───────────────────────────────
+
+    #[test]
+    fn reconstruct_roundtrip_via_endpoint() {
+        assert_reconstruct_roundtrip(&format!("vmess://{BASIC_B64}"));
+        assert_reconstruct_roundtrip(&vmess_url("example.com", 443, UUID, &[]));
+        assert_reconstruct_roundtrip(&vmess_url(
+            "example.com",
+            443,
+            UUID,
+            &[("host", "cdn.example.com"), ("path", "/ws")],
+        ));
     }
 
     #[test]
-    fn test_vmess_httpupgrade() {
-        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0Ijoid3MuZXhhbXBsZS5jb20iLCJpZCI6Ijk5OTk5OTk5LTk5OTktOTk5OS05OTk5LTk5OTk5OTk5OTk5OSIsIm5ldCI6Imh0dHB1cGdyYWRlIiwicGF0aCI6Ii92MnJheSIsInBvcnQiOiI4NDQzIiwicHMiOiJ0ZXN0aHR0cHVwZ3JhZGUiLCJzY3kiOiJhdXRvIiwic25pIjoiIiwidGxzIjoidGxzIiwidHlwZSI6IiIsInYiOiIyIn0=";
-        let url_str = format!("vmess://{b64}");
-        let raw = crate::urlx::RawUrlX::from(url_str.as_str());
-        let config = VmessConfig::try_parse(&raw).expect("vmess httpupgrade failed");
-        assert_eq!(config.transport.type_str(), "httpupgrade");
-    }
-
-    #[test]
-    fn test_vmess_splithttp() {
-        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0IjoieGh0dHAuZXhhbXBsZS5jb20iLCJpZCI6Ijk5OTk5OTk5LTk5OTktOTk5OS05OTk5LTk5OTk5OTk5OTk5OSIsIm5ldCI6InNwbGl0aHR0cCIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6InRlc3R4aHR0cCIsInNjeSI6ImF1dG8iLCJzbmkiOiIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiYXV0byIsInYiOiIyIn0=";
-        let url_str = format!("vmess://{b64}");
-        let raw = crate::urlx::RawUrlX::from(url_str.as_str());
-        let config = VmessConfig::try_parse(&raw).expect("vmess splithttp failed");
-        assert_eq!(config.transport.type_str(), "xhttp");
-    }
-
-    #[test]
-    fn test_trailing_emoji() {
-        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJuZXQiOiJ0Y3AiLCJwYXRoIjoiLyIsInBvcnQiOiI4NDQzIiwicHMiOiJ0ZXN0Iiwic2N5IjoiYXV0byIsInNuaSI6IiIsInRscyI6IiIsInR5cGUiOiIiLCJ2IjoiMiJ9";
-        let url = format!("vmess://{b64}💛💜test");
-        let raw = crate::urlx::RawUrlX::from(url.as_str());
-        let config = VmessConfig::try_parse(&raw).expect("trailing emoji failed");
-        assert_eq!(config.host.to_str(), "192.200.160.16");
-    }
-
-    #[test]
-    fn test_trailing_persian() {
-        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJuZXQiOiJ0Y3AiLCJwYXRoIjoiLyIsInBvcnQiOiI4NDQzIiwicHMiOiJ0ZXN0Iiwic2N5IjoiYXV0byIsInNuaSI6IiIsInRscyI6IiIsInR5cGUiOiIiLCJ2IjoiMiJ9";
-        let url = format!("vmess://{b64}سرور آلمان");
-        let raw = crate::urlx::RawUrlX::from(url.as_str());
-        let config = VmessConfig::try_parse(&raw).expect("trailing persian failed");
-        assert_eq!(config.host.to_str(), "192.200.160.16");
-    }
-
-    #[test]
-    fn test_trailing_ascii_after_padding() {
-        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJuZXQiOiJ0Y3AiLCJwYXRoIjoiLyIsInBvcnQiOiI4NDQzIiwicHMiOiJ0ZXN0Iiwic2N5IjoiYXV0byIsInNuaSI6IiIsInRscyI6IiIsInR5cGUiOiIiLCJ2IjoiMiJ9=";
-        let url = format!("vmess://{b64}Irancell&Mciفوروارد فراموش نشه📌");
-        let raw = crate::urlx::RawUrlX::from(url.as_str());
-        let config = VmessConfig::try_parse(&raw).expect("trailing ascii after = failed");
-        assert_eq!(config.host.to_str(), "192.200.160.16");
-    }
-
-    #[test]
-    fn vmess_ws_host_survives_parse_roundtrip() {
-        use base64::Engine as _;
-        let b64 = "eyJ2IjoiMiIsInBzIjoidGVzdHdzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUiLCJhaWQiOiIwIiwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwiaG9zdCI6ImNkbi5leGFtcGxlLmNvbSIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ";
-        let url = format!("vmess://{b64}");
-        let raw = crate::urlx::RawUrlX::from(url.as_str());
-        let parsed = VmessConfig::try_parse(&raw).expect("vmess ws parse");
-        match &parsed.transport {
-            super::TransportConfig::Ws(ws) => {
-                assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
-            }
-            other => panic!("expected ws transport, got {other:?}"),
+    fn explicit_host_param_survives_roundtrip() {
+        let url = vmess_url("example.com", 443, UUID, &[("host", "cdn.example.com")]);
+        let parsed = parse(&url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        if let TransportConfig::Ws(ws) = &cfg.transport {
+            assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+        } else {
+            panic!("expected ws transport");
         }
-        let reconstructed = parsed.reconstruct().expect("vmess ws reconstruct");
-        // The payload is base64 — decode it to inspect the JSON body
-        let payload = reconstructed
-            .strip_prefix("vmess://")
-            .expect("vmess scheme");
+        let out = cfg.reconstruct_proto(&endpoint).expect("reconstruct");
+        // The payload is base64 — decode it to inspect the JSON body.
+        let payload = out.strip_prefix("vmess://").expect("vmess scheme");
         let decoded = base64::prelude::BASE64_URL_SAFE_NO_PAD
             .decode(payload)
             .expect("decode vmess payload");
         let json: serde_json::Value = serde_json::from_slice(&decoded).expect("vmess json");
         assert_eq!(
             json["host"], "cdn.example.com",
-            "reconstruct keeps ws host in: {reconstructed}"
+            "reconstruct keeps ws host in: {out}"
         );
-        let reparsed = VmessConfig::try_parse(&crate::urlx::RawUrlX::from(reconstructed.as_str()))
-            .expect("vmess ws reparse");
-        assert_eq!(reparsed, parsed, "vmess ws roundtrip equality");
+    }
+
+    // ── Clash round-trip via *_proto ──────────────────────────────────────
+
+    #[test]
+    fn clash_roundtrip_from_url_via_proto() {
+        let url = format!("vmess://{BASIC_B64}");
+        let parsed = parse(&url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
+        let reparsed = VmessConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(
+            reparsed.endpoints[0], endpoint,
+            "endpoint round-trips through clash"
+        );
+        assert_eq!(
+            reparsed.protocol.config,
+            ProtocolConfig::Vmess(cfg),
+            "config round-trips through clash"
+        );
+    }
+
+    #[test]
+    fn clash_proxy_roundtrip_via_proto() {
+        use crate::clash::{ClashProxy, ClashVmess, ClashWSOpts};
+
+        let proxy = ClashProxy::Vmess(ClashVmess {
+            name: "test".into(),
+            server: "example.com".into(),
+            port: 443,
+            uuid: UUID.into(),
+            cipher: "auto".into(),
+            alter_id: None,
+            udp: None,
+            tfo: None,
+            network: Some("ws".into()),
+            tls: Some(true),
+            servername: Some("test.ir".into()),
+            skip_cert_verify: Some(true),
+            alpn: None,
+            fingerprint: None,
+            ws_opts: Some(ClashWSOpts {
+                path: Some("/ws".into()),
+                headers: Some(std::collections::HashMap::from([(
+                    "Host".to_string(),
+                    "cdn.example.com".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            grpc_opts: None,
+            h2_opts: None,
+            http_opts: None,
+            mkcp_opts: None,
+        });
+        let parsed = VmessConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(parsed.endpoints[0].host, "example.com");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Dns);
+        assert_eq!(parsed.endpoints[0].port, 443);
+        let cfg = match &parsed.protocol.config {
+            ProtocolConfig::Vmess(c) => c,
+            other => panic!("expected VmessConfig, got {other:?}"),
+        };
+        // Explicit Clash ws Host header stays in the config (host-free mandate).
+        if let TransportConfig::Ws(ws) = &cfg.transport {
+            assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+            assert_eq!(ws.path.as_deref(), Some("/ws"));
+        } else {
+            panic!("expected ws transport");
+        }
+        assert_eq!(cfg.security.sni(), Some("test.ir"));
+        assert_eq!(cfg.security.insecure(), Some(true));
+        assert_no_top_level_host_port(cfg);
+        let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
+        match (out, proxy) {
+            (ClashProxy::Vmess(out), ClashProxy::Vmess(orig)) => assert_eq!(out, orig),
+            _ => panic!("expected vmess clash proxy"),
+        }
+    }
+
+    // ── HOST-FREE PARSE MANDATE: no server-address fallback ───────────────
+
+    #[test]
+    fn ws_host_param_stored_but_absent_param_stays_unset() {
+        // Explicit `host` JSON field is a protocol parameter and IS stored.
+        let url = vmess_url("example.com", 443, UUID, &[("host", "cdn.example.com")]);
+        let parsed = parse(&url);
+        let cfg = config(parsed);
+        if let TransportConfig::Ws(ws) = &cfg.transport {
+            assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+        } else {
+            panic!("expected ws transport");
+        }
+
+        // Without `host`/`sni`, the ws host field must be UNSET — never the
+        // server (the explicit `sni` param would be stored, but an absent one
+        // must not fall back to the endpoint).
+        let url = vmess_url("example.com", 443, UUID, &[("sni", "")]);
+        let parsed = parse(&url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        if let TransportConfig::Ws(ws) = &cfg.transport {
+            assert_eq!(ws.host, None, "ws host must not fall back to the server");
+        } else {
+            panic!("expected ws transport");
+        }
+        // Reconstruct must not invent a `host` field for the absent one.
+        let out = cfg.reconstruct_proto(&endpoint).expect("reconstruct");
+        let payload = out.strip_prefix("vmess://").expect("vmess scheme");
+        let decoded = base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("decode vmess payload");
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect("vmess json");
+        assert!(
+            json.get("host").is_none(),
+            "no host field emitted for absent param: {json}"
+        );
+        assert_no_top_level_host_port(&cfg);
+    }
+
+    #[test]
+    fn sni_param_stored_but_absent_sni_stays_unset() {
+        // Explicit `sni` is a protocol parameter and IS stored.
+        let url = vmess_url("example.com", 443, UUID, &[("sni", "cdn.example.com")]);
+        let cfg = config(parse(&url));
+        assert_eq!(cfg.security.sni(), Some("cdn.example.com"));
+
+        // No `sni`: security must not carry the server as sni.
+        let url = vmess_url("example.com", 443, UUID, &[("sni", "")]);
+        let cfg = config(parse(&url));
+        assert_eq!(
+            cfg.security.sni(),
+            None,
+            "sni must not fall back to the server"
+        );
+    }
+
+    // ── Transport edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_vmess_httpupgrade() {
+        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0Ijoid3MuZXhhbXBsZS5jb20iLCJpZCI6Ijk5OTk5OTk5LTk5OTktOTk5OS05OTk5LTk5OTk5OTk5OTk5OSIsIm5ldCI6Imh0dHB1cGdyYWRlIiwicGF0aCI6Ii92MnJheSIsInBvcnQiOiI4NDQzIiwicHMiOiJ0ZXN0aHR0cHVwZ3JhZGUiLCJzY3kiOiJhdXRvIiwic25pIjoiIiwidGxzIjoidGxzIiwidHlwZSI6IiIsInYiOiIyIn0=";
+        let url = format!("vmess://{b64}");
+        let parsed = parse(&url);
+        let cfg = config(parsed);
+        assert_eq!(cfg.transport.type_str(), "httpupgrade");
+        if let TransportConfig::HttpUpgrade(h) = &cfg.transport {
+            assert_eq!(h.host.as_deref(), Some("ws.example.com"));
+        } else {
+            panic!("expected httpupgrade transport");
+        }
+        assert_reconstruct_roundtrip(&url);
+    }
+
+    #[test]
+    fn test_vmess_splithttp() {
+        let b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0IjoieGh0dHAuZXhhbXBsZS5jb20iLCJpZCI6Ijk5OTk5OTk5LTk5OTktOTk5OS05OTk5LTk5OTk5OTk5OTk5OSIsIm5ldCI6InNwbGl0aHR0cCIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6InRlc3R4aHR0cCIsInNjeSI6ImF1dG8iLCJzbmkiOiIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiYXV0byIsInYiOiIyIn0=";
+        let url = format!("vmess://{b64}");
+        let parsed = parse(&url);
+        let cfg = config(parsed);
+        assert_eq!(cfg.transport.type_str(), "xhttp");
+        if let TransportConfig::XHttp(x) = &cfg.transport {
+            assert_eq!(x.mode.as_deref(), Some("auto"));
+            assert_eq!(x.host.as_deref(), Some("xhttp.example.com"));
+        } else {
+            panic!("expected xhttp transport");
+        }
+        assert_reconstruct_roundtrip(&url);
+    }
+
+    #[test]
+    fn test_vmess_trailing_annotations() {
+        let tcp_b64 = "eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJuZXQiOiJ0Y3AiLCJwYXRoIjoiLyIsInBvcnQiOiI4NDQzIiwicHMiOiJ0ZXN0Iiwic2N5IjoiYXV0byIsInNuaSI6IiIsInRscyI6IiIsInR5cGUiOiIiLCJ2IjoiMiJ9";
+        // The `Irancell&Mci...` suffix is itself valid base64 text, so it is
+        // only stripped when padding marks the end of the real payload.
+        let padded = format!("{tcp_b64}=");
+        for (b64, suffix) in [
+            (tcp_b64, "💛💜test"),
+            (tcp_b64, "سرور آلمان"),
+            (padded.as_str(), "Irancell&Mciفوروارد فراموش نشه📌"),
+        ] {
+            let url = format!("vmess://{b64}{suffix}");
+            let parsed = parse(&url);
+            assert_eq!(parsed.endpoints[0].host, "192.200.160.16");
+            assert_eq!(parsed.endpoints[0].port, 8443);
+        }
+    }
+
+    // ── Serde ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_vmess_serde_roundtrip() {
+        let url = format!("vmess://{BASIC_B64}");
+        let parsed = parse(&url);
+        let cfg = config(parsed);
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let deserialized: VmessConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, deserialized);
+        assert_no_top_level_host_port(&deserialized);
+    }
+
+    // ── Legacy trait bridge ───────────────────────────────────────────────
+
+    #[test]
+    fn legacy_bridge_parse_works_but_reconstruct_to_clash_error() {
+        let url = vmess_url("example.com", 443, UUID, &[]);
+        // try_parse still extracts the config (endpoints discarded).
+        let bridged = VmessConfig::try_parse(&RawUrlX::from(url.as_str())).expect("bridged parse");
+        assert_eq!(bridged.schema(), SchemeX::Vmess);
+        assert_eq!(bridged.uuid, UUID);
+        // host/port accessors are gone — the endpoint lives on ParsedProto.
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
+        // Degraded legacy paths error instead of fabricating a host.
+        assert!(bridged.reconstruct().is_err());
+        assert!(bridged.to_clash().is_err());
+    }
+
+    #[test]
+    fn serialized_config_has_no_host_or_port_keys() {
+        for url in [
+            format!("vmess://{BASIC_B64}"),
+            vmess_url("example.com", 443, UUID, &[("host", "cdn.example.com")]),
+            vmess_url(
+                "example.com",
+                443,
+                UUID,
+                &[("net", "grpc"), ("path", "svc")],
+            ),
+        ] {
+            let cfg = config(parse(&url));
+            assert_no_top_level_host_port(&cfg);
+        }
     }
 }

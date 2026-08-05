@@ -1,7 +1,7 @@
 use crate::clash::{
     ClashGrpcOpts, ClashH2Opts, ClashHttpOpts, ClashKcpOpts, ClashRealityOpts, ClashWSOpts,
 };
-use crate::proto_spec::ParseError;
+use crate::proto_spec::{EndpointEssentials, HostKind, ParseError};
 use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
@@ -181,6 +181,28 @@ pub(crate) fn should_skip_param(host: &HostSpec, value: &str) -> bool {
     match host {
         HostSpec::DnsName(name) => name.as_ref().eq_ignore_ascii_case(value),
         _ => false,
+    }
+}
+
+/// Like [`should_skip_param`] but takes the endpoint host *string*, which is
+/// all the `*_proto` reconstruct path has (`EndpointEssentials::host`). An IP
+/// endpoint never skips — an IP cannot serve as a TLS SNI/HTTP Host value.
+pub(crate) fn should_skip_endpoint_param(endpoint_host: &str, value: &str) -> bool {
+    if endpoint_host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    endpoint_host.eq_ignore_ascii_case(value)
+}
+
+/// Endpoint host kind for a parsed [`HostSpec`] — the rule every URL parser
+/// uses: Ipv4/Ipv6 when the host parses as an IP address, Dns otherwise
+/// (`Undefined` only when there is no host at all, which vless/vmess never
+/// hit).
+pub(crate) fn host_kind_for(host: &HostSpec) -> HostKind {
+    match host {
+        HostSpec::IpAddress(rustls::pki_types::IpAddr::V4(_)) => HostKind::Ipv4,
+        HostSpec::IpAddress(rustls::pki_types::IpAddr::V6(_)) => HostKind::Ipv6,
+        _ => HostKind::Dns,
     }
 }
 
@@ -489,6 +511,23 @@ pub(crate) fn clash_server_to_host(server: &str) -> Result<HostSpec, ParseError>
     let (_, host) = crate::utils::host_port::host(server.as_bytes())
         .map_err(|_| ParseError::InvalidHost(format!("invalid clash server: {server}").into()))?;
     Ok(host.to_owned())
+}
+
+/// Clash `server` string + `port` → [`EndpointEssentials`], using the same
+/// host-kind rule as the URL parsers ([`host_kind_for`]). The raw server
+/// string is stored verbatim so `to_clash_proto` round-trips it unchanged.
+pub(crate) fn clash_to_endpoint(server: &str, port: u16) -> EndpointEssentials {
+    let host_type = match server.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => HostKind::Ipv4,
+        Ok(std::net::IpAddr::V6(_)) => HostKind::Ipv6,
+        Err(_) => HostKind::Dns,
+    };
+    EndpointEssentials {
+        host: server.to_string(),
+        host_type,
+        port,
+        ports: vec![port],
+    }
 }
 
 /// Convert Clash transport fields to a `TransportConfig`.

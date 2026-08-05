@@ -495,6 +495,18 @@ trait ProtoIdentity {
 
 /// Behavioral protocol spec, sealed to this crate via the private
 /// [`ProtoIdentity`] supertrait.
+///
+/// PARSE-CONTRACT MIGRATION (phase A): the parse contract is moving to the
+/// `*_proto` inherent methods on each config type (`try_parse_proto` /
+/// `try_from_clash_proto` / `to_clash_proto` / `reconstruct_proto`), which
+/// produce/consume [`ParsedProto`] with the endpoint ([`EndpointEssentials`])
+/// split out and [`ProtocolEssentials::config`] carrying only endpoint-free
+/// protocol parameters (host-free parse mandate). T5 converts every config to
+/// this shape; T11 rewires import/export to the `*_proto` variants. Until
+/// then, `VlessConfig`/`VmessConfig` (T4) keep this legacy trait as a bridge:
+/// `try_parse`/`try_from_clash` still work by delegating and discarding the
+/// endpoints; their `to_clash`/`reconstruct` return errors because host/port
+/// are no longer stored on the config.
 #[allow(private_bounds)] // edition 2024 denies private bounds; deliberate seal
 pub trait ProtoSpec: ProtoIdentity {
     /// # Errors
