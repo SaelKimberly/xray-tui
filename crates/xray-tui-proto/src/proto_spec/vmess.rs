@@ -893,27 +893,39 @@ mod tests {
 
         // Regression (F1): the endpoint host must never leak into the identity
         // config via the Clash h2 `host` fallback on export. With no explicit
-        // host, the export must not synthesize h2_opts from the endpoint.
+        // host, the export must not synthesize an h2 host from the endpoint —
+        // but a non-empty path must survive the cycle (F3).
         let url = vmess_url(
             "example.com",
             443,
             UUID,
-            &[("net", "h2"), ("path", ""), ("sni", "")],
+            &[("net", "h2"), ("path", "/foo"), ("sni", "")],
         );
         let parsed = parse(&url);
         let endpoint = parsed.endpoints[0].clone();
         let cfg = config(parsed);
         if let TransportConfig::Http(h) = &cfg.transport {
             assert_eq!(h.host, None, "no explicit host -> config host unset");
+            assert_eq!(h.path.as_deref(), Some("/foo"));
         } else {
             panic!("expected http transport");
         }
         let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
         match &proxy {
-            ClashProxy::Vmess(v) => assert_eq!(
-                v.h2_opts, None,
-                "export must not synthesize an h2 host from the endpoint: {proxy:?}"
-            ),
+            ClashProxy::Vmess(v) => match &v.h2_opts {
+                Some(opts) => {
+                    assert_eq!(
+                        opts.host, None,
+                        "export must not synthesize an h2 host from the endpoint: {proxy:?}"
+                    );
+                    assert_eq!(
+                        opts.path.as_deref(),
+                        Some("/foo"),
+                        "h2 path survives export"
+                    );
+                }
+                None => panic!("h2 opts must be emitted for a path-bearing h2 config: {proxy:?}"),
+            },
             other => panic!("expected vmess proxy, got {other:?}"),
         }
         let reparsed = VmessConfig::try_from_clash_proto(&proxy).expect("clash parse");

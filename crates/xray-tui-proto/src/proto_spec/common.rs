@@ -691,23 +691,18 @@ pub(crate) fn transport_to_clash(
             // h2 host is emitted ONLY from the config's explicit host, or from
             // the opt-in `server` fallback when the config host is unset. The
             // `*_proto` export path passes `None`, so an unset host stays unset
-            // (never the endpoint).
+            // (never the endpoint). The opts block is emitted when either host
+            // or path is present, so a host-free h2 config keeps its path.
             let host = h
                 .host
                 .as_ref()
                 .map(std::string::ToString::to_string)
                 .or_else(|| server.map(str::to_string));
-            (
-                Some("http".to_string()),
-                None,
-                None,
-                host.map(|host| ClashH2Opts {
-                    host: Some(vec![host]),
-                    path: h.path.as_ref().map(std::string::ToString::to_string),
-                }),
-                None,
-                None,
-            )
+            let h2_opts = (h.host.is_some() || h.path.is_some()).then(|| ClashH2Opts {
+                host: host.map(|host| vec![host]),
+                path: h.path.as_ref().map(std::string::ToString::to_string),
+            });
+            (Some("http".to_string()), None, None, h2_opts, None, None)
         }
         TransportConfig::Kcp(k) => (
             Some("kcp".to_string()),
