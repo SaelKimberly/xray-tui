@@ -979,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_real_ping_does_not_rank_untested_as_real_ok() {
         let (mut state, tx) = event_state().await;
-        let mut row = row_with_protocols(100, 2, 7); // p7, p8, both untested
+        let row = row_with_protocols(100, 2, 7); // p7, p8, both untested
         state.endpoints = vec![row];
         state.selected_index = 0;
         state.selected_sub = None;
