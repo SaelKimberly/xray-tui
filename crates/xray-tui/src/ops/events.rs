@@ -247,36 +247,42 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .find(|r| r.protocols.iter().any(|p| p.id == protocol_id));
                     match row {
                         Some(row) => {
-                            let ext = row.extensions.entry(protocol_id).or_insert_with(|| {
-                                ProfileExtension {
-                                    protocol_id,
-                                    delay: None,
-                                    speed: None,
-                                    sort_order: None,
-                                    ip_info: None,
-                                    delay_source: None,
-                                    protocol_row: Default::default(),
-                                }
-                            });
-                            match test_type {
-                                TestType::RealPing => {
-                                    ext.delay = latency_ms.map(|v| v as i32);
-                                    ext.delay_source = Some(DELAY_SOURCE_REAL);
-                                    ext.ip_info = ip_info;
-                                }
-                                TestType::TcpPing | TestType::UdpTest => {
-                                    ext.delay = latency_ms.map(|v| v as i32);
-                                    ext.delay_source = Some(if test_type == TestType::UdpTest {
-                                        DELAY_SOURCE_UDP
-                                    } else {
-                                        DELAY_SOURCE_FAST
-                                    });
-                                }
-                                TestType::SpeedTest => {
-                                    ext.speed = speed_bps.map(|v| v as i64);
-                                }
-                            }
+                            // An error event mutates nothing: no in-memory
+                            // measurement, no delay_source provenance, and no
+                            // DB write. (Gating the whole block — not just the
+                            // upsert — keeps a Cancelled RealPing from marking
+                            // a never-tested protocol as real-ok tier 0.)
                             if error.is_none() {
+                                let ext = row.extensions.entry(protocol_id).or_insert_with(|| {
+                                    ProfileExtension {
+                                        protocol_id,
+                                        delay: None,
+                                        speed: None,
+                                        sort_order: None,
+                                        ip_info: None,
+                                        delay_source: None,
+                                        protocol_row: Default::default(),
+                                    }
+                                });
+                                match test_type {
+                                    TestType::RealPing => {
+                                        ext.delay = latency_ms.map(|v| v as i32);
+                                        ext.delay_source = Some(DELAY_SOURCE_REAL);
+                                        ext.ip_info = ip_info;
+                                    }
+                                    TestType::TcpPing | TestType::UdpTest => {
+                                        ext.delay = latency_ms.map(|v| v as i32);
+                                        ext.delay_source =
+                                            Some(if test_type == TestType::UdpTest {
+                                                DELAY_SOURCE_UDP
+                                            } else {
+                                                DELAY_SOURCE_FAST
+                                            });
+                                    }
+                                    TestType::SpeedTest => {
+                                        ext.speed = speed_bps.map(|v| v as i64);
+                                    }
+                                }
                                 let _ = state.db.upsert_profile_extension(ext).await;
                             }
                             fmt_profile_id(protocol_id)
@@ -655,6 +661,8 @@ mod tests {
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{Endpoint, ProtocolRow};
 
+    use crate::types::EndpointInfo;
+
     use super::*;
 
     /// EndpointRow fixture: one endpoint owning one protocol.
@@ -928,5 +936,67 @@ mod tests {
         // `last_seen_at desc, then id asc` (Task 2 adjudicated spec) -> [7, 8].
         let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![7, 8]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_real_ping_does_not_rank_untested_as_real_ok() {
+        let (mut state, tx) = event_state().await;
+        let mut row = row_with_protocols(100, 2, 7); // p7, p8, both untested
+        state.endpoints = vec![row];
+        state.selected_index = 0;
+        state.selected_sub = None;
+        state.filter_cache_valid.set(false);
+        state.testing_profiles.insert(8);
+
+        tx.send(CoreEvent::SpeedTestResult {
+            protocol_id: 8,
+            test_type: TestType::RealPing,
+            latency_ms: None,
+            speed_bps: None,
+            ip_info: None,
+            error: Some("Cancelled".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        // An error event must not mutate the extension: no delay, no
+        // delay_source — p8 stays untested and is never hoisted to the
+        // real-ok tier. (Without the gate, delay_source=Some(REAL) would rank
+        // it tier 0 and flip the order to [8, 7].)
+        let ext = state.endpoints[0].extensions.get(&8);
+        assert!(ext.and_then(|e| e.delay_source).is_none());
+        assert!(ext.and_then(|e| e.delay).is_none());
+        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![7, 8]); // order unchanged, still untested tier
+    }
+
+    #[tokio::test]
+    async fn endpoint_info_flip_to_resolved_restores_priority_order() {
+        let (mut state, tx) = event_state().await;
+        let mut row = row_with_protocols(100, 2, 7); // p7, p8
+        set_delay(&mut row, 7, 50, Some(DELAY_SOURCE_FAST)); // fast-ok
+        set_delay(&mut row, 8, 10, Some(DELAY_SOURCE_REAL)); // real-ok
+        row.endpoint.host_type = "dns".to_string();
+        state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
+        state.selected_index = 0;
+        state.selected_sub = None;
+        state.filter_cache_valid.set(false);
+
+        tx.send(CoreEvent::EndpointInfoUpdated {
+            endpoint_id: 100,
+            info: EndpointInfo {
+                resolved_ips: vec!["1.2.3.4".parse().unwrap()],
+                ..EndpointInfo::default()
+            },
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        // Unresolved: both sink to the dns tier ([7, 8] by id). Once the DNS
+        // flip resolves, p8 (real-ok) rises above p7 (fast-ok) -> [8, 7].
+        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![8, 7]);
     }
 }
