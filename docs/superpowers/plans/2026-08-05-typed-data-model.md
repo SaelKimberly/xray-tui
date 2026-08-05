@@ -226,6 +226,7 @@ impl VlessConfig {
 
 - [ ] **Step 1: Read** `vless.rs` + `vmess.rs` fully. Identify every place `host`/`port` is read: parse (URL host:port → `EndpointEssentials`), format (re-inject from endpoint), clash conversion (`clash_server_to_host`/`port_spec_first`), `to_settings` (streamSettings `network` etc. — unaffected).
 - [ ] **Step 2: Update `try_parse`** to return `ParsedProto { endpoints: vec![EndpointEssentials::new(host, port)], protocol: ... }` where the protocol part is the config WITHOUT host/port. URL userinfo/path params that encode host/port (e.g. `?sni=`, `&host=`) stay in the config.
+  **HOST-FREE PARSE MANDATE (identity invariant):** parsers must NOT call `TransportConfig::with_host` and must NOT copy the endpoint host into transport/security config fields (ws/http/grpc host, `GrpcConfig.authority`, `SecurityConfig.sni`). An explicit URL-level host override (ws `host=` param, grpc authority, sni param present in the URL) IS a protocol parameter and IS stored in the config; when absent, the field stays unset. The builder injects endpoint host at build time (`inject_to`, Task 6+). This keeps endpoint-derived bytes out of the hashed protocol essentials — T3 invariant (a).
 - [ ] **Step 3: Update `format_share_url`** signature to take `&EndpointEssentials` and rebuild the URL.
 - [ ] **Step 4: Fix clash conversion call sites** in `common.rs` (`clash_server_to_host` etc.) to take endpoint essentials.
 - [ ] **Step 5: Update all existing tests** in both files to the new signatures; add test: parse → `ParsedProto`, assert endpoint host/port extracted, assert protocol JSON serialization contains no `"host"`/`"port"` key at top level.
@@ -252,11 +253,13 @@ impl VlessConfig {
 - Produces:
 ```rust
 pub trait InjectToCoreConf {
-    fn inject_to(&self, core_conf: &mut serde_json::Value, core_type: CoreType)
+    fn inject_to(&self, core_conf: &mut serde_json::Value, core_type: CoreType,
+                 endpoint: Option<&EndpointEssentials>)
         -> Result<(), SupportError>;
 }
 impl InjectToCoreConf for ProtocolConfig { /* dispatch! per variant */ }
 ```
+`endpoint` supplies host for transport/sni fields left unset by the host-free parse mandate (Task 4): the impl applies `transport.with_host(endpoint.host)` / sni default at build time, never at parse.
 
 - [ ] **Step 1: Write the trait + blanket dispatch** — `match self { ProtocolConfig::Vless(c) => c.inject_to(conf, ct), ... }` with `_ => Err(SupportError::UnsupportedProtocol(...))` for variants lacking impls yet.
 - [ ] **Step 2: Test** — `ProtocolConfig::Tuic(...).inject_to(&mut json!({}), CoreType::Xray)` returns `Err(UnsupportedProtocol)` (Tuic is sing-box-native and never implements the Xray shape — the assertion stays stable across Tasks 14-16). Add one dispatch-routing test: `ProtocolConfig::Vless(...).inject_to` reaches the Vless impl (returns `Err(UnsupportedProtocol)` from the Vless impl until Task 14, then `Ok`).
