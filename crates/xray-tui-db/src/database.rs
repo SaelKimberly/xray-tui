@@ -1807,12 +1807,17 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
         }
     }
 
-    // Sort each endpoint's protocols by last_seen_at descending — newest
-    // variant on top of the expandable sub-table. Stable sort: ties (e.g.
-    // never-seen protocols) keep insertion order.
+    // Sort each endpoint's protocols by test priority: measured latency
+    // (real ping first, then fast/UDP) ascending on top, untested protocols
+    // by last_seen_at descending (newest variant first, today's default),
+    // failures and DNS-unresolved hosts sink to the bottom. `rounds` is None
+    // here — failures are session-only state, applied live in the TUI.
+    // Persisted resolution counts as resolved: `resolved_as` empty means the
+    // host is unresolved (name tier) until a live resolution event flips it.
     for row in map.values_mut() {
-        row.protocols
-            .sort_by_key(|p| std::cmp::Reverse(p.last_seen_at));
+        let dns_unresolved = row.endpoint.host_type == "dns"
+            && row.endpoint.resolved_as.as_deref().is_none_or(str::is_empty);
+        row.sort_protocols_by_test_priority(dns_unresolved, None);
     }
 
     // Return in insertion order

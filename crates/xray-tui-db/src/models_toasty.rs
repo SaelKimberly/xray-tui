@@ -204,7 +204,7 @@ pub struct PingResultUpdate {
 
 // ── Data-transfer types ──────────────────────────────────────────────────
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// An endpoint with all its protocols, extensions, and stats.
 #[derive(Debug, Clone)]
@@ -233,6 +233,95 @@ impl EndpointRow {
             .get(self.selected_protocol)
             .unwrap_or_else(|| &self.protocols[0])
     }
+
+    /// Tier for one protocol under the test-priority model (lower = better):
+    /// 0 real-ok, 1 fast/udp-ok, 2 untested, 3 real-err, 4 fast-err,
+    /// 5 name/dns-unresolved. Fresh failures dominate stored successes.
+    fn protocol_test_tier(
+        delay: Option<i32>,
+        delay_source: Option<i32>,
+        dns_unresolved: bool,
+        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
+        pid: i64,
+    ) -> u8 {
+        if dns_unresolved {
+            5
+        } else if let Some((fast_failed, _)) = rounds
+            && fast_failed.contains(&pid)
+        {
+            4
+        } else if let Some((_, real_failed)) = rounds
+            && real_failed.contains(&pid)
+        {
+            3
+        } else if delay_source == Some(DELAY_SOURCE_REAL) {
+            0
+        } else if delay.is_some() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Ascending sort key: `(tier, latency, recency, id)`. `recency` is
+    /// negated so newer `last_seen_at` sorts first on ties. Only success
+    /// tiers (0/1) rank by latency; untested and error/dns tiers use
+    /// `i32::MAX` so they order by recency then id (design spec: "stable"
+    /// within-tier key).
+    fn protocol_test_key(
+        p: &ProtocolRow,
+        ext: Option<&ProfileExtension>,
+        dns_unresolved: bool,
+        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
+    ) -> (u8, i32, i64, i64) {
+        let delay = ext.and_then(|e| e.delay);
+        let tier = Self::protocol_test_tier(
+            delay,
+            ext.and_then(|e| e.delay_source),
+            dns_unresolved,
+            rounds,
+            p.id,
+        );
+        let latency = if tier <= 1 {
+            delay.unwrap_or(i32::MAX)
+        } else {
+            i32::MAX
+        };
+        (tier, latency, -p.last_seen_at, p.id)
+    }
+
+    /// Re-sort `protocols` by test priority: real-ping success first, then
+    /// fast/TCP/UDP success (latency ascending), then untested (newest
+    /// `last_seen_at` first), then failures (real below fast below untested),
+    /// then DNS-unresolved endpoints at the bottom. Deterministic tiebreak by
+    /// protocol id. `rounds` is `(fast_failed, real_failed)`; `None` when no
+    /// session state exists.
+    pub fn sort_protocols_by_test_priority(
+        &mut self,
+        dns_unresolved: bool,
+        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
+    ) {
+        self.protocols.sort_by_key(|p| {
+            Self::protocol_test_key(p, self.extensions.get(&p.id), dns_unresolved, rounds)
+        });
+    }
+
+    /// The endpoint's representative sort key = its best (minimum) protocol
+    /// key — used by the main-table Test column sort.
+    #[must_use]
+    pub fn best_test_priority_key(
+        &self,
+        dns_unresolved: bool,
+        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
+    ) -> (u8, i32, i64, i64) {
+        self.protocols
+            .iter()
+            .map(|p| {
+                Self::protocol_test_key(p, self.extensions.get(&p.id), dns_unresolved, rounds)
+            })
+            .min()
+            .unwrap_or((2, i32::MAX, 0, 0))
+    }
 }
 
 /// Three-way toggle for the Profiles tab.
@@ -242,4 +331,155 @@ pub enum PurgatoryView {
     Active,
     Stale,
     All,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use toasty::Deferred;
+
+    /// Endpoint with protocols `(id, last_seen_at, delay, delay_source)`.
+    /// `delay: None` = untested protocol (no extension entry).
+    fn row(protos: &[(i64, i64, Option<i32>, Option<i32>)]) -> EndpointRow {
+        let mut row = EndpointRow {
+            endpoint: Endpoint {
+                id: 1,
+                host: "h.example".to_string(),
+                host_type: "ipv4".to_string(),
+                port: 443,
+                port_spec_str: None,
+                parent_id: None,
+                last_source: None,
+                created_at: 0,
+                manual_protocol_override: None,
+                resolved_as: None,
+                resolved_at: None,
+            },
+            protocols: Vec::new(),
+            extensions: HashMap::new(),
+            stats: HashMap::new(),
+            selected_protocol: 0,
+            expanded: false,
+        };
+        for (id, last_seen, delay, src) in protos {
+            row.protocols.push(ProtocolRow {
+                id: *id,
+                endpoint_id: 1,
+                sig: 0,
+                cred_hash: 0,
+                proto_kind: String::new(),
+                spec_blob: Vec::new(),
+                config_type: 1,
+                core_type: "xray".to_string(),
+                transport: None,
+                security: None,
+                last_used_at: None,
+                created_at: 0,
+                last_seen_at: *last_seen,
+                endpoint: Deferred::from(None::<Endpoint>),
+                extension: Deferred::from(None::<ProfileExtension>),
+                server_stat: Deferred::from(None::<ServerStat>),
+            });
+            if let Some(d) = delay {
+                row.extensions.insert(
+                    *id,
+                    ProfileExtension {
+                        protocol_id: *id,
+                        delay: Some(*d),
+                        speed: None,
+                        sort_order: None,
+                        ip_info: None,
+                        delay_source: *src,
+                        protocol_row: Deferred::from(None::<ProtocolRow>),
+                    },
+                );
+            }
+        }
+        row
+    }
+
+    fn ids(r: &EndpointRow) -> Vec<i64> {
+        r.protocols.iter().map(|p| p.id).collect()
+    }
+
+    fn failed(ids: &[i64]) -> HashSet<i64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn real_ok_above_fast_ok_above_untested() {
+        // real-ok 200ms outranks fast-ok 10ms — tier beats latency.
+        let mut r = row(&[
+            (10, 1, Some(200), Some(DELAY_SOURCE_REAL)), // real-ok
+            (20, 2, Some(10), Some(DELAY_SOURCE_FAST)),  // fast-ok
+            (30, 3, None, None),                         // untested
+        ]);
+        r.sort_protocols_by_test_priority(false, None);
+        assert_eq!(ids(&r), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn latency_orders_within_success_tiers() {
+        let mut r = row(&[
+            (10, 1, Some(50), Some(DELAY_SOURCE_FAST)),
+            (20, 2, Some(10), Some(DELAY_SOURCE_FAST)),
+            (30, 3, Some(120), Some(DELAY_SOURCE_REAL)),
+            (40, 4, Some(90), Some(DELAY_SOURCE_REAL)),
+        ]);
+        r.sort_protocols_by_test_priority(false, None);
+        // real tier first (30:120, 40:90 by latency), then fast tier (20:10, 10:50)
+        assert_eq!(ids(&r), vec![40, 30, 20, 10]);
+    }
+
+    #[test]
+    fn fresh_failure_dominates_stored_success() {
+        // 10 has a stored real-ok delay but failed real this round -> sinks
+        // below the untested 30; 20 failed fast -> below 10 (fast worse than real).
+        let mut r = row(&[
+            (10, 1, Some(50), Some(DELAY_SOURCE_REAL)),
+            (20, 2, Some(80), Some(DELAY_SOURCE_FAST)),
+            (30, 3, None, None),
+        ]);
+        r.sort_protocols_by_test_priority(
+            false,
+            Some((&failed(&[20]), &failed(&[10]))),
+        );
+        assert_eq!(ids(&r), vec![30, 10, 20]);
+    }
+
+    #[test]
+    fn both_failed_uses_fast_tier() {
+        let mut r = row(&[(10, 1, None, None), (20, 2, None, None)]);
+        r.sort_protocols_by_test_priority(false, Some((&failed(&[10]), &failed(&[10]))));
+        assert_eq!(ids(&r), vec![20, 10]);
+    }
+
+    #[test]
+    fn dns_unresolved_sinks_all_protocols() {
+        let mut r = row(&[
+            (10, 1, Some(50), Some(DELAY_SOURCE_REAL)),
+            (20, 2, None, None),
+        ]);
+        r.sort_protocols_by_test_priority(true, None);
+        assert_eq!(ids(&r), vec![20, 10]); // untested first; dns tier wins for both
+    }
+
+    #[test]
+    fn untested_keeps_last_seen_recency_order() {
+        let mut r = row(&[(10, 5, None, None), (20, 9, None, None), (30, 1, None, None)]);
+        r.sort_protocols_by_test_priority(false, None);
+        assert_eq!(ids(&r), vec![20, 10, 30]); // newest first
+    }
+
+    #[test]
+    fn best_key_returns_min_over_protocols() {
+        let r = row(&[
+            (10, 1, Some(200), Some(DELAY_SOURCE_REAL)),
+            (20, 2, Some(10), Some(DELAY_SOURCE_FAST)),
+            (30, 3, None, None),
+        ]);
+        // Best = real-ok (tier 0), latency 200
+        assert_eq!(r.best_test_priority_key(false, None), (0, 200, -1, 10));
+    }
 }
