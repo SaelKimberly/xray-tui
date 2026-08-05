@@ -12,6 +12,7 @@ pub mod common;
 pub mod utils;
 
 mod anytls;
+mod error;
 mod http_client;
 mod hysteria1;
 mod hysteria2;
@@ -32,6 +33,7 @@ mod vmess;
 mod wireguard;
 pub use anytls::AnyTlsConfig;
 pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig};
+pub use error::SupportError;
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;
 pub use hysteria2::Hysteria2Config;
@@ -97,7 +99,7 @@ pub enum ParseResult {
 }
 
 /// Which proxy core to target for JSON config generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum CoreType {
     Xray,
     SingBox,
@@ -121,6 +123,12 @@ impl std::str::FromStr for CoreType {
             "sing-box" | "singbox" => Ok(Self::SingBox),
             _ => Err(()),
         }
+    }
+}
+
+impl std::fmt::Display for CoreType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1018,5 +1026,28 @@ mod tests {
             "seeded cred_hash returned without recompute"
         );
         assert_eq!(proto.uid(), 0x3039 ^ 0x1_0932, "uid == sig ^ cred_hash");
+    }
+
+    #[test]
+    fn core_type_display_matches_as_str() {
+        assert_eq!(CoreType::Xray.to_string(), "xray");
+        assert_eq!(CoreType::SingBox.to_string(), "sing-box");
+        assert_eq!(CoreType::Xray.as_str(), "xray");
+        assert_eq!(CoreType::SingBox.as_str(), "sing-box");
+    }
+
+    #[test]
+    fn core_type_from_str_round_trip() {
+        for original in [CoreType::Xray, CoreType::SingBox] {
+            let parsed: CoreType = original.to_string().parse().expect("round-trip parse");
+            assert_eq!(parsed, original);
+        }
+        // Accepted aliases.
+        assert_eq!("xray-core".parse::<CoreType>(), Ok(CoreType::Xray));
+        assert_eq!("singbox".parse::<CoreType>(), Ok(CoreType::SingBox));
+        assert_eq!("SING-BOX".parse::<CoreType>(), Ok(CoreType::SingBox));
+        // Unknown strings must error.
+        assert!("auto".parse::<CoreType>().is_err());
+        assert!("".parse::<CoreType>().is_err());
     }
 }
