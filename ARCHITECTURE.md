@@ -321,8 +321,14 @@ and archive patterns for automatic extraction in dev environments.
 
 **`config_builder/`** — Config builder module
 - `mod.rs` — Dispatches to xray or sing-box builder based on core type
-- `xray.rs` — Builds xray-core format JSON
-- `singbox.rs` — Builds sing-box format JSON
+- `xray.rs` — Builds xray-core format JSON. Validates emitted stream settings:
+  `security: "reality"` requires `realitySettings.publicKey` + `serverName` —
+  legacy VLESS blobs with `security=reality` and no realitySettings previously
+  killed the core at startup (`REALITY: Empty "realitySettings"`). Shadowsocks
+  methods are validated against `XRAY_SS_METHODS`.
+- `singbox.rs` — Builds sing-box format JSON. Reality emits only
+  `enabled`/`public_key`/`short_id` (sing-box's `OutboundRealityOptions` has no
+  `spider_x`; the URL's `spx` is dropped).
 
 
 pub enum BackendConfig {

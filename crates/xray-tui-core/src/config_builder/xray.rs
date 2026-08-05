@@ -276,6 +276,31 @@ fn build_proxy_outbound(
         .unwrap_or("");
     let s_settings = build_xray_stream_settings(protocol, s_settings_raw);
 
+    // A `security: "reality"` stream setting without a usable realitySettings
+    // kills the core at startup ("REALITY: Empty \"realitySettings\"" when the
+    // object is absent, `empty "password"` when publicKey is missing) — refuse
+    // to emit such a config. Realities need at least the server's public key
+    // and an SNI; both are unrecoverable if absent from the profile.
+    if let Some(ss) = &s_settings
+        && ss.get("security").and_then(|v| v.as_str()) == Some("reality")
+    {
+        let rs = ss.get("realitySettings").and_then(|v| v.as_object());
+        let has = |key: &str| {
+            rs.is_some_and(|r| {
+                r.get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+            })
+        };
+        if !has("publicKey") || !has("serverName") {
+            return Err(BuildError::InvalidProfile(format!(
+                "REALITY profile is missing required stream settings \
+                 (realitySettings.publicKey / serverName); \
+                 security is 'reality' but the reality settings are incomplete"
+            )));
+        }
+    }
+
     match proto {
         Protocol::Vmess => Ok(Outbound {
             tag: "proxy".to_string(),
@@ -822,6 +847,48 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
+    }
+
+    #[test]
+    fn xray_rejects_reality_without_reality_settings() {
+        // dump-2: 6× "REALITY: Empty \"realitySettings\"" — legacy blobs with
+        // stream_settings.security=reality but no realitySettings object make
+        // the core die at startup. The builder must refuse instead.
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+        set_stream_settings_json(
+            &mut protocol,
+            r#"{"security": "reality", "sni": "cdn.example.com"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let err = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect_err("security=reality without realitySettings must be rejected");
+        assert!(
+            err.to_string().contains("reality"),
+            "error must mention reality: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_rejects_reality_without_public_key() {
+        // Typed vless:// URL with security=reality but no pbk: the typed path
+        // emits realitySettings {} (no publicKey) — xray's client Build()
+        // rejects that with `empty "password"` at startup.
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?security=reality&type=tcp#r";
+        let settings = xray_tui_config::import_export::ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
+        let parsed = xray_tui_config::import_export::parse_share_url(url, &settings)
+            .expect("parse url");
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+        protocol.spec_blob = parsed.spec_blob;
+        let (params, rules, dns) = default_params();
+        let err = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect_err("reality without publicKey must be rejected");
+        assert!(
+            err.to_string().contains("reality"),
+            "error must mention reality: {err}"
+        );
     }
 
     #[test]

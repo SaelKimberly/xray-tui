@@ -1031,19 +1031,10 @@ fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) 
         {
             reality.insert("short_id".into(), json!(sid));
         }
-        if let Some(spx) = s_settings
-            .get("spx")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                s_settings
-                    .get("realitySettings")
-                    .and_then(|v| v.as_object())
-                    .and_then(|m| m.get("spiderX").and_then(|v| v.as_str()))
-            })
-        {
-            reality.insert("short_id".into(), json!(spx));
-        }
+        // NOTE: sing-box's OutboundRealityOptions has no spider_x field
+        // (option/tls.go — only enabled/public_key/short_id), so spiderX from
+        // the URL is intentionally dropped — it is xray-only. It must never
+        // be written into short_id (that corrupted the real short_id).
         // Only add reality block if it has meaningful content beyond "enabled"
         if reality.len() > 1 {
             tls.insert("reality".into(), json!(reality));
@@ -1236,6 +1227,35 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
+    }
+
+    #[test]
+    fn singbox_reality_short_id_not_overwritten_by_spider_x() {
+        // sing-box's OutboundRealityOptions has no spider_x field (unlike
+        // xray's realitySettings); the old code wrote the spx value into
+        // short_id, corrupting it.
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
+        set_stream_settings_json(
+            &mut protocol,
+            r#"{"security": "reality", "sni": "cdn.example.com", "pbk": "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg", "sid": "a7ec6c3316eddb11", "spx": "/foo"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        let reality = &proxy["tls"]["reality"];
+        assert_eq!(
+            reality["public_key"],
+            "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg"
+        );
+        assert_eq!(reality["short_id"], "a7ec6c3316eddb11");
+        assert!(reality.get("spider_x").is_none());
     }
 
     #[test]

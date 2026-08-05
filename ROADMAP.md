@@ -226,4 +226,5 @@
 - ✅ WS vhost deprecation — xray wsSettings emit top-level `host` instead of deprecated `headers.Host` (typed path in `xray-tui-proto/src/proto_spec/common.rs` + legacy dotted path in `config_builder/xray.rs`); kills the 152 "host in headers is deprecated" core warnings
 - ✅ Log hygiene — `TuiLogLayer` filter `trace,hickory_net::h2=error` (391 DoH h2 noise lines suppressed, everything else stays trace+); enrich "no records found" DNS warnings downgraded to debug
 - ✅ Forms — Shadowsocks2022 method select: removed invalid `none`, added missing `2022-blake3-chacha20-poly1305`
-- ✅ Tests — 21 new (routing 12, builder validation + 2022 4, retry 4, hostname 2, ws-host assertions 2). 571 workspace tests pass
+- ✅ REALITY config validation (dump-2) — the xray builder rejects `security: "reality"` without `realitySettings.publicKey`/`serverName` (6× `REALITY: Empty "realitySettings"` core-start failures from legacy VLESS blobs with `security=reality` and no key material); sing-box reality block fixed to emit only `enabled`/`public_key`/`short_id` (the URL's `spx` was being written into `short_id`, corrupting it — sing-box has no `spider_x` outbound field)
+- ✅ Tests — 24 new (routing 12, builder validation + 2022 4, retry 4, hostname 2, ws-host assertions 2, reality validation 2, singbox short_id 1). 575 workspace tests pass
