@@ -24,7 +24,7 @@
 - Clash YAML structs stay as external-format boundary types — never delete.
 - Workspace lints: `cargo clippy` (pedantic+nursery warn), `cargo fmt`, Rust 2024 edition.
 - `xray-tui-db` gains `xray-tui-proto` dependency (acyclic: proto has no internal deps). `xray-tui-proto` gains `toasty` with `default-features = false` (for `Embed` derives only).
-- Every task ends with a test cycle + commit. Do not run project-wide `cargo test`/`clippy` inside a task; run them once at the end (Task 30).
+- Do not run project-wide `cargo test`/`clippy` inside a task; run them once at the end (Task 25).
 
 ---
 
@@ -242,7 +242,7 @@ impl InjectToCoreConf for ProtocolConfig { /* dispatch! per variant */ }
 ```
 
 - [ ] **Step 1: Write the trait + blanket dispatch** — `match self { ProtocolConfig::Vless(c) => c.inject_to(conf, ct), ... }` with `_ => Err(SupportError::UnsupportedProtocol(...))` for variants lacking impls yet.
-- [ ] **Step 2: Test** — `ProtocolConfig::Vless(...).inject_to(&mut json!({}), CoreType::Xray)` returns `Err` for now (no impl yet) or `Ok` once Task 16 lands; keep the test asserting the dispatch routes to the right variant via a sentinel (implement `inject_to` for ONE protocol in Task 16; before that, assert `Err(UnsupportedProtocol)`).
+- [ ] **Step 2: Test** — `ProtocolConfig::Tuic(...).inject_to(&mut json!({}), CoreType::Xray)` returns `Err(UnsupportedProtocol)` (Tuic is sing-box-native and never implements the Xray shape — the assertion stays stable across Tasks 14-16). Add one dispatch-routing test: `ProtocolConfig::Vless(...).inject_to` reaches the Vless impl (returns `Err(UnsupportedProtocol)` from the Vless impl until Task 14, then `Ok`).
 - [ ] **Step 3: Run** `cargo test -p xray-tui-proto` — PASS.
 - [ ] **Step 4: Commit** `feat(proto): InjectToCoreConf trait + ProtocolConfig dispatch`
 
@@ -462,8 +462,8 @@ pub fn build(endpoint: &Endpoint, link: &ProfileStats, protocol: &Protocol,
   - `conf["outbounds"]` entry: `{ tag: "proxy", protocol: <xray protocol name>, settings: {...}, streamSettings: to_xray_stream_settings(...) }`
   - xray protocol name map: vmess/vless/trojan/ss/socks/http/wireguard/hysteria2 → xray names; sing-box-only protocols return `Err(UnsupportedProtocol)` for Xray.
 
-- [ ] **Step 1: Vless + Vmess `inject_to` (xray shape)** — port the existing outbound construction from `xray.rs` into `vless.rs`/`vmess.rs` impls (settings: vnext/users, streamSettings via common helper). Test: build `json!({})` → inject → assert outbound JSON matches the old `xray.rs` output for the same config (golden test). Commit `feat(proto): xray inject_to for vmess/vless`.
-- [ ] **Step 2: Trojan, Ss, Socks, Http, Wireguard, Hysteria2, Vless-xtls flow** (xray-native set) — same pattern; golden tests against old builder outputs. Commit `feat(proto): xray inject_to for trojan/ss/socks/http/wg/hy2`.
+- [ ] **Step 1: Vless + Vmess `inject_to` (xray shape)** — port the existing outbound construction from `xray.rs` into `vless.rs`/`vmess.rs` impls (settings: vnext/users, streamSettings via common helper). Tests assert the injected outbound JSON: `tag == "proxy"`, xray protocol name, settings fields per the test fixture, and `streamSettings` equal to `to_xray_stream_settings(...)` output for the same fixture. (Full-config correctness is covered by the ported builder tests in Task 16 — do not byte-golden against the old builder; Task 13 already removed it.) Commit `feat(proto): xray inject_to for vmess/vless`.
+- [ ] **Step 2: Trojan, Ss, Socks, Http, Wireguard, Hysteria2, Vless-xtls flow** (xray-native set) — same pattern; same focused assertions. Commit `feat(proto): xray inject_to for trojan/ss/socks/http/wg/hy2`.
 - [ ] **Step 3: Sing-box-only protocols** (TUIC, Hysteria1, Naive, AnyTls, ShadowTls, Tor, Ssh, Tailscale, Ssr, Redirect, TProxy, Mixed) — `inject_to` returns `Err(UnsupportedProtocol)` for Xray. Test each. Commit `feat(proto): xray inject_to rejects sing-box-only protocols`.
 
 ### Task 15: Per-protocol `inject_to` — sing-box core shape
@@ -473,8 +473,8 @@ pub fn build(endpoint: &Endpoint, link: &ProfileStats, protocol: &Protocol,
 **Interfaces:**
 - Produces: per-config `inject_to(&self, conf, CoreType::SingBox)` writing `conf["outbounds"]` entry `{ type: <singbox type>, tag: "proxy", ... }` with sing-box field names; xray-only protocols → `Err(UnsupportedProtocol)`.
 
-- [ ] **Step 1: sing-box shape for the sing-box-native set** (TUIC, Hysteria1, Naive, AnyTls, ShadowTls, Tor, Ssh, Tailscale, Ssr, Redirect, TProxy, Mixed) — port from `singbox.rs`; golden tests. Commit `feat(proto): sing-box inject_to (native set)`.
-- [ ] **Step 2: sing-box shape for shared protocols** (Vless, Vmess, Trojan, Ss, Socks, Http, Wireguard, Hysteria2) — port from `singbox.rs`; golden tests. Commit `feat(proto): sing-box inject_to (shared set)`.
+- [ ] **Step 1: sing-box shape for the sing-box-native set** (TUIC, Hysteria1, Naive, AnyTls, ShadowTls, Tor, Ssh, Tailscale, Ssr, Redirect, TProxy, Mixed) — port from `singbox.rs`; focused assertions on the injected outbound (`type`, `tag: "proxy"`, per-protocol fields). Commit `feat(proto): sing-box inject_to (native set)`.
+- [ ] **Step 2: sing-box shape for shared protocols** (Vless, Vmess, Trojan, Ss, Socks, Http, Wireguard, Hysteria2) — port from `singbox.rs`; same focused assertions. Commit `feat(proto): sing-box inject_to (shared set)`.
 - [ ] **Step 3: cipher whitelist enforcement** moves into `Ss::inject_to` (both cores): `XRAY_SS_METHODS`/`SINGBOX_SS_METHODS` checks → `Err(SupportError::Config(...))`. Commit `feat(proto): ss cipher whitelist enforced in inject_to`.
 
 ### Task 16: Wire builders fully; delete legacy
@@ -523,6 +523,8 @@ impl TaskScheduler {
     pub fn new(queue_limit: u16, dns_defer_secs: i64) -> Self;
     pub fn schedule(&self, link: &ProfileStats, kind: TaskKind, db: &Arc<Database>, tx: &mpsc::Sender<CoreEvent>) -> ScheduleOutcome;
     pub fn complete(&self, link: &ProfileStats, kind: TaskKind, result: PingOutcome, db: &Arc<Database>, tx: &mpsc::Sender<CoreEvent>);
+    /// Remove every queued task of `kind` for this link (sibling cancel).
+    pub fn cancel_queued(&self, link: &ProfileStats, kind: TaskKind, db: &Arc<Database>);
     pub fn mark_dns_failure(&self, endpoint: EndpointId);
     pub fn sweep_orphans(&self, link: &ProfileStats, db: &Arc<Database>);
     fn alloc_id(&self) -> u16;                 // non-zero, not live
@@ -560,7 +562,7 @@ pub enum ScheduleOutcome { Started(u16), Queued(u16), QueueFull, DnsDeferred }
 
 - [ ] **Step 1: Labels** — render `[real]` when all links of the endpoint have `error.kind == ProfileErr::Real`; `[fast]` analog; `[name]` when `resolved_as` empty. Remove `ping_status` round-map label logic.
 - [ ] **Step 2: Re-sort triggers** — on `SpeedTestResult`, re-sort the endpoint's links by the new tier key (Task 8); invalidate `filter_cache_valid`; remap `selected_sub` by protocol id.
-- [ ] **Step 3: Error TTL** — settings `error_ttl_hours`; background sweep (or on-load check) clears `error` where `updated_at` older than TTL. Default unset = never clear.
+- [ ] **Step 3: Error TTL** — settings `error_ttl_hours`; concrete sweep: in `reload_profiles` and after each batch completion (Task 19), run one typed update clearing `error` on rows where `error.is_some()` and `updated_at < now - ttl`. Default unset = never clear.
 - [ ] **Step 4: Tests** — label logic pure fn: endpoint with 2 links both `error.kind=Real` → `[real]`; one ok one err → no label. TTL expiry clears.
 - [ ] **Step 5: Commit** `feat(tui): persisted error labels + TTL`
 
