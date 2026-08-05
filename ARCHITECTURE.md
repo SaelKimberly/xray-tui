@@ -489,6 +489,11 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 backoff (1.28s cap). Wired into `update_endpoint_resolution` +
 `batch_flush_ping_buffer`, whose single-transaction bare-`?` commits previously
 dropped writes when the enrichment pipeline herded hundreds of concurrent writers.
+`Database::conn()` sets `PRAGMA busy_timeout=5000` on every pooled connection
+acquisition — the pragma in `open()` is per-connection and never reaches
+pool-created conns (deadpool default max_size 10), so concurrent writers now
+queue at the SQLite level instead of failing instantly; all write paths use
+`conn()`.
 
 **Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
 - `Endpoint` — server config; dedup key `sub_uid` (uid = sig ^ cred_hash); `resolved_as`/`resolved_at` DNS persistence

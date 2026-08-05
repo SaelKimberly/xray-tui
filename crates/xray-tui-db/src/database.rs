@@ -204,6 +204,20 @@ impl Database {
         Ok(())
     }
 
+    /// Acquire a pooled connection with the SQLite busy-wait configured.
+    /// `PRAGMA busy_timeout` is per-connection, so the pragma set in `open()`
+    /// never reaches pool-created connections. Without it, concurrent
+    /// writers (enrichment resolutions, ping-buffer flushes) fail instantly
+    /// with "database is locked" instead of queuing behind the lock holder —
+    /// this was the 850-line "database is locked" class in the dumps.
+    async fn conn(&self) -> Result<toasty::Connection> {
+        let mut conn = self.db.connection().await?;
+        toasty::sql::query("PRAGMA busy_timeout=5000")
+            .exec(&mut conn)
+            .await?;
+        Ok(conn)
+    }
+
     pub async fn in_memory() -> Result<Self> {
         let driver = toasty_driver_turso::Turso::in_memory();
         let db = toasty::Db::builder()
@@ -255,7 +269,7 @@ impl Database {
 impl Database {
     /// Active endpoints: `max(last_seen_at)` >= `active_threshold`
     pub async fn get_active_endpoints(&self, active_threshold: i64) -> Result<Vec<EndpointRow>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
@@ -280,7 +294,7 @@ impl Database {
         group_id: &str,
         active_threshold: i64,
     ) -> Result<Vec<EndpointRow>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
@@ -307,7 +321,7 @@ impl Database {
         active_threshold: i64,
         stale_threshold: i64,
     ) -> Result<Vec<EndpointRow>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
@@ -330,7 +344,7 @@ impl Database {
 
     /// Single endpoint by id with all protocols, extensions, stats.
     pub async fn get_endpoint(&self, id: i64) -> Result<Option<EndpointRow>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
@@ -355,7 +369,7 @@ impl Database {
         &self,
         protocol_id: i64,
     ) -> Result<Option<EndpointRow>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, \
                     e.last_source, e.created_at, e.manual_protocol_override, \
@@ -382,7 +396,7 @@ impl Database {
         &self,
         protocol_id: i64,
     ) -> Result<Option<ProfileExtension>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let ext = ProfileExtension::filter_by_protocol_id(protocol_id)
             .first()
             .exec(&mut conn)
@@ -391,7 +405,7 @@ impl Database {
     }
 
     pub async fn get_server_stats(&self, protocol_id: i64) -> Result<Option<ServerStat>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let stats = ServerStat::filter_by_protocol_id(protocol_id)
             .first()
             .exec(&mut conn)
@@ -400,7 +414,7 @@ impl Database {
     }
 
     pub async fn get_all_groups(&self) -> Result<Vec<Group>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let groups: Vec<Group> = Group::all()
             .order_by(Group::fields().sort_order().asc())
             .exec(&mut conn)
@@ -409,7 +423,7 @@ impl Database {
     }
 
     pub async fn get_groups_due_update(&self) -> Result<Vec<Group>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT g.id, g.name, g.url, g.enabled, g.user_agent, g.convert_target, g.core_type, g.sort_order, \
                     g.last_refreshed, g.status, g.error_message, g.refresh_interval \
@@ -449,7 +463,7 @@ impl Database {
         active_threshold: i64,
         stale_threshold: i64,
     ) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT COUNT(DISTINCT e.id) \
              FROM endpoints e \
@@ -493,7 +507,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         let mut eids = Vec::with_capacity(endpoint_protocols.len());
@@ -569,7 +583,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         toasty::sql::statement(
@@ -630,7 +644,7 @@ impl Database {
     /// seconds. Runs in an explicit transaction — raw statements on a pooled
     /// turso connection do not reliably commit in WAL mode.
     pub async fn update_last_used(&self, protocol_id: i64, ts: i64) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
         toasty::sql::statement(
             "UPDATE protocol_rows SET last_used_at = ?1, last_seen_at = ?1 WHERE id = ?2",
@@ -680,7 +694,7 @@ impl Database {
     /// Purge endpoints where every protocol has `last_seen_at` < threshold.
     /// Returns count of deleted endpoints.
     pub async fn purge_expired(&self, expire_threshold: i64) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         // Delete endpoint_groups for expired endpoints
@@ -755,7 +769,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement("UPDATE protocol_rows SET last_seen_at = ?1 WHERE endpoint_id = ?2")
             .bind(now)
             .bind(endpoint_id)
@@ -766,7 +780,7 @@ impl Database {
 
     /// Delete an endpoint and all related data.
     pub async fn delete_endpoint(&self, endpoint_id: i64) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         toasty::sql::statement("DELETE FROM endpoint_groups WHERE endpoint_id = ?1")
@@ -810,7 +824,7 @@ impl Database {
     }
 
     pub async fn set_protocol_override(&self, endpoint_id: i64, protocol_id: i64) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement("UPDATE endpoints SET manual_protocol_override = ?1 WHERE id = ?2")
             .bind(protocol_id)
             .bind(endpoint_id)
@@ -820,7 +834,7 @@ impl Database {
     }
 
     pub async fn clear_protocol_override(&self, endpoint_id: i64) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement(
             "UPDATE endpoints SET manual_protocol_override = NULL WHERE id = ?1",
         )
@@ -836,7 +850,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
 
         for ip in ips {
             let eid = stable_hash(ip.to_string(), 0i64);
@@ -887,7 +901,7 @@ impl Database {
             IpAddr::V6(_) => 1,
         });
 
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         // Remove old child endpoints
@@ -930,7 +944,7 @@ impl Database {
     /// Endpoints whose `parent_id` references `parent_id` (resolved-IP children
     /// of a `DnsName` endpoint). Used by tests; ordered by id.
     pub async fn endpoints_by_parent(&self, parent_id: i64) -> Result<Vec<Endpoint>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT id, host, host_type, port, port_spec_str, parent_id, last_source, \
                     created_at, manual_protocol_override, resolved_as, resolved_at \
@@ -961,7 +975,7 @@ impl Database {
     }
 
     pub async fn upsert_profile_extension(&self, ext: &ProfileExtension) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
             .delay(ext.delay.unwrap_or(0))
             .speed(ext.speed.unwrap_or(0))
@@ -974,7 +988,7 @@ impl Database {
     }
 
     pub async fn clear_all_stats(&self) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement("DELETE FROM server_stats")
             .exec(&mut conn)
             .await?;
@@ -982,7 +996,7 @@ impl Database {
     }
 
     pub async fn upsert_server_stats(&self, stats: &ServerStat) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         ServerStat::upsert_by_protocol_id(stats.protocol_id)
             .today_up(stats.today_up.unwrap_or(0))
             .today_down(stats.today_down.unwrap_or(0))
@@ -999,7 +1013,7 @@ impl Database {
 
 impl Database {
     pub async fn insert_group(&self, g: &Group) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         Group::create()
             .id(g.id.clone())
             .name(g.name.clone())
@@ -1020,7 +1034,7 @@ impl Database {
     }
 
     pub async fn update_group(&self, g: &Group) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         Group::filter_by_id(g.id.clone())
             .update()
             .name(g.name.clone())
@@ -1041,7 +1055,7 @@ impl Database {
 
     /// Delete a group and its associated data.
     pub async fn delete_group(&self, id: &str) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         // Capture this group's endpoints BEFORE unlinking. The orphan purge
@@ -1150,7 +1164,7 @@ impl Database {
 
     /// Remove all endpoints from a group, return count of affected links.
     pub async fn clear_group(&self, group_id: &str) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query("SELECT COUNT(*) FROM endpoint_groups WHERE group_id = ?1")
             .bind(group_id)
             .exec(&mut conn)
@@ -1183,7 +1197,7 @@ impl Database {
 
 impl Database {
     pub async fn get_all_routing_rules(&self) -> Result<Vec<RoutingRule>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rules: Vec<RoutingRule> = RoutingRule::all()
             .order_by(RoutingRule::fields().sort_order().asc())
             .exec(&mut conn)
@@ -1192,7 +1206,7 @@ impl Database {
     }
 
     pub async fn insert_routing_rule(&self, r: &RoutingRule) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         RoutingRule::create()
             .id(r.id.clone())
             .group_id(r.group_id.clone())
@@ -1218,7 +1232,7 @@ impl Database {
     }
 
     pub async fn update_routing_rule(&self, r: &RoutingRule) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         RoutingRule::filter_by_id(r.id.clone())
             .update()
             .group_id(r.group_id.clone())
@@ -1243,7 +1257,7 @@ impl Database {
     }
 
     pub async fn delete_routing_rule(&self, id: &str) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         RoutingRule::filter_by_id(id.to_string())
             .delete()
             .exec(&mut conn)
@@ -1252,7 +1266,7 @@ impl Database {
     }
 
     pub async fn reorder_routing_rules(&self, ids: &[(String, i32)]) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
         for (rule_id, order) in ids {
             RoutingRule::filter_by_id(rule_id.clone())
@@ -1270,13 +1284,13 @@ impl Database {
 
 impl Database {
     pub async fn get_dns_settings(&self) -> Result<Option<DnsSetting>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let settings: Vec<DnsSetting> = DnsSetting::all().exec(&mut conn).await?;
         Ok(settings.into_iter().next())
     }
 
     pub async fn upsert_dns_settings(&self, dns: &DnsSetting) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement(
             "INSERT INTO dns_settings (id, name, servers, hosts, query_strategy, disable_cache, disable_fallback, client_ip, cache_ttl_secs) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
@@ -1315,7 +1329,7 @@ impl Database {
         group_id: Option<&str>,
         profiles: Option<&[(i64, i32)]>,
     ) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
 
         // Helper to deserialize protocol rows with endpoint address/port
         let deserialize = |rows: Vec<Value>| -> Result<Vec<(i64, i32, String, String, i32)>> {
@@ -1425,7 +1439,7 @@ impl Database {
     }
 
     pub async fn get_ping_sessions(&self, batch_id: &str) -> Result<Vec<PingSession>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT id, batch_id, protocol_id, config_type, core_type, address, port, triplet_rank, \
                     ping_type, status, latency_ms, speed_bps, ip_info, error, created_at, updated_at \
@@ -1444,7 +1458,7 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<PingSession>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT id, batch_id, protocol_id, config_type, core_type, address, port, triplet_rank, \
                     ping_type, status, latency_ms, speed_bps, ip_info, error, created_at, updated_at \
@@ -1464,7 +1478,7 @@ impl Database {
         batch_id: &str,
         results: &[PingResultUpdate],
     ) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         for r in results {
@@ -1491,7 +1505,7 @@ impl Database {
     /// already has a completed real ping in Phase 2. These sessions are invisible to both
     /// the fast-ping pager (type != 'fast') and the real-ping query (excluded by NOT EXISTS).
     pub async fn cancel_stranded_real_pings(&self, batch_id: &str) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let updated = toasty::sql::statement(
             "UPDATE ping_sessions \
              SET status = 'cancelled', error = 'Endpoint already completed', \
@@ -1515,7 +1529,7 @@ impl Database {
     }
 
     pub async fn cancel_ping_batch(&self, batch_id: &str) -> Result<usize> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let updated = toasty::sql::statement(
             "UPDATE ping_sessions SET status='cancelled', updated_at=datetime('now') \
              WHERE batch_id=?1 AND status='queued'",
@@ -1527,7 +1541,7 @@ impl Database {
     }
 
     pub async fn cleanup_ping_batch(&self, batch_id: &str) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement("DELETE FROM ping_sessions WHERE batch_id = ?1")
             .bind(batch_id)
             .exec(&mut conn)
@@ -1536,7 +1550,7 @@ impl Database {
     }
 
     pub async fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement(
             "UPDATE ping_sessions SET status=?1, updated_at=datetime('now') WHERE id=?2",
         )
@@ -1553,7 +1567,7 @@ impl Database {
         ping_type: &str,
         new_status: &str,
     ) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement(
             "UPDATE ping_sessions SET ping_type=?1, status=?2, updated_at=datetime('now') WHERE id=?3",
         )
@@ -1570,7 +1584,7 @@ impl Database {
         batch_id: &str,
         limit: usize,
     ) -> Result<Vec<PingSession>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let rows = toasty::sql::query(
             "SELECT id, batch_id, protocol_id, config_type, core_type, address, port, triplet_rank, \
                     ping_type, status, latency_ms, speed_bps, ip_info, error, created_at, updated_at \
@@ -1605,7 +1619,7 @@ impl Database {
         limit: usize,
         dedup_endpoints: bool,
     ) -> Result<Vec<PingSession>> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let dedup_sql = if dedup_endpoints {
             "AND NOT EXISTS ( \
                       SELECT 1 FROM ping_sessions ps_s \
@@ -1651,7 +1665,7 @@ impl Database {
         &self,
         extensions: &[ProfileExtension],
     ) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
         for ext in extensions {
@@ -1720,7 +1734,7 @@ impl Database {
     }
 
     pub async fn delete_ping_session(&self, session_id: &str) -> Result<()> {
-        let mut conn = self.db.connection().await?;
+        let mut conn = self.conn().await?;
         toasty::sql::statement("DELETE FROM ping_sessions WHERE id = ?1")
             .bind(session_id)
             .exec(&mut conn)
@@ -2291,5 +2305,33 @@ mod tests {
             .await
             .expect("wave3");
         assert!(wave3.is_empty());
+    }
+
+    /// 50 concurrent writers must all succeed. Pooled turso connections are
+    /// created WITHOUT the busy_timeout pragma that `open()` sets on its own
+    /// connection (busy_timeout is per-connection), so the enrichment herd /
+    /// ping flush used to fail writes instantly with `database is locked`
+    /// instead of waiting their turn. Must be multi-threaded — a
+    /// current_thread runtime serializes the spawns and never contends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_writes_no_database_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(
+            Database::open(dir.path().join("busy.db"))
+                .await
+                .expect("open db"),
+        );
+        let handles: Vec<_> = (0..50i64)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move { db.update_last_used(i, 1_752_000_000).await })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .await
+                .expect("task panicked")
+                .unwrap_or_else(|e| panic!("concurrent write failed: {e}"));
+        }
     }
 }
