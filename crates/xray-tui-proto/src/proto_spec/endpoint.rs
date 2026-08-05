@@ -58,6 +58,16 @@ pub enum ConfigKind {
 
 /// Everything that defines *what* a protocol is — kind, config shape, core,
 /// transport, security — explicitly excluding endpoints.
+///
+/// Identity (`sig`/`cred_hash`/`uid`) hashes the serialized form of this
+/// struct, so it MUST NOT carry endpoint-derived values. In particular,
+/// transport configs must not store the server host: parsers today call
+/// [`TransportConfig::with_host`], which writes the resolved host into
+/// `WebSocketConfig::host`, `HttpConfig::host`, `HttpUpgradeConfig::host`,
+/// `XHttpConfig::host` and `GrpcConfig::authority` — those fields are part of
+/// the hash today (see `transport_host_field_is_hashed_today`). T4/T5 removes
+/// `with_host` from parse paths so that identity excludes host/port by
+/// construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolEssentials {
     pub proto_kind: ProtocolKind,
@@ -93,18 +103,31 @@ pub struct ParsedProto {
 }
 
 impl ParsedProto {
-    /// rapidhash over the serialized [`ProtocolEssentials`] JSON — the same
-    /// stream-hasher construction every `ProtoIdentity::compute_sig` impl uses.
+    /// Canonical serialized form of [`ProtocolEssentials`]: converted through
+    /// `serde_json::Value` so HashMap-backed fields (e.g. `headers` in
+    /// `WebSocketConfig`/`HttpConfig`/`HttpUpgradeConfig`/`XHttpConfig`)
+    /// materialize as sorted-key maps. serde's direct `to_vec` on a `HashMap`
+    /// iterates entries in per-instance random order (fresh `RandomState` per
+    /// map), which would make two value-equal protocols hash differently.
+    fn canonical_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.protocol)
+            .expect("ProtocolEssentials is serializable by construction")
+    }
+
+    /// rapidhash over the canonical serialized [`ProtocolEssentials`] JSON —
+    /// the same stream-hasher construction every `ProtoIdentity::compute_sig`
+    /// impl uses.
     fn protocol_hash(&self) -> u64 {
         use rapidhash::v3::RapidStreamHasherV3;
-        let bytes = serde_json::to_vec(&self.protocol)
-            .expect("ProtocolEssentials is serializable by construction");
+        let bytes = serde_json::to_vec(&self.canonical_json())
+            .expect("canonical protocol Value is serializable");
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(&bytes);
         hasher.finish()
     }
 
-    /// Deterministic signature over the serialized protocol essentials only.
+    /// Deterministic signature over the canonical serialized protocol
+    /// essentials only.
     ///
     /// Never zero: a zero rapidhash maps to 1, mirroring `Proto::materialize`'s
     /// `NonZeroU64::new(..).unwrap_or(NonZeroU64::MIN)` fallback.
@@ -114,14 +137,14 @@ impl ParsedProto {
         if sig == 0 { 1 } else { sig as i64 }
     }
 
-    /// Credential hash over the serialized protocol essentials only, reusing
-    /// the existing `utils::compute_cred_hash` primitive (stable sorted
-    /// `k=v;` pairs — same algorithm the per-config `compute_cred_hash` impls
-    /// use).
+    /// Credential hash over the canonical serialized protocol essentials only,
+    /// reusing the existing `utils::compute_cred_hash` primitive (stable
+    /// sorted `k=v;` pairs — same algorithm the per-config `compute_cred_hash`
+    /// impls use).
     #[must_use]
     pub fn cred_hash(&self) -> i64 {
-        let json = serde_json::to_string(&self.protocol)
-            .expect("ProtocolEssentials is serializable by construction");
+        let json = serde_json::to_string(&self.canonical_json())
+            .expect("canonical protocol Value is serializable");
         utils::compute_cred_hash(&[("protocol", &json)]) as i64
     }
 
@@ -273,5 +296,78 @@ mod tests {
         let bytes = serde_json::to_vec(&p).unwrap();
         let back: ProtocolEssentials = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn identity_hash_is_canonical_across_hashmap_insertion_order() {
+        // Regression: `TransportConfig` carries `headers: Option<HashMap<..>>`,
+        // and serde's direct `to_vec` iterates a HashMap in per-instance
+        // random order, so value-equal protocols used to hash differently.
+        // The canonical Value form (sorted keys) makes them equal.
+        let mk = |headers: &[(&str, &str)]| {
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in headers {
+                map.insert((*k).to_string(), (*v).to_string());
+            }
+            let mut p = proto(ProtocolKind::Vless);
+            p.transport = TransportEssentials {
+                r#type: crate::proto_spec::TransportType::Ws,
+                config: TransportConfig::Ws(crate::proto_spec::common::WebSocketConfig {
+                    headers: Some(map),
+                    ..Default::default()
+                }),
+            };
+            ParsedProto {
+                endpoints: vec![],
+                protocol: p,
+            }
+        };
+        let a = mk(&[("X-A", "1"), ("X-B", "2")]);
+        let b = mk(&[("X-B", "2"), ("X-A", "1")]);
+        assert_eq!(a.protocol, b.protocol, "protocols are value-equal");
+        assert_eq!(
+            a.sig(),
+            b.sig(),
+            "sig canonical across HashMap insertion order"
+        );
+        assert_eq!(
+            a.cred_hash(),
+            b.cred_hash(),
+            "cred_hash canonical across HashMap insertion order"
+        );
+        assert_eq!(
+            a.uid(),
+            b.uid(),
+            "uid canonical across HashMap insertion order"
+        );
+    }
+
+    #[test]
+    fn transport_host_field_is_hashed_today() {
+        // Pins current behavior: `TransportConfig::with_host` (called by the
+        // vless/vmess/trojan parsers today) writes the server host into the ws
+        // transport's `host` field, and that field IS part of the hashed
+        // protocol bytes. T4/T5 removes with_host from parse paths so identity
+        // excludes host/port by construction; until then, a host-bearing
+        // transport changes the uid.
+        let mk = |host: &str| {
+            let mut p = proto(ProtocolKind::Vless);
+            p.transport = TransportEssentials {
+                r#type: crate::proto_spec::TransportType::Ws,
+                config: TransportConfig::Ws(crate::proto_spec::common::WebSocketConfig {
+                    host: Some(host.into()),
+                    ..Default::default()
+                }),
+            };
+            ParsedProto {
+                endpoints: vec![],
+                protocol: p,
+            }
+        };
+        assert_ne!(
+            mk("cdn-a.example.com").uid(),
+            mk("cdn-b.example.com").uid(),
+            "transport host is part of identity today (T4/T5 removes it)"
+        );
     }
 }
