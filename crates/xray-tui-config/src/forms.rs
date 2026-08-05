@@ -394,7 +394,13 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                         "none",
                     ],
                     Protocol::Shadowsocks2022 => {
-                        &["2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "none"]
+                        // 2022-blake3 only — no "none" (neither core has a
+                        // plain 2022 mode; the 2022 spec requires a key).
+                        &[
+                            "2022-blake3-aes-128-gcm",
+                            "2022-blake3-aes-256-gcm",
+                            "2022-blake3-chacha20-poly1305",
+                        ]
                     }
                     _ => unreachable!(),
                 }),

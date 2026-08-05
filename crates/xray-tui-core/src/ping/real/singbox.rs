@@ -1,7 +1,7 @@
 use super::super::{PingResult, ProfileKey};
 use super::RealPingManager;
 use crate::bin_manager::find_binary;
-use crate::config_builder::{BuildParams, ConfigBuilder};
+use crate::config_builder::{BuildParams, ConfigBuilder, shadowsocks_method};
 use crate::process::RealCoreManager;
 use crate::protocol::Protocol;
 use crate::protocol_core_mapping::resolve_core;
@@ -34,7 +34,7 @@ pub(super) async fn real_ping(
         let temp_dir_path = temp_dir.path().to_path_buf();
 
         let proto = Protocol::try_from_i32(r#type).unwrap_or(Protocol::Custom);
-        let resolved_core = resolve_core(proto, None);
+        let resolved_core = resolve_core(proto, None, shadowsocks_method(&protocol).as_deref());
 
         let proxy_port = ctx.allocate_port();
 

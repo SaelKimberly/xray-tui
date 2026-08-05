@@ -4,7 +4,7 @@ use std::str::FromStr;
 use crate::EndpointRow;
 use xray_tui_config::import_export::{Profile, ValidationSettings, encode_profile_spec};
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{CoreType, resolve_core};
+use xray_tui_core::{CoreType, resolve_core, shadowsocks_method};
 
 use crate::AppState;
 use crate::state::profile_to_endpoint_protocol;
@@ -193,6 +193,7 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
                             CoreType::from_str(&row.active_protocol().core_type)
                                 .unwrap_or(CoreType::Auto),
                         ),
+                        shadowsocks_method(row.active_protocol()).as_deref(),
                     );
                     core.to_string()
                 };
@@ -237,7 +238,11 @@ pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
         .protocol_core_overrides
         .get(&protocol.to_string())
         .and_then(|s| s.parse::<CoreType>().ok());
-    resolve_core(protocol, config_override.or(profile_override))
+    resolve_core(
+        protocol,
+        config_override.or(profile_override),
+        shadowsocks_method(row.active_protocol()).as_deref(),
+    )
 }
 
 pub fn start_add_server(state: &mut AppState) {

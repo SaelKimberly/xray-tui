@@ -416,11 +416,20 @@ Reads Clash-compatible YAML, parses to JSON, and merges into sing-box config bef
 
 **`protocol_core_mapping.rs`** — Protocol → Core auto-resolution
 ```rust
-fn resolve_core(protocol: ProtocolType, profile_override: Option<CoreType>) -> CoreType {
+pub const XRAY_SS_METHODS: &[&str];      // AEAD + 2022-blake3 + aead_* aliases
+pub const SINGBOX_SS_METHODS: &[&str];  // modern + legacy (cfb/ctr/rc4-md5/none/...)
+fn resolve_core(protocol, profile_override: Option<CoreType>, ss_method: Option<&str>) -> CoreType {
     match profile_override {
-        Some(CoreType::Auto) | None => core_for_protocol(protocol),
-        Some(core_type) => core_type,
+        Some(CoreType::Auto) | None => core_for_protocol(protocol, ss_method),
+        Some(core_type) => core_type,   // forced override wins; builders validate
     }
+```
+Shadowsocks/Shadowsocks-2022 resolution is cipher-aware: xray-core's `CipherType` enum
+covers only AEAD + 2022-blake3, so legacy ciphers (`aes-*-cfb`, `aes-*-ctr`, `rc4-md5`,
+`chacha20-ietf`, `xchacha20`, `none`) auto-route to sing-box. Both config builders
+validate the method against their whitelist and return `BuildError::InvalidProfile`
+for ciphers neither core supports — an invalid config is never written. `ss_method`
+is extracted from the profile row via `config_builder::shadowsocks_method`.
 **`grpc_client.rs`** — gRPC StatsService abstraction
 
 Proto definition in `crates/xray-tui-core/proto/stats.proto` (vendored sing-box stats proto), compiled
@@ -474,7 +483,12 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 
 ### xray-tui-db (library crate)
 
-`crates/xray-tui-db/src/lib.rs` — toasty ORM database layer.
+`crates/xray-tui-db/src/lib.rs` — toasty ORM database layer. `retry.rs` adds
+`retry_on_busy`/`is_busy_error` — SQLite write contention (toasty
+`is_serialization_failure` or "database is locked") is retried with 20ms-doubling
+backoff (1.28s cap). Wired into `update_endpoint_resolution` +
+`batch_flush_ping_buffer`, whose single-transaction bare-`?` commits previously
+dropped writes when the enrichment pipeline herded hundreds of concurrent writers.
 
 **Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
 - `Endpoint` — server config; dedup key `sub_uid` (uid = sig ^ cred_hash); `resolved_as`/`resolved_at` DNS persistence
@@ -567,7 +581,7 @@ crate-local dep (serde feature dropped — filters rebuilt from disk on `new()`)
 User selects profile → hits Enter
         │
         ▼
-resolve_core(profile.protocol, profile.core_type) → core_type
+resolve_core(protocol, profile_override, ss_method) → core_type   // Shadowsocks: cipher-aware (legacy ciphers → sing-box)
         │
         ▼
 [Profile + Groups + Routing + DNS]

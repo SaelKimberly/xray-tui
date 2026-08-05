@@ -3,6 +3,7 @@ pub mod xray;
 
 pub mod clash_mixin;
 use crate::core_type::CoreType;
+use crate::protocol::Protocol;
 use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 /// Port for the gRPC Stats API (shared by xray-core and sing-box).
@@ -52,6 +53,23 @@ pub(crate) fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
     }
     let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
     (p_settings, s_settings)
+}
+
+/// The profile's shadowsocks method string when the protocol is
+/// Shadowsocks/Shadowsocks2022 — used for cipher-aware core resolution and
+/// builder validation. `None` for other protocols or a missing method.
+pub fn shadowsocks_method(protocol: &ProtocolRow) -> Option<String> {
+    if !matches!(
+        Protocol::try_from_i32(protocol.config_type),
+        Some(Protocol::Shadowsocks) | Some(Protocol::Shadowsocks2022)
+    ) {
+        return None;
+    }
+    parse_settings(protocol)
+        .0
+        .get("method")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Serialize)]

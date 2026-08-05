@@ -5,5 +5,7 @@ pub mod models_toasty;
 pub use database::Database;
 pub use error::{DatabaseError, Result};
 pub use models_toasty as models;
+pub use retry::{is_busy_error, retry_on_busy};
 
 mod database;
+mod retry;

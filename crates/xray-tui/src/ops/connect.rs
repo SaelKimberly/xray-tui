@@ -7,7 +7,7 @@ use xray_tui_core::grpc_client;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{
     BuildParams, CLASH_API_PORT, ConfigBuilder, CoreType, RealCoreManager,
-    config_builder::clash_mixin::parse_clash_mixin, find_binary, resolve_core,
+    config_builder::clash_mixin::parse_clash_mixin, find_binary, resolve_core, shadowsocks_method,
 };
 use xray_tui_db::models::{DnsSetting, RoutingRule};
 
@@ -66,7 +66,8 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         return;
     };
 
-    let core_type = resolve_core(protocol, profile_override);
+    let core_type =
+        resolve_core(protocol, profile_override, shadowsocks_method(&protocol_row).as_deref());
 
     // If already connected/disconnecting, send stop signal first
     if let Some(tx) = state.disconnect_tx.take() {

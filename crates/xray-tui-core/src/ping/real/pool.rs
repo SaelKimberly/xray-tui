@@ -12,7 +12,7 @@
 //!
 //! xray-core does not support SIGHUP (only SIGTERM/SIGINT).
 
-use crate::config_builder::{BuildParams, ConfigBuilder};
+use crate::config_builder::{BuildParams, ConfigBuilder, shadowsocks_method};
 use crate::core_type::CoreType;
 use crate::process::{CoreManager, RealCoreManager};
 use crate::protocol::Protocol;
@@ -125,7 +125,7 @@ impl CorePool {
     ) -> super::super::PingResult {
         let config_type = protocol.config_type;
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
-        let needed_core = resolve_core(proto, None);
+        let needed_core = resolve_core(proto, None, shadowsocks_method(protocol).as_deref());
 
         // Hold the pool lock across the entire reuse path — including the HTTP
         // ping itself. A concurrent single ping must not SIGHUP/reload the
@@ -436,7 +436,7 @@ impl CorePool {
     ) -> super::super::PingResult {
         let config_type = protocol.config_type;
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
-        let core_type = resolve_core(proto, None);
+        let core_type = resolve_core(proto, None, shadowsocks_method(protocol).as_deref());
         self.fresh_ping_and_cache(
             endpoint, protocol, core_type, ping_url, ip_api_url, timeout, retries,
         )

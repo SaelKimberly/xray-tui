@@ -9,6 +9,7 @@ mod xray;
 pub use pool::CorePool;
 
 use super::PingResult;
+use crate::config_builder::shadowsocks_method;
 use crate::core_type::CoreType;
 use crate::protocol::Protocol;
 use crate::protocol_core_mapping::resolve_core;
@@ -47,7 +48,7 @@ impl RealPingManager {
         config_type: i32,
     ) -> PingResult {
         let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
-        let core = resolve_core(proto, None);
+        let core = resolve_core(proto, None, shadowsocks_method(protocol).as_deref());
         match core {
             CoreType::Xray => xray::real_ping(endpoint, protocol, self).await,
             CoreType::SingBox => singbox::real_ping(endpoint, protocol, self).await,

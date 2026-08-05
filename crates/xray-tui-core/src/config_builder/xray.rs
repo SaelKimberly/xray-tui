@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
+use crate::protocol_core_mapping::xray_supports_ss_method;
 
 use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
 
@@ -313,11 +314,21 @@ fn build_proxy_outbound(
                 stream_settings: s_settings,
             })
         }
-        Protocol::Shadowsocks => {
+        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => {
             let method = p_settings
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("aes-256-gcm");
+            // xray-core's CipherType enum only covers AEAD + 2022-blake3;
+            // refusing here prevents the core from dying on startup with
+            // "unknown cipher method".
+            if !xray_supports_ss_method(method) {
+                return Err(BuildError::InvalidProfile(format!(
+                    "Shadowsocks cipher '{method}' is not supported by xray-core; \
+                     supported: aes-128-gcm, aes-256-gcm, chacha20-poly1305, \
+                     xchacha20-poly1305, 2022-blake3-*"
+                )));
+            }
             Ok(Outbound {
                 tag: "proxy".to_string(),
                 protocol: "shadowsocks".to_string(),
@@ -496,7 +507,9 @@ fn legacy_stream_settings_to_xray(
         ws.insert("path".into(), serde_json::json!(v));
     }
     if let Some(v) = get("ws.host").and_then(|v| v.as_str().map(str::to_string)) {
-        ws.insert("headers".into(), serde_json::json!({ "Host": v }));
+        // Top-level `host` — xray-core deprecates `headers.Host`
+        // ("will be removed soon").
+        ws.insert("host".into(), serde_json::json!(v));
     }
     if !ws.is_empty() {
         ss.insert("wsSettings".into(), serde_json::Value::Object(ws));
@@ -812,6 +825,44 @@ mod tests {
     }
 
     #[test]
+    fn xray_shadowsocks_rejects_unsupported_cipher() {
+        // aes-256-cfb is not in xray-core's CipherType enum; the builder must
+        // refuse to emit the config instead of the core dying on startup.
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
+        set_protocol_settings_json(&mut protocol, r#"{"method": "aes-256-cfb"}"#);
+        let (params, rules, dns) = default_params();
+        let err = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect_err("xray-core cannot build aes-256-cfb");
+        assert!(
+            err.to_string().contains("aes-256-cfb"),
+            "error must name the cipher: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_shadowsocks2022_builds() {
+        // xray-core builds 2022-blake3 ciphers under protocol "shadowsocks".
+        let (endpoint, mut protocol) =
+            test_endpoint_and_protocol(Protocol::Shadowsocks2022.to_i32());
+        set_protocol_settings_json(
+            &mut protocol,
+            r#"{"method": "2022-blake3-aes-128-gcm"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["protocol"], "shadowsocks");
+        assert_eq!(proxy["settings"]["servers"][0]["method"], "2022-blake3-aes-128-gcm");
+    }
+
+    #[test]
     fn xray_trojan_config() {
         let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Trojan.to_i32());
         let (params, rules, dns) = default_params();
@@ -1052,7 +1103,12 @@ mod tests {
         assert_eq!(ss["security"], "tls");
         assert_eq!(ss["tlsSettings"]["serverName"], "cdn.example.com");
         assert_eq!(ss["wsSettings"]["path"], "/ws");
-        assert_eq!(ss["wsSettings"]["headers"]["Host"], "cdn.example.com");
+        // Top-level `host`, not deprecated `headers.Host`.
+        assert_eq!(ss["wsSettings"]["host"], "cdn.example.com");
+        assert!(
+            ss["wsSettings"].get("headers").is_none(),
+            "headers.Host must not be emitted"
+        );
     }
 
     #[test]

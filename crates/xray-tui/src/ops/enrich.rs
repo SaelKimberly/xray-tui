@@ -71,6 +71,27 @@ const fn should_resolve(
     }
 }
 
+/// A DNS hostname safe to hand to the resolver: ASCII letters/digits/hyphens
+/// in dot-separated labels. Rejects plugin URLs (`host:port?plugin=...`),
+/// underscores (Telegram-channel names), spaces and non-ASCII — hickory
+/// errors on those ("Label contains invalid characters") and the failure is
+/// pure log noise.
+fn is_resolvable_hostname(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.contains("..") {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
 /// `"{ip} | {country}"` (real-ping `ip_info` format) → `(ip, country-hint)`.
 fn parse_ip_info(ip_info: &str) -> Option<(IpAddr, Option<String>)> {
     let (ip_part, country) = ip_info
@@ -162,39 +183,65 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                     .unwrap_or_default(),
                 None,
             ),
-            _ => match &dns {
-                Some(r) => {
-                    // Overall deadline: resolver init (DNSCrypt list
-                    // download) plus lookups over many name servers can
-                    // otherwise stall indefinitely.
-                    match tokio::time::timeout(Duration::from_secs(8), r.lookup_ip(&host, false))
-                        .await
-                    {
-                        Ok(Ok(ips)) => {
-                            tracing::info!(
-                                target: "tui::ops::enrich",
-                                "Resolved {host}: {} IP(s)",
-                                ips.len()
-                            );
-                            (ips, Some(now))
+            _ => {
+                if !is_resolvable_hostname(&host) {
+                    // Plugin URLs / garbage hostnames can never resolve;
+                    // record a failed attempt (TTL-gated) instead of firing
+                    // hickory parse errors on every refresh.
+                    tracing::debug!(
+                        target: "tui::ops::enrich",
+                        "Skipping DNS lookup for invalid hostname: {host}"
+                    );
+                    (Vec::new(), Some(now))
+                } else {
+                    match &dns {
+                        Some(r) => {
+                            // Overall deadline: resolver init (DNSCrypt list
+                            // download) plus lookups over many name servers
+                            // can otherwise stall indefinitely.
+                            match tokio::time::timeout(
+                                Duration::from_secs(8),
+                                r.lookup_ip(&host, false),
+                            )
+                            .await
+                            {
+                                Ok(Ok(ips)) => {
+                                    tracing::info!(
+                                        target: "tui::ops::enrich",
+                                        "Resolved {host}: {} IP(s)",
+                                        ips.len()
+                                    );
+                                    (ips, Some(now))
+                                }
+                                Ok(Err(e)) => {
+                                    if e.to_string().contains("no records found") {
+                                        // Host without any DNS record — the
+                                        // UI flag carries the signal; don't
+                                        // warn per host per TTL.
+                                        tracing::debug!(
+                                            target: "tui::ops::enrich",
+                                            "DNS lookup of {host} found no records"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            target: "tui::ops::enrich",
+                                            "DNS lookup of {host} failed: {e}"
+                                        );
+                                    }
+                                    (Vec::new(), Some(now))
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        target: "tui::ops::enrich",
+                                        "DNS lookup of {host} timed out"
+                                    );
+                                    (Vec::new(), Some(now))
+                                }
+                            }
                         }
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                target: "tui::ops::enrich",
-                                "DNS lookup of {host} failed: {e}"
-                            );
-                            (Vec::new(), Some(now))
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "tui::ops::enrich",
-                                "DNS lookup of {host} timed out"
-                            );
-                            (Vec::new(), Some(now))
-                        }
+                        None => (Vec::new(), None),
                     }
                 }
-                None => (Vec::new(), None),
             },
         };
 
@@ -410,6 +457,47 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
 mod tests {
     use super::*;
     use crate::format_ts;
+
+    #[test]
+    fn resolvable_hostname_accepts_valid_domains() {
+        for host in [
+            "example.com",
+            "cdn.example.com",
+            "like.myolddomain.kesug.com",
+            "x.com",
+            "a-b.example.com",
+            "example.com.", // trailing-dot FQDN
+        ] {
+            assert!(
+                is_resolvable_hostname(host),
+                "{host} should be resolvable"
+            );
+        }
+    }
+
+    #[test]
+    fn resolvable_hostname_rejects_garbage() {
+        // Observed in dumps: plugin URLs, port suffixes, Telegram-channel
+        // names with underscores, spaces and non-ASCII — all hickory errors.
+        for host in [
+            "",
+            "1.2.3.4:8388?plugin=obfs-local;obfs=tls;obfs-host=x",
+            "v2ray_configs_poolsTELEGRAM.kesug.com",
+            "foo bar.com",
+            "foo..com",
+            ".foo.com",
+            "-foo.com",
+            "foo-.com",
+            "foo@bar.com",
+            "exämple.com",
+            "foo_com.com",
+        ] {
+            assert!(
+                !is_resolvable_hostname(host),
+                "{host:?} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn test_format_ts() {

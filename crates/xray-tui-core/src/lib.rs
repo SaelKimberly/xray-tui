@@ -24,6 +24,7 @@ pub use bin_manager::{CoreBinInfo, find_binary, get_core_info};
 
 pub use config_builder::{
     BackendConfig, BuildError, BuildParams, CLASH_API_PORT, ConfigBuilder, MultiInboundItem,
+    shadowsocks_method,
 };
 pub use core_type::CoreType;
 pub use grpc_client::{

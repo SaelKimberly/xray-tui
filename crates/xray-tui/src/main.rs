@@ -227,14 +227,22 @@ async fn main() -> Result<()> {
                 // for the Logs tab and actions panel.
                 .with_filter(tracing_subscriber::EnvFilter::new("xray_tui=info")),
         )
-        .with(TuiLogLayer {
-            core_event_tx: state
-                .core_event_tx
-                .clone()
-                .expect("core_event_tx must be set before tracing init"),
-            log_sender: log_sender_tx,
-            log_file,
-        })
+        .with(
+            TuiLogLayer {
+                core_event_tx: state
+                    .core_event_tx
+                    .clone()
+                    .expect("core_event_tx must be set before tracing init"),
+                log_sender: log_sender_tx,
+                log_file,
+            }
+            // Logs tab stays unfiltered (trace+) except hickory's DoH h2
+            // transport chatter — those connections retry transparently and
+            // spammed the dump (391 lines of "peer closed connection").
+            .with_filter(tracing_subscriber::EnvFilter::new(
+                "trace,hickory_net::h2=error",
+            )),
+        )
         .try_init()
         .is_err()
     {

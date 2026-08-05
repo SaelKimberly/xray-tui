@@ -10,7 +10,7 @@ use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{
     BuildParams, ConfigBuilder, CorePool, CoreType, MultiInboundItem, RealCoreManager, find_binary,
-    resolve_core, wait_for_socks5,
+    resolve_core, shadowsocks_method, wait_for_socks5,
 };
 use xray_tui_db::Database;
 use xray_tui_db::models::{
@@ -885,7 +885,8 @@ async fn dispatch_real_ping_batch(
             continue;
         };
         let proto = Protocol::try_from_i32(session.config_type).unwrap_or(Protocol::Custom);
-        let core_type = resolve_core(proto, None);
+        let core_type =
+            resolve_core(proto, None, shadowsocks_method(profile.active_protocol()).as_deref());
         // Draw from the pool's shared allocator — batch and single pings can
         // never collide on a port.
         let assigned_port = port_allocator.fetch_add(1, Ordering::Relaxed);

@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
 
 use crate::protocol::Protocol;
+use crate::protocol_core_mapping::singbox_supports_ss_method;
 
 use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
 
@@ -254,11 +255,20 @@ fn build_proxy_outbound(
                 }
             })
         }
-        Protocol::Shadowsocks => {
+        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => {
             let method = p_settings
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("aes-256-gcm");
+            // sing-box accepts modern + legacy methods; anything else (e.g.
+            // salsa20) is refused here so the config is never written invalid.
+            if !singbox_supports_ss_method(method) {
+                return Err(BuildError::InvalidProfile(format!(
+                    "Shadowsocks cipher '{method}' is not supported by sing-box; \
+                     supported: modern AEAD/2022-blake3 + legacy cfb/ctr/rc4-md5 \
+                     methods"
+                )));
+            }
             json!({
                 "tag": "proxy",
                 "type": "shadowsocks",
@@ -1226,6 +1236,43 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
         assert_proxy_outbound(&json, "shadowsocks");
+    }
+
+    #[test]
+    fn singbox_shadowsocks_rejects_unsupported_cipher() {
+        // salsa20 is supported by neither core; the builder must refuse it.
+        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
+        set_protocol_settings_json(&mut protocol, r#"{"method": "salsa20"}"#);
+        let (params, rules, dns) = default_params();
+        let err = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
+            .expect_err("salsa20 is not a sing-box method");
+        assert!(
+            err.to_string().contains("salsa20"),
+            "error must name the cipher: {err}"
+        );
+    }
+
+    #[test]
+    fn singbox_shadowsocks2022_builds() {
+        // sing-box 2022 methods flow through type "shadowsocks".
+        let (endpoint, mut protocol) =
+            test_endpoint_and_protocol(Protocol::Shadowsocks2022.to_i32());
+        set_protocol_settings_json(
+            &mut protocol,
+            r#"{"method": "2022-blake3-aes-128-gcm"}"#,
+        );
+        let (params, rules, dns) = default_params();
+        let config =
+            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["type"], "shadowsocks");
+        assert_eq!(proxy["method"], "2022-blake3-aes-128-gcm");
     }
 
     #[test]

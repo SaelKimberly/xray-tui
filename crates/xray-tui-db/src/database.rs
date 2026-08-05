@@ -7,6 +7,7 @@ use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
+use crate::retry_on_busy;
 use crate::models_toasty::EndpointRow;
 use crate::models_toasty::{
     DnsSetting, Endpoint, EndpointGroup, Group, PingResultUpdate, PingSession, ProfileExtension,
@@ -652,18 +653,28 @@ impl Database {
         resolved_as: Option<&str>,
         resolved_at: Option<i64>,
     ) -> Result<()> {
-        let mut conn = self.db.connection().await?;
-        let mut tx = conn.transaction().await?;
-        toasty::sql::statement(
-            "UPDATE endpoints SET resolved_as = ?1, resolved_at = ?2 WHERE id = ?3",
+        // Retry on write contention: the enrichment pipeline resolves many
+        // endpoints concurrently, and concurrent writers surface SQLite
+        // "database is locked" (previously dropped the resolution write).
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.db.connection().await?;
+                let mut tx = conn.transaction().await?;
+                toasty::sql::statement(
+                    "UPDATE endpoints SET resolved_as = ?1, resolved_at = ?2 WHERE id = ?3",
+                )
+                .bind_typed(resolved_as, DbType::Text)
+                .bind_typed(resolved_at, DbType::Integer(8))
+                .bind(endpoint_id)
+                .exec(&mut tx)
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            },
+            5,
         )
-        .bind_typed(resolved_as, DbType::Text)
-        .bind_typed(resolved_at, DbType::Integer(8))
-        .bind(endpoint_id)
-        .exec(&mut tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        .await
     }
 
     /// Purge endpoints where every protocol has `last_seen_at` < threshold.
@@ -1665,38 +1676,47 @@ impl Database {
         results: &[PingResultUpdate],
         extensions: &[ProfileExtension],
     ) -> Result<()> {
-        let mut conn = self.db.connection().await?;
-        let mut tx = conn.transaction().await?;
+        // Retry on write contention — the flush collides with enrichment
+        // writes during batch pings; previously the whole buffer was dropped.
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.db.connection().await?;
+                let mut tx = conn.transaction().await?;
 
-        for r in results {
-            toasty::sql::statement(
-                "UPDATE ping_sessions SET status=?1, latency_ms=?2, speed_bps=?3, ip_info=?4, error=?5, updated_at=datetime('now') \
-                 WHERE id=?6 AND batch_id=?7",
-            )
-            .bind(&r.status)
-            .bind_typed(r.latency_ms, DbType::Integer(4))
-            .bind(r.speed_bps.unwrap_or(0))
-            .bind(r.ip_info.as_deref().unwrap_or(""))
-            .bind_typed(r.error.as_deref(), DbType::Text)
-            .bind(&r.session_id)
-            .bind(batch_id)
-            .exec(&mut tx)
-            .await?;
-        }
+                for r in results {
+                    toasty::sql::statement(
+                        "UPDATE ping_sessions SET status=?1, latency_ms=?2, speed_bps=?3, ip_info=?4, error=?5, updated_at=datetime('now') \
+                         WHERE id=?6 AND batch_id=?7",
+                    )
+                    .bind(&r.status)
+                    .bind_typed(r.latency_ms, DbType::Integer(4))
+                    .bind(r.speed_bps.unwrap_or(0))
+                    .bind(r.ip_info.as_deref().unwrap_or(""))
+                    .bind_typed(r.error.as_deref(), DbType::Text)
+                    .bind(&r.session_id)
+                    .bind(batch_id)
+                    .exec(&mut tx)
+                    .await?;
+                }
 
-        for ext in extensions {
-            ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
-                .delay(ext.delay.unwrap_or(0))
-                .speed(ext.speed.unwrap_or(0))
-                .sort_order(ext.sort_order.unwrap_or(0))
-                .ip_info(ext.ip_info.as_deref().unwrap_or(""))
-                .delay_source(ext.delay_source.unwrap_or(-1))
-                .exec(&mut tx)
-                .await?;
-        }
+                for ext in extensions {
+                    ProfileExtension::upsert_by_protocol_id(ext.protocol_id)
+                        .delay(ext.delay.unwrap_or(0))
+                        .speed(ext.speed.unwrap_or(0))
+                        .sort_order(ext.sort_order.unwrap_or(0))
+                        .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+                        .delay_source(ext.delay_source.unwrap_or(-1))
+                        .exec(&mut tx)
+                        .await?;
+                }
 
-        tx.commit().await?;
-        Ok(())
+                tx.commit().await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 
     pub async fn delete_ping_session(&self, session_id: &str) -> Result<()> {

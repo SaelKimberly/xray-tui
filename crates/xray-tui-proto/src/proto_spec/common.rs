@@ -783,7 +783,9 @@ pub fn to_xray_stream_settings(
                 w.insert("path".into(), serde_json::json!(p.as_str()));
             }
             if let Some(h) = &cfg.host {
-                w.insert("headers".into(), serde_json::json!({ "Host": h.as_str() }));
+                // Top-level `host` — xray-core deprecates `headers.Host`
+                // ("will be removed soon").
+                w.insert("host".into(), serde_json::json!(h.as_str()));
             }
             if !w.is_empty() {
                 ss.insert("wsSettings".into(), serde_json::Value::Object(w));
@@ -862,6 +864,13 @@ mod tests {
         assert_eq!(ss["network"], "ws");
         assert_eq!(ss["security"], "tls");
         assert_eq!(ss["wsSettings"]["path"], "/ws");
+        // The WS vhost goes in the top-level `host` field — xray-core
+        // deprecates `headers.Host` ("will be removed soon").
+        assert_eq!(ss["wsSettings"]["host"], "cdn.example.com");
+        assert!(
+            ss["wsSettings"].get("headers").is_none(),
+            "headers.Host must not be emitted"
+        );
     }
 
     #[test]
