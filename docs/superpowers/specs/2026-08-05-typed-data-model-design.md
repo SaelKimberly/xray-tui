@@ -58,10 +58,14 @@ pub struct EndpointEssentials {
 
 pub struct ProtocolEssentials {
     pub proto_kind: ProtocolKind,
-    pub transport: Transport,          // typed embed, see §4
-    pub security: Security,            // typed embed, see §4
     pub config_type: ConfigType,       // ShareUrl | Form
     pub core_type: CoreType,           // Xray | SingBox (auto-resolved at parse)
+    /// The exact, serializable protocol definition — the config struct sans
+    /// host/port. This is the identity-hashed payload. Transport/security
+    /// "exposed fields" (TransportEssentials/SecurityEssentials) are derived
+    /// from it at DB write time for the cached columns — they are NOT stored
+    /// here.
+    pub config: ProtocolConfig,
 }
 ```
 
@@ -77,6 +81,18 @@ pub struct ProtocolEssentials {
   presentation of orphan protocols is deferred until such a protocol exists.
 - Natural keys prevent duplicate protocol configs: endpoint natural key is
   `(host, host_type, ports)`; protocol natural key is `uid`.
+- `ProtocolEssentials.config` is the identity-hashed payload; the DB's cached
+  `transport`/`security` embed columns (type, sni, fp, insecure + JSON data)
+  are derived from it at write time via config accessors
+  (`config.transport()`, `config.security()`). No denormalized
+  `TransportEssentials`/`SecurityEssentials` types in the boundary.
+- HOST-FREE PARSE MANDATE: parsers never call `TransportConfig::with_host`
+  and never copy the endpoint host into transport/security config fields
+  (ws/http/grpc host, `GrpcConfig.authority`, `SecurityConfig.sni`). An
+  explicit URL-level override (ws `host=` param, grpc authority, sni param)
+  IS a protocol parameter and stays in the config; absent → field unset.
+  Builders inject endpoint host at build time (`inject_to` receives
+  `endpoint`). Keeps endpoint-derived bytes out of `uid`.
 - The `Proto` container survives with the new content. `ProtoSpec` trait
   (`parse_share_url`, `format_share_url`, `try_from_clash`, `to_clash`,
   identity computation) is updated to the split. Clash YAML structs remain
@@ -178,8 +194,14 @@ struct Protocol {
     sig: i64,
     cred_hash: i64,
     proto_kind: ProtocolKind,
-    transport: Transport,                   // embed
-    security: Security,                     // embed
+    transport: Transport,                   // embed — cached type/data derived from config at write
+    security: Security,                     // embed — cached sni/fp/insecure/data derived from config at write
+    /// The full exact definition (ProtocolConfig sans host/port), stored as
+    /// one opaque JSON column. Deferred: not loaded by list queries; decoded
+    /// only when the config is needed (config build, edit form). The cached
+    /// transport/security embeds are derived from it on every write.
+    #[column(type = text)]
+    config: Deferred<Json<ProtocolConfig>>,
     #[auto] created_at: jiff::Timestamp,
     #[has_many] links: Deferred<Vec<ProfileStats>>,
 }
@@ -283,15 +305,16 @@ enforced with newtype embeds whose constructors `debug_assert` and reject 0:
 
 ## 5. Config Storage (Protocol)
 
-`transport.data` / `security.data` are `Deferred<Json<TransportConfig>>` /
-`Deferred<Json<SecurityConfig>>`: opaque JSON columns excluded from the
-default `SELECT`. List queries no longer decode configs; the cached typed
-columns (`r#type`, `sni`, `fp`, `insecure`) serve display and filtering.
+`Protocol.config` is a `Deferred<Json<ProtocolConfig>>` opaque JSON column
+excluded from the default `SELECT`: list queries never decode configs. The
+cached typed embeds (`transport`/`security`: `type`, `sni`, `fp`, `insecure`
++ their own `Deferred<Json<...>>` data columns) serve display and filtering.
+The full config is decoded only when actually needed (config build, edit
+form).
 
-Write path: one constructor builds the `Transport`/`Security` embeds from a
-single `ProtocolConfig` — `type` + cached fields + JSON data are derived from
-the same value, so denormalization cannot drift. `spec_blob` column is
-deleted.
+Write path: one constructor takes a `ProtocolConfig` (sans host/port) and
+derives proto_kind + transport/security embeds from it in the same function —
+cached columns cannot drift from the config. `spec_blob` column is deleted.
 
 ## 6. ProfileStats Task Scheduler
 
