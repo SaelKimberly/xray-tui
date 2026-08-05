@@ -76,29 +76,48 @@ toasty = { version = "0.9", default-features = false }
 // crates/xray-tui-proto/src/proto_spec/kinds.rs
 use serde::{Deserialize, Serialize};
 
+/// Protocol kinds. Variants mirror the (being-replaced) `Protocol` enum from
+/// `crates/xray-tui-core/src/protocol.rs` — 27 variants incl. the 7 outbound-only
+/// form types (DokodemoDoor, Freedom, Blackhole, Dns, Loopback, Custom) and the
+/// separate Shadowsocks2022. `as_str()` MUST equal `Protocol::Display` outputs
+/// VERBATIM ("hy", "hy2", "any-tls", "shadow-tls", "t-proxy", "ss-2022",
+/// "dokodemo", ...). `FromStr` additionally accepts the legacy hyphen-less
+/// aliases ("hysteria", "hysteria2", "anytls", "shadowtls", "tproxy",
+/// "hysteria1") that proto identity hashing, security_rank and
+/// fields_to_profile historically wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
 pub enum ProtocolKind {
-    Vmess, Vless, Trojan, Ss, Ssr, Tuic, Hysteria1, Hysteria2, Wireguard,
-    Socks, Http, Naive, AnyTls, ShadowTls, Tor, Ssh, Tailscale,
-    Redirect, TProxy, Mixed,
+    Vmess, Vless, Shadowsocks, Shadowsocks2022, Socks, Http, Trojan, WireGuard,
+    Hysteria2, DokodemoDoor, Freedom, Blackhole, Dns, Loopback, Custom,
+    Tuic, Hysteria, Naive, AnyTls, ShadowTls, Tor, Ssh, Tailscale,
+    ShadowsocksR, Redirect, TProxy, Mixed,
 }
 impl ProtocolKind {
-    /// Canonical protocol string used in URLs and proto_kind columns.
-    /// NOTE: explicit mapping — serde snake_case would emit any_tls/shadow_tls/t_proxy.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Vmess => "vmess", Self::Vless => "vless", Self::Trojan => "trojan",
-            Self::Ss => "ss", Self::Ssr => "ssr", Self::Tuic => "tuic",
-            Self::Hysteria1 => "hysteria1", Self::Hysteria2 => "hysteria2",
-            Self::Wireguard => "wireguard", Self::Socks => "socks", Self::Http => "http",
-            Self::Naive => "naive", Self::AnyTls => "anytls", Self::ShadowTls => "shadowtls",
+            Self::Vmess => "vmess", Self::Vless => "vless",
+            Self::Shadowsocks => "ss", Self::Shadowsocks2022 => "ss-2022",
+            Self::Socks => "socks", Self::Http => "http", Self::Trojan => "trojan",
+            Self::WireGuard => "wireguard", Self::Hysteria2 => "hy2",
+            Self::DokodemoDoor => "dokodemo", Self::Freedom => "freedom",
+            Self::Blackhole => "blackhole", Self::Dns => "dns",
+            Self::Loopback => "loopback", Self::Custom => "custom",
+            Self::Tuic => "tuic", Self::Hysteria => "hy", Self::Naive => "naive",
+            Self::AnyTls => "any-tls", Self::ShadowTls => "shadow-tls",
             Self::Tor => "tor", Self::Ssh => "ssh", Self::Tailscale => "tailscale",
-            Self::Redirect => "redirect", Self::TProxy => "tproxy", Self::Mixed => "mixed",
+            Self::ShadowsocksR => "ssr", Self::Redirect => "redirect",
+            Self::TProxy => "t-proxy", Self::Mixed => "mixed",
         }
     }
 }
 impl std::fmt::Display for ProtocolKind { /* as_str */ }
-impl std::str::FromStr for ProtocolKind { /* parse as_str, case-insensitive */ }
+impl std::str::FromStr for ProtocolKind {
+    /* as_str, case-insensitive; plus legacy aliases: "hysteria"|"hysteria1" -> Hysteria,
+       "hysteria2" -> Hysteria2, "anytls" -> AnyTls, "shadowtls" -> ShadowTls,
+       "tproxy" -> TProxy, "shadowsocks" -> Shadowsocks, "shadowsocks-r" -> ShadowsocksR,
+       "shadowsocks-2022" -> Shadowsocks2022, "dokodemo-door" -> DokodemoDoor,
+       "wire-guard" -> WireGuard, "socks5" -> Socks, "naive+https"/"naive+quic" -> Naive */
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
 #[serde(rename_all = "snake_case")]
@@ -110,9 +129,7 @@ impl TransportType { pub const fn as_str(self) -> &'static str { /* "tcp","ws","
 pub enum SecurityType { None, Tls, Reality }
 impl SecurityType { pub const fn as_str(self) -> &'static str { /* "none","tls","reality" */ } }
 ```
-(These `as_str` outputs MUST equal the current `proto_kind` column values and
-`TransportConfig::type_str()`/`SecurityConfig::type_str()` strings — verify
-against `crates/xray-tui-core/src/protocol.rs` and `common.rs` while writing.)
+Authoritative sources to verify against while writing: `crates/xray-tui-core/src/protocol.rs` (Display/FromStr), `crates/xray-tui/src/ops/profiles.rs` `fields_to_profile` (line ~341), `crates/xray-tui-config/src/import_export.rs` `parse_protocol_id` (line ~183), `crates/xray-tui-proto/src/proto_spec/security_rank.rs`, `crates/xray-tui/src/ui/settings.rs` (line ~462). CURRENT CODE WINS on any delta — report it.
 
 - [ ] **Step 3: Tests** — for each enum: `FromStr`/`Display` round-trip all variants; serde JSON round-trip; `TransportType`/`SecurityType` values match `TransportConfig::type_str()` / `SecurityConfig::type_str()` outputs for the variants that exist today.
 - [ ] **Step 4: Run** `cargo test -p xray-tui-proto` — PASS.
