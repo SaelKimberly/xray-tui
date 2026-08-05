@@ -15,6 +15,7 @@ mod anytls;
 mod http_client;
 mod hysteria1;
 mod hysteria2;
+mod kinds;
 mod naive;
 pub mod security_rank;
 mod shadowtls;
@@ -34,6 +35,7 @@ pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsO
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;
 pub use hysteria2::Hysteria2Config;
+pub use kinds::{ParseProtocolKindError, ProtocolKind, SecurityType, TransportType};
 pub use naive::NaiveConfig;
 pub use security_rank::protocol_security_rank;
 pub use shadowtls::ShadowTlsConfig;

@@ -1,0 +1,500 @@
+use serde::{Deserialize, Serialize};
+
+/// Protocol kinds. Variants mirror the (being-replaced) `Protocol` enum from
+/// `crates/xray-tui-core/src/protocol.rs` — 27 variants incl. the 7 outbound-only
+/// form types (DokodemoDoor, Freedom, Blackhole, Dns, Loopback, Custom) and the
+/// separate Shadowsocks2022. `as_str()` MUST equal `Protocol::Display` outputs
+/// VERBATIM ("hy", "hy2", "any-tls", "shadow-tls", "t-proxy", "ss-2022",
+/// "dokodemo", ...). `FromStr` additionally accepts the legacy hyphen-less
+/// aliases ("hysteria", "hysteria2", "anytls", "shadowtls", "tproxy",
+/// "hysteria1") that proto identity hashing, security_rank and
+/// fields_to_profile historically wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
+pub enum ProtocolKind {
+    Vmess,
+    Vless,
+    Shadowsocks,
+    Shadowsocks2022,
+    Socks,
+    Http,
+    Trojan,
+    WireGuard,
+    Hysteria2,
+    DokodemoDoor,
+    Freedom,
+    Blackhole,
+    Dns,
+    Loopback,
+    Custom,
+    Tuic,
+    Hysteria,
+    Naive,
+    AnyTls,
+    ShadowTls,
+    Tor,
+    Ssh,
+    Tailscale,
+    ShadowsocksR,
+    Redirect,
+    TProxy,
+    Mixed,
+}
+
+impl ProtocolKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vmess => "vmess",
+            Self::Vless => "vless",
+            Self::Shadowsocks => "ss",
+            Self::Shadowsocks2022 => "ss-2022",
+            Self::Socks => "socks",
+            Self::Http => "http",
+            Self::Trojan => "trojan",
+            Self::WireGuard => "wireguard",
+            Self::Hysteria2 => "hy2",
+            Self::DokodemoDoor => "dokodemo",
+            Self::Freedom => "freedom",
+            Self::Blackhole => "blackhole",
+            Self::Dns => "dns",
+            Self::Loopback => "loopback",
+            Self::Custom => "custom",
+            Self::Tuic => "tuic",
+            Self::Hysteria => "hy",
+            Self::Naive => "naive",
+            Self::AnyTls => "any-tls",
+            Self::ShadowTls => "shadow-tls",
+            Self::Tor => "tor",
+            Self::Ssh => "ssh",
+            Self::Tailscale => "tailscale",
+            Self::ShadowsocksR => "ssr",
+            Self::Redirect => "redirect",
+            Self::TProxy => "t-proxy",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when a [`ProtocolKind`] string cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid protocol kind: '{0}'")]
+pub struct ParseProtocolKindError(String);
+
+impl std::str::FromStr for ProtocolKind {
+    type Err = ParseProtocolKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Same normalization as `Protocol::from_str` in xray-tui-core:
+        // lowercase, `-` → `_`, then match canonical `as_str` spellings plus
+        // the legacy hyphen-less aliases written by proto identity hashing,
+        // security_rank, fields_to_profile and normalize_protocol_key.
+        let normalized = s.to_lowercase().replace('-', "_");
+        let kind = match normalized.as_str() {
+            // Canonical (`as_str`) spellings.
+            "vmess" => Self::Vmess,
+            "vless" => Self::Vless,
+            "ss" => Self::Shadowsocks,
+            "ss_2022" => Self::Shadowsocks2022,
+            "socks" => Self::Socks,
+            "http" => Self::Http,
+            "trojan" => Self::Trojan,
+            "wireguard" => Self::WireGuard,
+            "hy2" => Self::Hysteria2,
+            "dokodemo" => Self::DokodemoDoor,
+            "freedom" => Self::Freedom,
+            "blackhole" => Self::Blackhole,
+            "dns" => Self::Dns,
+            "loopback" => Self::Loopback,
+            "custom" => Self::Custom,
+            "tuic" => Self::Tuic,
+            "hy" => Self::Hysteria,
+            "naive" => Self::Naive,
+            "any_tls" => Self::AnyTls,
+            "shadow_tls" => Self::ShadowTls,
+            "tor" => Self::Tor,
+            "ssh" => Self::Ssh,
+            "tailscale" => Self::Tailscale,
+            "ssr" => Self::ShadowsocksR,
+            "redirect" => Self::Redirect,
+            "t_proxy" => Self::TProxy,
+            "mixed" => Self::Mixed,
+            // Legacy spellings historically written/parsed elsewhere in the
+            // codebase.
+            "shadowsocks" => Self::Shadowsocks,
+            "shadowsocks_2022" => Self::Shadowsocks2022,
+            "wire_guard" => Self::WireGuard,
+            "hysteria" | "hysteria1" => Self::Hysteria,
+            "hysteria2" | "hysteria_2" => Self::Hysteria2,
+            "dokodemo_door" => Self::DokodemoDoor,
+            "anytls" => Self::AnyTls,
+            "shadowtls" => Self::ShadowTls,
+            "shadowsocks_r" | "shadowsocksr" => Self::ShadowsocksR,
+            "tproxy" => Self::TProxy,
+            "socks5" => Self::Socks,
+            "naive+https" | "naive+quic" => Self::Naive,
+            _ => return Err(ParseProtocolKindError(s.to_owned())),
+        };
+        Ok(kind)
+    }
+}
+
+/// Transport kinds. Mirrors the `type_str()` outputs of [`TransportConfig`]
+/// for every transport that exists today (Quic has no typed variant yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportType {
+    Tcp,
+    Ws,
+    Grpc,
+    Http,
+    HttpUpgrade,
+    XHttp,
+    Kcp,
+}
+
+impl TransportType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Ws => "ws",
+            Self::Grpc => "grpc",
+            Self::Http => "http",
+            Self::HttpUpgrade => "httpupgrade",
+            Self::XHttp => "xhttp",
+            Self::Kcp => "kcp",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TransportType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "tcp" => Ok(Self::Tcp),
+            "ws" => Ok(Self::Ws),
+            "grpc" => Ok(Self::Grpc),
+            "http" => Ok(Self::Http),
+            "httpupgrade" => Ok(Self::HttpUpgrade),
+            "xhttp" => Ok(Self::XHttp),
+            "kcp" => Ok(Self::Kcp),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Security kinds. Mirrors the `type_str()` outputs of [`SecurityConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityType {
+    None,
+    Tls,
+    Reality,
+}
+
+impl SecurityType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Tls => "tls",
+            Self::Reality => "reality",
+        }
+    }
+}
+
+impl std::fmt::Display for SecurityType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SecurityType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "tls" => Ok(Self::Tls),
+            "reality" => Ok(Self::Reality),
+            _ => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_KINDS: [ProtocolKind; 27] = [
+        ProtocolKind::Vmess,
+        ProtocolKind::Vless,
+        ProtocolKind::Shadowsocks,
+        ProtocolKind::Shadowsocks2022,
+        ProtocolKind::Socks,
+        ProtocolKind::Http,
+        ProtocolKind::Trojan,
+        ProtocolKind::WireGuard,
+        ProtocolKind::Hysteria2,
+        ProtocolKind::DokodemoDoor,
+        ProtocolKind::Freedom,
+        ProtocolKind::Blackhole,
+        ProtocolKind::Dns,
+        ProtocolKind::Loopback,
+        ProtocolKind::Custom,
+        ProtocolKind::Tuic,
+        ProtocolKind::Hysteria,
+        ProtocolKind::Naive,
+        ProtocolKind::AnyTls,
+        ProtocolKind::ShadowTls,
+        ProtocolKind::Tor,
+        ProtocolKind::Ssh,
+        ProtocolKind::Tailscale,
+        ProtocolKind::ShadowsocksR,
+        ProtocolKind::Redirect,
+        ProtocolKind::TProxy,
+        ProtocolKind::Mixed,
+    ];
+
+    const ALL_TRANSPORTS: [TransportType; 7] = [
+        TransportType::Tcp,
+        TransportType::Ws,
+        TransportType::Grpc,
+        TransportType::Http,
+        TransportType::HttpUpgrade,
+        TransportType::XHttp,
+        TransportType::Kcp,
+    ];
+
+    const ALL_SECURITIES: [SecurityType; 3] =
+        [SecurityType::None, SecurityType::Tls, SecurityType::Reality];
+
+    #[test]
+    fn display_from_str_round_trip_all_variants() {
+        for kind in ALL_KINDS {
+            assert_eq!(kind.as_str(), kind.to_string(), "mismatch for {kind:?}");
+            let parsed: ProtocolKind = kind.to_string().parse().expect("parse as_str output");
+            assert_eq!(parsed, kind, "round-trip failed for {kind:?}");
+        }
+        for transport in ALL_TRANSPORTS {
+            assert_eq!(transport.as_str(), transport.to_string());
+            let parsed: TransportType = transport.to_string().parse().expect("parse as_str output");
+            assert_eq!(parsed, transport, "round-trip failed for {transport:?}");
+        }
+        for security in ALL_SECURITIES {
+            assert_eq!(security.as_str(), security.to_string());
+            let parsed: SecurityType = security.to_string().parse().expect("parse as_str output");
+            assert_eq!(parsed, security, "round-trip failed for {security:?}");
+        }
+    }
+
+    /// `ProtocolKind::as_str()` must equal the `Display` output of the
+    /// (being-replaced) `Protocol` enum in `xray-tui-core`. Core is not a
+    /// dependency of this crate, so the expected strings are hard-coded from
+    /// the current `Protocol::Display` impl (verified 2026-08-05 — no deltas;
+    /// see task report).
+    #[test]
+    fn as_str_equals_protocol_display_strings() {
+        let cases = [
+            (ProtocolKind::Vmess, "vmess"),
+            (ProtocolKind::Vless, "vless"),
+            (ProtocolKind::Shadowsocks, "ss"),
+            (ProtocolKind::Shadowsocks2022, "ss-2022"),
+            (ProtocolKind::Socks, "socks"),
+            (ProtocolKind::Http, "http"),
+            (ProtocolKind::Trojan, "trojan"),
+            (ProtocolKind::WireGuard, "wireguard"),
+            (ProtocolKind::Hysteria2, "hy2"),
+            (ProtocolKind::DokodemoDoor, "dokodemo"),
+            (ProtocolKind::Freedom, "freedom"),
+            (ProtocolKind::Blackhole, "blackhole"),
+            (ProtocolKind::Dns, "dns"),
+            (ProtocolKind::Loopback, "loopback"),
+            (ProtocolKind::Custom, "custom"),
+            (ProtocolKind::Tuic, "tuic"),
+            (ProtocolKind::Hysteria, "hy"),
+            (ProtocolKind::Naive, "naive"),
+            (ProtocolKind::AnyTls, "any-tls"),
+            (ProtocolKind::ShadowTls, "shadow-tls"),
+            (ProtocolKind::Tor, "tor"),
+            (ProtocolKind::Ssh, "ssh"),
+            (ProtocolKind::Tailscale, "tailscale"),
+            (ProtocolKind::ShadowsocksR, "ssr"),
+            (ProtocolKind::Redirect, "redirect"),
+            (ProtocolKind::TProxy, "t-proxy"),
+            (ProtocolKind::Mixed, "mixed"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected, "as_str mismatch for {kind:?}");
+            assert_eq!(kind.to_string(), expected, "Display mismatch for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_aliases_parse() {
+        let cases = [
+            ("hysteria", ProtocolKind::Hysteria),
+            ("hysteria1", ProtocolKind::Hysteria),
+            ("hysteria2", ProtocolKind::Hysteria2),
+            ("anytls", ProtocolKind::AnyTls),
+            ("shadowtls", ProtocolKind::ShadowTls),
+            ("tproxy", ProtocolKind::TProxy),
+            ("shadowsocks", ProtocolKind::Shadowsocks),
+            ("ss", ProtocolKind::Shadowsocks),
+            ("ss-2022", ProtocolKind::Shadowsocks2022),
+            ("shadowsocks-r", ProtocolKind::ShadowsocksR),
+            ("ssr", ProtocolKind::ShadowsocksR),
+            ("dokodemo-door", ProtocolKind::DokodemoDoor),
+            ("dokodemo", ProtocolKind::DokodemoDoor),
+            ("wire-guard", ProtocolKind::WireGuard),
+            ("socks5", ProtocolKind::Socks),
+            ("naive+https", ProtocolKind::Naive),
+            ("naive+quic", ProtocolKind::Naive),
+            // Case-insensitive.
+            ("VMESS", ProtocolKind::Vmess),
+            ("AnyTLS", ProtocolKind::AnyTls),
+            ("Shadowsocks-2022", ProtocolKind::Shadowsocks2022),
+            ("Naive+HTTPS", ProtocolKind::Naive),
+            ("T-PROXY", ProtocolKind::TProxy),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                input.parse::<ProtocolKind>().expect("parse alias"),
+                expected,
+                "failed for {input:?}"
+            );
+        }
+        // Unknown strings must error.
+        assert!("bogus".parse::<ProtocolKind>().is_err());
+        assert!("".parse::<ProtocolKind>().is_err());
+        assert!("vmess-extra".parse::<ProtocolKind>().is_err());
+    }
+
+    #[test]
+    fn serde_json_round_trip() {
+        for kind in ALL_KINDS {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            let back: ProtocolKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, kind, "serde round-trip failed for {kind:?}");
+        }
+        for transport in ALL_TRANSPORTS {
+            let json = serde_json::to_string(&transport).expect("serialize");
+            let back: TransportType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, transport, "serde round-trip failed for {transport:?}");
+        }
+        for security in ALL_SECURITIES {
+            let json = serde_json::to_string(&security).expect("serialize");
+            let back: SecurityType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, security, "serde round-trip failed for {security:?}");
+        }
+    }
+
+    /// Pin the serde representation so later tasks (DB embeds, JSON columns)
+    /// know exactly what these enums serialize to.
+    #[test]
+    fn serde_representation_is_stable() {
+        // ProtocolKind uses default unit-variant naming (no rename attribute).
+        assert_eq!(
+            serde_json::to_string(&ProtocolKind::Shadowsocks2022).expect("serialize"),
+            "\"Shadowsocks2022\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProtocolKind::Hysteria2).expect("serialize"),
+            "\"Hysteria2\""
+        );
+        // TransportType/SecurityType use snake_case.
+        assert_eq!(
+            serde_json::to_string(&TransportType::HttpUpgrade).expect("serialize"),
+            "\"http_upgrade\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SecurityType::None).expect("serialize"),
+            "\"none\""
+        );
+    }
+
+    #[test]
+    fn transport_as_str_matches_type_str() {
+        use super::super::common::{
+            GrpcConfig, HttpConfig, HttpUpgradeConfig, KcpConfig, TransportConfig, WebSocketConfig,
+            XHttpConfig,
+        };
+        let cases = [
+            (TransportType::Tcp, TransportConfig::Tcp),
+            (
+                TransportType::Ws,
+                TransportConfig::Ws(WebSocketConfig::default()),
+            ),
+            (
+                TransportType::Grpc,
+                TransportConfig::Grpc(GrpcConfig::default()),
+            ),
+            (
+                TransportType::Http,
+                TransportConfig::Http(HttpConfig::default()),
+            ),
+            (
+                TransportType::HttpUpgrade,
+                TransportConfig::HttpUpgrade(HttpUpgradeConfig::default()),
+            ),
+            (
+                TransportType::XHttp,
+                TransportConfig::XHttp(XHttpConfig::default()),
+            ),
+            (
+                TransportType::Kcp,
+                TransportConfig::Kcp(KcpConfig::default()),
+            ),
+        ];
+        for (transport, config) in cases {
+            assert_eq!(
+                transport.as_str(),
+                config.type_str(),
+                "mismatch for {transport:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_as_str_matches_type_str() {
+        use super::super::common::{RealityOpts, SecurityConfig, TlsConfig, TlsOpts};
+        let cases = [
+            // `SecurityConfig::default()` has no TLS; `type_str()` is `None`
+            // while `SecurityType::None::as_str()` is "none".
+            (SecurityType::None, SecurityConfig::default()),
+            (
+                SecurityType::Tls,
+                SecurityConfig {
+                    tls: Some(TlsConfig::Tls(TlsOpts::default())),
+                    ..SecurityConfig::default()
+                },
+            ),
+            (
+                SecurityType::Reality,
+                SecurityConfig {
+                    tls: Some(TlsConfig::Reality(RealityOpts::default())),
+                    ..SecurityConfig::default()
+                },
+            ),
+        ];
+        for (security, config) in cases {
+            match config.type_str() {
+                Some(s) => assert_eq!(security.as_str(), s, "mismatch for {security:?}"),
+                None => assert_eq!(security.as_str(), "none", "mismatch for {security:?}"),
+            }
+        }
+    }
+}

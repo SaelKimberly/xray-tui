@@ -39,6 +39,9 @@ rustls-pki-types = { version = "1.15.1" }
 # ============ Parsing ============
 nom = { version = "^8.0.0", default-features = false, features = ["std"] }
 
+# ============ ORM (Embed derives only) ============
+toasty = { version = "0.9", default-features = false }
+
 # ============ Performance & Memory ============
 smallvec.workspace = true
 bstr = { version = "^1.12.1", default-features = false, features = ["std"] }

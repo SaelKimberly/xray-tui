@@ -2,6 +2,7 @@ pub mod clash;
 pub mod proto_spec;
 pub mod urlx;
 pub mod utils;
+pub use proto_spec::{ProtocolKind, SecurityType, TransportType};
 pub(crate) use urlx::PortSpec;
 pub use urlx::SchemeX;
 

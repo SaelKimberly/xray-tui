@@ -6681,6 +6681,7 @@ dependencies = [
  "smallvec",
  "smartstring",
  "thiserror 2.0.19",
+ "toasty",
  "tracing",
  "url",
  "urlencoding",
