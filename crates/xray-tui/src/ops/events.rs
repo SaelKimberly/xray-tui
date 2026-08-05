@@ -907,6 +907,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_result_does_not_resort_and_records_udp_provenance() {
+        let (mut state, tx) = event_state().await;
+        let mut row = row_with_protocols(100, 2, 7); // p7, p8
+        set_delay(&mut row, 7, 200, Some(DELAY_SOURCE_FAST)); // fast-ok
+        state.endpoints = vec![row];
+        state.selected_index = 0;
+        state.selected_sub = None;
+        state.filter_cache_valid.set(false);
+        state.testing_profiles.insert(8);
+
+        tx.send(CoreEvent::SpeedTestResult {
+            protocol_id: 8,
+            test_type: TestType::UdpTest,
+            latency_ms: Some(50),
+            speed_bps: None,
+            ip_info: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        // UDP must not trigger a re-sort: p8 (udp-ok 50ms) stays below p7
+        // (fast-ok 200ms). Without the `TcpPing | RealPing` gate, the sort
+        // would put p8 in the same tier 1 and rank it above p7 by latency ->
+        // [8, 7].
+        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![7, 8]);
+        // Provenance recorded: udp delay_source + latency persisted (tier 1
+        // fast-ok semantics).
+        assert_eq!(
+            state.endpoints[0].extensions[&8].delay_source,
+            Some(DELAY_SOURCE_UDP)
+        );
+        assert_eq!(state.endpoints[0].extensions[&8].delay, Some(50));
+    }
+
+    #[tokio::test]
     async fn dns_unresolved_endpoint_sinks_after_result() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
