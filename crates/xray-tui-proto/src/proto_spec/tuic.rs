@@ -35,18 +35,28 @@ use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_param};
+use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::core_mapping;
 use super::utils;
-use super::{ParseError, ProtoSpec};
+use super::{
+    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
+    ProtocolEssentials, ProtocolKind,
+};
 use crate::clash::{ClashProxy, ClashTuic};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{
-    clash_alpn_as_str, clash_server_to_host, clash_tls_to_security, host_spec_to_string,
+    clash_alpn_as_str, clash_tls_to_security, clash_to_endpoint, host_kind_for,
 };
 
+/// TUIC protocol configuration — the identity payload (sans host/port).
+///
+/// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
+/// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
+/// parameters, so the same config pointed at different servers shares one
+/// identity.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -54,10 +64,6 @@ use crate::proto_spec::common::{
 pub struct TuicConfig {
     pub uuid: String,
     pub password: String,
-    #[serde(with = "host_serde")]
-    pub host: HostSpec,
-    #[serde(with = "port_serde")]
-    pub port: u16,
     pub congestion_control: Option<TinyText>,
     pub udp_relay_mode: Option<TinyText>,
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
@@ -65,13 +71,16 @@ pub struct TuicConfig {
     pub remarks: Option<TinyText>,
 }
 
-impl ProtoSpec for TuicConfig {
-    /// Parse a TUIC URL.
+impl TuicConfig {
+    /// Parse a TUIC URL into the parse boundary: [`ParsedProto`] with the
+    /// endpoint essentials (host/port) split out and the identity payload
+    /// ([`ProtocolEssentials::config`]) holding only endpoint-free protocol
+    /// parameters.
     ///
     /// Userinfo is `uuid:password` (colon-separated). UUID validated via
     /// `uuid::Uuid::parse_str`. Server address and port from hostport.
     /// `allow_insecure` accepts 3 alias variants for compatibility.
-    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+    pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         let (userinfo, hostport) = if let Some(hostport) = raw.hostport {
             (raw.userinfo, hostport)
         } else {
@@ -89,10 +98,17 @@ impl ProtoSpec for TuicConfig {
         uuid::Uuid::parse_str(uuid)
             .map_err(|_| ParseError::InvalidUserInfo(format!("invalid UUID: {uuid}").into()))?;
 
-        let (parsed_host, parsed_port) = utils::parse_hostport(hostport)?;
-        let parsed_port = parsed_port
+        let (parsed_host, parsed_port_spec) = utils::parse_hostport(hostport)?;
+        let parsed_port = parsed_port_spec
             .first()
             .ok_or_else(|| ParseError::InvalidPort("empty port spec".into()))?;
+
+        // Endpoint essentials: host/port live here, never in the config payload.
+        let mut endpoint = EndpointEssentials::new(parsed_host.to_str().into_owned(), parsed_port);
+        endpoint.host_type = host_kind_for(&parsed_host);
+        if parsed_port_spec.length() > 1 {
+            endpoint.ports = parsed_port_spec.iter().collect();
+        }
 
         let query = utils::parse_query(raw.query);
 
@@ -121,34 +137,43 @@ impl ProtoSpec for TuicConfig {
         };
         let remarks = utils::decode_fragment(raw)?;
 
-        Ok(Self {
+        let config = Self {
             uuid: uuid.to_string(),
             password: password.to_string(),
-            host: parsed_host,
-            port: parsed_port,
             congestion_control,
             udp_relay_mode,
             security,
             remarks,
+        };
+        Ok(ParsedProto {
+            endpoints: vec![endpoint],
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Tuic,
+                config_type: ConfigKind::ShareUrl,
+                core_type: core_mapping::resolve_core(ProtocolKind::Tuic, None, None),
+                config: ProtocolConfig::Tuic(config),
+            },
         })
     }
 
-    fn reconstruct(&self) -> Result<String, ParseError> {
-        let host = self.host.to_str();
-        let hostport = if host.contains(':') {
-            format!("[{host}]:{}", self.port)
+    /// Rebuild the share URL from this endpoint-free config plus the endpoint
+    /// essentials. Endpoint host/port come from `endpoint`.
+    pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+        let endpoint_host = endpoint.host.as_str();
+        let hostport = if endpoint_host.contains(':') {
+            format!("[{endpoint_host}]:{}", endpoint.port)
         } else {
-            format!("{host}:{}", self.port)
+            format!("{endpoint_host}:{}", endpoint.port)
         };
 
         let mut base = format!("tuic://{}:{}@{}", self.uuid, self.password, hostport);
 
         let query_string = {
             let mut parts: Vec<String> = Vec::new();
-            if let Some(ref v) = self.congestion_control {
+            if let Some(v) = &self.congestion_control {
                 parts.push(format!("congestion_control={}", urlencoding::encode(v)));
             }
-            if let Some(ref v) = self.udp_relay_mode {
+            if let Some(v) = &self.udp_relay_mode {
                 parts.push(format!("udp_relay_mode={}", urlencoding::encode(v)));
             }
             // Security config (TUIC always uses TLS)
@@ -159,7 +184,7 @@ impl ProtoSpec for TuicConfig {
                 parts.push(format!("allow_insecure={}", if v { "1" } else { "0" }));
             }
             if let Some(v) = self.security.sni()
-                && !should_skip_param(&self.host, v)
+                && !should_skip_endpoint_param(endpoint_host, v)
             {
                 parts.push(format!("sni={}", urlencoding::encode(v)));
             }
@@ -171,7 +196,7 @@ impl ProtoSpec for TuicConfig {
         };
         base.push_str(&query_string);
 
-        if let Some(ref remarks) = self.remarks {
+        if let Some(remarks) = &self.remarks {
             let frag = urlencoding::decode(remarks).unwrap_or(std::borrow::Cow::Borrowed(remarks));
             let frag = frag.trim();
             if !frag.is_empty() {
@@ -181,64 +206,15 @@ impl ProtoSpec for TuicConfig {
 
         Ok(base)
     }
+}
 
-    fn schema(&self) -> SchemeX {
-        SchemeX::TUIC
-    }
-
-    fn host(&self) -> Option<&HostSpec> {
-        Some(&self.host)
-    }
-
-    fn port(&self) -> Option<u16> {
-        Some(self.port)
-    }
-
-    fn remarks(&self) -> Option<&str> {
-        self.remarks.as_deref()
-    }
-
-    fn transport_type(&self) -> Option<&str> {
-        Some("quic")
-    }
-
-    fn security(&self) -> Option<&SecurityConfig> {
-        Some(&self.security)
-    }
-
-    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
-        match proxy {
-            ClashProxy::Tuic(c) => {
-                let (uuid, password) = match c.token.split_once(':') {
-                    Some((u, p)) if !u.is_empty() => (u.to_string(), p.to_string()),
-                    _ => (c.token.clone(), String::new()),
-                };
-                Ok(Self {
-                    uuid,
-                    password,
-                    host: clash_server_to_host(&c.server)?,
-                    port: c.port,
-                    congestion_control: c.congestion_controller.clone().map(TinyText::from),
-                    udp_relay_mode: c.udp_relay_mode.clone().map(TinyText::from),
-                    security: clash_tls_to_security(
-                        Some(true),
-                        c.servername.as_deref(),
-                        c.skip_cert_verify,
-                        clash_alpn_as_str(c.alpn.as_ref()),
-                        None,
-                        None,
-                    ),
-                    remarks: match c.name.as_str() {
-                        "" => None,
-                        s => Some(TinyText::from(s)),
-                    },
-                })
-            }
-            _ => Err(ParseError::Unknown("expected tuic clash proxy".into())),
-        }
-    }
-
-    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+impl TuicConfig {
+    /// Serialize this endpoint-free config plus the endpoint to a Clash proxy
+    /// entry. Endpoint host/port are taken from `endpoint`.
+    pub fn to_clash_proto(
+        &self,
+        endpoint: &EndpointEssentials,
+    ) -> Result<ClashProxy, ProtoSpecError> {
         let name = self.remarks.as_deref().unwrap_or("").to_string();
         let alpn_str = self.security.alpn();
         let token = if self.password.is_empty() {
@@ -248,8 +224,8 @@ impl ProtoSpec for TuicConfig {
         };
         Ok(ClashProxy::Tuic(ClashTuic {
             name,
-            server: host_spec_to_string(&self.host),
-            port: self.port,
+            server: endpoint.host.clone(),
+            port: endpoint.port,
             token,
             ip: None,
             heartbeat_interval: None,
@@ -268,6 +244,133 @@ impl ProtoSpec for TuicConfig {
             alpn: alpn_str.map(|s| vec![s.to_string()]),
         }))
     }
+
+    /// Parse a Clash proxy entry into the parse boundary: `server`/`port`
+    /// become the endpoint essentials; the config payload is endpoint-free.
+    /// Explicit Clash `servername` stays in the config (protocol parameter).
+    pub fn try_from_clash_proto(proxy: &ClashProxy) -> Result<ParsedProto, ParseError> {
+        match proxy {
+            ClashProxy::Tuic(c) => {
+                let (uuid, password) = match c.token.split_once(':') {
+                    Some((u, p)) if !u.is_empty() => (u.to_string(), p.to_string()),
+                    _ => (c.token.clone(), String::new()),
+                };
+                let config = Self {
+                    uuid,
+                    password,
+                    congestion_control: c.congestion_controller.clone().map(TinyText::from),
+                    udp_relay_mode: c.udp_relay_mode.clone().map(TinyText::from),
+                    security: clash_tls_to_security(
+                        Some(true),
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        clash_alpn_as_str(c.alpn.as_ref()),
+                        None,
+                        None,
+                    ),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                };
+                Ok(ParsedProto {
+                    endpoints: vec![clash_to_endpoint(&c.server, c.port)],
+                    protocol: ProtocolEssentials {
+                        proto_kind: ProtocolKind::Tuic,
+                        config_type: ConfigKind::ShareUrl,
+                        core_type: core_mapping::resolve_core(ProtocolKind::Tuic, None, None),
+                        config: ProtocolConfig::Tuic(config),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected tuic clash proxy".into())),
+        }
+    }
+}
+
+/// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
+/// `Proto`/`ParseResult` consumers in xray-tui-config) compile unchanged.
+///
+/// DEGRADED PATH (documented): `try_parse`/`try_from_clash` still work by
+/// delegating to the `*_proto` variants and discarding the parsed endpoints;
+/// `to_clash`/`reconstruct` return errors because the config no longer stores
+/// host/port. Import/export rewires to the `*_proto` variants in T11 (phase D
+/// builders take the endpoint separately).
+impl ProtoSpec for TuicConfig {
+    /// # Errors
+    ///
+    /// If either the URL is invalid or the external configuration is invalid.
+    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+        let parsed = Self::try_parse_proto(raw)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Tuic(config) => Ok(config),
+            // Parser invariant: a tuic URL always yields a TuicConfig.
+            _ => Err(ParseError::Unknown(
+                "tuic URL parsed to a non-tuic config".into(),
+            )),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::reconstruct_proto`] with the endpoint.
+    fn reconstruct(&self) -> Result<String, ParseError> {
+        Err(ParseError::InvalidHost(
+            "tuic config no longer stores host/port; use TuicConfig::reconstruct_proto(endpoint)"
+                .into(),
+        ))
+    }
+
+    fn schema(&self) -> SchemeX {
+        SchemeX::TUIC
+    }
+
+    /// `None` — the endpoint host moved to [`EndpointEssentials`] (T5).
+    fn host(&self) -> Option<&HostSpec> {
+        None
+    }
+
+    /// `None` — the endpoint port moved to [`EndpointEssentials`] (T5).
+    fn port(&self) -> Option<u16> {
+        None
+    }
+
+    fn remarks(&self) -> Option<&str> {
+        self.remarks.as_deref()
+    }
+
+    fn transport_type(&self) -> Option<&str> {
+        Some("quic")
+    }
+
+    fn security(&self) -> Option<&SecurityConfig> {
+        Some(&self.security)
+    }
+
+    /// # Errors
+    ///
+    /// If the Clash proxy doesn't match this protocol type.
+    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
+        let parsed = Self::try_from_clash_proto(proxy)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Tuic(config) => Ok(config),
+            _ => Err(ParseError::Unknown(
+                "tuic clash proxy parsed to a non-tuic config".into(),
+            )),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::to_clash_proto`] with the endpoint.
+    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
+        Err(ProtoSpecError::Unsupported(
+            "tuic config no longer stores host/port; use TuicConfig::to_clash_proto(endpoint)"
+                .into(),
+        ))
+    }
 }
 
 impl ProtoIdentity for TuicConfig {
@@ -275,8 +378,8 @@ impl ProtoIdentity for TuicConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"tuic");
-        hasher.write(self.host.to_str().as_bytes());
-        hasher.write(&self.port.to_le_bytes());
+        // Endpoint (host/port) intentionally absent from the identity — it
+        // lives on the ParsedProto boundary, never in the config payload (T5).
         if let Some(v) = &self.congestion_control {
             hasher.write(v.as_bytes());
         }
@@ -304,113 +407,209 @@ impl ProtoIdentity for TuicConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ProtoSpec, ProtocolConfig};
+    use super::super::{
+        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
+    use super::TuicConfig;
+    use crate::urlx::{RawUrlX, SchemeX};
 
-    use crate::urlx::SchemeX;
+    const TUIC_URL: &str = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3";
+
+    fn parse(url: &str) -> ParsedProto {
+        TuicConfig::try_parse_proto(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"))
+    }
+
+    fn config(parsed: ParsedProto) -> TuicConfig {
+        match parsed.protocol.config {
+            ProtocolConfig::Tuic(c) => c,
+            other => panic!("expected TuicConfig, got {other:?}"),
+        }
+    }
+
+    /// The identity payload must be endpoint-free: no top-level `host`/`port`
+    /// keys in the serialized config.
+    fn assert_no_top_level_host_port(cfg: &TuicConfig) {
+        let json = serde_json::to_value(cfg).expect("serialize");
+        let obj = json.as_object().expect("config is an object");
+        assert!(
+            !obj.contains_key("host"),
+            "config payload must not carry a top-level host key: {json}"
+        );
+        assert!(
+            !obj.contains_key("port"),
+            "config payload must not carry a top-level port key: {json}"
+        );
+    }
+
+    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
+    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    fn assert_reconstruct_roundtrip(url: &str) {
+        let parsed = parse(url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed.clone());
+        let out = cfg
+            .reconstruct_proto(&endpoint)
+            .unwrap_or_else(|e| panic!("reconstruct failed for {url}: {e}"));
+        let reparsed = parse(&out);
+        assert_eq!(parsed, reparsed, "reconstruct round-trip failed for: {url}");
+    }
+
+    // ── URL parse: endpoints + config ─────────────────────────────────────
 
     #[test]
     fn test_tuic_basic() {
-        let url = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = TuicConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.schema(), SchemeX::TUIC);
-        assert_eq!(
-            config.host().map(|h| h.to_str()),
-            Some("5.178.101.117".into())
-        );
-        assert_eq!(config.port(), Some(30006_u16));
-        assert_eq!(config.uuid, "36106e0f-4d9a-470b-a3fd-535f3b7a1e92");
-        assert_eq!(config.password, "dongtaiwang.com");
-        assert_eq!(config.congestion_control.as_deref(), Some("cubic"));
-        assert_eq!(config.udp_relay_mode.as_deref(), Some("native"));
-        assert_eq!(config.security.alpn(), Some("h3"));
+        let parsed = parse(TUIC_URL);
+        assert_eq!(parsed.endpoints.len(), 1);
+        let ep = &parsed.endpoints[0];
+        assert_eq!(ep.host, "5.178.101.117");
+        assert_eq!(ep.host_type, HostKind::Ipv4);
+        assert_eq!(ep.port, 30006);
+        assert_eq!(ep.ports, vec![30006]);
+
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Tuic);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
+        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
+        let cfg = config(parsed);
+        assert_eq!(cfg.uuid, "36106e0f-4d9a-470b-a3fd-535f3b7a1e92");
+        assert_eq!(cfg.password, "dongtaiwang.com");
+        assert_eq!(cfg.congestion_control.as_deref(), Some("cubic"));
+        assert_eq!(cfg.udp_relay_mode.as_deref(), Some("native"));
+        assert_eq!(cfg.security.alpn(), Some("h3"));
+        assert_no_top_level_host_port(&cfg);
     }
 
     #[test]
-    fn test_tuic_allow_insecure() {
+    fn test_tuic_allow_insecure_and_sni() {
         let url = "tuic://9bbd1f42-7ae7-4239-bd10-a68de95e3295:dongtaiwang.com@ip1.758733.xyz:10088?allow_insecure=0&alpn=h3&congestion_control=bbr&sni=apple.com";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = TuicConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.schema(), SchemeX::TUIC);
-        assert_eq!(
-            config.host().map(|h| h.to_str()),
-            Some("ip1.758733.xyz".into())
-        );
-        assert_eq!(config.security.insecure(), Some(false));
-        assert_eq!(config.security.sni(), Some("apple.com"));
-        assert_eq!(config.congestion_control.as_deref(), Some("bbr"));
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints[0].host, "ip1.758733.xyz");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Dns);
+        let cfg = config(parsed);
+        assert_eq!(cfg.security.insecure(), Some(false));
+        assert_eq!(cfg.security.sni(), Some("apple.com"));
+        assert_eq!(cfg.congestion_control.as_deref(), Some("bbr"));
     }
 
     #[test]
-    fn test_tuic_with_remark() {
-        let url = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3#DE";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = TuicConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.remarks(), Some("DE"));
+    fn test_tuic_endpoint_host_kinds() {
+        let v6 = parse("tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:pw@[2001:db8::1]:443");
+        assert_eq!(v6.endpoints[0].host, "2001:db8::1");
+        assert_eq!(v6.endpoints[0].host_type, HostKind::Ipv6);
+        assert_eq!(v6.endpoints[0].port, 443);
     }
 
+    // ── Identity: endpoint-free uid ───────────────────────────────────────
+
     #[test]
-    fn test_tuic_via_protocol_config() {
-        let url = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3#DE";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = ProtocolConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.schema(), SchemeX::TUIC);
+    fn uid_identical_across_servers_different_across_uuids() {
+        let url_a = TUIC_URL;
+        let url_b = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@other.example.com:443?congestion_control=cubic&udp_relay_mode=native&alpn=h3";
+        let url_c = "tuic://22222222-3333-4444-5555-666666666666:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3";
+        let a = parse(url_a);
+        let b = parse(url_b);
+        let c = parse(url_c);
         assert_eq!(
-            config.host().map(|h| h.to_str()),
-            Some("5.178.101.117".into())
+            a.uid(),
+            b.uid(),
+            "same protocol on different servers must dedup to one uid"
+        );
+        assert_ne!(a.uid(), c.uid(), "different uuid -> different uid");
+        assert_ne!(a.sig(), 0);
+    }
+
+    // ── Reconstruct round-trip via endpoint ───────────────────────────────
+
+    #[test]
+    fn reconstruct_roundtrip_via_endpoint() {
+        assert_reconstruct_roundtrip(TUIC_URL);
+        assert_reconstruct_roundtrip(
+            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3#DE",
+        );
+    }
+
+    // ── Clash round-trip via *_proto ──────────────────────────────────────
+
+    #[test]
+    fn clash_roundtrip_from_url_via_proto() {
+        let parsed = parse(TUIC_URL);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
+        let reparsed = TuicConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(
+            reparsed.endpoints[0], endpoint,
+            "endpoint round-trips through clash"
+        );
+        assert_eq!(
+            reparsed.protocol.config,
+            ProtocolConfig::Tuic(cfg),
+            "config round-trips through clash"
         );
     }
 
     #[test]
-    fn test_reconstruct_tuic_roundtrip() {
-        let input = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3";
-        let raw = crate::urlx::RawUrlX::from(input);
-        let parsed = TuicConfig::try_parse(&raw).expect("failed to parse");
-        let reconstructed = parsed.reconstruct().expect("failed to reconstruct");
+    fn clash_proxy_roundtrip_via_proto() {
+        use crate::clash::{ClashProxy, ClashTuic};
 
-        let raw2 = crate::urlx::RawUrlX::from(reconstructed.as_str());
-        let reparsed = TuicConfig::try_parse(&raw2).expect("failed to re-parse");
-
-        assert_eq!(parsed.host, reparsed.host, "host mismatch");
-        assert_eq!(parsed.port, reparsed.port, "port mismatch");
-        assert_eq!(parsed.uuid, reparsed.uuid, "uuid mismatch");
-        assert_eq!(parsed.password, reparsed.password, "password mismatch");
-        assert_eq!(
-            parsed.congestion_control, reparsed.congestion_control,
-            "congestion_control mismatch"
-        );
+        let proxy = ClashProxy::Tuic(ClashTuic {
+            name: "test".into(),
+            server: "example.com".into(),
+            port: 30006,
+            token: "36106e0f-4d9a-470b-a3fd-535f3b7a1e92:pw".into(),
+            ip: None,
+            heartbeat_interval: None,
+            reduce_rtt: None,
+            request_timeout: None,
+            udp_relay_mode: Some("native".into()),
+            congestion_controller: Some("bbr".into()),
+            skip_cert_verify: None,
+            servername: Some("cdn.example.com".into()),
+            alpn: Some(vec!["h3".into()]),
+        });
+        let parsed = TuicConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(parsed.endpoints[0].host, "example.com");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Dns);
+        assert_eq!(parsed.endpoints[0].port, 30006);
+        let cfg = match &parsed.protocol.config {
+            ProtocolConfig::Tuic(c) => c,
+            other => panic!("expected TuicConfig, got {other:?}"),
+        };
+        assert_eq!(cfg.uuid, "36106e0f-4d9a-470b-a3fd-535f3b7a1e92");
+        assert_eq!(cfg.password, "pw");
+        // Explicit Clash servername stays in the config (host-free mandate).
+        assert_eq!(cfg.security.sni(), Some("cdn.example.com"));
+        assert_no_top_level_host_port(cfg);
+        let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
+        match (out, proxy) {
+            (ClashProxy::Tuic(out), ClashProxy::Tuic(orig)) => assert_eq!(out, orig),
+            _ => panic!("expected tuic clash proxy"),
+        }
     }
+
+    // ── Serde ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_tuic_serde_roundtrip() {
-        let input = "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3";
-        let raw = crate::urlx::RawUrlX::from(input);
-        let parsed = TuicConfig::try_parse(&raw).expect("failed to parse");
-
-        let json = serde_json::to_string(&parsed).expect("serialize");
+        let cfg = config(parse(TUIC_URL));
+        let json = serde_json::to_string(&cfg).expect("serialize");
         let deserialized: TuicConfig = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(parsed.host, deserialized.host, "host mismatch");
-        assert_eq!(parsed.port, deserialized.port, "port mismatch");
-        assert_eq!(parsed.uuid, deserialized.uuid, "uuid mismatch");
-        assert_eq!(parsed.password, deserialized.password, "password mismatch");
+        assert_eq!(cfg, deserialized);
+        assert_no_top_level_host_port(&deserialized);
     }
 
-    use super::super::test_helpers::check_roundtrip;
-    use super::TuicConfig;
+    // ── Legacy trait bridge ───────────────────────────────────────────────
 
     #[test]
-    fn test_roundtrip() {
-        check_roundtrip::<TuicConfig>(
-            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
-        );
-    }
-
-    #[test]
-    fn test_clash_roundtrip() {
-        use super::super::test_helpers::check_clash_roundtrip;
-        check_clash_roundtrip::<TuicConfig>(
-            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
-        );
+    fn legacy_bridge_parse_works_but_reconstruct_to_clash_error() {
+        let bridged = TuicConfig::try_parse(&RawUrlX::from(TUIC_URL)).expect("bridged parse");
+        assert_eq!(bridged.schema(), SchemeX::TUIC);
+        assert_eq!(bridged.uuid, "36106e0f-4d9a-470b-a3fd-535f3b7a1e92");
+        // host/port accessors are gone — the endpoint lives on ParsedProto.
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
+        // Degraded legacy paths error instead of fabricating a host.
+        assert!(bridged.reconstruct().is_err());
+        assert!(bridged.to_clash().is_err());
     }
 }
