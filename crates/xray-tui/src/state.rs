@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 
@@ -13,7 +12,7 @@ use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{CorePool, CoreType, resolve_core};
+use xray_tui_core::{CorePool, CoreType};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
     Endpoint, Group, ProtocolRow, PurgatoryView, RoutingRule,
@@ -398,98 +397,6 @@ impl AppState {
 
     pub fn filtered_profiles(&self) -> impl Iterator<Item = &EndpointRow> {
         profiles::filtered_profiles(self)
-    }
-
-    fn compute_filtered_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = self
-            .endpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                if !self.search_query.is_empty() {
-                    let q = self.search_query.to_lowercase();
-                    let address = row.endpoint.host.clone();
-                    let port = row.endpoint.port.to_string();
-                    if !address.to_lowercase().contains(&q) && !port.contains(&q) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        let asc = self.sort_ascending;
-        indices.sort_by(|&a, &b| {
-            let a_row = &self.endpoints[a];
-            let b_row = &self.endpoints[b];
-            let cmp = match self.sort_column {
-                SortColumn::ConfigType => a_row
-                    .active_protocol()
-                    .config_type
-                    .cmp(&b_row.active_protocol().config_type),
-                SortColumn::LastSeen => a_row
-                    .active_protocol()
-                    .last_seen_at
-                    .cmp(&b_row.active_protocol().last_seen_at),
-                SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
-                SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
-                SortColumn::Delay => {
-                    let da = a_row
-                        .extensions
-                        .get(&a_row.active_protocol().id)
-                        .and_then(|e| e.delay)
-                        .unwrap_or(-1);
-                    let db = b_row
-                        .extensions
-                        .get(&b_row.active_protocol().id)
-                        .and_then(|e| e.delay)
-                        .unwrap_or(-1);
-                    da.cmp(&db)
-                }
-                SortColumn::Speed => {
-                    let sa = a_row
-                        .extensions
-                        .get(&a_row.active_protocol().id)
-                        .and_then(|e| e.speed)
-                        .unwrap_or(-1);
-                    let sb = b_row
-                        .extensions
-                        .get(&b_row.active_protocol().id)
-                        .and_then(|e| e.speed)
-                        .unwrap_or(-1);
-                    sa.cmp(&sb)
-                }
-                SortColumn::Traffic => {
-                    let ta = a_row
-                        .stats
-                        .get(&a_row.active_protocol().id)
-                        .map_or(0, |s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0));
-                    let tb = b_row
-                        .stats
-                        .get(&b_row.active_protocol().id)
-                        .map_or(0, |s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0));
-                    ta.cmp(&tb)
-                }
-                SortColumn::Core => {
-                    let resolve = |row: &EndpointRow| -> String {
-                        let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
-                            .unwrap_or(Protocol::Custom);
-                        let core = resolve_core(
-                            protocol,
-                            Some(
-                                CoreType::from_str(&row.active_protocol().core_type)
-                                    .unwrap_or(CoreType::Auto),
-                            ),
-                        );
-                        core.to_string()
-                    };
-                    resolve(a_row).cmp(&resolve(b_row))
-                }
-            };
-            if asc { cmp } else { cmp.reverse() }
-        });
-        indices
     }
 
     pub fn filtered_len(&self) -> usize {

@@ -586,7 +586,7 @@ fn render_data_grid(
         SortColumn::ConfigType => Some(3),
         SortColumn::Address => Some(6),
         SortColumn::Port => Some(6),
-        SortColumn::Delay => Some(12),
+        SortColumn::Test => Some(12),
         SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
     };
     let sort_direction = if state.sort_ascending {

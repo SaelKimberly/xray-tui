@@ -148,18 +148,16 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
                 .cmp(&b_row.active_protocol().last_seen_at),
             SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
             SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
-            SortColumn::Delay => {
-                let da = a_row
-                    .extensions
-                    .get(&a_row.active_protocol().id)
-                    .and_then(|e| e.delay)
-                    .unwrap_or(-1);
-                let db = b_row
-                    .extensions
-                    .get(&b_row.active_protocol().id)
-                    .and_then(|e| e.delay)
-                    .unwrap_or(-1);
-                da.cmp(&db)
+            SortColumn::Test => {
+                let ka = a_row.best_test_priority_key(
+                    endpoint_dns_unresolved(state, a_row),
+                    session_rounds(&state.ping_status, a_row),
+                );
+                let kb = b_row.best_test_priority_key(
+                    endpoint_dns_unresolved(state, b_row),
+                    session_rounds(&state.ping_status, b_row),
+                );
+                ka.cmp(&kb)
             }
             SortColumn::Speed => {
                 let sa = a_row
@@ -1342,5 +1340,91 @@ mod clamp_tests {
         reload_profiles(&mut state).await;
         assert_eq!(state.selected_index, 0);
         assert_eq!(state.selected_profile_id(), Some(9));
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::test_support::fake_row;
+    use super::*;
+    use crate::AppState;
+    use std::sync::Arc;
+    use xray_tui_config::AppConfig;
+    use xray_tui_db::models::{DELAY_SOURCE_FAST, DELAY_SOURCE_REAL};
+
+    fn set_delay(row: &mut EndpointRow, proto_id: i64, delay: i32, source: Option<i32>) {
+        row.extensions.insert(
+            proto_id,
+            ProfileExtension {
+                protocol_id: proto_id,
+                delay: Some(delay),
+                speed: None,
+                sort_order: None,
+                ip_info: None,
+                delay_source: source,
+                protocol_row: toasty::Deferred::from(None::<xray_tui_db::models::ProtocolRow>),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_ranks_by_best_protocol_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        // E1: real-ok 300ms; E2: fast-ok 100ms; E3: untested.
+        let mut e1 = fake_row(1, "e1.example", 1);
+        set_delay(&mut e1, 100, 300, Some(DELAY_SOURCE_REAL));
+        let mut e2 = fake_row(2, "e2.example", 1);
+        set_delay(&mut e2, 200, 100, Some(DELAY_SOURCE_FAST));
+        let e3 = fake_row(3, "e3.example", 1);
+        state.endpoints = vec![e1, e2, e3];
+        state.sort_column = SortColumn::Test;
+        state.sort_ascending = true;
+        state.filter_cache_valid.set(false);
+
+        let order: Vec<i64> = state.filtered_profiles().map(|r| r.endpoint.id).collect();
+        assert_eq!(order, vec![1, 2, 3]); // real beats fast beats untested
+    }
+
+    #[tokio::test]
+    async fn test_sort_sinks_failures_and_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        // E1 untested; E2 fast-ok but real-failed this round; E3 dns-unresolved.
+        let e1 = fake_row(1, "e1.example", 1);
+        let mut e2 = fake_row(2, "e2.example", 1);
+        set_delay(&mut e2, 200, 100, Some(DELAY_SOURCE_FAST));
+        let mut e3 = fake_row(3, "dns.example", 1);
+        e3.endpoint.host_type = "dns".to_string();
+        state.endpoints = vec![e1, e2, e3];
+        state.ping_status.insert(
+            2,
+            crate::types::EndpointPingStatus {
+                fast: crate::types::PingRound {
+                    seen: std::collections::HashSet::new(),
+                    failed: std::collections::HashSet::new(),
+                },
+                real: crate::types::PingRound {
+                    seen: std::collections::HashSet::new(),
+                    failed: std::collections::HashSet::from([200]),
+                },
+            },
+        );
+        state.sort_column = SortColumn::Test;
+        state.sort_ascending = true;
+        state.filter_cache_valid.set(false);
+
+        let order: Vec<i64> = state.filtered_profiles().map(|r| r.endpoint.id).collect();
+        assert_eq!(order, vec![1, 2, 3]); // untested above real-failure above dns
     }
 }

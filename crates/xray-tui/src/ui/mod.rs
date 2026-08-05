@@ -405,7 +405,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.start_batch_then_real_ping();
                     }
                     7 => {
-                        state.sort_column = SortColumn::Delay;
+                        state.sort_column = SortColumn::Test;
                         state.sort_ascending = true;
                         state.filter_cache_valid.set(false);
                     }
@@ -635,7 +635,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             let all = &[
                 SortColumn::Address,
                 SortColumn::Port,
-                SortColumn::Delay,
+                SortColumn::Test,
                 SortColumn::Speed,
                 SortColumn::Traffic,
                 SortColumn::ConfigType,
@@ -1026,7 +1026,7 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Fast Ping (All Visible)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (All Visible)"),
-    SpeedTestMenuItem::Item("Sort by Delay"),
+    SpeedTestMenuItem::Item("Sort by Test"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Stop Testing"),

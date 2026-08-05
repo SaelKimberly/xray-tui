@@ -75,7 +75,7 @@ pub enum SortColumn {
     ConfigType,
     Address,
     Port,
-    Delay,
+    Test,
     Speed,
     Traffic,
     Core,
