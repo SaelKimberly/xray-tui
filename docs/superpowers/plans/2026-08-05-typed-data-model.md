@@ -121,8 +121,8 @@ impl std::str::FromStr for ProtocolKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
 #[serde(rename_all = "snake_case")]
-pub enum TransportType { Tcp, Ws, Grpc, Http, HttpUpgrade, XHttp, Kcp }
-impl TransportType { pub const fn as_str(self) -> &'static str { /* "tcp","ws","grpc","http","httpupgrade","xhttp","kcp" */ } }
+pub enum TransportType { Tcp, Ws, Grpc, Http, HttpUpgrade, XHttp, Kcp, Quic }
+impl TransportType { pub const fn as_str(self) -> &'static str { /* "tcp","ws","grpc","http","httpupgrade","xhttp","kcp","quic" */ } }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
 #[serde(rename_all = "snake_case")]
