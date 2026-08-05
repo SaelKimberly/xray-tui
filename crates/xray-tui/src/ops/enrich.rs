@@ -1,6 +1,6 @@
 //! Background enrichment of endpoint display data.
 //!
-//! All network- and IO-bound work (DNS resolution, GeoIP mmdb lookups,
+//! All network- and IO-bound work (DNS resolution, `GeoIP` mmdb lookups,
 //! whitelist checks) runs in spawned tokio tasks that report back through
 //! `CoreEvent::EndpointInfoUpdated`. The UI thread never blocks on them.
 //! Every failure degrades to defaults (no flag / `🏴`) with a `tracing::warn!`.
@@ -16,6 +16,7 @@ use crate::profile_to_fields;
 use crate::types::{CoreEvent, EndpointInfo};
 
 /// Rebuild the same `Profile` connect.rs builds from an endpoint row + protocol.
+#[must_use]
 pub fn protocol_row_to_profile(
     ep: &Endpoint,
     p: &ProtocolRow,
@@ -42,10 +43,10 @@ pub fn protocol_row_to_profile(
 /// "sni" or "*.sni") for opaque/legacy blobs.
 fn extract_sni(profile: &xray_tui_config::import_export::Profile) -> Option<String> {
     use xray_tui_proto::proto_spec::ProtoSpec;
-    if let Some(config) = xray_tui_config::import_export::profile_config(profile) {
-        if let Some(sni) = config.security().and_then(|s| s.sni()) {
-            return Some(sni.to_string());
-        }
+    if let Some(config) = xray_tui_config::import_export::profile_config(profile)
+        && let Some(sni) = config.security().and_then(|s| s.sni())
+    {
+        return Some(sni.to_string());
     }
     profile_to_fields(profile)
         .into_iter()
@@ -55,7 +56,12 @@ fn extract_sni(profile: &xray_tui_config::import_export::Profile) -> Option<Stri
 
 /// True when a resolution must run: no entry, or a DNS entry older than the
 /// TTL, or `force`. IP-host entries (`resolved_at_secs: None`) never re-resolve.
-fn should_resolve(entry: Option<&EndpointInfo>, force: bool, ttl_secs: i64, now_secs: i64) -> bool {
+const fn should_resolve(
+    entry: Option<&EndpointInfo>,
+    force: bool,
+    ttl_secs: i64,
+    now_secs: i64,
+) -> bool {
     match entry {
         None => true,
         Some(e) => match e.resolved_at_secs {
@@ -65,7 +71,7 @@ fn should_resolve(entry: Option<&EndpointInfo>, force: bool, ttl_secs: i64, now_
     }
 }
 
-/// `"{ip} | {country}"` (real-ping ip_info format) → `(ip, country-hint)`.
+/// `"{ip} | {country}"` (real-ping `ip_info` format) → `(ip, country-hint)`.
 fn parse_ip_info(ip_info: &str) -> Option<(IpAddr, Option<String>)> {
     let (ip_part, country) = ip_info
         .split_once('|')
@@ -390,7 +396,7 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
                 Ok(Some(loc)) => info.outbound_country = Some(loc.country),
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(target: "tui::ops::enrich", "outbound geo lookup failed: {e}")
+                    tracing::warn!(target: "tui::ops::enrich", "outbound geo lookup failed: {e}");
                 }
             }
         }

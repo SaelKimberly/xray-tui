@@ -380,7 +380,7 @@ impl AppState {
                 }
             }
             Err(e) => {
-                tracing::error!(target: "tui::state::log_init", "Failed to load initial logs: {e}")
+                tracing::error!(target: "tui::state::log_init", "Failed to load initial logs: {e}");
             }
         }
     }

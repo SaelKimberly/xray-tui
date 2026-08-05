@@ -678,7 +678,7 @@ struct Identity {
 ///
 /// `sig`/`cred_hash`/`uid` are computed once (atomically, on first access) and
 /// cached. Serializes byte-identical to the wrapped [`ProtocolConfig`]
-/// (spec_blob format), so deserializing a stored spec produces an identical
+/// (`spec_blob` format), so deserializing a stored spec produces an identical
 /// [`Proto`] whose identity starts deferred (empty `OnceLock`).
 #[derive(Debug)]
 pub struct Proto {
@@ -688,7 +688,7 @@ pub struct Proto {
 
 impl Proto {
     #[must_use]
-    pub fn new(config: ProtocolConfig) -> Self {
+    pub const fn new(config: ProtocolConfig) -> Self {
         Self {
             config,
             // Empty lock == deferred identity; materialized on first access.
@@ -722,7 +722,7 @@ impl Proto {
     }
 
     #[must_use]
-    pub fn config(&self) -> &ProtocolConfig {
+    pub const fn config(&self) -> &ProtocolConfig {
         &self.config
     }
 
@@ -850,7 +850,7 @@ impl ProtoSpec for PlaceholderConfig {
 impl PlaceholderConfig {
     /// Construct a placeholder wrapping an opaque legacy JSON body.
     #[must_use]
-    pub fn new(proto_name: String, settings_json: Vec<u8>) -> Self {
+    pub const fn new(proto_name: String, settings_json: Vec<u8>) -> Self {
         Self {
             proto_name,
             settings_json,

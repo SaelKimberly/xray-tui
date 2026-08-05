@@ -18,7 +18,7 @@ use fastbloom::BloomFilter;
 use rustls::pki_types::{IpAddr, ServerName};
 
 /// Upstream repository supplying the whitelist files
-/// (https://github.com/hxehex/russia-mobile-internet-whitelist).
+/// (<https://github.com/hxehex/russia-mobile-internet-whitelist>).
 const SNI_WHITELIST_URL: &str = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/whitelist.txt";
 const IP_WHITELIST_URL: &str = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/ipwhitelist.txt";
 const CIDR_WHITELIST_URL: &str = "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/cidrwhitelist.txt";
@@ -42,7 +42,7 @@ pub struct HostFeaturesChecker {
     /// IP whitelist (ipwhitelist.txt) — IPv4 as u32 big-endian
     ip_bloom: BloomFilter,
     ip_set: HashSet<u32>,
-    /// CIDR whitelist (cidrwhitelist.txt) — sorted (start_u32, end_u32) intervals
+    /// CIDR whitelist (cidrwhitelist.txt) — sorted (`start_u32`, `end_u32`) intervals
     cidr_ranges: Vec<(u32, u32)>,
 }
 
@@ -221,7 +221,7 @@ impl HostFeaturesChecker {
 
     // ── Lookup methods ───────────────────────────────────────────────────
 
-    /// Fast-negative bloom filter + HashSet verification.
+    /// Fast-negative bloom filter + `HashSet` verification.
     #[must_use]
     pub fn is_sni_whitelisted(&self, host: &str) -> bool {
         let lower = host.to_ascii_lowercase();
@@ -231,7 +231,7 @@ impl HostFeaturesChecker {
         self.sni_set.contains(&lower)
     }
 
-    /// Fast-negative bloom filter + HashSet verification.
+    /// Fast-negative bloom filter + `HashSet` verification.
     #[must_use]
     pub fn is_ip_whitelisted(&self, ip: Ipv4Addr) -> bool {
         let key = u32::from_be_bytes(ip.octets());

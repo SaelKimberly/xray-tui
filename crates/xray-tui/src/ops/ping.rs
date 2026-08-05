@@ -336,6 +336,7 @@ pub fn start_batch_then_real_ping(state: &mut AppState) {
 }
 
 /// Fast-ping every protocol of the selected endpoint (endpoint-scoped batch).
+///
 /// Collapsed endpoint rows with >1 protocols dispatch here — different
 /// credentials can route differently, so each protocol gets its own result.
 pub fn start_endpoint_batch_ping(state: &mut AppState) {
@@ -557,7 +558,7 @@ struct RealPingBatchCtx<'a> {
     log_tx: Option<mpsc::Sender<String>>,
 }
 
-impl<'a> RealPingBatchCtx<'a> {
+impl RealPingBatchCtx<'_> {
     /// Dispatch `items` for one core type with halving retry on group-level
     /// failures: a retryable failure splits the group in half and retests each
     /// half (stack-based, no recursion), down to single-profile groups.
@@ -925,16 +926,15 @@ async fn dispatch_real_ping_batch(
     // all-visible batches — endpoint-scoped batches must real-ping EVERY
     // protocol (dedup=false), so one success must not cancel its siblings
     // before their waves run.
-    if dedup_endpoints {
-        if let Err(e) = db.cancel_stranded_real_pings(batch_id).await {
-            tracing::warn!(target: "ops::ping", "cancel_stranded_real_pings: {e}");
-        }
+    if dedup_endpoints && let Err(e) = db.cancel_stranded_real_pings(batch_id).await {
+        tracing::warn!(target: "ops::ping", "cancel_stranded_real_pings: {e}");
     }
     progress.1.fetch_add(flushed, Ordering::Relaxed);
     flushed
 }
 
 /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
+///
 /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
 /// `profile_order` is the explicit `(protocol_id, sort_order)` list to test;
 /// `dedup_endpoints` gates the real-ping endpoint dedup (all-visible batches

@@ -16,7 +16,7 @@ pub struct Endpoint {
     pub created_at: i64,
     pub manual_protocol_override: Option<i64>, // FK -> protocols.id, NULL = auto-select best
     /// Cached DNS resolution of `host` for `host_type == "dns"`: comma-joined
-    /// IP strings ("1.2.3.4,2606:4700::1"). NULL = not resolved yet (deferred)
+    /// IP strings ("`1.2.3.4,2606:4700::1`"). NULL = not resolved yet (deferred)
     /// or host is an IP. Persisted so launches do not re-resolve.
     pub resolved_as: Option<String>,
     /// Unix secs of the `resolved_as` lookup. NULL = never / IP host.

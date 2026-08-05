@@ -101,14 +101,13 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         .endpoints
         .iter_mut()
         .find(|r| r.endpoint.id == endpoint.id)
+        && let Some(pr) = r.protocols.iter_mut().find(|pr| pr.id == lu_protocol_id)
     {
-        if let Some(pr) = r.protocols.iter_mut().find(|pr| pr.id == lu_protocol_id) {
-            pr.last_used_at = Some(now);
-            // Mirror the DB write (update_last_used sets both columns to the
-            // same ts) so the sub-table's displayed last_seen matches the DB
-            // staleness classification between reloads.
-            pr.last_seen_at = now;
-        }
+        pr.last_used_at = Some(now);
+        // Mirror the DB write (update_last_used sets both columns to the
+        // same ts) so the sub-table's displayed last_seen matches the DB
+        // staleness classification between reloads.
+        pr.last_seen_at = now;
     }
     let tx = if let Some(tx) = &state.core_event_tx {
         tx.clone()

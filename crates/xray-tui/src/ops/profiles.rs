@@ -889,14 +889,13 @@ pub fn nav_protocol_down(state: &mut AppState) -> bool {
     // Extract data before any mutable access.
     let expanded_count = filtered_profiles(state)
         .nth(state.selected_index)
-        .map(|r| {
+        .and_then(|r| {
             if r.expanded {
                 Some(r.protocols.len())
             } else {
                 None
             }
-        })
-        .flatten();
+        });
     let Some(proto_count) = expanded_count else {
         // Not on an expandable endpoint: fall through to endpoint nav and
         // drop any stale sub-row selection.

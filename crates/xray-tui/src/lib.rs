@@ -120,6 +120,7 @@ const fn civil_from_days(z: u64) -> (u64, u64, u64) {
 }
 
 /// Unix seconds → "YYYY-MM-DDTHH:MM:SS" (UTC). Callers render "—" for 0/None.
+#[must_use]
 pub fn format_ts(secs: i64) -> String {
     let days = secs.div_euclid(86_400) as u64;
     let rem = secs.rem_euclid(86_400);
@@ -131,6 +132,7 @@ pub fn format_ts(secs: i64) -> String {
 }
 
 /// "US" → "🇺🇸"; anything not exactly 2 ASCII alpha chars → "🏴" (U+1F3F4).
+#[must_use]
 pub fn iso_to_flag(iso: &str) -> String {
     let b = iso.as_bytes();
     if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1].is_ascii_alphabetic() {

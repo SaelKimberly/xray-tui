@@ -361,7 +361,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     let ep_id = state.selected_profile_id();
                     let row =
                         ep_id.and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id == id));
-                    let multi = row.map_or(false, |r| r.protocols.len() > 1);
+                    let multi = row.is_some_and(|r| r.protocols.len() > 1);
                     let pid = if on_sub {
                         state.selected_sub_protocol_id()
                     } else {
@@ -784,7 +784,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         }
                     }
                     Err(e) => {
-                        state.log_trace("error", "tui::ui", &format!("Clipboard unavailable: {e}"))
+                        state.log_trace("error", "tui::ui", &format!("Clipboard unavailable: {e}"));
                     }
                 }
             }

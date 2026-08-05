@@ -212,6 +212,7 @@ impl PingRound {
     /// `protocol_count` is the endpoint's protocol count; a round that only
     /// covered part of the endpoint (single pings, cancelled batches) never
     /// reports all-unreachable.
+    #[must_use]
     pub fn all_unreachable(&self, protocol_count: usize) -> bool {
         !self.seen.is_empty()
             && self.seen.len() == protocol_count
@@ -239,9 +240,9 @@ pub struct EndpointInfo {
     pub host_features: xray_tui_host_features::HostFeatures,
     /// None = no SNI in config or checker not loaded.
     pub sni_whitelisted: Option<bool>,
-    /// Exit IP parsed from real-ping ip_info.
+    /// Exit IP parsed from real-ping `ip_info`.
     pub outbound_ip: Option<std::net::IpAddr>,
-    /// ISO-3166 alpha-2 of outbound_ip.
+    /// ISO-3166 alpha-2 of `outbound_ip`.
     pub outbound_country: Option<String>,
     /// Unix secs of DNS resolution; None = IP host (static, never expires).
     pub resolved_at_secs: Option<i64>,

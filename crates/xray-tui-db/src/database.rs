@@ -171,7 +171,7 @@ impl Database {
         column: &str,
         ddl: &str,
     ) -> Result<()> {
-        let rows = toasty::sql::query(&format!(
+        let rows = toasty::sql::query(format!(
             "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
         ))
         .bind(column)
@@ -617,7 +617,7 @@ impl Database {
         Ok(())
     }
 
-    /// Record when a protocol was last activated; also refreshes last_seen_at
+    /// Record when a protocol was last activated; also refreshes `last_seen_at`
     /// so active use keeps a profile out of the Stale/purge lists. ts = unix
     /// seconds. Runs in an explicit transaction — raw statements on a pooled
     /// turso connection do not reliably commit in WAL mode.
@@ -910,7 +910,7 @@ impl Database {
     }
 
     /// Endpoints whose `parent_id` references `parent_id` (resolved-IP children
-    /// of a DnsName endpoint). Used by tests; ordered by id.
+    /// of a `DnsName` endpoint). Used by tests; ordered by id.
     pub async fn endpoints_by_parent(&self, parent_id: i64) -> Result<Vec<Endpoint>> {
         let mut conn = self.db.connection().await?;
         let rows = toasty::sql::query(
@@ -1567,7 +1567,7 @@ impl Database {
     }
 
     /// Fetch queued real-ping sessions for `wave` (occurrence rank within each
-    /// endpoint, ordered by config_type then protocol_id) of `batch_id`.
+    /// endpoint, ordered by `config_type` then `protocol_id`) of `batch_id`.
     ///
     /// Occurrence is computed over ALL `ping_type='real'` rows of the batch
     /// (status-independent), so wave ranks stay STABLE across dispatches: a
@@ -1618,7 +1618,6 @@ impl Database {
              WHERE sub.occurrence = ?2 AND sub.status = 'queued' \
              ORDER BY sub.id \
              LIMIT ?3",
-            dedup_sql = dedup_sql,
         );
         let rows = toasty::sql::query(&query)
             .bind(batch_id)

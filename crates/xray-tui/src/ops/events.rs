@@ -18,10 +18,10 @@ fn fmt_profile_id(id: i64) -> String {
 /// (a `ProtocolRow` id). Endpoint ids (stable hashes of host:port) are
 /// unrelated to protocol ids, so the match scans `r.protocols`.
 #[must_use]
-pub(crate) fn endpoint_row_for_protocol<'a>(
-    endpoints: &'a mut [EndpointRow],
+pub(crate) fn endpoint_row_for_protocol(
+    endpoints: &mut [EndpointRow],
     protocol_id: i64,
-) -> Option<&'a mut EndpointRow> {
+) -> Option<&mut EndpointRow> {
     endpoints
         .iter_mut()
         .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
@@ -206,8 +206,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     .endpoints
                     .iter()
                     .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
-                    .map(|r| (r.endpoint.id, r.endpoint.host_type == "dns"))
-                    .unwrap_or((0, false));
+                    .map_or((0, false), |r| {
+                        (r.endpoint.id, r.endpoint.host_type == "dns")
+                    });
                 let ip_info_clone = ip_info.clone();
 
                 // Feed the per-endpoint ping round used by the profiles Test
@@ -502,7 +503,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                 entry
                                     .resolved_ips
                                     .iter()
-                                    .map(|ip| ip.to_string())
+                                    .map(std::string::ToString::to_string)
                                     .collect::<Vec<_>>()
                                     .join(","),
                                 entry.resolved_at_secs,

@@ -277,7 +277,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     render_confirmation_overlays(frame, area, &rows, state);
 }
 
-fn test_glyph(test_type: &TestType) -> &'static str {
+const fn test_glyph(test_type: &TestType) -> &'static str {
     match test_type {
         TestType::TcpPing => "↔",
         TestType::RealPing => "◎",
@@ -314,7 +314,7 @@ fn compute_test_cell(
     )
 }
 
-/// Pure Test-cell logic (no AppState) so the label precedence and color
+/// Pure Test-cell logic (no `AppState`) so the label precedence and color
 /// thresholds are unit-testable.
 fn test_cell_content(
     host_is_dns: bool,
@@ -401,7 +401,7 @@ fn build_display_rows(
         };
 
         let info = state.endpoint_info.get(&row.endpoint.id);
-        let resolved = info.map(|i| !i.resolved_ips.is_empty()).unwrap_or(false);
+        let resolved = info.is_some_and(|i| !i.resolved_ips.is_empty());
 
         let type_str = format!("{protocol:.12}");
         let country_flag = match info.and_then(|i| i.country.as_deref()) {
@@ -415,8 +415,7 @@ fn build_display_rows(
         let ip_feature = if row.endpoint.host_type == "dns" && !resolved {
             "\u{1F3C1}".to_string()
         } else if info
-            .map(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
-            .unwrap_or(false)
+            .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
         {
             "\u{1F3F3}\u{FE0F}".to_string()
         } else {
@@ -456,7 +455,7 @@ fn build_display_rows(
             .map(|i| {
                 i.resolved_ips
                     .iter()
-                    .map(|ip| format!("[{}]", ip))
+                    .map(|ip| format!("[{ip}]"))
                     .collect::<Vec<_>>()
                     .join(" ")
             })
@@ -721,7 +720,7 @@ fn center_cell(s: &str, width: usize) -> String {
     if w >= width {
         return truncate_pad(s, width);
     }
-    let left = (width - w + 1) / 2;
+    let left = (width - w).div_ceil(2);
     let right = width - w - left;
     format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }

@@ -130,15 +130,14 @@ async fn main() -> Result<()> {
         let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
         loop {
             // Wait for at least one message
-            let msg = match log_rx.recv() {
-                Ok(msg) => msg,
-                Err(_) => {
-                    // Channel closed (sender dropped) — flush and exit
-                    if !batch.is_empty() {
-                        let _ = writer_heed.write_log_batch(&batch);
-                    }
-                    return;
+            let msg = if let Ok(msg) = log_rx.recv() {
+                msg
+            } else {
+                // Channel closed (sender dropped) — flush and exit
+                if !batch.is_empty() {
+                    let _ = writer_heed.write_log_batch(&batch);
                 }
+                return;
             };
             let batch_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             batch.push(msg);
