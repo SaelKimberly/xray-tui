@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::num::NonZeroU64;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,6 +10,7 @@ use crate::clash::ClashProxy;
 use crate::urlx::{HostSpec, RawUrlX, SchemeX};
 
 pub mod common;
+pub mod endpoint;
 pub mod utils;
 
 mod anytls;
@@ -33,6 +35,10 @@ mod vmess;
 mod wireguard;
 pub use anytls::AnyTlsConfig;
 pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig};
+pub use endpoint::{
+    ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials, SecurityEssentials,
+    TransportEssentials,
+};
 pub use error::SupportError;
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;
@@ -129,6 +135,29 @@ impl std::str::FromStr for CoreType {
 impl std::fmt::Display for CoreType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+// Serde for `CoreType` follows the same as_str dialect as the kind enums in
+// `kinds.rs` ("xray" / "sing-box") — required so `ProtocolEssentials` can
+// derive `Serialize`/`Deserialize` (T3 parse boundary).
+impl Serialize for CoreType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CoreType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::from_str(&s)
+            .map_err(|_| serde::de::Error::custom(format_args!("invalid core type: '{s}'")))
     }
 }
 
