@@ -1,5 +1,10 @@
 use toasty::Deferred;
 
+/// `ProfileExtension.delay_source` provenance values.
+pub const DELAY_SOURCE_FAST: i32 = 0;
+pub const DELAY_SOURCE_REAL: i32 = 1;
+pub const DELAY_SOURCE_UDP: i32 = 2;
+
 // ── Primary models (toasty ORM, mapped to DB tables) ────────────────────
 
 /// Endpoint: a network endpoint identified by host+port.
@@ -97,6 +102,9 @@ pub struct ProfileExtension {
     pub speed: Option<i64>,
     pub sort_order: Option<i32>,
     pub ip_info: Option<String>,
+    /// Provenance of `delay`: `DELAY_SOURCE_FAST` / `DELAY_SOURCE_REAL` /
+    /// `DELAY_SOURCE_UDP`. `None` = no measurement recorded.
+    pub delay_source: Option<i32>,
 
     #[belongs_to(key = protocol_id, references = id)]
     pub protocol_row: Deferred<Option<ProtocolRow>>, // was protocol

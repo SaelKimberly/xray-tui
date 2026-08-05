@@ -404,6 +404,7 @@ async fn batch_upsert_buffer(
                 speed: None,
                 sort_order: None,
                 ip_info: r.ip_info.clone(),
+                delay_source: None,
                 protocol_row: Default::default(),
             })
         })

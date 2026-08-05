@@ -55,7 +55,7 @@ impl Database {
         // only run push_schema on fresh databases. Existing databases are
         // upgraded in place by an explicit transaction of idempotent
         // ALTER TABLE / CREATE INDEX statements.
-        const SCHEMA_VERSION: i64 = 3;
+        const SCHEMA_VERSION: i64 = 4;
         let rows = toasty::sql::query("PRAGMA user_version")
             .exec(&mut conn)
             .await?;
@@ -108,6 +108,13 @@ impl Database {
                 "dns_settings",
                 "cache_ttl_secs",
                 "ALTER TABLE dns_settings ADD COLUMN cache_ttl_secs INTEGER",
+            )
+            .await?;
+            Self::ensure_column(
+                &mut tx,
+                "profile_extensions",
+                "delay_source",
+                "ALTER TABLE profile_extensions ADD COLUMN delay_source INTEGER",
             )
             .await?;
             // get_active_endpoints' correlated MAX(last_seen_at) subquery
@@ -251,7 +258,7 @@ impl Database {
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
-                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
+                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, ext.delay_source, \
                     s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
                     e.resolved_as, e.resolved_at \
              FROM endpoints e \
@@ -276,7 +283,7 @@ impl Database {
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
-                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
+                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, ext.delay_source, \
                     s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
                     e.resolved_as, e.resolved_at \
              FROM endpoints e \
@@ -303,7 +310,7 @@ impl Database {
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
-                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
+                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, ext.delay_source, \
                     s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
                     e.resolved_as, e.resolved_at \
              FROM endpoints e \
@@ -326,7 +333,7 @@ impl Database {
         let rows = toasty::sql::query(
             "SELECT e.id, e.host, e.host_type, e.port, e.port_spec_str, e.parent_id, e.last_source, e.created_at, e.manual_protocol_override, \
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, p.config_type, p.core_type, p.transport, p.security, p.last_used_at, p.created_at, p.last_seen_at, \
-                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
+                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, ext.delay_source, \
                     s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, s.last_updated, \
                     e.resolved_as, e.resolved_at \
              FROM endpoints e \
@@ -354,7 +361,7 @@ impl Database {
                     p.id, p.endpoint_id, p.sig, p.cred_hash, p.proto_kind, p.spec_blob, \
                     p.config_type, p.core_type, p.transport, p.security, p.last_used_at, \
                     p.created_at, p.last_seen_at, \
-                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, \
+                    ext.protocol_id, ext.delay, ext.speed, ext.sort_order, ext.ip_info, ext.delay_source, \
                     s.protocol_id, s.today_up, s.today_down, s.total_up, s.total_down, \
                     s.last_updated, e.resolved_as, e.resolved_at \
              FROM endpoints e \
@@ -949,6 +956,7 @@ impl Database {
             .speed(ext.speed.unwrap_or(0))
             .sort_order(ext.sort_order.unwrap_or(0))
             .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+            .delay_source(ext.delay_source.unwrap_or(-1))
             .exec(&mut conn)
             .await?;
         Ok(())
@@ -1641,6 +1649,7 @@ impl Database {
                 .speed(ext.speed.unwrap_or(0))
                 .sort_order(ext.sort_order.unwrap_or(0))
                 .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+                .delay_source(ext.delay_source.unwrap_or(-1))
                 .exec(&mut tx)
                 .await?;
         }
@@ -1681,6 +1690,7 @@ impl Database {
                 .speed(ext.speed.unwrap_or(0))
                 .sort_order(ext.sort_order.unwrap_or(0))
                 .ip_info(ext.ip_info.as_deref().unwrap_or(""))
+                .delay_source(ext.delay_source.unwrap_or(-1))
                 .exec(&mut tx)
                 .await?;
         }
@@ -1702,11 +1712,12 @@ impl Database {
 // ── Deserialization helpers ────────────────────────────────────────────
 
 /// Deserialize JOIN query results into `EndpointRow` instances.
-/// Column order (0-32):
+/// Column order (0-35):
 ///   0-8: Endpoint fields
 ///   9-21: `ProtocolRow` fields
-///   22-26: `ProfileExtension` fields (nullable from LEFT JOIN)
-///   27-32: `ServerStat` fields (nullable from LEFT JOIN)
+///   22-27: `ProfileExtension` fields (nullable from LEFT JOIN)
+///   28-33: `ServerStat` fields (nullable from LEFT JOIN)
+///   34-35: `resolved_as`, `resolved_at`
 fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
     let mut map: HashMap<i64, EndpointRow> = HashMap::new();
     // Preserve insertion order
@@ -1729,8 +1740,8 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                         last_source: get_opt_string(&fields, 6),
                         created_at: get_i64(&fields, 7)?,
                         manual_protocol_override: get_opt_i64(&fields, 8),
-                        resolved_as: get_opt_string(&fields, 33),
-                        resolved_at: get_opt_i64(&fields, 34),
+                        resolved_as: get_opt_string(&fields, 34),
+                        resolved_at: get_opt_i64(&fields, 35),
                     },
                     protocols: Vec::new(),
                     extensions: HashMap::new(),
@@ -1775,19 +1786,20 @@ fn deserialize_endpoint_rows(rows: Vec<Value>) -> Result<Vec<EndpointRow>> {
                             speed: get_opt_i64(&fields, 24),
                             sort_order: get_opt_i64(&fields, 25).map(|v| v as i32),
                             ip_info: get_opt_string(&fields, 26),
+                            delay_source: get_opt_i64(&fields, 27).map(|v| v as i32),
                             protocol_row: Default::default(),
                         });
                 }
 
-                // Add stats if present (field 27 is protocol_id, non-null = exists)
-                if let Some(stat_pid) = get_opt_i64(&fields, 27) {
+                // Add stats if present (field 28 is protocol_id, non-null = exists)
+                if let Some(stat_pid) = get_opt_i64(&fields, 28) {
                     entry.stats.entry(stat_pid).or_insert_with(|| ServerStat {
                         protocol_id: stat_pid,
-                        today_up: get_opt_i64(&fields, 28),
-                        today_down: get_opt_i64(&fields, 29),
-                        total_up: get_opt_i64(&fields, 30),
-                        total_down: get_opt_i64(&fields, 31),
-                        last_updated: get_opt_string(&fields, 32),
+                        today_up: get_opt_i64(&fields, 29),
+                        today_down: get_opt_i64(&fields, 30),
+                        total_up: get_opt_i64(&fields, 31),
+                        total_down: get_opt_i64(&fields, 32),
+                        last_updated: get_opt_string(&fields, 33),
                         protocol_row: Default::default(),
                     });
                 }
@@ -1959,6 +1971,112 @@ mod tests {
         // Reopening again must be a no-op (idempotent).
         let db2 = Database::open(&path).await.expect("reopen");
         assert!(db2.get_endpoint(0).await.is_ok());
+    }
+
+    /// Simulate a v3 database (no delay_source column) and prove `Database::open`
+    /// re-adds it in place — push_schema never runs on existing databases.
+    #[tokio::test]
+    async fn test_open_adds_delay_source_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v3.db");
+        {
+            let driver = toasty_driver_turso::Turso::file(&path);
+            let db = toasty::Db::builder()
+                .models(toasty::models!(
+                    Endpoint,
+                    ProtocolRow,
+                    EndpointGroup,
+                    Group,
+                    ProfileExtension,
+                    ServerStat,
+                    PingSession,
+                    RoutingRule,
+                    DnsSetting
+                ))
+                .build(driver)
+                .await
+                .expect("build db");
+            db.push_schema().await.expect("push schema");
+            let mut conn = db.connection().await.expect("connection");
+            toasty::sql::statement("ALTER TABLE profile_extensions DROP COLUMN delay_source")
+                .exec(&mut conn)
+                .await
+                .expect("drop delay_source");
+            toasty::sql::query("PRAGMA user_version = 3")
+                .exec(&mut conn)
+                .await
+                .expect("set version 3");
+        }
+        let db = Database::open(&path).await.expect("open migrates delay_source");
+        let mut conn = db.db.connection().await.expect("connection");
+        let rows = toasty::sql::query(
+            "SELECT COUNT(*) FROM pragma_table_info('profile_extensions') WHERE name = 'delay_source'",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("pragma");
+        let count: i64 = rows
+            .first()
+            .and_then(|v| {
+                if let Value::Record(fields) = v {
+                    fields.first().and_then(|f| match f {
+                        Value::I64(n) => Some(*n),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(count, 1, "open() did not add profile_extensions.delay_source");
+    }
+
+    /// `delay_source` plus the shifted stats/resolved column indices round-trip
+    /// through `get_active_endpoints` (a misaligned SELECT breaks these reads).
+    #[tokio::test]
+    async fn delay_source_roundtrips_through_get_active_endpoints() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.db.connection().await.expect("connection");
+        toasty::sql::statement(
+            "INSERT INTO endpoints (id, host, host_type, port, created_at, resolved_as, resolved_at) \
+             VALUES (1001, 'dns.example', 'dns', 443, 0, '1.2.3.4', 100)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("insert endpoint");
+        toasty::sql::statement(
+            "INSERT INTO protocol_rows \
+               (id, endpoint_id, sig, cred_hash, proto_kind, spec_blob, config_type, core_type, created_at, last_seen_at) \
+             VALUES (2001, 1001, 1, 0, 'vmess', X'', 0, 'xray', 0, 10)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("insert protocol");
+        toasty::sql::statement(
+            "INSERT INTO profile_extensions (protocol_id, delay, speed, sort_order, ip_info, delay_source) \
+             VALUES (2001, 123, 0, 0, '1.2.3.4|US', 1)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("insert extension");
+        toasty::sql::statement(
+            "INSERT INTO server_stats (protocol_id, total_down, total_up) VALUES (2001, 5, 6)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("insert stats");
+
+        let rows = db.get_active_endpoints(0).await.expect("load");
+        assert_eq!(rows.len(), 1);
+        let ext = &rows[0].extensions[&2001];
+        assert_eq!(ext.delay, Some(123));
+        assert_eq!(ext.delay_source, Some(1));
+        assert_eq!(ext.ip_info.as_deref(), Some("1.2.3.4|US"));
+        let st = &rows[0].stats[&2001];
+        assert_eq!(st.total_down, Some(5));
+        assert_eq!(st.total_up, Some(6));
+        assert_eq!(rows[0].endpoint.resolved_as.as_deref(), Some("1.2.3.4"));
+        assert_eq!(rows[0].endpoint.resolved_at, Some(100));
     }
 
     /// `get_active_endpoints` runs a correlated subquery

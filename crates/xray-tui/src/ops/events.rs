@@ -250,6 +250,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                     speed: None,
                                     sort_order: None,
                                     ip_info: None,
+                                    delay_source: None,
                                     protocol_row: Default::default(),
                                 }
                             });

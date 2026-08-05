@@ -16,7 +16,7 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{CorePool, CoreType, resolve_core};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    Endpoint, Group, PingResultUpdate, ProfileExtension, ProtocolRow, PurgatoryView, RoutingRule,
+    Endpoint, Group, ProtocolRow, PurgatoryView, RoutingRule,
 };
 
 use crate::BackendUpdateStatus;
@@ -1348,33 +1348,6 @@ impl AppState {
         ping::start_endpoint_batch_real_ping(self);
     }
 
-    /// Flush accumulated `PingResultUpdate`s to DB. Called at page boundaries and batch end.
-    async fn batch_upsert_buffer(
-        batch_id: &str,
-        db: &Arc<Database>,
-        buffer: &mut Vec<PingResultUpdate>,
-    ) {
-        if buffer.is_empty() {
-            return;
-        }
-        let batch = std::mem::take(buffer);
-        let extensions: Vec<ProfileExtension> = batch
-            .iter()
-            .filter_map(|r| {
-                r.latency_ms.map(|ms| ProfileExtension {
-                    protocol_id: r.protocol_id,
-                    delay: Some(ms),
-                    speed: None,
-                    sort_order: None,
-                    ip_info: r.ip_info.clone(),
-                    protocol_row: Default::default(),
-                })
-            })
-            .collect();
-        let _ = db
-            .batch_flush_ping_buffer(batch_id, &batch, &extensions)
-            .await;
-    }
     /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
     pub async fn remove_failed_servers(&mut self) {
         ping::remove_failed_servers(self).await;
