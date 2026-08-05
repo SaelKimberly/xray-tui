@@ -631,7 +631,17 @@ pub(crate) fn clash_transport_to_transport(
 }
 
 /// Convert a `TransportConfig` back to Clash transport fields.
-pub(crate) fn transport_to_clash(transport: &TransportConfig, server: &str) -> TransportClash {
+///
+/// `server` is the OPT-IN fallback for the HTTP/h2 transport's `host` when the
+/// config carries no explicit host. The `*_proto` export path passes `None` —
+/// the endpoint host must never leak into Clash fields that re-import into the
+/// identity-hashed config (host-free parse mandate). Legacy `to_clash` impls
+/// (config still stores its host) pass `Some(config_host)` to preserve the
+/// historical fallback.
+pub(crate) fn transport_to_clash(
+    transport: &TransportConfig,
+    server: Option<&str>,
+) -> TransportClash {
     match transport {
         TransportConfig::Ws(w) => {
             // Clash carries the WS vhost in `headers.Host`; forward `host` so the
@@ -677,20 +687,28 @@ pub(crate) fn transport_to_clash(transport: &TransportConfig, server: &str) -> T
             None,
             None,
         ),
-        TransportConfig::Http(h) => (
-            Some("http".to_string()),
-            None,
-            None,
-            Some(ClashH2Opts {
-                host: Some(vec![h.host.as_ref().map_or_else(
-                    || server.to_string(),
-                    std::string::ToString::to_string,
-                )]),
-                path: h.path.as_ref().map(std::string::ToString::to_string),
-            }),
-            None,
-            None,
-        ),
+        TransportConfig::Http(h) => {
+            // h2 host is emitted ONLY from the config's explicit host, or from
+            // the opt-in `server` fallback when the config host is unset. The
+            // `*_proto` export path passes `None`, so an unset host stays unset
+            // (never the endpoint).
+            let host = h
+                .host
+                .as_ref()
+                .map(std::string::ToString::to_string)
+                .or_else(|| server.map(str::to_string));
+            (
+                Some("http".to_string()),
+                None,
+                None,
+                host.map(|host| ClashH2Opts {
+                    host: Some(vec![host]),
+                    path: h.path.as_ref().map(std::string::ToString::to_string),
+                }),
+                None,
+                None,
+            )
+        }
         TransportConfig::Kcp(k) => (
             Some("kcp".to_string()),
             None,

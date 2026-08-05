@@ -406,8 +406,10 @@ impl VmessConfig {
         let server = endpoint.host.clone();
         let (tls, servername, skip_cert_verify, alpn_str, fingerprint) =
             security_to_clash_tls(&self.security);
+        // HOST-FREE: `None` — the endpoint host must never fall back into
+        // Clash h2 `host` (which re-imports into the identity config).
         let (network, ws_opts, grpc_opts, h2_opts, http_opts, mkcp_opts) =
-            transport_to_clash(&self.transport, &server);
+            transport_to_clash(&self.transport, None);
         Ok(ClashProxy::Vmess(ClashVmess {
             name,
             server,
@@ -885,6 +887,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clash_roundtrip_via_proto_h2_keeps_config_host_free() {
+        use crate::clash::ClashProxy;
+
+        // Regression (F1): the endpoint host must never leak into the identity
+        // config via the Clash h2 `host` fallback on export. With no explicit
+        // host, the export must not synthesize h2_opts from the endpoint.
+        let url = vmess_url(
+            "example.com",
+            443,
+            UUID,
+            &[("net", "h2"), ("path", ""), ("sni", "")],
+        );
+        let parsed = parse(&url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        if let TransportConfig::Http(h) = &cfg.transport {
+            assert_eq!(h.host, None, "no explicit host -> config host unset");
+        } else {
+            panic!("expected http transport");
+        }
+        let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
+        match &proxy {
+            ClashProxy::Vmess(v) => assert_eq!(
+                v.h2_opts, None,
+                "export must not synthesize an h2 host from the endpoint: {proxy:?}"
+            ),
+            other => panic!("expected vmess proxy, got {other:?}"),
+        }
+        let reparsed = VmessConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(
+            reparsed.endpoints[0], endpoint,
+            "endpoint round-trips through clash"
+        );
+        assert_eq!(
+            reparsed.protocol.config,
+            ProtocolConfig::Vmess(cfg),
+            "config must stay endpoint-free through the clash cycle"
+        );
+    }
+
     // ── HOST-FREE PARSE MANDATE: no server-address fallback ───────────────
 
     #[test]
@@ -1021,6 +1064,41 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    #[test]
+    fn legacy_bridge_try_from_clash_extracts_config() {
+        use crate::clash::{ClashProxy, ClashVmess};
+
+        let proxy = ClashProxy::Vmess(ClashVmess {
+            name: "test".into(),
+            server: "example.com".into(),
+            port: 443,
+            uuid: UUID.into(),
+            cipher: "auto".into(),
+            alter_id: None,
+            udp: None,
+            tfo: None,
+            network: Some("ws".into()),
+            tls: Some(true),
+            servername: Some("test.ir".into()),
+            skip_cert_verify: None,
+            alpn: None,
+            fingerprint: None,
+            ws_opts: None,
+            grpc_opts: None,
+            h2_opts: None,
+            http_opts: None,
+            mkcp_opts: None,
+        });
+        // try_from_clash delegates to try_from_clash_proto and extracts the
+        // config (endpoints discarded).
+        let bridged = VmessConfig::try_from_clash(&proxy).expect("bridged clash parse");
+        assert_eq!(bridged.uuid, UUID);
+        assert_eq!(bridged.security.sni(), Some("test.ir"));
+        // host/port accessors are gone even via the bridge.
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
     }
 
     #[test]

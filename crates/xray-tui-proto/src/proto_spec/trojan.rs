@@ -356,7 +356,9 @@ impl ProtoSpec for TrojanConfig {
         let server = host_spec_to_string(&self.host);
         let (tls, servername, skip_cert_verify, alpn_str, fingerprint) =
             security_to_clash_tls(&self.security);
-        let (_, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, &server);
+        // Legacy path: the config still stores its host, so the historical h2
+        // host fallback is preserved via `Some(&server)`.
+        let (_, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, Some(&server));
         Ok(ClashProxy::Trojan(ClashTrojan {
             name,
             server,

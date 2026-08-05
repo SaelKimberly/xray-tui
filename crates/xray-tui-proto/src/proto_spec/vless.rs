@@ -417,7 +417,9 @@ impl VlessConfig {
         let name = self.remarks.as_deref().unwrap_or("").to_string();
         let server = endpoint.host.clone();
         let alpn_str = self.security.alpn();
-        let (network, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, &server);
+        // HOST-FREE: `None` — the endpoint host must never fall back into
+        // Clash h2 `host` (which re-imports into the identity config).
+        let (network, ws_opts, grpc_opts, _, _, _) = transport_to_clash(&self.transport, None);
         let (tls, servername, skip_cert_verify, _, _) = security_to_clash_tls(&self.security);
         let reality_opts = security_to_clash_reality(&self.security);
         Ok(ClashProxy::Vless(ClashVless {
@@ -953,6 +955,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clash_roundtrip_via_proto_http_keeps_config_host_free() {
+        // Regression (F1): the endpoint host must never leak into the identity
+        // config through the clash export/import cycle.
+        let url = format!("vless://{UUID}@example.com:443?type=http");
+        let parsed = parse(&url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        if let TransportConfig::Http(h) = &cfg.transport {
+            assert_eq!(h.host, None, "no explicit host -> config host unset");
+        } else {
+            panic!("expected http transport");
+        }
+        let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
+        let reparsed = VlessConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(
+            reparsed.endpoints[0], endpoint,
+            "endpoint round-trips through clash"
+        );
+        assert_eq!(
+            reparsed.protocol.config,
+            ProtocolConfig::Vless(cfg),
+            "config must stay endpoint-free through the clash cycle"
+        );
+    }
+
     // ── HOST-FREE PARSE MANDATE: no server-address fallback ───────────────
 
     #[test]
@@ -1151,6 +1179,39 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    #[test]
+    fn legacy_bridge_try_from_clash_extracts_config() {
+        use crate::clash::{ClashProxy, ClashVless};
+
+        let proxy = ClashProxy::Vless(ClashVless {
+            name: "test".into(),
+            server: "example.com".into(),
+            port: 443,
+            uuid: UUID.into(),
+            udp: None,
+            tfo: None,
+            network: Some("ws".into()),
+            flow: None,
+            encryption: None,
+            tls: Some(true),
+            servername: Some("test.ir".into()),
+            skip_cert_verify: None,
+            alpn: None,
+            reality_opts: None,
+            ws_opts: None,
+            grpc_opts: None,
+            xhttp_opts: None,
+        });
+        // try_from_clash delegates to try_from_clash_proto and extracts the
+        // config (endpoints discarded).
+        let bridged = VlessConfig::try_from_clash(&proxy).expect("bridged clash parse");
+        assert_eq!(bridged.uuid, UUID);
+        assert_eq!(bridged.security.sni(), Some("test.ir"));
+        // host/port accessors are gone even via the bridge.
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
     }
 
     #[test]
