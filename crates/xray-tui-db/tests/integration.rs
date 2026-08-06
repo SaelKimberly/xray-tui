@@ -1,842 +1,623 @@
+//! Integration tests for the typed 7-table read paths.
+//!
+//! Data is seeded through the public pooled-connection accessor with
+//! `toasty::create!` (typed writes land in Task 10; until then the read
+//! paths are exercised against directly-created rows). Deleted legacy
+//! machinery (ping sessions, extensions, server stats) has no tests here —
+//! Task 24 rewrites the suite properly.
+
 #![allow(
     clippy::significant_drop_tightening,
     reason = "test db lifetime is the function scope"
 )]
 
-use toasty::Deferred;
+use jiff::Timestamp;
+use toasty::{Deferred, Json};
 use xray_tui_db::Database;
-use xray_tui_db::hash::stable_hash;
-use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
+use xray_tui_db::models::{
+    ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, Group, HostType, Latency,
+    ProfileStats, Protocol, ProtocolId, RoutingRule, Security, TrafficStats, Transport,
+};
+use xray_tui_proto::proto_spec::common::TransportConfig;
+use xray_tui_proto::proto_spec::{
+    CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+    VlessConfig,
+};
 
 /// Helper: create in-memory database.
 async fn test_db() -> Database {
     Database::in_memory().await.expect("open in-memory db")
 }
 
-fn test_group(id: &str) -> Group {
-    Group {
-        id: id.to_string(),
-        name: Some(format!("group-{id}")),
-        url: None,
-        enabled: Some(1),
-        user_agent: None,
-        convert_target: None,
-        core_type: None,
-        sort_order: None,
-        last_refreshed: None,
-        status: Some("ok".to_string()),
-        error_message: None,
-        refresh_interval: None,
+fn ts(secs: i64) -> Timestamp {
+    Timestamp::from_second(secs).expect("valid ts")
+}
+
+fn tcp_transport() -> Transport {
+    Transport {
+        r#type: TransportType::Tcp,
+        data: Deferred::from(Json(TransportConfig::Tcp)),
     }
 }
 
-fn make_endpoint(host: &str, port: i32) -> Endpoint {
-    let id = stable_hash(host, port);
-    Endpoint {
-        id,
+fn no_security() -> Security {
+    Security {
+        r#type: SecurityType::None,
+        sni: None,
+        fp: None,
+        insecure: None,
+        data: Deferred::from(Json(SecurityConfig::default())),
+    }
+}
+
+fn vless_config() -> ProtocolConfig {
+    ProtocolConfig::Vless(VlessConfig {
+        uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+        uuid_origin: None,
+        security: SecurityConfig::default(),
+        transport: TransportConfig::Tcp,
+        encryption: None,
+        flow: None,
+        path: None,
+        splice: None,
+        remarks: None,
+    })
+}
+
+fn zero_traffic() -> TrafficStats {
+    TrafficStats {
+        today_up: 0,
+        today_down: 0,
+        total_up: 0,
+        total_down: 0,
+    }
+}
+
+/// Insert one endpoint with one protocol and one link at `last_seen`.
+async fn seed_endpoint(
+    conn: &mut toasty::Connection,
+    endpoint_id: i64,
+    protocol_id: i64,
+    host: &str,
+    host_type: HostType,
+    port: u16,
+    last_seen: i64,
+) {
+    toasty::create!(Endpoint {
+        id: EndpointId::new(endpoint_id),
         host: host.to_string(),
-        host_type: if host.is_empty() {
-            "undefined".to_string()
-        } else {
-            "ipv4".to_string()
-        },
+        host_type,
         port,
-        port_spec_str: None,
-        parent_id: None,
-        last_source: None,
-        created_at: 1000,
-        manual_protocol_override: None,
-        resolved_as: None,
-        resolved_at: None,
-    }
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(conn)
+    .await
+    .expect("create endpoint");
+    seed_link(conn, endpoint_id, protocol_id, last_seen).await;
 }
 
-fn make_protocol(endpoint_id: i64, proto_kind: &str, sid: i64) -> ProtocolRow {
-    ProtocolRow {
-        id: sid,
-        endpoint_id,
-        sig: sid,
+/// Insert one additional protocol + link for an existing endpoint.
+async fn seed_link(
+    conn: &mut toasty::Connection,
+    endpoint_id: i64,
+    protocol_id: i64,
+    last_seen: i64,
+) {
+    toasty::create!(Protocol {
+        id: ProtocolId::new(protocol_id),
+        sig: protocol_id,
         cred_hash: 0,
-        proto_kind: proto_kind.to_string(),
-        spec_blob: vec![],
-        config_type: 0,
-        core_type: "auto".to_string(),
-        transport: None,
-        security: None,
-        last_used_at: None,
-        created_at: 1000,
-        last_seen_at: 1000,
-        endpoint: Deferred::default(),
-        extension: Deferred::default(),
-        server_stat: Deferred::default(),
-    }
+        proto_kind: ProtocolKind::Vless,
+        transport: tcp_transport(),
+        security: no_security(),
+        config: Deferred::from(Json(vless_config())),
+    })
+    .exec(conn)
+    .await
+    .expect("create protocol");
+
+    toasty::create!(ProfileStats {
+        protocol_id: ProtocolId::new(protocol_id),
+        endpoint_id: EndpointId::new(endpoint_id),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_seen_at: ts(last_seen),
+        task_queue: Vec::<u16>::new(),
+        traffic: zero_traffic(),
+    })
+    .exec(conn)
+    .await
+    .expect("create link");
 }
 
-// ── Phase 9 — Basic CRUD ───────────────────────────────────────────────
+// ── EndpointRow assembly ────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_insert_endpoint_with_two_protocols() {
+async fn get_active_endpoints_assembles_rows_with_links_and_protocols() {
     let db = test_db().await;
-    let gid = "default";
-    db.insert_group(&test_group(gid)).await.unwrap();
+    let mut conn = db.connection().await.expect("connection");
 
-    let ep = make_endpoint("1.2.3.4", 443);
-    let proto1 = make_protocol(ep.id, "vmess", 1001);
-    let proto2 = make_protocol(ep.id, "vless", 1002);
+    seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
+    seed_link(&mut conn, 1, 1002, 20).await;
 
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto1, proto2])])
-        .await
-        .unwrap();
-
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
+    let rows = db.get_active_endpoints(ts(0)).await.expect("active");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.endpoint.id, EndpointId::new(1));
     assert_eq!(row.endpoint.host, "1.2.3.4");
-    assert_eq!(row.protocols.len(), 2);
-    assert_eq!(row.protocols[0].proto_kind, "vmess"); // row order (no sort)
-    assert_eq!(row.protocols[1].proto_kind, "vless");
+    assert_eq!(row.endpoint.port, 443);
+    assert_eq!(row.links.len(), 2, "links carried per endpoint");
+    assert_eq!(row.protocols.len(), 2, "protocols map built from links");
+    assert!(row.protocols.contains_key(&ProtocolId::new(1001)));
+    assert!(row.protocols.contains_key(&ProtocolId::new(1002)));
+
+    // Newest link first (untested tier, recency order).
+    assert_eq!(row.links[0].protocol_id, ProtocolId::new(1002));
+    assert_eq!(row.links[1].protocol_id, ProtocolId::new(1001));
+
+    let (link, proto) = row.active_protocol().expect("active protocol");
+    assert_eq!(link.protocol_id, ProtocolId::new(1002));
+    assert_eq!(proto.proto_kind, ProtocolKind::Vless);
 }
 
 #[tokio::test]
-async fn test_subscription_upsert_idempotent() {
+async fn rows_are_sorted_by_test_priority() {
     let db = test_db().await;
-    let gid = "sub";
-    db.insert_group(&test_group(gid)).await.unwrap();
+    let mut conn = db.connection().await.expect("connection");
 
-    let ep = make_endpoint("10.0.0.1", 80);
-    let proto = make_protocol(ep.id, "trojan", 2001);
-
-    // First insert
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
-        .await
-        .unwrap();
-    let row1 = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row1.protocols.len(), 1);
-    let first_seen = row1.protocols[0].last_seen_at;
-
-    // Same subscription again → last_seen_at updated, no new rows
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
-        .await
-        .unwrap();
-    let row2 = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row2.protocols.len(), 1); // no duplicate
-    assert!(row2.protocols[0].last_seen_at >= first_seen); // timestamp bumped
-}
-
-#[tokio::test]
-async fn test_active_vs_stale() {
-    let db = test_db().await;
-    let gid = "test";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let now = 5000i64;
-    let ttl_secs = 3600i64; // 1 hour
-
-    // Active endpoint: last_seen_at = now (recent)
-    let active_ep = make_endpoint("5.6.7.8", 443);
-    let active_proto = ProtocolRow {
-        last_seen_at: now,
-        ..make_protocol(active_ep.id, "ss", 3001)
-    };
-    db.subscription_upsert(gid, &[(active_ep.clone(), vec![active_proto])])
-        .await
-        .unwrap();
-
-    // Stale endpoint: last_seen_at = now - 2*ttl (old)
-    let stale_ep = make_endpoint("9.10.11.12", 80);
-    let stale_proto = ProtocolRow {
-        last_seen_at: now - 2 * ttl_secs,
-        ..make_protocol(stale_ep.id, "socks", 4001)
-    };
-    db.subscription_upsert(gid, &[(stale_ep.clone(), vec![stale_proto])])
-        .await
-        .unwrap();
-
-    // Active query: should only return active_ep
-    let active_rows = db.get_active_endpoints(now - ttl_secs).await.unwrap();
-    assert!(
-        active_rows.iter().any(|r| r.endpoint.id == active_ep.id),
-        "active endpoint should be in active view"
-    );
-    let stale_rows = db
-        .get_stale_endpoints(now - ttl_secs, -999_999)
-        .await
-        .unwrap();
-    assert!(
-        !stale_rows.iter().any(|r| r.endpoint.id == active_ep.id),
-        "active endpoint should NOT be in stale view"
-    );
-
-    let stale_rows = db
-        .get_stale_endpoints(now - ttl_secs, -999_999)
-        .await
-        .unwrap();
-    assert!(
-        stale_rows.iter().any(|r| r.endpoint.id == stale_ep.id),
-        "stale endpoint should be in stale view"
-    );
-    assert!(
-        !stale_rows.iter().any(|r| r.endpoint.id == active_ep.id),
-        "active endpoint should NOT be in stale view"
-    );
-
-    // Update stale endpoint → becomes active again
-    db.restore_endpoint(stale_ep.id).await.unwrap();
-    let active_after = db.get_active_endpoints(now - ttl_secs).await.unwrap();
-    assert!(
-        active_after.iter().any(|r| r.endpoint.id == stale_ep.id),
-        "restored endpoint should be in active view"
-    );
-}
-
-#[tokio::test]
-async fn test_undefined_endpoint() {
-    let db = test_db().await;
-    let gid = "def";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    // Exotic config → empty host, port 0, host_type="undefined"
-    let uid = stable_hash("undefined", "exotic-uid-123");
-    let ep = Endpoint {
-        id: uid,
-        host: String::new(),
-        host_type: "undefined".to_string(),
-        port: 0,
-        ..make_endpoint("", 0)
-    };
-    let proto = make_protocol(ep.id, "custom", 5001);
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto])])
-        .await
-        .unwrap();
-
-    let row = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row.endpoint.host_type, "undefined");
-    assert_eq!(row.endpoint.host, "");
-    assert_eq!(row.endpoint.port, 0);
-}
-
-#[tokio::test]
-async fn test_two_sources_same_endpoint() {
-    let db = test_db().await;
-    let gid1 = "source-a";
-    let gid2 = "source-b";
-    db.insert_group(&test_group(gid1)).await.unwrap();
-    db.insert_group(&test_group(gid2)).await.unwrap();
-
-    let ep = make_endpoint("192.168.1.1", 8080);
-    let proto = make_protocol(ep.id, "vmess", 6001);
-
-    // Insert same endpoint from source A
-    db.subscription_upsert(gid1, &[(ep.clone(), vec![proto.clone()])])
-        .await
-        .unwrap();
-
-    // Insert same endpoint from source B
-    db.subscription_upsert(gid2, &[(ep.clone(), vec![proto.clone()])])
-        .await
-        .unwrap();
-
-    // One EndpointRow
-    let row = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row.endpoint.host, "192.168.1.1");
-    assert_eq!(row.protocols.len(), 1);
-
-    // Two EndpointGroup rows
-    let from_a = db
-        .get_active_endpoints_by_group("source-a", 0)
-        .await
-        .unwrap();
-    let from_b = db
-        .get_active_endpoints_by_group("source-b", 0)
-        .await
-        .unwrap();
-    assert!(
-        from_a.iter().any(|r| r.endpoint.id == ep.id),
-        "endpoint in source-a"
-    );
-    assert!(
-        from_b.iter().any(|r| r.endpoint.id == ep.id),
-        "endpoint in source-b"
-    );
-}
-
-#[tokio::test]
-async fn test_manual_override() {
-    let db = test_db().await;
-    let gid = "ovr";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let ep = make_endpoint("10.10.10.10", 53);
-    let proto1 = make_protocol(ep.id, "vmess", 7001);
-    let proto2 = make_protocol(ep.id, "trojan", 7002);
-
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto1, proto2])])
-        .await
-        .unwrap();
-
-    // Auto-select: vmess (rank 1) before trojan (rank 3)
-    let row_before = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row_before.selected_protocol, 0); // first = vmess
-    assert_eq!(
-        row_before.protocols[row_before.selected_protocol].proto_kind,
-        "vmess"
-    );
-
-    // Set manual override to protocol id 7002 (trojan)
-    db.set_protocol_override(ep.id, 7002).await.unwrap();
-    let row_after = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row_after.endpoint.manual_protocol_override, Some(7002));
-
-    // Clear override
-    db.clear_protocol_override(ep.id).await.unwrap();
-    let row_cleared = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row_cleared.endpoint.manual_protocol_override, None);
-}
-
-#[tokio::test]
-async fn test_sub_table_sorted_newest_first() {
-    let db = test_db().await;
-    let gid = "sort";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let ep = make_endpoint("10.10.10.11", 443);
-    let mut proto_old = make_protocol(ep.id, "vmess", 8001);
-    let mut proto_new = make_protocol(ep.id, "trojan", 8002);
-    proto_old.last_seen_at = 1000;
-    proto_new.last_seen_at = 9000;
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto_old, proto_new])])
-        .await
-        .unwrap();
-
-    let row = db.get_endpoint(ep.id).await.unwrap().unwrap();
-    assert_eq!(row.protocols.len(), 2);
-    assert_eq!(
-        row.protocols[0].id, 8002,
-        "newest variant must be on top of the sub-table"
-    );
-    assert_eq!(row.protocols[1].id, 8001);
-}
-
-#[tokio::test]
-async fn test_hard_delete_cascade() {
-    let db = test_db().await;
-    let gid = "purge";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let retention_secs = 86400i64; // 1 day
-    let now = 100_000i64;
-
-    let ep = make_endpoint("1.1.1.1", 1111);
-    let proto = ProtocolRow {
-        last_seen_at: now - 2 * retention_secs, // past retention
-        ..make_protocol(ep.id, "vmess", 8001)
-    };
-    db.insert_manual_endpoint(&ep, &proto, gid).await.unwrap();
-    // Verify endpoint exists
-    assert!(
-        db.get_endpoint(ep.id).await.unwrap().is_some(),
-        "endpoint should exist before purge"
-    );
-
-    // Purge past retention
-    let deleted = db.purge_expired(now - retention_secs).await.unwrap();
-    assert!(deleted > 0, "should delete endpoint past retention");
-
-    // Verify gone
-    assert!(
-        db.get_endpoint(ep.id).await.unwrap().is_none(),
-        "endpoint should be deleted after purge"
-    );
-}
-
-#[tokio::test]
-async fn test_resolve_endpoint_dns() {
-    let db = test_db().await;
-    let gid = "dns";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    // Create a DnsName endpoint
-    let host = "example.com";
-    let dns_id = stable_hash(host, 443);
-    let dns_ep = Endpoint {
-        id: dns_id,
-        host: host.to_string(),
-        host_type: "dns".to_string(),
-        port: 443,
-        parent_id: None,
-        ..make_endpoint(host, 443)
-    };
-    let proto = make_protocol(dns_id, "vmess", 9001);
-    db.insert_manual_endpoint(&dns_ep, &proto, gid)
-        .await
-        .unwrap();
-
-    // Resolve DNS (in test, may fail if no network — still check structure)
-    let resolved = db.resolve_endpoint_dns(dns_id, host).await;
-    match resolved {
-        Ok(ips) => {
-            // Child endpoints (parent_id = dns_id) are created per resolved IP
-            let children = db
-                .endpoints_by_parent(dns_id)
-                .await
-                .expect("query child endpoints");
-            let child_ips: Vec<String> = children.iter().map(|e| e.host.clone()).collect();
-            for ip in &ips {
-                assert!(
-                    child_ips.contains(&ip.to_string()),
-                    "{ip} should have a child endpoint"
-                );
-            }
-        }
-        Err(_) => {
-            // DNS may fail without network — skip structural assertion
-            eprintln!("DNS resolution failed (expected without network)");
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_stale_count_and_view() {
-    let db = test_db().await;
-    let gid = "cnt";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let now = 9999i64;
-    let ep1 = make_endpoint("10.0.0.1", 100);
-    let ep2 = make_endpoint("10.0.0.2", 200);
-
-    // ep1 = active, ep2 = stale
-    db.subscription_upsert(
-        gid,
-        &[(
-            ep1.clone(),
-            vec![ProtocolRow {
-                last_seen_at: now,
-                ..make_protocol(ep1.id, "vmess", 101)
-            }],
-        )],
+    seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
+    // fast-ok with the best latency.
+    seed_link_latency(&mut conn, 1, 1002, 20, Some(Latency::Fast { delay: 5 })).await;
+    // real-ok (tier 0 beats tier 1 regardless of latency).
+    seed_link_latency(
+        &mut conn,
+        1,
+        1003,
+        30,
+        Some(Latency::Real {
+            delay: 200,
+            ip: None,
+        }),
     )
-    .await
-    .unwrap();
+    .await;
 
-    db.subscription_upsert(
-        gid,
-        &[(
-            ep2.clone(),
-            vec![ProtocolRow {
-                last_seen_at: now - 7200,
-                ..make_protocol(ep2.id, "ss", 102)
-            }],
-        )],
+    let rows = db.get_active_endpoints(ts(0)).await.expect("active");
+    let row = &rows[0];
+    let order: Vec<i64> = row.links.iter().map(|l| l.protocol_id.get()).collect();
+    assert_eq!(order, vec![1003, 1002, 1001], "real-ok, fast-ok, untested");
+}
+
+#[tokio::test]
+async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    seed_endpoint(
+        &mut conn,
+        1,
+        1001,
+        "unresolved.example",
+        HostType::Dns,
+        443,
+        10,
     )
+    .await;
+    seed_link_latency(
+        &mut conn,
+        1,
+        1002,
+        20,
+        Some(Latency::Real { delay: 5, ip: None }),
+    )
+    .await;
+
+    let rows = db.get_active_endpoints(ts(0)).await.expect("active");
+    let row = &rows[0];
+    assert_eq!(
+        row.best_test_priority_key(true).expect("key").0,
+        5,
+        "dns-unresolved dominates every link tier"
+    );
+}
+
+#[tokio::test]
+async fn manual_override_shapes_active_link() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    seed_endpoint(&mut conn, 1, 1001, "10.10.10.10", HostType::Ipv4, 53, 10).await;
+    seed_link(&mut conn, 1, 1002, 20).await;
+
+    let row = db.get_endpoint(EndpointId::new(1)).await.expect("row");
+    let mut row = row.expect("row");
+    assert_eq!(
+        row.active_link().expect("link").protocol_id,
+        ProtocolId::new(1002)
+    );
+
+    // Override selects the older protocol.
+    toasty::update!(row.endpoint {
+        manual_protocol_override: Some(ProtocolId::new(1001)),
+    })
+    .exec(&mut conn)
     .await
-    .unwrap();
-
-    let count = db.get_stale_count(now - 3600, 0).await.unwrap();
-    assert_eq!(count, 1, "only ep2 should be stale");
-}
-
-// ── Task 14 — update_last_used refreshes last_seen_at ────────────────────
-
-#[tokio::test]
-async fn test_update_last_used_refreshes_last_seen_at() {
-    let db = test_db().await;
-    let gid = "touch";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let now = 10_000i64;
-    let stale_seen = now - 100_000; // pre-update last_seen_at (7+ days stale)
-
-    let ep = make_endpoint("203.0.113.7", 443);
-    let proto = ProtocolRow {
-        last_seen_at: stale_seen,
-        ..make_protocol(ep.id, "vmess", 7003)
-    };
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
-        .await
-        .unwrap();
-
-    // Threshold just above the pre-update last_seen_at: profile is stale
-    // until a connect refreshes it.
-    let before = db.get_active_endpoints(stale_seen + 1).await.unwrap();
-    assert!(
-        !before.iter().any(|r| r.endpoint.id == ep.id),
-        "untouched profile with stale last_seen_at must NOT be active"
-    );
-
-    // Connect: update_last_used must refresh last_seen_at, not just last_used_at.
-    db.update_last_used(proto.id, now).await.unwrap();
-    let active = db.get_active_endpoints(stale_seen + 1).await.unwrap();
-    assert!(
-        active.iter().any(|r| r.endpoint.id == ep.id),
-        "touched profile must count as active (last_seen_at refreshed)"
-    );
-}
-
-// ── Task 2.2 — Cross-subscription dedup, system groups, concurrent upsert ────
-
-#[tokio::test]
-async fn test_cross_subscription_dedup_different_protocols() {
-    let db = test_db().await;
-    let gid1 = "src-a";
-    let gid2 = "src-b";
-    db.insert_group(&test_group(gid1)).await.unwrap();
-    db.insert_group(&test_group(gid2)).await.unwrap();
-
-    // Same host:port → same stable_hash → same endpoint id
-    let ep = make_endpoint("203.0.113.5", 8443);
-    let proto_a = make_protocol(ep.id, "vmess", 10001);
-    let proto_b = make_protocol(ep.id, "trojan", 10002);
-
-    // Source A inserts endpoint with vmess protocol
-    db.subscription_upsert(gid1, &[(ep.clone(), vec![proto_a])])
-        .await
-        .unwrap();
-
-    // Source B inserts same host:port with a different protocol (trojan)
-    db.subscription_upsert(gid2, &[(ep.clone(), vec![proto_b])])
-        .await
-        .unwrap();
-
-    // Verify: one endpoint row with two protocols
+    .expect("set override");
     let row = db
-        .get_endpoint(ep.id)
+        .get_endpoint(EndpointId::new(1))
         .await
-        .unwrap()
-        .expect("endpoint should exist");
-    assert_eq!(row.endpoint.host, "203.0.113.5");
-    assert_eq!(row.endpoint.port, 8443);
+        .expect("row")
+        .expect("row");
     assert_eq!(
-        row.protocols.len(),
-        2,
-        "should have protocols from both sources"
+        row.active_link().expect("link").protocol_id,
+        ProtocolId::new(1001)
     );
+    assert_eq!(
+        row.endpoint.manual_protocol_override,
+        Some(ProtocolId::new(1001))
+    );
+}
 
-    // Both groups have the endpoint linked
-    let from_a = db.get_active_endpoints_by_group(gid1, 0).await.unwrap();
-    let from_b = db.get_active_endpoints_by_group(gid2, 0).await.unwrap();
+// ── Active / stale windows ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn active_and_stale_windows() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let now = 5_000i64;
+
+    seed_endpoint(&mut conn, 1, 1001, "5.6.7.8", HostType::Ipv4, 443, now).await;
+    seed_endpoint(
+        &mut conn,
+        2,
+        2001,
+        "9.10.11.12",
+        HostType::Ipv4,
+        80,
+        now - 7_200,
+    )
+    .await;
+
+    let active = db
+        .get_active_endpoints(ts(now - 3_600))
+        .await
+        .expect("active");
+    let active_ids: Vec<i64> = active.iter().map(|r| r.endpoint.id.get()).collect();
+    assert_eq!(active_ids, vec![1]);
+
+    let stale = db
+        .get_stale_endpoints(ts(now - 3_600), ts(now - 7_200))
+        .await
+        .expect("stale");
+    let stale_ids: Vec<i64> = stale.iter().map(|r| r.endpoint.id.get()).collect();
+    assert_eq!(stale_ids, vec![2]);
+
+    let count = db
+        .get_stale_count(ts(now - 3_600), ts(now - 7_200))
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
+}
+
+// ── Group filter ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn group_filter_selects_by_group_membership() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    seed_endpoint(&mut conn, 1, 1001, "192.168.1.1", HostType::Ipv4, 8080, 100).await;
+
+    // Link endpoint 1 to two groups.
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "source-a".to_string(),
+        last_seen_at: ts(100),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("link group a");
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "source-b".to_string(),
+        last_seen_at: ts(100),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("link group b");
+
+    let from_a = db
+        .get_active_endpoints_by_group("source-a", ts(0))
+        .await
+        .expect("group a");
+    let from_b = db
+        .get_active_endpoints_by_group("source-b", ts(0))
+        .await
+        .expect("group b");
+    let from_c = db
+        .get_active_endpoints_by_group("source-c", ts(0))
+        .await
+        .expect("group c");
+    assert_eq!(from_a.len(), 1);
+    assert_eq!(from_a[0].endpoint.id, EndpointId::new(1));
+    assert_eq!(from_b.len(), 1);
+    assert!(from_c.is_empty(), "unlinked group matches nothing");
+}
+
+// ── Single-row lookups ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_endpoint_and_get_by_protocol_id() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    seed_endpoint(&mut conn, 7, 3001, "10.0.0.1", HostType::Ipv4, 53, 100).await;
+
+    let row = db.get_endpoint(EndpointId::new(7)).await.expect("get");
+    assert_eq!(row.as_ref().expect("row").endpoint.host, "10.0.0.1");
+    assert_eq!(row.unwrap().links.len(), 1);
+
+    let by_proto = db
+        .get_endpoint_by_protocol_id(ProtocolId::new(3001))
+        .await
+        .expect("by protocol");
+    assert_eq!(by_proto.expect("row").endpoint.id, EndpointId::new(7));
+
     assert!(
-        from_a.iter().any(|r| r.endpoint.id == ep.id),
-        "endpoint linked to source-a"
+        db.get_endpoint(EndpointId::new(999))
+            .await
+            .expect("missing")
+            .is_none()
     );
     assert!(
-        from_b.iter().any(|r| r.endpoint.id == ep.id),
-        "endpoint linked to source-b"
+        db.get_endpoint_by_protocol_id(ProtocolId::new(9999))
+            .await
+            .expect("missing")
+            .is_none()
     );
 }
 
 #[tokio::test]
-async fn test_system_group_created_on_init() {
+async fn endpoints_by_parent_orders_by_id() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    toasty::create!(Endpoint {
+        id: EndpointId::new(50),
+        host: "dns.example".to_string(),
+        host_type: HostType::Dns,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("parent");
+    for (id, ip) in [(51, "1.1.1.1"), (52, "2.2.2.2")] {
+        toasty::create!(Endpoint {
+            id: EndpointId::new(id),
+            host: ip.to_string(),
+            host_type: HostType::Ipv4,
+            port: 443,
+            ports: Vec::<u16>::new(),
+            parent_id: Some(EndpointId::new(50)),
+            resolved_as: Vec::<String>::new(),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("child");
+    }
+
+    let children = db
+        .endpoints_by_parent(EndpointId::new(50))
+        .await
+        .expect("children");
+    let ids: Vec<i64> = children.iter().map(|e| e.id.get()).collect();
+    assert_eq!(ids, vec![51, 52]);
+}
+
+// ── Newtype columns ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn newtype_ids_roundtrip_through_reads() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    let ep_id = EndpointId::new(424_242);
+    let proto_id = ProtocolId::new(1_001_001);
+    seed_endpoint(
+        &mut conn,
+        ep_id.get(),
+        proto_id.get(),
+        "1.1.1.1",
+        HostType::Ipv4,
+        443,
+        50,
+    )
+    .await;
+
+    let row = db.get_endpoint(ep_id).await.expect("get").expect("row");
+    assert_eq!(row.endpoint.id, ep_id);
+    assert_eq!(row.links[0].protocol_id, proto_id);
+    let proto = row.protocols.get(&proto_id).expect("protocol in map");
+    assert_eq!(proto.id, proto_id);
+
+    let by_proto = db
+        .get_endpoint_by_protocol_id(proto_id)
+        .await
+        .expect("by protocol")
+        .expect("row");
+    assert_eq!(by_proto.endpoint.id, ep_id);
+}
+
+// ── Groups ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn default_group_created_on_init() {
     let db = test_db().await;
 
-    // in_memory() calls init_default_groups which creates a "Default" group
-    let groups = db.get_all_groups().await.unwrap();
+    let groups = db.get_all_groups().await.expect("groups");
     assert!(!groups.is_empty(), "should have at least the default group");
 
-    // Verify there is exactly one default group (idempotent init)
-    let default_groups: Vec<_> = groups
+    let default_groups: Vec<&Group> = groups
         .iter()
         .filter(|g| g.name.as_deref() == Some("Default"))
         .collect();
     assert_eq!(default_groups.len(), 1, "exactly one Default group");
-    assert!(
-        default_groups[0].sort_order == Some(0),
-        "default group has sort_order 0"
-    );
+    assert_eq!(default_groups[0].sort_order, Some(0));
 }
 
 #[tokio::test]
-async fn test_concurrent_subscription_upsert() {
+async fn groups_due_update_respects_refresh_interval() {
     let db = test_db().await;
-    let gid = "concurrent";
-    db.insert_group(&test_group(gid)).await.unwrap();
+    let mut conn = db.connection().await.expect("connection");
+    let now = Timestamp::now();
+    let hour_ago = now
+        .checked_sub(jiff::Span::new().hours(1))
+        .expect("subtract");
 
-    // 10 sequential upserts of different endpoints into the same group.
-    // (Parallel SQLite writes from separate connections require per-connection
-    // busy_timeout which the internal connection setup doesn't propagate.)
-    for i in 0..10 {
-        let host = format!("192.0.2.{}", i + 1);
-        let port = 1000 + i32::try_from(i).expect("test loop index fits in i32");
-        let ep = make_endpoint(&host, port);
-        let proto = make_protocol(ep.id, "vmess", 20000 + i);
-        let ids = db
-            .subscription_upsert(gid, &[(ep, vec![proto])])
-            .await
-            .expect("upsert should succeed");
-        assert_eq!(ids.len(), 1, "upsert {i} returned 1 id");
-    }
+    // Due: never refreshed.
+    toasty::create!(Group {
+        id: "g-never".to_string(),
+        name: Some("never".to_string()),
+        url: Some("https://example.com/sub".to_string()),
+        enabled: true,
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group");
 
-    // All 10 endpoints exist in the group
-    let endpoints = db.get_active_endpoints_by_group(gid, 0).await.unwrap();
-    assert_eq!(endpoints.len(), 10, "all 10 endpoints should exist");
+    // Due: refreshed 1h ago with a 30-minute interval.
+    toasty::create!(Group {
+        id: "g-due".to_string(),
+        name: Some("due".to_string()),
+        url: Some("https://example.com/sub2".to_string()),
+        enabled: true,
+        refresh_interval: Some(30),
+        last_refreshed: Some(hour_ago),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group");
+
+    // Not due: refreshed now.
+    toasty::create!(Group {
+        id: "g-fresh".to_string(),
+        name: Some("fresh".to_string()),
+        url: Some("https://example.com/sub3".to_string()),
+        enabled: true,
+        last_refreshed: Some(now),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group");
+
+    // Not due: disabled.
+    toasty::create!(Group {
+        id: "g-off".to_string(),
+        name: Some("off".to_string()),
+        url: Some("https://example.com/sub4".to_string()),
+        enabled: false,
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group");
+
+    // Not due: no url.
+    toasty::create!(Group {
+        id: "g-nourl".to_string(),
+        name: Some("nourl".to_string()),
+        url: None,
+        enabled: true,
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group");
+
+    let due = db.get_groups_due_update().await.expect("due");
+    let mut due_ids: Vec<&str> = due.iter().map(|g| g.id.as_str()).collect();
+    due_ids.sort_unstable();
+    assert_eq!(due_ids, vec!["g-due", "g-never"]);
 }
 
-// ── last_used_at + DNS resolution columns ──────────────────────────────
+// ── Routing rules + DNS settings ────────────────────────────────────────
 
-/// Gate test for toasty 0.9 upsert semantics: `subscription_upsert` omits
-/// `last_used_at` from the builder, so a re-upsert of the same protocol must
-/// NOT clobber a value written by `update_last_used`.
 #[tokio::test]
-async fn test_last_used_survives_subscription_upsert() {
+async fn routing_rules_and_dns_settings_roundtrip() {
     let db = test_db().await;
-    let gid = "gate";
-    db.insert_group(&test_group(gid)).await.unwrap();
+    let mut conn = db.connection().await.expect("connection");
 
-    let ep = make_endpoint("192.0.2.10", 443);
-    let proto = make_protocol(ep.id, "vmess", 30001);
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto.clone()])])
-        .await
-        .unwrap();
+    assert!(db.get_dns_settings().await.expect("empty").is_none());
 
-    // Mark as used
-    db.update_last_used(proto.id, 777_000).await.unwrap();
+    toasty::create!(DnsSetting {
+        id: "dns-1".to_string(),
+        name: Some("main".to_string()),
+        servers: ["1.1.1.1".to_string()],
+        hosts: Vec::<String>::new(),
+        disable_cache: true,
+        disable_fallback: false,
+    })
+    .exec(&mut conn)
+    .await
+    .expect("dns setting");
 
-    // Re-upsert from a subscription refresh
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto])])
-        .await
-        .unwrap();
+    let dns = db.get_dns_settings().await.expect("dns").expect("row");
+    assert_eq!(dns.servers, vec!["1.1.1.1".to_string()]);
+    assert!(dns.disable_cache);
 
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(
-        row.protocols[0].last_used_at,
-        Some(777_000),
-        "subscription re-upsert must not clobber last_used_at"
-    );
+    toasty::create!(RoutingRule {
+        id: "rule-1".to_string(),
+        r#type: 0,
+        domains: ["example.com".to_string()],
+        ips: Vec::<String>::new(),
+        inbound_tags: Vec::<String>::new(),
+        ports: [443],
+        source_ports: Vec::<u16>::new(),
+        protocols: Vec::<String>::new(),
+        sort_order: Some(2),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("routing rule");
+
+    let rules = db.get_all_routing_rules().await.expect("rules");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].domains, vec!["example.com".to_string()]);
+    assert_eq!(rules[0].ports, vec![443]);
 }
 
-#[tokio::test]
-async fn test_update_last_used_roundtrip() {
-    let db = test_db().await;
-    let gid = "lu";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let ep = make_endpoint("192.0.2.11", 443);
-    let proto = make_protocol(ep.id, "trojan", 30002);
-    db.insert_manual_endpoint(&ep, &proto, gid).await.unwrap();
-
-    // Fresh insert leaves last_used_at NULL
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(row.protocols[0].last_used_at, None);
-
-    db.update_last_used(proto.id, 555_000).await.unwrap();
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(row.protocols[0].last_used_at, Some(555_000));
-}
-
-#[tokio::test]
-async fn test_update_endpoint_resolution_roundtrip() {
-    let db = test_db().await;
-    let gid = "res";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let ep = Endpoint {
-        host_type: "dns".to_string(),
-        ..make_endpoint("example.com", 443)
-    };
-    let proto = make_protocol(ep.id, "vmess", 30003);
-    db.insert_manual_endpoint(&ep, &proto, gid).await.unwrap();
-
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(row.endpoint.resolved_as, None);
-
-    db.update_endpoint_resolution(ep.id, Some("1.2.3.4,2606:4700::1"), Some(999_000))
-        .await
-        .unwrap();
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(
-        row.endpoint.resolved_as.as_deref(),
-        Some("1.2.3.4,2606:4700::1")
-    );
-    assert_eq!(row.endpoint.resolved_at, Some(999_000));
-
-    // Clearing (failed lookup) sets both back to NULL
-    db.update_endpoint_resolution(ep.id, None, None)
-        .await
-        .unwrap();
-    let row = db.get_endpoint(ep.id).await.unwrap().expect("endpoint");
-    assert_eq!(row.endpoint.resolved_as, None);
-    assert_eq!(row.endpoint.resolved_at, None);
-}
-
-// ── get_batch_for_real_ping dedup flag ─────────────────────────────────
-
-#[tokio::test]
-async fn test_get_batch_for_real_ping_dedup_flag() {
-    let db = test_db().await;
-    let gid = "batch";
-    db.insert_group(&test_group(gid)).await.unwrap();
-
-    let ep = make_endpoint("192.0.2.20", 443);
-    let proto1 = make_protocol(ep.id, "vmess", 30011);
-    let proto2 = make_protocol(ep.id, "vless", 30012);
-    db.subscription_upsert(gid, &[(ep.clone(), vec![proto1.clone(), proto2.clone()])])
-        .await
-        .unwrap();
-
-    let batch = "batch-1";
-    let n = db
-        .create_ping_batch(batch, None, Some(&[(proto1.id, 0), (proto2.id, 1)]))
-        .await
-        .unwrap();
-    assert_eq!(n, 2, "both protocols queued");
-
-    // Promote both fast sessions to real (what the sieve does on fast success)
-    let sessions = db.get_ping_sessions(batch).await.unwrap();
-    assert_eq!(sessions.len(), 2);
-    for s in &sessions {
-        db.update_session_ping_type(&s.id, "real", "queued")
-            .await
-            .unwrap();
-    }
-
-    // Mark proto1's session completed (same address+port endpoint)
-    let s1 = sessions
-        .iter()
-        .find(|s| s.protocol_id == proto1.id)
-        .expect("proto1 session");
-    db.batch_flush_ping_buffer(
-        batch,
-        &[xray_tui_db::models::PingResultUpdate {
-            session_id: s1.id.clone(),
-            protocol_id: proto1.id,
-            status: "completed".to_string(),
-            ping_type: "real".to_string(),
-            latency_ms: None,
-            speed_bps: None,
-            ip_info: None,
-            error: None,
-        }],
-        &[],
-    )
+/// Seed a protocol + link with an explicit latency value.
+async fn seed_link_latency(
+    conn: &mut toasty::Connection,
+    endpoint_id: i64,
+    protocol_id: i64,
+    last_seen: i64,
+    latency: Option<Latency>,
+) {
+    toasty::create!(Protocol {
+        id: ProtocolId::new(protocol_id),
+        sig: protocol_id,
+        cred_hash: 0,
+        proto_kind: ProtocolKind::Vless,
+        transport: tcp_transport(),
+        security: no_security(),
+        config: Deferred::from(Json(vless_config())),
+    })
+    .exec(conn)
     .await
-    .unwrap();
+    .expect("create protocol");
 
-    // dedup=true: proto2's session is hidden (its endpoint already completed)
-    let with_dedup = db
-        .get_batch_for_real_ping(batch, 2, 10, true)
-        .await
-        .unwrap();
-    assert_eq!(with_dedup.len(), 0, "dedup hides same-endpoint sessions");
-
-    // dedup=false: both sessions visible again (endpoint-scoped batch)
-    let without_dedup = db
-        .get_batch_for_real_ping(batch, 2, 10, false)
-        .await
-        .unwrap();
-    assert_eq!(
-        without_dedup.len(),
-        1,
-        "no-dedup returns the remaining queued"
-    );
-    assert_eq!(without_dedup[0].protocol_id, proto2.id);
-}
-
-// ── Task 16 — delete_group removes orphaned profiles ────────────────────
-
-#[tokio::test]
-async fn test_delete_group_removes_orphaned_profiles() {
-    let db = test_db().await;
-    db.insert_group(&test_group("g1")).await.unwrap();
-    db.insert_group(&test_group("g2")).await.unwrap();
-
-    // g1 owns ep1 (two protocols); g2 owns ep2; ep3 is shared by both.
-    let ep1 = make_endpoint("1.2.3.4", 443);
-    db.subscription_upsert(
-        "g1",
-        &[(
-            ep1.clone(),
-            vec![
-                make_protocol(ep1.id, "vmess", 9001),
-                make_protocol(ep1.id, "vless", 9002),
-            ],
-        )],
-    )
+    toasty::create!(ProfileStats {
+        protocol_id: ProtocolId::new(protocol_id),
+        endpoint_id: EndpointId::new(endpoint_id),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_seen_at: ts(last_seen),
+        latency,
+        task_queue: Vec::<u16>::new(),
+        traffic: zero_traffic(),
+    })
+    .exec(conn)
     .await
-    .unwrap();
-
-    let ep2 = make_endpoint("5.6.7.8", 443);
-    db.subscription_upsert(
-        "g2",
-        &[(ep2.clone(), vec![make_protocol(ep2.id, "ss", 9003)])],
-    )
-    .await
-    .unwrap();
-
-    let ep3 = make_endpoint("9.9.9.9", 443);
-    db.subscription_upsert(
-        "g1",
-        &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])],
-    )
-    .await
-    .unwrap();
-    db.subscription_upsert(
-        "g2",
-        &[(ep3.clone(), vec![make_protocol(ep3.id, "trojan", 9004)])],
-    )
-    .await
-    .unwrap();
-
-    // Delete g1 → ep1 becomes an orphan (no remaining group link), ep2 and
-    // shared ep3 must survive.
-    db.delete_group("g1").await.unwrap();
-
-    let all = db.get_active_endpoints(0).await.unwrap();
-    assert!(
-        !all.iter().any(|r| r.endpoint.id == ep1.id),
-        "g1-only profiles should be purged"
-    );
-    assert!(
-        all.iter().any(|r| r.endpoint.id == ep2.id),
-        "g2 profiles must remain"
-    );
-    assert!(
-        all.iter().any(|r| r.endpoint.id == ep3.id),
-        "profiles shared with another group must survive"
-    );
-}
-
-#[tokio::test]
-async fn test_delete_group_preserves_cleared_group_profiles() {
-    let db = test_db().await;
-    db.insert_group(&test_group("gA")).await.unwrap();
-    db.insert_group(&test_group("gB")).await.unwrap();
-
-    let ep_a = make_endpoint("1.1.1.1", 443);
-    db.subscription_upsert(
-        "gA",
-        &[(ep_a.clone(), vec![make_protocol(ep_a.id, "vmess", 9101)])],
-    )
-    .await
-    .unwrap();
-    let ep_b = make_endpoint("2.2.2.2", 443);
-    db.subscription_upsert(
-        "gB",
-        &[(ep_b.clone(), vec![make_protocol(ep_b.id, "ss", 9102)])],
-    )
-    .await
-    .unwrap();
-
-    // clear_group only unlinks — the profile stays in the All view.
-    let cleared = db.clear_group("gA").await.unwrap();
-    assert_eq!(cleared, 1, "one link removed");
-    assert!(
-        db.get_active_endpoints(0)
-            .await
-            .unwrap()
-            .iter()
-            .any(|r| r.endpoint.id == ep_a.id),
-        "cleared profile must remain after clear_group"
-    );
-
-    // Deleting an unrelated group must NOT purge the cleared profile (only
-    // endpoints whose sole link was the deleted group are purged).
-    db.delete_group("gB").await.unwrap();
-
-    let all = db.get_active_endpoints(0).await.unwrap();
-    assert!(
-        all.iter().any(|r| r.endpoint.id == ep_a.id),
-        "clear_group survivors must survive deleting another group"
-    );
-    assert!(
-        !all.iter().any(|r| r.endpoint.id == ep_b.id),
-        "deleted group's own profiles are purged"
-    );
+    .expect("create link");
 }

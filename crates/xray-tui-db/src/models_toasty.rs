@@ -1,350 +1,30 @@
+//! Toasty models for the typed data model (phase B).
+//!
+//! Seven tables replace the old nine: `endpoints`, `protocols`,
+//! `profile_stats` (per endpoint-protocol pair state), `endpoint_groups`
+//! (many-to-many link), `groups`, `routing_rules`, `dns_settings`.
+//! All values are typed — newtype ids, embedded enums/structs, jiff
+//! timestamps, deferred JSON config blobs — and every read in
+//! [`crate::database`] goes through the typed query API.
+
+use std::collections::HashMap;
+
+use jiff::Timestamp;
 use toasty::{Deferred, Json};
+use xray_tui_proto::proto_spec::common::TransportConfig;
+use xray_tui_proto::proto_spec::{
+    CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+};
 
-/// `ProfileExtension.delay_source` provenance values.
-pub const DELAY_SOURCE_FAST: i32 = 0;
-pub const DELAY_SOURCE_REAL: i32 = 1;
-pub const DELAY_SOURCE_UDP: i32 = 2;
-
-// ── Primary models (toasty ORM, mapped to DB tables) ────────────────────
-
-/// Endpoint: a network endpoint identified by host+port.
-#[derive(Debug, Clone, toasty::Model)]
-pub struct Endpoint {
-    #[key]
-    pub id: i64, // stable_hash(host, port) for known types; stable_hash("undefined", config_uid) for exotic
-    pub host: String,                  // canonical host string; empty for undefined
-    pub host_type: String,             // "ipv4" | "ipv6" | "dns" | "undefined"
-    pub port: i32,                     // primary port; 0 for undefined
-    pub port_spec_str: Option<String>, // full PortSpec when multi-port
-    pub parent_id: Option<i64>,        // resolved IP -> DnsName parent
-    pub last_source: Option<String>,   // hash of source subscription
-    pub created_at: i64,
-    pub manual_protocol_override: Option<i64>, // FK -> protocols.id, NULL = auto-select best
-    /// Cached DNS resolution of `host` for `host_type == "dns"`: comma-joined
-    /// IP strings ("`1.2.3.4,2606:4700::1`"). NULL = not resolved yet (deferred)
-    /// or host is an IP. Persisted so launches do not re-resolve.
-    pub resolved_as: Option<String>,
-    /// Unix secs of the `resolved_as` lookup. NULL = never / IP host.
-    pub resolved_at: Option<i64>,
-}
-
-/// `ProtocolRow`: a protocol configuration. Replaces Profile.
-/// PK = uid = sig ^ `cred_hash` (same as old Profile.id).
-#[derive(Debug, Clone, toasty::Model)]
-#[index(endpoint_id)]
-pub struct ProtocolRow {
-    #[key]
-    pub id: i64, // = uid = sig ^ cred_hash (same as old Profile.id)
-    pub endpoint_id: i64, // FK -> endpoints.id
-    pub sig: i64,
-    pub cred_hash: i64,
-    pub proto_kind: String,
-    pub spec_blob: Vec<u8>,
-    pub config_type: i32, // same semantics: 0 = share URL, 1 = form created
-    pub core_type: String,
-    pub transport: Option<String>,
-    pub security: Option<String>,
-    pub last_used_at: Option<i64>, // unix secs of last activation; None = never used
-    pub created_at: i64,
-    pub last_seen_at: i64, // per-config staleness tracking
-
-    #[belongs_to(key = endpoint_id, references = id)]
-    pub endpoint: Deferred<Option<Endpoint>>,
-
-    #[has_one]
-    pub extension: Deferred<Option<ProfileExtension>>,
-    #[has_one]
-    pub server_stat: Deferred<Option<ServerStat>>,
-}
-
-/// Many-to-many link between endpoints and groups.
-/// Replaces Connection (was `profile_id/group_id`, now `endpoint_id/group_id`).
-#[derive(Debug, Clone, toasty::Model)]
-#[unique(endpoint_id, group_id)]
-pub struct EndpointGroup {
-    #[key]
-    pub id: String, // UUID
-    pub endpoint_id: i64,  // -> endpoints.id
-    pub group_id: String,  // -> groups.id
-    pub last_seen_at: i64, // per-source last confirmation
-    pub sort_order: Option<i32>,
-
-    #[belongs_to(key = endpoint_id, references = id)]
-    pub endpoint: Deferred<Option<Endpoint>>,
-    #[belongs_to(key = group_id, references = id)]
-    pub group: Deferred<Option<Group>>,
-}
-
-/// Group: merged with old Subscription fields. Removed `is_system`.
-#[derive(Debug, Clone, toasty::Model)]
-pub struct Group {
-    #[key]
-    pub id: String,
-    pub name: Option<String>,
-    pub url: Option<String>,  // was subscription_url
-    pub enabled: Option<i32>, // was subscription_enabled
-    pub user_agent: Option<String>,
-    pub convert_target: Option<i32>,
-    pub core_type: Option<String>,
-    pub sort_order: Option<i32>,
-    pub last_refreshed: Option<String>, // from Subscription.last_updated
-    pub status: Option<String>,         // "ok" | "error" | "never" — from Subscription.status
-    pub error_message: Option<String>,  // from Subscription.error_message
-    pub refresh_interval: Option<i32>,  // from Subscription.update_interval
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-pub struct ProfileExtension {
-    #[key]
-    pub protocol_id: i64, // was profile_id
-
-    pub delay: Option<i32>,
-    pub speed: Option<i64>,
-    pub sort_order: Option<i32>,
-    pub ip_info: Option<String>,
-    /// Provenance of `delay`: `DELAY_SOURCE_FAST` / `DELAY_SOURCE_REAL` /
-    /// `DELAY_SOURCE_UDP`. `None` = no measurement recorded.
-    pub delay_source: Option<i32>,
-
-    #[belongs_to(key = protocol_id, references = id)]
-    pub protocol_row: Deferred<Option<ProtocolRow>>, // was protocol
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-pub struct ServerStat {
-    #[key]
-    pub protocol_id: i64, // was profile_id
-
-    pub today_up: Option<i64>,
-    pub today_down: Option<i64>,
-    pub total_up: Option<i64>,
-    pub total_down: Option<i64>,
-    pub last_updated: Option<String>,
-
-    #[belongs_to(key = protocol_id, references = id)]
-    pub protocol_row: Deferred<Option<ProtocolRow>>, // was protocol
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-pub struct RoutingRule {
-    #[key]
-    pub id: String,
-
-    pub group_id: Option<String>,
-    pub r#type: i32,
-    pub domain_matcher: Option<String>,
-    pub domains: Option<String>,
-    pub ips: Option<String>,
-    pub inbound_tags: Option<String>,
-    pub port: Option<String>,
-    pub source_ports: Option<String>,
-    pub network: Option<String>,
-    pub protocols: Option<String>,
-    pub domain_strategy: Option<String>,
-    pub outbound_tag: Option<String>,
-    pub balancer_tag: Option<String>,
-    pub rule_set_file: Option<String>,
-    pub rule_set_url: Option<String>,
-    pub sort_order: Option<i32>,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-pub struct DnsSetting {
-    #[key]
-    pub id: String,
-
-    pub name: Option<String>,
-    pub servers: Option<String>,
-    pub hosts: Option<String>,
-    pub query_strategy: Option<String>,
-    pub disable_cache: Option<i32>,
-    pub disable_fallback: Option<i32>,
-    pub client_ip: Option<String>,
-    /// TTL (secs) for the TUI-side DNS resolution cache; None = default 300.
-    pub cache_ttl_secs: Option<i64>,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[index(batch_id, status, ping_type)]
-pub struct PingSession {
-    #[key]
-    pub id: String,
-
-    pub batch_id: String,
-    pub protocol_id: i64, // was profile_id
-    pub config_type: i32,
-    pub core_type: String,
-    pub address: Option<String>,
-    pub port: Option<i32>,
-    pub triplet_rank: i32,
-    pub ping_type: String,
-    pub status: String,
-    pub latency_ms: Option<i32>,
-    pub speed_bps: Option<i64>,
-    pub ip_info: Option<String>,
-    pub error: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
-// ── Non-model types (plain structs for data passing) ─────────────────────
-
-/// Result update for a single ping session — used to batch-write to DB.
-#[derive(Debug, Clone)]
-pub struct PingResultUpdate {
-    pub session_id: String,
-    pub protocol_id: i64, // was profile_id
-    pub status: String,
-    pub ping_type: String,
-    pub latency_ms: Option<i32>,
-    pub speed_bps: Option<i64>,
-    pub ip_info: Option<String>,
-    pub error: Option<String>,
-}
-
-// ── Data-transfer types ──────────────────────────────────────────────────
-
-use std::collections::{HashMap, HashSet};
-
-/// An endpoint with all its protocols, extensions, and stats.
-#[derive(Debug, Clone)]
-pub struct EndpointRow {
-    pub endpoint: Endpoint,
-    pub protocols: Vec<ProtocolRow>,
-    pub extensions: HashMap<i64, ProfileExtension>,
-    pub stats: HashMap<i64, ServerStat>,
-    pub selected_protocol: usize,
-    pub expanded: bool,
-}
-
-impl EndpointRow {
-    /// Returns the currently active protocol row, respecting manual override.
-    /// Falls back to `selected_protocol` if override is unset or protocol not found.
-    #[must_use]
-    pub fn active_protocol(&self) -> &ProtocolRow {
-        // Check manual override first
-        if let Some(override_id) = self.endpoint.manual_protocol_override
-            && let Some(p) = self.protocols.iter().find(|p| p.id == override_id)
-        {
-            return p;
-        }
-        // Fall back to selected_protocol index
-        self.protocols
-            .get(self.selected_protocol)
-            .unwrap_or_else(|| &self.protocols[0])
-    }
-
-    /// Tier for one protocol under the test-priority model (lower = better):
-    /// 0 real-ok, 1 fast/udp-ok, 2 untested, 3 real-err, 4 fast-err,
-    /// 5 name/dns-unresolved. Fresh failures dominate stored successes.
-    fn protocol_test_tier(
-        delay: Option<i32>,
-        delay_source: Option<i32>,
-        dns_unresolved: bool,
-        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
-        pid: i64,
-    ) -> u8 {
-        if dns_unresolved {
-            5
-        } else if let Some((fast_failed, _)) = rounds
-            && fast_failed.contains(&pid)
-        {
-            4
-        } else if let Some((_, real_failed)) = rounds
-            && real_failed.contains(&pid)
-        {
-            3
-        } else if delay_source == Some(DELAY_SOURCE_REAL) {
-            0
-        } else if delay.is_some() {
-            1
-        } else {
-            2
-        }
-    }
-
-    /// Ascending sort key: `(tier, latency, recency, id)`. `recency` is
-    /// negated so newer `last_seen_at` sorts first on ties. Only success
-    /// tiers (0/1) rank by latency; untested and error/dns tiers use
-    /// `i32::MAX` so they order by recency then id (design spec: "stable"
-    /// within-tier key).
-    fn protocol_test_key(
-        p: &ProtocolRow,
-        ext: Option<&ProfileExtension>,
-        dns_unresolved: bool,
-        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
-    ) -> (u8, i32, i64, i64) {
-        let delay = ext.and_then(|e| e.delay);
-        let tier = Self::protocol_test_tier(
-            delay,
-            ext.and_then(|e| e.delay_source),
-            dns_unresolved,
-            rounds,
-            p.id,
-        );
-        let latency = if tier <= 1 {
-            delay.unwrap_or(i32::MAX)
-        } else {
-            i32::MAX
-        };
-        (tier, latency, -p.last_seen_at, p.id)
-    }
-
-    /// Re-sort `protocols` by test priority: real-ping success first, then
-    /// fast/TCP/UDP success (latency ascending), then untested (newest
-    /// `last_seen_at` first), then failures (real below fast below untested),
-    /// then DNS-unresolved endpoints at the bottom. Deterministic tiebreak by
-    /// protocol id. `rounds` is `(fast_failed, real_failed)`; `None` when no
-    /// session state exists.
-    pub fn sort_protocols_by_test_priority(
-        &mut self,
-        dns_unresolved: bool,
-        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
-    ) {
-        self.protocols.sort_by_key(|p| {
-            Self::protocol_test_key(p, self.extensions.get(&p.id), dns_unresolved, rounds)
-        });
-    }
-
-    /// The endpoint's representative sort key = its best (minimum) protocol
-    /// key — used by the main-table Test column sort.
-    #[must_use]
-    pub fn best_test_priority_key(
-        &self,
-        dns_unresolved: bool,
-        rounds: Option<(&HashSet<i64>, &HashSet<i64>)>,
-    ) -> (u8, i32, i64, i64) {
-        self.protocols
-            .iter()
-            .map(|p| Self::protocol_test_key(p, self.extensions.get(&p.id), dns_unresolved, rounds))
-            .min()
-            .unwrap_or((2, i32::MAX, 0, 0))
-    }
-}
-
-/// Three-way toggle for the Profiles tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PurgatoryView {
-    #[default]
-    Active,
-    Stale,
-    All,
-}
-
-// ── Typed embed types (Task 8's 7-table model rewrite) ──────────────────
+// ── Typed embed types ───────────────────────────────────────────────────
 //
 // Toasty embeds flatten into columns of the owning table (no separate
 // tables). Proto's typed configs are stored opaque as deferred JSON columns.
-// The legacy string/i32 columns in the models above stay until Task 8 removes
-// them; these types are added now and exercised by the scratch-model tests.
-
-use xray_tui_proto::proto_spec::common::TransportConfig;
-use xray_tui_proto::proto_spec::{SecurityConfig, SecurityType, TransportType};
 
 /// Endpoint id. Non-zero invariant — toasty has no `NonZero` column support,
 /// so the constructor enforces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
-pub struct EndpointId(pub i64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, toasty::Embed)]
+pub struct EndpointId(i64);
 
 impl EndpointId {
     /// Construct a new id. Panics (debug builds) when `v == 0`.
@@ -353,11 +33,17 @@ impl EndpointId {
         debug_assert!(v != 0, "EndpointId must be non-zero");
         Self(v)
     }
+
+    /// The raw column value.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
 }
 
 /// Protocol row id. Non-zero invariant — see [`EndpointId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
-pub struct ProtocolId(pub i64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, toasty::Embed)]
+pub struct ProtocolId(i64);
 
 impl ProtocolId {
     /// Construct a new id. Panics (debug builds) when `v == 0`.
@@ -365,6 +51,12 @@ impl ProtocolId {
     pub const fn new(v: i64) -> Self {
         debug_assert!(v != 0, "ProtocolId must be non-zero");
         Self(v)
+    }
+
+    /// The raw column value.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
     }
 }
 
@@ -482,132 +174,409 @@ pub enum Latency {
     },
 }
 
+// ── Primary models (toasty ORM, mapped to DB tables) ────────────────────
+
+/// Endpoint: a network endpoint identified by host+port.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "endpoints"]
+pub struct Endpoint {
+    #[key]
+    pub id: EndpointId, // stable_hash(host, port) for known types; stable_hash("undefined", config_uid) for exotic
+    pub host: String, // canonical host string; empty for undefined
+    pub host_type: HostType,
+    pub port: u16,                     // primary port; 0 for undefined
+    pub ports: Vec<u16>,               // full port spec; empty when single-port
+    pub parent_id: Option<EndpointId>, // resolved IP -> DnsName parent
+    pub last_source: Option<String>,   // hash of source subscription
+    /// Manual protocol override (FK -> protocols.id); NULL = auto-select best.
+    pub manual_protocol_override: Option<ProtocolId>,
+    /// Cached DNS resolution of `host` for `host_type == Dns`: the resolved
+    /// IP strings. Empty = not resolved yet or host is an IP. Persisted so
+    /// launches do not re-resolve.
+    pub resolved_as: Vec<String>,
+    /// Timestamp of the `resolved_as` lookup; NULL = never / IP host.
+    pub resolved_at: Option<Timestamp>,
+    #[auto]
+    pub created_at: Timestamp,
+    #[has_many]
+    pub links: Deferred<Vec<ProfileStats>>,
+    #[has_many]
+    pub group_links: Deferred<Vec<EndpointGroup>>,
+}
+
+/// `Protocol`: a protocol configuration. Replaces the old `ProtocolRow`.
+/// PK = uid = sig ^ `cred_hash` (same as old Profile.id).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "protocols"]
+pub struct Protocol {
+    #[key]
+    pub id: ProtocolId, // = uid = sig ^ cred_hash (protocol essentials only)
+    pub sig: i64,
+    pub cred_hash: i64,
+    pub proto_kind: ProtocolKind,
+    pub transport: Transport, // embed (T7): type + Deferred<Json<TransportConfig>>
+    pub security: Security,   // embed (T7): type/sni/fp/insecure + Deferred<Json<SecurityConfig>>
+    /// Full exact definition, sans host/port.
+    #[column(type = text)]
+    pub config: Deferred<Json<ProtocolConfig>>,
+    #[auto]
+    pub created_at: Timestamp,
+    #[has_many]
+    pub links: Deferred<Vec<ProfileStats>>,
+}
+
+/// Per endpoint-protocol pair state (replaces `ProtocolRow.last_seen_at` +
+/// `ProfileExtension` + `ServerStat`).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "profile_stats"]
+#[key(protocol_id, endpoint_id)]
+pub struct ProfileStats {
+    // Indexed so the `Endpoint::links` / `Protocol::links` has_many relations
+    // (and the batched `endpoint_id IN (...)` read) can use them.
+    #[index]
+    pub protocol_id: ProtocolId,
+    #[index]
+    pub endpoint_id: EndpointId,
+    pub core_type: CoreType, // per-pair override (resolved at parse, overridable)
+    pub config_type: ConfigType,
+    pub last_used_at: Option<Timestamp>,
+    pub last_seen_at: Timestamp,  // per-link staleness tracking
+    pub task_id: Option<u16>,     // current task slot; 0 never valid
+    pub task_queue: Vec<u16>,     // FIFO of queued task ids
+    pub latency: Option<Latency>, // embed enum, shared delay column
+    pub speed_bps: Option<i64>,
+    pub error: Option<ErrorInfo>, // persisted failure marker
+    pub traffic: TrafficStats,    // today/total up/down
+    #[auto]
+    pub created_at: Timestamp,
+    #[auto]
+    pub updated_at: Timestamp,
+    #[version]
+    pub version: u64, // optimistic concurrency
+    #[belongs_to(key = protocol_id, references = id)]
+    pub protocol: Deferred<Option<Protocol>>,
+    #[belongs_to(key = endpoint_id, references = id)]
+    pub endpoint: Deferred<Option<Endpoint>>,
+}
+
+/// Many-to-many link between endpoints and groups.
+/// Replaces Connection (was `profile_id/group_id`, now `endpoint_id/group_id`).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "endpoint_groups"]
+#[key(endpoint_id, group_id)]
+pub struct EndpointGroup {
+    // Indexed so `Endpoint::group_links` is queryable and the per-group
+    // membership filter can use it.
+    #[index]
+    pub endpoint_id: EndpointId,
+    #[index]
+    pub group_id: String,
+    pub last_seen_at: Timestamp, // per-source last confirmation
+    pub sort_order: Option<i32>,
+    #[belongs_to(key = endpoint_id, references = id)]
+    pub endpoint: Deferred<Option<Endpoint>>,
+    #[belongs_to(key = group_id, references = id)]
+    pub group: Deferred<Option<Group>>,
+}
+
+/// Group: merged with old Subscription fields. Removed `is_system`.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "groups"]
+pub struct Group {
+    #[key]
+    pub id: String, // UUID
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub enabled: bool,
+    pub user_agent: Option<String>,
+    pub convert_target: Option<ConvertTarget>,
+    pub core_type: Option<GroupCoreType>, // form allows "auto"
+    pub sort_order: Option<i32>,
+    pub last_refreshed: Option<Timestamp>,
+    pub status: Option<GroupStatus>,
+    pub error_message: Option<String>,
+    pub refresh_interval: Option<i64>, // minutes; None = default 1440 (24h)
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "routing_rules"]
+pub struct RoutingRule {
+    #[key]
+    pub id: String,
+
+    pub group_id: Option<String>,
+    pub r#type: i32, // opaque free-form number, no consumer; kept for form
+    pub domain_matcher: Option<String>,
+    pub domains: Vec<String>,
+    pub ips: Vec<String>,
+    pub inbound_tags: Vec<String>,
+    pub ports: Vec<u16>, // "80,443" -> [80, 443]
+    pub source_ports: Vec<u16>,
+    pub network: Option<String>,         // pass-through, comma-able
+    pub protocols: Vec<String>,          // IANA protocol names, NOT ProtocolKind
+    pub domain_strategy: Option<String>, // pass-through
+    pub outbound_tag: Option<String>,
+    pub balancer_tag: Option<String>,
+    pub rule_set_file: Option<String>,
+    pub rule_set_url: Option<String>,
+    pub sort_order: Option<i32>,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "dns_settings"]
+pub struct DnsSetting {
+    #[key]
+    pub id: String,
+
+    pub name: Option<String>,
+    pub servers: Vec<String>,
+    pub hosts: Vec<String>,
+    pub query_strategy: Option<QueryStrategy>,
+    pub disable_cache: bool,
+    pub disable_fallback: bool,
+    pub client_ip: Option<String>,
+    /// TTL (secs) for the TUI-side DNS resolution cache; None = default 300.
+    pub cache_ttl_secs: Option<i64>,
+}
+
+// ── Data-transfer types ──────────────────────────────────────────────────
+
+/// An endpoint with its per-pair links and their protocols, as loaded by the
+/// typed read paths in [`crate::database`].
+#[derive(Debug, Clone)]
+pub struct EndpointRow {
+    pub endpoint: Endpoint,
+    pub links: Vec<ProfileStats>, // per-pair state, sorted by test priority
+    pub protocols: HashMap<ProtocolId, Protocol>, // included via links
+    pub selected_protocol: usize, // index into links
+    pub expanded: bool,
+}
+
+impl EndpointRow {
+    /// Returns the currently active link, respecting manual override.
+    /// Falls back to `selected_protocol` if the override is unset or the
+    /// override protocol is not found among the links.
+    #[must_use]
+    pub fn active_link(&self) -> Option<&ProfileStats> {
+        if let Some(pid) = self.endpoint.manual_protocol_override
+            && let Some(link) = self.links.iter().find(|l| l.protocol_id == pid)
+        {
+            return Some(link);
+        }
+        self.links.get(self.selected_protocol)
+    }
+
+    /// The active link together with its included [`Protocol`] row.
+    #[must_use]
+    pub fn active_protocol(&self) -> Option<(&ProfileStats, &Protocol)> {
+        let link = self.active_link()?;
+        let protocol = self.protocols.get(&link.protocol_id)?;
+        Some((link, protocol))
+    }
+
+    /// Tier for one link under the test-priority model (lower = better):
+    /// 0 real-ok, 1 fast-ok, 2 untested, 3 real-err, 4 fast-err,
+    /// 5 dns-unresolved. `dns_unresolved` is endpoint-level: one flag for
+    /// all links (`host_type == Dns` and no cached `resolved_as`).
+    fn link_test_tier(link: &ProfileStats, dns_unresolved: bool) -> u8 {
+        if dns_unresolved {
+            5
+        } else if let Some(err) = &link.error {
+            match err.kind {
+                ProfileErr::Real => 3,
+                // A name-resolution failure surfaces on a real attempt, so it
+                // shares the real-err bucket.
+                ProfileErr::Name => 3,
+                ProfileErr::Fast => 4,
+            }
+        } else {
+            match link.latency {
+                Some(Latency::Real { .. }) => 0,
+                Some(Latency::Fast { .. }) => 1,
+                None => 2,
+            }
+        }
+    }
+
+    /// Ascending sort key: `(tier, latency, recency, protocol_id)`. `recency`
+    /// is the negated `last_seen_at` epoch so newer links sort first on ties.
+    /// Only success tiers (0/1) rank by latency; untested and error/dns tiers
+    /// use `i32::MAX` so they order by recency then protocol id.
+    fn link_test_key(link: &ProfileStats, dns_unresolved: bool) -> (u8, i32, i64, i64) {
+        let tier = Self::link_test_tier(link, dns_unresolved);
+        let delay = match link.latency {
+            Some(Latency::Real { delay, .. }) | Some(Latency::Fast { delay }) => delay,
+            None => i32::MAX,
+        };
+        let latency = if tier <= 1 { delay } else { i32::MAX };
+        (
+            tier,
+            latency,
+            -link.last_seen_at.as_second(),
+            link.protocol_id.get(),
+        )
+    }
+
+    /// Re-sort `links` by test priority: real-ping success first, then fast
+    /// success (latency ascending), then untested (newest `last_seen_at`
+    /// first), then persisted failures (real below fast), then DNS-unresolved
+    /// endpoints at the bottom. Deterministic tiebreak by protocol id.
+    pub fn sort_links_by_test_priority(&mut self, dns_unresolved: bool) {
+        self.links
+            .sort_by_key(|l| Self::link_test_key(l, dns_unresolved));
+    }
+
+    /// The endpoint's representative sort key = its best (minimum) link key —
+    /// used by the main-table Test column sort. `None` when the endpoint has
+    /// no links.
+    #[must_use]
+    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, i32, i64, i64)> {
+        self.links
+            .iter()
+            .map(|l| Self::link_test_key(l, dns_unresolved))
+            .min()
+    }
+}
+
+/// Three-way toggle for the Profiles tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PurgatoryView {
+    #[default]
+    Active,
+    Stale,
+    All,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use toasty::Deferred;
 
-    /// Endpoint with protocols `(id, last_seen_at, delay, delay_source)`.
-    /// `delay: None` = untested protocol (no extension entry).
-    fn row(protos: &[(i64, i64, Option<i32>, Option<i32>)]) -> EndpointRow {
+    /// Endpoint with links `(protocol_id, last_seen_at_secs, latency, error)`.
+    fn row(links: &[(i64, i64, Option<Latency>, Option<ErrorInfo>)]) -> EndpointRow {
         let mut row = EndpointRow {
             endpoint: Endpoint {
-                id: 1,
+                id: EndpointId::new(1),
                 host: "h.example".to_string(),
-                host_type: "ipv4".to_string(),
+                host_type: HostType::Ipv4,
                 port: 443,
-                port_spec_str: None,
+                ports: Vec::new(),
                 parent_id: None,
                 last_source: None,
-                created_at: 0,
                 manual_protocol_override: None,
-                resolved_as: None,
+                resolved_as: Vec::new(),
                 resolved_at: None,
+                created_at: Timestamp::from_second(0).expect("ts"),
+                links: Deferred::default(),
+                group_links: Deferred::default(),
             },
-            protocols: Vec::new(),
-            extensions: HashMap::new(),
-            stats: HashMap::new(),
+            links: Vec::new(),
+            protocols: HashMap::new(),
             selected_protocol: 0,
             expanded: false,
         };
-        for (id, last_seen, delay, src) in protos {
-            row.protocols.push(ProtocolRow {
-                id: *id,
-                endpoint_id: 1,
-                sig: 0,
-                cred_hash: 0,
-                proto_kind: String::new(),
-                spec_blob: Vec::new(),
-                config_type: 1,
-                core_type: "xray".to_string(),
-                transport: None,
-                security: None,
+        for (pid, last_seen, latency, error) in links {
+            row.links.push(ProfileStats {
+                protocol_id: ProtocolId::new(*pid),
+                endpoint_id: EndpointId::new(1),
+                core_type: CoreType::Xray,
+                config_type: ConfigType::ShareUrl,
                 last_used_at: None,
-                created_at: 0,
-                last_seen_at: *last_seen,
-                endpoint: Deferred::from(None::<Endpoint>),
-                extension: Deferred::from(None::<ProfileExtension>),
-                server_stat: Deferred::from(None::<ServerStat>),
+                last_seen_at: Timestamp::from_second(*last_seen).expect("ts"),
+                task_id: None,
+                task_queue: Vec::new(),
+                latency: latency.clone(),
+                speed_bps: None,
+                error: error.clone(),
+                traffic: TrafficStats {
+                    today_up: 0,
+                    today_down: 0,
+                    total_up: 0,
+                    total_down: 0,
+                },
+                created_at: Timestamp::from_second(0).expect("ts"),
+                updated_at: Timestamp::from_second(0).expect("ts"),
+                version: 1,
+                protocol: Deferred::default(),
+                endpoint: Deferred::default(),
             });
-            if let Some(d) = delay {
-                row.extensions.insert(
-                    *id,
-                    ProfileExtension {
-                        protocol_id: *id,
-                        delay: Some(*d),
-                        speed: None,
-                        sort_order: None,
-                        ip_info: None,
-                        delay_source: *src,
-                        protocol_row: Deferred::from(None::<ProtocolRow>),
-                    },
-                );
-            }
         }
         row
     }
 
     fn ids(r: &EndpointRow) -> Vec<i64> {
-        r.protocols.iter().map(|p| p.id).collect()
+        r.links.iter().map(|l| l.protocol_id.get()).collect()
     }
 
-    fn failed(ids: &[i64]) -> HashSet<i64> {
-        ids.iter().copied().collect()
+    fn real(delay: i32) -> Option<Latency> {
+        Some(Latency::Real { delay, ip: None })
+    }
+
+    fn fast(delay: i32) -> Option<Latency> {
+        Some(Latency::Fast { delay })
+    }
+
+    fn err(kind: ProfileErr) -> Option<ErrorInfo> {
+        Some(ErrorInfo {
+            kind,
+            text: "boom".to_string(),
+        })
     }
 
     #[test]
     fn real_ok_above_fast_ok_above_untested() {
         // real-ok 200ms outranks fast-ok 10ms — tier beats latency.
         let mut r = row(&[
-            (10, 1, Some(200), Some(DELAY_SOURCE_REAL)), // real-ok
-            (20, 2, Some(10), Some(DELAY_SOURCE_FAST)),  // fast-ok
-            (30, 3, None, None),                         // untested
+            (10, 1, real(200), None), // real-ok
+            (20, 2, fast(10), None),  // fast-ok
+            (30, 3, None, None),      // untested
         ]);
-        r.sort_protocols_by_test_priority(false, None);
+        r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![10, 20, 30]);
     }
 
     #[test]
     fn latency_orders_within_success_tiers() {
         let mut r = row(&[
-            (10, 1, Some(50), Some(DELAY_SOURCE_FAST)),
-            (20, 2, Some(10), Some(DELAY_SOURCE_FAST)),
-            (30, 3, Some(120), Some(DELAY_SOURCE_REAL)),
-            (40, 4, Some(90), Some(DELAY_SOURCE_REAL)),
+            (10, 1, fast(50), None),
+            (20, 2, fast(10), None),
+            (30, 3, real(120), None),
+            (40, 4, real(90), None),
         ]);
-        r.sort_protocols_by_test_priority(false, None);
+        r.sort_links_by_test_priority(false);
         // real tier first (30:120, 40:90 by latency), then fast tier (20:10, 10:50)
         assert_eq!(ids(&r), vec![40, 30, 20, 10]);
     }
 
     #[test]
     fn fresh_failure_dominates_stored_success() {
-        // 10 has a stored real-ok delay but failed real this round -> sinks
-        // below the untested 30; 20 failed fast -> below 10 (fast worse than real).
+        // 10 has a stored real-ok delay but a persisted real error -> sinks
+        // below the untested 30; 20 has a fast error -> below 10 (fast worse
+        // than real).
         let mut r = row(&[
-            (10, 1, Some(50), Some(DELAY_SOURCE_REAL)),
-            (20, 2, Some(80), Some(DELAY_SOURCE_FAST)),
+            (10, 1, real(50), err(ProfileErr::Real)),
+            (20, 2, fast(80), err(ProfileErr::Fast)),
             (30, 3, None, None),
         ]);
-        r.sort_protocols_by_test_priority(false, Some((&failed(&[20]), &failed(&[10]))));
+        r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![30, 10, 20]);
     }
 
     #[test]
     fn both_failed_uses_fast_tier() {
-        let mut r = row(&[(10, 1, None, None), (20, 2, None, None)]);
-        r.sort_protocols_by_test_priority(false, Some((&failed(&[10]), &failed(&[10]))));
+        // Both links carry a fast error: tie on tier, order by recency.
+        let mut r = row(&[
+            (10, 1, None, err(ProfileErr::Fast)),
+            (20, 2, None, err(ProfileErr::Fast)),
+        ]);
+        r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![20, 10]);
     }
 
     #[test]
     fn dns_unresolved_sinks_all_protocols() {
-        let mut r = row(&[
-            (10, 1, Some(50), Some(DELAY_SOURCE_REAL)),
-            (20, 2, None, None),
-        ]);
-        r.sort_protocols_by_test_priority(true, None);
+        let mut r = row(&[(10, 1, real(50), None), (20, 2, None, None)]);
+        r.sort_links_by_test_priority(true);
         assert_eq!(ids(&r), vec![20, 10]); // untested first; dns tier wins for both
     }
 
@@ -618,26 +587,84 @@ mod tests {
             (20, 9, None, None),
             (30, 1, None, None),
         ]);
-        r.sort_protocols_by_test_priority(false, None);
+        r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![20, 10, 30]); // newest first
     }
 
     #[test]
-    fn best_key_returns_min_over_protocols() {
+    fn best_key_returns_min_over_links() {
         let r = row(&[
-            (10, 1, Some(200), Some(DELAY_SOURCE_REAL)),
-            (20, 2, Some(10), Some(DELAY_SOURCE_FAST)),
+            (10, 1, real(200), None),
+            (20, 2, fast(10), None),
             (30, 3, None, None),
         ]);
         // Best = real-ok (tier 0), latency 200
-        assert_eq!(r.best_test_priority_key(false, None), (0, 200, -1, 10));
+        assert_eq!(r.best_test_priority_key(false), Some((0, 200, -1, 10)));
+        // Empty links -> None
+        let empty = row(&[]);
+        assert_eq!(empty.best_test_priority_key(false), None);
+    }
+
+    #[test]
+    fn active_link_respects_override() {
+        let mut r = row(&[(10, 1, real(50), None), (20, 2, fast(10), None)]);
+        r.endpoint.manual_protocol_override = Some(ProtocolId::new(20));
+        assert_eq!(r.active_link().unwrap().protocol_id, ProtocolId::new(20));
+        // Override to a protocol with no link -> fall back to selection.
+        r.endpoint.manual_protocol_override = Some(ProtocolId::new(99));
+        assert_eq!(r.active_link().unwrap().protocol_id, ProtocolId::new(10));
+        // No links -> None.
+        let empty = row(&[]);
+        assert!(empty.active_link().is_none());
+    }
+
+    #[test]
+    fn active_protocol_pairs_link_with_protocol() {
+        let mut r = row(&[(10, 1, real(50), None)]);
+        let protocol = Protocol {
+            id: ProtocolId::new(10),
+            sig: 10,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(vless_config())),
+            created_at: Timestamp::from_second(0).expect("ts"),
+            links: Deferred::default(),
+        };
+        r.protocols.insert(protocol.id, protocol);
+        let (link, proto) = r.active_protocol().expect("active protocol");
+        assert_eq!(link.protocol_id, ProtocolId::new(10));
+        assert_eq!(proto.proto_kind, ProtocolKind::Vless);
+    }
+
+    fn vless_config() -> ProtocolConfig {
+        ProtocolConfig::Vless(xray_tui_proto::proto_spec::VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            uuid_origin: None,
+            security: SecurityConfig::default(),
+            transport: TransportConfig::Tcp,
+            encryption: None,
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        })
     }
 
     // ── Scratch-model probes: typed embeds end-to-end in SQLite ──────────
     //
-    // Task 8 rewires the real models onto the typed embed types above; these
-    // tests pin the embed behavior (shared columns, deferred JSON,
-    // enum/struct round-trips) in an in-memory DB now, before the rewrite.
+    // These tests pin the embed behavior (shared columns, deferred JSON,
+    // enum/struct round-trips, newtype key columns) in an in-memory DB.
 
     use xray_tui_proto::proto_spec::common::WebSocketConfig;
     use xray_tui_proto::proto_spec::{TlsConfig, TlsOpts};
@@ -881,10 +908,43 @@ mod tests {
         }
     }
 
+    /// Endpoint's newtype key column round-trips through the real model.
+    #[tokio::test]
+    async fn endpoint_id_newtype_column_roundtrip() {
+        let driver = toasty_driver_turso::Turso::in_memory();
+        let mut db = toasty::Db::builder()
+            .models(toasty::models!(Endpoint))
+            .build(driver)
+            .await
+            .expect("build db");
+        db.push_schema().await.expect("push schema");
+
+        let created = toasty::create!(Endpoint {
+            id: EndpointId::new(42),
+            host: "1.2.3.4".to_string(),
+            host_type: HostType::Ipv4,
+            port: 443,
+            ports: Vec::<u16>::new(),
+            resolved_as: Vec::<String>::new(),
+        })
+        .exec(&mut db)
+        .await
+        .expect("create");
+
+        assert_eq!(created.id, EndpointId::new(42));
+
+        let read = Endpoint::filter_by_id(EndpointId::new(42))
+            .get(&mut db)
+            .await
+            .expect("read back");
+        assert_eq!(read.id.get(), 42);
+        assert_eq!(read.port, 443);
+    }
+
     #[test]
     fn endpoint_id_accepts_nonzero() {
-        assert_eq!(EndpointId::new(42).0, 42);
-        assert_eq!(ProtocolId::new(7).0, 7);
+        assert_eq!(EndpointId::new(42).get(), 42);
+        assert_eq!(ProtocolId::new(7).get(), 7);
     }
 
     #[test]
