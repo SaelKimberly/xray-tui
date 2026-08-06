@@ -383,7 +383,11 @@ replaced by per-pair tasks:
   `error.kind == Real` / `Fast` for that test. `[name]` renders when the
   endpoint is DNS-unresolved (`resolved_as` empty). Tier/sort logic reads
   persisted rows (`latency`, `error.kind`, `resolved_as`) instead of
-  session-only round sets.
+  session-only round sets. Note: the tier fn checks the endpoint-level
+  `resolved_as`-empty flag FIRST (tier 5); `error.kind == ProfileErr::Name` on
+  an endpoint that is NOT flagged unresolved (e.g. stale non-empty cache on a
+  Dns host) falls into the real-attempt failure bucket (tier 3) — a deliberate
+  judgment call, documented in the tier fn.
 - **Behavior change (approved):** failure markers persist across restarts.
   New setting (Speed Test section) "Clear error after" — an optional TTL
   using `updated_at` as the anchor; when unset (default), errors survive
@@ -410,7 +414,12 @@ pub trait InjectToCoreConf {
 
 - Implemented by every `XxxConfig` type; `ProtocolConfig` dispatches via the
   existing `dispatch!` macro. `PlaceholderConfig` (Redirect/TProxy/Mixed —
-  form-only, no URL format) injects its raw `settings_json`.
+  form-only, no URL format) stores its raw `settings_json` in the typed model
+  but its `inject_to` returns `Err(SupportError::UnsupportedProtocol)` on
+  BOTH cores: sing-box has no redirect/tproxy/mixed outbound type
+  (`option/redir.go` is inbound-only), so no raw body can ever parse. Until a
+  real outbound shape exists, the build-time error is the correct behavior
+  (config validity enforced at build, AGENTS.md decision 2).
 - `xray.rs`/`singbox.rs` shrink to: build the common JSON skeleton (log,
   stats/api, inbounds, routing, DNS, policy, tag naming, mux/freedom/
   blackhole outbounds) → call `protocol.config().inject_to(&mut conf,
