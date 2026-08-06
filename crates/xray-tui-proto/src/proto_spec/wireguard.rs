@@ -451,11 +451,15 @@ impl InjectToCoreConf for WireguardConfig {
 impl WireguardConfig {
     /// xray-core outbound for this config. The old builder never constructed
     /// wireguard (it errored as unsupported), so this follows xray-core's
-    /// `proxy/wireguard/config.proto` shape: `secretKey`/`address`/`peers`
-    /// (+ optional `mtu`). The peer endpoint is `host:port` from `endpoint`.
+    /// `proxy/wireguard/config.proto` shape: `secretKey`/`address`/`reserved`/
+    /// `peers` (+ optional `mtu`). The peer endpoint is `host:port` from
+    /// `endpoint` (IPv6 hosts bracketed — xray-core cannot split an
+    /// unbracketed `2606:...:2408`).
     ///
     /// `address` (T12 F5: no form source — URL imports always carry it) is
-    /// emitted as-is, possibly empty. `reserved`/`dns`/`remote_dns_resolve`
+    /// emitted as-is, possibly empty. `reserved` (comma-separated decimals or
+    /// base64 in the typed config) is decoded to the byte array xray expects
+    /// (required for Cloudflare WARP endpoints). `dns`/`remote_dns_resolve`
     /// have no xray outbound key and are dropped (sing-box-only concepts).
     fn inject_xray(
         &self,
@@ -477,7 +481,7 @@ impl WireguardConfig {
         let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
         let mut peer = json!({
             "publicKey": self.public_key,
-            "endpoint": format!("{}:{}", ep.host, ep.port),
+            "endpoint": wg_endpoint(&ep.host, ep.port),
             "allowedIPs": ["0.0.0.0/0", "::/0"],
         });
         if let Some(psk) = &self.preshared_key {
@@ -491,6 +495,11 @@ impl WireguardConfig {
             "address": [self.address.as_str()],
             "peers": [peer],
         });
+        if let Some(reserved) = &self.reserved
+            && let Some(bytes) = parse_reserved_bytes(reserved.as_str())
+        {
+            settings["reserved"] = json!(bytes);
+        }
         if let Some(mtu) = &self.mtu
             && let Ok(v) = mtu.as_str().parse::<u32>()
         {
@@ -508,12 +517,45 @@ impl WireguardConfig {
     }
 }
 
+/// Peer endpoint as `host:port`, with IPv6 hosts bracketed (`[2606:...]:2408`)
+/// so xray-core's endpoint parser can split them.
+fn wg_endpoint(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Decode the typed `reserved` field (comma-separated decimals or base64 per
+/// the module doc) into the byte array xray-core's wireguard config expects.
+fn parse_reserved_bytes(raw: &str) -> Option<Vec<u8>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Comma-separated decimals: "236,163,162"
+    if raw.contains(',') {
+        let mut bytes = Vec::new();
+        for part in raw.split(',') {
+            bytes.push(part.trim().parse::<u8>().ok()?);
+        }
+        return Some(bytes);
+    }
+    // Base64-encoded bytes (URL-safe or standard, padded or not)
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw))
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
         ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
     };
-    use super::WireguardConfig;
+    use super::{WireguardConfig, parse_reserved_bytes};
     use crate::urlx::{RawUrlX, SchemeX};
     use serde_json::json;
 
@@ -762,6 +804,8 @@ mod tests {
         // interface address emitted as-is (URL import carries it)
         assert_eq!(settings["address"], json!(["172.16.0.2/32"]));
         assert_eq!(settings["mtu"], 1280);
+        // WARP endpoint — reserved bytes decoded to the array xray needs
+        assert_eq!(settings["reserved"], json!([236, 163, 162]));
         let peer = &settings["peers"][0];
         assert_eq!(
             peer["publicKey"],
@@ -771,9 +815,43 @@ mod tests {
         assert_eq!(peer["allowedIPs"], json!(["0.0.0.0/0", "::/0"]));
         // empty presharedkey → preSharedKey omitted
         assert!(peer.get("preSharedKey").is_none());
-        // reserved has no xray key → dropped
-        assert!(settings.get("reserved").is_none());
         assert!(conf.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_inject_ipv6_peer_endpoint_is_bracketed() {
+        let url = format!(
+            "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@[2606:4700:d0::a29f:c001]:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D"
+        );
+        let cfg = config(parse(&url));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("2606:4700:d0::a29f:c001", 2408)),
+            InjectOptions::default(),
+        )
+        .expect("wireguard inject");
+        assert_eq!(
+            conf["settings"]["peers"][0]["endpoint"],
+            "[2606:4700:d0::a29f:c001]:2408"
+        );
+    }
+
+    #[test]
+    fn parse_reserved_bytes_accepts_decimals_and_base64() {
+        assert_eq!(
+            parse_reserved_bytes("236,163,162"),
+            Some(vec![236, 163, 162])
+        );
+        assert_eq!(
+            parse_reserved_bytes("236, 163, 162"),
+            Some(vec![236, 163, 162])
+        );
+        // base64 of 236,163,162
+        assert_eq!(parse_reserved_bytes("7KOi"), Some(vec![236, 163, 162]));
+        assert_eq!(parse_reserved_bytes(""), None);
+        assert_eq!(parse_reserved_bytes("999"), None);
     }
 
     #[test]
