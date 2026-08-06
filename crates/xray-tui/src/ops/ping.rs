@@ -739,9 +739,10 @@ pub(crate) async fn run_batch(params: BatchParams) {
             }
         }
     }
+    let mut deferred_real_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for plan in deferred_real {
         let shared = shared.clone();
-        tokio::spawn(retry_deferred_real(shared, plan));
+        deferred_real_handles.push(tokio::spawn(retry_deferred_real(shared, plan)));
     }
 
     // Fire one endpoint group at a time (bounded by `real_concurrency`); links
@@ -785,6 +786,15 @@ pub(crate) async fn run_batch(params: BatchParams) {
         shared.real_settled.notified().await;
     }
     for h in real_handles {
+        let _ = h.await;
+    }
+    // Join the DNS-deferred retries: they may still be sleeping while every
+    // already-scheduled task settled (`pending_real == 0` does not account for
+    // deferrals). `finish_batch` must run only after ALL work — including
+    // their late results and progress events — has been emitted; otherwise the
+    // terminal `BatchProgress{0,0}` would clear the progress bar before the
+    // retries' events arrive and re-create it, leaving it stuck forever.
+    for h in deferred_real_handles {
         let _ = h.await;
     }
     finish_batch(&shared);
@@ -1257,6 +1267,9 @@ mod tests {
         real_calls: Arc<AtomicUsize>,
         real_probed: Arc<Mutex<HashSet<i64>>>,
         real_gate: Mutex<Option<Arc<Notify>>>,
+        /// When set, every fast probe marks the endpoint's DNS failure — used
+        /// to land a deferral deterministically between phase 1 and phase 2.
+        dns_mark_on_fast: Mutex<Option<(Arc<TaskScheduler>, EndpointId)>>,
     }
 
     impl StubRunner {
@@ -1274,6 +1287,7 @@ mod tests {
                 real_calls: Arc::new(AtomicUsize::new(0)),
                 real_probed: Arc::new(Mutex::new(HashSet::new())),
                 real_gate: Mutex::new(None),
+                dns_mark_on_fast: Mutex::new(None),
             }
         }
     }
@@ -1288,6 +1302,9 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.fast_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some((sched, eid)) = &*self.dns_mark_on_fast.lock() {
+                    sched.mark_dns_failure(*eid);
+                }
                 self.fast_outcome.clone()
             })
         }
@@ -1568,6 +1585,49 @@ mod tests {
             h.state.endpoints[0].links[0].latency,
             Some(Latency::Fast { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn phase2_dns_deferred_retry_is_joined_before_finish() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1), fake_row(2, "10.0.0.2", 1)];
+        let mut h = harness(rows.clone()).await;
+        // 3s window. Endpoint 2 is marked when the phase-1 fast probe for
+        // endpoint 1 runs (deterministically BEFORE phase-2 scheduling), so
+        // link 200's real task is DNS-deferred and re-scheduled after the
+        // window.
+        h.state.scheduler = Arc::new(TaskScheduler::new(3, 3));
+        *h.runner.dns_mark_on_fast.lock() = Some((h.state.scheduler.clone(), EndpointId::new(2)));
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch(&mut h, plan, true, false);
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        // Both links got fast AND real results; no markers; gates clear.
+        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 2);
+        for row in &h.state.endpoints {
+            for link in &row.links {
+                assert!(matches!(link.latency, Some(Latency::Real { .. })));
+                assert!(link.error.is_none());
+                assert_gate_clear(&h.state.db, link).await;
+            }
+        }
+        // Regression (reviewer F1): the deferred-real retry was spawned but
+        // never joined, so the terminal `BatchProgress{0,0}` fired before the
+        // retry's late events re-created the progress — stuck bar + rejected
+        // future batches. The fix joins the retries first, so the terminal
+        // event is last and the progress bar is truly cleared.
+        assert!(
+            h.state.batch_progress.is_none(),
+            "progress must be cleared after the batch (terminal event last)"
+        );
+
+        // A subsequent batch starts cleanly.
+        let plan2 = plan_from_rows(&rows);
+        let handle2 = start_test_batch(&mut h, plan2, false, false);
+        handle2.await.unwrap();
+        await_batch_done(&mut h.state).await;
+        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 4);
     }
 
     // ── stop mid-batch ───────────────────────────────────────────────────
