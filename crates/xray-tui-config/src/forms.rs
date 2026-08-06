@@ -1561,7 +1561,7 @@ fn transport_and_path(ps: &SettingsMap, ss: &SettingsMap) -> (TransportConfig, O
         let sn = opt_string(ss.get("grpc.serviceName"));
         TransportConfig::Grpc(GrpcConfig {
             service_name: sn.clone().map(TinyText::from),
-            path: sn.clone().map(TinyText::from),
+            path: sn.map(TinyText::from),
             ..Default::default()
         })
     };
