@@ -176,21 +176,25 @@ impl ProtocolConfig {
     ///
     /// If the URL is not a valid proxy URL for any supported protocol.
     pub fn try_parse_detailed(raw: &RawUrlX<'_>) -> Result<ParseResult, ParseError> {
+        // Every arm goes through the config's `try_parse_proto` (the parse
+        // boundary entry — T4/T5) and extracts the endpoint-free config
+        // payload; the endpoints are discarded here and will be rewired to
+        // `ParsedProto` consumers in T11.
         let r = match raw.schema {
-            SchemeX::Vless => VlessConfig::try_parse(raw).map(Self::Vless),
-            SchemeX::Trojan => TrojanConfig::try_parse(raw).map(Self::Trojan),
-            SchemeX::Vmess => VmessConfig::try_parse(raw).map(Self::Vmess),
-            SchemeX::Hysteria => Hysteria1Config::try_parse(raw).map(Self::Hysteria1),
-            SchemeX::Hysteria2 => Hysteria2Config::try_parse(raw).map(Self::Hysteria2),
-            SchemeX::SS => SsConfig::try_parse(raw).map(Self::Ss),
-            SchemeX::SSR => SsrConfig::try_parse(raw).map(Self::Ssr),
-            SchemeX::TUIC => TuicConfig::try_parse(raw).map(Self::Tuic),
-            SchemeX::WireGuard => WireguardConfig::try_parse(raw).map(Self::Wireguard),
-            SchemeX::ShadowTls => ShadowTlsConfig::try_parse(raw).map(Self::ShadowTls),
-            SchemeX::Socks => Socks5Config::try_parse(raw).map(Self::Socks),
-            SchemeX::Http => HttpClientConfig::try_parse(raw).map(Self::Http),
-            SchemeX::Naive => NaiveConfig::try_parse(raw).map(Self::Naive),
-            SchemeX::AnyTLS => AnyTlsConfig::try_parse(raw).map(Self::AnyTls),
+            SchemeX::Vless => VlessConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Trojan => TrojanConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Vmess => VmessConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Hysteria => Hysteria1Config::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Hysteria2 => Hysteria2Config::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::SS => SsConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::SSR => SsrConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::TUIC => TuicConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::WireGuard => WireguardConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::ShadowTls => ShadowTlsConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Socks => Socks5Config::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Http => HttpClientConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Naive => NaiveConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::AnyTLS => AnyTlsConfig::try_parse_proto(raw).map(|p| p.protocol.config),
             SchemeX::Warp => {
                 // Warp is not directly URL-parsable — fall through to fallback
                 Err(ParseError::UnsupportedScheme(raw.schema.clone()))
@@ -214,14 +218,14 @@ impl ProtocolConfig {
         };
         let original_scheme = raw.schema.clone();
         let original_error = original_err.to_string();
-        let v = SsConfig::try_parse(raw)
-            .map(Self::Ss)
-            .or_else(|_| SsrConfig::try_parse(raw).map(Self::Ssr))
-            .or_else(|_| VmessConfig::try_parse(raw).map(Self::Vmess))
-            .or_else(|_| VlessConfig::try_parse(raw).map(Self::Vless))
-            .or_else(|_| TrojanConfig::try_parse(raw).map(Self::Trojan))
-            .or_else(|_| Hysteria2Config::try_parse(raw).map(Self::Hysteria2))
-            .or_else(|_| Hysteria1Config::try_parse(raw).map(Self::Hysteria1))
+        let v = SsConfig::try_parse_proto(raw)
+            .map(|p| p.protocol.config)
+            .or_else(|_| SsrConfig::try_parse_proto(raw).map(|p| p.protocol.config))
+            .or_else(|_| VmessConfig::try_parse_proto(raw).map(|p| p.protocol.config))
+            .or_else(|_| VlessConfig::try_parse_proto(raw).map(|p| p.protocol.config))
+            .or_else(|_| TrojanConfig::try_parse_proto(raw).map(|p| p.protocol.config))
+            .or_else(|_| Hysteria2Config::try_parse_proto(raw).map(|p| p.protocol.config))
+            .or_else(|_| Hysteria1Config::try_parse_proto(raw).map(|p| p.protocol.config))
             .or(Err(original_err))?;
         Ok(ParseResult::Fallback(
             v,
@@ -496,17 +500,20 @@ trait ProtoIdentity {
 /// Behavioral protocol spec, sealed to this crate via the private
 /// [`ProtoIdentity`] supertrait.
 ///
-/// PARSE-CONTRACT MIGRATION (phase A): the parse contract is moving to the
-/// `*_proto` inherent methods on each config type (`try_parse_proto` /
+/// PARSE-CONTRACT MIGRATION (phase A): the parse contract lives on the
+/// `*_proto` inherent methods of every config type (`try_parse_proto` /
 /// `try_from_clash_proto` / `to_clash_proto` / `reconstruct_proto`), which
 /// produce/consume [`ParsedProto`] with the endpoint ([`EndpointEssentials`])
 /// split out and [`ProtocolEssentials::config`] carrying only endpoint-free
-/// protocol parameters (host-free parse mandate). T5 converts every config to
-/// this shape; T11 rewires import/export to the `*_proto` variants. Until
-/// then, `VlessConfig`/`VmessConfig` (T4) keep this legacy trait as a bridge:
-/// `try_parse`/`try_from_clash` still work by delegating and discarding the
-/// endpoints; their `to_clash`/`reconstruct` return errors because host/port
-/// are no longer stored on the config.
+/// protocol parameters (host-free parse mandate). T4 converted vless/vmess;
+/// T5 converted all remaining configs (no config struct carries host/port
+/// anymore). This legacy trait is kept as a bridge so `ProtocolConfig`
+/// dispatch and the `Proto`/`ParseResult` consumers in xray-tui-config keep
+/// compiling: `try_parse`/`try_from_clash` still work by delegating to the
+/// `*_proto` variants and discarding the endpoints; `to_clash`/`reconstruct`
+/// return errors because host/port are no longer stored on the config. T11
+/// rewires import/export to the `*_proto` variants (phase D builders take
+/// the endpoint separately).
 #[allow(private_bounds)] // edition 2024 denies private bounds; deliberate seal
 pub trait ProtoSpec: ProtoIdentity {
     /// # Errors
@@ -905,6 +912,71 @@ impl PlaceholderConfig {
             settings_json,
         }
     }
+
+    /// Wrap this placeholder as an endpoint-less [`ParsedProto`] — the parse
+    /// boundary entry for orphan protocols (Redirect/TProxy/Mixed) that have
+    /// no URL format and no endpoint. `endpoints` EMPTY is legal for these.
+    ///
+    /// The kind is derived from `proto_name`; unknown names fall back to
+    /// [`ProtocolKind::Mixed`], the same backward-compat rule as
+    /// [`ProtocolConfig::from_legacy_parse`].
+    #[must_use]
+    pub fn try_parse_proto(&self) -> ParsedProto {
+        let (proto_kind, config) = match self.proto_name.to_lowercase().as_str() {
+            "redirect" => (
+                ProtocolKind::Redirect,
+                ProtocolConfig::Redirect(self.clone()),
+            ),
+            "tproxy" => (ProtocolKind::TProxy, ProtocolConfig::TProxy(self.clone())),
+            _ => (ProtocolKind::Mixed, ProtocolConfig::Mixed(self.clone())),
+        };
+        ParsedProto {
+            endpoints: vec![],
+            protocol: ProtocolEssentials {
+                proto_kind,
+                config_type: ConfigKind::ShareUrl,
+                core_type: core_mapping::resolve_core(proto_kind, None, None),
+                config,
+            },
+        }
+    }
+
+    /// Placeholder protocols have no Clash representation — always an error
+    /// (mirrors the legacy trait default).
+    ///
+    /// # Errors
+    ///
+    /// Always — placeholder protocols have no Clash format.
+    pub fn try_from_clash_proto(_proxy: &ClashProxy) -> Result<ParsedProto, ParseError> {
+        Err(ParseError::Unknown(
+            "clash parsing not implemented for this protocol".into(),
+        ))
+    }
+
+    /// Placeholder protocols have no Clash representation — always an error
+    /// (mirrors the legacy trait default).
+    ///
+    /// # Errors
+    ///
+    /// Always — placeholder protocols have no Clash format.
+    pub fn to_clash_proto(
+        &self,
+        _endpoint: &EndpointEssentials,
+    ) -> Result<ClashProxy, ProtoSpecError> {
+        Err(ProtoSpecError::Unsupported(
+            "clash serialization not implemented for this protocol".into(),
+        ))
+    }
+
+    /// Placeholder protocols have no URL format — always an error (mirrors
+    /// the legacy [`Self::reconstruct`]).
+    ///
+    /// # Errors
+    ///
+    /// Always — placeholder protocols have no URL format.
+    pub fn reconstruct_proto(&self, _endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+        Err(ParseError::Unimplemented("placeholder protocol"))
+    }
 }
 
 impl ProtoIdentity for PlaceholderConfig {
@@ -937,6 +1009,62 @@ impl ProtoIdentity for PlaceholderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_try_parse_proto_emits_endpointless_parsed_proto() {
+        // Placeholder configs wrap into the parse boundary as orphan
+        // protocols: empty endpoints, kind derived from proto_name.
+        let blob = serde_json::json!({
+            "protocol_settings": {"password": "sekrit"},
+            "stream_settings": {}
+        });
+        let json = serde_json::to_vec(&blob).unwrap();
+
+        let redirect = PlaceholderConfig::new("redirect".into(), json.clone());
+        let parsed = redirect.try_parse_proto();
+        assert!(parsed.endpoints.is_empty(), "orphan protocol: no endpoint");
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Redirect);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
+        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
+        assert_eq!(
+            parsed.protocol.config,
+            ProtocolConfig::Redirect(redirect.clone())
+        );
+
+        let tproxy = PlaceholderConfig::new("tproxy".into(), json.clone());
+        let parsed = tproxy.try_parse_proto();
+        assert!(parsed.endpoints.is_empty());
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::TProxy);
+        assert_eq!(parsed.protocol.config, ProtocolConfig::TProxy(tproxy));
+
+        // Unknown proto_name falls back to Mixed (from_legacy_parse rule).
+        let mixed = PlaceholderConfig::new("wireguard".into(), json);
+        let parsed = mixed.try_parse_proto();
+        assert!(parsed.endpoints.is_empty());
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Mixed);
+        assert_eq!(parsed.protocol.config, ProtocolConfig::Mixed(mixed));
+
+        // The *_proto clash/reconstruct paths mirror the legacy errors.
+        assert!(
+            PlaceholderConfig::try_from_clash_proto(&ClashProxy::Direct(
+                crate::clash::ClashDirect {
+                    name: "d".into(),
+                    udp: None
+                }
+            ))
+            .is_err()
+        );
+        assert!(
+            redirect
+                .to_clash_proto(&EndpointEssentials::new("x", 1))
+                .is_err()
+        );
+        assert!(
+            redirect
+                .reconstruct_proto(&EndpointEssentials::new("x", 1))
+                .is_err()
+        );
+    }
 
     #[test]
     fn placeholder_config_sig_is_deterministic_nonzero_body_hash() {
