@@ -24,7 +24,7 @@ use xray_tui_proto::proto_spec::{
 };
 
 use crate::BackendUpdateStatus;
-use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
+use crate::ops::{connect, events, ping, profiles, scheduler, settings, subscriptions, updates};
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, SettingsSection,
     SortColumn, SplitRightPane, Tab,
@@ -36,6 +36,10 @@ use crate::types::{
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
+    /// Per-(protocol, endpoint) task gate (design §6.2): one live task per
+    /// link, FIFO queue, orphan sweep, DNS-deferral. Defaults `(3, 5)` for
+    /// now — T21 wires the config's queue_limit/dns_defer_secs.
+    pub scheduler: scheduler::TaskScheduler,
     /// Currently selected theme name from config or UI selection.
     pub theme_name: ratatui_themes::ThemeName,
     pub current_tab: Tab,
@@ -361,6 +365,7 @@ impl AppState {
         let mut state = Self {
             db,
             config,
+            scheduler: scheduler::TaskScheduler::new(3, 5), // T21: config queue_limit/dns_defer_secs
             theme_name,
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),
