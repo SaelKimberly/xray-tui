@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_db::models::{EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, TrafficStats};
+use xray_tui_db::models::{
+    EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, TrafficStats,
+};
 
 use crate::AppState;
 use crate::ops::profiles::endpoint_dns_unresolved;
@@ -89,6 +91,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 if !state.connecting {
                     state.connected_core = None;
                     state.connected_protocol_id = None;
+                    // Session over: the actions-log traffic segment must not
+                    // keep showing the last session's deltas.
+                    state.current_traffic_up = 0;
+                    state.current_traffic_down = 0;
                     state.log_trace("info", "core::process", "Core process stopped");
                 }
             }
@@ -115,36 +121,36 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 total_down,
             } => {
                 state.connection_error = None;
+                // Stale-event guard: only the connected session's poller may
+                // write traffic. An event whose protocol the connected
+                // endpoint does not own (left over from a profile switch, or
+                // still in the channel after disconnect) must not accumulate
+                // into the row or drive the actions-log deltas.
+                let Some(eid) = state.connected_protocol_id else {
+                    continue;
+                };
+                let current = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
+                    .is_some_and(|row| row.endpoint.id.get() == eid);
+                if !current {
+                    continue;
+                }
                 // protocol_id is a Protocol row id — match the row whose links
                 // own it (never the endpoint id). Patch the link's traffic
                 // in-memory and persist via `upsert_link` (the gRPC stats
                 // poller writes these).
-                if let Some(row) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
+                if apply_stats_delta(
+                    &mut state.endpoints,
+                    protocol_id,
+                    today_up,
+                    today_down,
+                    total_up,
+                    total_down,
+                ) && let Some(row) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
                     && let Some(link) = row
                         .links
                         .iter_mut()
                         .find(|l| l.protocol_id.get() == protocol_id)
                 {
-                    // The poller reports deltas since the last poll
-                    // (`query_stats(..., reset = true)`); accumulate them
-                    // into the persisted row. The "today" counters reset
-                    // when the row's last-write day differs from today (jiff
-                    // civil-date comparison) — totals never reset. The row
-                    // day boundary is the row's `updated_at`, refreshed
-                    // here so consecutive same-day writes accumulate.
-                    let now = jiff::Timestamp::now();
-                    let (base_up, base_down) = if same_local_day(link.updated_at, now) {
-                        (link.traffic.today_up, link.traffic.today_down)
-                    } else {
-                        (0, 0)
-                    };
-                    link.traffic = TrafficStats {
-                        today_up: base_up + today_up,
-                        today_down: base_down + today_down,
-                        total_up: link.traffic.total_up + total_up,
-                        total_down: link.traffic.total_down + total_down,
-                    };
-                    link.updated_at = now;
                     if let Err(e) = state.db.upsert_link(link).await {
                         state.log_trace(
                             "error",
@@ -693,6 +699,92 @@ pub(crate) fn merge_host_features(
     }
 }
 
+/// Accumulate one poller delta into the owning link's traffic counters.
+///
+/// The poller reports deltas since the last poll (`query_stats(..., reset =
+/// true)` for xray; one `/traffic` line per second for sing-box). The "today"
+/// counters reset when the row's last-write day differs from today (jiff
+/// civil-date comparison) — totals never reset. The row day boundary is the
+/// row's `updated_at`, refreshed here so consecutive same-day writes
+/// accumulate. Persistence stays with the caller: the T21 event handler
+/// persists every event, and the disconnect flush persists once after
+/// draining.
+fn apply_stats_delta(
+    endpoints: &mut [EndpointRow],
+    protocol_id: i64,
+    today_up: i64,
+    today_down: i64,
+    total_up: i64,
+    total_down: i64,
+) -> bool {
+    let Some(row) = endpoint_row_for_protocol(endpoints, protocol_id) else {
+        return false;
+    };
+    let Some(link) = row
+        .links
+        .iter_mut()
+        .find(|l| l.protocol_id.get() == protocol_id)
+    else {
+        return false;
+    };
+    let now = jiff::Timestamp::now();
+    let (base_up, base_down) = if same_local_day(link.updated_at, now) {
+        (link.traffic.today_up, link.traffic.today_down)
+    } else {
+        (0, 0)
+    };
+    link.traffic = TrafficStats {
+        today_up: base_up + today_up,
+        today_down: base_down + today_down,
+        total_up: link.traffic.total_up + total_up,
+        total_down: link.traffic.total_down + total_down,
+    };
+    link.updated_at = now;
+    true
+}
+
+/// Drain the core-event channel of `StatsUpdate` events the poller sent
+/// before disconnect — the event loop (which drains once per frame) may not
+/// have processed them yet, so the final session delta could otherwise be
+/// lost when the task is aborted. Each pending delta is accumulated into its
+/// owning link; returns the final link row state for the caller to persist
+/// once. Non-stats events are left in the channel (the event loop drains
+/// them normally after disconnect).
+pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Option<ProfileStats> {
+    let mut last_protocol: Option<i64> = None;
+    loop {
+        let Some(rx) = state.core_event_rx.as_mut() else {
+            break;
+        };
+        let event = match rx.try_recv() {
+            Ok(ev) => ev,
+            Err(_) => break,
+        };
+        if let CoreEvent::StatsUpdate {
+            protocol_id,
+            today_up,
+            today_down,
+            total_up,
+            total_down,
+        } = event
+            && apply_stats_delta(
+                &mut state.endpoints,
+                protocol_id,
+                today_up,
+                today_down,
+                total_up,
+                total_down,
+            )
+        {
+            last_protocol = Some(protocol_id);
+        }
+    }
+    let pid = last_protocol?;
+    endpoint_row_for_protocol(&mut state.endpoints, pid)
+        .and_then(|row| row.links.iter().find(|l| l.protocol_id.get() == pid))
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -828,6 +920,9 @@ mod tests {
         link.updated_at =
             jiff::Timestamp::from_second(now.as_second() - 48 * 3600).expect("valid ts");
         state.endpoints = vec![row];
+        // The events handler only accepts traffic from the connected session
+        // (T22 stale-event guard): the connected endpoint owns protocol 7.
+        state.connected_protocol_id = Some(100);
 
         // Day changed: today counters reset before the delta is added,
         // totals keep accumulating.
@@ -883,6 +978,80 @@ mod tests {
         .expect("link persisted");
         assert_eq!(stored.traffic.today_up, 8);
         assert_eq!(stored.traffic.total_up, 1_008);
+    }
+
+    #[tokio::test]
+    async fn stats_update_after_disconnect_is_ignored() {
+        let (mut state, tx) = event_state().await;
+        let row = row_with_protocols(100, 1, 7); // one link, protocol 7
+        state.endpoints = vec![row];
+        state.connected_protocol_id = Some(100);
+
+        // A session delta lands while connected: accumulated + drives the
+        // actions-log segment.
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 7,
+            today_up: 100,
+            today_down: 200,
+            total_up: 100,
+            total_down: 200,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert_eq!(state.endpoints[0].links[0].traffic.total_up, 100);
+        assert_eq!(state.current_traffic_up, 100);
+
+        // Disconnect clears the session state (also exercised by the
+        // connect.rs disconnect test — the drain here finds no pending
+        // events, so nothing is flushed).
+        state.disconnect();
+        assert_eq!(state.connected_protocol_id, None);
+        assert_eq!(state.current_traffic_up, 0);
+
+        // A stale event arriving post-disconnect is ignored: it must not
+        // accumulate into the row (double-count) nor drive the actions-log
+        // deltas.
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 7,
+            today_up: 50,
+            today_down: 60,
+            total_up: 50,
+            total_down: 60,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        let link = &state.endpoints[0].links[0];
+        assert_eq!(
+            link.traffic.total_up, 100,
+            "stale delta must not accumulate after disconnect"
+        );
+        assert_eq!(
+            link.traffic.total_down, 200,
+            "stale delta must not accumulate after disconnect"
+        );
+        assert_eq!(
+            state.current_traffic_up, 0,
+            "stale delta must not drive the actions log"
+        );
+        assert_eq!(state.current_traffic_down, 0);
+
+        // Same guard applies to a profile-switch: traffic for a protocol the
+        // connected endpoint does not own is ignored even while connected.
+        state.connected_protocol_id = Some(100);
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 999, // owned by no endpoint row
+            today_up: 5,
+            today_down: 5,
+            total_up: 5,
+            total_down: 5,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert_eq!(state.endpoints[0].links[0].traffic.total_up, 100);
+        assert_eq!(state.current_traffic_up, 0);
     }
 
     #[tokio::test]

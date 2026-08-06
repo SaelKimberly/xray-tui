@@ -431,6 +431,21 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
 
 /// Disconnect the currently running core.
 pub fn disconnect(state: &mut AppState) {
+    // Flush the final traffic delta: a poller tick landing just before the
+    // stop can still sit in the event channel, unprocessed (the event loop
+    // drains once per frame). Accumulate those deltas into the owning link
+    // and persist the final row state once. Traffic since the last poll tick
+    // (≤ one poll interval — 3s xray / 1s sing-box) was never captured as an
+    // event and is dropped by design; the T21 handler already persisted
+    // every processed tick, so the row is current as of the last tick.
+    if let Some(link) = crate::ops::events::drain_pending_stats_updates(state) {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db.upsert_link(&link).await {
+                tracing::warn!(target: "tui::ops::connect", "final stats flush failed: {e}");
+            }
+        });
+    }
     if let Some(tx) = state.disconnect_tx.take() {
         let _ = tx.send(());
     }
@@ -440,12 +455,254 @@ pub fn disconnect(state: &mut AppState) {
     state.connected_core = None;
     state.connected_protocol_id = None;
     state.connecting = false;
+    // Session state: drop the error marker and the actions-log traffic
+    // deltas so a disconnected session renders as "Disconnected", never as a
+    // stale error or a frozen traffic segment.
+    state.connection_error = None;
+    state.current_traffic_up = 0;
+    state.current_traffic_down = 0;
     state.log_trace("info", "core::process", "Disconnected");
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use toasty::{Deferred, Json};
+    use xray_tui_config::AppConfig;
+    use xray_tui_db::models::{
+        ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId, Security, Transport,
+    };
+    use xray_tui_proto::proto_spec::common::TransportConfig;
+    use xray_tui_proto::proto_spec::{
+        PlaceholderConfig, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType,
+        TransportType,
+    };
+
+    use crate::ops::profiles::test_support::fake_row;
+
     use super::*;
+
+    /// A `Protocol` row whose config is a placeholder (`Redirect`): the
+    /// `ConfigBuilder::build` outbound injection errors on BOTH cores, so a
+    /// connect attempt fails deterministically at config build — before any
+    /// binary lookup or core start.
+    fn placeholder_protocol(id: i64) -> xray_tui_db::models::Protocol {
+        use crate::ops::profiles::test_support::ts;
+        let settings = serde_json::json!({
+            "protocol_settings": {"password": "sekrit"},
+            "stream_settings": {},
+        });
+        xray_tui_db::models::Protocol {
+            id: ProtocolId::new(id),
+            sig: id,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Redirect,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(ProtocolConfig::Redirect(PlaceholderConfig::new(
+                "redirect".to_string(),
+                serde_json::to_vec(&settings).unwrap(),
+            )))),
+            created_at: ts(0),
+            links: Deferred::default(),
+        }
+    }
+
+    async fn read_link(
+        db: &xray_tui_db::Database,
+        protocol_id: i64,
+        endpoint_id: i64,
+    ) -> Option<ProfileStats> {
+        let mut conn = db.connection().await.unwrap();
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(protocol_id),
+            xray_tui_db::models::EndpointId::new(endpoint_id),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_failure_placeholder_errors_without_touching_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        // Endpoint row with one link (protocol id 100); its protocol config
+        // is a placeholder so `ConfigBuilder::build` errors on either core.
+        let mut row = fake_row(100, "h100.example", 1);
+        let pid = row.links[0].protocol_id;
+        row.protocols.insert(pid, placeholder_protocol(pid.get()));
+        // Pre-existing latency + error markers must survive a connect
+        // failure (a failed connect is NOT a ping — no markers written).
+        let link = &mut row.links[0];
+        link.latency = Some(Latency::Fast { delay: 42 });
+        link.error = Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "previous failure".to_string(),
+        });
+        let traffic_before = link.traffic;
+        // Persist rows: the connect task's `load_protocol_with_config` reads
+        // the Protocol row (with config) from the DB.
+        db.upsert_endpoint(&row.endpoint).await.unwrap();
+        db.upsert_protocol(row.protocols.get(&pid).unwrap())
+            .await
+            .unwrap();
+        db.upsert_link(&row.links[0]).await.unwrap();
+
+        // AppState over the SAME database the rows were persisted to (the
+        // connect task reads the Protocol row back from `state.db`).
+        let mut state = crate::AppState::new(db, AppConfig::default()).await;
+        state.endpoints = vec![row];
+        state.filter_cache_valid.set(false);
+        state.selected_index = 0;
+        state.connect_to_profile(100);
+
+        // Connect initiation bookkeeping: `connecting` in flight, the
+        // connected endpoint registered, and last_used/last_seen patched
+        // in-memory (mirrors the persisted write).
+        assert!(state.connecting, "connecting flag set during connect");
+        assert_eq!(state.connected_protocol_id, Some(100));
+        let link = &state.endpoints[0].links[0];
+        let used_at = link
+            .last_used_at
+            .expect("in-memory last_used_at set at initiation");
+        assert_eq!(
+            link.last_seen_at, used_at,
+            "last_used mirrors last_seen (old semantics)"
+        );
+
+        // Drain until the connect task's error event lands (config build
+        // fails on the placeholder before any binary lookup or core start).
+        for _ in 0..200 {
+            let _ = state.poll_core_events().await;
+            if state.connection_error.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let err = state
+            .connection_error
+            .clone()
+            .expect("connect failure surfaced as an event");
+        assert!(err.contains("Config build failed"), "got: {err}");
+        assert!(!state.connecting, "connecting cleared by the error event");
+        assert_eq!(state.connected_core, None);
+        assert_eq!(state.connected_protocol_id, None);
+
+        // Failure surfaced as an event ONLY: latency/error markers and the
+        // traffic counters are untouched.
+        let link = &state.endpoints[0].links[0];
+        assert!(
+            link.latency.is_some(),
+            "pre-existing latency marker preserved"
+        );
+        assert!(link.error.is_some(), "pre-existing error marker preserved");
+        assert_eq!(
+            link.traffic, traffic_before,
+            "connect failure writes no traffic"
+        );
+
+        // Persisted consistency: the spawned update_last_used write lands
+        // with the same timestamp the in-memory patch used.
+        let mut stored = None;
+        for _ in 0..100 {
+            stored = read_link(&state.db, pid.get(), 100).await;
+            if stored.as_ref().is_some_and(|l| l.last_used_at.is_some()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stored = stored.expect("link persisted");
+        let stored_used = stored.last_used_at.expect("last_used_at persisted");
+        assert_eq!(
+            stored.last_seen_at, stored_used,
+            "DB write sets both columns"
+        );
+        assert_eq!(
+            state.endpoints[0].links[0].last_used_at,
+            Some(stored_used),
+            "in-memory and persisted timestamps agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_flushes_pending_stats_and_clears_session_state() {
+        let mut state =
+            crate::ops::profiles::test_support::test_state(vec![fake_row(100, "h100.example", 1)])
+                .await;
+        // Isolate from the startup channels (whitelist load, auto-update):
+        // replace the rx so only this test can feed events — deterministic.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        state.core_event_rx = Some(rx);
+        state.connected_core = Some(CoreType::Xray);
+        state.connected_protocol_id = Some(100);
+        state.current_traffic_up = 42;
+        state.current_traffic_down = 84;
+        state.connection_error = Some("stale error".to_string());
+
+        // A poller tick in flight when disconnect is pressed: the delta must
+        // be flushed into the link (in-memory + persisted), not lost with
+        // the task abort. fake_row's link protocol id is id*100 = 10_000.
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 10_000,
+            today_up: 10,
+            today_down: 20,
+            total_up: 10,
+            total_down: 20,
+        })
+        .await
+        .unwrap();
+
+        state.disconnect();
+
+        // Pollers stopped: the stop signal was taken and the task aborted.
+        assert!(state.disconnect_tx.is_none(), "stop signal consumed");
+        assert!(state.core_task_handle.is_none(), "core task aborted");
+        // Session state cleared.
+        assert_eq!(state.connected_core, None);
+        assert_eq!(state.connected_protocol_id, None);
+        assert!(!state.connecting);
+        assert_eq!(state.connection_error, None, "stale error cleared");
+        assert_eq!(state.current_traffic_up, 0, "actions-log traffic reset");
+        assert_eq!(state.current_traffic_down, 0);
+        // The in-flight delta was flushed into the link in-memory.
+        let link = &state.endpoints[0].links[0];
+        assert_eq!(link.traffic.today_up, 10);
+        assert_eq!(link.traffic.today_down, 20);
+        assert_eq!(link.traffic.total_up, 10);
+        assert_eq!(link.traffic.total_down, 20);
+        // ... and persisted by the spawned flush.
+        let mut stored = None;
+        for _ in 0..100 {
+            stored = read_link(&state.db, 10_000, 100).await;
+            if stored.as_ref().is_some_and(|l| l.traffic.total_up >= 10) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stored = stored.expect("link persisted");
+        assert_eq!(stored.traffic.total_up, 10);
+        assert_eq!(stored.traffic.total_down, 20);
+        // Disconnect left no stragglers: draining the channel post-disconnect
+        // finds nothing (the flush consumed the pending tick).
+        assert!(!state.poll_core_events().await);
+    }
 
     #[test]
     fn clash_traffic_lines_map_to_per_line_deltas() {

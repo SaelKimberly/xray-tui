@@ -15,11 +15,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         render_placeholder(frame, area, &palette);
         return;
     }
-    // `selected_index` indexes the FILTERED list, so resolve through the same
-    // `filtered_profiles()` path as the profiles footer; otherwise a search
-    // filter active on the Profiles tab (it persists across tab switches)
-    // would show a different profile's stats here.
-    let Some(profile) = state.filtered_profiles().nth(state.selected_index) else {
+    // The screen shows the CONNECTED profile's stats — the session the user
+    // is actually running (the connected link's ProfileStats, accumulated by
+    // the T21 handler). `connected_protocol_id` holds the connected ENDPOINT
+    // id. When no endpoint is connected (transient mid-connect state), fall
+    // back to the filtered selection: `selected_index` indexes the FILTERED
+    // list, so resolve through the same `filtered_profiles()` path as the
+    // profiles footer — a search filter active on the Profiles tab (it
+    // persists across tab switches) would otherwise show a different
+    // profile's stats here.
+    let profile = state
+        .connected_protocol_id
+        .and_then(|eid| state.endpoints.iter().find(|r| r.endpoint.id.get() == eid))
+        .or_else(|| state.filtered_profiles().nth(state.selected_index));
+    let Some(profile) = profile else {
         render_placeholder(frame, area, &palette);
         return;
     };
@@ -137,6 +146,8 @@ mod tests {
     use xray_tui_core::CoreType;
     use xray_tui_db::models::EndpointRow;
 
+    use crate::types::CoreEvent;
+
     /// Minimal typed `EndpointRow` with one link (statistics render calls
     /// `active_link()`); host + port drive the search filter.
     fn endpoint_row(id: i64, host: &str, port: i32) -> EndpointRow {
@@ -190,6 +201,66 @@ mod tests {
         assert!(rendered.contains("beta.example:8443"), "got: {rendered}");
         assert!(!rendered.contains("alpha.example"), "got: {rendered}");
         assert!(!rendered.contains("gamma.example"), "got: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn render_shows_connected_profiles_accumulated_traffic() {
+        // Connected to endpoint 1 (alpha); the selection sits on endpoint 3
+        // (gamma). The statistics tab must render the CONNECTED session's
+        // accumulated traffic, not the selected (browsing) profile's zeros.
+        let mut state = filtered_state("").await;
+        // Known persisted values on alpha's link. The row's `updated_at` is
+        // today so the T21 day-reset does not zero `today_*` before the
+        // session delta lands (that reset is covered by the events test).
+        let link = &mut state.endpoints[0].links[0];
+        link.traffic = xray_tui_db::models::TrafficStats {
+            today_up: 1_024,
+            today_down: 2_048,
+            total_up: 10_000,
+            total_down: 20_000,
+        };
+        link.updated_at = jiff::Timestamp::now();
+        state.connected_protocol_id = Some(1);
+        state.selected_index = 2; // gamma selected
+        // Session delta via the T21 handler: the same path the pollers use.
+        let tx = state.core_event_tx.clone().unwrap();
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 100, // alpha's link protocol id (fake_row: id*100)
+            today_up: 5,
+            today_down: 10,
+            total_up: 5,
+            total_down: 10,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        let rendered = render_to_string(&state);
+        assert!(
+            rendered.contains("alpha.example:443"),
+            "connected profile rendered, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("gamma.example:443"),
+            "selection must not win over the connected profile, got: {rendered}"
+        );
+        // Today/Total reflect the T21 accumulation (base + session delta).
+        assert!(
+            rendered.contains(&xray_tui_core::format_bytes(1_024 + 5)),
+            "today_up accumulated, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&xray_tui_core::format_bytes(2_048 + 10)),
+            "today_down accumulated, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&xray_tui_core::format_bytes(10_000 + 5)),
+            "total_up accumulated, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&xray_tui_core::format_bytes(20_000 + 10)),
+            "total_down accumulated, got: {rendered}"
+        );
     }
 
     #[tokio::test]
