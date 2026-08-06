@@ -1,4 +1,15 @@
+use serde_json::{Map, Value};
 use xray_tui_core::protocol::Protocol;
+use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
+use xray_tui_proto::proto_spec::core_mapping;
+use xray_tui_proto::proto_spec::{
+    AnyTlsConfig, ConfigKind, EndpointEssentials, HostKind, HttpClientConfig, Hysteria1Config,
+    Hysteria2Config, NaiveConfig, ParsedProto, PlaceholderConfig, ProtocolConfig,
+    ProtocolEssentials, ProtocolKind, SecurityConfig, ShadowTlsConfig, Socks5Config, SsConfig,
+    SshConfig, SsrConfig, TailscaleConfig, TlsConfig, TlsOpts, TorConfig, TrojanConfig, TuicConfig,
+    VlessConfig, VmessConfig, WireguardConfig,
+};
+use xray_tui_proto::urlx::TinyText;
 
 /// A single input field in a protocol form.
 #[derive(Debug, Clone)]
@@ -1282,9 +1293,884 @@ pub const fn url_scheme_for(protocol: Protocol) -> &'static str {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Typed config builders (T12) — form field JSON → ParsedProto
+//
+// The TUI's `fields_to_profile` (ops/profiles.rs, READ-ONLY) produces the
+// settings JSON consumed here: `{ "user_id"?, "protocol_settings": {…},
+// "stream_settings": {…} }` — `user_id` is the credential form field
+// (`user_id`/`uuid`/`password`), which `fields_to_profile` keeps OUT of the
+// two settings maps. These builders are the reverse of
+// `ProtocolConfig::to_settings()` for the typed config structs, and wrap
+// outbound-only kinds in a `PlaceholderConfig`.
+//
+// HOST-FREE rule: the endpoint `address` never enters transport/security
+// config fields — only explicit form override keys (`sni`, `ws.host`, …) do.
+// ═══════════════════════════════════════════════════════════════════════
+
+type SettingsMap = Map<String, Value>;
+
+/// Build a typed [`ParsedProto`] from form field JSON. `address`/`port` are
+/// the endpoint essentials the form collected; `settings` is the form's
+/// `{ "user_id"?, "protocol_settings": …, "stream_settings": … }` JSON (the
+/// shape `fields_to_profile` produces — T17 passes its `extra` object
+/// verbatim; no wrapper helper is needed). Unknown settings keys -> Err.
+pub fn build_typed_config(
+    proto_kind: ProtocolKind,
+    address: &str,
+    port: u16,
+    settings: &Value,
+) -> Result<ParsedProto, String> {
+    let proto = proto_kind.as_str();
+    let obj = settings
+        .as_object()
+        .ok_or_else(|| format!("settings must be a JSON object for {proto}"))?;
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "user_id" | "protocol_settings" | "stream_settings"
+        ) {
+            return Err(format!("unknown setting {key} for {proto}"));
+        }
+    }
+    let user_id = obj.get("user_id").and_then(Value::as_str);
+    let ps = settings_map(obj.get("protocol_settings"), "protocol_settings", proto)?;
+    let ss = settings_map(obj.get("stream_settings"), "stream_settings", proto)?;
+
+    let config = match proto_kind {
+        // Shadowsocks: kind and core are cipher-aware (mirrors
+        // `SsConfig::try_parse_proto` — 2022-blake3 methods are
+        // Shadowsocks2022), so the whole ParsedProto is built here.
+        ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022 => {
+            let cfg = ss_from_form(user_id, ps, ss)?;
+            let kind = kind_for_ss_method(cfg.method.as_str());
+            return Ok(ParsedProto {
+                endpoints: vec![endpoint_from(address, port)],
+                protocol: ProtocolEssentials {
+                    proto_kind: kind,
+                    config_type: ConfigKind::Form,
+                    core_type: core_mapping::resolve_core(kind, None, Some(cfg.method.as_str())),
+                    config: ProtocolConfig::Ss(cfg),
+                },
+            });
+        }
+        ProtocolKind::Vless => ProtocolConfig::Vless(vless_from_form(user_id, ps, ss)?),
+        ProtocolKind::Vmess => ProtocolConfig::Vmess(vmess_from_form(user_id, ps, ss)?),
+        ProtocolKind::Trojan => ProtocolConfig::Trojan(trojan_from_form(user_id, ps, ss)?),
+        ProtocolKind::Hysteria2 => ProtocolConfig::Hysteria2(hysteria2_from_form(user_id, ps, ss)?),
+        ProtocolKind::Socks => ProtocolConfig::Socks(socks_from_form(user_id, ps, ss)?),
+        ProtocolKind::Http => ProtocolConfig::Http(http_from_form(user_id, ps, ss)?),
+        ProtocolKind::Tuic => ProtocolConfig::Tuic(tuic_from_form(user_id, ps, ss)?),
+        ProtocolKind::WireGuard => ProtocolConfig::Wireguard(wireguard_from_form(user_id, ps, ss)?),
+        ProtocolKind::Naive => ProtocolConfig::Naive(naive_from_form(user_id, ps, ss)?),
+        ProtocolKind::AnyTls => ProtocolConfig::AnyTls(anytls_from_form(user_id, ps, ss)?),
+        ProtocolKind::ShadowTls => ProtocolConfig::ShadowTls(shadowtls_from_form(user_id, ps, ss)?),
+        ProtocolKind::Tor => ProtocolConfig::Tor(tor_from_form(ps, ss)?),
+        ProtocolKind::Ssh => ProtocolConfig::Ssh(ssh_from_form(ps, ss)?),
+        ProtocolKind::Tailscale => ProtocolConfig::Tailscale(tailscale_from_form(ps, ss)?),
+        ProtocolKind::Hysteria => ProtocolConfig::Hysteria1(hysteria1_from_form(ps, ss)?),
+        ProtocolKind::ShadowsocksR => ProtocolConfig::Ssr(ssr_from_form(user_id, ps, ss)?),
+        // Outbound-only kinds (no URL, no typed config) + Redirect/TProxy/
+        // Mixed: raw settings passthrough in a PlaceholderConfig.
+        ProtocolKind::DokodemoDoor
+        | ProtocolKind::Freedom
+        | ProtocolKind::Blackhole
+        | ProtocolKind::Dns
+        | ProtocolKind::Loopback
+        | ProtocolKind::Custom
+        | ProtocolKind::Redirect
+        | ProtocolKind::TProxy
+        | ProtocolKind::Mixed => {
+            return placeholder_parsed(proto_kind, address, port, settings);
+        }
+    };
+
+    let mut endpoint = endpoint_from(address, port);
+    // Hysteria2: the form's `ports` hop spec flattens onto endpoints[0]
+    // (primary port + full list), same as the URL parser's multi-port path.
+    if proto_kind == ProtocolKind::Hysteria2
+        && let Some(ports) = ps.get("ports").and_then(value_string)
+        && !ports.is_empty()
+    {
+        let spec = parse_port_spec(proto, &ports)?;
+        if !spec.is_empty() {
+            endpoint.port = spec[0];
+            endpoint.ports = spec;
+        }
+    }
+
+    Ok(ParsedProto {
+        endpoints: vec![endpoint],
+        protocol: ProtocolEssentials {
+            proto_kind,
+            config_type: ConfigKind::Form,
+            core_type: core_mapping::resolve_core(proto_kind, None, None),
+            config,
+        },
+    })
+}
+
+// ── shared helpers ──────────────────────────────────────────────────────
+
+/// Extract a named sub-object; missing → empty map, non-object → Err.
+fn settings_map<'a>(
+    v: Option<&'a Value>,
+    what: &str,
+    proto: &str,
+) -> Result<&'a SettingsMap, String> {
+    match v {
+        None => Ok(&EMPTY_SETTINGS),
+        Some(Value::Object(m)) => Ok(m),
+        Some(_) => Err(format!("{what} must be a JSON object for {proto}")),
+    }
+}
+
+static EMPTY_SETTINGS: std::sync::LazyLock<SettingsMap> = std::sync::LazyLock::new(Map::new);
+
+/// JSON value → string (numbers accepted: `fields_to_profile` converts
+/// numeric-looking form values to JSON numbers).
+fn value_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn opt_string(v: Option<&Value>) -> Option<String> {
+    v.and_then(value_string).filter(|s| !s.is_empty())
+}
+
+fn opt_str(v: Option<&str>) -> Option<String> {
+    v.filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn opt_text(v: Option<&Value>) -> Option<TinyText> {
+    opt_string(v).map(TinyText::from)
+}
+
+fn req_string(proto: &str, key: &str, v: Option<&str>) -> Result<String, String> {
+    opt_str(v).ok_or_else(|| format!("missing required field {key} for {proto}"))
+}
+
+fn opt_bool(v: Option<&Value>) -> Option<bool> {
+    v.and_then(Value::as_bool)
+}
+
+fn opt_u32(proto: &str, key: &str, v: Option<&Value>) -> Result<Option<u32>, String> {
+    match v {
+        None => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|u| u32::try_from(u).ok())
+            .map(Some)
+            .ok_or_else(|| format!("invalid setting {key} for {proto}: expected u32")),
+        Some(Value::String(s)) => s
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("invalid setting {key} for {proto}: {s}")),
+        Some(_) => Err(format!("invalid setting {key} for {proto}: expected u32")),
+    }
+}
+
+/// Reject settings keys the form does not emit for `proto` — catches
+/// form/builder drift (a new form field T17 emits without a mapper here).
+fn check_keys(proto: &str, map: &SettingsMap, allowed: &[&str]) -> Result<(), String> {
+    for key in map.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("unknown setting {key} for {proto}"));
+        }
+    }
+    Ok(())
+}
+
+/// TLS options from the shared stream keys (`sni`/`alpn`/`fingerprint`/
+/// `allow_insecure` — all in `stream_settings`) plus `pin_sha256` (routed to
+/// `protocol_settings` by `fields_to_profile`). Explicit form overrides only.
+fn tls_opts_stream(ps: &SettingsMap, ss: &SettingsMap) -> TlsOpts {
+    TlsOpts {
+        sni: opt_text(ss.get("sni")),
+        alpn: opt_text(ss.get("alpn")),
+        fp: opt_text(ss.get("fingerprint")),
+        insecure: opt_bool(ss.get("allow_insecure")),
+        pin_sha256: opt_text(ps.get("pin_sha256")),
+        ..Default::default()
+    }
+}
+
+/// TLS options for the always-TLS protocols whose keys live in
+/// `protocol_settings` (`sni`/`insecure`, plus `alpn` when `with_alpn`).
+fn tls_opts_ps(ps: &SettingsMap, with_alpn: bool) -> TlsOpts {
+    TlsOpts {
+        sni: opt_text(ps.get("sni")),
+        alpn: with_alpn.then(|| opt_text(ps.get("alpn"))).flatten(),
+        insecure: opt_bool(ps.get("insecure")),
+        ..Default::default()
+    }
+}
+
+/// Transport from the form's stream keys. Presence of `ws.*`/`grpc.*` keys
+/// selects that transport — the form's `network` select is a Profile column
+/// that `fields_to_profile` drops, so it is unrecoverable here; defaults to
+/// Tcp. Returns the top-level `path` the vless/vmess configs carry for
+/// reconstruct parity (ws path / grpc serviceName).
+fn transport_and_path(ss: &SettingsMap) -> (TransportConfig, Option<TinyText>) {
+    if ss.contains_key("ws.path") || ss.contains_key("ws.host") {
+        let path = opt_text(ss.get("ws.path"));
+        (
+            TransportConfig::Ws(WebSocketConfig {
+                path: path.clone(),
+                host: opt_text(ss.get("ws.host")),
+                ..Default::default()
+            }),
+            path,
+        )
+    } else if let Some(sn) = opt_text(ss.get("grpc.serviceName")) {
+        // serviceName doubles as the gRPC path (share-link convention) so
+        // reconstruct emits `path=` and to_settings emits `serviceName`.
+        (
+            TransportConfig::Grpc(GrpcConfig {
+                service_name: Some(sn.clone()),
+                path: Some(sn.clone()),
+                ..Default::default()
+            }),
+            Some(sn),
+        )
+    } else {
+        (TransportConfig::Tcp, None)
+    }
+}
+
+/// Endpoint essentials from the form's address/port — host-kind detection
+/// follows the URL parsers (Ipv4/Ipv6 literal vs Dns).
+fn endpoint_from(address: &str, port: u16) -> EndpointEssentials {
+    let host_type = match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => HostKind::Ipv4,
+        Ok(std::net::IpAddr::V6(_)) => HostKind::Ipv6,
+        Err(_) => HostKind::Dns,
+    };
+    EndpointEssentials {
+        host: address.to_string(),
+        host_type,
+        port,
+        ports: vec![port],
+    }
+}
+
+/// Parse a port spec ("443", "1000-2000,3000") into a flattened list.
+fn parse_port_spec(proto: &str, spec: &str) -> Result<Vec<u16>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo = lo
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid setting ports for {proto}: {part}"))?;
+            let hi = hi
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid setting ports for {proto}: {part}"))?;
+            if lo > hi {
+                return Err(format!("invalid setting ports for {proto}: {part}"));
+            }
+            out.extend(lo..=hi);
+        } else {
+            out.push(
+                part.parse::<u16>()
+                    .map_err(|_| format!("invalid setting ports for {proto}: {part}"))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Cipher-aware kind routing, mirroring `SsConfig::try_parse_proto`.
+fn kind_for_ss_method(method: &str) -> ProtocolKind {
+    if method.starts_with("2022-blake3-") {
+        ProtocolKind::Shadowsocks2022
+    } else {
+        ProtocolKind::Shadowsocks
+    }
+}
+
+/// Outbound-only / non-URL kinds: raw settings passthrough in a
+/// [`PlaceholderConfig`] (same semantics as the legacy `from_legacy_parse`
+/// path), endpoints from address/port. Redirect/TProxy/Mixed get their
+/// dedicated [`ProtocolConfig`] variants; the other outbound-only kinds share
+/// the Mixed placeholder variant (the only one that can carry them — the
+/// `proto_kind` stays the real kind).
+fn placeholder_parsed(
+    proto_kind: ProtocolKind,
+    address: &str,
+    port: u16,
+    settings: &Value,
+) -> Result<ParsedProto, String> {
+    let settings_json = serde_json::to_vec(settings).map_err(|e| {
+        format!(
+            "failed to serialize settings for {}: {e}",
+            proto_kind.as_str()
+        )
+    })?;
+    let placeholder = PlaceholderConfig::new(proto_kind.as_str().to_string(), settings_json);
+    let config = match proto_kind {
+        ProtocolKind::Redirect => ProtocolConfig::Redirect(placeholder),
+        ProtocolKind::TProxy => ProtocolConfig::TProxy(placeholder),
+        _ => ProtocolConfig::Mixed(placeholder),
+    };
+    Ok(ParsedProto {
+        endpoints: vec![endpoint_from(address, port)],
+        protocol: ProtocolEssentials {
+            proto_kind,
+            config_type: ConfigKind::Form,
+            core_type: core_mapping::resolve_core(proto_kind, None, None),
+            config,
+        },
+    })
+}
+
+// ── per-protocol mappers ────────────────────────────────────────────────
+
+fn vless_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    ss: &SettingsMap,
+) -> Result<VlessConfig, String> {
+    check_keys(
+        "vless",
+        ps,
+        &[
+            "flow",
+            "pin_sha256",
+            "ech.enable",
+            "ech.config",
+            "fragment.enable",
+            "fragment.packets",
+            "fragment.length",
+            "fragment.interval",
+        ],
+    )?;
+    check_keys(
+        "vless",
+        ss,
+        &[
+            "fingerprint",
+            "alpn",
+            "sni",
+            "allow_insecure",
+            "tls.enable",
+            "ws.path",
+            "ws.host",
+            "grpc.serviceName",
+        ],
+    )?;
+    let uuid = req_string("vless", "user_id", user_id)?;
+    let (transport, path) = transport_and_path(ss);
+    let security = tls_security_from_stream(ps, ss);
+    Ok(VlessConfig {
+        uuid,
+        uuid_origin: None,
+        security,
+        transport,
+        // The form has no encryption field; None is the parser default
+        // ("none").
+        encryption: None,
+        flow: opt_text(ps.get("flow")),
+        path,
+        splice: None,
+        remarks: None,
+    })
+}
+
+/// TLS security for vless/vmess: enabled only by the explicit `tls.enable`
+/// form flag; `ech.*` (when enabled) maps to `TlsOpts::ech`. `reality.show`,
+/// `fragment.*` and `tcp.headerType` have no typed fields — accepted and
+/// ignored (see the T12 report for T17).
+fn tls_security_from_stream(ps: &SettingsMap, ss: &SettingsMap) -> SecurityConfig {
+    if opt_bool(ss.get("tls.enable")).unwrap_or(false) {
+        let mut opts = tls_opts_stream(ps, ss);
+        if opt_bool(ps.get("ech.enable")).unwrap_or(false) {
+            opts.ech = opt_text(ps.get("ech.config"));
+        }
+        SecurityConfig {
+            tls: Some(TlsConfig::Tls(opts)),
+            enc: None,
+        }
+    } else {
+        SecurityConfig::default()
+    }
+}
+
+fn vmess_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    ss: &SettingsMap,
+) -> Result<VmessConfig, String> {
+    check_keys(
+        "vmess",
+        ps,
+        &[
+            "pin_sha256",
+            "ech.enable",
+            "ech.config",
+            "fragment.enable",
+            "fragment.packets",
+            "fragment.length",
+            "fragment.interval",
+            "reality.show",
+        ],
+    )?;
+    check_keys(
+        "vmess",
+        ss,
+        &[
+            "tls.enable",
+            "fingerprint",
+            "alpn",
+            "sni",
+            "allow_insecure",
+            "ws.path",
+            "ws.host",
+            "grpc.serviceName",
+            "tcp.headerType",
+        ],
+    )?;
+    let uuid = req_string("vmess", "user_id", user_id)?;
+    let (transport, path) = transport_and_path(ss);
+    let mut security = tls_security_from_stream(ps, ss);
+    // Encryption is a Profile column in fields_to_profile (never lands in the
+    // settings JSON); "auto" is the parser default and what to_settings emits.
+    security.enc = Some(TinyText::from("auto"));
+    Ok(VmessConfig {
+        uuid,
+        security,
+        transport,
+        alter_id: None,
+        path,
+        remarks: None,
+    })
+}
+
+fn trojan_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    ss: &SettingsMap,
+) -> Result<TrojanConfig, String> {
+    check_keys(
+        "trojan",
+        ps,
+        &[
+            "flow",
+            "pin_sha256",
+            "ech.enable",
+            "ech.config",
+            "fragment.enable",
+            "fragment.packets",
+            "fragment.length",
+            "fragment.interval",
+        ],
+    )?;
+    check_keys(
+        "trojan",
+        ss,
+        &["sni", "alpn", "fingerprint", "allow_insecure"],
+    )?;
+    let password = req_string("trojan", "password", user_id)?;
+    // Trojan always uses TLS (parser default); sni/alpn/fp/insecure/pin_sha256
+    // from the form go into the TlsOpts.
+    let mut opts = tls_opts_stream(ps, ss);
+    if opt_bool(ps.get("ech.enable")).unwrap_or(false) {
+        opts.ech = opt_text(ps.get("ech.config"));
+    }
+    Ok(TrojanConfig {
+        password,
+        security: SecurityConfig {
+            tls: Some(TlsConfig::Tls(opts)),
+            enc: None,
+        },
+        transport: TransportConfig::Tcp,
+        path: None,
+        remarks: None,
+    })
+}
+
+fn ss_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<SsConfig, String> {
+    check_keys("ss", ps, &["method", "plugin", "plugin_opts"])?;
+    let method = req_string("ss", "method", opt_string(ps.get("method")).as_deref())?;
+    let password = req_string("ss", "password", user_id)?;
+    let plugin = opt_text(ps.get("plugin"));
+    let plugin_opts = opt_string(ps.get("plugin_opts")).map(|s| {
+        s.split(';')
+            .filter_map(|pair| {
+                pair.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect::<std::collections::HashMap<String, String>>()
+    });
+    Ok(SsConfig {
+        method: TinyText::from(method),
+        password,
+        security: SecurityConfig::default(),
+        remarks: None,
+        plugin,
+        plugin_opts,
+    })
+}
+
+fn socks_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<Socks5Config, String> {
+    check_keys("socks", ps, &["username", "udp"])?;
+    Ok(Socks5Config {
+        username: opt_string(ps.get("username")),
+        // The form's `password` routes to the top-level `user_id`.
+        password: opt_str(user_id),
+        security: SecurityConfig::default(),
+        remarks: None,
+    })
+}
+
+fn http_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<HttpClientConfig, String> {
+    check_keys("http", ps, &["username", "tls", "path"])?;
+    let security = if opt_bool(ps.get("tls")).unwrap_or(false) {
+        SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts::default())),
+            enc: None,
+        }
+    } else {
+        SecurityConfig::default()
+    };
+    Ok(HttpClientConfig {
+        username: opt_string(ps.get("username")),
+        password: opt_str(user_id),
+        security,
+        remarks: None,
+    })
+}
+
+fn tuic_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<TuicConfig, String> {
+    check_keys(
+        "tuic",
+        ps,
+        &[
+            "password",
+            "congestion_control",
+            "udp_relay_mode",
+            "sni",
+            "alpn",
+            "insecure",
+        ],
+    )?;
+    let uuid = req_string("tuic", "uuid", user_id)?;
+    Ok(TuicConfig {
+        uuid,
+        password: opt_string(ps.get("password")).unwrap_or_default(),
+        congestion_control: opt_text(ps.get("congestion_control")),
+        udp_relay_mode: opt_text(ps.get("udp_relay_mode")),
+        // Tuic always uses TLS (parser default).
+        security: SecurityConfig {
+            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, true))),
+            enc: None,
+        },
+        remarks: None,
+    })
+}
+
+fn wireguard_from_form(
+    _user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<WireguardConfig, String> {
+    check_keys(
+        "wireguard",
+        ps,
+        &[
+            "private_key",
+            "public_key",
+            "endpoint",
+            "allowed_ips",
+            "dns",
+            "mtu",
+            "workers",
+            "preshared_key",
+            "reserved",
+            "persistent_keepalive",
+            "udp_timeout",
+            "system",
+            "peers",
+        ],
+    )?;
+    let private_key = req_string(
+        "wireguard",
+        "private_key",
+        opt_string(ps.get("private_key")).as_deref(),
+    )?;
+    let public_key = req_string(
+        "wireguard",
+        "public_key",
+        opt_string(ps.get("public_key")).as_deref(),
+    )?;
+    let dns = opt_string(ps.get("dns"))
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .filter(|v| !v.is_empty());
+    let persistent_keepalive = opt_u32(
+        "wireguard",
+        "persistent_keepalive",
+        ps.get("persistent_keepalive"),
+    )?;
+    Ok(WireguardConfig {
+        private_key,
+        security: SecurityConfig::default(),
+        // The interface CIDR has no form field (the form's `address` is the
+        // server endpoint, which lands in EndpointEssentials) — default empty.
+        address: TinyText::default(),
+        public_key,
+        preshared_key: opt_string(ps.get("preshared_key")),
+        reserved: opt_text(ps.get("reserved")),
+        mtu: opt_text(ps.get("mtu")),
+        persistent_keepalive,
+        dns,
+        remote_dns_resolve: None,
+        remarks: None,
+    })
+}
+
+fn hysteria2_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<Hysteria2Config, String> {
+    check_keys(
+        "hysteria2",
+        ps,
+        &["ports", "hop", "obfs", "obfs_password", "sni", "insecure"],
+    )?;
+    let hop_interval = opt_u32("hysteria2", "hop", ps.get("hop"))?;
+    Ok(Hysteria2Config {
+        // The form's `password` routes to the top-level `user_id`.
+        auth: opt_str(user_id).unwrap_or_default(),
+        // Hysteria2 always uses TLS (parser default).
+        security: SecurityConfig {
+            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, false))),
+            enc: None,
+        },
+        obfs: opt_text(ps.get("obfs")),
+        obfs_password: opt_text(ps.get("obfs_password")),
+        up: None,
+        down: None,
+        hop_interval,
+        pin_sha256: None,
+        remarks: None,
+    })
+}
+
+fn hysteria1_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<Hysteria1Config, String> {
+    check_keys(
+        "hysteria",
+        ps,
+        &[
+            "protocol",
+            "auth",
+            "obfs",
+            "up_mbps",
+            "down_mbps",
+            "sni",
+            "insecure",
+        ],
+    )?;
+    Ok(Hysteria1Config {
+        auth: opt_string(ps.get("auth")),
+        protocol: opt_text(ps.get("protocol")),
+        obfs: opt_text(ps.get("obfs")),
+        up_mbps: opt_u32("hysteria", "up_mbps", ps.get("up_mbps"))?,
+        down_mbps: opt_u32("hysteria", "down_mbps", ps.get("down_mbps"))?,
+        // Hysteria always uses TLS (parser default).
+        security: SecurityConfig {
+            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, false))),
+            enc: None,
+        },
+        remarks: None,
+    })
+}
+
+fn naive_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<NaiveConfig, String> {
+    check_keys("naive", ps, &["user", "extra_headers", "padding"])?;
+    let password = req_string("naive", "password", user_id)?;
+    Ok(NaiveConfig {
+        username: opt_string(ps.get("user")).unwrap_or_default(),
+        password,
+        // Naive is always TLS (parser default).
+        security: SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts::default())),
+            enc: None,
+        },
+        remarks: None,
+    })
+}
+
+fn anytls_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<AnyTlsConfig, String> {
+    check_keys("anytls", ps, &["sni", "alpn", "insecure"])?;
+    Ok(AnyTlsConfig {
+        password: opt_str(user_id),
+        // AnyTLS always uses TLS (parser default).
+        security: SecurityConfig {
+            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, true))),
+            enc: None,
+        },
+        remarks: None,
+    })
+}
+
+fn shadowtls_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<ShadowTlsConfig, String> {
+    check_keys("shadowtls", ps, &["version", "sni"])?;
+    // ShadowTLS is TLS only when an explicit sni is provided (parser
+    // behavior — the disguise host).
+    let security = match opt_text(ps.get("sni")) {
+        Some(sni) => SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts {
+                sni: Some(sni),
+                ..Default::default()
+            })),
+            enc: None,
+        },
+        None => SecurityConfig::default(),
+    };
+    Ok(ShadowTlsConfig {
+        password: opt_str(user_id),
+        version: opt_text(ps.get("version")),
+        security,
+        remarks: None,
+    })
+}
+
+fn tor_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<TorConfig, String> {
+    check_keys(
+        "tor",
+        ps,
+        &["socks_port", "control_port", "control_password", "data_dir"],
+    )?;
+    Ok(TorConfig {
+        executable_path: None,
+        extra_args: None,
+        data_directory: opt_string(ps.get("data_dir")),
+        torrc: None,
+        security: SecurityConfig::default(),
+        remarks: None,
+    })
+}
+
+fn ssh_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<SshConfig, String> {
+    check_keys(
+        "ssh",
+        ps,
+        &["host", "ssh_port", "username", "private_key", "auth_method"],
+    )?;
+    Ok(SshConfig {
+        user: opt_string(ps.get("username")),
+        password: None,
+        private_key: opt_string(ps.get("private_key")),
+        private_key_path: None,
+        private_key_passphrase: None,
+        host_key: None,
+        host_key_algorithms: None,
+        client_version: None,
+        security: SecurityConfig::default(),
+        remarks: None,
+    })
+}
+
+fn tailscale_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<TailscaleConfig, String> {
+    check_keys("tailscale", ps, &["auth_key", "control_url", "ephemeral"])?;
+    Ok(TailscaleConfig {
+        hostname: None,
+        auth_key: opt_string(ps.get("auth_key")),
+        control_url: opt_string(ps.get("control_url")),
+        state_directory: None,
+        ephemeral: opt_bool(ps.get("ephemeral")),
+        accept_routes: None,
+        exit_node: None,
+        exit_node_allow_lan_access: None,
+        advertise_routes: None,
+        security: SecurityConfig::default(),
+        remarks: None,
+    })
+}
+
+fn ssr_from_form(
+    user_id: Option<&str>,
+    ps: &SettingsMap,
+    _ss: &SettingsMap,
+) -> Result<SsrConfig, String> {
+    check_keys(
+        "ssr",
+        ps,
+        &["method", "obfs", "obfs_param", "protocol", "protocol_param"],
+    )?;
+    let password = req_string("ssr", "password", user_id)?;
+    let protocol = opt_text(ps.get("protocol")).unwrap_or_default();
+    let method = opt_text(ps.get("method")).unwrap_or_default();
+    let obfs = opt_text(ps.get("obfs")).unwrap_or_default();
+    // Mirror the SSR parser: protocol/obfs live in both the fields and params
+    // (reconstruct skips them in the query string).
+    let mut params = std::collections::HashMap::new();
+    params.insert("protocol".to_string(), protocol.to_string());
+    params.insert("obfs".to_string(), obfs.to_string());
+    if let Some(v) = opt_string(ps.get("protocol_param")) {
+        params.insert("protocol_param".to_string(), v);
+    }
+    if let Some(v) = opt_string(ps.get("obfs_param")) {
+        params.insert("obfs_param".to_string(), v);
+    }
+    Ok(SsrConfig {
+        security: SecurityConfig::default(),
+        protocol,
+        method,
+        obfs,
+        password,
+        params,
+        remarks: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_tui_proto::proto_spec::CoreType;
 
     #[test]
     fn form_fields_all_protocols() {
@@ -1370,5 +2256,874 @@ mod tests {
         assert_eq!(url_scheme_for(Protocol::Trojan), "trojan://");
         assert_eq!(url_scheme_for(Protocol::WireGuard), "wireguard://");
         assert_eq!(url_scheme_for(Protocol::Freedom), "");
+    }
+
+    // ── T12: typed config builders ────────────────────────────────────
+
+    fn s(v: &str) -> Value {
+        Value::String(v.to_string())
+    }
+
+    fn b(v: bool) -> Value {
+        Value::Bool(v)
+    }
+
+    fn n(v: u64) -> Value {
+        Value::Number(v.into())
+    }
+
+    /// Build the settings JSON in the exact shape `fields_to_profile`
+    /// produces: `user_id` at top level, flat protocol/stream settings maps.
+    fn settings(user_id: Option<&str>, ps: &[(&str, Value)], ss: &[(&str, Value)]) -> Value {
+        let mut obj = Map::new();
+        if let Some(u) = user_id {
+            obj.insert("user_id".into(), Value::String(u.to_string()));
+        }
+        if !ps.is_empty() {
+            obj.insert(
+                "protocol_settings".into(),
+                Value::Object(ps.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()),
+            );
+        }
+        if !ss.is_empty() {
+            obj.insert(
+                "stream_settings".into(),
+                Value::Object(ss.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()),
+            );
+        }
+        Value::Object(obj)
+    }
+
+    fn built(kind: ProtocolKind, settings: Value) -> ParsedProto {
+        build_typed_config(kind, "1.2.3.4", 443, &settings).expect("build_typed_config")
+    }
+
+    fn config_json(parsed: &ParsedProto) -> Value {
+        serde_json::to_value(&parsed.protocol.config).expect("config serializable")
+    }
+
+    #[test]
+    fn build_vless_ws_tls() {
+        let parsed = built(
+            ProtocolKind::Vless,
+            settings(
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                &[("flow", s("xtls-rprx-vision"))],
+                &[
+                    ("tls.enable", b(true)),
+                    ("sni", s("real.example.com")),
+                    ("alpn", s("h2,http/1.1")),
+                    ("fingerprint", s("chrome")),
+                    ("allow_insecure", b(false)),
+                    ("ws.path", s("/ws")),
+                    ("ws.host", s("cdn.example.com")),
+                ],
+            ),
+        );
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Vless);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        assert_eq!(c.uuid, "6202b230-417c-4d8e-b624-0f71afa9c75d");
+        assert_eq!(c.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(c.encryption, None);
+        let TransportConfig::Ws(ws) = &c.transport else {
+            panic!("expected ws transport");
+        };
+        assert_eq!(ws.path.as_deref(), Some("/ws"));
+        // Explicit form override host — host-free rule allows it.
+        assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+        let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
+            panic!("expected tls security");
+        };
+        assert_eq!(tls.sni.as_deref(), Some("real.example.com"));
+        assert_eq!(tls.alpn.as_deref(), Some("h2,http/1.1"));
+        assert_eq!(tls.fp.as_deref(), Some("chrome"));
+        assert_eq!(tls.insecure, Some(false));
+        assert_eq!(parsed.endpoints.len(), 1);
+        assert_eq!(parsed.endpoints[0].host, "1.2.3.4");
+        assert_eq!(parsed.endpoints[0].port, 443);
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Ipv4);
+    }
+
+    #[test]
+    fn build_vmess_ws_tls_enc_auto() {
+        let parsed = built(
+            ProtocolKind::Vmess,
+            settings(
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                &[("reality.show", b(false)), ("fragment.enable", b(false))],
+                &[
+                    ("tls.enable", b(true)),
+                    ("sni", s("real.example.com")),
+                    ("ws.path", s("/ws")),
+                    ("grpc.serviceName", s("")),
+                    ("tcp.headerType", s("none")),
+                ],
+            ),
+        );
+        let ProtocolConfig::Vmess(c) = &parsed.protocol.config else {
+            panic!("expected Vmess config");
+        };
+        assert_eq!(c.uuid, "6202b230-417c-4d8e-b624-0f71afa9c75d");
+        // Encryption is a Profile column in fields_to_profile; mapper defaults
+        // to the parser's "auto".
+        assert_eq!(c.security.enc.as_deref(), Some("auto"));
+        let TransportConfig::Ws(ws) = &c.transport else {
+            panic!("expected ws transport (ws.path present)");
+        };
+        assert_eq!(ws.path.as_deref(), Some("/ws"));
+        assert!(c.security.tls.is_some());
+    }
+
+    #[test]
+    fn build_vless_defaults_tcp_no_tls() {
+        let parsed = built(ProtocolKind::Vless, settings(Some("uuid-here"), &[], &[]));
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        assert!(matches!(c.transport, TransportConfig::Tcp));
+        assert!(c.security.is_empty());
+    }
+
+    #[test]
+    fn build_vless_grpc_service_name() {
+        let parsed = built(
+            ProtocolKind::Vless,
+            settings(
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                &[],
+                &[("grpc.serviceName", s("myservice"))],
+            ),
+        );
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        let TransportConfig::Grpc(g) = &c.transport else {
+            panic!("expected grpc transport");
+        };
+        assert_eq!(g.service_name.as_deref(), Some("myservice"));
+        // path doubles as serviceName (share-link convention).
+        assert_eq!(c.path.as_deref(), Some("myservice"));
+    }
+
+    #[test]
+    fn build_ss_aead_resolves_xray() {
+        let parsed = built(
+            ProtocolKind::Shadowsocks,
+            settings(
+                Some("passw0rd"),
+                &[
+                    ("method", s("aes-256-gcm")),
+                    ("plugin", s("obfs-local")),
+                    ("plugin_opts", s("obfs=http;obfs-host=example.com")),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let ProtocolConfig::Ss(c) = &parsed.protocol.config else {
+            panic!("expected Ss config");
+        };
+        assert_eq!(c.method.as_str(), "aes-256-gcm");
+        assert_eq!(c.password, "passw0rd");
+        assert_eq!(c.plugin.as_deref(), Some("obfs-local"));
+        assert_eq!(
+            c.plugin_opts
+                .as_ref()
+                .and_then(|m| m.get("obfs"))
+                .map(String::as_str),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn build_ss_2022_method_kind_and_core() {
+        let parsed = built(
+            ProtocolKind::Shadowsocks,
+            settings(
+                Some("passw0rd"),
+                &[("method", s("2022-blake3-aes-128-gcm"))],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+    }
+
+    #[test]
+    fn build_ss_legacy_method_resolves_singbox() {
+        let parsed = built(
+            ProtocolKind::Shadowsocks,
+            settings(Some("passw0rd"), &[("method", s("aes-256-cfb"))], &[]),
+        );
+        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
+    }
+
+    #[test]
+    fn build_trojan_tls() {
+        let parsed = built(
+            ProtocolKind::Trojan,
+            settings(
+                Some("humanity"),
+                &[("flow", s("xtls-rprx-vision"))],
+                &[
+                    ("sni", s("real.example.com")),
+                    ("alpn", s("h2")),
+                    ("fingerprint", s("chrome")),
+                    ("allow_insecure", b(true)),
+                ],
+            ),
+        );
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let ProtocolConfig::Trojan(c) = &parsed.protocol.config else {
+            panic!("expected Trojan config");
+        };
+        assert_eq!(c.password, "humanity");
+        assert!(matches!(c.transport, TransportConfig::Tcp));
+        // Trojan always uses TLS.
+        let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
+            panic!("expected tls security");
+        };
+        assert_eq!(tls.sni.as_deref(), Some("real.example.com"));
+        assert_eq!(tls.insecure, Some(true));
+    }
+
+    #[test]
+    fn build_socks() {
+        let parsed = built(
+            ProtocolKind::Socks,
+            settings(
+                Some("secret"),
+                &[("username", s("alice")), ("udp", b(true))],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Socks(c) = &parsed.protocol.config else {
+            panic!("expected Socks config");
+        };
+        assert_eq!(c.username.as_deref(), Some("alice"));
+        // The form's `password` routes to top-level `user_id`.
+        assert_eq!(c.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn build_http_tls() {
+        let parsed = built(
+            ProtocolKind::Http,
+            settings(
+                Some("secret"),
+                &[
+                    ("username", s("alice")),
+                    ("tls", b(true)),
+                    ("path", s("/proxy")),
+                ],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Http(c) = &parsed.protocol.config else {
+            panic!("expected Http config");
+        };
+        assert_eq!(c.username.as_deref(), Some("alice"));
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        assert!(c.security.tls.is_some());
+    }
+
+    #[test]
+    fn build_wireguard() {
+        let parsed = built(
+            ProtocolKind::WireGuard,
+            settings(
+                None,
+                &[
+                    ("private_key", s("aGVsbG8=")),
+                    ("public_key", s("d29ybGQ=")),
+                    ("preshared_key", s("cHNr")),
+                    ("reserved", s("0,1,2")),
+                    ("mtu", n(1420)),
+                    ("dns", s("1.1.1.1,8.8.8.8")),
+                    ("persistent_keepalive", n(25)),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let ProtocolConfig::Wireguard(c) = &parsed.protocol.config else {
+            panic!("expected Wireguard config");
+        };
+        assert_eq!(c.private_key, "aGVsbG8=");
+        assert_eq!(c.public_key, "d29ybGQ=");
+        assert_eq!(c.preshared_key.as_deref(), Some("cHNr"));
+        assert_eq!(c.reserved.as_deref(), Some("0,1,2"));
+        assert_eq!(c.mtu.as_deref(), Some("1420"));
+        assert_eq!(c.persistent_keepalive, Some(25));
+        assert_eq!(
+            c.dns.as_deref(),
+            Some(&["1.1.1.1".to_string(), "8.8.8.8".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn build_hysteria2_with_ports() {
+        let parsed = built(
+            ProtocolKind::Hysteria2,
+            settings(
+                Some("token"),
+                &[
+                    ("ports", s("1000-1002,2000")),
+                    ("hop", n(5)),
+                    ("obfs", s("salamander")),
+                    ("obfs_password", s("obfs-secret")),
+                    ("sni", s("real.example.com")),
+                    ("insecure", b(true)),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let ProtocolConfig::Hysteria2(c) = &parsed.protocol.config else {
+            panic!("expected Hysteria2 config");
+        };
+        assert_eq!(c.auth, "token");
+        assert_eq!(c.obfs.as_deref(), Some("salamander"));
+        assert_eq!(c.obfs_password.as_deref(), Some("obfs-secret"));
+        assert_eq!(c.hop_interval, Some(5));
+        let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
+            panic!("expected tls security");
+        };
+        assert_eq!(tls.sni.as_deref(), Some("real.example.com"));
+        assert_eq!(tls.insecure, Some(true));
+        // The form's `ports` hop spec flattens onto endpoints[0].
+        assert_eq!(parsed.endpoints[0].port, 1000);
+        assert_eq!(parsed.endpoints[0].ports, vec![1000, 1001, 1002, 2000]);
+    }
+
+    #[test]
+    fn build_hysteria1() {
+        let parsed = built(
+            ProtocolKind::Hysteria,
+            settings(
+                None,
+                &[
+                    ("auth", s("token")),
+                    ("protocol", s("udp")),
+                    ("obfs", s("salamander")),
+                    ("up_mbps", n(100)),
+                    ("down_mbps", n(200)),
+                    ("sni", s("real.example.com")),
+                ],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Hysteria1(c) = &parsed.protocol.config else {
+            panic!("expected Hysteria1 config");
+        };
+        assert_eq!(c.auth.as_deref(), Some("token"));
+        assert_eq!(c.protocol.as_deref(), Some("udp"));
+        assert_eq!(c.up_mbps, Some(100));
+        assert_eq!(c.down_mbps, Some(200));
+        assert!(c.security.tls.is_some());
+    }
+
+    #[test]
+    fn build_tuic() {
+        let parsed = built(
+            ProtocolKind::Tuic,
+            settings(
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                &[
+                    ("password", s("pw")),
+                    ("congestion_control", s("bbr")),
+                    ("udp_relay_mode", s("native")),
+                    ("sni", s("real.example.com")),
+                    ("alpn", s("h3")),
+                    ("insecure", b(false)),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
+        let ProtocolConfig::Tuic(c) = &parsed.protocol.config else {
+            panic!("expected Tuic config");
+        };
+        assert_eq!(c.uuid, "6202b230-417c-4d8e-b624-0f71afa9c75d");
+        assert_eq!(c.password, "pw");
+        assert_eq!(c.congestion_control.as_deref(), Some("bbr"));
+        assert_eq!(c.udp_relay_mode.as_deref(), Some("native"));
+        let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
+            panic!("expected tls security");
+        };
+        assert_eq!(tls.sni.as_deref(), Some("real.example.com"));
+        assert_eq!(tls.alpn.as_deref(), Some("h3"));
+        assert_eq!(tls.insecure, Some(false));
+    }
+
+    #[test]
+    fn build_naive() {
+        let parsed = built(
+            ProtocolKind::Naive,
+            settings(
+                Some("secret"),
+                &[("user", s("alice")), ("padding", b(true))],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Naive(c) = &parsed.protocol.config else {
+            panic!("expected Naive config");
+        };
+        assert_eq!(c.username, "alice");
+        assert_eq!(c.password, "secret");
+        assert!(c.security.tls.is_some());
+    }
+
+    #[test]
+    fn build_anytls() {
+        let parsed = built(
+            ProtocolKind::AnyTls,
+            settings(
+                Some("secret"),
+                &[
+                    ("sni", s("real.example.com")),
+                    ("alpn", s("h2")),
+                    ("insecure", b(true)),
+                ],
+                &[],
+            ),
+        );
+        let ProtocolConfig::AnyTls(c) = &parsed.protocol.config else {
+            panic!("expected AnyTls config");
+        };
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
+            panic!("expected tls security");
+        };
+        assert_eq!(tls.sni.as_deref(), Some("real.example.com"));
+        assert_eq!(tls.insecure, Some(true));
+    }
+
+    #[test]
+    fn build_shadowtls() {
+        let parsed = built(
+            ProtocolKind::ShadowTls,
+            settings(
+                Some("secret"),
+                &[("version", n(3)), ("sni", s("real.example.com"))],
+                &[],
+            ),
+        );
+        let ProtocolConfig::ShadowTls(c) = &parsed.protocol.config else {
+            panic!("expected ShadowTls config");
+        };
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        assert_eq!(c.version.as_deref(), Some("3"));
+        let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
+            panic!("expected tls security from sni");
+        };
+        assert_eq!(tls.sni.as_deref(), Some("real.example.com"));
+    }
+
+    #[test]
+    fn build_tor_ssh_tailscale() {
+        let tor = built(
+            ProtocolKind::Tor,
+            settings(
+                None,
+                &[
+                    ("socks_port", n(9050)),
+                    ("control_port", n(9051)),
+                    ("control_password", s("pw")),
+                    ("data_dir", s("/tmp/tor")),
+                ],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Tor(c) = &tor.protocol.config else {
+            panic!("expected Tor config");
+        };
+        assert_eq!(c.data_directory.as_deref(), Some("/tmp/tor"));
+
+        let ssh = built(
+            ProtocolKind::Ssh,
+            settings(
+                None,
+                &[
+                    ("host", s("ssh.example.com")),
+                    ("ssh_port", n(22)),
+                    ("username", s("root")),
+                    ("private_key", s("key")),
+                    ("auth_method", s("key")),
+                ],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Ssh(c) = &ssh.protocol.config else {
+            panic!("expected Ssh config");
+        };
+        assert_eq!(c.user.as_deref(), Some("root"));
+        assert_eq!(c.private_key.as_deref(), Some("key"));
+
+        let ts = built(
+            ProtocolKind::Tailscale,
+            settings(
+                None,
+                &[
+                    ("auth_key", s("tskey-abc")),
+                    ("control_url", s("https://control.example.com")),
+                    ("ephemeral", b(true)),
+                ],
+                &[],
+            ),
+        );
+        let ProtocolConfig::Tailscale(c) = &ts.protocol.config else {
+            panic!("expected Tailscale config");
+        };
+        assert_eq!(c.auth_key.as_deref(), Some("tskey-abc"));
+        assert_eq!(
+            c.control_url.as_deref(),
+            Some("https://control.example.com")
+        );
+        assert_eq!(c.ephemeral, Some(true));
+    }
+
+    #[test]
+    fn build_ssr() {
+        let parsed = built(
+            ProtocolKind::ShadowsocksR,
+            settings(
+                Some("secret"),
+                &[
+                    ("method", s("aes-256-cfb")),
+                    ("protocol", s("auth_sha1_v4")),
+                    ("obfs", s("tls1.2_ticket_auth")),
+                    ("protocol_param", s("#1")),
+                    ("obfs_param", s("example.com")),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
+        let ProtocolConfig::Ssr(c) = &parsed.protocol.config else {
+            panic!("expected Ssr config");
+        };
+        assert_eq!(c.password, "secret");
+        assert_eq!(c.method.as_str(), "aes-256-cfb");
+        assert_eq!(c.protocol.as_str(), "auth_sha1_v4");
+        assert_eq!(c.obfs.as_str(), "tls1.2_ticket_auth");
+        assert_eq!(
+            c.params.get("protocol_param").map(String::as_str),
+            Some("#1")
+        );
+        assert_eq!(
+            c.params.get("obfs_param").map(String::as_str),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn build_rejects_unknown_protocol_settings_key() {
+        let settings = settings(Some("uuid"), &[("bogus", s("x"))], &[]);
+        let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &settings)
+            .expect_err("unknown key must error");
+        assert_eq!(err, "unknown setting bogus for vless");
+    }
+
+    #[test]
+    fn build_rejects_unknown_stream_settings_key() {
+        let settings = settings(Some("uuid"), &[], &[("ws.foo", s("x"))]);
+        let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &settings)
+            .expect_err("unknown key must error");
+        assert_eq!(err, "unknown setting ws.foo for vless");
+    }
+
+    #[test]
+    fn build_rejects_unknown_top_level_key() {
+        let mut obj = Map::new();
+        obj.insert("user_id".into(), Value::String("uuid".into()));
+        obj.insert("protocol_settings".into(), Value::Object(Map::new()));
+        obj.insert("extra".into(), Value::Bool(true));
+        let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &Value::Object(obj))
+            .expect_err("unknown top-level key must error");
+        assert_eq!(err, "unknown setting extra for vless");
+    }
+
+    #[test]
+    fn build_rejects_missing_required_credential() {
+        let raw = settings(None, &[], &[]);
+        let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &raw)
+            .expect_err("missing user_id must error");
+        assert_eq!(err, "missing required field user_id for vless");
+        let err = build_typed_config(
+            ProtocolKind::Shadowsocks,
+            "1.2.3.4",
+            443,
+            &settings(Some("pw"), &[], &[]),
+        )
+        .expect_err("missing method must error");
+        assert_eq!(err, "missing required field method for ss");
+    }
+
+    #[test]
+    fn build_rejects_non_object_settings() {
+        let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &Value::Null)
+            .expect_err("non-object settings must error");
+        assert_eq!(err, "settings must be a JSON object for vless");
+    }
+
+    #[test]
+    fn outbound_only_kinds_build_placeholder() {
+        for kind in [
+            ProtocolKind::DokodemoDoor,
+            ProtocolKind::Freedom,
+            ProtocolKind::Blackhole,
+            ProtocolKind::Dns,
+            ProtocolKind::Loopback,
+            ProtocolKind::Custom,
+        ] {
+            let raw = settings(
+                None,
+                &[("network", s("tcp")), ("doko_address", s("10.0.0.1"))],
+                &[],
+            );
+            let parsed = built(kind, raw.clone());
+            assert_eq!(parsed.protocol.proto_kind, kind);
+            assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
+            let ProtocolConfig::Mixed(p) = &parsed.protocol.config else {
+                panic!("{kind:?} must be a Mixed placeholder");
+            };
+            assert_eq!(p.proto_name, kind.as_str());
+            // Raw settings JSON preserved verbatim.
+            let back: Value = serde_json::from_slice(&p.settings_json).expect("settings JSON");
+            assert_eq!(back, raw);
+            assert_eq!(parsed.endpoints.len(), 1);
+            assert_eq!(parsed.endpoints[0].host, "1.2.3.4");
+            assert_eq!(parsed.endpoints[0].port, 443);
+        }
+    }
+
+    #[test]
+    fn redirect_tproxy_mixed_build_placeholder() {
+        for (kind, expect) in [
+            (ProtocolKind::Redirect, "Redirect"),
+            (ProtocolKind::TProxy, "TProxy"),
+            (ProtocolKind::Mixed, "Mixed"),
+        ] {
+            let raw = settings(None, &[], &[]);
+            let parsed = built(kind, raw.clone());
+            assert_eq!(parsed.protocol.proto_kind, kind);
+            assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
+            let config = &parsed.protocol.config;
+            let variant = match config {
+                ProtocolConfig::Redirect(_) => "Redirect",
+                ProtocolConfig::TProxy(_) => "TProxy",
+                ProtocolConfig::Mixed(_) => "Mixed",
+                _ => panic!("{kind:?} must be a placeholder variant"),
+            };
+            assert_eq!(variant, expect);
+        }
+    }
+
+    #[test]
+    fn serialized_config_has_no_address_bytes() {
+        for (kind, user_id, ps, ss) in [
+            (
+                ProtocolKind::Vless,
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                vec![("flow", s("xtls-rprx-vision"))],
+                vec![
+                    ("tls.enable", b(true)),
+                    ("sni", s("real.example.com")),
+                    ("ws.path", s("/ws")),
+                ],
+            ),
+            (
+                ProtocolKind::Vmess,
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                vec![],
+                vec![("tls.enable", b(true)), ("ws.host", s("cdn.example.com"))],
+            ),
+            (
+                ProtocolKind::Trojan,
+                Some("humanity"),
+                vec![],
+                vec![("sni", s("real.example.com"))],
+            ),
+            (
+                ProtocolKind::Hysteria2,
+                Some("token"),
+                vec![("sni", s("real.example.com"))],
+                vec![],
+            ),
+        ] {
+            let parsed = built(kind, settings(user_id, &ps, &ss));
+            let json = serde_json::to_string(&parsed.protocol.config).expect("serialize");
+            assert!(
+                !json.contains("1.2.3.4"),
+                "{kind:?} config must not contain the endpoint address: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_host_kind_detection() {
+        let ipv4 = built(ProtocolKind::Vless, settings(Some("uuid"), &[], &[]));
+        assert_eq!(ipv4.endpoints[0].host_type, HostKind::Ipv4);
+
+        let ipv6 = build_typed_config(
+            ProtocolKind::Vless,
+            "2001:db8::1",
+            443,
+            &settings(Some("uuid"), &[], &[]),
+        )
+        .expect("ipv6 build");
+        assert_eq!(ipv6.endpoints[0].host_type, HostKind::Ipv6);
+        assert_eq!(ipv6.endpoints[0].host, "2001:db8::1");
+
+        let dns = build_typed_config(
+            ProtocolKind::Vless,
+            "example.com",
+            443,
+            &settings(Some("uuid"), &[], &[]),
+        )
+        .expect("dns build");
+        assert_eq!(dns.endpoints[0].host_type, HostKind::Dns);
+    }
+
+    /// Reconstruct the built config via the endpoint and re-parse — the
+    /// config payload must survive the round trip (JSON equality, since
+    /// proto config structs derive PartialEq only inside the proto crate).
+    fn assert_reconstruct_roundtrip(parsed: &ParsedProto) {
+        let endpoint = &parsed.endpoints[0];
+        let url = parsed
+            .protocol
+            .config
+            .reconstruct_proto(endpoint)
+            .expect("reconstruct_proto");
+        let reparsed =
+            ProtocolConfig::try_parse_proto(&xray_tui_proto::urlx::RawUrlX::from(url.as_str()))
+                .expect("re-parse reconstructed URL");
+        assert_eq!(config_json(parsed), config_json(&reparsed));
+    }
+
+    #[test]
+    fn reconstruct_roundtrip_vless_ws_tls() {
+        let parsed = built(
+            ProtocolKind::Vless,
+            settings(
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                &[("flow", s("xtls-rprx-vision"))],
+                &[
+                    ("tls.enable", b(true)),
+                    ("sni", s("real.example.com")),
+                    ("fingerprint", s("chrome")),
+                    ("ws.path", s("/ws")),
+                    ("ws.host", s("cdn.example.com")),
+                ],
+            ),
+        );
+        assert_reconstruct_roundtrip(&parsed);
+    }
+
+    #[test]
+    fn reconstruct_roundtrip_trojan() {
+        let parsed = built(
+            ProtocolKind::Trojan,
+            settings(
+                Some("humanity"),
+                &[],
+                &[
+                    ("sni", s("real.example.com")),
+                    ("alpn", s("h2")),
+                    ("fingerprint", s("chrome")),
+                ],
+            ),
+        );
+        assert_reconstruct_roundtrip(&parsed);
+    }
+
+    #[test]
+    fn reconstruct_roundtrip_shadowsocks() {
+        let parsed = built(
+            ProtocolKind::Shadowsocks,
+            settings(
+                Some("passw0rd"),
+                &[
+                    ("method", s("aes-256-gcm")),
+                    ("plugin", s("obfs-local")),
+                    ("plugin_opts", s("obfs=http;obfs-host=example.com")),
+                ],
+                &[],
+            ),
+        );
+        assert_reconstruct_roundtrip(&parsed);
+    }
+
+    #[test]
+    fn reconstruct_roundtrip_grpc_reformatable() {
+        // gRPC service_name has no URL query slot (share links carry it as
+        // `path`), so strict config equality is not expected — the URL must
+        // still reconstruct and re-parse.
+        let parsed = built(
+            ProtocolKind::Vless,
+            settings(
+                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                &[],
+                &[("grpc.serviceName", s("myservice"))],
+            ),
+        );
+        let url = parsed
+            .protocol
+            .config
+            .reconstruct_proto(&parsed.endpoints[0])
+            .expect("reconstruct_proto");
+        assert!(
+            url.contains("type=grpc") && url.contains("path=myservice"),
+            "grpc URL should carry type and path: {url}"
+        );
+        ProtocolConfig::try_parse_proto(&xray_tui_proto::urlx::RawUrlX::from(url.as_str()))
+            .expect("re-parse reconstructed URL");
+    }
+
+    #[test]
+    fn reconstruct_roundtrip_shadowsocks2022() {
+        let parsed = built(
+            ProtocolKind::Shadowsocks2022,
+            settings(
+                Some("0123456789abcdef0123456789abcdef"),
+                &[("method", s("2022-blake3-aes-128-gcm"))],
+                &[],
+            ),
+        );
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
+        assert_reconstruct_roundtrip(&parsed);
+    }
+
+    #[test]
+    fn hy2_ports_roundtrip_flattens_endpoint() {
+        let parsed = built(
+            ProtocolKind::Hysteria2,
+            settings(
+                Some("token"),
+                &[
+                    ("ports", s("1000-1002,2000")),
+                    ("sni", s("real.example.com")),
+                ],
+                &[],
+            ),
+        );
+        let url = parsed
+            .protocol
+            .config
+            .reconstruct_proto(&parsed.endpoints[0])
+            .expect("reconstruct_proto");
+        // The multi-port hop spec must reconstruct (endpoint.ports drives it).
+        assert!(url.contains("1000"), "reconstructed URL: {url}");
+        let reparsed =
+            ProtocolConfig::try_parse_proto(&xray_tui_proto::urlx::RawUrlX::from(url.as_str()))
+                .expect("re-parse reconstructed URL");
+        assert_eq!(reparsed.endpoints[0].ports, parsed.endpoints[0].ports);
     }
 }
