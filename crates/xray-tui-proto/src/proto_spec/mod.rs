@@ -642,8 +642,8 @@ pub struct InjectOptions {
 ///
 /// Standalone by design: deliberately NOT a supertrait of [`ProtoSpec`] (no
 /// coupling). Task 6 adds the trait plus the [`ProtocolConfig`] dispatch; the
-/// per-config implementations land in Tasks 14/15 (the interim `inject_stub`
-/// errors with [`SupportError::UnsupportedProtocol`] until then).
+/// per-config implementations land in Tasks 14/15 (the interim stub impls
+/// errored with [`SupportError::UnsupportedProtocol`] until then).
 pub trait InjectToCoreConf {
     /// # Errors
     ///
