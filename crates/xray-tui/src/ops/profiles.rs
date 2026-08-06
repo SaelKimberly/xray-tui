@@ -12,8 +12,9 @@ use crate::state::{
 };
 use crate::types::{AppMode, BatchImportItem, SortColumn};
 use crate::{common_field_defaults, get_field, profile_to_fields};
+use xray_tui_db::Database;
 use xray_tui_db::DatabaseError;
-use xray_tui_db::models::{EndpointRow, PurgatoryView};
+use xray_tui_db::models::{EndpointRow, ProfileStats, PurgatoryView};
 use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ParsedProto, ProtocolKind};
 
 /// Unix-seconds now, as a `Timestamp` (the typed staleness clock).
@@ -21,8 +22,45 @@ fn now_ts() -> Timestamp {
     Timestamp::now()
 }
 
+/// Sweep stale persisted failure markers: clear `error` on every
+/// `profile_stats` row whose `error` is set AND whose `updated_at` predates
+/// `now - ttl_hours` — the "Clear error after" setting (design §6.4, anchor =
+/// `updated_at`). One typed query-based UPDATE (no read-modify-write).
+///
+/// `None` (the default) never clears: errors survive until the next test
+/// overwrites them. Best-effort housekeeping — DB errors are logged and
+/// swallowed, never surfaced to the user.
+pub async fn clear_expired_errors(db: &Database, ttl_hours: Option<i64>) {
+    let Some(ttl_hours) = ttl_hours.filter(|&h| h > 0) else {
+        return;
+    };
+    let mut conn = match db.connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(target: "tui::ops::profiles", "clear_expired_errors: open connection: {e}");
+            return;
+        }
+    };
+    let cutoff = now_ts()
+        .checked_sub(jiff::Span::new().hours(ttl_hours))
+        .unwrap_or_else(|_| now_ts());
+    if let Err(e) = ProfileStats::filter(ProfileStats::fields().error().is_some())
+        .filter(ProfileStats::fields().updated_at().lt(cutoff))
+        .update()
+        .error(None)
+        .exec(&mut conn)
+        .await
+    {
+        tracing::warn!(target: "tui::ops::profiles", "clear_expired_errors: {e}");
+    }
+}
+
 pub async fn reload_profiles(state: &mut AppState) {
     let now = now_ts();
+    // Error-TTL sweep (design §6.4): clear failure markers older than the
+    // configured TTL before rows are (re)loaded, so a swept error never
+    // renders. `None` (default) = no-op.
+    clear_expired_errors(&state.db, state.config.speed_test.error_ttl_hours).await;
     let result = match state.purgatory_view {
         PurgatoryView::Active => {
             let threshold = now
@@ -1612,5 +1650,156 @@ mod sort_tests {
             .map(|r| r.endpoint.id.get())
             .collect();
         assert_eq!(order, vec![2, 1]); // 0 before 300
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::test_support::{fake_row, ts};
+    use super::*;
+    use std::sync::Arc;
+    use xray_tui_config::AppConfig;
+    use xray_tui_db::models::{EndpointId, ErrorInfo, ProfileErr, ProfileStats, ProtocolId};
+
+    /// Stamp `error` on the row's link so it persists as a failure marker.
+    fn set_error(row: &mut EndpointRow, proto_id: i64, kind: ProfileErr) {
+        let link = row
+            .links
+            .iter_mut()
+            .find(|l| l.protocol_id.get() == proto_id)
+            .expect("link exists");
+        link.error = Some(ErrorInfo {
+            kind,
+            text: "boom".to_string(),
+        });
+    }
+
+    /// Persist the rows (endpoint + links + protocols) via the typed writes.
+    async fn persist_rows(db: &Database, rows: &[EndpointRow]) {
+        for row in rows {
+            db.upsert_endpoint(&row.endpoint).await.unwrap();
+            for link in &row.links {
+                db.upsert_link(link).await.unwrap();
+                if let Some(proto) = row.protocols.get(&link.protocol_id) {
+                    db.upsert_protocol(proto).await.unwrap();
+                }
+            }
+        }
+    }
+
+    /// Backdate a link's `updated_at` (the error-TTL anchor) to `secs`.
+    async fn backdate(db: &Database, proto_id: i64, endpoint_id: i64, secs: i64) {
+        let mut conn = db.connection().await.unwrap();
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(proto_id),
+            EndpointId::new(endpoint_id),
+        )
+        .update()
+        .updated_at(ts(secs))
+        .exec(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    /// The persisted error kind of a link, if any.
+    async fn link_error_kind(db: &Database, proto_id: i64, endpoint_id: i64) -> Option<ProfileErr> {
+        let mut conn = db.connection().await.unwrap();
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(proto_id),
+            EndpointId::new(endpoint_id),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .unwrap()
+        .expect("link persisted")
+        .error
+        .map(|e| e.kind)
+    }
+
+    #[tokio::test]
+    async fn reload_profiles_sweeps_expired_errors_and_keeps_fresh() {
+        // Endpoint 1 with two failing links: p100 (error 48h old), p101
+        // (error 10 min old).
+        let mut row = fake_row(1, "10.0.0.1", 2);
+        set_error(&mut row, 100, ProfileErr::Fast);
+        set_error(&mut row, 101, ProfileErr::Real);
+        let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
+        persist_rows(&db, std::slice::from_ref(&row)).await;
+        let now = jiff::Timestamp::now().as_second();
+        backdate(&db, 100, 1, now - 48 * 3600).await;
+        backdate(&db, 101, 1, now - 600).await;
+
+        let mut state = AppState::new(db.clone(), AppConfig::default()).await;
+        state.purgatory_view = PurgatoryView::All;
+
+        // Default config (ttl None): reload must NOT clear anything.
+        reload_profiles(&mut state).await;
+        assert_eq!(
+            link_error_kind(&db, 100, 1).await,
+            Some(ProfileErr::Fast),
+            "ttl None: stale error untouched"
+        );
+        assert_eq!(
+            link_error_kind(&db, 101, 1).await,
+            Some(ProfileErr::Real),
+            "ttl None: fresh error untouched"
+        );
+
+        // Configured ttl (24h): the 48h-old error is swept, the fresh one
+        // survives, and the reloaded in-memory rows match the DB.
+        state.config.speed_test.error_ttl_hours = Some(24);
+        reload_profiles(&mut state).await;
+        assert_eq!(link_error_kind(&db, 100, 1).await, None, "stale cleared");
+        assert_eq!(
+            link_error_kind(&db, 101, 1).await,
+            Some(ProfileErr::Real),
+            "fresh kept"
+        );
+        let row1 = state
+            .endpoints
+            .iter()
+            .find(|r| r.endpoint.id.get() == 1)
+            .expect("endpoint reloaded");
+        let p100 = row1
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 100)
+            .expect("p100 link");
+        assert!(p100.error.is_none(), "in-memory row reflects the sweep");
+        let p101 = row1
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 101)
+            .expect("p101 link");
+        assert!(p101.error.is_some(), "fresh marker still renders");
+    }
+
+    #[tokio::test]
+    async fn clear_expired_errors_none_and_nonpositive_ttl_are_noops() {
+        let mut row = fake_row(1, "10.0.0.1", 1);
+        set_error(&mut row, 100, ProfileErr::Fast);
+        let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
+        persist_rows(&db, std::slice::from_ref(&row)).await;
+        let now = jiff::Timestamp::now().as_second();
+        backdate(&db, 100, 1, now - 48 * 3600).await;
+
+        // None (default) and non-positive values both mean "never clear".
+        clear_expired_errors(&db, None).await;
+        assert_eq!(
+            link_error_kind(&db, 100, 1).await,
+            Some(ProfileErr::Fast),
+            "ttl None: no-op"
+        );
+        clear_expired_errors(&db, Some(0)).await;
+        assert_eq!(
+            link_error_kind(&db, 100, 1).await,
+            Some(ProfileErr::Fast),
+            "ttl 0: no-op"
+        );
+
+        // A positive ttl clears the stale marker.
+        clear_expired_errors(&db, Some(24)).await;
+        assert_eq!(link_error_kind(&db, 100, 1).await, None);
     }
 }

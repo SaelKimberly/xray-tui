@@ -332,6 +332,21 @@ mod tests {
     }
 
     #[test]
+    fn speed_test_error_ttl_defaults_none_and_round_trips() {
+        // Default: None — errors survive until the next test overwrites them.
+        let original = AppConfig::default();
+        assert!(original.speed_test.error_ttl_hours.is_none());
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(restored.speed_test.error_ttl_hours.is_none());
+
+        // Explicit value round-trips through the speed-test section.
+        let json = r#"{"core":{},"gui":{},"inbound":{},"speed_test":{"error_ttl_hours":168}}"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.speed_test.error_ttl_hours, Some(168));
+    }
+
+    #[test]
     fn core_type_field_accepts_null() {
         // When core_type is absent in JSON, it should become None
         let json = r#"{"core":{},"gui":{},"inbound":{}}"#;
@@ -483,6 +498,13 @@ pub struct SpeedTestConfig {
     pub fast_ping_concurrency: usize,
     #[serde(default = "default_real_ping_test_all_protocols")]
     pub real_ping_test_all_protocols: bool,
+    /// "Clear error after": persisted failure markers (`ProfileStats.error`)
+    /// older than this many hours are swept, anchored on `updated_at`.
+    /// `None` (the default) = errors survive until the next test overwrites
+    /// them. The TUI sweeps on profile reload and after batch completion;
+    /// T21 wires the settings form.
+    #[serde(default)]
+    pub error_ttl_hours: Option<i64>,
 }
 
 fn default_ping_url() -> String {
@@ -538,6 +560,7 @@ impl Default for SpeedTestConfig {
             real_ping_window: default_real_ping_window(),
             fast_ping_concurrency: default_fast_ping_concurrency(),
             real_ping_test_all_protocols: default_real_ping_test_all_protocols(),
+            error_ttl_hours: None,
         }
     }
 }

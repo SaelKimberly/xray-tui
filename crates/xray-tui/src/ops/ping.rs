@@ -542,6 +542,8 @@ struct BatchShared {
     ip_api_url: String,
     defer_delay: Duration,
     real_concurrency: usize,
+    /// "Clear error after" (design §6.4): `None` = never sweep.
+    error_ttl_hours: Option<i64>,
     total: u16,
     /// Fast config type per link (derived from the plan's protocol kind).
     fast_config: HashMap<(ProtocolId, EndpointId), i32>,
@@ -583,6 +585,7 @@ pub(crate) struct BatchParams {
     ip_api_url: String,
     defer_delay: Duration,
     real_concurrency: usize,
+    error_ttl_hours: Option<i64>,
 }
 
 impl From<BatchParams> for BatchShared {
@@ -620,6 +623,7 @@ impl From<BatchParams> for BatchShared {
             ip_api_url: p.ip_api_url,
             defer_delay: p.defer_delay,
             real_concurrency: p.real_concurrency,
+            error_ttl_hours: p.error_ttl_hours,
             total,
             fast_config,
             endpoints,
@@ -701,7 +705,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
     }
 
     if !shared.real_phase {
-        finish_batch(&shared);
+        finish_batch(&shared).await;
         return;
     }
 
@@ -797,13 +801,19 @@ pub(crate) async fn run_batch(params: BatchParams) {
     for h in deferred_real_handles {
         let _ = h.await;
     }
-    finish_batch(&shared);
+    finish_batch(&shared).await;
 }
 
 /// Signal the batch's end: total 0 makes the events handler clear the shared
-/// progress and re-arm the stop flag.
-fn finish_batch(shared: &BatchShared) {
+/// progress and re-arm the stop flag. Runs the error-TTL sweep first (design
+/// §6.4): batch completion is a natural "errors are fresh now" boundary, so
+/// persisted failure markers older than the configured TTL are cleared
+/// before the terminal progress event lands. Links the batch did not touch
+/// (dedup-cancelled siblings, queue-full/stop skips) are exactly the ones
+/// whose stale markers this clears.
+async fn finish_batch(shared: &BatchShared) {
     shared.progress.0.store(0, Ordering::Relaxed);
+    crate::ops::profiles::clear_expired_errors(&shared.db, shared.error_ttl_hours).await;
     let _ = shared.tx.try_send(CoreEvent::BatchProgress {
         total: 0,
         completed: 0,
@@ -1221,6 +1231,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_api_url = state.config.speed_test.ip_api_url.clone();
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
+    let error_ttl_hours = state.config.speed_test.error_ttl_hours;
     // Sleep the full deferral window once, then re-schedule (the window is
     // measured in whole seconds; T21 wires the configured value).
     let defer_delay = Duration::from_secs(scheduler.dns_defer_secs().max(1) as u64);
@@ -1242,6 +1253,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
         ip_api_url,
         defer_delay,
         real_concurrency,
+        error_ttl_hours,
     }));
 }
 
@@ -1251,9 +1263,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use tokio::sync::mpsc;
-    use xray_tui_db::models::{Latency, ProfileErr};
+    use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
 
-    use crate::ops::profiles::test_support::{fake_row, test_state};
+    use crate::ops::profiles::test_support::{fake_row, test_state, ts};
     use crate::ops::scheduler::TaskScheduler;
 
     use super::*;
@@ -1384,6 +1396,7 @@ mod tests {
             ip_api_url: "http://127.0.0.1/ip".to_string(),
             defer_delay: Duration::from_millis(50),
             real_concurrency: 8,
+            error_ttl_hours: None,
         }
     }
 
@@ -1452,6 +1465,52 @@ mod tests {
                 assert_gate_clear(&h.state.db, link).await;
             }
         }
+    }
+
+    // ── error-TTL sweep at batch completion ──────────────────────────────
+
+    #[tokio::test]
+    async fn batch_completion_sweeps_stale_error_markers() {
+        // A link with a persisted error whose updated_at predates the TTL.
+        // The batch is stopped before dispatch, so no probe touches the link
+        // — the `finish_batch` sweep must clear the stale marker from the DB
+        // (links the batch never re-tests are exactly the ones it clears).
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let mut h = harness(rows.clone()).await;
+        let mut link = h.state.endpoints[0].links[0].clone();
+        link.error = Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "old failure".to_string(),
+        });
+        h.state.db.upsert_link(&link).await.expect("upsert link");
+        let mut conn = h.state.db.connection().await.unwrap();
+        xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            link.protocol_id,
+            link.endpoint_id,
+        )
+        .update()
+        .updated_at(ts(jiff::Timestamp::now().as_second() - 48 * 3600))
+        .exec(&mut conn)
+        .await
+        .unwrap();
+
+        let plan = plan_from_rows(&rows);
+        let mut params = build_params(&h, plan, false, false);
+        params.error_ttl_hours = Some(24);
+        h.state.batch_progress = Some(params.progress.clone());
+        h.state.speed_test_stop.store(true, Ordering::Relaxed);
+        tokio::spawn(run_batch(params)).await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        let db: &Database = &h.state.db;
+        let stored = SchedulerDb::read_link(db, link.protocol_id, link.endpoint_id)
+            .await
+            .expect("read link")
+            .expect("link persisted");
+        assert!(
+            stored.error.is_none(),
+            "stale marker swept at batch completion: {stored:?}"
+        );
     }
 
     #[tokio::test]

@@ -292,10 +292,12 @@ const TEST_BAD_MS: i32 = 1000;
 
 /// Compute the Test cell for one endpoint row: `[value]` with the active
 /// link's last measured delay, colored by magnitude, or the red problem
-/// labels — `[name]` when the DNS name could not be resolved, `[fast]`/`[real]`
+/// labels — `[name]` when the DNS name could not be resolved, `[real]`/`[fast]`
 /// when any of the endpoint's links carries a persisted failure marker of
-/// that class (round maps removed in T17 — the labels now come from
-/// `link.error.kind`).
+/// that class (`link.error.kind`, round maps removed in T17). Precedence
+/// follows the tier model (decision 16): real-err (3) ranks above fast-err
+/// (4) — when both marker classes are present the deeper real check wins —
+/// and DNS-unresolved (5) is the deepest, so `[name]` beats both.
 fn compute_test_cell(
     row: &EndpointRow,
     resolved: bool,
@@ -340,11 +342,13 @@ fn test_cell_content(
     if host_is_dns && !resolved {
         return (format!("[{}]", center_cell("name", 4)), bad);
     }
-    if fast_failed {
-        return (format!("[{}]", center_cell("fast", 4)), bad);
-    }
+    // Tier ordering (decision 16): real-err ranks above fast-err — the real
+    // check is the deeper probe, so when both classes failed `[real]` wins.
     if real_failed {
         return (format!("[{}]", center_cell("real", 4)), bad);
+    }
+    if fast_failed {
+        return (format!("[{}]", center_cell("fast", 4)), bad);
     }
     match active_delay {
         Some(d) if d >= 0 => {
@@ -1178,16 +1182,39 @@ mod tests {
     #[test]
     fn test_cell_labels_persisted_failure_markers() {
         let palette = test_palette();
-        // Any link with a fast-class failure marker → [fast] (wins over [real]
-        // and over any latency).
+        // Both marker classes present → [real]: real-err (tier 3) ranks above
+        // fast-err (tier 4), the real check being the deeper probe (T20 flip).
         let (t, s) = test_cell_content(false, true, true, true, Some(12), &palette);
-        assert_eq!(t, "[fast]");
+        assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
         // Only a real-class failure marker → [real].
         let (t, _) = test_cell_content(false, true, false, true, Some(12), &palette);
         assert_eq!(t, "[real]");
+        // Only a fast-class failure marker → [fast].
+        let (t, _) = test_cell_content(false, true, true, false, Some(12), &palette);
+        assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
         let (t, _) = test_cell_content(false, true, false, false, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
+    }
+
+    #[test]
+    fn test_cell_label_precedence_matrix() {
+        let palette = test_palette();
+        // (a) only real markers → [real]
+        let (t, _) = test_cell_content(false, true, false, true, None, &palette);
+        assert_eq!(t, "[real]");
+        // (b) only fast markers → [fast]
+        let (t, _) = test_cell_content(false, true, true, false, None, &palette);
+        assert_eq!(t, "[fast]");
+        // (c) both real and fast markers → [real] (tier-consistent)
+        let (t, _) = test_cell_content(false, true, true, true, None, &palette);
+        assert_eq!(t, "[real]");
+        // (d) DNS-unresolved + fast marker → [name] (DNS tier 5 is deepest)
+        let (t, _) = test_cell_content(true, false, true, false, None, &palette);
+        assert_eq!(t, "[name]");
+        // (e) no markers, no measurement → blank
+        let (t, _) = test_cell_content(false, true, false, false, None, &palette);
+        assert_eq!(t, "      ");
     }
 }
