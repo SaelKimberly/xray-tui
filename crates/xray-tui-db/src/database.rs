@@ -491,7 +491,22 @@ impl Database {
     }
 
     /// Insert or update one protocol row by id.
+    ///
+    /// The `config`, `transport.data`, and `security.data` deferred JSON
+    /// columns are read via `.get()`, which panics when unloaded — a default
+    /// read path (including the crate's own `load_endpoint_rows`, which never
+    /// includes deferred data) yields an unloaded `Protocol`. Callers must
+    /// pass a freshly-built struct or one loaded with the deferred data
+    /// included; an unloaded struct is rejected with an error instead of
+    /// panicking.
     pub async fn upsert_protocol(&self, p: &Protocol) -> Result<()> {
+        if p.config.is_unloaded() || p.transport.data.is_unloaded() || p.security.data.is_unloaded()
+        {
+            return Err(DatabaseError::Generic(
+                "upsert_protocol: deferred config not loaded (rebuild the Protocol or load it with config/transport/security data included)"
+                    .into(),
+            ));
+        }
         let mut conn = self.conn().await?;
         Protocol::upsert_by_id(p.id)
             .sig(p.sig)
@@ -650,15 +665,31 @@ impl Database {
         }
 
         // Remove children whose IP is no longer in the resolution set.
+        // toasty emits no physical foreign keys, so a pruned child's links
+        // would dangle otherwise — cascade them, then purge protocols that
+        // lost their last link.
         let children: Vec<Endpoint> =
             Endpoint::filter(Endpoint::fields().parent_id().eq(parent_id))
                 .exec(&mut tx)
                 .await?;
         let keep: Vec<String> = ips.iter().map(ToString::to_string).collect();
+        let mut pruned = false;
         for child in children {
             if !keep.contains(&child.host) {
+                ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(child.id))
+                    .delete()
+                    .exec(&mut tx)
+                    .await?;
+                EndpointGroup::filter(EndpointGroup::fields().endpoint_id().eq(child.id))
+                    .delete()
+                    .exec(&mut tx)
+                    .await?;
                 child.delete().exec(&mut tx).await?;
+                pruned = true;
             }
+        }
+        if pruned {
+            Self::purge_orphan_protocols(&mut tx).await?;
         }
 
         tx.commit().await?;
@@ -1729,6 +1760,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_protocol_rejects_unloaded_config() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        toasty::create!(Protocol {
+            id: ProtocolId::new(1001),
+            sig: 1001,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: tcp_transport(),
+            security: no_security(),
+            config: Deferred::from(Json(vless_config())),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("protocol");
+
+        // A default read leaves the deferred JSON unloaded (the crate's own
+        // read paths never include it) — upserting must fail with an error
+        // instead of panicking on `.get()`.
+        let loaded = Protocol::filter_by_id(ProtocolId::new(1001))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(loaded.config.is_unloaded(), "config deferred by default");
+
+        let err = db
+            .upsert_protocol(&loaded)
+            .await
+            .expect_err("unloaded config must be rejected, not panic");
+        assert!(
+            err.to_string().contains("not loaded"),
+            "error explains the unloaded state: {err}"
+        );
+
+        // A freshly-built struct with loaded config still upserts fine.
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("loaded protocol upserts");
+    }
+
+    #[tokio::test]
     async fn update_last_used_refreshes_both_columns() {
         let db = Database::in_memory().await.expect("in-memory db");
         let mut conn = db.connection().await.expect("connection");
@@ -1847,7 +1921,36 @@ mod tests {
         .await
         .expect("child link");
 
-        // Prune: only ip1 stays, and its accumulated link survives.
+        // The child that WILL be pruned also has a link + protocol — pruning
+        // must cascade them (toasty emits no physical FKs, so the link would
+        // dangle and its protocol would never be reclaimable otherwise).
+        toasty::create!(Protocol {
+            id: ProtocolId::new(9002),
+            sig: 9002,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: tcp_transport(),
+            security: no_security(),
+            config: Deferred::from(Json(vless_config())),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("pruned child protocol");
+        toasty::create!(ProfileStats {
+            protocol_id: ProtocolId::new(9002),
+            endpoint_id: cid2,
+            core_type: CoreType::Xray,
+            config_type: ConfigType::ShareUrl,
+            last_seen_at: ts(1),
+            task_queue: Vec::<u16>::new(),
+            traffic: zero_traffic(),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("pruned child link");
+
+        // Prune: only ip1 stays; its accumulated link survives, while the
+        // pruned child, its link, and its now-orphaned protocol are removed.
         db.upsert_resolved_ip_children(EndpointId::new(50), &[ip1])
             .await
             .expect("prune children");
@@ -1866,6 +1969,31 @@ mod tests {
         assert_eq!(
             kept.endpoint_id, cid1,
             "re-resolution keeps the child row + links"
+        );
+
+        let pruned_links: Vec<ProfileStats> =
+            ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(cid2))
+                .exec(&mut conn)
+                .await
+                .expect("pruned links");
+        assert!(pruned_links.is_empty(), "pruned child's links cascade");
+        assert!(
+            Protocol::filter_by_id(ProtocolId::new(9002))
+                .first()
+                .exec(&mut conn)
+                .await
+                .expect("read")
+                .is_none(),
+            "protocol orphaned by the prune is cleaned up"
+        );
+        assert!(
+            Protocol::filter_by_id(ProtocolId::new(9001))
+                .first()
+                .exec(&mut conn)
+                .await
+                .expect("read")
+                .is_some(),
+            "protocol of the kept child survives"
         );
     }
 
