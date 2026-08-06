@@ -174,19 +174,11 @@ impl TransportConfig {
     }
 }
 
-/// Returns `true` when `value` equals the server's DNS name (case-insensitive).
-/// When the server is an IP address, always returns `false` — sni/host must be
-/// emitted because the IP address cannot serve as a TLS SNI/HTTP Host value.
-pub(crate) fn should_skip_param(host: &HostSpec, value: &str) -> bool {
-    match host {
-        HostSpec::DnsName(name) => name.as_ref().eq_ignore_ascii_case(value),
-        _ => false,
-    }
-}
-
-/// Like [`should_skip_param`] but takes the endpoint host *string*, which is
-/// all the `*_proto` reconstruct path has (`EndpointEssentials::host`). An IP
-/// endpoint never skips — an IP cannot serve as a TLS SNI/HTTP Host value.
+/// Returns `true` when `value` equals the endpoint host's DNS name
+/// (case-insensitive). When the endpoint is an IP address, always returns
+/// `false` — sni/host must be emitted because the IP address cannot serve as
+/// a TLS SNI/HTTP Host value. Takes the endpoint host *string*, which is all
+/// the `*_proto` reconstruct path has (`EndpointEssentials::host`).
 pub(crate) fn should_skip_endpoint_param(endpoint_host: &str, value: &str) -> bool {
     if endpoint_host.parse::<std::net::IpAddr>().is_ok() {
         return false;
@@ -965,28 +957,20 @@ mod tests {
     }
 
     #[test]
-    fn should_skip_param_skips_matching_dns() {
-        let host =
-            HostSpec::DnsName(rustls::pki_types::DnsName::try_from_str("example.com").unwrap());
-        assert!(should_skip_param(&host, "example.com"));
-        assert!(should_skip_param(&host, "EXAMPLE.COM"));
-        assert!(!should_skip_param(&host, "other.com"));
-        assert!(!should_skip_param(&host, "example.org"));
+    fn should_skip_endpoint_param_skips_matching_dns() {
+        assert!(should_skip_endpoint_param("example.com", "example.com"));
+        assert!(should_skip_endpoint_param("example.com", "EXAMPLE.COM"));
+        assert!(!should_skip_endpoint_param("example.com", "other.com"));
+        assert!(!should_skip_endpoint_param("example.com", "example.org"));
     }
 
     #[test]
-    fn should_skip_param_never_skips_for_ip() {
-        let host_v4 = HostSpec::IpAddress(rustls::pki_types::IpAddr::V4(
-            rustls::pki_types::Ipv4Addr::from(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-        ));
-        assert!(!should_skip_param(&host_v4, "anything"));
-        assert!(!should_skip_param(&host_v4, "1.2.3.4"));
+    fn should_skip_endpoint_param_never_skips_for_ip() {
+        assert!(!should_skip_endpoint_param("1.2.3.4", "anything"));
+        assert!(!should_skip_endpoint_param("1.2.3.4", "1.2.3.4"));
 
-        let host_v6 = HostSpec::IpAddress(rustls::pki_types::IpAddr::V6(
-            rustls::pki_types::Ipv6Addr::from(std::net::Ipv6Addr::LOCALHOST),
-        ));
-        assert!(!should_skip_param(&host_v6, "::1"));
-        assert!(!should_skip_param(&host_v6, "anything"));
+        assert!(!should_skip_endpoint_param("::1", "::1"));
+        assert!(!should_skip_endpoint_param("::1", "anything"));
     }
 
     #[test]
