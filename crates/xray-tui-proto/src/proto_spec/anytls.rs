@@ -48,7 +48,7 @@ use crate::proto_spec::common::{
 };
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
-/// AnyTLS protocol configuration — the identity payload (sans host/port).
+/// `AnyTLS` protocol configuration — the identity payload (sans host/port).
 ///
 /// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
 /// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
@@ -372,7 +372,9 @@ impl InjectToCoreConf for AnyTlsConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("any-tls".into(), other)),
+            other @ CoreType::Xray => {
+                Err(SupportError::UnsupportedProtocol("any-tls".into(), other))
+            }
         }
     }
 }
@@ -380,8 +382,8 @@ impl InjectToCoreConf for AnyTlsConfig {
 impl AnyTlsConfig {
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::AnyTls` arm (`password` + TLS via the shared
-    /// helper). AnyTLS always uses TLS, so an empty typed security still
-    /// yields a block with the endpoint-host server_name.
+    /// helper). `AnyTLS` always uses TLS, so an empty typed security still
+    /// yields a block with the endpoint-host `server_name`.
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
@@ -441,8 +443,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();

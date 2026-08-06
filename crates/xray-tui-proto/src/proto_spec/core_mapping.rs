@@ -1,15 +1,17 @@
-//! Core resolution for protocol kinds — canonical logic. The core crate's
-//! `protocol_core_mapping.rs` adapter shim (which converted core's
-//! `Protocol`/`CoreType` types) was deleted in T23; `xray-tui-core` now
-//! re-exports this module verbatim.
+//! Core resolution for protocol kinds — canonical logic.
+//!
+//! The core crate's `protocol_core_mapping.rs` adapter shim (which converted
+//! core's `Protocol`/`CoreType` types) was deleted in T23; `xray-tui-core`
+//! now re-exports this module verbatim.
 
 use crate::proto_spec::{CoreType, ProtocolKind};
 
-/// Shadowsocks ciphers xray-core accepts, case-insensitive: the AEAD set from
-/// `CipherType` (proxy/shadowsocks/config.proto) plus the `aead_*` and
-/// `chacha20-poly1305` name aliases of `cipherFromString`
+/// Shadowsocks ciphers xray-core accepts, case-insensitive.
+///
+/// The AEAD set from `CipherType` (proxy/shadowsocks/config.proto) plus the
+/// `aead_*` and `chacha20-poly1305` name aliases of `cipherFromString`
 /// (infra/conf/shadowsocks.go), plus the 2022-blake3 family
-/// (shadowaead_2022.List).
+/// (`shadowaead_2022.List`).
 pub const XRAY_SS_METHODS: &[&str] = &[
     "aes-128-gcm",
     "aes-256-gcm",
@@ -71,9 +73,11 @@ pub fn ss_method_supported(method: &str) -> bool {
     xray_supports_ss_method(method) || singbox_supports_ss_method(method)
 }
 
-/// Protocol kinds that only sing-box implements — the canonical sing-box-only
-/// set (the core crate's `SINGBOX_ONLY_PROTOCOLS` was deleted with the legacy
-/// `Protocol` enum in T23; consumers use this list over [`ProtocolKind`]).
+/// Protocol kinds that only sing-box implements.
+///
+/// The canonical sing-box-only set (the core crate's `SINGBOX_ONLY_PROTOCOLS`
+/// was deleted with the legacy `Protocol` enum in T23; consumers use this
+/// list over [`ProtocolKind`]).
 pub const SINGBOX_ONLY_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Tuic,
     ProtocolKind::Hysteria,
@@ -106,10 +110,7 @@ pub fn resolve_core(
     profile_override: Option<CoreType>,
     ss_method: Option<&str>,
 ) -> CoreType {
-    match profile_override {
-        Some(core_type) => core_type,
-        None => core_for_protocol(kind, ss_method),
-    }
+    profile_override.unwrap_or_else(|| core_for_protocol(kind, ss_method))
 }
 
 fn core_for_protocol(kind: ProtocolKind, ss_method: Option<&str>) -> CoreType {

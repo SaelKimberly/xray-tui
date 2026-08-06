@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -169,7 +169,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
     } else {
         state.log_trace("error", "tui::ops::ping", "Profile not found for real ping");
         return;
-    };
+    }
 
     let tx = match &state.core_event_tx {
         Some(tx) => tx.clone(),
@@ -652,7 +652,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
     // ── Phase 1: one FastPing task per link ───────────────────────────
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut deferred: Vec<PlanLink> = Vec::new();
-    for plan in shared.plan.iter() {
+    for plan in &shared.plan {
         if shared.stop.load(Ordering::Relaxed) {
             // Stop at the dispatch boundary: remaining links are never
             // scheduled, so they never write anything.
@@ -711,7 +711,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
     // ── Phase 2: one RealPing task per link, fired per endpoint ───────
     let mut per_endpoint: BTreeMap<i64, Vec<(ProfileStats, u16)>> = BTreeMap::new();
     let mut deferred_real: Vec<PlanLink> = Vec::new();
-    for plan in shared.plan.iter() {
+    for plan in &shared.plan {
         if shared.stop.load(Ordering::Relaxed) {
             break;
         }
@@ -980,14 +980,18 @@ impl BatchShared {
             if let Some(outcome) = inner.cache.get(&key) {
                 return outcome.clone();
             }
-            match inner.in_flight.get(&key) {
-                Some(existing) => (false, existing.clone()),
-                None => {
+            let pair = match inner.in_flight.entry(key.clone()) {
+                Entry::Occupied(existing) => (false, existing.get().clone()),
+                Entry::Vacant(slot) => {
                     let n = Arc::new(Notify::new());
-                    inner.in_flight.insert(key.clone(), n.clone());
+                    slot.insert(n.clone());
                     (true, n)
                 }
-            }
+            };
+            // Drop the guard before the follower awaits below — a stuck
+            // follower must not hold the dedup lock while waiting.
+            drop(inner);
+            pair
         };
         let timeout = self.fast_timeout;
         let config_type = self
@@ -1331,7 +1335,10 @@ mod tests {
             Box::pin(async move {
                 self.real_calls.fetch_add(1, Ordering::Relaxed);
                 self.real_probed.lock().insert(link.protocol_id.get());
-                if let Some(gate) = &*self.real_gate.lock() {
+                // Clone the gate out of the lock so the await below does not
+                // hold the mutex guard across the yield point.
+                let gate = self.real_gate.lock().clone();
+                if let Some(gate) = gate {
                     gate.notified().await;
                 }
                 self.real_outcome.lock().clone()

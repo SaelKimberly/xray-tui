@@ -1,8 +1,9 @@
 //! The per-(protocol, endpoint) task gate (design §6.2): at most one live
-//! task per `ProfileStats` row, a FIFO `task_queue` of waiting task ids, an
-//! orphan sweep that reconciles the in-memory registry against persisted
-//! state, and DNS-failure deferral so endpoints with recent DNS failures are
-//! skipped.
+//! task per `ProfileStats` row.
+//!
+//! It provides a FIFO `task_queue` of waiting task ids, an orphan sweep that
+//! reconciles the in-memory registry against persisted state, and
+//! DNS-failure deferral so endpoints with recent DNS failures are skipped.
 //!
 //! This module is pure scheduling state — it decides *which* task id may run
 //! and persists that decision through the [`SchedulerDb`] seam; it never
@@ -33,7 +34,7 @@
 //! inside the critical section. Concurrent callers on the same link therefore
 //! observe each other's writes: at most one `Started` outcome per gate-open,
 //! and a stale caller snapshot can never double-advance the gate. The mutex
-//! adds no serialization beyond what SQLite's single-writer model already
+//! adds no serialization beyond what `SQLite`'s single-writer model already
 //! imposes.
 
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
@@ -61,10 +62,12 @@ pub enum ScheduleOutcome {
     DnsDeferred,
 }
 
-/// Persistence seam for the scheduler. Implemented by [`Database`] for real
-/// storage; tests use an in-memory mock so the scheduling logic runs
-/// hermetically. Methods are RPITIT (`impl Future + Send`) so the returned
-/// futures can be spawned on tokio tasks by the caller (T19).
+/// Persistence seam for the scheduler.
+///
+/// Implemented by [`Database`] for real storage; tests use an in-memory mock
+/// so the scheduling logic runs hermetically. Methods are RPITIT
+/// (`impl Future + Send`) so the returned futures can be spawned on tokio
+/// tasks by the caller (T19).
 pub trait SchedulerDb {
     /// Load one `ProfileStats` row for a (protocol, endpoint) pair.
     fn read_link(
@@ -130,11 +133,13 @@ pub struct TaskScheduler {
     /// Endpoints whose DNS failed recently, by last failure time.
     dns_failures: DashMap<EndpointId, Timestamp>,
     /// Serializes every gate transition ([`Self::schedule`], [`Self::complete`],
-    /// [`Self::cancel_queued`], [`Self::sweep_orphans`]): the check-then-act
-    /// re-reads the persisted link inside the critical section, so concurrent
-    /// callers on the same link observe each other's writes — at most one
-    /// `Started` per gate-open. Contention is bounded: SQLite is single-writer
-    /// anyway, so this adds no serialization the DB would not impose.
+    /// [`Self::cancel_queued`], [`Self::sweep_orphans`]).
+    ///
+    /// The check-then-act re-reads the persisted link inside the critical
+    /// section, so concurrent callers on the same link observe each other's
+    /// writes — at most one `Started` per gate-open. Contention is bounded:
+    /// `SQLite` is single-writer anyway, so this adds no serialization the DB
+    /// would not impose.
     gate: tokio::sync::Mutex<()>,
 }
 
@@ -526,12 +531,18 @@ mod tests {
         }
     }
 
+    /// Persisted `(task_id, queue)` per `(protocol, endpoint)` link id pair.
+    type LinkState = HashMap<(i64, i64), (Option<u16>, Vec<u16>)>;
+
     /// In-memory [`SchedulerDb`]: stores the persisted `(task_id, queue)` per
     /// link so tests can assert exactly what the scheduler wrote.
     #[derive(Default)]
     struct MockDb {
-        state: Mutex<HashMap<(i64, i64), (Option<u16>, Vec<u16>)>>,
+        state: Mutex<LinkState>,
     }
+
+    /// One recorded write: `(protocol id, task_id, queue)`.
+    type WriteRecord = (i64, Option<u16>, Vec<u16>);
 
     impl MockDb {
         fn put(&self, l: &ProfileStats) {
@@ -549,7 +560,7 @@ mod tests {
                 .expect("link present in mock db")
         }
 
-        fn writes(&self) -> Vec<(i64, Option<u16>, Vec<u16>)> {
+        fn writes(&self) -> Vec<WriteRecord> {
             self.state
                 .lock()
                 .iter()

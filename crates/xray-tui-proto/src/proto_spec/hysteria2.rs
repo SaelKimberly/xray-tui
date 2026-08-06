@@ -478,9 +478,9 @@ impl Hysteria2Config {
     /// "hysteria2" protocol name; "hysteria" with version 2 IS hysteria2.
     /// `settings` is exactly `{version, address, port}` (hysteria.go); `auth`
     /// is silently dropped there and must live in
-    /// `streamSettings.hysteriaSettings.auth` (transport_method.go
-    /// `HysteriaConfig`; emitted as transport ProtocolName "hysteria" by
-    /// transport_internet.go — `proxy/hysteria/client.go` hard-errors "not
+    /// `streamSettings.hysteriaSettings.auth` (`transport_method.go`)
+    /// `HysteriaConfig`; emitted as transport `ProtocolName` "hysteria" by
+    /// `transport_internet.go` — `proxy/hysteria/client.go` hard-errors "not
     /// hysteria transport" without it). TLS stays in streamSettings
     /// security/tlsSettings (the Task 16 TLS ruling; the settings block has
     /// no TLS keys).
@@ -524,7 +524,7 @@ impl Hysteria2Config {
     /// 100 — always emitted like the old builder), `obfs` object
     /// (`{type, password}`) when the typed obfs is set (sing-box key the old
     /// builder dropped), and the mandatory TLS block. `hop_interval`/
-    /// `server_ports` are dropped (typed hop_interval is a raw int with
+    /// `server_ports` are dropped (typed `hop_interval` is a raw int with
     /// ambiguous Duration semantics; the old builder dropped it too).
     fn inject_singbox(
         &self,
@@ -540,7 +540,7 @@ impl Hysteria2Config {
                 .and_then(|s| {
                     s.as_str()
                         .chars()
-                        .take_while(|c| c.is_ascii_digit())
+                        .take_while(char::is_ascii_digit)
                         .collect::<String>()
                         .parse::<i64>()
                         .ok()
@@ -606,8 +606,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();

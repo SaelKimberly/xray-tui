@@ -7,6 +7,15 @@
 //! timestamps, deferred JSON config blobs — and every read in
 //! [`crate::database`] goes through the typed query API.
 
+// allow(clippy::used_underscore_binding): toasty-macros synthesizes `_0`-named
+// parameters in the `Update` builder setters for unnamed tuple fields
+// (`EndpointId`, `ProtocolId`) and uses them. The binding names are generated
+// by the third-party derive with the field's span, so a struct-level allow
+// cannot reach them (the generated impls are sibling items); the lint level
+// must be set at this module. No handwritten code here uses underscore-
+// prefixed bindings.
+#![allow(clippy::used_underscore_binding)]
+
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -161,7 +170,7 @@ pub struct Security {
 
 /// Latency of one probe, real or fast. Both variants share the `delay`
 /// column (`latency_delay`); `ip` exists only on `Real` (`latency_ip`).
-#[derive(Debug, Clone, PartialEq, toasty::Embed)]
+#[derive(Debug, Clone, PartialEq, Eq, toasty::Embed)]
 pub enum Latency {
     Real {
         #[shared(delay)]
@@ -377,15 +386,14 @@ impl EndpointRow {
     /// 0 real-ok, 1 fast-ok, 2 untested, 3 real-err, 4 fast-err,
     /// 5 dns-unresolved. `dns_unresolved` is endpoint-level: one flag for
     /// all links (`host_type == Dns` and no cached `resolved_as`).
-    fn link_test_tier(link: &ProfileStats, dns_unresolved: bool) -> u8 {
+    const fn link_test_tier(link: &ProfileStats, dns_unresolved: bool) -> u8 {
         if dns_unresolved {
             5
         } else if let Some(err) = &link.error {
             match err.kind {
-                ProfileErr::Real => 3,
                 // A name-resolution failure surfaces on a real attempt, so it
                 // shares the real-err bucket.
-                ProfileErr::Name => 3,
+                ProfileErr::Real | ProfileErr::Name => 3,
                 ProfileErr::Fast => 4,
             }
         } else {
@@ -404,7 +412,7 @@ impl EndpointRow {
     fn link_test_key(link: &ProfileStats, dns_unresolved: bool) -> (u8, i32, i64, i64) {
         let tier = Self::link_test_tier(link, dns_unresolved);
         let delay = match link.latency {
-            Some(Latency::Real { delay, .. }) | Some(Latency::Fast { delay }) => delay,
+            Some(Latency::Real { delay, .. } | Latency::Fast { delay }) => delay,
             None => i32::MAX,
         };
         let latency = if tier <= 1 { delay } else { i32::MAX };
@@ -507,28 +515,28 @@ mod tests {
         r.links.iter().map(|l| l.protocol_id.get()).collect()
     }
 
-    fn real(delay: i32) -> Option<Latency> {
-        Some(Latency::Real { delay, ip: None })
+    fn real(delay: i32) -> Latency {
+        Latency::Real { delay, ip: None }
     }
 
-    fn fast(delay: i32) -> Option<Latency> {
-        Some(Latency::Fast { delay })
+    fn fast(delay: i32) -> Latency {
+        Latency::Fast { delay }
     }
 
-    fn err(kind: ProfileErr) -> Option<ErrorInfo> {
-        Some(ErrorInfo {
+    fn err(kind: ProfileErr) -> ErrorInfo {
+        ErrorInfo {
             kind,
             text: "boom".to_string(),
-        })
+        }
     }
 
     #[test]
     fn real_ok_above_fast_ok_above_untested() {
         // real-ok 200ms outranks fast-ok 10ms — tier beats latency.
         let mut r = row(&[
-            (10, 1, real(200), None), // real-ok
-            (20, 2, fast(10), None),  // fast-ok
-            (30, 3, None, None),      // untested
+            (10, 1, Some(real(200)), None), // real-ok
+            (20, 2, Some(fast(10)), None),  // fast-ok
+            (30, 3, None, None),            // untested
         ]);
         r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![10, 20, 30]);
@@ -537,10 +545,10 @@ mod tests {
     #[test]
     fn latency_orders_within_success_tiers() {
         let mut r = row(&[
-            (10, 1, fast(50), None),
-            (20, 2, fast(10), None),
-            (30, 3, real(120), None),
-            (40, 4, real(90), None),
+            (10, 1, Some(fast(50)), None),
+            (20, 2, Some(fast(10)), None),
+            (30, 3, Some(real(120)), None),
+            (40, 4, Some(real(90)), None),
         ]);
         r.sort_links_by_test_priority(false);
         // real tier first (30:120, 40:90 by latency), then fast tier (20:10, 10:50)
@@ -553,8 +561,8 @@ mod tests {
         // below the untested 30; 20 has a fast error -> below 10 (fast worse
         // than real).
         let mut r = row(&[
-            (10, 1, real(50), err(ProfileErr::Real)),
-            (20, 2, fast(80), err(ProfileErr::Fast)),
+            (10, 1, Some(real(50)), Some(err(ProfileErr::Real))),
+            (20, 2, Some(fast(80)), Some(err(ProfileErr::Fast))),
             (30, 3, None, None),
         ]);
         r.sort_links_by_test_priority(false);
@@ -565,8 +573,8 @@ mod tests {
     fn both_failed_uses_fast_tier() {
         // Both links carry a fast error: tie on tier, order by recency.
         let mut r = row(&[
-            (10, 1, None, err(ProfileErr::Fast)),
-            (20, 2, None, err(ProfileErr::Fast)),
+            (10, 1, None, Some(err(ProfileErr::Fast))),
+            (20, 2, None, Some(err(ProfileErr::Fast))),
         ]);
         r.sort_links_by_test_priority(false);
         assert_eq!(ids(&r), vec![20, 10]);
@@ -574,7 +582,7 @@ mod tests {
 
     #[test]
     fn dns_unresolved_sinks_all_protocols() {
-        let mut r = row(&[(10, 1, real(50), None), (20, 2, None, None)]);
+        let mut r = row(&[(10, 1, Some(real(50)), None), (20, 2, None, None)]);
         r.sort_links_by_test_priority(true);
         assert_eq!(ids(&r), vec![20, 10]); // untested first; dns tier wins for both
     }
@@ -593,8 +601,8 @@ mod tests {
     #[test]
     fn best_key_returns_min_over_links() {
         let r = row(&[
-            (10, 1, real(200), None),
-            (20, 2, fast(10), None),
+            (10, 1, Some(real(200)), None),
+            (20, 2, Some(fast(10)), None),
             (30, 3, None, None),
         ]);
         // Best = real-ok (tier 0), latency 200
@@ -606,7 +614,7 @@ mod tests {
 
     #[test]
     fn active_link_respects_override() {
-        let mut r = row(&[(10, 1, real(50), None), (20, 2, fast(10), None)]);
+        let mut r = row(&[(10, 1, Some(real(50)), None), (20, 2, Some(fast(10)), None)]);
         r.endpoint.manual_protocol_override = Some(ProtocolId::new(20));
         assert_eq!(r.active_link().unwrap().protocol_id, ProtocolId::new(20));
         // Override to a protocol with no link -> fall back to selection.
@@ -619,7 +627,7 @@ mod tests {
 
     #[test]
     fn active_protocol_pairs_link_with_protocol() {
-        let mut r = row(&[(10, 1, real(50), None)]);
+        let mut r = row(&[(10, 1, Some(real(50)), None)]);
         let protocol = Protocol {
             id: ProtocolId::new(10),
             sig: 10,

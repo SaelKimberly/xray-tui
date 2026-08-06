@@ -56,7 +56,7 @@ use crate::clash::{ClashProxy, ClashSSR};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{clash_to_endpoint, host_kind_for};
 
-/// ShadowsocksR protocol configuration — the identity payload (sans host/port).
+/// `ShadowsocksR` protocol configuration — the identity payload (sans host/port).
 ///
 /// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
 /// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
@@ -429,7 +429,7 @@ impl InjectToCoreConf for SsrConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::SingBox => self.inject_singbox(core_conf, endpoint),
-            other => Err(SupportError::UnsupportedProtocol("ssr".into(), other)),
+            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("ssr".into(), other)),
         }
     }
 }
@@ -439,8 +439,8 @@ impl SsrConfig {
     /// builder's `Protocol::ShadowsocksR` arm (`method`/`password`/`obfs`/
     /// `obfs_param`/`protocol`/`protocol_param`, all with the old defaults).
     /// The typed `params` map carries the query params verbatim; the obfs/
-    /// protocol param values are read under both the modern ("obfs_param"/
-    /// "protocol_param") and share-link ("obfsparam"/"protoparam") spellings.
+    /// protocol param values are read under both the modern ("`obfs_param`"/
+    /// "`protocol_param`") and share-link ("obfsparam"/"protoparam") spellings.
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
@@ -508,8 +508,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();
@@ -660,7 +660,7 @@ mod tests {
         let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
         match (out, proxy) {
             (ClashProxy::ShadowsocksR(out), ClashProxy::ShadowsocksR(orig)) => {
-                assert_eq!(out, orig)
+                assert_eq!(out, orig);
             }
             _ => panic!("expected ssr clash proxy"),
         }

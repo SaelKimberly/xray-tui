@@ -23,9 +23,10 @@ fn now_ts() -> Timestamp {
 
 /// Sweep stale persisted failure markers: clear `error` on every
 /// `profile_stats` row whose `error` is set AND whose `updated_at` predates
-/// `now - ttl_hours` — the "Clear error after" setting (design §6.4, anchor =
-/// `updated_at`). One typed query-based UPDATE (no read-modify-write).
+/// `now - ttl_hours`.
 ///
+/// This is the "Clear error after" setting (design §6.4, anchor =
+/// `updated_at`): one typed query-based UPDATE (no read-modify-write).
 /// `None` (the default) never clears: errors survive until the next test
 /// overwrites them. Best-effort housekeeping — DB errors are logged and
 /// swallowed, never surfaced to the user.
@@ -211,8 +212,7 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
             SortColumn::Traffic => {
                 let traffic = |row: &EndpointRow| {
                     row.active_link()
-                        .map(|l| l.traffic.total_down + l.traffic.total_up)
-                        .unwrap_or(0)
+                        .map_or(0, |l| l.traffic.total_down + l.traffic.total_up)
                 };
                 traffic(a_row).cmp(&traffic(b_row))
             }
@@ -225,7 +225,7 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
     indices
 }
 
-/// Sort rank for the config-type column: Form before ShareUrl (hand-made
+/// Sort rank for the config-type column: Form before `ShareUrl` (hand-made
 /// profiles first, deterministic for the sort).
 fn config_type_rank(row: &EndpointRow) -> u8 {
     use xray_tui_db::models::ConfigType;
@@ -310,7 +310,7 @@ async fn find_editable_endpoint(
 }
 
 /// The typed `EndpointId` for a raw i64 (used by edit/delete flows).
-pub(crate) fn endpoint_id_from_raw(raw: i64) -> xray_tui_db::models::EndpointId {
+pub(crate) const fn endpoint_id_from_raw(raw: i64) -> xray_tui_db::models::EndpointId {
     xray_tui_db::models::EndpointId::new(raw)
 }
 
@@ -473,7 +473,10 @@ pub fn fields_to_parsed(
             serde_json::Value::String(value.clone())
         };
         match key.as_str() {
-            "address" | "port" => {}
+            // Profile-column / edit-form plumbing fields — never in the
+            // settings JSON (the mapper infers transport from ws/grpc keys;
+            // vmess encryption defaults to auto).
+            "address" | "port" | "security" | "network" | "config_type" => {}
             "core_type" => core_type.clone_from(value),
             // F6: tuic's `password` is a protocol_setting credential (its
             // `uuid` owns the top-level `user_id` slot); every other
@@ -483,11 +486,6 @@ pub fn fields_to_parsed(
                 proto_map.insert(key.clone(), json_val);
             }
             "user_id" | "password" | "uuid" => user_id = Some(value.clone()),
-            "security" | "network" | "config_type" => {
-                // Profile-column / edit-form plumbing fields — never in the
-                // settings JSON (the mapper infers transport from ws/grpc
-                // keys; vmess encryption defaults to auto).
-            }
             _ if key.starts_with("tls.")
                 || key.starts_with("ws.")
                 || key.starts_with("grpc.")
@@ -633,8 +631,7 @@ pub async fn confirm_add_server(state: &mut AppState) {
             let addr = parsed
                 .0
                 .first_endpoint()
-                .map(|e| format!("{}:{}", e.host, e.port))
-                .unwrap_or_else(|| "?".into());
+                .map_or_else(|| "?".into(), |e| format!("{}:{}", e.host, e.port));
             state.log_trace(
                 "info",
                 "tui::ops::profiles",
@@ -670,16 +667,15 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         _ => return,
     };
 
-    let row = match state
+    let row = if let Ok(Some(r)) = state
         .db
         .get_endpoint(endpoint_id_from_raw(endpoint_id))
         .await
     {
-        Ok(Some(r)) => r,
-        _ => {
-            state.log_trace("error", "tui::ops::profiles", "Profile not found for edit");
-            return;
-        }
+        r
+    } else {
+        state.log_trace("error", "tui::ops::profiles", "Profile not found for edit");
+        return;
     };
     let Some((_, protocol)) = row.active_protocol() else {
         state.log_trace(
@@ -739,8 +735,7 @@ pub async fn confirm_edit_server(state: &mut AppState) {
             let addr = parsed
                 .0
                 .first_endpoint()
-                .map(|e| format!("{}:{}", e.host, e.port))
-                .unwrap_or_else(|| "?".into());
+                .map_or_else(|| "?".into(), |e| format!("{}:{}", e.host, e.port));
             state.log_trace(
                 "info",
                 "tui::ops::profiles",
@@ -803,7 +798,7 @@ pub fn toggle_multi_select(state: &mut AppState, id: i64) {
     }
 }
 
-/// Populate the AddServer form from a parsed share URL: the first endpoint's
+/// Populate the `AddServer` form from a parsed share URL: the first endpoint's
 /// address/port plus the typed config's form fields.
 fn form_from_parsed(state: &mut AppState, parsed: &ParsedProfile) {
     let Some(first) = parsed.parsed.first_endpoint().cloned() else {
@@ -1080,22 +1075,16 @@ pub fn selected_sub_protocol_id(state: &AppState) -> Option<i64> {
 pub(crate) mod test_support {
 
     use crate::AppState;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use toasty::Deferred;
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{
         ConfigType, Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId,
-        Security, TrafficStats, Transport,
+        TrafficStats,
     };
-    use xray_tui_proto::proto_spec::ProtocolKind;
-    use xray_tui_proto::proto_spec::common::TransportConfig;
-    use xray_tui_proto::proto_spec::{
-        CoreType as ProtoCoreType, ProtocolConfig, SecurityConfig, SecurityType, TransportType,
-        VlessConfig,
-    };
+    use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
 
-    pub(crate) fn ts(secs: i64) -> jiff::Timestamp {
+    pub fn ts(secs: i64) -> jiff::Timestamp {
         jiff::Timestamp::from_second(secs).expect("valid ts")
     }
 
@@ -1180,7 +1169,7 @@ pub(crate) mod test_support {
 /// A vless `Protocol` row for tests (config loaded).
 #[cfg(test)]
 pub(crate) mod xray_tui_db_helper {
-    pub(crate) fn vless_protocol(id: i64) -> xray_tui_db::models::Protocol {
+    pub fn vless_protocol(id: i64) -> xray_tui_db::models::Protocol {
         use super::test_support::ts;
         use toasty::{Deferred, Json};
         use xray_tui_db::models::{Protocol, ProtocolId, Security, Transport};
@@ -1541,7 +1530,7 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod sort_tests {
-    use super::test_support::{fake_row, ts};
+    use super::test_support::fake_row;
     use super::*;
     use crate::AppState;
     use std::sync::Arc;

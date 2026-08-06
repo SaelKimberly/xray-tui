@@ -434,7 +434,7 @@ impl InjectToCoreConf for Hysteria1Config {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("hy".into(), other)),
+            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("hy".into(), other)),
         }
     }
 }
@@ -510,8 +510,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();

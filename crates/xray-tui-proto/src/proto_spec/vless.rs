@@ -257,8 +257,8 @@ impl VlessConfig {
         let config = Self {
             uuid,
             uuid_origin,
-            transport,
             security,
+            transport,
             encryption,
             flow,
             path,
@@ -804,8 +804,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();
@@ -899,9 +899,9 @@ mod tests {
         let url_b = format!(
             "vless://{UUID}@b.example.com:8443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws"
         );
-        let url_c = format!(
+        let url_c =
             "vless://22222222-3333-4444-5555-666666666666@a.example.com:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws"
-        );
+                .to_string();
         let a = parse(&url_a);
         let b = parse(&url_b);
         let c = parse(&url_c);
@@ -1129,10 +1129,10 @@ mod tests {
             let cfg = config(parsed);
             match &cfg.transport {
                 TransportConfig::Grpc(g) => {
-                    assert_eq!(g.authority, None, "grpc authority must not be the server")
+                    assert_eq!(g.authority, None, "grpc authority must not be the server");
                 }
                 TransportConfig::HttpUpgrade(c) => {
-                    assert_eq!(c.host, None, "httpupgrade host must not be the server")
+                    assert_eq!(c.host, None, "httpupgrade host must not be the server");
                 }
                 other => panic!("unexpected transport for {url}: {other:?}"),
             }
@@ -1514,8 +1514,7 @@ mod tests {
         // NO spider_x: sing-box OutboundRealityOptions has no such field.
         assert!(
             conf["tls"]["reality"].get("spider_x").is_none(),
-            "spider_x must never be emitted: {}",
-            conf
+            "spider_x must never be emitted: {conf}"
         );
         assert_eq!(conf["tls"]["utls"]["fingerprint"], "chrome");
     }

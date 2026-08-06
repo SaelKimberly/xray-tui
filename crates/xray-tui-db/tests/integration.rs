@@ -65,7 +65,7 @@ fn vless_config() -> ProtocolConfig {
     })
 }
 
-fn zero_traffic() -> TrafficStats {
+const fn zero_traffic() -> TrafficStats {
     TrafficStats {
         today_up: 0,
         today_down: 0,

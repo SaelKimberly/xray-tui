@@ -14,7 +14,7 @@ use crate::proto_spec::{CoreType, ProtocolConfig, ProtocolKind};
 use serde::{Deserialize, Serialize};
 
 /// Endpoint host kind. Plain enum (this crate); the db crate has its own
-/// toasty::Embed copy.
+/// `toasty::Embed` copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostKind {
     Ipv4,
@@ -117,7 +117,15 @@ impl ParsedProto {
     #[must_use]
     pub fn sig(&self) -> i64 {
         let sig = self.protocol_hash();
-        if sig == 0 { 1 } else { sig as i64 }
+        if sig == 0 {
+            1
+        } else {
+            // Bit-pattern reinterpretation (two's-complement wrap), the same
+            // mapping the historical `as i64` produced. A clamping conversion
+            // (e.g. `try_from().unwrap_or(i64::MAX)`) would collide distinct
+            // hashes above i64::MAX and break the uid distinctness invariant.
+            i64::from_le_bytes(sig.to_le_bytes())
+        }
     }
 
     /// Credential hash over the canonical serialized protocol essentials only,
@@ -128,7 +136,10 @@ impl ParsedProto {
     pub fn cred_hash(&self) -> i64 {
         let json = serde_json::to_string(&self.canonical_json())
             .expect("canonical protocol Value is serializable");
-        utils::compute_cred_hash(&[("protocol", &json)]) as i64
+        let hash = utils::compute_cred_hash(&[("protocol", &json)]);
+        // Two's-complement reinterpretation — see `sig` for why clamping is
+        // wrong here: distinct credentials must yield distinct hashes.
+        i64::from_le_bytes(hash.to_le_bytes())
     }
 
     /// `sig ^ cred_hash`, never zero.
@@ -299,9 +310,8 @@ mod tests {
             for (k, v) in headers {
                 map.insert((*k).to_string(), (*v).to_string());
             }
-            let mut cfg = match config_from(VLESS_WS_URL) {
-                ProtocolConfig::Vless(c) => c,
-                _ => unreachable!("vless URL parses to VlessConfig"),
+            let ProtocolConfig::Vless(mut cfg) = config_from(VLESS_WS_URL) else {
+                unreachable!("vless URL parses to VlessConfig")
             };
             cfg.transport = TransportConfig::Ws(WebSocketConfig {
                 headers: Some(map),

@@ -429,7 +429,7 @@ impl InjectToCoreConf for SsConfig {
 impl SsConfig {
     /// xray-core outbound for this config, ported field-by-field from the old
     /// xray builder's `Protocol::Shadowsocks | Protocol::Shadowsocks2022` arm.
-    /// xray-core's CipherType enum only covers AEAD + 2022-blake3; refusing
+    /// xray-core's `CipherType` enum only covers AEAD + 2022-blake3; refusing
     /// here prevents the core from dying on startup with "unknown cipher
     /// method" (build-time validation).
     fn inject_xray(
@@ -551,8 +551,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();

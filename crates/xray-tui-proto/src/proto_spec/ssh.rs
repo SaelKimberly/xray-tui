@@ -233,7 +233,7 @@ impl InjectToCoreConf for SshConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::SingBox => self.inject_singbox(core_conf, endpoint),
-            other => Err(SupportError::UnsupportedProtocol("ssh".into(), other)),
+            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("ssh".into(), other)),
         }
     }
 }
@@ -241,7 +241,7 @@ impl InjectToCoreConf for SshConfig {
 impl SshConfig {
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Ssh` arm (`server`/`server_port` from the
-    /// endpoint — the typed config has no host/ssh_port fields — `user`
+    /// endpoint — the typed config has no `host/ssh_port` fields — `user`
     /// defaulting to "root", `password`/`private_key` when non-empty, the
     /// private key as an array), plus the typed `private_key_path`/
     /// `private_key_passphrase`/`host_key`/`host_key_algorithms`/

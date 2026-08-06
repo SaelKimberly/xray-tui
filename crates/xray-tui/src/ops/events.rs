@@ -157,14 +157,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .links
                         .iter_mut()
                         .find(|l| l.protocol_id.get() == protocol_id)
+                    && let Err(e) = state.db.upsert_link(link).await
                 {
-                    if let Err(e) = state.db.upsert_link(link).await {
-                        state.log_trace(
-                            "error",
-                            "tui::ops::events",
-                            &format!("Failed to save stats: {e}"),
-                        );
-                    }
+                    state.log_trace(
+                        "error",
+                        "tui::ops::events",
+                        &format!("Failed to save stats: {e}"),
+                    );
                 }
                 state.current_traffic_up = total_up;
                 state.current_traffic_down = total_down;
@@ -772,10 +771,7 @@ fn apply_stats_delta(
 pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileStats> {
     let mut touched: Vec<ProfileStats> = Vec::new();
     let mut non_stats: Vec<CoreEvent> = Vec::new();
-    loop {
-        let Some(rx) = state.core_event_rx.as_mut() else {
-            break;
-        };
+    while let Some(rx) = state.core_event_rx.as_mut() {
         let event = match rx.try_recv() {
             Ok(ev) => ev,
             Err(_) => break,
@@ -1201,7 +1197,7 @@ mod tests {
         state.core_event_rx = Some(rx);
         state.core_event_tx = Some(tx.clone());
         // Endpoint 100 owns protocols 7 + 8; endpoint 200 owns protocol 9.
-        let mut row = row_with_protocols(100, 2, 7);
+        let row = row_with_protocols(100, 2, 7);
         let other = row_with_protocols(200, 1, 9);
         state.endpoints = vec![row, other];
         state.connected_protocol_id = Some(100);

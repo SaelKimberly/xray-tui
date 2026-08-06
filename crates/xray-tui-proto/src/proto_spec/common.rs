@@ -190,7 +190,7 @@ pub(crate) fn should_skip_endpoint_param(endpoint_host: &str, value: &str) -> bo
 /// uses: Ipv4/Ipv6 when the host parses as an IP address, Dns otherwise
 /// (`Undefined` only when there is no host at all, which vless/vmess never
 /// hit).
-pub(crate) fn host_kind_for(host: &HostSpec) -> HostKind {
+pub(crate) const fn host_kind_for(host: &HostSpec) -> HostKind {
     match host {
         HostSpec::IpAddress(rustls::pki_types::IpAddr::V4(_)) => HostKind::Ipv4,
         HostSpec::IpAddress(rustls::pki_types::IpAddr::V6(_)) => HostKind::Ipv6,
@@ -1111,7 +1111,7 @@ pub(crate) fn to_singbox_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto_spec::{ProtoSpec, ProtocolConfig, VlessConfig};
+    use crate::proto_spec::{ProtoSpec, VlessConfig};
     use crate::urlx::RawUrlX;
 
     #[test]

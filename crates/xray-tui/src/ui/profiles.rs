@@ -314,18 +314,34 @@ fn compute_test_cell(
         }
     }
     let active_delay = row.active_link().and_then(|l| match l.latency {
-        Some(xray_tui_db::models::Latency::Real { delay, .. })
-        | Some(xray_tui_db::models::Latency::Fast { delay }) => Some(delay),
+        Some(
+            xray_tui_db::models::Latency::Real { delay, .. }
+            | xray_tui_db::models::Latency::Fast { delay },
+        ) => Some(delay),
         None => None,
     });
     test_cell_content(
         row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
         resolved,
-        fast_failed,
-        real_failed,
+        if real_failed {
+            Some(TestFailure::Real)
+        } else if fast_failed {
+            Some(TestFailure::Fast)
+        } else {
+            None
+        },
         active_delay,
         palette,
     )
+}
+
+/// Test-failure tier for one row. Real outranks fast in the label
+/// precedence (decision 16), so the two failure markers collapse into a
+/// single value — `Real` when the real check failed, else `Fast`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TestFailure {
+    Real,
+    Fast,
 }
 
 /// Pure Test-cell logic (no `AppState`) so the label precedence and color
@@ -333,8 +349,7 @@ fn compute_test_cell(
 fn test_cell_content(
     host_is_dns: bool,
     resolved: bool,
-    fast_failed: bool,
-    real_failed: bool,
+    failure: Option<TestFailure>,
     active_delay: Option<i32>,
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
@@ -344,10 +359,10 @@ fn test_cell_content(
     }
     // Tier ordering (decision 16): real-err ranks above fast-err — the real
     // check is the deeper probe, so when both classes failed `[real]` wins.
-    if real_failed {
+    if failure == Some(TestFailure::Real) {
         return (format!("[{}]", center_cell("real", 4)), bad);
     }
-    if fast_failed {
+    if failure == Some(TestFailure::Fast) {
         return (format!("[{}]", center_cell("fast", 4)), bad);
     }
     match active_delay {
@@ -498,10 +513,10 @@ fn build_display_rows(
                 .map(|link| {
                     let proto = row.protocols.get(&link.protocol_id);
                     let delay = match link.latency {
-                        Some(xray_tui_db::models::Latency::Real { delay, .. })
-                        | Some(xray_tui_db::models::Latency::Fast { delay }) => {
-                            format!("{delay}ms")
-                        }
+                        Some(
+                            xray_tui_db::models::Latency::Real { delay, .. }
+                            | xray_tui_db::models::Latency::Fast { delay },
+                        ) => format!("{delay}ms"),
                         None => "-".to_string(),
                     };
                     let speed = link
@@ -1150,13 +1165,13 @@ mod tests {
     #[test]
     fn test_cell_colors_delay_by_threshold() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(false, true, false, false, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, None, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
         assert_eq!(s.fg, Some(palette.success));
-        let (t, s) = test_cell_content(false, true, false, false, Some(612), &palette);
+        let (t, s) = test_cell_content(false, true, None, Some(612), &palette);
         assert_eq!(t, "[ 612]");
         assert_eq!(s.fg, Some(ratatui::style::Color::Yellow));
-        let (t, s) = test_cell_content(false, true, false, false, Some(1234), &palette);
+        let (t, s) = test_cell_content(false, true, None, Some(1234), &palette);
         assert_eq!(t, "[1234]");
         assert_eq!(s.fg, Some(palette.error));
     }
@@ -1164,18 +1179,18 @@ mod tests {
     #[test]
     fn test_cell_blank_without_measurement() {
         let palette = test_palette();
-        let (t, _) = test_cell_content(false, true, false, false, None, &palette);
+        let (t, _) = test_cell_content(false, true, None, None, &palette);
         assert_eq!(t, "      ");
     }
 
     #[test]
     fn test_cell_shows_name_when_dns_unresolved() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(true, false, false, false, Some(12), &palette);
+        let (t, s) = test_cell_content(true, false, None, Some(12), &palette);
         assert_eq!(t, "[name]");
         assert_eq!(s.fg, Some(palette.error));
         // Resolved DNS name behaves like a normal host.
-        let (t, _) = test_cell_content(true, true, false, false, Some(12), &palette);
+        let (t, _) = test_cell_content(true, true, None, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
     }
 
@@ -1184,17 +1199,17 @@ mod tests {
         let palette = test_palette();
         // Both marker classes present → [real]: real-err (tier 3) ranks above
         // fast-err (tier 4), the real check being the deeper probe (T20 flip).
-        let (t, s) = test_cell_content(false, true, true, true, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, Some(TestFailure::Real), Some(12), &palette);
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
         // Only a real-class failure marker → [real].
-        let (t, _) = test_cell_content(false, true, false, true, Some(12), &palette);
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), Some(12), &palette);
         assert_eq!(t, "[real]");
         // Only a fast-class failure marker → [fast].
-        let (t, _) = test_cell_content(false, true, true, false, Some(12), &palette);
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), Some(12), &palette);
         assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
-        let (t, _) = test_cell_content(false, true, false, false, Some(30), &palette);
+        let (t, _) = test_cell_content(false, true, None, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
     }
 
@@ -1202,19 +1217,19 @@ mod tests {
     fn test_cell_label_precedence_matrix() {
         let palette = test_palette();
         // (a) only real markers → [real]
-        let (t, _) = test_cell_content(false, true, false, true, None, &palette);
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), None, &palette);
         assert_eq!(t, "[real]");
         // (b) only fast markers → [fast]
-        let (t, _) = test_cell_content(false, true, true, false, None, &palette);
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), None, &palette);
         assert_eq!(t, "[fast]");
         // (c) both real and fast markers → [real] (tier-consistent)
-        let (t, _) = test_cell_content(false, true, true, true, None, &palette);
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), None, &palette);
         assert_eq!(t, "[real]");
         // (d) DNS-unresolved + fast marker → [name] (DNS tier 5 is deepest)
-        let (t, _) = test_cell_content(true, false, true, false, None, &palette);
+        let (t, _) = test_cell_content(true, false, Some(TestFailure::Fast), None, &palette);
         assert_eq!(t, "[name]");
         // (e) no markers, no measurement → blank
-        let (t, _) = test_cell_content(false, true, false, false, None, &palette);
+        let (t, _) = test_cell_content(false, true, None, None, &palette);
         assert_eq!(t, "      ");
     }
 }

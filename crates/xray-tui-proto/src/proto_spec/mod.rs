@@ -140,7 +140,7 @@ impl<'de> Deserialize<'de> for CoreType {
     {
         let s = String::deserialize(deserializer)?;
         Self::from_str(&s)
-            .map_err(|_| serde::de::Error::custom(format_args!("invalid core type: '{s}'")))
+            .map_err(|()| serde::de::Error::custom(format_args!("invalid core type: '{s}'")))
     }
 }
 
@@ -369,9 +369,11 @@ pub struct InjectOptions {
 }
 
 /// A protocol config injects its outbound block + stream settings into a core
-/// JSON config. `endpoint` supplies host/port for transport/sni fields left
+/// JSON config.
+///
+/// `endpoint` supplies host/port for transport/sni fields left
 /// unset by the host-free parse mandate (Task 4/5) — impls apply
-/// transport.with_host(endpoint.host) / sni defaults at build time, NEVER at
+/// `transport.with_host(endpoint.host)` / sni defaults at build time, NEVER at
 /// parse time. `opts` carries build-time overrides (see [`InjectOptions`])
 /// applied at inject time.
 ///
@@ -799,7 +801,10 @@ impl PlaceholderConfig {
     /// # Errors
     ///
     /// Always — placeholder protocols have no URL format.
-    pub fn reconstruct_proto(&self, _endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+    pub const fn reconstruct_proto(
+        &self,
+        _endpoint: &EndpointEssentials,
+    ) -> Result<String, ParseError> {
         Err(ParseError::Unimplemented("placeholder protocol"))
     }
 }
@@ -1286,7 +1291,7 @@ mod tests {
         // NO outbound shape on either core (sing-box has no such outbound
         // type) and are rejected at build time.
         for (config, expected) in &variants {
-            if matches!(expected.as_ref(), "redirect" | "tproxy" | "mixed") {
+            if matches!(*expected, "redirect" | "tproxy" | "mixed") {
                 continue;
             }
             let core = supported_core(config);

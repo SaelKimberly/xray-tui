@@ -266,16 +266,18 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     });
 }
 
+/// One enrichment target: endpoint id, the endpoint, its persisted
+/// `resolved_as` list, the persisted `resolved_at` (unix secs), and the
+/// SNI of its active protocol (None for linkless endpoints).
+type EnrichTarget = (i64, Endpoint, Vec<String>, Option<i64>, Option<String>);
+
 /// Startup/refresh pass: seed `endpoint_info` for every endpoint that has no
 ///
 /// entry yet — IP hosts (parse host, no DNS) and DNS hosts with a persisted
 /// `resolved_as` (from the endpoints table; no network). Geo + whitelist
 /// features are filled in the same task.
 pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
-    // One target per endpoint: endpoint id, the endpoint, its persisted
-    // `resolved_as` list, the persisted `resolved_at` (unix secs), and the
-    // SNI of its active protocol (None for linkless endpoints).
-    let targets: Vec<(i64, Endpoint, Vec<String>, Option<i64>, Option<String>)> = state
+    let targets: Vec<EnrichTarget> = state
         .endpoints
         .iter()
         .filter(|r| {
@@ -288,7 +290,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 r.endpoint.id.get(),
                 r.endpoint.clone(),
                 r.endpoint.resolved_as.clone(),
-                r.endpoint.resolved_at.map(|t| t.as_second()),
+                r.endpoint.resolved_at.map(jiff::Timestamp::as_second),
                 r.active_protocol().and_then(|(_, p)| extract_sni(p)),
             )
         })
@@ -303,21 +305,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
 
     tokio::spawn(async move {
         for (endpoint_id, ep, cached_as, cached_at, sni) in targets {
-            let mut info = if !cached_as.is_empty() {
-                // DNS host with a persisted resolution — reuse it, no network.
-                EndpointInfo {
-                    resolved_ips: cached_as
-                        .iter()
-                        .filter_map(|s| s.parse::<IpAddr>().ok())
-                        .collect(),
-                    country: None,
-                    host_features: HostFeatures::default(),
-                    sni_whitelisted: None,
-                    outbound_ip: None,
-                    outbound_country: None,
-                    resolved_at_secs: cached_at,
-                }
-            } else {
+            let mut info = if cached_as.is_empty() {
                 // IP host — its own address is the "resolution".
                 EndpointInfo {
                     resolved_ips: vec![
@@ -331,6 +319,20 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                     outbound_ip: None,
                     outbound_country: None,
                     resolved_at_secs: None,
+                }
+            } else {
+                // DNS host with a persisted resolution — reuse it, no network.
+                EndpointInfo {
+                    resolved_ips: cached_as
+                        .iter()
+                        .filter_map(|s| s.parse::<IpAddr>().ok())
+                        .collect(),
+                    country: None,
+                    host_features: HostFeatures::default(),
+                    sni_whitelisted: None,
+                    outbound_ip: None,
+                    outbound_country: None,
+                    resolved_at_secs: cached_at,
                 }
             };
             // Phase 1 first: cached IPs/host reach the UI before geo work

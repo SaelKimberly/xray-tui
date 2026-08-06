@@ -168,7 +168,7 @@ impl CorePool {
                                 profile_key: super::super::ProfileKey {
                                     config_type,
                                     address: endpoint.host.clone(),
-                                    port: endpoint.port as u16,
+                                    port: endpoint.port,
                                 },
                                 latency_ms: None,
                                 ip_info: None,
@@ -194,7 +194,7 @@ impl CorePool {
                                     profile_key: super::super::ProfileKey {
                                         config_type,
                                         address: endpoint.host.clone(),
-                                        port: endpoint.port as u16,
+                                        port: endpoint.port,
                                     },
                                     latency_ms: None,
                                     ip_info: None,
@@ -217,7 +217,7 @@ impl CorePool {
                                     profile_key: super::super::ProfileKey {
                                         config_type,
                                         address: endpoint.host.clone(),
-                                        port: endpoint.port as u16,
+                                        port: endpoint.port,
                                     },
                                     latency_ms: None,
                                     ip_info: None,
@@ -239,7 +239,7 @@ impl CorePool {
                             profile_key: super::super::ProfileKey {
                                 config_type,
                                 address: endpoint.host.clone(),
-                                port: endpoint.port as u16,
+                                port: endpoint.port,
                             },
                             latency_ms: None,
                             ip_info: None,
@@ -258,7 +258,7 @@ impl CorePool {
                         profile_key: super::super::ProfileKey {
                             config_type,
                             address: endpoint.host.clone(),
-                            port: endpoint.port as u16,
+                            port: endpoint.port,
                         },
                         latency_ms: None,
                         ip_info: None,
@@ -333,7 +333,7 @@ impl CorePool {
                         profile_key: super::super::ProfileKey {
                             config_type,
                             address: endpoint.host.clone(),
-                            port: endpoint.port as u16,
+                            port: endpoint.port,
                         },
                         latency_ms: None,
                         ip_info: None,
@@ -349,7 +349,7 @@ impl CorePool {
                     profile_key: super::super::ProfileKey {
                         config_type,
                         address: endpoint.host.clone(),
-                        port: endpoint.port as u16,
+                        port: endpoint.port,
                     },
                     latency_ms: None,
                     ip_info: None,
@@ -366,7 +366,7 @@ impl CorePool {
                 profile_key: super::super::ProfileKey {
                     config_type,
                     address: endpoint.host.clone(),
-                    port: endpoint.port as u16,
+                    port: endpoint.port,
                 },
                 latency_ms: None,
                 ip_info: None,
@@ -383,7 +383,7 @@ impl CorePool {
                 profile_key: super::super::ProfileKey {
                     config_type,
                     address: endpoint.host.clone(),
-                    port: endpoint.port as u16,
+                    port: endpoint.port,
                 },
                 latency_ms: None,
                 ip_info: None,
@@ -497,7 +497,7 @@ impl CorePool {
                 profile_key: super::super::ProfileKey {
                     config_type,
                     address: endpoint.host.clone(),
-                    port: endpoint.port as u16,
+                    port: endpoint.port,
                 },
                 latency_ms: Some(rp.latency_ms),
                 ip_info: rp.ip_info,
@@ -507,7 +507,7 @@ impl CorePool {
                 profile_key: super::super::ProfileKey {
                     config_type,
                     address: endpoint.host.clone(),
-                    port: endpoint.port as u16,
+                    port: endpoint.port,
                 },
                 latency_ms: None,
                 ip_info: None,

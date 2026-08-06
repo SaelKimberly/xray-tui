@@ -220,7 +220,7 @@ impl InjectToCoreConf for TorConfig {
                 *core_conf = out;
                 Ok(())
             }
-            other => Err(SupportError::UnsupportedProtocol("tor".into(), other)),
+            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("tor".into(), other)),
         }
     }
 }
@@ -296,7 +296,7 @@ mod tests {
 
     // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
 
-    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+    use super::super::{InjectOptions, InjectToCoreConf, SupportError};
 
     #[test]
     fn singbox_inject_writes_proxy_outbound() {

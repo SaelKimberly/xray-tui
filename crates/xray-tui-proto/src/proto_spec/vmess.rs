@@ -74,7 +74,7 @@ use crate::proto_spec::common::{
     host_kind_for, security_to_clash_tls, should_skip_endpoint_param, transport_to_clash,
 };
 
-/// VMess protocol configuration — the identity payload (sans host/port).
+/// `VMess` protocol configuration — the identity payload (sans host/port).
 ///
 /// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
 /// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
@@ -801,8 +801,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();

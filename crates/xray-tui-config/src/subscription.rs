@@ -7,7 +7,7 @@ use crate::import_export::{
 };
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use xray_tui_proto::proto_spec::ProtoSpec;
+use xray_tui_proto::proto_spec::{ProtoSpec, SecurityConfig};
 
 /// Maximum input chunk size for `StreamingDecoder::feed()`.
 const INPUT_CHUNK_SIZE: usize = 65536;
@@ -436,7 +436,7 @@ pub fn parse_subscription_data(
                 .protocol
                 .config
                 .security()
-                .and_then(|s| s.insecure())
+                .and_then(SecurityConfig::insecure)
                 == Some(true)
         })
         .count();

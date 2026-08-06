@@ -418,7 +418,7 @@ impl InjectToCoreConf for TuicConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("tuic".into(), other)),
+            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol("tuic".into(), other)),
         }
     }
 }
@@ -427,7 +427,7 @@ impl TuicConfig {
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Tuic` arm (`uuid`/`password`/`server`/`server_port`
     /// + mandatory `tls`), plus the typed `congestion_control`/`udp_relay_mode`
-    /// fields (sing-box `TUICOutboundOptions` keys the old builder dropped).
+    ///   fields (sing-box `TUICOutboundOptions` keys the old builder dropped).
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
@@ -496,8 +496,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();

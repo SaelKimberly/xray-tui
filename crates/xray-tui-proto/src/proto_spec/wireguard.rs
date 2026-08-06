@@ -51,7 +51,7 @@ use crate::clash::{ClashProxy, ClashWireGuard};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{clash_to_endpoint, host_kind_for};
 
-/// WireGuard protocol configuration — the identity payload (sans host/port).
+/// `WireGuard` protocol configuration — the identity payload (sans host/port).
 ///
 /// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
 /// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
@@ -523,7 +523,7 @@ impl WireguardConfig {
     /// `WireGuardEndpointOptions`/`WireGuardPeer` structs: `server`/
     /// `server_port` from the endpoint, `address` (interface CIDR list),
     /// `mtu` (typed value or the old 1420 default), `private_key`, one peer
-    /// with `address`/`port`/`public_key`/`allowed_ips` (["0.0.0.0/0"]),
+    /// with `address`/`port`/`public_key`/`allowed_ips` (`0.0.0.0/0`),
     /// `pre_shared_key`/`persistent_keepalive_interval` when set. `reserved`
     /// follows the T14 3-byte rule: decoded (comma decimals or base64) and
     /// emitted as the byte array only when EXACTLY 3 bytes — sing-box's
@@ -659,8 +659,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();
@@ -891,9 +891,9 @@ mod tests {
 
     #[test]
     fn xray_inject_ipv6_peer_endpoint_is_bracketed() {
-        let url = format!(
+        let url =
             "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@[2606:4700:d0::a29f:c001]:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D"
-        );
+                .to_string();
         let cfg = config(parse(&url));
         let mut conf = serde_json::json!({});
         cfg.inject_to(
@@ -940,9 +940,9 @@ mod tests {
 
     #[test]
     fn xray_inject_skips_malformed_reserved() {
-        let url = format!(
+        let url =
             "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&reserved=1%2C2"
-        );
+                .to_string();
         let cfg = config(parse(&url));
         let mut conf = serde_json::json!({});
         cfg.inject_to(

@@ -770,18 +770,15 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             // `format_share_url(&ParsedProto, &EndpointEssentials)` equivalent
             // is `ProtocolConfig::reconstruct_proto(&endpoint_essentials)` —
             // the config must be loaded WITH its deferred data included.
-            let (endpoint, pid) = match state.selected_profile_id().and_then(|id| {
+            let Some((endpoint, pid)) = state.selected_profile_id().and_then(|id| {
                 let row = state
                     .filtered_profiles()
                     .find(|r| r.endpoint.id.get() == id)?;
                 let (_, protocol) = row.active_protocol()?;
                 Some((row.endpoint.clone(), protocol.id))
-            }) {
-                Some(pair) => pair,
-                None => {
-                    state.log_trace("warn", "tui::ui", "No active protocol to copy");
-                    return;
-                }
+            }) else {
+                state.log_trace("warn", "tui::ui", "No active protocol to copy");
+                return;
             };
             let essentials = xray_tui_core::config_builder::endpoint_essentials(&endpoint);
             let url = match crate::state::load_protocol_with_config(&state.db, pid).await {

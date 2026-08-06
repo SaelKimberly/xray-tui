@@ -44,8 +44,8 @@ pub enum ImportError {
 impl From<ParseError> for ImportError {
     fn from(e: ParseError) -> Self {
         match e {
-            ParseError::UnsupportedScheme(_) => ImportError::UnsupportedScheme,
-            other => ImportError::Parse(other.to_string()),
+            ParseError::UnsupportedScheme(_) => Self::UnsupportedScheme,
+            other => Self::Parse(other.to_string()),
         }
     }
 }

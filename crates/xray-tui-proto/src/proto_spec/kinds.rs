@@ -1,15 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-/// Protocol kinds. Variants mirror the (being-replaced) `Protocol` enum from
+/// Protocol kinds.
+///
+/// Variants mirror the (being-replaced) `Protocol` enum from
 /// `crates/xray-tui-core/src/protocol.rs` — 27 variants incl. the 7 outbound-only
-/// form types (DokodemoDoor, Freedom, Blackhole, Dns, Loopback, Custom) and the
+/// form types (`DokodemoDoor`, Freedom, Blackhole, Dns, Loopback, Custom) and the
 /// separate Shadowsocks2022. `as_str()` MUST equal `Protocol::Display` outputs
 /// VERBATIM ("hy", "hy2", "any-tls", "shadow-tls", "t-proxy", "ss-2022",
 /// "dokodemo", ...). `FromStr` additionally accepts the legacy hyphen-less
 /// aliases ("hysteria", "hysteria2", "anytls", "shadowtls", "tproxy",
-/// "hysteria1") that proto identity hashing, security_rank and
-/// fields_to_profile historically wrote.
+/// "hysteria1") that proto identity hashing, `security_rank` and
+/// `fields_to_profile` historically wrote.
 ///
 /// Serde serializes via [`as_str`](Self::as_str) and deserializes via
 /// [`FromStr`], so the JSON form is the protocol dialect ("vmess", "ss-2022",
@@ -192,48 +194,35 @@ impl std::str::FromStr for ProtocolKind {
         // security_rank, fields_to_profile and normalize_protocol_key.
         let normalized = s.to_lowercase().replace('-', "_");
         let kind = match normalized.as_str() {
-            // Canonical (`as_str`) spellings.
+            // Canonical (`as_str`) spellings, plus the legacy hyphen-less
+            // aliases historically written/parsed elsewhere in the codebase.
             "vmess" => Self::Vmess,
             "vless" => Self::Vless,
-            "ss" => Self::Shadowsocks,
-            "ss_2022" => Self::Shadowsocks2022,
-            "socks" => Self::Socks,
+            "ss" | "shadowsocks" => Self::Shadowsocks,
+            "ss_2022" | "shadowsocks_2022" => Self::Shadowsocks2022,
+            "socks" | "socks5" => Self::Socks,
             "http" => Self::Http,
             "trojan" => Self::Trojan,
-            "wireguard" => Self::WireGuard,
-            "hy2" => Self::Hysteria2,
-            "dokodemo" => Self::DokodemoDoor,
+            "wireguard" | "wire_guard" => Self::WireGuard,
+            "hy2" | "hysteria2" | "hysteria_2" => Self::Hysteria2,
+            "dokodemo" | "dokodemo_door" => Self::DokodemoDoor,
             "freedom" => Self::Freedom,
             "blackhole" => Self::Blackhole,
             "dns" => Self::Dns,
             "loopback" => Self::Loopback,
             "custom" => Self::Custom,
             "tuic" => Self::Tuic,
-            "hy" => Self::Hysteria,
-            "naive" => Self::Naive,
-            "any_tls" => Self::AnyTls,
-            "shadow_tls" => Self::ShadowTls,
+            "hy" | "hysteria" | "hysteria1" => Self::Hysteria,
+            "naive" | "naive+https" | "naive+quic" => Self::Naive,
+            "any_tls" | "anytls" => Self::AnyTls,
+            "shadow_tls" | "shadowtls" => Self::ShadowTls,
             "tor" => Self::Tor,
             "ssh" => Self::Ssh,
             "tailscale" => Self::Tailscale,
-            "ssr" => Self::ShadowsocksR,
+            "ssr" | "shadowsocks_r" | "shadowsocksr" => Self::ShadowsocksR,
             "redirect" => Self::Redirect,
-            "t_proxy" => Self::TProxy,
+            "t_proxy" | "tproxy" => Self::TProxy,
             "mixed" => Self::Mixed,
-            // Legacy spellings historically written/parsed elsewhere in the
-            // codebase.
-            "shadowsocks" => Self::Shadowsocks,
-            "shadowsocks_2022" => Self::Shadowsocks2022,
-            "wire_guard" => Self::WireGuard,
-            "hysteria" | "hysteria1" => Self::Hysteria,
-            "hysteria2" | "hysteria_2" => Self::Hysteria2,
-            "dokodemo_door" => Self::DokodemoDoor,
-            "anytls" => Self::AnyTls,
-            "shadowtls" => Self::ShadowTls,
-            "shadowsocks_r" | "shadowsocksr" => Self::ShadowsocksR,
-            "tproxy" => Self::TProxy,
-            "socks5" => Self::Socks,
-            "naive+https" | "naive+quic" => Self::Naive,
             _ => return Err(ParseProtocolKindError(s.to_owned())),
         };
         Ok(kind)
@@ -292,7 +281,7 @@ impl<'de> Deserialize<'de> for TransportType {
     {
         let s = String::deserialize(deserializer)?;
         Self::from_str(&s)
-            .map_err(|_| serde::de::Error::custom(format_args!("invalid transport type: '{s}'")))
+            .map_err(|()| serde::de::Error::custom(format_args!("invalid transport type: '{s}'")))
     }
 }
 
@@ -355,7 +344,7 @@ impl<'de> Deserialize<'de> for SecurityType {
     {
         let s = String::deserialize(deserializer)?;
         Self::from_str(&s)
-            .map_err(|_| serde::de::Error::custom(format_args!("invalid security type: '{s}'")))
+            .map_err(|()| serde::de::Error::custom(format_args!("invalid security type: '{s}'")))
     }
 }
 

@@ -385,7 +385,7 @@ impl Database {
     /// Groups enabled with a non-empty url whose refresh window has elapsed:
     /// `last_refreshed IS NULL` or `last_refreshed + refresh_interval minutes
     /// < now` (`refresh_interval` defaults to 1440 minutes, matching the old
-    /// subscription update interval). Ordered by sort_order.
+    /// subscription update interval). Ordered by `sort_order`.
     pub async fn get_groups_due_update(&self) -> Result<Vec<Group>> {
         let mut conn = self.conn().await?;
         let candidates: Vec<Group> = Group::filter(Group::fields().enabled().eq(true))
@@ -443,7 +443,7 @@ impl Database {
     /// included relations. `dns_unresolved` is endpoint-level: `Dns` host
     /// with no cached `resolved_as` sinks all its links to tier 5.
     ///
-    /// Page ceiling: the step-2 `IN` list is bounded by SQLite's
+    /// Page ceiling: the step-2 `IN` list is bounded by `SQLite`'s
     /// `SQLITE_MAX_VARIABLE_NUMBER` (default 32766 parameters — the T8+9
     /// note's ">32k" limit). Real TUI pages are hundreds of endpoints, far
     /// below it; a page larger than the limit would need chunking. The

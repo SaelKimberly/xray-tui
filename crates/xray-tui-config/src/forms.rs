@@ -1309,10 +1309,11 @@ pub const fn url_scheme_for(protocol: ProtocolKind) -> &'static str {
 
 type SettingsMap = Map<String, Value>;
 
-/// Build a typed [`ParsedProto`] from form field JSON. `address`/`port` are
-/// the endpoint essentials the form collected; `settings` is the form's
-/// `{ "user_id"?, "protocol_settings": …, "stream_settings": … }` JSON (the
-/// shape `fields_to_profile` produces — T17 passes its `extra` object
+/// Build a typed [`ParsedProto`] from form field JSON.
+///
+/// `address`/`port` are the endpoint essentials the form collected; `settings`
+/// is the form's `{ "user_id"?, "protocol_settings": …, "stream_settings": … }`
+/// JSON (the shape `fields_to_profile` produces — T17 passes its `extra` object
 /// verbatim; no wrapper helper is needed). Unknown settings keys -> Err.
 pub fn build_typed_config(
     proto_kind: ProtocolKind,
@@ -2071,16 +2072,14 @@ fn shadowtls_from_form(
     // sni routes to stream_settings (producer exact-match arm) — it is the
     // TLS trigger for ShadowTLS (the disguise host).
     check_keys("shadowtls", ss, &["sni"])?;
-    let security = match opt_text(ss.get("sni")) {
-        Some(sni) => SecurityConfig {
+    let security =
+        opt_text(ss.get("sni")).map_or_else(SecurityConfig::default, |sni| SecurityConfig {
             tls: Some(TlsConfig::Tls(TlsOpts {
                 sni: Some(sni),
                 ..Default::default()
             })),
             enc: None,
-        },
-        None => SecurityConfig::default(),
-    };
+        });
     Ok(ShadowTlsConfig {
         password: opt_str(user_id),
         version: opt_text(ps.get("version")),
@@ -2350,8 +2349,8 @@ mod tests {
         Value::Object(obj)
     }
 
-    fn built(kind: ProtocolKind, settings: Value) -> ParsedProto {
-        build_typed_config(kind, "1.2.3.4", 443, &settings).expect("build_typed_config")
+    fn built(kind: ProtocolKind, settings: &Value) -> ParsedProto {
+        build_typed_config(kind, "1.2.3.4", 443, settings).expect("build_typed_config")
     }
 
     fn config_json(parsed: &ParsedProto) -> Value {
@@ -2362,7 +2361,7 @@ mod tests {
     fn build_vless_ws_tls() {
         let parsed = built(
             ProtocolKind::Vless,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
                 ("flow", "xtls-rprx-vision"),
                 ("tls.enable", "true"),
@@ -2408,7 +2407,7 @@ mod tests {
         // both must be accepted (decoration keys), not rejected.
         let parsed = built(
             ProtocolKind::Vmess,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
                 ("reality.show", "false"),
                 ("fragment.enable", "false"),
@@ -2436,7 +2435,7 @@ mod tests {
     fn build_vless_defaults_tcp_no_tls() {
         let parsed = built(
             ProtocolKind::Vless,
-            producer_settings(&[("user_id", "uuid-here")]),
+            &producer_settings(&[("user_id", "uuid-here")]),
         );
         let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
             panic!("expected Vless config");
@@ -2449,7 +2448,7 @@ mod tests {
     fn build_vless_grpc_service_name() {
         let parsed = built(
             ProtocolKind::Vless,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
                 ("grpc.serviceName", "myservice"),
             ]),
@@ -2469,7 +2468,7 @@ mod tests {
     fn build_ss_aead_resolves_xray() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "passw0rd"),
                 ("method", "aes-256-gcm"),
                 ("plugin", "obfs-local"),
@@ -2497,7 +2496,7 @@ mod tests {
     fn build_ss_2022_method_kind_and_core() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "passw0rd"),
                 ("method", "2022-blake3-aes-128-gcm"),
             ]),
@@ -2510,7 +2509,7 @@ mod tests {
     fn build_ss_legacy_method_resolves_singbox() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            producer_settings(&[("user_id", "passw0rd"), ("method", "aes-256-cfb")]),
+            &producer_settings(&[("user_id", "passw0rd"), ("method", "aes-256-cfb")]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
@@ -2520,7 +2519,7 @@ mod tests {
     fn build_trojan_tls() {
         let parsed = built(
             ProtocolKind::Trojan,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "humanity"),
                 ("flow", "xtls-rprx-vision"),
                 ("sni", "real.example.com"),
@@ -2547,7 +2546,7 @@ mod tests {
     fn build_socks() {
         let parsed = built(
             ProtocolKind::Socks,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "secret"),
                 ("username", "alice"),
                 ("udp", "true"),
@@ -2565,7 +2564,7 @@ mod tests {
     fn build_http_tls() {
         let parsed = built(
             ProtocolKind::Http,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "secret"),
                 ("username", "alice"),
                 ("tls", "true"),
@@ -2584,7 +2583,7 @@ mod tests {
     fn build_wireguard() {
         let parsed = built(
             ProtocolKind::WireGuard,
-            producer_settings(&[
+            &producer_settings(&[
                 ("private_key", "aGVsbG8="),
                 ("public_key", "d29ybGQ="),
                 ("preshared_key", "cHNr"),
@@ -2614,7 +2613,7 @@ mod tests {
     fn build_hysteria2_with_ports() {
         let parsed = built(
             ProtocolKind::Hysteria2,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "token"),
                 ("ports", "1000-1002,2000"),
                 ("hop", "5"),
@@ -2646,7 +2645,7 @@ mod tests {
     fn build_hysteria1() {
         let parsed = built(
             ProtocolKind::Hysteria,
-            producer_settings(&[
+            &producer_settings(&[
                 ("auth", "token"),
                 ("protocol", "udp"),
                 ("obfs", "salamander"),
@@ -2672,7 +2671,7 @@ mod tests {
         // tuic_password_collides_with_uuid / F6 in the T12 report).
         let parsed = built(
             ProtocolKind::Tuic,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
                 ("congestion_control", "bbr"),
                 ("udp_relay_mode", "native"),
@@ -2709,7 +2708,7 @@ mod tests {
             ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
             ("password", "pw"),
         ]);
-        let parsed = built(ProtocolKind::Tuic, settings);
+        let parsed = built(ProtocolKind::Tuic, &settings);
         let ProtocolConfig::Tuic(c) = &parsed.protocol.config else {
             panic!("expected Tuic config");
         };
@@ -2721,7 +2720,7 @@ mod tests {
     fn build_naive() {
         let parsed = built(
             ProtocolKind::Naive,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "secret"),
                 ("user", "alice"),
                 ("padding", "true"),
@@ -2739,7 +2738,7 @@ mod tests {
     fn build_anytls() {
         let parsed = built(
             ProtocolKind::AnyTls,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "secret"),
                 ("sni", "real.example.com"),
                 ("alpn", "h2"),
@@ -2761,7 +2760,7 @@ mod tests {
     fn build_shadowtls() {
         let parsed = built(
             ProtocolKind::ShadowTls,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "secret"),
                 ("version", "3"),
                 ("sni", "real.example.com"),
@@ -2782,7 +2781,7 @@ mod tests {
     fn build_tor_ssh_tailscale() {
         let tor = built(
             ProtocolKind::Tor,
-            producer_settings(&[
+            &producer_settings(&[
                 ("socks_port", "9050"),
                 ("control_port", "9051"),
                 ("control_password", "pw"),
@@ -2796,7 +2795,7 @@ mod tests {
 
         let ssh = built(
             ProtocolKind::Ssh,
-            producer_settings(&[
+            &producer_settings(&[
                 ("host", "ssh.example.com"),
                 ("ssh_port", "22"),
                 ("username", "root"),
@@ -2812,7 +2811,7 @@ mod tests {
 
         let ts = built(
             ProtocolKind::Tailscale,
-            producer_settings(&[
+            &producer_settings(&[
                 ("auth_key", "tskey-abc"),
                 ("control_url", "https://control.example.com"),
                 ("ephemeral", "true"),
@@ -2833,7 +2832,7 @@ mod tests {
     fn build_ssr() {
         let parsed = built(
             ProtocolKind::ShadowsocksR,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "secret"),
                 ("method", "aes-256-cfb"),
                 ("protocol", "auth_sha1_v4"),
@@ -2921,7 +2920,7 @@ mod tests {
             ProtocolKind::Custom,
         ] {
             let raw = producer_settings(&[("network", "tcp"), ("doko_address", "10.0.0.1")]);
-            let parsed = built(kind, raw.clone());
+            let parsed = built(kind, &raw);
             assert_eq!(parsed.protocol.proto_kind, kind);
             assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
             let ProtocolConfig::Mixed(p) = &parsed.protocol.config else {
@@ -2945,7 +2944,7 @@ mod tests {
             (ProtocolKind::Mixed, "Mixed"),
         ] {
             let raw = producer_settings(&[]);
-            let parsed = built(kind, raw.clone());
+            let parsed = built(kind, &raw);
             assert_eq!(parsed.protocol.proto_kind, kind);
             assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
             let config = &parsed.protocol.config;
@@ -2989,7 +2988,7 @@ mod tests {
                 vec![("user_id", "token"), ("sni", "real.example.com")],
             ),
         ] {
-            let parsed = built(kind, producer_settings(&fields));
+            let parsed = built(kind, &producer_settings(&fields));
             let json = serde_json::to_string(&parsed.protocol.config).expect("serialize");
             assert!(
                 !json.contains("1.2.3.4"),
@@ -3002,7 +3001,7 @@ mod tests {
     fn endpoint_host_kind_detection() {
         let ipv4 = built(
             ProtocolKind::Vless,
-            producer_settings(&[("user_id", "uuid")]),
+            &producer_settings(&[("user_id", "uuid")]),
         );
         assert_eq!(ipv4.endpoints[0].host_type, HostKind::Ipv4);
 
@@ -3028,7 +3027,7 @@ mod tests {
 
     /// Reconstruct the built config via the endpoint and re-parse — the
     /// config payload must survive the round trip (JSON equality, since
-    /// proto config structs derive PartialEq only inside the proto crate).
+    /// proto config structs derive `PartialEq` only inside the proto crate).
     fn assert_reconstruct_roundtrip(parsed: &ParsedProto) {
         let endpoint = &parsed.endpoints[0];
         let url = parsed
@@ -3046,7 +3045,7 @@ mod tests {
     fn reconstruct_roundtrip_vless_ws_tls() {
         let parsed = built(
             ProtocolKind::Vless,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
                 ("flow", "xtls-rprx-vision"),
                 ("tls.enable", "true"),
@@ -3063,7 +3062,7 @@ mod tests {
     fn reconstruct_roundtrip_trojan() {
         let parsed = built(
             ProtocolKind::Trojan,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "humanity"),
                 ("sni", "real.example.com"),
                 ("alpn", "h2"),
@@ -3077,7 +3076,7 @@ mod tests {
     fn reconstruct_roundtrip_shadowsocks() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "passw0rd"),
                 ("method", "aes-256-gcm"),
                 ("plugin", "obfs-local"),
@@ -3094,7 +3093,7 @@ mod tests {
         // still reconstruct and re-parse.
         let parsed = built(
             ProtocolKind::Vless,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
                 ("grpc.serviceName", "myservice"),
             ]),
@@ -3116,7 +3115,7 @@ mod tests {
     fn reconstruct_roundtrip_shadowsocks2022() {
         let parsed = built(
             ProtocolKind::Shadowsocks2022,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "0123456789abcdef0123456789abcdef"),
                 ("method", "2022-blake3-aes-128-gcm"),
             ]),
@@ -3129,7 +3128,7 @@ mod tests {
     fn hy2_ports_roundtrip_flattens_endpoint() {
         let parsed = built(
             ProtocolKind::Hysteria2,
-            producer_settings(&[
+            &producer_settings(&[
                 ("user_id", "token"),
                 ("ports", "1000-1002,2000"),
                 ("sni", "real.example.com"),
@@ -3239,7 +3238,7 @@ mod tests {
     }
 
     /// The reviewer-flagged vmess case, pinned explicitly: the real vmess
-    /// form-default key set (incl. `reality.show=false` in stream_settings and
+    /// form-default key set (incl. `reality.show=false` in `stream_settings` and
     /// `tcp.headerType=none`) builds, and sni/tls still map.
     #[test]
     fn vmess_form_defaults_build() {

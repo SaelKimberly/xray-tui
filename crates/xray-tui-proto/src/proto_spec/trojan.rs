@@ -687,8 +687,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();
@@ -949,9 +949,9 @@ mod tests {
     use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
 
     fn trojan_ws_tls() -> TrojanConfig {
-        config(parse(&format!(
-            "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org"
-        )))
+        config(parse(
+            "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org",
+        ))
     }
 
     #[test]

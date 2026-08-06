@@ -106,7 +106,7 @@ pub(super) async fn real_ping(
             profile_key: ProfileKey {
                 config_type: r#type,
                 address: endpoint.host.clone(),
-                port: endpoint.port as u16,
+                port: endpoint.port,
             },
             latency_ms: Some(rp.latency_ms),
             ip_info: rp.ip_info,
@@ -116,7 +116,7 @@ pub(super) async fn real_ping(
             profile_key: ProfileKey {
                 config_type: r#type,
                 address: endpoint.host.clone(),
-                port: endpoint.port as u16,
+                port: endpoint.port,
             },
             latency_ms: None,
             ip_info: None,

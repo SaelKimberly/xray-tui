@@ -280,7 +280,7 @@ pub fn parsed_to_rows(parsed: &ParsedProto) -> Vec<(Endpoint, Protocol, ProfileS
         .map(|ep| {
             let endpoint = endpoint_from_essentials(ep);
             (
-                endpoint.clone(),
+                endpoint,
                 protocol_from_parsed(parsed),
                 link_from_parsed(parsed, ep),
             )
@@ -719,7 +719,7 @@ impl AppState {
         ping::start_udp_test(self, protocol_id);
     }
     /// Batch fast-ping every link of every visible endpoint (T19 rebuild on
-    /// the TaskScheduler).
+    /// the `TaskScheduler`).
     pub fn start_batch_ping(&mut self) {
         ping::start_batch_ping(self);
     }

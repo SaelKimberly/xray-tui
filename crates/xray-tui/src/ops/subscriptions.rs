@@ -13,7 +13,7 @@ use crate::types::{CoreEvent, SplitRightPane};
 use crate::{get_field, try_send_or_warn};
 
 /// Map the typed group core enum to the form's select values.
-fn group_core_to_str(c: GroupCoreType) -> &'static str {
+const fn group_core_to_str(c: GroupCoreType) -> &'static str {
     match c {
         GroupCoreType::Auto => "auto",
         GroupCoreType::Xray => "Xray",
@@ -84,8 +84,7 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
             "core_type".into(),
             group
                 .core_type
-                .map(group_core_to_str)
-                .unwrap_or("auto")
+                .map_or("auto", group_core_to_str)
                 .to_string(),
         ),
     ];

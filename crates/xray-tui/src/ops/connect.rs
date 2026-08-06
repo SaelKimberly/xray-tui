@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 /// same semantics as the xray gRPC poller (`query_stats(..., reset = true)`).
 /// The events handler accumulates deltas into the persisted row; sending a
 /// cumulative session total here would double-count on every event.
-fn clash_stats_event(protocol_id: i64, t: &ClashTraffic) -> CoreEvent {
+const fn clash_stats_event(protocol_id: i64, t: &ClashTraffic) -> CoreEvent {
     CoreEvent::StatsUpdate {
         protocol_id,
         today_up: t.up,
@@ -378,8 +378,8 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                                     Some(Ok(bytes)) => {
                                         buf.extend_from_slice(&bytes);
                                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                                            let line = buf.drain(..=pos).collect::<Vec<_>>();
-                                            let trimmed = line.as_slice().trim_ascii();
+                                            let raw_line = buf.drain(..=pos).collect::<Vec<_>>();
+                                            let trimmed = raw_line.as_slice().trim_ascii();
                                             if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
                                                 // Per-line deltas (sing-box
                                                 // emits each second's traffic

@@ -41,7 +41,7 @@ use crate::proto_spec::common::{
     clash_tls_to_security, clash_to_endpoint, host_kind_for, security_to_clash_tls,
 };
 
-/// ShadowTLS protocol configuration — the identity payload (sans host/port).
+/// `ShadowTLS` protocol configuration — the identity payload (sans host/port).
 ///
 /// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
 /// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
@@ -336,7 +336,7 @@ impl InjectToCoreConf for ShadowTlsConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol(
+            other @ CoreType::Xray => Err(SupportError::UnsupportedProtocol(
                 "shadow-tls".into(),
                 other,
             )),
@@ -416,8 +416,8 @@ mod tests {
         );
     }
 
-    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
-    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    /// Reconstruct round-trip via the endpoint: parse → `reconstruct_proto(endpoint)`
+    /// → re-parse must reproduce the same `ParsedProto` (endpoints + config).
     fn assert_reconstruct_roundtrip(url: &str) {
         let parsed = parse(url);
         let endpoint = parsed.endpoints[0].clone();
