@@ -964,31 +964,26 @@ impl ProtoSpec for PlaceholderConfig {
 impl InjectToCoreConf for PlaceholderConfig {
     fn inject_to(
         &self,
-        core_conf: &mut Value,
+        _core_conf: &mut Value,
         core_type: CoreType,
         _endpoint: Option<&EndpointEssentials>,
         _opts: InjectOptions,
     ) -> Result<(), SupportError> {
-        match core_type {
-            // Redirect / TProxy / Mixed have no typed shape — the raw legacy
-            // settings_json IS the outbound body (design doc §7: "injects its
-            // raw settings_json"). The builder owns/overwrites the tag.
-            CoreType::SingBox => {
-                let raw: Value = serde_json::from_slice(&self.settings_json).map_err(|e| {
-                    SupportError::Config(format!(
-                        "PlaceholderConfig ({}) has invalid settings_json: {e}",
-                        self.proto_name
-                    ))
-                })?;
-                *core_conf = raw;
-                Ok(())
-            }
-            // Redirect / TProxy / Mixed have no xray shape.
-            other => Err(SupportError::UnsupportedProtocol(
-                self.proto_name.clone(),
-                other,
-            )),
-        }
+        // Redirect / TProxy / Mixed share this one type; the variant is carried
+        // in `proto_name` ("redirect" / "tproxy" / "mixed" as written by
+        // `from_legacy_parse` and `try_parse_proto`), so it is the kind string.
+        //
+        // Both cores error: sing-box has NO redirect/tproxy/mixed OUTBOUND
+        // type (option/redir.go is inbound-only; the design doc §7 raw
+        // settings_json injection predates the runtime contract and would
+        // yield an outbound without a `type` key that sing-box rejects at
+        // config load — "unknown outbound type"). Config validity is enforced
+        // at build time (AGENTS.md decision 2): no raw body can ever be a
+        // valid outbound, so these stay unsupported until a real shape exists.
+        Err(SupportError::UnsupportedProtocol(
+            self.proto_name.clone(),
+            core_type,
+        ))
     }
 }
 
@@ -1519,7 +1514,10 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_injects_raw_settings_json_for_singbox() {
+    fn placeholder_rejected_on_both_cores() {
+        // sing-box has no redirect/tproxy/mixed OUTBOUND type, so the raw
+        // settings_json can never be a valid outbound — both cores refuse at
+        // build time (config validity enforced, AGENTS.md decision 2).
         let raw = json!({
             "protocol_settings": { "redirect_address": "1.2.3.4" },
             "stream_settings": {},
@@ -1528,22 +1526,16 @@ mod tests {
             "redirect".into(),
             serde_json::to_vec(&raw).expect("serialize"),
         );
-        let mut conf = json!({});
-        placeholder
-            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
-            .expect("placeholder sing-box inject");
-        // The raw settings_json IS the outbound body (tag owned by builder).
-        assert_eq!(conf, raw);
-
-        // Xray has no shape for redirect/tproxy/mixed.
-        let mut conf = json!({});
-        let err = placeholder
-            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
-            .expect_err("placeholder has no xray shape");
-        assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "redirect"
-        ));
+        for core in [CoreType::SingBox, CoreType::Xray] {
+            let mut conf = json!({});
+            let err = placeholder
+                .inject_to(&mut conf, core, None, InjectOptions::default())
+                .expect_err("placeholder must be rejected on both cores");
+            assert!(matches!(
+                &err,
+                SupportError::UnsupportedProtocol(kind, got) if kind == "redirect" && *got == core
+            ));
+        }
     }
 
     #[test]
@@ -1551,11 +1543,15 @@ mod tests {
         let variants = all_variants_with_kinds();
         assert_eq!(variants.len(), 20, "all 20 dispatch arms must be covered");
         let endpoint = EndpointEssentials::new("1.2.3.4", 443);
-        // Since T15 every variant has a real sing-box shape: with an
-        // endpoint, dispatch must succeed for all 20 (tor/tailscale and the
-        // redirect/tproxy/mixed placeholders ignore the endpoint — the
-        // placeholders emit their raw settings_json).
+        // Since T15 every non-placeholder variant has a real sing-box shape:
+        // with an endpoint, dispatch must succeed for all 17 (tor/tailscale
+        // ignore the endpoint). The redirect/tproxy/mixed placeholders have
+        // NO outbound shape on either core (sing-box has no such outbound
+        // type) and are rejected at build time.
         for (config, expected) in &variants {
+            if matches!(expected.as_ref(), "redirect" | "tproxy" | "mixed") {
+                continue;
+            }
             let core = supported_core(config);
             config
                 .inject_to(

@@ -34,7 +34,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
-    should_skip_endpoint_param, to_xray_stream_settings,
+    should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings,
 };
 use super::core_mapping;
 use super::utils;
@@ -426,13 +426,15 @@ impl HttpClientConfig {
 
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Http` arm: `username`/`password` only when BOTH
-    /// are non-empty (the old `add_user_if_present` semantics). sing-box
-    /// `http` has no TLS field, so the typed security is not emitted.
+    /// are non-empty (the old `add_user_if_present` semantics). The typed
+    /// TLS is emitted when the security carries it (`HTTPOutboundOptions`
+    /// embeds `OutboundTLSOptionsContainer` — an http-over-TLS profile must
+    /// not dial a TLS port in plaintext), via the shared helper.
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
         endpoint: Option<&EndpointEssentials>,
-        _opts: InjectOptions,
+        opts: InjectOptions,
     ) -> Result<(), SupportError> {
         let Some(ep) = endpoint else {
             return Err(SupportError::MissingField("server", "http"));
@@ -449,6 +451,9 @@ impl HttpClientConfig {
         {
             out["username"] = json!(u);
             out["password"] = json!(p);
+        }
+        if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
+            out["tls"] = tls;
         }
         *core_conf = out;
         Ok(())
@@ -752,6 +757,28 @@ mod tests {
         assert_eq!(conf["server_port"], 8080);
         assert_eq!(conf["username"], "user");
         assert_eq!(conf["password"], "pass");
+    }
+
+    #[test]
+    fn singbox_inject_emits_tls_from_security() {
+        // http-over-TLS profile: security=tls + sni -> tls block emitted.
+        let cfg = config(parse(
+            "http://user:pass@1.2.3.4:8443?security=tls&sni=cdn.example.com",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 8443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("http sing-box inject");
+        assert_eq!(conf["type"], "http");
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "cdn.example.com");
+        assert_eq!(conf["tls"]["insecure"], true, "skip_cert_verify forces it");
     }
 
     #[test]
