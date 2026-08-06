@@ -91,18 +91,6 @@ pub enum ParseError {
     Unimplemented(&'static str),
 }
 
-#[derive(Debug, Clone)]
-pub struct FallbackInfo {
-    pub raw_url: String,
-    pub original_scheme: SchemeX,
-    pub original_error: String,
-}
-
-pub enum ParseResult {
-    Direct(ProtocolConfig),
-    Fallback(ProtocolConfig, FallbackInfo),
-}
-
 /// Which proxy core to target for JSON config generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum CoreType {
@@ -170,34 +158,72 @@ pub enum ProtoSpecError {
     Unsupported(String),
 }
 
+macro_rules! dispatch {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            ProtocolConfig::Vless(c) => c.$method($($arg),*),
+            ProtocolConfig::Vmess(c) => c.$method($($arg),*),
+            ProtocolConfig::Trojan(c) => c.$method($($arg),*),
+            ProtocolConfig::Hysteria2(c) => c.$method($($arg),*),
+            ProtocolConfig::Ss(c) => c.$method($($arg),*),
+            ProtocolConfig::Ssr(c) => c.$method($($arg),*),
+            ProtocolConfig::Tuic(c) => c.$method($($arg),*),
+            ProtocolConfig::Wireguard(c) => c.$method($($arg),*),
+            ProtocolConfig::Socks(c) => c.$method($($arg),*),
+            ProtocolConfig::Http(c) => c.$method($($arg),*),
+            ProtocolConfig::Naive(c) => c.$method($($arg),*),
+            ProtocolConfig::AnyTls(c) => c.$method($($arg),*),
+            ProtocolConfig::ShadowTls(c) => c.$method($($arg),*),
+            ProtocolConfig::Tor(c) => c.$method($($arg),*),
+            ProtocolConfig::Ssh(c) => c.$method($($arg),*),
+            ProtocolConfig::Tailscale(c) => c.$method($($arg),*),
+            ProtocolConfig::Hysteria1(c) => c.$method($($arg),*),
+            ProtocolConfig::Redirect(c) => c.$method($($arg),*),
+            ProtocolConfig::TProxy(c) => c.$method($($arg),*),
+            ProtocolConfig::Mixed(c) => c.$method($($arg),*),
+        }
+    };
+}
+
 impl ProtocolConfig {
-    /// Like [`ProtoSpec::try_parse`] but distinguishes direct vs. fallback parses.
+    /// Full parse boundary: scheme dispatch + fallback chain, returning the
+    /// complete [`ParsedProto`] (endpoints + protocol essentials) of the
+    /// FIRST parser that succeeds.
+    ///
+    /// The scheme-mapped parser runs first; when it fails with a recoverable
+    /// structural error (missing/malformed host, port, userinfo, or unknown),
+    /// the chain falls back through `Ss → Ssr → Vmess → Vless → Trojan →
+    /// Hysteria2 → Hysteria1`. Unrecoverable errors (unsupported scheme,
+    /// promotion/navigation URLs, invalid conf) abort immediately.
+    ///
+    /// Supersedes the removed `try_parse_detailed`/`ParseResult` (T11): the
+    /// endpoints are no longer discarded — callers get them on the returned
+    /// [`ParsedProto`].
     ///
     /// # Errors
     ///
     /// If the URL is not a valid proxy URL for any supported protocol.
-    pub fn try_parse_detailed(raw: &RawUrlX<'_>) -> Result<ParseResult, ParseError> {
+    pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         // Every arm goes through the config's `try_parse_proto` (the parse
-        // boundary entry — T4/T5) and extracts the endpoint-free config
-        // payload; the endpoints are discarded here and will be rewired to
-        // `ParsedProto` consumers in T11.
+        // boundary entry — T4/T5) and keeps the full ParsedProto (endpoints
+        // + protocol essentials).
         let r = match raw.schema {
-            SchemeX::Vless => VlessConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Trojan => TrojanConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Vmess => VmessConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Hysteria => Hysteria1Config::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Hysteria2 => Hysteria2Config::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::SS => SsConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::SSR => SsrConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::TUIC => TuicConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::WireGuard => WireguardConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::ShadowTls => ShadowTlsConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Socks => Socks5Config::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Http => HttpClientConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::Naive => NaiveConfig::try_parse_proto(raw).map(|p| p.protocol.config),
-            SchemeX::AnyTLS => AnyTlsConfig::try_parse_proto(raw).map(|p| p.protocol.config),
+            SchemeX::Vless => VlessConfig::try_parse_proto(raw),
+            SchemeX::Trojan => TrojanConfig::try_parse_proto(raw),
+            SchemeX::Vmess => VmessConfig::try_parse_proto(raw),
+            SchemeX::Hysteria => Hysteria1Config::try_parse_proto(raw),
+            SchemeX::Hysteria2 => Hysteria2Config::try_parse_proto(raw),
+            SchemeX::SS => SsConfig::try_parse_proto(raw),
+            SchemeX::SSR => SsrConfig::try_parse_proto(raw),
+            SchemeX::TUIC => TuicConfig::try_parse_proto(raw),
+            SchemeX::WireGuard => WireguardConfig::try_parse_proto(raw),
+            SchemeX::ShadowTls => ShadowTlsConfig::try_parse_proto(raw),
+            SchemeX::Socks => Socks5Config::try_parse_proto(raw),
+            SchemeX::Http => HttpClientConfig::try_parse_proto(raw),
+            SchemeX::Naive => NaiveConfig::try_parse_proto(raw),
+            SchemeX::AnyTLS => AnyTlsConfig::try_parse_proto(raw),
             SchemeX::Warp => {
-                // Warp is not directly URL-parsable — fall through to fallback
+                // Warp is not directly URL-parsable — no fallback applies.
                 Err(ParseError::UnsupportedScheme(raw.schema.clone()))
             }
             SchemeX::Undefined | SchemeX::Https => return Err(ParseError::PromotionUrl),
@@ -205,7 +231,7 @@ impl ProtocolConfig {
         };
 
         let original_err = match r {
-            Ok(r) => return Ok(ParseResult::Direct(r)),
+            Ok(parsed) => return Ok(parsed),
             Err(
                 e @ (ParseError::InvalidStructure(_)
                 | ParseError::MissingHost
@@ -217,25 +243,28 @@ impl ProtocolConfig {
             ) => e,
             unrecoverable @ Err(_) => return Err(unrecoverable.unwrap_err()),
         };
-        let original_scheme = raw.schema.clone();
-        let original_error = original_err.to_string();
-        let v = SsConfig::try_parse_proto(raw)
-            .map(|p| p.protocol.config)
-            .or_else(|_| SsrConfig::try_parse_proto(raw).map(|p| p.protocol.config))
-            .or_else(|_| VmessConfig::try_parse_proto(raw).map(|p| p.protocol.config))
-            .or_else(|_| VlessConfig::try_parse_proto(raw).map(|p| p.protocol.config))
-            .or_else(|_| TrojanConfig::try_parse_proto(raw).map(|p| p.protocol.config))
-            .or_else(|_| Hysteria2Config::try_parse_proto(raw).map(|p| p.protocol.config))
-            .or_else(|_| Hysteria1Config::try_parse_proto(raw).map(|p| p.protocol.config))
-            .or(Err(original_err))?;
-        Ok(ParseResult::Fallback(
-            v,
-            FallbackInfo {
-                raw_url: raw.raw.to_string(),
-                original_scheme,
-                original_error,
-            },
-        ))
+        SsConfig::try_parse_proto(raw)
+            .or_else(|_| SsrConfig::try_parse_proto(raw))
+            .or_else(|_| VmessConfig::try_parse_proto(raw))
+            .or_else(|_| VlessConfig::try_parse_proto(raw))
+            .or_else(|_| TrojanConfig::try_parse_proto(raw))
+            .or_else(|_| Hysteria2Config::try_parse_proto(raw))
+            .or_else(|_| Hysteria1Config::try_parse_proto(raw))
+            .or(Err(original_err))
+    }
+
+    /// Reconstruct the share URL for this config given its endpoint.
+    ///
+    /// Dispatches to the per-config `reconstruct_proto`; placeholder
+    /// protocols (no URL format) return
+    /// [`ParseError::Unimplemented`].
+    ///
+    /// # Errors
+    ///
+    /// If this protocol has no URL format, or the endpoint/config cannot be
+    /// rendered.
+    pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+        dispatch!(self, reconstruct_proto, endpoint)
     }
 
     /// Construct a `ProtocolConfig` from legacy parser fields.
@@ -507,14 +536,14 @@ trait ProtoIdentity {
 /// produce/consume [`ParsedProto`] with the endpoint ([`EndpointEssentials`])
 /// split out and [`ProtocolEssentials::config`] carrying only endpoint-free
 /// protocol parameters (host-free parse mandate). T4 converted vless/vmess;
-/// T5 converted all remaining configs (no config struct carries host/port
+/// T4 converted vless/vmess; T5 converted all remaining configs (no config struct carries host/port
 /// anymore). This legacy trait is kept as a bridge so `ProtocolConfig`
-/// dispatch and the `Proto`/`ParseResult` consumers in xray-tui-config keep
-/// compiling: `try_parse`/`try_from_clash` still work by delegating to the
-/// `*_proto` variants and discarding the endpoints; `to_clash`/`reconstruct`
-/// return errors because host/port are no longer stored on the config. T11
-/// rewires import/export to the `*_proto` variants (phase D builders take
-/// the endpoint separately).
+/// dispatch and the `Proto` consumers in xray-tui-core keep compiling:
+/// `try_parse`/`try_from_clash` still work by delegating to the `*_proto`
+/// variants and discarding the endpoints; `to_clash`/`reconstruct` return
+/// errors because host/port are no longer stored on the config. T11 rewired
+/// import/export to the `*_proto` variants (phase D builders take the
+/// endpoint separately); the trait itself is slated for removal in T23.
 #[allow(private_bounds)] // edition 2024 denies private bounds; deliberate seal
 pub trait ProtoSpec: ProtoIdentity {
     /// # Errors
@@ -633,33 +662,6 @@ pub enum ProtocolConfig {
     Mixed(PlaceholderConfig),
 }
 
-macro_rules! dispatch {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            ProtocolConfig::Vless(c) => c.$method($($arg),*),
-            ProtocolConfig::Vmess(c) => c.$method($($arg),*),
-            ProtocolConfig::Trojan(c) => c.$method($($arg),*),
-            ProtocolConfig::Hysteria2(c) => c.$method($($arg),*),
-            ProtocolConfig::Ss(c) => c.$method($($arg),*),
-            ProtocolConfig::Ssr(c) => c.$method($($arg),*),
-            ProtocolConfig::Tuic(c) => c.$method($($arg),*),
-            ProtocolConfig::Wireguard(c) => c.$method($($arg),*),
-            ProtocolConfig::Socks(c) => c.$method($($arg),*),
-            ProtocolConfig::Http(c) => c.$method($($arg),*),
-            ProtocolConfig::Naive(c) => c.$method($($arg),*),
-            ProtocolConfig::AnyTls(c) => c.$method($($arg),*),
-            ProtocolConfig::ShadowTls(c) => c.$method($($arg),*),
-            ProtocolConfig::Tor(c) => c.$method($($arg),*),
-            ProtocolConfig::Ssh(c) => c.$method($($arg),*),
-            ProtocolConfig::Tailscale(c) => c.$method($($arg),*),
-            ProtocolConfig::Hysteria1(c) => c.$method($($arg),*),
-            ProtocolConfig::Redirect(c) => c.$method($($arg),*),
-            ProtocolConfig::TProxy(c) => c.$method($($arg),*),
-            ProtocolConfig::Mixed(c) => c.$method($($arg),*),
-        }
-    };
-}
-
 impl ProtoIdentity for ProtocolConfig {
     fn compute_sig(&self) -> u64 {
         dispatch!(self, compute_sig)
@@ -737,10 +739,9 @@ impl ProtoSpec for ProtocolConfig {
     ///
     /// If the URL is not a valid proxy URL for any supported protocol.
     fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
-        match Self::try_parse_detailed(raw) {
-            Ok(ParseResult::Direct(c) | ParseResult::Fallback(c, _)) => Ok(c),
-            Err(e) => Err(e),
-        }
+        // T11: the full parse boundary is `try_parse_proto`; this legacy
+        // config-only bridge discards the parsed endpoints.
+        Self::try_parse_proto(raw).map(|p| p.protocol.config)
     }
 }
 

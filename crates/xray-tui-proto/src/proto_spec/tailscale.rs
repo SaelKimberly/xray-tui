@@ -137,7 +137,7 @@ impl TailscaleConfig {
 }
 
 /// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
-/// `Proto`/`ParseResult` consumers in xray-tui-config) compile unchanged.
+/// `Proto` consumer in xray-tui-core) compile unchanged.
 ///
 /// DEGRADED PATH (documented): `try_from_clash` still works by delegating to
 /// the `*_proto` variant and discarding the parsed endpoints; `to_clash`/
