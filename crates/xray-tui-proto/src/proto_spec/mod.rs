@@ -19,7 +19,6 @@ mod error;
 mod http_client;
 mod hysteria1;
 mod hysteria2;
-mod inject_stub;
 mod kinds;
 mod naive;
 pub mod security_rank;
@@ -962,6 +961,37 @@ impl ProtoSpec for PlaceholderConfig {
     }
 }
 
+impl InjectToCoreConf for PlaceholderConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        _endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            // Redirect / TProxy / Mixed have no typed shape — the raw legacy
+            // settings_json IS the outbound body (design doc §7: "injects its
+            // raw settings_json"). The builder owns/overwrites the tag.
+            CoreType::SingBox => {
+                let raw: Value = serde_json::from_slice(&self.settings_json).map_err(|e| {
+                    SupportError::Config(format!(
+                        "PlaceholderConfig ({}) has invalid settings_json: {e}",
+                        self.proto_name
+                    ))
+                })?;
+                *core_conf = raw;
+                Ok(())
+            }
+            // Redirect / TProxy / Mixed have no xray shape.
+            other => Err(SupportError::UnsupportedProtocol(
+                self.proto_name.clone(),
+                other,
+            )),
+        }
+    }
+}
+
 impl PlaceholderConfig {
     /// Construct a placeholder wrapping an opaque legacy JSON body.
     #[must_use]
@@ -1489,19 +1519,43 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_injects_raw_settings_json_for_singbox() {
+        let raw = json!({
+            "protocol_settings": { "redirect_address": "1.2.3.4" },
+            "stream_settings": {},
+        });
+        let placeholder = PlaceholderConfig::new(
+            "redirect".into(),
+            serde_json::to_vec(&raw).expect("serialize"),
+        );
+        let mut conf = json!({});
+        placeholder
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect("placeholder sing-box inject");
+        // The raw settings_json IS the outbound body (tag owned by builder).
+        assert_eq!(conf, raw);
+
+        // Xray has no shape for redirect/tproxy/mixed.
+        let mut conf = json!({});
+        let err = placeholder
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("placeholder has no xray shape");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "redirect"
+        ));
+    }
+
+    #[test]
     fn all_variants_route_to_their_kind_string() {
         let variants = all_variants_with_kinds();
         assert_eq!(variants.len(), 20, "all 20 dispatch arms must be covered");
         let endpoint = EndpointEssentials::new("1.2.3.4", 443);
-        // Since T15 every non-placeholder variant has a real sing-box shape:
-        // with an endpoint, dispatch must succeed for all 17 (tor/tailscale
-        // ignore the endpoint). The redirect/tproxy/mixed placeholders emit
-        // their raw settings_json in T15 Step 3 (still UnsupportedProtocol
-        // until then).
+        // Since T15 every variant has a real sing-box shape: with an
+        // endpoint, dispatch must succeed for all 20 (tor/tailscale and the
+        // redirect/tproxy/mixed placeholders ignore the endpoint — the
+        // placeholders emit their raw settings_json).
         for (config, expected) in &variants {
-            if matches!(expected.as_ref(), "redirect" | "tproxy" | "mixed") {
-                continue;
-            }
             let core = supported_core(config);
             config
                 .inject_to(

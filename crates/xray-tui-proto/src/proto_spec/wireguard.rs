@@ -561,7 +561,7 @@ impl WireguardConfig {
         if let Some(ka) = self.persistent_keepalive {
             peer["persistent_keepalive_interval"] = json!(ka);
         }
-        let mut out = json!({
+        let out = json!({
             "tag": "proxy",
             "type": "wireguard",
             "server": ep.host,
