@@ -515,16 +515,16 @@ fn build_display_rows(
                         .latency
                         .as_ref()
                         .and_then(|l| match l {
+                            // Latency::Real.ip is the bare IP prefix now
+                            // (events.rs strips any "|"-joined suffix) — no
+                            // split here; country needs parsed fields, which
+                            // T20 refines.
                             xray_tui_db::models::Latency::Real { ip, .. } => ip.clone(),
                             xray_tui_db::models::Latency::Fast { .. } => None,
                         })
-                        .and_then(|ip| {
-                            ip.split_once('|')
-                                .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
-                        })
                         .map_or_else(
                             || ("—".to_string(), "—".to_string()),
-                            |(ip, country)| (ip, truncate_pad(&country, 7)),
+                            |ip| (ip, "—".to_string()),
                         );
                     let (t, s) = proto.map_or((None, None), |p| {
                         (

@@ -25,8 +25,12 @@ fn group_core_to_str(c: GroupCoreType) -> &'static str {
 /// model's "unset" state).
 fn group_core_from_str(s: &str) -> Option<GroupCoreType> {
     match s {
-        "xray" => Some(GroupCoreType::Xray),
-        "sing-box" | "singbox" => Some(GroupCoreType::SingBox),
+        // Accept the select's capitalized values ("Xray"/"SingBox") in
+        // addition to the legacy lowercase spellings — the group form writes
+        // the capitalized strings, so rejecting them silently reset every
+        // explicit override to auto.
+        "xray" | "Xray" => Some(GroupCoreType::Xray),
+        "sing-box" | "singbox" | "SingBox" => Some(GroupCoreType::SingBox),
         _ => None,
     }
 }
@@ -481,4 +485,49 @@ pub fn spawn_auto_update(state: &mut AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_core_select_round_trip() {
+        // The group form's Core Type select (ui/settings.rs OPTIONS) offers
+        // "Auto"/"Xray"/"SingBox". Every option must parse to the right core
+        // instead of silently degrading to auto (F1: the capitalized values
+        // were rejected, so explicit Xray/SingBox overrides reset to auto on
+        // save — and editing such a group showed the override as lost).
+        for (select, expected) in [
+            ("Auto", None),
+            ("Xray", Some(GroupCoreType::Xray)),
+            ("SingBox", Some(GroupCoreType::SingBox)),
+        ] {
+            assert_eq!(
+                group_core_from_str(select),
+                expected,
+                "from_str({select:?})"
+            );
+        }
+        // Emitter output must parse back to the same core. Auto's emitter
+        // spelling is "auto", which maps to the model's unset state (None).
+        for (core, expected) in [
+            (GroupCoreType::Auto, None),
+            (GroupCoreType::Xray, Some(GroupCoreType::Xray)),
+            (GroupCoreType::SingBox, Some(GroupCoreType::SingBox)),
+        ] {
+            assert_eq!(
+                group_core_from_str(group_core_to_str(core)),
+                expected,
+                "round-trip {core:?}"
+            );
+        }
+        // Legacy lowercase spellings remain accepted.
+        assert_eq!(group_core_from_str("xray"), Some(GroupCoreType::Xray));
+        assert_eq!(
+            group_core_from_str("sing-box"),
+            Some(GroupCoreType::SingBox)
+        );
+        assert_eq!(group_core_from_str("singbox"), Some(GroupCoreType::SingBox));
+    }
 }
