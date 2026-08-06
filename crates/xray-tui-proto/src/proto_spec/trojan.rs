@@ -44,7 +44,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
-    should_skip_endpoint_param, to_xray_stream_settings, validate_xray_reality,
+    should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
@@ -569,7 +569,7 @@ impl InjectToCoreConf for TrojanConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("trojan".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -609,6 +609,33 @@ impl TrojanConfig {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Trojan` arm (`password` + TLS via the shared
+    /// helper). The typed `transport` has no sing-box emission (the old
+    /// builder dropped it too).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "trojan"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "trojan",
+            "server": ep.host,
+            "server_port": ep.port,
+            "password": self.password,
+        });
+        if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
+            out["tls"] = tls;
+        }
+        *core_conf = out;
         Ok(())
     }
 }
@@ -994,20 +1021,51 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = trojan_ws_tls();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("172.64.152.23", 443)),
+            InjectOptions::default(),
+        )
+        .expect("trojan sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "trojan");
+        assert_eq!(conf["server"], "172.64.152.23");
+        assert_eq!(conf["server_port"], 443);
+        assert_eq!(conf["password"], "humanity");
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "www.creationlong.org");
+    }
+
+    #[test]
+    fn singbox_inject_skip_cert_verify_forces_insecure() {
+        let cfg = trojan_ws_tls();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("172.64.152.23", 443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("trojan sing-box inject");
+        assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = trojan_ws_tls();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(
-                &mut conf,
-                CoreType::SingBox,
-                Some(&EndpointEssentials::new("172.64.152.23", 443)),
-                InjectOptions::default(),
-            )
-            .expect_err("sing-box shape lands in T15");
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan trojan must be rejected");
         assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "trojan"
+            err,
+            SupportError::MissingField("server", "trojan")
         ));
     }
 }

@@ -58,7 +58,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
 use super::common::{
-    SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
+    SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure, to_singbox_tls,
     to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
@@ -648,7 +648,7 @@ impl InjectToCoreConf for VmessConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("vmess".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -693,6 +693,36 @@ impl VmessConfig {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Vmess` arm (`uuid` + hard-coded `security`
+    /// "auto" — here sourced from the typed `enc`, which the old builder
+    /// TODO'd — plus TLS via the shared helper). The typed `transport`/
+    /// `alter_id` have no sing-box emission (the old builder dropped them).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "vmess"));
+        };
+        let enc = self.security.enc.as_deref().unwrap_or("auto");
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "vmess",
+            "server": ep.host,
+            "server_port": ep.port,
+            "uuid": self.uuid,
+            "security": enc,
+        });
+        if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
+            out["tls"] = tls;
+        }
+        *core_conf = out;
         Ok(())
     }
 }
@@ -1279,20 +1309,50 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("192.200.160.16", 8443)),
+            InjectOptions::default(),
+        )
+        .expect("vmess sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "vmess");
+        assert_eq!(conf["server"], "192.200.160.16");
+        assert_eq!(conf["server_port"], 8443);
+        assert_eq!(conf["uuid"], UUID);
+        // security = typed scy (default "auto").
+        assert_eq!(conf["security"], "auto");
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "steam.avaaaal.ir");
+    }
+
+    #[test]
+    fn singbox_inject_skip_cert_verify_forces_insecure() {
+        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("192.200.160.16", 8443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("vmess sing-box inject");
+        assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(
-                &mut conf,
-                CoreType::SingBox,
-                Some(&EndpointEssentials::new("192.200.160.16", 8443)),
-                InjectOptions::default(),
-            )
-            .expect_err("sing-box shape lands in T15");
-        assert!(matches!(
-            err,
-            SupportError::UnsupportedProtocol(ref kind, CoreType::SingBox) if kind == "vmess"
-        ));
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan vmess must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "vmess")));
     }
 }

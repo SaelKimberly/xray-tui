@@ -443,7 +443,7 @@ impl InjectToCoreConf for WireguardConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("wireguard".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -515,6 +515,68 @@ impl WireguardConfig {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported from the old builder's
+    /// `Protocol::WireGuard` arm against the vendored sing-box
+    /// `WireGuardEndpointOptions`/`WireGuardPeer` structs: `server`/
+    /// `server_port` from the endpoint, `address` (interface CIDR list),
+    /// `mtu` (typed value or the old 1420 default), `private_key`, one peer
+    /// with `address`/`port`/`public_key`/`allowed_ips` (["0.0.0.0/0"]),
+    /// `pre_shared_key`/`persistent_keepalive_interval` when set. `reserved`
+    /// follows the T14 3-byte rule: decoded (comma decimals or base64) and
+    /// emitted as the byte array only when EXACTLY 3 bytes — sing-box's
+    /// `WireGuardPeer.Reserved []uint8` rejects other lengths. `dns`/
+    /// `remote_dns_resolve`/`workers`/`udp_timeout`/`system` have no typed
+    /// source or sing-box key here and are dropped.
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "wireguard"));
+        };
+        let mtu = self
+            .mtu
+            .as_ref()
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(1420);
+        let mut peer = json!({
+            "address": ep.host,
+            "port": ep.port,
+            "public_key": self.public_key,
+            "allowed_ips": ["0.0.0.0/0"],
+        });
+        if let Some(psk) = self.preshared_key.as_deref().filter(|s| !s.is_empty()) {
+            peer["pre_shared_key"] = json!(psk);
+        }
+        if let Some(reserved) = &self.reserved
+            && let Some(bytes) = parse_reserved_bytes(reserved.as_str())
+        {
+            peer["reserved"] = json!(bytes);
+        }
+        if let Some(ka) = self.persistent_keepalive {
+            peer["persistent_keepalive_interval"] = json!(ka);
+        }
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "wireguard",
+            "server": ep.host,
+            "server_port": ep.port,
+            "address": self
+                .address
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>(),
+            "mtu": mtu,
+            "private_key": self.private_key,
+            "peers": [peer],
+        });
+        *core_conf = out;
         Ok(())
     }
 }
@@ -930,20 +992,73 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse(WG_URL));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("162.159.192.1", 2408)),
+            InjectOptions::default(),
+        )
+        .expect("wireguard sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "wireguard");
+        assert_eq!(conf["server"], "162.159.192.1");
+        assert_eq!(conf["server_port"], 2408);
+        assert_eq!(
+            conf["address"],
+            serde_json::json!(["172.16.0.2/32"]),
+            "interface address list"
+        );
+        assert_eq!(conf["mtu"], 1280);
+        assert_eq!(
+            conf["private_key"],
+            "eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j+wAPSEH4="
+        );
+        let peer = &conf["peers"][0];
+        assert_eq!(peer["address"], "162.159.192.1");
+        assert_eq!(peer["port"], 2408);
+        assert_eq!(
+            peer["public_key"],
+            "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+        );
+        assert_eq!(peer["allowed_ips"], serde_json::json!(["0.0.0.0/0"]));
+        // reserved: decoded from "236,163,162" to the 3-byte array.
+        assert_eq!(peer["reserved"], serde_json::json!([236, 163, 162]));
+    }
+
+    #[test]
+    fn singbox_inject_skips_malformed_reserved() {
+        // 2-byte reserved -> no reserved key (sing-box rejects non-3-byte).
+        let cfg = config(parse(
+            "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&reserved=1%2C2&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("162.159.192.1", 2408)),
+            InjectOptions::default(),
+        )
+        .expect("wireguard sing-box inject");
+        assert!(
+            conf["peers"][0].get("reserved").is_none(),
+            "malformed reserved must be skipped: {conf}"
+        );
+        assert_eq!(conf["mtu"], 1420, "mtu defaults to 1420 when unset");
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = config(parse(WG_URL));
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(
-                &mut conf,
-                CoreType::SingBox,
-                Some(&EndpointEssentials::new("162.159.192.1", 2408)),
-                InjectOptions::default(),
-            )
-            .expect_err("sing-box shape lands in T15");
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan wireguard must be rejected");
         assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "wireguard"
+            err,
+            SupportError::MissingField("server", "wireguard")
         ));
     }
 }

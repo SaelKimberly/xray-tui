@@ -49,7 +49,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
-    should_skip_endpoint_param, to_xray_stream_settings, validate_xray_reality,
+    should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
@@ -672,7 +672,7 @@ impl InjectToCoreConf for VlessConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("vless".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -721,6 +721,36 @@ impl VlessConfig {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Vless` arm (`uuid` + `flow` when non-empty + TLS
+    /// via the shared helper). The typed `transport` has no sing-box emission
+    /// yet (the old builder dropped it too) — only the TLS block appears.
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "vless"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "vless",
+            "server": ep.host,
+            "server_port": ep.port,
+            "uuid": self.uuid,
+        });
+        if let Some(flow) = self.flow.as_deref().filter(|s| !s.is_empty()) {
+            out["flow"] = json!(flow);
+        }
+        if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
+            out["tls"] = tls;
+        }
+        *core_conf = out;
         Ok(())
     }
 }
@@ -1411,20 +1441,81 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = vless_ws_tls();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&endpoint()),
+            InjectOptions::default(),
+        )
+        .expect("vless sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "vless");
+        assert_eq!(conf["server"], "159.223.24.65");
+        assert_eq!(conf["server_port"], 443);
+        assert_eq!(conf["uuid"], UUID);
+        assert!(conf.get("flow").is_none(), "no flow -> key omitted");
+        // tls via the shared helper: sni from the config.
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "test.ir");
+    }
+
+    #[test]
+    fn singbox_inject_flow_and_skip_cert_verify() {
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:8443?security=tls&encryption=none&type=tcp&flow=xtls-rprx-vision"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 8443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("vless sing-box inject");
+        assert_eq!(conf["flow"], "xtls-rprx-vision");
+        // skip_cert_verify forces tls.insecure; server_name falls back to the
+        // endpoint host at build time.
+        assert_eq!(conf["tls"]["insecure"], true);
+        assert_eq!(conf["tls"]["server_name"], "example.com");
+    }
+
+    #[test]
+    fn singbox_inject_reality_block() {
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?security=reality&encryption=none&type=tcp&flow=xtls-rprx-vision&pbk=REALITY_PUBLIC_KEY&sid=abc123&fp=chrome&spx=%2Fpath"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&endpoint()),
+            InjectOptions::default(),
+        )
+        .expect("vless sing-box inject");
+        assert_eq!(conf["tls"]["reality"]["enabled"], true);
+        assert_eq!(conf["tls"]["reality"]["public_key"], "REALITY_PUBLIC_KEY");
+        assert_eq!(conf["tls"]["reality"]["short_id"], "abc123");
+        // NO spider_x: sing-box OutboundRealityOptions has no such field.
+        assert!(
+            conf["tls"]["reality"].get("spider_x").is_none(),
+            "spider_x must never be emitted: {}",
+            conf
+        );
+        assert_eq!(conf["tls"]["utls"]["fingerprint"], "chrome");
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = vless_ws_tls();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(
-                &mut conf,
-                CoreType::SingBox,
-                Some(&endpoint()),
-                InjectOptions::default(),
-            )
-            .expect_err("sing-box shape lands in T15");
-        assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "vless"
-        ));
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan vless must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "vless")));
     }
 }

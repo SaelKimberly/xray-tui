@@ -334,7 +334,7 @@ impl InjectToCoreConf for Socks5Config {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("socks".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -372,6 +372,36 @@ impl Socks5Config {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Socks` arm: `username`/`password` only when BOTH
+    /// are non-empty (the old `add_user_if_present` semantics). sing-box
+    /// `socks` has no TLS field, so the typed security is not emitted.
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "socks"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "socks",
+            "server": ep.host,
+            "server_port": ep.port,
+        });
+        if let (Some(u), Some(p)) = (&self.username, &self.password)
+            && !u.is_empty()
+            && !p.is_empty()
+        {
+            out["username"] = json!(u);
+            out["password"] = json!(p);
+        }
+        *core_conf = out;
         Ok(())
     }
 }
@@ -643,20 +673,47 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = socks_auth();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 1080)),
+            InjectOptions::default(),
+        )
+        .expect("socks sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "socks");
+        assert_eq!(conf["server"], "1.2.3.4");
+        assert_eq!(conf["server_port"], 1080);
+        assert_eq!(conf["username"], "user");
+        assert_eq!(conf["password"], "pass");
+    }
+
+    #[test]
+    fn singbox_inject_auth_omitted_when_password_missing() {
+        // Lone username (no password) -> no auth block (old builder rule).
+        let cfg = config(parse("socks://user@1.2.3.4:1080"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 1080)),
+            InjectOptions::default(),
+        )
+        .expect("socks sing-box inject");
+        assert!(conf.get("username").is_none());
+        assert!(conf.get("password").is_none());
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = socks_auth();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(
-                &mut conf,
-                CoreType::SingBox,
-                Some(&EndpointEssentials::new("1.2.3.4", 1080)),
-                InjectOptions::default(),
-            )
-            .expect_err("sing-box shape lands in T15");
-        assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "socks"
-        ));
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan socks must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "socks")));
     }
 }

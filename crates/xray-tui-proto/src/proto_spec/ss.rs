@@ -421,7 +421,7 @@ impl InjectToCoreConf for SsConfig {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("ss".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -466,6 +466,49 @@ impl SsConfig {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Shadowsocks | Protocol::Shadowsocks2022` arm
+    /// (`method`/`password` with build-time cipher validation via
+    /// `core_mapping::singbox_supports_ss_method` — legacy cfb/ctr/rc4-md5/
+    /// none methods build on sing-box, unknown ones are refused so the config
+    /// is never written invalid), plus the typed `plugin`/`plugin_opts`
+    /// (sing-box `ShadowsocksOutboundOptions` keys the old builder dropped).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "ss"));
+        };
+        if !core_mapping::singbox_supports_ss_method(self.method.as_str()) {
+            return Err(SupportError::Config(format!(
+                "Shadowsocks cipher '{}' is not supported by sing-box; \
+                 supported: modern AEAD/2022-blake3 + legacy cfb/ctr/rc4-md5 \
+                 methods",
+                self.method.as_str()
+            )));
+        }
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "shadowsocks",
+            "server": ep.host,
+            "server_port": ep.port,
+            "method": self.method,
+            "password": self.password,
+        });
+        if let Some(plugin) = &self.plugin {
+            out["plugin"] = json!(plugin);
+        }
+        if let Some(opts) = &self.plugin_opts {
+            let joined: Vec<String> = opts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            out["plugin_opts"] = json!(joined.join(";"));
+        }
+        *core_conf = out;
         Ok(())
     }
 }
@@ -807,20 +850,73 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
         let cfg = ss_aead();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+            InjectOptions::default(),
+        )
+        .expect("ss sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "shadowsocks");
+        assert_eq!(conf["server"], "1.2.3.4");
+        assert_eq!(conf["server_port"], 8080);
+        assert_eq!(conf["method"], "aes-256-gcm");
+        assert_eq!(conf["password"], "password");
+    }
+
+    #[test]
+    fn singbox_inject_legacy_cipher_builds_ok() {
+        // aes-256-cfb is legacy — sing-box builds it, xray-core cannot.
+        let cfg = config(parse("ss://YWVzLTI1Ni1jZmI6cGFzcw@1.2.3.4:8388"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 8388)),
+            InjectOptions::default(),
+        )
+        .expect("legacy cipher must build on sing-box");
+        assert_eq!(conf["type"], "shadowsocks");
+        assert_eq!(conf["method"], "aes-256-cfb");
+    }
+
+    #[test]
+    fn singbox_inject_unknown_cipher_is_rejected() {
+        // salsa20 is supported by neither core — refuse at build time.
+        let cfg = SsConfig {
+            method: "salsa20".into(),
+            password: "password".into(),
+            security: super::super::common::SecurityConfig::default(),
+            remarks: None,
+            plugin: None,
+            plugin_opts: None,
+        };
         let mut conf = serde_json::json!({});
         let err = cfg
             .inject_to(
                 &mut conf,
                 CoreType::SingBox,
-                Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+                Some(&EndpointEssentials::new("1.2.3.4", 8388)),
                 InjectOptions::default(),
             )
-            .expect_err("sing-box shape lands in T15");
-        assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "ss"
-        ));
+            .expect_err("unknown cipher must be rejected");
+        assert!(
+            err.to_string().contains("salsa20"),
+            "error must name the cipher: {err}"
+        );
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
+        let cfg = ss_aead();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan ss must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "ss")));
     }
 }

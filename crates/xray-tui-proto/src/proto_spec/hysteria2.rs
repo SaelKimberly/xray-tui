@@ -58,7 +58,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
-    should_skip_endpoint_param, to_xray_stream_settings,
+    should_skip_endpoint_param, to_singbox_tls_or_default, to_xray_stream_settings,
 };
 use super::core_mapping;
 use super::utils;
@@ -465,7 +465,7 @@ impl InjectToCoreConf for Hysteria2Config {
     ) -> Result<(), SupportError> {
         match core_type {
             CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
-            other => Err(SupportError::UnsupportedProtocol("hy2".into(), other)),
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
         }
     }
 }
@@ -499,6 +499,58 @@ impl Hysteria2Config {
         if let Some(ss) = stream {
             core_conf["streamSettings"] = ss;
         }
+        Ok(())
+    }
+
+    /// sing-box outbound for this config, ported from the old builder's
+    /// `Protocol::Hysteria2` arm against the vendored sing-box
+    /// `Hysteria2OutboundOptions`: `password` (typed `auth`), `up_mbps`/
+    /// `down_mbps` (numeric prefix of the typed `up`/`down` strings, default
+    /// 100 — always emitted like the old builder), `obfs` object
+    /// (`{type, password}`) when the typed obfs is set (sing-box key the old
+    /// builder dropped), and the mandatory TLS block. `hop_interval`/
+    /// `server_ports` are dropped (typed hop_interval is a raw int with
+    /// ambiguous Duration semantics; the old builder dropped it too).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "hy2"));
+        };
+        let mbps = |v: &Option<TinyText>, default: i64| -> i64 {
+            v.as_ref()
+                .and_then(|s| {
+                    s.as_str()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse::<i64>()
+                        .ok()
+                })
+                .unwrap_or(default)
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "hysteria2",
+            "server": ep.host,
+            "server_port": ep.port,
+            "password": self.auth,
+            "up_mbps": mbps(&self.up, 100),
+            "down_mbps": mbps(&self.down, 100),
+        });
+        if let Some(obfs) = &self.obfs {
+            let mut obfs_json = serde_json::Map::new();
+            obfs_json.insert("type".into(), json!(obfs));
+            if let Some(pw) = &self.obfs_password {
+                obfs_json.insert("password".into(), json!(pw));
+            }
+            out["obfs"] = json!(obfs_json);
+        }
+        out["tls"] = to_singbox_tls_or_default(&self.security, ep, opts.skip_cert_verify);
+        *core_conf = out;
         Ok(())
     }
 }
@@ -810,20 +862,58 @@ mod tests {
     }
 
     #[test]
-    fn xray_inject_singbox_errors_until_t15() {
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = hy2_tls();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("2a01:4f9:4b:f378::1", 13599)),
+            InjectOptions::default(),
+        )
+        .expect("hy2 sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "hysteria2");
+        assert_eq!(conf["server"], "2a01:4f9:4b:f378::1");
+        assert_eq!(conf["server_port"], 13599);
+        assert_eq!(conf["password"], "linux.do");
+        assert_eq!(conf["up_mbps"], 100, "no up -> default 100");
+        assert_eq!(conf["down_mbps"], 100, "no down -> default 100");
+        assert!(conf.get("obfs").is_none(), "no obfs -> key omitted");
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "www.bing.com");
+        assert_eq!(conf["tls"]["insecure"], true, "config insecure=1");
+    }
+
+    #[test]
+    fn singbox_inject_obfs_up_down_and_skip_cert_verify() {
+        let cfg = config(parse(
+            "hysteria2://b4bd0613-ff7c-4f2f-954d-185915e6ddad@206.71.158.41:35000?security=tls&obfs=salamander&obfs-password=password123&up=50mbps&down=100mbps",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("206.71.158.41", 35000)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("hy2 sing-box inject");
+        assert_eq!(conf["up_mbps"], 50, "numeric prefix of '50mbps'");
+        assert_eq!(conf["down_mbps"], 100, "numeric prefix of '100mbps'");
+        assert_eq!(conf["obfs"]["type"], "salamander");
+        assert_eq!(conf["obfs"]["password"], "password123");
+        assert_eq!(conf["tls"]["insecure"], true, "skip_cert_verify forces it");
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = hy2_tls();
         let mut conf = serde_json::json!({});
         let err = cfg
-            .inject_to(
-                &mut conf,
-                CoreType::SingBox,
-                Some(&EndpointEssentials::new("2a01:4f9:4b:f378::1", 13599)),
-                InjectOptions::default(),
-            )
-            .expect_err("sing-box shape lands in T15");
-        assert!(matches!(
-            &err,
-            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "hy2"
-        ));
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan hy2 must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "hy2")));
     }
 }

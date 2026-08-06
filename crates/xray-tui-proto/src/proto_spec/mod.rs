@@ -1336,7 +1336,8 @@ mod tests {
                 "hy2",
             ),
             (
-                config_from_url("ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080"),
+                // AEAD cipher so the xray arm's build-time validation passes.
+                config_from_url("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388"),
                 "ss",
             ),
             (
@@ -1388,10 +1389,9 @@ mod tests {
         ]
     }
 
-    /// Core whose dispatch arm still reports `UnsupportedProtocol` for a
-    /// variant: Xray-native protocols (real `inject_to` landed in T14 for
-    /// Xray) still error for sing-box until T15; sing-box-only protocols
-    /// error for Xray permanently.
+    /// Core whose dispatch arm reports `UnsupportedProtocol` for a variant:
+    /// the sing-box-only protocols (real sing-box `inject_to` landed in T15)
+    /// have no Xray shape and error for Xray permanently.
     fn reject_core_for(config: &ProtocolConfig) -> CoreType {
         match config {
             ProtocolConfig::Vless(_)
@@ -1406,10 +1406,25 @@ mod tests {
         }
     }
 
+    /// Cores that can build an outbound for the variant (T14 xray + T15
+    /// sing-box for the shared set; sing-box only for the sing-box-native set).
+    fn supported_core(config: &ProtocolConfig) -> CoreType {
+        match config {
+            ProtocolConfig::Vless(_)
+            | ProtocolConfig::Vmess(_)
+            | ProtocolConfig::Trojan(_)
+            | ProtocolConfig::Hysteria2(_)
+            | ProtocolConfig::Ss(_)
+            | ProtocolConfig::Wireguard(_)
+            | ProtocolConfig::Socks(_)
+            | ProtocolConfig::Http(_) => CoreType::Xray,
+            _ => CoreType::SingBox,
+        }
+    }
+
     #[test]
     fn dispatch_routes_to_variant() {
-        // vless: the Xray arm now lands (T14); the sing-box arm still reports
-        // the dispatch kind until T15.
+        // vless: both the Xray (T14) and sing-box (T15) arms land.
         let vless = ProtocolConfig::Vless(vless_config());
         let endpoint = EndpointEssentials::new("1.2.3.4", 443);
         vless
@@ -1420,24 +1435,20 @@ mod tests {
                 InjectOptions::default(),
             )
             .expect("xray inject must succeed in T14");
-        match vless.inject_to(
-            &mut json!({}),
-            CoreType::SingBox,
-            Some(&endpoint),
-            InjectOptions::default(),
-        ) {
-            Err(SupportError::UnsupportedProtocol(kind, core)) => {
-                assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
-                assert_eq!(core, CoreType::SingBox, "error reports the requested core");
-            }
-            other => panic!("expected UnsupportedProtocol, got {other:?}"),
-        }
+        vless
+            .inject_to(
+                &mut json!({}),
+                CoreType::SingBox,
+                Some(&endpoint),
+                InjectOptions::default(),
+            )
+            .expect("sing-box inject must succeed in T15");
 
+        // tuic: real sing-box shape since T15; an orphan (no endpoint) is
+        // rejected with the missing-server error, not UnsupportedProtocol.
         let tuic = config_from_url(
             "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
         );
-        // tuic has a real sing-box shape since T15; an orphan (no endpoint)
-        // is rejected with the missing-server error, not UnsupportedProtocol.
         let err = tuic
             .inject_to(
                 &mut json!({}),
@@ -1450,34 +1461,6 @@ mod tests {
             matches!(err, SupportError::MissingField("server", "tuic")),
             "expected MissingField(server), got {err:?}"
         );
-    }
-
-    #[test]
-    fn xray_implemented_singbox_still_stubbed() {
-        // vless inject_to landed for Xray in T14; the sing-box shape lands in
-        // T15.
-        let vless = ProtocolConfig::Vless(vless_config());
-        let endpoint = EndpointEssentials::new("1.2.3.4", 443);
-        vless
-            .inject_to(
-                &mut json!({}),
-                CoreType::Xray,
-                Some(&endpoint),
-                InjectOptions::default(),
-            )
-            .expect("xray inject must succeed in T14");
-        match vless.inject_to(
-            &mut json!({}),
-            CoreType::SingBox,
-            Some(&endpoint),
-            InjectOptions::default(),
-        ) {
-            Err(SupportError::UnsupportedProtocol(kind, got)) => {
-                assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
-                assert_eq!(got, CoreType::SingBox, "error reports the requested core");
-            }
-            other => panic!("expected UnsupportedProtocol for sing-box, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1509,31 +1492,57 @@ mod tests {
     fn all_variants_route_to_their_kind_string() {
         let variants = all_variants_with_kinds();
         assert_eq!(variants.len(), 20, "all 20 dispatch arms must be covered");
+        let endpoint = EndpointEssentials::new("1.2.3.4", 443);
+        // Since T15 every non-placeholder variant has a real sing-box shape:
+        // with an endpoint, dispatch must succeed for all 17 (tor/tailscale
+        // ignore the endpoint). The redirect/tproxy/mixed placeholders emit
+        // their raw settings_json in T15 Step 3 (still UnsupportedProtocol
+        // until then).
+        for (config, expected) in &variants {
+            if matches!(expected.as_ref(), "redirect" | "tproxy" | "mixed") {
+                continue;
+            }
+            let core = supported_core(config);
+            config
+                .inject_to(
+                    &mut json!({}),
+                    core,
+                    Some(&endpoint),
+                    InjectOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("{expected:?} must build via {core:?}, got {e:?}"));
+        }
+        // The sing-box-only variants still report their kind string via the
+        // Xray arm (no Xray shape, permanently).
         let mut kinds = Vec::new();
         for (config, expected) in &variants {
-            // Xray-native variants route via their sing-box arm (still
-            // stubbed until T15); sing-box-only variants via their Xray arm.
-            let core = reject_core_for(config);
-            match config.inject_to(&mut json!({}), core, None, InjectOptions::default()) {
-                Err(SupportError::UnsupportedProtocol(kind, _)) => {
-                    assert_eq!(
-                        kind.as_str(),
-                        *expected,
-                        "dispatch arm for {config:?} must report kind {expected:?}"
-                    );
-                    kinds.push(kind);
+            if supported_core(config) == CoreType::SingBox {
+                match config.inject_to(
+                    &mut json!({}),
+                    CoreType::Xray,
+                    Some(&endpoint),
+                    InjectOptions::default(),
+                ) {
+                    Err(SupportError::UnsupportedProtocol(kind, _)) => {
+                        assert_eq!(
+                            kind.as_str(),
+                            *expected,
+                            "dispatch arm for {config:?} must report kind {expected:?}"
+                        );
+                        kinds.push(kind);
+                    }
+                    other => panic!(
+                        "expected UnsupportedProtocol for {config:?} via Xray, got {other:?}"
+                    ),
                 }
-                other => panic!(
-                    "expected UnsupportedProtocol for {config:?} via {core:?}, got {other:?}"
-                ),
             }
         }
         kinds.sort_unstable();
         kinds.dedup();
         assert_eq!(
             kinds.len(),
-            20,
-            "every variant must report a distinct kind string"
+            12,
+            "the 12 sing-box-only variants must report distinct kind strings"
         );
     }
 }
