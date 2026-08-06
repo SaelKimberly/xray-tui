@@ -15,12 +15,13 @@ use serde_json::Value;
 
 use super::{
     AnyTlsConfig, CoreType, EndpointEssentials, HttpClientConfig, Hysteria1Config, Hysteria2Config,
-    InjectToCoreConf, NaiveConfig, PlaceholderConfig, ShadowTlsConfig, Socks5Config, SsConfig,
-    SshConfig, SsrConfig, SupportError, TailscaleConfig, TorConfig, TrojanConfig, TuicConfig,
-    VlessConfig, VmessConfig, WireguardConfig,
+    InjectOptions, InjectToCoreConf, NaiveConfig, PlaceholderConfig, ShadowTlsConfig, Socks5Config,
+    SsConfig, SshConfig, SsrConfig, SupportError, TailscaleConfig, TorConfig, TrojanConfig,
+    TuicConfig, VlessConfig, VmessConfig, WireguardConfig,
 };
 
 /// Stub `inject_to` for one config: always `UnsupportedProtocol(kind, core)`.
+/// `opts` is ignored by the stubs (signature-only until T14/15 real impls).
 macro_rules! stub_inject {
     ($config:ty, $kind:literal) => {
         impl InjectToCoreConf for $config {
@@ -29,6 +30,7 @@ macro_rules! stub_inject {
                 _core_conf: &mut Value,
                 core_type: CoreType,
                 _endpoint: Option<&EndpointEssentials>,
+                _opts: InjectOptions,
             ) -> Result<(), SupportError> {
                 Err(SupportError::UnsupportedProtocol($kind.into(), core_type))
             }
@@ -60,6 +62,7 @@ impl InjectToCoreConf for PlaceholderConfig {
         _core_conf: &mut Value,
         core_type: CoreType,
         _endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
     ) -> Result<(), SupportError> {
         // Redirect / TProxy / Mixed share this one type; the variant is carried
         // in `proto_name` ("redirect" / "tproxy" / "mixed" as written by

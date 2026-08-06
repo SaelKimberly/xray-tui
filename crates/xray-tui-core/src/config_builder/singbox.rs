@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use xray_tui_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
-use xray_tui_proto::proto_spec::{CoreType, InjectToCoreConf};
+use xray_tui_proto::proto_spec::{CoreType, InjectOptions, InjectToCoreConf};
 
 use super::{
     BuildError, BuildParams, MultiInboundItem, build_hosts_map, endpoint_essentials,
@@ -218,6 +218,9 @@ fn build_proxy_outbound(
         &mut out,
         core_type,
         Some(&endpoint_essentials(endpoint)),
+        InjectOptions {
+            skip_cert_verify: params.skip_cert_verify,
+        },
     )?;
     out["tag"] = json!("proxy");
     // Inject multiplex block if configured

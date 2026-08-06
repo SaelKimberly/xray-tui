@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use xray_tui_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
-use xray_tui_proto::proto_spec::{CoreType, InjectToCoreConf};
+use xray_tui_proto::proto_spec::{CoreType, InjectOptions, InjectToCoreConf};
 
 use super::{
     BuildError, BuildParams, MultiInboundItem, build_hosts_map, endpoint_essentials,
@@ -109,7 +109,7 @@ impl XrayConfigBuilder {
     ) -> Result<XrayConfig, BuildError> {
         let mut config = skeleton(params, routing, dns);
         config.outbounds = vec![
-            build_proxy_outbound(endpoint, protocol, core_type)?,
+            build_proxy_outbound(endpoint, protocol, core_type, params.skip_cert_verify)?,
             build_dns_outbound(),
             build_direct_outbound(),
             build_block_outbound(),
@@ -149,8 +149,12 @@ impl XrayConfigBuilder {
                 tag: inbound_tag.clone(),
             });
 
-            let mut outbound =
-                build_proxy_outbound(item.endpoint, item.protocol, item.link.core_type)?;
+            let mut outbound = build_proxy_outbound(
+                item.endpoint,
+                item.protocol,
+                item.link.core_type,
+                base_params.skip_cert_verify,
+            )?;
             outbound.tag = tag.clone();
             proxy_outbounds.push(outbound);
 
@@ -276,17 +280,20 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
 /// The proxy outbound: `protocol.config.inject_to(...)` writes the
 /// protocol-specific block (settings + streamSettings) into `conf`, which is
 /// then deserialized into [`Outbound`]. The tag is owned by the builder
-/// ("proxy" single / "proxy-{i}" multi).
+/// ("proxy" single / "proxy-{i}" multi). `skip_cert_verify` is forwarded as a
+/// build-time override so TLS `insecure` reflects the user setting.
 fn build_proxy_outbound(
     endpoint: &Endpoint,
     protocol: &Protocol,
     core_type: CoreType,
+    skip_cert_verify: bool,
 ) -> Result<Outbound, BuildError> {
     let mut conf = json!({});
     protocol_config(protocol)?.inject_to(
         &mut conf,
         core_type,
         Some(&endpoint_essentials(endpoint)),
+        InjectOptions { skip_cert_verify },
     )?;
     let mut outbound: Outbound = serde_json::from_value(conf)?;
     outbound.tag = "proxy".to_string();

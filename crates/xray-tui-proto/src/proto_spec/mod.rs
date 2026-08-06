@@ -617,11 +617,23 @@ pub trait ProtoSpec: ProtoIdentity {
     }
 }
 
+/// Build-time overrides applied by config builders at inject time.
+///
+/// Carries user-facing settings that are not part of the protocol config
+/// itself but must be honored when the outbound block is materialized (e.g.
+/// the TUI's "skip cert verify" toggle → `tls.insecure`). Tasks 14/15 impls
+/// MUST honor [`InjectOptions::skip_cert_verify`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InjectOptions {
+    pub skip_cert_verify: bool,
+}
+
 /// A protocol config injects its outbound block + stream settings into a core
 /// JSON config. `endpoint` supplies host/port for transport/sni fields left
 /// unset by the host-free parse mandate (Task 4/5) — impls apply
 /// transport.with_host(endpoint.host) / sni defaults at build time, NEVER at
-/// parse time.
+/// parse time. `opts` carries build-time overrides (see [`InjectOptions`])
+/// applied at inject time.
 ///
 /// Standalone by design: deliberately NOT a supertrait of [`ProtoSpec`] (no
 /// coupling). Task 6 adds the trait plus the [`ProtocolConfig`] dispatch; the
@@ -637,6 +649,7 @@ pub trait InjectToCoreConf {
         core_conf: &mut serde_json::Value,
         core_type: CoreType,
         endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
     ) -> Result<(), SupportError>;
 }
 
@@ -757,10 +770,12 @@ impl InjectToCoreConf for ProtocolConfig {
         core_conf: &mut serde_json::Value,
         core_type: CoreType,
         endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
     ) -> Result<(), SupportError> {
         // Reuses the existing `dispatch!` macro — it already forwards extra
-        // arguments (`core_conf`, `core_type`, `endpoint`) to each variant.
-        dispatch!(self, inject_to, core_conf, core_type, endpoint)
+        // arguments (`core_conf`, `core_type`, `endpoint`, `opts`) to each
+        // variant.
+        dispatch!(self, inject_to, core_conf, core_type, endpoint, opts)
     }
 }
 
@@ -1376,7 +1391,12 @@ mod tests {
     #[test]
     fn dispatch_routes_to_variant() {
         let vless = ProtocolConfig::Vless(vless_config());
-        match vless.inject_to(&mut json!({}), CoreType::Xray, None) {
+        match vless.inject_to(
+            &mut json!({}),
+            CoreType::Xray,
+            None,
+            InjectOptions::default(),
+        ) {
             Err(SupportError::UnsupportedProtocol(kind, core)) => {
                 assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
                 assert_eq!(core, CoreType::Xray, "error reports the requested core");
@@ -1387,7 +1407,12 @@ mod tests {
         let tuic = config_from_url(
             "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
         );
-        match tuic.inject_to(&mut json!({}), CoreType::SingBox, None) {
+        match tuic.inject_to(
+            &mut json!({}),
+            CoreType::SingBox,
+            None,
+            InjectOptions::default(),
+        ) {
             Err(SupportError::UnsupportedProtocol(kind, core)) => {
                 assert!(kind.contains("tuic"), "kind {kind:?} must mention tuic");
                 assert_eq!(core, CoreType::SingBox, "error reports the requested core");
@@ -1401,7 +1426,7 @@ mod tests {
         // NOTE: replaced in T14/T15 when real per-config `inject_to` impls land.
         let vless = ProtocolConfig::Vless(vless_config());
         for core in [CoreType::Xray, CoreType::SingBox] {
-            match vless.inject_to(&mut json!({}), core, None) {
+            match vless.inject_to(&mut json!({}), core, None, InjectOptions::default()) {
                 Err(SupportError::UnsupportedProtocol(kind, got)) => {
                     assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
                     assert_eq!(got, core, "error reports the requested core");
@@ -1416,7 +1441,12 @@ mod tests {
         let vless = ProtocolConfig::Vless(vless_config());
         let endpoint = EndpointEssentials::new("1.2.3.4", 443);
         for endpoint in [None, Some(&endpoint)] {
-            match vless.inject_to(&mut json!({}), CoreType::Xray, endpoint) {
+            match vless.inject_to(
+                &mut json!({}),
+                CoreType::Xray,
+                endpoint,
+                InjectOptions::default(),
+            ) {
                 Err(SupportError::UnsupportedProtocol(..)) => {}
                 other => panic!("expected UnsupportedProtocol, got {other:?}"),
             }
@@ -1429,7 +1459,12 @@ mod tests {
         assert_eq!(variants.len(), 20, "all 20 dispatch arms must be covered");
         let mut kinds = Vec::new();
         for (config, expected) in &variants {
-            match config.inject_to(&mut json!({}), CoreType::Xray, None) {
+            match config.inject_to(
+                &mut json!({}),
+                CoreType::Xray,
+                None,
+                InjectOptions::default(),
+            ) {
                 Err(SupportError::UnsupportedProtocol(kind, _)) => {
                     assert_eq!(
                         kind.as_str(),
