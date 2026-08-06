@@ -575,7 +575,10 @@ mod tests {
 
     #[test]
     fn xray_hysteria2_full_config() {
-        // Restores the old xray_hysteria2_config test on the typed config.
+        // Restores the old xray_hysteria2_config test on the typed config,
+        // pinned to the vendored xray-core shape: protocol "hysteria"
+        // (unified outbound, version 2 = hysteria2), auth in
+        // streamSettings.hysteriaSettings, TLS in security/tlsSettings.
         let endpoint = super::super::tests::endpoint("example.com", 443);
         let protocol = super::super::tests::protocol(
             ProtocolKind::Hysteria2,
@@ -594,17 +597,27 @@ mod tests {
             .iter()
             .find(|o| o["tag"] == "proxy")
             .expect("proxy outbound");
-        assert_eq!(proxy["protocol"], "hysteria2");
-        assert_eq!(proxy["settings"]["auth"], "hy2-secret");
+        assert_eq!(proxy["protocol"], "hysteria");
         assert_eq!(proxy["settings"]["version"], 2);
+        assert_eq!(proxy["settings"]["address"], "example.com");
+        assert!(
+            proxy["settings"].get("auth").is_none(),
+            "no auth in settings"
+        );
+        // auth lives in the hysteria transport settings.
+        assert_eq!(proxy["streamSettings"]["network"], "hysteria");
+        assert_eq!(
+            proxy["streamSettings"]["hysteriaSettings"]["auth"],
+            "hy2-secret"
+        );
         // TLS placement (Task 16): xray-core hysteria settings carry no TLS
         // (HysteriaClientConfig = {version, address, port}); TLS belongs in
-        // streamSettings only.
+        // streamSettings only — absent here because the typed security is
+        // empty.
         assert!(proxy["settings"].get("tls").is_none(), "no TLS in settings");
         assert!(
-            proxy["stream_settings"].is_null(),
-            "no streamSettings without TLS/transport: {}",
-            proxy["stream_settings"]
+            proxy["streamSettings"].get("security").is_none(),
+            "no TLS security without typed security"
         );
     }
 

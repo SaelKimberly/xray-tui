@@ -471,17 +471,19 @@ impl InjectToCoreConf for Hysteria2Config {
 }
 
 impl Hysteria2Config {
-    /// xray-core outbound for this config, ported field-by-field from the old
-    /// xray builder's `Protocol::Hysteria2` arm (`version`/`address`/`port`/
-    /// `auth`). The typed config carries no transport — only the TLS block
-    /// can appear in streamSettings (QUIC network is implied).
+    /// xray-core outbound for this config.
     ///
-    /// TLS placement (Task 16 ruling): xray-core's hysteria outbound settings
-    /// schema (`infra/conf/hysteria.go` `HysteriaClientConfig`) is
-    /// `{version, address, port}` — no TLS keys; TLS is uniformly a
-    /// streamSettings concern (`security` + `tlsSettings` via
-    /// `StreamConfig.Build`). streamSettings is therefore correct; `settings`
-    /// must never carry TLS.
+    /// Vendored xray-core (v26.7.28) registers the UNIFIED `"hysteria"`
+    /// outbound (`infra/conf/xray.go` → `HysteriaClientConfig`) — there is no
+    /// "hysteria2" protocol name; "hysteria" with version 2 IS hysteria2.
+    /// `settings` is exactly `{version, address, port}` (hysteria.go); `auth`
+    /// is silently dropped there and must live in
+    /// `streamSettings.hysteriaSettings.auth` (transport_method.go
+    /// `HysteriaConfig`; emitted as transport ProtocolName "hysteria" by
+    /// transport_internet.go — `proxy/hysteria/client.go` hard-errors "not
+    /// hysteria transport" without it). TLS stays in streamSettings
+    /// security/tlsSettings (the Task 16 TLS ruling; the settings block has
+    /// no TLS keys).
     fn inject_xray(
         &self,
         core_conf: &mut Value,
@@ -492,20 +494,26 @@ impl Hysteria2Config {
             return Err(SupportError::MissingField("server", "hy2"));
         };
         let security = security_force_insecure(&self.security, opts.skip_cert_verify);
-        let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
         *core_conf = json!({
             "tag": "proxy",
-            "protocol": "hysteria2",
+            "protocol": "hysteria",
             "settings": {
                 "version": 2,
                 "address": ep.host,
-                "port": ep.port,
-                "auth": self.auth
+                "port": ep.port
             },
         });
-        if let Some(ss) = stream {
-            core_conf["streamSettings"] = ss;
-        }
+        // TLS block (security/tlsSettings) from the typed security, merged
+        // with the mandatory hysteria transport (network + hysteriaSettings).
+        let mut ss = to_xray_stream_settings(&security, &TransportConfig::Tcp)
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        ss.insert("network".into(), json!("hysteria"));
+        ss.insert(
+            "hysteriaSettings".into(),
+            json!({ "version": 2, "auth": self.auth }),
+        );
+        core_conf["streamSettings"] = Value::Object(ss);
         Ok(())
     }
 
@@ -825,17 +833,27 @@ mod tests {
         )
         .expect("hy2 inject");
         assert_eq!(conf["tag"], "proxy");
-        assert_eq!(conf["protocol"], "hysteria2");
+        assert_eq!(conf["protocol"], "hysteria");
         assert_eq!(conf["settings"]["version"], 2);
         assert_eq!(conf["settings"]["address"], "2a01:4f9:4b:f378::1");
         assert_eq!(conf["settings"]["port"], 13599);
-        assert_eq!(conf["settings"]["auth"], "linux.do");
-        // TLS placement (Task 16 verification): xray-core's hysteria
-        // ClientConfig settings block has no TLS keys (`version`/`address`/
-        // `port` only — infra/conf/hysteria.go); TLS is uniformly a
-        // streamSettings concern (`security` + `tlsSettings`, per
-        // infra/conf/transport_internet.go StreamConfig.Build). So the TLS
-        // block must live in streamSettings and never in settings.
+        // settings is exactly {version, address, port} — auth silently drops
+        // there and must live in streamSettings.hysteriaSettings.auth
+        // (vendored HysteriaClientConfig + HysteriaConfig).
+        assert!(
+            conf["settings"].get("auth").is_none(),
+            "auth must not leak into settings: {}",
+            conf["settings"]
+        );
+        // TLS placement (Task 16 verification): TLS is uniformly a
+        // streamSettings concern (security + tlsSettings per StreamConfig.
+        // Build); the hysteria transport carries auth.
+        assert_eq!(conf["streamSettings"]["network"], "hysteria");
+        assert_eq!(conf["streamSettings"]["hysteriaSettings"]["version"], 2);
+        assert_eq!(
+            conf["streamSettings"]["hysteriaSettings"]["auth"],
+            "linux.do"
+        );
         assert_eq!(conf["streamSettings"]["security"], "tls");
         assert_eq!(
             conf["streamSettings"]["tlsSettings"]["serverName"],
