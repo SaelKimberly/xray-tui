@@ -897,6 +897,105 @@ pub(crate) fn validate_xray_reality(security: &SecurityConfig) -> Result<(), Sup
     Ok(())
 }
 
+/// Build the sing-box `tls` block shared by every TLS-capable outbound,
+/// ported field-by-field from the old sing-box builder's `build_tls` onto the
+/// typed configs. Returns `None` when the config carries no TLS at all (e.g.
+/// `security=none` vless/vmess/trojan, empty shadowtls) — the caller then
+/// emits no `tls` key, exactly like the old builder.
+///
+/// Shape: `{ "enabled": true, "server_name", "insecure"?, "alpn"?,
+/// "utls"?, "reality"? }` (sing-box `OutboundTLSOptions`).
+///
+/// - `server_name` = explicit config sni, falling back to the endpoint host
+///   at BUILD time — never stored in the config (host-free parse mandate).
+/// - `skip_cert_verify` forces `insecure: true` (old builder:
+///   `params.skip_cert_verify || p_settings.insecure`).
+/// - `alpn` is the comma-separated list string → array.
+/// - `utls` from the config fingerprint.
+/// - reality emits `public_key`/`short_id` only when present; the block is
+///   dropped when it would carry nothing beyond `enabled`. `spider_x` is
+///   deliberately NOT emitted — sing-box's `OutboundRealityOptions` has no
+///   such field (xray-only; it must never leak into `short_id`).
+#[must_use]
+pub(crate) fn to_singbox_tls(
+    security: &SecurityConfig,
+    endpoint: &EndpointEssentials,
+    skip_cert_verify: bool,
+) -> Option<serde_json::Value> {
+    let tls = security.tls.as_ref()?;
+    let mut tls_json = serde_json::Map::new();
+    tls_json.insert("enabled".into(), serde_json::json!(true));
+
+    let sni = security.sni().filter(|s| !s.is_empty());
+    tls_json.insert(
+        "server_name".into(),
+        serde_json::json!(sni.unwrap_or(endpoint.host.as_str())),
+    );
+
+    let insecure = skip_cert_verify || security.insecure() == Some(true);
+    if insecure {
+        tls_json.insert("insecure".into(), serde_json::json!(true));
+    }
+
+    if let Some(alpn) = security.alpn().filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = alpn
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            tls_json.insert("alpn".into(), serde_json::json!(parts));
+        }
+    }
+
+    if let Some(fp) = security.fp().filter(|s| !s.is_empty()) {
+        tls_json.insert(
+            "utls".into(),
+            serde_json::json!({ "enabled": true, "fingerprint": fp }),
+        );
+    }
+
+    if let TlsConfig::Reality(reality) = tls {
+        let mut r = serde_json::Map::new();
+        r.insert("enabled".into(), serde_json::json!(true));
+        if let Some(pbk) = reality.pbk.as_deref().filter(|s| !s.is_empty()) {
+            r.insert("public_key".into(), serde_json::json!(pbk));
+        }
+        if let Some(sid) = reality.sid.as_deref().filter(|s| !s.is_empty()) {
+            r.insert("short_id".into(), serde_json::json!(sid));
+        }
+        // Only add the reality block if it has meaningful content beyond
+        // "enabled" (old builder: `if reality.len() > 1`).
+        if r.len() > 1 {
+            tls_json.insert("reality".into(), serde_json::json!(r));
+        }
+    }
+
+    Some(serde_json::Value::Object(tls_json))
+}
+
+/// Like [`to_singbox_tls`] but always returns a block: for protocols where
+/// TLS is mandatory (tuic/hysteria1/hysteria2/naive/anytls) the old builder
+/// unconditionally emitted `tls.enabled`, so an empty typed security still
+/// yields `{ enabled: true, server_name: <sni or endpoint host> }` (plus any
+/// insecure/alpn/utls the config does carry).
+#[must_use]
+pub(crate) fn to_singbox_tls_or_default(
+    security: &SecurityConfig,
+    endpoint: &EndpointEssentials,
+    skip_cert_verify: bool,
+) -> serde_json::Value {
+    to_singbox_tls(security, endpoint, skip_cert_verify).unwrap_or_else(|| {
+        serde_json::json!({
+            "enabled": true,
+            "server_name": security
+                .sni()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(endpoint.host.as_str()),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

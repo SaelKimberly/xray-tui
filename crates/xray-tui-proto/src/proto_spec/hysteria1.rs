@@ -37,16 +37,19 @@
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::common::{
+    SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls_or_default,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashHysteria1, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
@@ -421,6 +424,57 @@ impl ProtoIdentity for Hysteria1Config {
     }
 }
 
+impl InjectToCoreConf for Hysteria1Config {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("hy".into(), other)),
+        }
+    }
+}
+
+impl Hysteria1Config {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Hysteria` arm (`up_mbps`/`down_mbps` defaulting to
+    /// 100, `auth_str`/`obfs` when non-empty, mandatory TLS block). The typed
+    /// `protocol` field has no sing-box outbound key (the old builder dropped
+    /// it too) and is left out.
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "hy"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "hysteria",
+            "server": ep.host,
+            "server_port": ep.port,
+            "up_mbps": self.up_mbps.unwrap_or(100),
+            "down_mbps": self.down_mbps.unwrap_or(100),
+        });
+        if let Some(auth) = self.auth.as_deref().filter(|s| !s.is_empty()) {
+            out["auth_str"] = json!(auth);
+        }
+        if let Some(obfs) = &self.obfs {
+            out["obfs"] = json!(obfs);
+        }
+        // Hysteria v1 always uses TLS.
+        out["tls"] = to_singbox_tls_or_default(&self.security, ep, opts.skip_cert_verify);
+        *core_conf = out;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -644,5 +698,65 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse(
+            "hysteria://example.com:443?protocol=udp&obfs=xplus&up_mbps=200&down_mbps=200&insecure=1&sni=real.example.com",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("hysteria sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "hysteria");
+        assert_eq!(conf["server"], "example.com");
+        assert_eq!(conf["server_port"], 443);
+        assert_eq!(conf["up_mbps"], 200);
+        assert_eq!(conf["down_mbps"], 200);
+        assert_eq!(conf["obfs"], "xplus");
+        // TLS is mandatory for hysteria v1; config insecure=1 -> insecure.
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "real.example.com");
+        assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_defaults_and_endpoint_host_sni() {
+        // No auth/obfs/up/down — defaults (100) and endpoint-host server_name.
+        let cfg = config(parse("hysteria://example.com:443"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("hysteria sing-box inject");
+        assert_eq!(conf["up_mbps"], 100);
+        assert_eq!(conf["down_mbps"], 100);
+        assert!(conf.get("auth_str").is_none());
+        assert!(conf.get("obfs").is_none());
+        assert_eq!(conf["tls"]["server_name"], "example.com");
+        assert!(conf["tls"].get("insecure").is_none());
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse("hysteria://example.com:443"));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan hysteria must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "hy")));
     }
 }

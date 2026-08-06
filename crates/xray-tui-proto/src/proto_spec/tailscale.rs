@@ -30,9 +30,12 @@ use crate::proto_spec::common::clash_to_endpoint;
 use crate::proto_spec::core_mapping;
 use crate::proto_spec::utils;
 use crate::proto_spec::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoIdentity, ProtoSpec,
-    ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    SupportError,
 };
+use serde_json::{Value, json};
+
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 /// Tailscale protocol configuration — the identity payload (sans host/port).
@@ -221,10 +224,60 @@ impl ProtoIdentity for TailscaleConfig {
     }
 }
 
+impl InjectToCoreConf for TailscaleConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        _endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            // Tailscale is a self-contained endpoint outbound (no server
+            // field) — the old builder emitted `{ "type": "tailscale" }`
+            // endpoint-less.
+            CoreType::SingBox => {
+                let mut out = json!({ "tag": "proxy", "type": "tailscale" });
+                if let Some(v) = &self.hostname {
+                    out["hostname"] = json!(v);
+                }
+                if let Some(v) = &self.auth_key {
+                    out["auth_key"] = json!(v);
+                }
+                if let Some(v) = &self.control_url {
+                    out["control_url"] = json!(v);
+                }
+                if let Some(v) = &self.state_directory {
+                    out["state_directory"] = json!(v);
+                }
+                if self.ephemeral == Some(true) {
+                    out["ephemeral"] = json!(true);
+                }
+                if self.accept_routes == Some(true) {
+                    out["accept_routes"] = json!(true);
+                }
+                if let Some(v) = &self.exit_node {
+                    out["exit_node"] = json!(v);
+                }
+                if self.exit_node_allow_lan_access == Some(true) {
+                    out["exit_node_allow_lan_access"] = json!(true);
+                }
+                if let Some(v) = &self.advertise_routes {
+                    out["advertise_routes"] = json!(v);
+                }
+                *core_conf = out;
+                Ok(())
+            }
+            other => Err(SupportError::UnsupportedProtocol("tailscale".into(), other)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{ConfigKind, CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::TailscaleConfig;
+    use crate::proto_spec::common::SecurityConfig;
     use crate::urlx::{RawUrlX, SchemeX};
 
     #[test]
@@ -306,5 +359,94 @@ mod tests {
         assert_eq!(bridged.port(), None);
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = TailscaleConfig {
+            hostname: Some("node1".into()),
+            auth_key: Some("tskey-auth-abc".into()),
+            control_url: Some("https://control.example.com".into()),
+            state_directory: Some("/var/lib/tailscale".into()),
+            ephemeral: Some(true),
+            accept_routes: Some(true),
+            exit_node: Some("100.64.0.2".into()),
+            exit_node_allow_lan_access: Some(true),
+            advertise_routes: Some(vec!["10.0.0.0/24".into()]),
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            None, // tailscale needs no server — endpoint-less is fine
+            InjectOptions::default(),
+        )
+        .expect("tailscale sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "tailscale");
+        assert_eq!(conf["hostname"], "node1");
+        assert_eq!(conf["auth_key"], "tskey-auth-abc");
+        assert_eq!(conf["control_url"], "https://control.example.com");
+        assert_eq!(conf["state_directory"], "/var/lib/tailscale");
+        assert_eq!(conf["ephemeral"], true);
+        assert_eq!(conf["accept_routes"], true);
+        assert_eq!(conf["exit_node"], "100.64.0.2");
+        assert_eq!(conf["exit_node_allow_lan_access"], true);
+        assert_eq!(conf["advertise_routes"], serde_json::json!(["10.0.0.0/24"]));
+    }
+
+    #[test]
+    fn singbox_inject_false_flags_are_omitted() {
+        let cfg = TailscaleConfig {
+            hostname: None,
+            auth_key: None,
+            control_url: None,
+            state_directory: None,
+            ephemeral: Some(false),
+            accept_routes: Some(false),
+            exit_node: None,
+            exit_node_allow_lan_access: Some(false),
+            advertise_routes: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect("tailscale sing-box inject");
+        assert_eq!(
+            conf,
+            serde_json::json!({ "tag": "proxy", "type": "tailscale" })
+        );
+    }
+
+    #[test]
+    fn xray_core_is_rejected() {
+        let cfg = TailscaleConfig {
+            hostname: None,
+            auth_key: None,
+            control_url: None,
+            state_directory: None,
+            ephemeral: None,
+            accept_routes: None,
+            exit_node: None,
+            exit_node_allow_lan_access: None,
+            advertise_routes: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("tailscale has no xray shape");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "tailscale"
+        ));
     }
 }

@@ -31,18 +31,20 @@
 //! - subconverter: `subparser.cpp` `explodeAnyTLS()`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoIdentity, ProtoSpec,
-    ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    SupportError,
 };
 use crate::clash::{ClashAnyTls, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{
     SecurityConfig, TlsConfig, TlsOpts, clash_tls_to_security, clash_to_endpoint, host_kind_for,
-    should_skip_endpoint_param,
+    should_skip_endpoint_param, to_singbox_tls_or_default,
 };
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
@@ -360,6 +362,50 @@ impl ProtoIdentity for AnyTlsConfig {
     }
 }
 
+impl InjectToCoreConf for AnyTlsConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("any-tls".into(), other)),
+        }
+    }
+}
+
+impl AnyTlsConfig {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::AnyTls` arm (`password` + TLS via the shared
+    /// helper). AnyTLS always uses TLS, so an empty typed security still
+    /// yields a block with the endpoint-host server_name.
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "any-tls"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "anytls",
+            "server": ep.host,
+            "server_port": ep.port,
+        });
+        if let Some(password) = &self.password {
+            out["password"] = json!(password);
+        }
+        out["tls"] = to_singbox_tls_or_default(&self.security, ep, opts.skip_cert_verify);
+        *core_conf = out;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -565,5 +611,56 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse("anytls://1.2.3.4:8080?password=secret"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+            InjectOptions::default(),
+        )
+        .expect("anytls sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "anytls");
+        assert_eq!(conf["server"], "1.2.3.4");
+        assert_eq!(conf["server_port"], 8080);
+        assert_eq!(conf["password"], "secret");
+        // anytls always uses TLS; server_name falls back to endpoint host.
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "1.2.3.4");
+    }
+
+    #[test]
+    fn singbox_inject_without_password_and_endpoint() {
+        let cfg = config(parse("anytls://1.2.3.4:8080"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+            InjectOptions::default(),
+        )
+        .expect("anytls sing-box inject");
+        assert!(
+            conf.get("password").is_none(),
+            "password omitted when unset"
+        );
+
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan anytls must be rejected");
+        assert!(matches!(
+            err,
+            SupportError::MissingField("server", "any-tls")
+        ));
     }
 }

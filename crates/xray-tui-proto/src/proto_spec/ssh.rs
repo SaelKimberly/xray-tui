@@ -21,6 +21,7 @@
 //! - sing-box: `option/ssh.go` — `SSHOutboundOptions`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::clash::{ClashProxy, ClashSsh};
 use crate::proto_spec::ProtoSpecError;
@@ -29,8 +30,9 @@ use crate::proto_spec::common::clash_to_endpoint;
 use crate::proto_spec::core_mapping;
 use crate::proto_spec::utils;
 use crate::proto_spec::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoIdentity, ProtoSpec,
-    ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    SupportError,
 };
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
@@ -221,10 +223,76 @@ impl ProtoIdentity for SshConfig {
     }
 }
 
+impl InjectToCoreConf for SshConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint),
+            other => Err(SupportError::UnsupportedProtocol("ssh".into(), other)),
+        }
+    }
+}
+
+impl SshConfig {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Ssh` arm (`server`/`server_port` from the
+    /// endpoint — the typed config has no host/ssh_port fields — `user`
+    /// defaulting to "root", `password`/`private_key` when non-empty, the
+    /// private key as an array), plus the typed `private_key_path`/
+    /// `private_key_passphrase`/`host_key`/`host_key_algorithms`/
+    /// `client_version` fields (sing-box `SSHOutboundOptions` keys the old
+    /// builder dropped).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "ssh"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "ssh",
+            "server": ep.host,
+            "server_port": ep.port,
+            "user": self.user.as_deref().unwrap_or("root"),
+        });
+        if let Some(password) = self.password.as_deref().filter(|s| !s.is_empty()) {
+            out["password"] = json!(password);
+        }
+        if let Some(key) = self.private_key.as_deref().filter(|s| !s.is_empty()) {
+            out["private_key"] = json!([key]);
+        }
+        if let Some(path) = &self.private_key_path {
+            out["private_key_path"] = json!(path);
+        }
+        if let Some(passphrase) = &self.private_key_passphrase {
+            out["private_key_passphrase"] = json!(passphrase);
+        }
+        if let Some(keys) = &self.host_key {
+            out["host_key"] = json!(keys);
+        }
+        if let Some(algos) = &self.host_key_algorithms {
+            out["host_key_algorithms"] = json!(algos);
+        }
+        if let Some(version) = &self.client_version {
+            out["client_version"] = json!(version);
+        }
+        *core_conf = out;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{ConfigKind, CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::SshConfig;
+    use crate::proto_spec::common::SecurityConfig;
     use crate::urlx::{RawUrlX, SchemeX};
 
     #[test]
@@ -307,5 +375,81 @@ mod tests {
         assert_eq!(bridged.port(), None);
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = SshConfig {
+            user: Some("root".into()),
+            password: Some("sekrit".into()),
+            private_key: Some("PRIVATE-KEY".into()),
+            private_key_path: Some("/home/user/.ssh/id_ed25519".into()),
+            private_key_passphrase: Some("passphrase".into()),
+            host_key: Some(vec!["ssh-ed25519 AAA".into()]),
+            host_key_algorithms: Some(vec!["ssh-ed25519".into()]),
+            client_version: Some("SSH-2.0-myclient".into()),
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 22)),
+            InjectOptions::default(),
+        )
+        .expect("ssh sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "ssh");
+        assert_eq!(conf["server"], "example.com");
+        assert_eq!(conf["server_port"], 22);
+        assert_eq!(conf["user"], "root");
+        assert_eq!(conf["password"], "sekrit");
+        assert_eq!(conf["private_key"], serde_json::json!(["PRIVATE-KEY"]));
+        assert_eq!(conf["private_key_path"], "/home/user/.ssh/id_ed25519");
+        assert_eq!(conf["private_key_passphrase"], "passphrase");
+        assert_eq!(conf["host_key"], serde_json::json!(["ssh-ed25519 AAA"]));
+        assert_eq!(
+            conf["host_key_algorithms"],
+            serde_json::json!(["ssh-ed25519"])
+        );
+        assert_eq!(conf["client_version"], "SSH-2.0-myclient");
+    }
+
+    #[test]
+    fn singbox_inject_defaults_and_endpoint_requirement() {
+        let cfg = SshConfig {
+            user: None,
+            password: None,
+            private_key: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            host_key: None,
+            host_key_algorithms: None,
+            client_version: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 22)),
+            InjectOptions::default(),
+        )
+        .expect("ssh sing-box inject");
+        assert_eq!(conf["user"], "root");
+        assert!(conf.get("password").is_none());
+        assert!(conf.get("private_key").is_none());
+
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan ssh must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "ssh")));
     }
 }

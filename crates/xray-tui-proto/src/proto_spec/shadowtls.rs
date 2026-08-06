@@ -21,16 +21,19 @@
 //! - `thirdparty/sing-box/docs/configuration/outbound/shadowtls.md`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::common::{
+    SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashShadowTls};
 use crate::proto_spec::ProtoSpecError;
@@ -323,6 +326,61 @@ impl ProtoIdentity for ShadowTlsConfig {
     }
 }
 
+impl InjectToCoreConf for ShadowTlsConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol(
+                "shadow-tls".into(),
+                other,
+            )),
+        }
+    }
+}
+
+impl ShadowTlsConfig {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::ShadowTls` arm (`password`/`version` defaulting to
+    /// 3 + TLS via the shared helper — emitted only when the config carries
+    /// TLS material, exactly like the old `build_tls` enabled check).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "shadow-tls"));
+        };
+        let version = self
+            .version
+            .as_ref()
+            .and_then(|v| v.as_str().parse::<i64>().ok())
+            .unwrap_or(3);
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "shadowtls",
+            "server": ep.host,
+            "server_port": ep.port,
+            "version": version,
+        });
+        if let Some(password) = &self.password {
+            out["password"] = json!(password);
+        }
+        if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
+            out["tls"] = tls;
+        }
+        *core_conf = out;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -515,5 +573,62 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse(
+            "shadowtls://1.2.3.4:443?password=pass123&version=1&sni=example.com",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 443)),
+            InjectOptions::default(),
+        )
+        .expect("shadowtls sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "shadowtls");
+        assert_eq!(conf["server"], "1.2.3.4");
+        assert_eq!(conf["server_port"], 443);
+        assert_eq!(conf["password"], "pass123");
+        assert_eq!(conf["version"], 1);
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "example.com");
+    }
+
+    #[test]
+    fn singbox_inject_version_defaults_to_three() {
+        // No version in the URL -> old builder default 3.
+        let cfg = config(parse("shadowtls://1.2.3.4:443?password=pass123"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("1.2.3.4", 443)),
+            InjectOptions::default(),
+        )
+        .expect("shadowtls sing-box inject");
+        assert_eq!(conf["version"], 3);
+        // No TLS material -> no tls block (old build_tls enabled check).
+        assert!(conf.get("tls").is_none());
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse("shadowtls://1.2.3.4:443?password=pass123"));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan shadowtls must be rejected");
+        assert!(matches!(
+            err,
+            SupportError::MissingField("server", "shadow-tls")
+        ));
     }
 }

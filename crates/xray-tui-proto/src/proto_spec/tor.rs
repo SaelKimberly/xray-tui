@@ -17,6 +17,7 @@
 //! - sing-box: `option/tor.go` — `TorOutboundOptions`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::clash::{ClashProxy, ClashTor};
 use crate::proto_spec::ProtoSpecError;
@@ -24,8 +25,9 @@ use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::clash_to_endpoint;
 use crate::proto_spec::core_mapping;
 use crate::proto_spec::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoIdentity, ProtoSpec,
-    ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
+    SupportError,
 };
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
@@ -190,10 +192,44 @@ impl ProtoIdentity for TorConfig {
     }
 }
 
+impl InjectToCoreConf for TorConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        _endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            // Tor is a self-contained outbound (no server field) — the old
+            // builder emitted `{ "type": "tor" }` endpoint-less.
+            CoreType::SingBox => {
+                let mut out = json!({ "tag": "proxy", "type": "tor" });
+                if let Some(path) = &self.executable_path {
+                    out["executable_path"] = json!(path);
+                }
+                if let Some(args) = &self.extra_args {
+                    out["extra_args"] = json!(args);
+                }
+                if let Some(dir) = &self.data_directory {
+                    out["data_directory"] = json!(dir);
+                }
+                if let Some(torrc) = &self.torrc {
+                    out["torrc"] = json!(torrc);
+                }
+                *core_conf = out;
+                Ok(())
+            }
+            other => Err(SupportError::UnsupportedProtocol("tor".into(), other)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{ConfigKind, CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::TorConfig;
+    use crate::proto_spec::common::SecurityConfig;
     use crate::urlx::{RawUrlX, SchemeX};
 
     #[test]
@@ -256,5 +292,73 @@ mod tests {
         assert_eq!(bridged.port(), None);
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let mut torrc = std::collections::HashMap::new();
+        torrc.insert("SocksPort".to_string(), "0".to_string());
+        let cfg = TorConfig {
+            executable_path: Some("/usr/bin/tor".into()),
+            extra_args: Some(vec!["--quiet".into()]),
+            data_directory: Some("/var/lib/tor".into()),
+            torrc: Some(torrc),
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            None, // tor needs no server — endpoint-less is fine
+            InjectOptions::default(),
+        )
+        .expect("tor sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "tor");
+        assert_eq!(conf["executable_path"], "/usr/bin/tor");
+        assert_eq!(conf["extra_args"], serde_json::json!(["--quiet"]));
+        assert_eq!(conf["data_directory"], "/var/lib/tor");
+        assert_eq!(conf["torrc"], serde_json::json!({ "SocksPort": "0" }));
+    }
+
+    #[test]
+    fn singbox_inject_minimal_is_just_tor_type() {
+        let cfg = TorConfig {
+            executable_path: None,
+            extra_args: None,
+            data_directory: None,
+            torrc: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect("tor sing-box inject");
+        assert_eq!(conf, serde_json::json!({ "tag": "proxy", "type": "tor" }));
+    }
+
+    #[test]
+    fn xray_core_is_rejected() {
+        let cfg = TorConfig {
+            executable_path: None,
+            extra_args: None,
+            data_directory: None,
+            torrc: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        };
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("tor has no xray shape");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "tor"
+        ));
     }
 }

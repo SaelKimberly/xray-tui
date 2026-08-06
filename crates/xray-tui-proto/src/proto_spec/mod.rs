@@ -1436,18 +1436,20 @@ mod tests {
         let tuic = config_from_url(
             "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
         );
-        match tuic.inject_to(
-            &mut json!({}),
-            CoreType::SingBox,
-            None,
-            InjectOptions::default(),
-        ) {
-            Err(SupportError::UnsupportedProtocol(kind, core)) => {
-                assert!(kind.contains("tuic"), "kind {kind:?} must mention tuic");
-                assert_eq!(core, CoreType::SingBox, "error reports the requested core");
-            }
-            other => panic!("expected UnsupportedProtocol, got {other:?}"),
-        }
+        // tuic has a real sing-box shape since T15; an orphan (no endpoint)
+        // is rejected with the missing-server error, not UnsupportedProtocol.
+        let err = tuic
+            .inject_to(
+                &mut json!({}),
+                CoreType::SingBox,
+                None,
+                InjectOptions::default(),
+            )
+            .expect_err("orphan tuic must be rejected by the real impl");
+        assert!(
+            matches!(err, SupportError::MissingField("server", "tuic")),
+            "expected MissingField(server), got {err:?}"
+        );
     }
 
     #[test]

@@ -24,14 +24,15 @@
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts};
+use super::common::{SecurityConfig, TlsConfig, TlsOpts, to_singbox_tls};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashNaive, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
@@ -290,6 +291,53 @@ impl ProtoIdentity for NaiveConfig {
     }
 }
 
+impl InjectToCoreConf for NaiveConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("naive".into(), other)),
+        }
+    }
+}
+
+impl NaiveConfig {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Naive` arm (`password` always, `username` when
+    /// non-empty, TLS via the shared helper — the parse always sets
+    /// `security.tls`, so the block is effectively mandatory).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "naive"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "naive",
+            "server": ep.host,
+            "server_port": ep.port,
+            "password": self.password,
+        });
+        if !self.username.is_empty() {
+            out["username"] = json!(self.username);
+        }
+        if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
+            out["tls"] = tls;
+        }
+        *core_conf = out;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -466,5 +514,58 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse("naive+https://user:pass@example.com:443"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("naive sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "naive");
+        assert_eq!(conf["server"], "example.com");
+        assert_eq!(conf["server_port"], 443);
+        assert_eq!(conf["username"], "user");
+        assert_eq!(conf["password"], "pass");
+        // naive always has a tls block; server_name falls back to the
+        // endpoint host at build time (never stored).
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "example.com");
+    }
+
+    #[test]
+    fn singbox_inject_skip_cert_verify_forces_insecure() {
+        let cfg = config(parse("naive+https://user:pass@example.com:443"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("naive sing-box inject");
+        assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse("naive+https://user:pass@example.com:443"));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan naive must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "naive")));
     }
 }

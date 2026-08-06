@@ -40,6 +40,7 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
@@ -48,8 +49,8 @@ use super::common::SecurityConfig;
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashSSR};
 use crate::proto_spec::ProtoSpecError;
@@ -418,6 +419,58 @@ impl ProtoIdentity for SsrConfig {
     }
 }
 
+impl InjectToCoreConf for SsrConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        _opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint),
+            other => Err(SupportError::UnsupportedProtocol("ssr".into(), other)),
+        }
+    }
+}
+
+impl SsrConfig {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::ShadowsocksR` arm (`method`/`password`/`obfs`/
+    /// `obfs_param`/`protocol`/`protocol_param`, all with the old defaults).
+    /// The typed `params` map carries the query params verbatim; the obfs/
+    /// protocol param values are read under both the modern ("obfs_param"/
+    /// "protocol_param") and share-link ("obfsparam"/"protoparam") spellings.
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "ssr"));
+        };
+        let param = |keys: &[&str]| -> String {
+            keys.iter()
+                .find_map(|k| self.params.get(*k))
+                .cloned()
+                .unwrap_or_default()
+        };
+        *core_conf = json!({
+            "tag": "proxy",
+            "type": "shadowsocksr",
+            "server": ep.host,
+            "server_port": ep.port,
+            "method": self.method,
+            "password": self.password,
+            "obfs": self.obfs,
+            "obfs_param": param(&["obfs_param", "obfsparam"]),
+            "protocol": self.protocol,
+            "protocol_param": param(&["protocol_param", "protoparam"]),
+        });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -637,5 +690,61 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse(SSR_URL));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("ssr sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "shadowsocksr");
+        assert_eq!(conf["server"], "example.com");
+        assert_eq!(conf["server_port"], 443);
+        assert_eq!(conf["method"], "rc4-md5");
+        assert_eq!(conf["password"], "cGFzc3dvcmQ");
+        assert_eq!(conf["obfs"], "plain");
+        assert_eq!(conf["protocol"], "origin");
+        // param fields default to "" when the URL carries none.
+        assert_eq!(conf["obfs_param"], "");
+        assert_eq!(conf["protocol_param"], "");
+    }
+
+    #[test]
+    fn singbox_inject_params_from_share_link() {
+        // SSR share links carry obfsparam/protoparam in the query part.
+        let cfg = config(parse(
+            "ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9vYmZzcGFyYW09b2Jmcy12YWx1ZSZwcm90b3BhcmFtPXByb3RvLXZhbHVl",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("ssr sing-box inject");
+        assert_eq!(conf["obfs_param"], "obfs-value");
+        assert_eq!(conf["protocol_param"], "proto-value");
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse(SSR_URL));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan ssr must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "ssr")));
     }
 }

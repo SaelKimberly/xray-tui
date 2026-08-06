@@ -34,16 +34,19 @@
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::common::{
+    SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls_or_default,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashTuic};
 use crate::proto_spec::ProtoSpecError;
@@ -405,6 +408,57 @@ impl ProtoIdentity for TuicConfig {
     }
 }
 
+impl InjectToCoreConf for TuicConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::SingBox => self.inject_singbox(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("tuic".into(), other)),
+        }
+    }
+}
+
+impl TuicConfig {
+    /// sing-box outbound for this config, ported field-by-field from the old
+    /// builder's `Protocol::Tuic` arm (`uuid`/`password`/`server`/`server_port`
+    /// + mandatory `tls`), plus the typed `congestion_control`/`udp_relay_mode`
+    /// fields (sing-box `TUICOutboundOptions` keys the old builder dropped).
+    fn inject_singbox(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "tuic"));
+        };
+        let mut out = json!({
+            "tag": "proxy",
+            "type": "tuic",
+            "server": ep.host,
+            "server_port": ep.port,
+            "uuid": self.uuid,
+            "password": self.password,
+        });
+        if let Some(cc) = &self.congestion_control {
+            out["congestion_control"] = json!(cc);
+        }
+        if let Some(urm) = &self.udp_relay_mode {
+            out["udp_relay_mode"] = json!(urm);
+        }
+        // TUIC always uses TLS (QUIC) — old builder emitted the block
+        // unconditionally.
+        out["tls"] = to_singbox_tls_or_default(&self.security, ep, opts.skip_cert_verify);
+        *core_conf = out;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -611,5 +665,83 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Sing-box inject_to (Task 15) ──────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn singbox_inject_writes_proxy_outbound() {
+        let cfg = config(parse(TUIC_URL));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("5.178.101.117", 30006)),
+            InjectOptions::default(),
+        )
+        .expect("tuic sing-box inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["type"], "tuic");
+        assert_eq!(conf["server"], "5.178.101.117");
+        assert_eq!(conf["server_port"], 30006);
+        assert_eq!(conf["uuid"], "36106e0f-4d9a-470b-a3fd-535f3b7a1e92");
+        assert_eq!(conf["password"], "dongtaiwang.com");
+        assert_eq!(conf["congestion_control"], "cubic");
+        assert_eq!(conf["udp_relay_mode"], "native");
+        // tls via the shared helper: enabled + server_name from endpoint host
+        // (no explicit sni) + alpn from the typed config.
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert_eq!(conf["tls"]["server_name"], "5.178.101.117");
+        assert_eq!(conf["tls"]["alpn"], serde_json::json!(["h3"]));
+        assert!(conf["tls"].get("insecure").is_none());
+    }
+
+    #[test]
+    fn singbox_inject_sni_and_skip_cert_verify() {
+        let cfg = config(parse(
+            "tuic://9bbd1f42-7ae7-4239-bd10-a68de95e3295:pw@ip1.758733.xyz:10088?sni=apple.com&alpn=h3",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("ip1.758733.xyz", 10088)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("tuic sing-box inject");
+        assert_eq!(conf["tls"]["server_name"], "apple.com");
+        assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse(TUIC_URL));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
+            .expect_err("orphan tuic must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "tuic")));
+    }
+
+    #[test]
+    fn xray_core_is_rejected() {
+        let cfg = config(parse(TUIC_URL));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::Xray,
+                Some(&EndpointEssentials::new("5.178.101.117", 30006)),
+                InjectOptions::default(),
+            )
+            .expect_err("tuic has no xray shape");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::Xray) if kind == "tuic"
+        ));
     }
 }
