@@ -1498,12 +1498,13 @@ fn tls_opts_stream(ps: &SettingsMap, ss: &SettingsMap) -> TlsOpts {
     }
 }
 
-/// TLS options for the always-TLS protocols whose keys live in
-/// `protocol_settings` (`sni`/`insecure`, plus `alpn` when `with_alpn`).
-fn tls_opts_ps(ps: &SettingsMap, with_alpn: bool) -> TlsOpts {
+/// TLS options for the always-TLS protocols. The producer routes `sni`/`alpn`
+/// into `stream_settings` (exact-match arm) while `insecure` stays in
+/// `protocol_settings` (no stream prefix/exact match).
+fn tls_opts_always_tls(ps: &SettingsMap, ss: &SettingsMap, with_alpn: bool) -> TlsOpts {
     TlsOpts {
-        sni: opt_text(ps.get("sni")),
-        alpn: with_alpn.then(|| opt_text(ps.get("alpn"))).flatten(),
+        sni: opt_text(ss.get("sni")),
+        alpn: with_alpn.then(|| opt_text(ss.get("alpn"))).flatten(),
         insecure: opt_bool(ps.get("insecure")),
         ..Default::default()
     }
@@ -1720,7 +1721,6 @@ fn vmess_from_form(
             "fragment.packets",
             "fragment.length",
             "fragment.interval",
-            "reality.show",
         ],
     )?;
     check_keys(
@@ -1736,6 +1736,11 @@ fn vmess_from_form(
             "ws.host",
             "grpc.serviceName",
             "tcp.headerType",
+            // Producer routes every `reality.*` key to stream_settings; the
+            // form always emits `reality.show=false` (non-empty default).
+            // Accepted decoration key — no typed Reality fields exist on the
+            // form (no pbk/sid), so it is deliberately dropped.
+            "reality.show",
         ],
     )?;
     let uuid = req_string("vmess", "user_id", user_id)?;
@@ -1864,7 +1869,7 @@ fn http_from_form(
 fn tuic_from_form(
     user_id: Option<&str>,
     ps: &SettingsMap,
-    _ss: &SettingsMap,
+    ss: &SettingsMap,
 ) -> Result<TuicConfig, String> {
     check_keys(
         "tuic",
@@ -1873,11 +1878,11 @@ fn tuic_from_form(
             "password",
             "congestion_control",
             "udp_relay_mode",
-            "sni",
-            "alpn",
             "insecure",
         ],
     )?;
+    // sni/alpn route to stream_settings (producer exact-match arm).
+    check_keys("tuic", ss, &["sni", "alpn"])?;
     let uuid = req_string("tuic", "uuid", user_id)?;
     Ok(TuicConfig {
         uuid,
@@ -1886,7 +1891,7 @@ fn tuic_from_form(
         udp_relay_mode: opt_text(ps.get("udp_relay_mode")),
         // Tuic always uses TLS (parser default).
         security: SecurityConfig {
-            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, true))),
+            tls: Some(TlsConfig::Tls(tls_opts_always_tls(ps, ss, true))),
             enc: None,
         },
         remarks: None,
@@ -1961,20 +1966,22 @@ fn wireguard_from_form(
 fn hysteria2_from_form(
     user_id: Option<&str>,
     ps: &SettingsMap,
-    _ss: &SettingsMap,
+    ss: &SettingsMap,
 ) -> Result<Hysteria2Config, String> {
     check_keys(
         "hysteria2",
         ps,
-        &["ports", "hop", "obfs", "obfs_password", "sni", "insecure"],
+        &["ports", "hop", "obfs", "obfs_password", "insecure"],
     )?;
+    // sni routes to stream_settings (producer exact-match arm).
+    check_keys("hysteria2", ss, &["sni"])?;
     let hop_interval = opt_u32("hysteria2", "hop", ps.get("hop"))?;
     Ok(Hysteria2Config {
         // The form's `password` routes to the top-level `user_id`.
         auth: opt_str(user_id).unwrap_or_default(),
         // Hysteria2 always uses TLS (parser default).
         security: SecurityConfig {
-            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, false))),
+            tls: Some(TlsConfig::Tls(tls_opts_always_tls(ps, ss, false))),
             enc: None,
         },
         obfs: opt_text(ps.get("obfs")),
@@ -1987,7 +1994,7 @@ fn hysteria2_from_form(
     })
 }
 
-fn hysteria1_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<Hysteria1Config, String> {
+fn hysteria1_from_form(ps: &SettingsMap, ss: &SettingsMap) -> Result<Hysteria1Config, String> {
     check_keys(
         "hysteria",
         ps,
@@ -1997,10 +2004,11 @@ fn hysteria1_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<Hysteria1C
             "obfs",
             "up_mbps",
             "down_mbps",
-            "sni",
             "insecure",
         ],
     )?;
+    // sni routes to stream_settings (producer exact-match arm).
+    check_keys("hysteria", ss, &["sni"])?;
     Ok(Hysteria1Config {
         auth: opt_string(ps.get("auth")),
         protocol: opt_text(ps.get("protocol")),
@@ -2009,7 +2017,7 @@ fn hysteria1_from_form(ps: &SettingsMap, _ss: &SettingsMap) -> Result<Hysteria1C
         down_mbps: opt_u32("hysteria", "down_mbps", ps.get("down_mbps"))?,
         // Hysteria always uses TLS (parser default).
         security: SecurityConfig {
-            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, false))),
+            tls: Some(TlsConfig::Tls(tls_opts_always_tls(ps, ss, false))),
             enc: None,
         },
         remarks: None,
@@ -2038,14 +2046,16 @@ fn naive_from_form(
 fn anytls_from_form(
     user_id: Option<&str>,
     ps: &SettingsMap,
-    _ss: &SettingsMap,
+    ss: &SettingsMap,
 ) -> Result<AnyTlsConfig, String> {
-    check_keys("anytls", ps, &["sni", "alpn", "insecure"])?;
+    check_keys("anytls", ps, &["insecure"])?;
+    // sni/alpn route to stream_settings (producer exact-match arm).
+    check_keys("anytls", ss, &["sni", "alpn"])?;
     Ok(AnyTlsConfig {
         password: opt_str(user_id),
         // AnyTLS always uses TLS (parser default).
         security: SecurityConfig {
-            tls: Some(TlsConfig::Tls(tls_opts_ps(ps, true))),
+            tls: Some(TlsConfig::Tls(tls_opts_always_tls(ps, ss, true))),
             enc: None,
         },
         remarks: None,
@@ -2055,12 +2065,13 @@ fn anytls_from_form(
 fn shadowtls_from_form(
     user_id: Option<&str>,
     ps: &SettingsMap,
-    _ss: &SettingsMap,
+    ss: &SettingsMap,
 ) -> Result<ShadowTlsConfig, String> {
-    check_keys("shadowtls", ps, &["version", "sni"])?;
-    // ShadowTLS is TLS only when an explicit sni is provided (parser
-    // behavior — the disguise host).
-    let security = match opt_text(ps.get("sni")) {
+    check_keys("shadowtls", ps, &["version"])?;
+    // sni routes to stream_settings (producer exact-match arm) — it is the
+    // TLS trigger for ShadowTLS (the disguise host).
+    check_keys("shadowtls", ss, &["sni"])?;
+    let security = match opt_text(ss.get("sni")) {
         Some(sni) => SecurityConfig {
             tls: Some(TlsConfig::Tls(TlsOpts {
                 sni: Some(sni),
@@ -2260,21 +2271,66 @@ mod tests {
 
     // ── T12: typed config builders ────────────────────────────────────
 
-    fn s(v: &str) -> Value {
-        Value::String(v.to_string())
+    /// Replicates `fields_to_profile` (crates/xray-tui/src/ops/profiles.rs)
+    /// EXACTLY: empty values skipped; `user_id`/`password`/`uuid` → top-level
+    /// `user_id`; `address`/`port`/`core_type`/`security`/`network` are
+    /// profile columns (never in the maps); `tls.`/`ws.`/`grpc.`/`reality.`/
+    /// `tcp.` prefixes + exact `sni`/`alpn`/`fingerprint`/`allow_insecure` →
+    /// `stream_settings`; everything else → `protocol_settings`. "true"/
+    /// "false" → bool, integers → number.
+    fn producer_settings(fields: &[(&str, &str)]) -> Value {
+        let mut proto_map = Map::new();
+        let mut stream_map = Map::new();
+        let mut user_id: Option<String> = None;
+        for &(key, value) in fields {
+            if value.is_empty() {
+                continue;
+            }
+            let json_val = if value == "true" {
+                Value::Bool(true)
+            } else if value == "false" {
+                Value::Bool(false)
+            } else if let Ok(n) = value.parse::<i64>() {
+                Value::Number(n.into())
+            } else {
+                Value::String(value.to_string())
+            };
+            match key {
+                "user_id" | "password" | "uuid" => user_id = Some(value.to_string()),
+                "address" | "port" | "core_type" | "security" | "network" => {}
+                _ if key.starts_with("tls.")
+                    || key.starts_with("ws.")
+                    || key.starts_with("grpc.")
+                    || key.starts_with("reality.")
+                    || key.starts_with("tcp.")
+                    || key == "sni"
+                    || key == "alpn"
+                    || key == "fingerprint"
+                    || key == "allow_insecure" =>
+                {
+                    stream_map.insert(key.to_string(), json_val);
+                }
+                _ => {
+                    proto_map.insert(key.to_string(), json_val);
+                }
+            }
+        }
+        let mut obj = Map::new();
+        if let Some(u) = user_id {
+            obj.insert("user_id".into(), Value::String(u));
+        }
+        if !proto_map.is_empty() {
+            obj.insert("protocol_settings".into(), Value::Object(proto_map));
+        }
+        if !stream_map.is_empty() {
+            obj.insert("stream_settings".into(), Value::Object(stream_map));
+        }
+        Value::Object(obj)
     }
 
-    fn b(v: bool) -> Value {
-        Value::Bool(v)
-    }
-
-    fn n(v: u64) -> Value {
-        Value::Number(v.into())
-    }
-
-    /// Build the settings JSON in the exact shape `fields_to_profile`
-    /// produces: `user_id` at top level, flat protocol/stream settings maps.
-    fn settings(user_id: Option<&str>, ps: &[(&str, Value)], ss: &[(&str, Value)]) -> Value {
+    /// Direct settings construction for negative tests (unknown-key
+    /// rejection) where producer routing cannot express the bad key.
+    fn raw_settings(user_id: Option<&str>, ps: &[(&str, Value)], ss: &[(&str, Value)]) -> Value {
         let mut obj = Map::new();
         if let Some(u) = user_id {
             obj.insert("user_id".into(), Value::String(u.to_string()));
@@ -2306,19 +2362,17 @@ mod tests {
     fn build_vless_ws_tls() {
         let parsed = built(
             ProtocolKind::Vless,
-            settings(
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                &[("flow", s("xtls-rprx-vision"))],
-                &[
-                    ("tls.enable", b(true)),
-                    ("sni", s("real.example.com")),
-                    ("alpn", s("h2,http/1.1")),
-                    ("fingerprint", s("chrome")),
-                    ("allow_insecure", b(false)),
-                    ("ws.path", s("/ws")),
-                    ("ws.host", s("cdn.example.com")),
-                ],
-            ),
+            producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("flow", "xtls-rprx-vision"),
+                ("tls.enable", "true"),
+                ("sni", "real.example.com"),
+                ("alpn", "h2,http/1.1"),
+                ("fingerprint", "chrome"),
+                ("allow_insecure", "false"),
+                ("ws.path", "/ws"),
+                ("ws.host", "cdn.example.com"),
+            ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Vless);
         assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
@@ -2350,19 +2404,19 @@ mod tests {
 
     #[test]
     fn build_vmess_ws_tls_enc_auto() {
+        // Producer routes reality.show AND tcp.headerType to stream_settings;
+        // both must be accepted (decoration keys), not rejected.
         let parsed = built(
             ProtocolKind::Vmess,
-            settings(
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                &[("reality.show", b(false)), ("fragment.enable", b(false))],
-                &[
-                    ("tls.enable", b(true)),
-                    ("sni", s("real.example.com")),
-                    ("ws.path", s("/ws")),
-                    ("grpc.serviceName", s("")),
-                    ("tcp.headerType", s("none")),
-                ],
-            ),
+            producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("reality.show", "false"),
+                ("fragment.enable", "false"),
+                ("tls.enable", "true"),
+                ("sni", "real.example.com"),
+                ("ws.path", "/ws"),
+                ("tcp.headerType", "none"),
+            ]),
         );
         let ProtocolConfig::Vmess(c) = &parsed.protocol.config else {
             panic!("expected Vmess config");
@@ -2380,7 +2434,10 @@ mod tests {
 
     #[test]
     fn build_vless_defaults_tcp_no_tls() {
-        let parsed = built(ProtocolKind::Vless, settings(Some("uuid-here"), &[], &[]));
+        let parsed = built(
+            ProtocolKind::Vless,
+            producer_settings(&[("user_id", "uuid-here")]),
+        );
         let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
             panic!("expected Vless config");
         };
@@ -2392,11 +2449,10 @@ mod tests {
     fn build_vless_grpc_service_name() {
         let parsed = built(
             ProtocolKind::Vless,
-            settings(
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                &[],
-                &[("grpc.serviceName", s("myservice"))],
-            ),
+            producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("grpc.serviceName", "myservice"),
+            ]),
         );
         let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
             panic!("expected Vless config");
@@ -2413,15 +2469,12 @@ mod tests {
     fn build_ss_aead_resolves_xray() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            settings(
-                Some("passw0rd"),
-                &[
-                    ("method", s("aes-256-gcm")),
-                    ("plugin", s("obfs-local")),
-                    ("plugin_opts", s("obfs=http;obfs-host=example.com")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "passw0rd"),
+                ("method", "aes-256-gcm"),
+                ("plugin", "obfs-local"),
+                ("plugin_opts", "obfs=http;obfs-host=example.com"),
+            ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
@@ -2444,11 +2497,10 @@ mod tests {
     fn build_ss_2022_method_kind_and_core() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            settings(
-                Some("passw0rd"),
-                &[("method", s("2022-blake3-aes-128-gcm"))],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "passw0rd"),
+                ("method", "2022-blake3-aes-128-gcm"),
+            ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
@@ -2458,7 +2510,7 @@ mod tests {
     fn build_ss_legacy_method_resolves_singbox() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            settings(Some("passw0rd"), &[("method", s("aes-256-cfb"))], &[]),
+            producer_settings(&[("user_id", "passw0rd"), ("method", "aes-256-cfb")]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
@@ -2468,16 +2520,14 @@ mod tests {
     fn build_trojan_tls() {
         let parsed = built(
             ProtocolKind::Trojan,
-            settings(
-                Some("humanity"),
-                &[("flow", s("xtls-rprx-vision"))],
-                &[
-                    ("sni", s("real.example.com")),
-                    ("alpn", s("h2")),
-                    ("fingerprint", s("chrome")),
-                    ("allow_insecure", b(true)),
-                ],
-            ),
+            producer_settings(&[
+                ("user_id", "humanity"),
+                ("flow", "xtls-rprx-vision"),
+                ("sni", "real.example.com"),
+                ("alpn", "h2"),
+                ("fingerprint", "chrome"),
+                ("allow_insecure", "true"),
+            ]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Trojan(c) = &parsed.protocol.config else {
@@ -2497,11 +2547,11 @@ mod tests {
     fn build_socks() {
         let parsed = built(
             ProtocolKind::Socks,
-            settings(
-                Some("secret"),
-                &[("username", s("alice")), ("udp", b(true))],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "secret"),
+                ("username", "alice"),
+                ("udp", "true"),
+            ]),
         );
         let ProtocolConfig::Socks(c) = &parsed.protocol.config else {
             panic!("expected Socks config");
@@ -2515,15 +2565,12 @@ mod tests {
     fn build_http_tls() {
         let parsed = built(
             ProtocolKind::Http,
-            settings(
-                Some("secret"),
-                &[
-                    ("username", s("alice")),
-                    ("tls", b(true)),
-                    ("path", s("/proxy")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "secret"),
+                ("username", "alice"),
+                ("tls", "true"),
+                ("path", "/proxy"),
+            ]),
         );
         let ProtocolConfig::Http(c) = &parsed.protocol.config else {
             panic!("expected Http config");
@@ -2537,19 +2584,15 @@ mod tests {
     fn build_wireguard() {
         let parsed = built(
             ProtocolKind::WireGuard,
-            settings(
-                None,
-                &[
-                    ("private_key", s("aGVsbG8=")),
-                    ("public_key", s("d29ybGQ=")),
-                    ("preshared_key", s("cHNr")),
-                    ("reserved", s("0,1,2")),
-                    ("mtu", n(1420)),
-                    ("dns", s("1.1.1.1,8.8.8.8")),
-                    ("persistent_keepalive", n(25)),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("private_key", "aGVsbG8="),
+                ("public_key", "d29ybGQ="),
+                ("preshared_key", "cHNr"),
+                ("reserved", "0,1,2"),
+                ("mtu", "1420"),
+                ("dns", "1.1.1.1,8.8.8.8"),
+                ("persistent_keepalive", "25"),
+            ]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Wireguard(c) = &parsed.protocol.config else {
@@ -2571,18 +2614,15 @@ mod tests {
     fn build_hysteria2_with_ports() {
         let parsed = built(
             ProtocolKind::Hysteria2,
-            settings(
-                Some("token"),
-                &[
-                    ("ports", s("1000-1002,2000")),
-                    ("hop", n(5)),
-                    ("obfs", s("salamander")),
-                    ("obfs_password", s("obfs-secret")),
-                    ("sni", s("real.example.com")),
-                    ("insecure", b(true)),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "token"),
+                ("ports", "1000-1002,2000"),
+                ("hop", "5"),
+                ("obfs", "salamander"),
+                ("obfs_password", "obfs-secret"),
+                ("sni", "real.example.com"),
+                ("insecure", "true"),
+            ]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Hysteria2(c) = &parsed.protocol.config else {
@@ -2606,18 +2646,14 @@ mod tests {
     fn build_hysteria1() {
         let parsed = built(
             ProtocolKind::Hysteria,
-            settings(
-                None,
-                &[
-                    ("auth", s("token")),
-                    ("protocol", s("udp")),
-                    ("obfs", s("salamander")),
-                    ("up_mbps", n(100)),
-                    ("down_mbps", n(200)),
-                    ("sni", s("real.example.com")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("auth", "token"),
+                ("protocol", "udp"),
+                ("obfs", "salamander"),
+                ("up_mbps", "100"),
+                ("down_mbps", "200"),
+                ("sni", "real.example.com"),
+            ]),
         );
         let ProtocolConfig::Hysteria1(c) = &parsed.protocol.config else {
             panic!("expected Hysteria1 config");
@@ -2631,27 +2667,26 @@ mod tests {
 
     #[test]
     fn build_tuic() {
+        // NOTE: no `password` field here — the producer routes a key literally
+        // named `password` to the top-level `user_id` (clobbering `uuid`; see
+        // tuic_password_collides_with_uuid / F6 in the T12 report).
         let parsed = built(
             ProtocolKind::Tuic,
-            settings(
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                &[
-                    ("password", s("pw")),
-                    ("congestion_control", s("bbr")),
-                    ("udp_relay_mode", s("native")),
-                    ("sni", s("real.example.com")),
-                    ("alpn", s("h3")),
-                    ("insecure", b(false)),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("congestion_control", "bbr"),
+                ("udp_relay_mode", "native"),
+                ("sni", "real.example.com"),
+                ("alpn", "h3"),
+                ("insecure", "false"),
+            ]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let ProtocolConfig::Tuic(c) = &parsed.protocol.config else {
             panic!("expected Tuic config");
         };
         assert_eq!(c.uuid, "6202b230-417c-4d8e-b624-0f71afa9c75d");
-        assert_eq!(c.password, "pw");
+        assert_eq!(c.password, "");
         assert_eq!(c.congestion_control.as_deref(), Some("bbr"));
         assert_eq!(c.udp_relay_mode.as_deref(), Some("native"));
         let Some(TlsConfig::Tls(tls)) = &c.security.tls else {
@@ -2663,14 +2698,34 @@ mod tests {
     }
 
     #[test]
+    fn tuic_password_collides_with_uuid() {
+        // F6 (T17 producer fix): fields_to_profile routes BOTH `uuid` and
+        // `password` (exact key names) to the top-level `user_id`; the later
+        // field in form order (`password`) wins. The mapper reads `user_id`
+        // into the config's `uuid` field per the settings contract — the
+        // collision is upstream and must be fixed in the producer. Pinned
+        // here so the behavior is explicit.
+        let settings = producer_settings(&[
+            ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+            ("password", "pw"),
+        ]);
+        let parsed = built(ProtocolKind::Tuic, settings);
+        let ProtocolConfig::Tuic(c) = &parsed.protocol.config else {
+            panic!("expected Tuic config");
+        };
+        assert_eq!(c.uuid, "pw", "last field wins in the producer's user_id");
+        assert_eq!(c.password, "");
+    }
+
+    #[test]
     fn build_naive() {
         let parsed = built(
             ProtocolKind::Naive,
-            settings(
-                Some("secret"),
-                &[("user", s("alice")), ("padding", b(true))],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "secret"),
+                ("user", "alice"),
+                ("padding", "true"),
+            ]),
         );
         let ProtocolConfig::Naive(c) = &parsed.protocol.config else {
             panic!("expected Naive config");
@@ -2684,15 +2739,12 @@ mod tests {
     fn build_anytls() {
         let parsed = built(
             ProtocolKind::AnyTls,
-            settings(
-                Some("secret"),
-                &[
-                    ("sni", s("real.example.com")),
-                    ("alpn", s("h2")),
-                    ("insecure", b(true)),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "secret"),
+                ("sni", "real.example.com"),
+                ("alpn", "h2"),
+                ("insecure", "true"),
+            ]),
         );
         let ProtocolConfig::AnyTls(c) = &parsed.protocol.config else {
             panic!("expected AnyTls config");
@@ -2709,11 +2761,11 @@ mod tests {
     fn build_shadowtls() {
         let parsed = built(
             ProtocolKind::ShadowTls,
-            settings(
-                Some("secret"),
-                &[("version", n(3)), ("sni", s("real.example.com"))],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "secret"),
+                ("version", "3"),
+                ("sni", "real.example.com"),
+            ]),
         );
         let ProtocolConfig::ShadowTls(c) = &parsed.protocol.config else {
             panic!("expected ShadowTls config");
@@ -2730,16 +2782,12 @@ mod tests {
     fn build_tor_ssh_tailscale() {
         let tor = built(
             ProtocolKind::Tor,
-            settings(
-                None,
-                &[
-                    ("socks_port", n(9050)),
-                    ("control_port", n(9051)),
-                    ("control_password", s("pw")),
-                    ("data_dir", s("/tmp/tor")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("socks_port", "9050"),
+                ("control_port", "9051"),
+                ("control_password", "pw"),
+                ("data_dir", "/tmp/tor"),
+            ]),
         );
         let ProtocolConfig::Tor(c) = &tor.protocol.config else {
             panic!("expected Tor config");
@@ -2748,17 +2796,13 @@ mod tests {
 
         let ssh = built(
             ProtocolKind::Ssh,
-            settings(
-                None,
-                &[
-                    ("host", s("ssh.example.com")),
-                    ("ssh_port", n(22)),
-                    ("username", s("root")),
-                    ("private_key", s("key")),
-                    ("auth_method", s("key")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("host", "ssh.example.com"),
+                ("ssh_port", "22"),
+                ("username", "root"),
+                ("private_key", "key"),
+                ("auth_method", "key"),
+            ]),
         );
         let ProtocolConfig::Ssh(c) = &ssh.protocol.config else {
             panic!("expected Ssh config");
@@ -2768,15 +2812,11 @@ mod tests {
 
         let ts = built(
             ProtocolKind::Tailscale,
-            settings(
-                None,
-                &[
-                    ("auth_key", s("tskey-abc")),
-                    ("control_url", s("https://control.example.com")),
-                    ("ephemeral", b(true)),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("auth_key", "tskey-abc"),
+                ("control_url", "https://control.example.com"),
+                ("ephemeral", "true"),
+            ]),
         );
         let ProtocolConfig::Tailscale(c) = &ts.protocol.config else {
             panic!("expected Tailscale config");
@@ -2793,17 +2833,14 @@ mod tests {
     fn build_ssr() {
         let parsed = built(
             ProtocolKind::ShadowsocksR,
-            settings(
-                Some("secret"),
-                &[
-                    ("method", s("aes-256-cfb")),
-                    ("protocol", s("auth_sha1_v4")),
-                    ("obfs", s("tls1.2_ticket_auth")),
-                    ("protocol_param", s("#1")),
-                    ("obfs_param", s("example.com")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "secret"),
+                ("method", "aes-256-cfb"),
+                ("protocol", "auth_sha1_v4"),
+                ("obfs", "tls1.2_ticket_auth"),
+                ("protocol_param", "#1"),
+                ("obfs_param", "example.com"),
+            ]),
         );
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let ProtocolConfig::Ssr(c) = &parsed.protocol.config else {
@@ -2825,7 +2862,7 @@ mod tests {
 
     #[test]
     fn build_rejects_unknown_protocol_settings_key() {
-        let settings = settings(Some("uuid"), &[("bogus", s("x"))], &[]);
+        let settings = raw_settings(Some("uuid"), &[("bogus", Value::String("x".into()))], &[]);
         let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &settings)
             .expect_err("unknown key must error");
         assert_eq!(err, "unknown setting bogus for vless");
@@ -2833,7 +2870,7 @@ mod tests {
 
     #[test]
     fn build_rejects_unknown_stream_settings_key() {
-        let settings = settings(Some("uuid"), &[], &[("ws.foo", s("x"))]);
+        let settings = raw_settings(Some("uuid"), &[], &[("ws.foo", Value::String("x".into()))]);
         let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &settings)
             .expect_err("unknown key must error");
         assert_eq!(err, "unknown setting ws.foo for vless");
@@ -2852,7 +2889,7 @@ mod tests {
 
     #[test]
     fn build_rejects_missing_required_credential() {
-        let raw = settings(None, &[], &[]);
+        let raw = raw_settings(None, &[], &[]);
         let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &raw)
             .expect_err("missing user_id must error");
         assert_eq!(err, "missing required field user_id for vless");
@@ -2860,7 +2897,7 @@ mod tests {
             ProtocolKind::Shadowsocks,
             "1.2.3.4",
             443,
-            &settings(Some("pw"), &[], &[]),
+            &raw_settings(Some("pw"), &[], &[]),
         )
         .expect_err("missing method must error");
         assert_eq!(err, "missing required field method for ss");
@@ -2883,11 +2920,7 @@ mod tests {
             ProtocolKind::Loopback,
             ProtocolKind::Custom,
         ] {
-            let raw = settings(
-                None,
-                &[("network", s("tcp")), ("doko_address", s("10.0.0.1"))],
-                &[],
-            );
+            let raw = producer_settings(&[("network", "tcp"), ("doko_address", "10.0.0.1")]);
             let parsed = built(kind, raw.clone());
             assert_eq!(parsed.protocol.proto_kind, kind);
             assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
@@ -2911,7 +2944,7 @@ mod tests {
             (ProtocolKind::TProxy, "TProxy"),
             (ProtocolKind::Mixed, "Mixed"),
         ] {
-            let raw = settings(None, &[], &[]);
+            let raw = producer_settings(&[]);
             let parsed = built(kind, raw.clone());
             assert_eq!(parsed.protocol.proto_kind, kind);
             assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
@@ -2928,37 +2961,35 @@ mod tests {
 
     #[test]
     fn serialized_config_has_no_address_bytes() {
-        for (kind, user_id, ps, ss) in [
+        for (kind, fields) in [
             (
                 ProtocolKind::Vless,
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                vec![("flow", s("xtls-rprx-vision"))],
                 vec![
-                    ("tls.enable", b(true)),
-                    ("sni", s("real.example.com")),
-                    ("ws.path", s("/ws")),
+                    ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                    ("flow", "xtls-rprx-vision"),
+                    ("tls.enable", "true"),
+                    ("sni", "real.example.com"),
+                    ("ws.path", "/ws"),
                 ],
             ),
             (
                 ProtocolKind::Vmess,
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                vec![],
-                vec![("tls.enable", b(true)), ("ws.host", s("cdn.example.com"))],
+                vec![
+                    ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                    ("tls.enable", "true"),
+                    ("ws.host", "cdn.example.com"),
+                ],
             ),
             (
                 ProtocolKind::Trojan,
-                Some("humanity"),
-                vec![],
-                vec![("sni", s("real.example.com"))],
+                vec![("user_id", "humanity"), ("sni", "real.example.com")],
             ),
             (
                 ProtocolKind::Hysteria2,
-                Some("token"),
-                vec![("sni", s("real.example.com"))],
-                vec![],
+                vec![("user_id", "token"), ("sni", "real.example.com")],
             ),
         ] {
-            let parsed = built(kind, settings(user_id, &ps, &ss));
+            let parsed = built(kind, producer_settings(&fields));
             let json = serde_json::to_string(&parsed.protocol.config).expect("serialize");
             assert!(
                 !json.contains("1.2.3.4"),
@@ -2969,14 +3000,17 @@ mod tests {
 
     #[test]
     fn endpoint_host_kind_detection() {
-        let ipv4 = built(ProtocolKind::Vless, settings(Some("uuid"), &[], &[]));
+        let ipv4 = built(
+            ProtocolKind::Vless,
+            producer_settings(&[("user_id", "uuid")]),
+        );
         assert_eq!(ipv4.endpoints[0].host_type, HostKind::Ipv4);
 
         let ipv6 = build_typed_config(
             ProtocolKind::Vless,
             "2001:db8::1",
             443,
-            &settings(Some("uuid"), &[], &[]),
+            &producer_settings(&[("user_id", "uuid")]),
         )
         .expect("ipv6 build");
         assert_eq!(ipv6.endpoints[0].host_type, HostKind::Ipv6);
@@ -2986,7 +3020,7 @@ mod tests {
             ProtocolKind::Vless,
             "example.com",
             443,
-            &settings(Some("uuid"), &[], &[]),
+            &producer_settings(&[("user_id", "uuid")]),
         )
         .expect("dns build");
         assert_eq!(dns.endpoints[0].host_type, HostKind::Dns);
@@ -3012,17 +3046,15 @@ mod tests {
     fn reconstruct_roundtrip_vless_ws_tls() {
         let parsed = built(
             ProtocolKind::Vless,
-            settings(
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                &[("flow", s("xtls-rprx-vision"))],
-                &[
-                    ("tls.enable", b(true)),
-                    ("sni", s("real.example.com")),
-                    ("fingerprint", s("chrome")),
-                    ("ws.path", s("/ws")),
-                    ("ws.host", s("cdn.example.com")),
-                ],
-            ),
+            producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("flow", "xtls-rprx-vision"),
+                ("tls.enable", "true"),
+                ("sni", "real.example.com"),
+                ("fingerprint", "chrome"),
+                ("ws.path", "/ws"),
+                ("ws.host", "cdn.example.com"),
+            ]),
         );
         assert_reconstruct_roundtrip(&parsed);
     }
@@ -3031,15 +3063,12 @@ mod tests {
     fn reconstruct_roundtrip_trojan() {
         let parsed = built(
             ProtocolKind::Trojan,
-            settings(
-                Some("humanity"),
-                &[],
-                &[
-                    ("sni", s("real.example.com")),
-                    ("alpn", s("h2")),
-                    ("fingerprint", s("chrome")),
-                ],
-            ),
+            producer_settings(&[
+                ("user_id", "humanity"),
+                ("sni", "real.example.com"),
+                ("alpn", "h2"),
+                ("fingerprint", "chrome"),
+            ]),
         );
         assert_reconstruct_roundtrip(&parsed);
     }
@@ -3048,15 +3077,12 @@ mod tests {
     fn reconstruct_roundtrip_shadowsocks() {
         let parsed = built(
             ProtocolKind::Shadowsocks,
-            settings(
-                Some("passw0rd"),
-                &[
-                    ("method", s("aes-256-gcm")),
-                    ("plugin", s("obfs-local")),
-                    ("plugin_opts", s("obfs=http;obfs-host=example.com")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "passw0rd"),
+                ("method", "aes-256-gcm"),
+                ("plugin", "obfs-local"),
+                ("plugin_opts", "obfs=http;obfs-host=example.com"),
+            ]),
         );
         assert_reconstruct_roundtrip(&parsed);
     }
@@ -3068,11 +3094,10 @@ mod tests {
         // still reconstruct and re-parse.
         let parsed = built(
             ProtocolKind::Vless,
-            settings(
-                Some("6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                &[],
-                &[("grpc.serviceName", s("myservice"))],
-            ),
+            producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("grpc.serviceName", "myservice"),
+            ]),
         );
         let url = parsed
             .protocol
@@ -3091,11 +3116,10 @@ mod tests {
     fn reconstruct_roundtrip_shadowsocks2022() {
         let parsed = built(
             ProtocolKind::Shadowsocks2022,
-            settings(
-                Some("0123456789abcdef0123456789abcdef"),
-                &[("method", s("2022-blake3-aes-128-gcm"))],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "0123456789abcdef0123456789abcdef"),
+                ("method", "2022-blake3-aes-128-gcm"),
+            ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks2022);
         assert_reconstruct_roundtrip(&parsed);
@@ -3105,14 +3129,11 @@ mod tests {
     fn hy2_ports_roundtrip_flattens_endpoint() {
         let parsed = built(
             ProtocolKind::Hysteria2,
-            settings(
-                Some("token"),
-                &[
-                    ("ports", s("1000-1002,2000")),
-                    ("sni", s("real.example.com")),
-                ],
-                &[],
-            ),
+            producer_settings(&[
+                ("user_id", "token"),
+                ("ports", "1000-1002,2000"),
+                ("sni", "real.example.com"),
+            ]),
         );
         let url = parsed
             .protocol
@@ -3125,5 +3146,146 @@ mod tests {
             ProtocolConfig::try_parse_proto(&xray_tui_proto::urlx::RawUrlX::from(url.as_str()))
                 .expect("re-parse reconstructed URL");
         assert_eq!(reparsed.endpoints[0].ports, parsed.endpoints[0].ports);
+    }
+
+    // ── producer-accurate end-to-end: real form defaults must build ─────
+
+    /// `form_fields_for` `Protocol` → `ProtocolKind`.
+    fn kind_for_proto(p: Protocol) -> ProtocolKind {
+        match p {
+            Protocol::Vmess => ProtocolKind::Vmess,
+            Protocol::Vless => ProtocolKind::Vless,
+            Protocol::Shadowsocks => ProtocolKind::Shadowsocks,
+            Protocol::Shadowsocks2022 => ProtocolKind::Shadowsocks2022,
+            Protocol::Socks => ProtocolKind::Socks,
+            Protocol::Http => ProtocolKind::Http,
+            Protocol::Trojan => ProtocolKind::Trojan,
+            Protocol::WireGuard => ProtocolKind::WireGuard,
+            Protocol::Hysteria2 => ProtocolKind::Hysteria2,
+            Protocol::DokodemoDoor => ProtocolKind::DokodemoDoor,
+            Protocol::Freedom => ProtocolKind::Freedom,
+            Protocol::Blackhole => ProtocolKind::Blackhole,
+            Protocol::Dns => ProtocolKind::Dns,
+            Protocol::Loopback => ProtocolKind::Loopback,
+            Protocol::Custom => ProtocolKind::Custom,
+            Protocol::Tuic => ProtocolKind::Tuic,
+            Protocol::Hysteria => ProtocolKind::Hysteria,
+            Protocol::Naive => ProtocolKind::Naive,
+            Protocol::AnyTls => ProtocolKind::AnyTls,
+            Protocol::ShadowTls => ProtocolKind::ShadowTls,
+            Protocol::Tor => ProtocolKind::Tor,
+            Protocol::Ssh => ProtocolKind::Ssh,
+            Protocol::Tailscale => ProtocolKind::Tailscale,
+            Protocol::ShadowsocksR => ProtocolKind::ShadowsocksR,
+            Protocol::Redirect => ProtocolKind::Redirect,
+            Protocol::TProxy => ProtocolKind::TProxy,
+            Protocol::Mixed => ProtocolKind::Mixed,
+        }
+    }
+
+    /// The form's own default field values, with empty-default REQUIRED
+    /// fields filled so the builder's required-credential backstop does not
+    /// trip (the TUI validates required fields before submission).
+    fn form_default_fields(proto: Protocol) -> Vec<(&'static str, String)> {
+        let mut fields: Vec<(&'static str, String)> = form_fields_for(proto)
+            .iter()
+            .map(|f| (f.key, f.default.to_string()))
+            .collect();
+        for (key, value) in &mut fields {
+            match (proto, *key) {
+                (Protocol::Vmess | Protocol::Vless | Protocol::Tuic, "user_id" | "uuid") => {
+                    *value = "6202b230-417c-4d8e-b624-0f71afa9c75d".into();
+                }
+                (
+                    Protocol::Shadowsocks
+                    | Protocol::Shadowsocks2022
+                    | Protocol::ShadowsocksR
+                    | Protocol::Trojan
+                    | Protocol::Naive
+                    | Protocol::AnyTls
+                    | Protocol::ShadowTls,
+                    "password",
+                ) => {
+                    *value = "secret".into();
+                }
+                (Protocol::Ssh, "host") => *value = "ssh.example.com".into(),
+                (Protocol::Ssh, "username") => *value = "root".into(),
+                (Protocol::WireGuard, "private_key") => *value = "aGVsbG8=".into(),
+                (Protocol::WireGuard, "public_key") => *value = "d29ybGQ=".into(),
+                (Protocol::Dns, "dns_address") => *value = "1.1.1.1".into(),
+                (Protocol::Custom, "config_json") => *value = "{}".into(),
+                _ => {}
+            }
+        }
+        fields
+    }
+
+    /// Every protocol's REAL form-default key set (default values routed
+    /// through the exact `fields_to_profile` logic) must build without error
+    /// — regression net for the producer-routing contract (F1/F2 class bugs:
+    /// a default-emitted key must never be rejected as unknown, and
+    /// stream-routed keys must never be silently dropped).
+    #[test]
+    fn form_defaults_build_cleanly_for_all_protocols() {
+        for proto in [
+            Protocol::Vmess,
+            Protocol::Vless,
+            Protocol::Shadowsocks,
+            Protocol::Shadowsocks2022,
+            Protocol::Socks,
+            Protocol::Http,
+            Protocol::Trojan,
+            Protocol::WireGuard,
+            Protocol::Hysteria2,
+            Protocol::Hysteria,
+            Protocol::Tuic,
+            Protocol::Naive,
+            Protocol::AnyTls,
+            Protocol::ShadowTls,
+            Protocol::Tor,
+            Protocol::Ssh,
+            Protocol::Tailscale,
+            Protocol::ShadowsocksR,
+            Protocol::DokodemoDoor,
+            Protocol::Freedom,
+            Protocol::Blackhole,
+            Protocol::Loopback,
+            Protocol::Dns,
+            Protocol::Redirect,
+            Protocol::Custom,
+            Protocol::TProxy,
+            Protocol::Mixed,
+        ] {
+            let fields = form_default_fields(proto);
+            let pairs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let settings = producer_settings(&pairs);
+            let result = build_typed_config(kind_for_proto(proto), "1.2.3.4", 443, &settings);
+            assert!(
+                result.is_ok(),
+                "{proto:?} default form must build without error: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// The reviewer-flagged vmess case, pinned explicitly: the real vmess
+    /// form-default key set (incl. `reality.show=false` in stream_settings and
+    /// `tcp.headerType=none`) builds, and sni/tls still map.
+    #[test]
+    fn vmess_form_defaults_build() {
+        let fields = form_default_fields(Protocol::Vmess);
+        let pairs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let settings = producer_settings(&pairs);
+        let parsed = build_typed_config(ProtocolKind::Vmess, "1.2.3.4", 443, &settings)
+            .expect("vmess default form builds");
+        let ProtocolConfig::Vmess(c) = &parsed.protocol.config else {
+            panic!("expected Vmess config");
+        };
+        // Defaults: no TLS, no ws/grpc keys → Tcp transport, no TLS, enc auto
+        // (the parser default; the form's encryption select is a Profile
+        // column dropped by fields_to_profile).
+        assert!(matches!(c.transport, TransportConfig::Tcp));
+        assert!(c.security.tls.is_none());
+        assert_eq!(c.security.enc.as_deref(), Some("auto"));
     }
 }
