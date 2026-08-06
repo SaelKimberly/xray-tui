@@ -519,7 +519,13 @@ fn validate_required_fields(parsed: &ParsedProto) -> Result<(), String> {
             if !endpoint_ok() {
                 return missing("address");
             }
-            cred(&c.uuid)
+            // Legacy has_credential counted uuid OR password (tuic URLs carry
+            // `uuid:password`; password-only must not be stricter).
+            if c.uuid.is_empty() && c.password.is_empty() {
+                missing("user_id")
+            } else {
+                Ok(())
+            }
         }
         ProtocolConfig::Hysteria2(c) => {
             if !endpoint_ok() {
@@ -677,9 +683,8 @@ mod tests {
     }
 
     /// Minimal Vless [`ParsedProto`] whose endpoint host is overridden — lets
-    /// `validate_host` be exercised on arbitrary hosts (private/unspecified
-    /// hosts are rejected at parse time by the typed boundary, so they cannot
-    /// be built through `parse_share_url`).
+    /// `validate_host` be exercised on arbitrary hosts without round-tripping
+    /// through `parse_share_url`.
     fn parsed_with_host(host: &str) -> ParsedProto {
         let mut parsed = ProtocolConfig::try_parse_proto(&RawUrlX::from(
             "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?type=tcp",
@@ -850,19 +855,61 @@ mod tests {
     }
 
     #[test]
-    fn parse_share_url_rejects_private_and_localhost_hosts() {
-        // The typed parse boundary rejects private/loopback/localhost hosts
-        // (ParseError::InvalidPrivateHost) before config-layer validation can
-        // run — unconditionally, even with allow_private_ips.
-        for url in [
-            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@127.0.0.1:443?type=tcp#test",
-            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@10.0.0.5:443?type=tcp#test",
-            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@localhost:443?type=tcp#test",
-        ] {
-            assert!(
-                parse_share_url(url, &permissive_settings()).is_err(),
-                "{url} must be rejected"
-            );
+    fn reject_private_ip() {
+        // Private/loopback hosts parse fine at the typed boundary (structural
+        // only) but are rejected by the config-layer host policy when
+        // allow_private_ips=false.
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@127.0.0.1:443?type=tcp#test";
+        let settings = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
+        assert!(matches!(
+            parse_share_url(url, &settings),
+            Err(ImportError::Validation(_))
+        ));
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@10.0.0.5:443?type=tcp#test";
+        assert!(matches!(
+            parse_share_url(url, &settings),
+            Err(ImportError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn accept_private_ip_when_allowed() {
+        // Same URLs with allow_private_ips=true must succeed (the gate is the
+        // single host-policy authority — regression guard for T11 F1).
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@127.0.0.1:443?type=tcp#test";
+        let settings = ValidationSettings {
+            allow_private_ips: true,
+            reject_insecure: false,
+        };
+        let p = parse_share_url(url, &settings).unwrap();
+        assert_eq!(p.parsed.endpoints[0].host, "127.0.0.1");
+    }
+
+    #[test]
+    fn reject_localhost_hostname() {
+        // "localhost" and "*.localhost" (RFC 6761 special-use domains) parse
+        // fine at the typed boundary and are rejected by the config-layer
+        // host policy when the gate is closed; admitted when it is open.
+        for host in ["localhost", "foo.localhost"] {
+            let url =
+                format!("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@{host}:443?type=tcp#test");
+            let settings = ValidationSettings {
+                allow_private_ips: false,
+                reject_insecure: false,
+            };
+            assert!(matches!(
+                parse_share_url(&url, &settings),
+                Err(ImportError::Validation(_))
+            ));
+            let settings = ValidationSettings {
+                allow_private_ips: true,
+                reject_insecure: false,
+            };
+            let p = parse_share_url(&url, &settings).unwrap();
+            assert_eq!(p.parsed.endpoints[0].host, host);
         }
     }
 
@@ -913,6 +960,34 @@ mod tests {
         // A complete trojan URL validates ok.
         let p = parse_share_url("trojan://pass@example.com:443", &permissive_settings()).unwrap();
         assert!(p.validation.is_ok(), "complete trojan must validate ok");
+    }
+
+    #[test]
+    fn tuic_password_only_validation_not_stricter_than_legacy() {
+        // Legacy has_credential accepted uuid OR password for tuic; the typed
+        // check must not be stricter. (The typed PARSER requires a valid
+        // uuid, so this exercises validate_required_fields directly on a
+        // parsed profile with the uuid stripped.)
+        let mut parsed = ProtocolConfig::try_parse_proto(&RawUrlX::from(
+            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:pw@example.com:443",
+        ))
+        .expect("canonical tuic URL parses");
+        match &mut parsed.protocol.config {
+            ProtocolConfig::Tuic(c) => c.uuid.clear(),
+            other => panic!("expected tuic config, got {other:?}"),
+        }
+        assert!(
+            validate_required_fields(&parsed).is_ok(),
+            "password-only tuic must pass validation"
+        );
+        match &mut parsed.protocol.config {
+            ProtocolConfig::Tuic(c) => c.password.clear(),
+            other => panic!("expected tuic config, got {other:?}"),
+        }
+        assert!(
+            validate_required_fields(&parsed).is_err(),
+            "credential-less tuic must fail validation"
+        );
     }
 
     #[test]

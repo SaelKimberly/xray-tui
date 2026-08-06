@@ -84,6 +84,12 @@ pub enum ParseError {
     #[error("not a proxy config URL (promotion or navigation link)")]
     PromotionUrl,
     /// Private/reserved/loopback IP address as the server host.
+    ///
+    /// No longer raised by the parsers: host *policy* (private/loopback/
+    /// link-local/localhost rejection, gated by `allow_private_ips`) moved to
+    /// the config layer (`xray-tui-config::import_export::validate_host`) in
+    /// T11, which is the single host-policy authority. Kept for API
+    /// compatibility; slated for removal with the legacy surface in T23.
     #[error("private/reserved host: {0}")]
     InvalidPrivateHost(Cow<'static, str>),
     /// The protocol is recognized but not yet implemented as a placeholder.
