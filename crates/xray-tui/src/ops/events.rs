@@ -762,6 +762,13 @@ fn apply_stats_delta(
 /// pending `SubscriptionsUpdated`/`SpeedTestResult`/`EndpointInfoUpdated`
 /// must not be lost (e.g. a `SubscriptionsUpdated` whose
 /// `updating_groups.remove` never runs would leave the group spinner stuck).
+/// Session-scoped lifecycle/error events (`Connected`/`Disconnected`/
+/// `Error`/`StatsError`) are exceptions: meaningless after teardown, and
+/// their handlers mutate session state unconditionally — a re-sent
+/// `StatsError` would re-set `connection_error` after `disconnect()` cleared
+/// it (the footer would paint "Error: ..." for the whole disconnected
+/// period), and a re-sent `Connected` would resurrect `connected_core` on a
+/// disconnected UI.
 pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileStats> {
     let mut touched: Vec<ProfileStats> = Vec::new();
     let mut non_stats: Vec<CoreEvent> = Vec::new();
@@ -773,38 +780,43 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
             Ok(ev) => ev,
             Err(_) => break,
         };
-        if let CoreEvent::StatsUpdate {
-            protocol_id,
-            today_up,
-            today_down,
-            total_up,
-            total_down,
-        } = event
-        {
-            if !is_connected_protocol(state, protocol_id) {
-                continue;
-            }
-            if apply_stats_delta(
-                &mut state.endpoints,
+        match event {
+            CoreEvent::StatsUpdate {
                 protocol_id,
                 today_up,
                 today_down,
                 total_up,
                 total_down,
-            ) && let Some(link) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
-                .and_then(|row| {
-                    row.links
-                        .iter()
-                        .find(|l| l.protocol_id.get() == protocol_id)
-                })
-            {
-                // Keep only the final state per link (a protocol can appear
-                // more than once if several ticks were pending).
-                touched.retain(|l| l.protocol_id != link.protocol_id);
-                touched.push(link.clone());
+            } => {
+                if !is_connected_protocol(state, protocol_id) {
+                    continue;
+                }
+                if apply_stats_delta(
+                    &mut state.endpoints,
+                    protocol_id,
+                    today_up,
+                    today_down,
+                    total_up,
+                    total_down,
+                ) && let Some(link) =
+                    endpoint_row_for_protocol(&mut state.endpoints, protocol_id).and_then(|row| {
+                        row.links
+                            .iter()
+                            .find(|l| l.protocol_id.get() == protocol_id)
+                    })
+                {
+                    // Keep only the final state per link (a protocol can
+                    // appear more than once if several ticks were pending).
+                    touched.retain(|l| l.protocol_id != link.protocol_id);
+                    touched.push(link.clone());
+                }
             }
-        } else {
-            non_stats.push(event);
+            // Session-scoped: dropped at the disconnect boundary.
+            CoreEvent::Connected(_)
+            | CoreEvent::Disconnected
+            | CoreEvent::Error(_)
+            | CoreEvent::StatsError(_) => {}
+            other => non_stats.push(other),
         }
     }
     // Re-send non-stats events in drain order (channel capacity is 65536 in
@@ -1131,6 +1143,55 @@ mod tests {
             !state.updating_groups.contains("g1"),
             "subscription result delivered post-drain"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_flush_drops_session_scoped_error_events() {
+        // Session-scoped lifecycle/error events pending at disconnect must
+        // not be re-sent: a re-sent StatsError would re-set
+        // `connection_error` after disconnect() cleared it (stale "Error:"
+        // footer), and a re-sent Connected would resurrect connected_core on
+        // a disconnected UI.
+        let (mut state, _orig_tx) = event_state().await;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        state.core_event_rx = Some(rx);
+        state.core_event_tx = Some(tx.clone());
+        let row = row_with_protocols(100, 1, 7);
+        state.endpoints = vec![row];
+        state.connected_protocol_id = Some(100);
+        state.connected_core = Some(CoreType::Xray);
+
+        tx.send(CoreEvent::StatsError("stats api unavailable".to_string()))
+            .await
+            .unwrap();
+        tx.send(CoreEvent::Error("config build failed".to_string()))
+            .await
+            .unwrap();
+        tx.send(CoreEvent::Connected(CoreType::Xray)).await.unwrap();
+
+        state.disconnect();
+        assert_eq!(
+            state.connection_error, None,
+            "footer stays clean after disconnect"
+        );
+        assert_eq!(
+            state.connected_core, None,
+            "connected state not resurrected by a stale Connected"
+        );
+        // The only event re-delivered after the drain is disconnect()'s own
+        // "Disconnected" TuiLog (it logs through the same channel) — the
+        // session-scoped StatsError/Error/Connected must be gone.
+        let mut seen_disconnect_log = false;
+        while let Some(rx) = state.core_event_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(CoreEvent::TuiLog { message, .. }) => {
+                    seen_disconnect_log |= message.contains("Disconnected");
+                }
+                Ok(other) => panic!("unexpected re-sent event after disconnect: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(seen_disconnect_log, "disconnect log present");
     }
 
     #[tokio::test]
