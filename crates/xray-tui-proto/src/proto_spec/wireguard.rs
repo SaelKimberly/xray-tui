@@ -459,8 +459,10 @@ impl WireguardConfig {
     /// `address` (T12 F5: no form source — URL imports always carry it) is
     /// emitted as-is, possibly empty. `reserved` (comma-separated decimals or
     /// base64 in the typed config) is decoded to the byte array xray expects
-    /// (required for Cloudflare WARP endpoints). `dns`/`remote_dns_resolve`
-    /// have no xray outbound key and are dropped (sing-box-only concepts).
+    /// (required for Cloudflare WARP endpoints) — emitted only when exactly 3
+    /// bytes, since xray-core rejects other lengths at config load.
+    /// `dns`/`remote_dns_resolve` have no xray outbound key and are dropped
+    /// (sing-box-only concepts).
     fn inject_xray(
         &self,
         core_conf: &mut Value,
@@ -529,25 +531,32 @@ fn wg_endpoint(host: &str, port: u16) -> String {
 
 /// Decode the typed `reserved` field (comma-separated decimals or base64 per
 /// the module doc) into the byte array xray-core's wireguard config expects.
+///
+/// Returns `None` unless the decoded value is EXACTLY 3 bytes — xray-core
+/// rejects any other length at config load
+/// (`infra/conf/wireguard.go`: `"reserved" should be empty or 3 bytes`), so a
+/// malformed value is skipped rather than hard-failing the whole outbound.
 fn parse_reserved_bytes(raw: &str) -> Option<Vec<u8>> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
     // Comma-separated decimals: "236,163,162"
-    if raw.contains(',') {
+    let bytes = if raw.contains(',') {
         let mut bytes = Vec::new();
         for part in raw.split(',') {
             bytes.push(part.trim().parse::<u8>().ok()?);
         }
-        return Some(bytes);
-    }
-    // Base64-encoded bytes (URL-safe or standard, padded or not)
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw))
-        .ok()
+        bytes
+    } else {
+        // Base64-encoded bytes (URL-safe or standard, padded or not)
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw))
+            .ok()?
+    };
+    (bytes.len() == 3).then_some(bytes)
 }
 
 #[cfg(test)]
@@ -852,6 +861,40 @@ mod tests {
         assert_eq!(parse_reserved_bytes("7KOi"), Some(vec![236, 163, 162]));
         assert_eq!(parse_reserved_bytes(""), None);
         assert_eq!(parse_reserved_bytes("999"), None);
+    }
+
+    #[test]
+    fn parse_reserved_bytes_rejects_non_three_byte_values() {
+        // xray-core refuses any length other than 0 or 3 at config load
+        // ("reserved" should be empty or 3 bytes) — malformed values must be
+        // skipped, not emitted.
+        assert_eq!(parse_reserved_bytes("1,2"), None);
+        assert_eq!(parse_reserved_bytes("1,2,3,4"), None);
+        // base64 of [1,2,3,4] (4 bytes)
+        assert_eq!(parse_reserved_bytes("AQIDBA"), None);
+        // base64 of [1,2] (2 bytes)
+        assert_eq!(parse_reserved_bytes("AQI"), None);
+    }
+
+    #[test]
+    fn xray_inject_skips_malformed_reserved() {
+        let url = format!(
+            "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&reserved=1%2C2"
+        );
+        let cfg = config(parse(&url));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("162.159.192.1", 2408)),
+            InjectOptions::default(),
+        )
+        .expect("wireguard inject");
+        assert!(
+            conf["settings"].get("reserved").is_none(),
+            "2-byte reserved must not be emitted: {}",
+            conf["settings"]
+        );
     }
 
     #[test]
