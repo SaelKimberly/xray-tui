@@ -1510,6 +1510,35 @@ fn tls_opts_always_tls(ps: &SettingsMap, ss: &SettingsMap, with_alpn: bool) -> T
     }
 }
 
+/// The add/edit form always emits the `network` select (default "tcp") and
+/// renders the ws/grpc stream fields unconditionally. A submission that fills
+/// WebSocket/gRPC fields while leaving the select on tcp would otherwise
+/// silently drop them (`transport_and_path` treats network=tcp as
+/// authoritative — the I1 P2 regression). Reject the mismatch loudly for both
+/// add and edit. Absent `network` (legacy producers) is untouched: key
+/// presence still infers the transport.
+fn validate_network_vs_transport_fields(
+    proto: &str,
+    ps: &SettingsMap,
+    ss: &SettingsMap,
+) -> Result<(), String> {
+    let network = ps.get("network").and_then(value_string);
+    if !network
+        .as_deref()
+        .is_some_and(|n| n == "tcp" || n.is_empty())
+    {
+        return Ok(());
+    }
+    let ws_set = opt_string(ss.get("ws.path")).is_some() || opt_string(ss.get("ws.host")).is_some();
+    let grpc_set = opt_string(ss.get("grpc.serviceName")).is_some();
+    if ws_set || grpc_set {
+        return Err(format!(
+            "network must be ws/grpc when WebSocket/gRPC fields are set for {proto}"
+        ));
+    }
+    Ok(())
+}
+
 /// Transport from the form's stream keys and `network` select. The form's
 /// `network` select is routed by `fields_to_parsed` into
 /// `protocol_settings.network` and is authoritative when present: network=kcp
@@ -1687,6 +1716,7 @@ fn vless_from_form(
             "grpc.serviceName",
         ],
     )?;
+    validate_network_vs_transport_fields("vless", ps, ss)?;
     let uuid = req_string("vless", "user_id", user_id)?;
     let (transport, path) = transport_and_path(ps, ss);
     let security = tls_security_from_stream(ps, ss);
@@ -1764,6 +1794,7 @@ fn vmess_from_form(
             "reality.show",
         ],
     )?;
+    validate_network_vs_transport_fields("vmess", ps, ss)?;
     let uuid = req_string("vmess", "user_id", user_id)?;
     let (transport, path) = transport_and_path(ps, ss);
     let mut security = tls_security_from_stream(ps, ss);
@@ -2516,6 +2547,44 @@ mod tests {
     }
 
     #[test]
+    fn build_vless_network_tcp_with_ws_path_errors() {
+        // The add form initializes `network` to "tcp" (default select) and
+        // renders ws.path unconditionally, so a user who fills WebSocket
+        // Path but leaves the Network select untouched would silently get a
+        // Tcp transport with the path discarded. Validation must reject the
+        // mismatch loudly; selecting ws builds the Ws transport with the
+        // path.
+        let settings = producer_settings(&[
+            ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+            ("network", "tcp"),
+            ("ws.path", "/x"),
+        ]);
+        let err = build_typed_config(ProtocolKind::Vless, "1.2.3.4", 443, &settings)
+            .expect_err("network=tcp with ws.path must be rejected");
+        assert_eq!(
+            err,
+            "network must be ws/grpc when WebSocket/gRPC fields are set for vless"
+        );
+
+        let parsed = built(
+            ProtocolKind::Vless,
+            &producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("network", "ws"),
+                ("ws.path", "/x"),
+            ]),
+        );
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        let TransportConfig::Ws(ws) = &c.transport else {
+            panic!("expected ws transport (network=ws)");
+        };
+        assert_eq!(ws.path.as_deref(), Some("/x"));
+        assert_eq!(c.path.as_deref(), Some("/x"));
+    }
+
+    #[test]
     fn build_vless_network_kcp() {
         // network=kcp selects the Kcp variant (no ws/grpc keys involved).
         let parsed = built(
@@ -2533,24 +2602,24 @@ mod tests {
     }
 
     #[test]
-    fn build_vmess_network_tcp_ignores_stale_ws() {
-        // network=tcp is authoritative: leftover ws.* keys must not override
-        // the explicit TCP selection (the I1 regression).
-        let parsed = built(
-            ProtocolKind::Vmess,
-            &producer_settings(&[
-                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
-                ("network", "tcp"),
-                ("ws.path", "/stale"),
-                ("ws.host", "old.example.com"),
-            ]),
+    fn build_vmess_network_tcp_with_ws_fields_errors() {
+        // network=tcp is authoritative in transport_and_path, but the form
+        // defaults the select to "tcp" while rendering ws fields
+        // unconditionally — a submission with both must fail loudly instead
+        // of silently discarding the ws values (the I1 P2 add-flow
+        // regression).
+        let settings = producer_settings(&[
+            ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+            ("network", "tcp"),
+            ("ws.path", "/stale"),
+            ("ws.host", "old.example.com"),
+        ]);
+        let err = build_typed_config(ProtocolKind::Vmess, "1.2.3.4", 443, &settings)
+            .expect_err("network=tcp with ws fields must be rejected");
+        assert_eq!(
+            err,
+            "network must be ws/grpc when WebSocket/gRPC fields are set for vmess"
         );
-        let ProtocolConfig::Vmess(c) = &parsed.protocol.config else {
-            panic!("expected Vmess config");
-        };
-        assert!(matches!(c.transport, TransportConfig::Tcp));
-        assert_eq!(c.path, None);
-        assert_eq!(c.security.enc.as_deref(), Some("auto"));
     }
 
     #[test]

@@ -477,11 +477,14 @@ pub fn fields_to_parsed(
         match key.as_str() {
             // The vmess/vless form's transport `network` select is a real
             // setting: routed into `protocol_settings.network` so the T12
-            // mapper builds the typed transport from it (network=kcp → Kcp;
-            // network=tcp with stale ws.*/grpc.* keys stays Tcp). Other
-            // kinds' `network` fields are Profile columns — dropped (edit
-            // forms seed network from `transport_type()`, e.g. trojan "tcp",
-            // hy/hy2/tuic "quic", and those mappers do not accept the key).
+            // mapper builds the typed transport from it (network=kcp → Kcp).
+            // network=tcp with non-empty ws.*/grpc.* keys is rejected by
+            // build_typed_config validation (the add-flow P2 regression: the
+            // form defaults the select to "tcp" while rendering the ws/grpc
+            // fields unconditionally). Other kinds' `network` fields are
+            // Profile columns — dropped (edit forms seed network from
+            // `transport_type()`, e.g. trojan "tcp", hy/hy2/tuic "quic", and
+            // those mappers do not accept the key).
             "network" if matches!(kind, ProtocolKind::Vless | ProtocolKind::Vmess) => {
                 proto_map.insert(key.clone(), json_val);
             }
