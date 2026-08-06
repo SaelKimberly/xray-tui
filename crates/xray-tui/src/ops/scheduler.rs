@@ -24,6 +24,17 @@
 //! - Persistence failures are logged and the logical outcome still returned;
 //!   the next `schedule`/`sweep_orphans` pass reconciles (an id persisted as
 //!   `task_id` but absent from the registry is the orphan case).
+//!
+//! ## Concurrency
+//!
+//! Every gate transition ([`TaskScheduler::schedule`], `complete`,
+//! `cancel_queued`, `sweep_orphans`) holds one internal async mutex for the
+//! whole check-then-act (persist included) and re-reads the persisted link
+//! inside the critical section. Concurrent callers on the same link therefore
+//! observe each other's writes: at most one `Started` outcome per gate-open,
+//! and a stale caller snapshot can never double-advance the gate. The mutex
+//! adds no serialization beyond what SQLite's single-writer model already
+//! imposes.
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -114,6 +125,13 @@ pub struct TaskScheduler {
     dns_defer_secs: i64,
     /// Endpoints whose DNS failed recently, by last failure time.
     dns_failures: DashMap<EndpointId, Timestamp>,
+    /// Serializes every gate transition ([`Self::schedule`], [`Self::complete`],
+    /// [`Self::cancel_queued`], [`Self::sweep_orphans`]): the check-then-act
+    /// re-reads the persisted link inside the critical section, so concurrent
+    /// callers on the same link observe each other's writes — at most one
+    /// `Started` per gate-open. Contention is bounded: SQLite is single-writer
+    /// anyway, so this adds no serialization the DB would not impose.
+    gate: tokio::sync::Mutex<()>,
 }
 
 impl TaskScheduler {
@@ -126,21 +144,31 @@ impl TaskScheduler {
             queue_limit,
             dns_defer_secs,
             dns_failures: DashMap::new(),
+            gate: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Decide whether a new task for `link` may run now, and persist the
     /// decision. See the module docs for the fire-handshake.
+    ///
+    /// The caller's `link` is treated as a snapshot: the decision re-reads
+    /// the persisted row inside the gate, so a stale snapshot cannot produce
+    /// two `Started` outcomes on the same link.
     pub async fn schedule(
         &self,
         link: &ProfileStats,
         kind: TaskKind,
         db: &impl SchedulerDb,
     ) -> ScheduleOutcome {
-        // DNS deferral FIRST — nothing is touched.
+        // DNS deferral FIRST — nothing is touched. No gate needed: the
+        // failure map is a DashMap and the check mutates nothing but expired
+        // entries.
         if self.is_dns_deferred(link.endpoint_id, Timestamp::now()) {
             return ScheduleOutcome::DnsDeferred;
         }
+
+        let _guard = self.gate.lock().await;
+        let link = self.fresh(link, db).await;
 
         let Some(current) = link.task_id else {
             // Gate open: allocate, register, persist, fire.
@@ -148,7 +176,7 @@ impl TaskScheduler {
             self.tasks.insert(id, kind);
             self.persist(
                 db,
-                link,
+                &link,
                 Some(id),
                 &link.task_queue,
                 &format!("start task {id}"),
@@ -171,8 +199,14 @@ impl TaskScheduler {
             self.tasks.insert(id, kind);
             let mut queue = link.task_queue.clone();
             queue.push(id);
-            self.persist(db, link, Some(current), &queue, &format!("queue task {id}"))
-                .await;
+            self.persist(
+                db,
+                &link,
+                Some(current),
+                &queue,
+                &format!("queue task {id}"),
+            )
+            .await;
             return ScheduleOutcome::Queued(id);
         }
 
@@ -189,7 +223,7 @@ impl TaskScheduler {
             .collect();
         self.persist(
             db,
-            link,
+            &link,
             Some(id),
             &wiped,
             &format!("orphan-replace task {id}"),
@@ -202,11 +236,29 @@ impl TaskScheduler {
     /// matches the live registry entry is honored (race guard); anything
     /// else is stale and leaves the gate untouched.
     ///
-    /// FIFO pop: persists `task_id = queue.first, queue = rest`. The caller
-    /// must re-read the link and dispatch the new `task_id` (see module
-    /// docs).
+    /// FIFO pop: persists `task_id = first registered queue id, queue =
+    /// rest`. Queue ids that are no longer registered (a cancel persist
+    /// failure or a missed orphan wipe) are skipped and dropped from the
+    /// rewritten queue; if nothing live remains, the gate is cleared. The
+    /// caller must re-read the link and dispatch the new `task_id` (see
+    /// module docs).
     pub async fn complete(&self, link: &ProfileStats, kind: TaskKind, db: &impl SchedulerDb) {
-        let Some(current) = link.task_id else {
+        let _guard = self.gate.lock().await;
+        let fresh = self.fresh(link, db).await;
+        // Stale completion: the gate advanced since the caller read the
+        // link, so the completed task is no longer current — do not advance
+        // the gate twice.
+        if fresh.task_id != link.task_id {
+            debug!(
+                target: "tui::scheduler",
+                "complete: stale snapshot on xray-tui://{:x} (task_id {:?} -> {:?}) — ignored",
+                link.protocol_id.get(),
+                link.task_id,
+                fresh.task_id,
+            );
+            return;
+        }
+        let Some(current) = fresh.task_id else {
             debug!(
                 target: "tui::scheduler",
                 "complete: no task_id on xray-tui://{:x}",
@@ -224,23 +276,37 @@ impl TaskScheduler {
         }
         self.tasks.remove(&current);
 
-        let mut queue = link.task_queue.clone();
-        let next = if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        };
-        self.persist(db, link, next, &queue, &format!("complete task {current}"))
-            .await;
+        // Pop FIFO, skipping ids that are no longer registered: advancing
+        // past them also drops them from the rewritten queue. If nothing
+        // live remains, the gate is cleared.
+        let mut queue = fresh.task_queue.clone();
+        let mut next = None;
+        while !queue.is_empty() {
+            let candidate = queue.remove(0);
+            if self.tasks.contains_key(&candidate) {
+                next = Some(candidate);
+                break;
+            }
+        }
+        self.persist(
+            db,
+            &fresh,
+            next,
+            &queue,
+            &format!("complete task {current}"),
+        )
+        .await;
     }
 
     /// Sibling cancel: drop every queued id whose registry entry is `kind`
-    /// (other kinds are preserved). Persists the filtered queue; skips the
-    /// write when nothing matched.
+    /// (other kinds are preserved). Persists the filtered queue against the
+    /// CURRENT gate state; skips the write when nothing matched.
     pub async fn cancel_queued(&self, link: &ProfileStats, kind: TaskKind, db: &impl SchedulerDb) {
-        let mut kept = Vec::with_capacity(link.task_queue.len());
+        let _guard = self.gate.lock().await;
+        let fresh = self.fresh(link, db).await;
+        let mut kept = Vec::with_capacity(fresh.task_queue.len());
         let mut changed = false;
-        for id in &link.task_queue {
+        for id in &fresh.task_queue {
             if self.tasks.get(id).map(|k| *k) == Some(kind) {
                 self.tasks.remove(id);
                 changed = true;
@@ -253,8 +319,8 @@ impl TaskScheduler {
         }
         self.persist(
             db,
-            link,
-            link.task_id,
+            &fresh,
+            fresh.task_id,
             &kept,
             &format!("cancel queued {kind:?}"),
         )
@@ -272,19 +338,45 @@ impl TaskScheduler {
     /// Wipe queued ids that are not live in this process's registry (stale
     /// after a restart or a persist failure). Only the queue is touched;
     /// `task_id` reconciliation happens on the next `schedule` via the
-    /// orphan branch. Skips the write when nothing changed.
+    /// orphan branch. Operates on the current gate state; skips the write
+    /// when nothing changed.
     pub async fn sweep_orphans(&self, link: &ProfileStats, db: &impl SchedulerDb) {
-        let kept: Vec<u16> = link
+        let _guard = self.gate.lock().await;
+        let fresh = self.fresh(link, db).await;
+        let kept: Vec<u16> = fresh
             .task_queue
             .iter()
             .copied()
             .filter(|id| self.tasks.contains_key(id))
             .collect();
-        if kept.len() == link.task_queue.len() {
+        if kept.len() == fresh.task_queue.len() {
             return;
         }
-        self.persist(db, link, link.task_id, &kept, "sweep orphaned queue ids")
+        self.persist(db, &fresh, fresh.task_id, &kept, "sweep orphaned queue ids")
             .await;
+    }
+
+    /// Re-read the persisted link inside the gate so the check-then-act runs
+    /// on current state. Falls back to the caller's snapshot when the row is
+    /// gone or the read fails (the persist that follows will surface real
+    /// DB trouble).
+    async fn fresh<'a>(
+        &self,
+        link: &'a ProfileStats,
+        db: &impl SchedulerDb,
+    ) -> std::borrow::Cow<'a, ProfileStats> {
+        match db.read_link(link.protocol_id, link.endpoint_id).await {
+            Ok(Some(fresh)) => std::borrow::Cow::Owned(fresh),
+            Ok(None) => std::borrow::Cow::Borrowed(link),
+            Err(e) => {
+                error!(
+                    target: "tui::scheduler",
+                    "read_link for xray-tui://{:x}: {e}",
+                    link.protocol_id.get(),
+                );
+                std::borrow::Cow::Borrowed(link)
+            }
+        }
     }
 
     /// Allocate a fresh task id: never `0`, never a live id, wrapping.
@@ -468,7 +560,7 @@ mod tests {
     async fn gate_none_starts_live_queue() {
         let s = sched();
         let db = MockDb::default();
-        let mut l = link(1, 10, None, Vec::new());
+        let l = link(1, 10, None, Vec::new());
         db.put(&l);
 
         // None -> Started, id persisted as task_id.
@@ -482,8 +574,10 @@ mod tests {
         assert_eq!(task_id, Some(id));
         assert!(queue.is_empty());
 
-        // Live -> Queued, queue grows with a fresh id.
-        l.task_id = Some(id);
+        // Live -> Queued even when the caller passes the ORIGINAL stale
+        // snapshot (task_id == None): schedule re-reads the persisted link
+        // inside the gate, so it sees the winner's id and queues instead of
+        // starting a second probe.
         let out = s.schedule(&l, TaskKind::RealPing, &db).await;
         let qid = match out {
             ScheduleOutcome::Queued(id) => id,
@@ -546,6 +640,56 @@ mod tests {
         let (task_id, queue) = db.state_of(&l);
         assert_eq!(task_id, Some(id), "orphan replaced with the fresh id");
         assert_eq!(queue, vec![3], "orphan queue ids wiped, live ones kept");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_schedule_same_link_single_winner() {
+        let s = Arc::new(TaskScheduler::new(3, 5));
+        let db = Arc::new(MockDb::default());
+        db.put(&link(1, 10, None, Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&s);
+            let db = Arc::clone(&db);
+            handles.push(tokio::spawn(async move {
+                // Caller flow: read the link, then schedule. The snapshot is
+                // stale by the time the gate opens — schedule re-reads.
+                let l =
+                    SchedulerDb::read_link(db.as_ref(), ProtocolId::new(1), EndpointId::new(10))
+                        .await
+                        .unwrap()
+                        .expect("link");
+                s.schedule(&l, TaskKind::FastPing, db.as_ref()).await
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for h in handles {
+            outcomes.push(h.await.unwrap());
+        }
+        let started = outcomes
+            .iter()
+            .filter(|o| matches!(o, ScheduleOutcome::Started(_)))
+            .count();
+        assert_eq!(started, 1, "exactly one winner, got {outcomes:?}");
+        let queued = outcomes
+            .iter()
+            .filter(|o| matches!(o, ScheduleOutcome::Queued(_)))
+            .count();
+        let full = outcomes
+            .iter()
+            .filter(|o| matches!(o, ScheduleOutcome::QueueFull))
+            .count();
+        assert_eq!(
+            (queued, full),
+            (3, 4),
+            "queue_limit 3: 1 Started + 3 Queued + 4 QueueFull, got {outcomes:?}"
+        );
+        let (task_id, _) = db.state_of(&link(1, 10, None, Vec::new()));
+        assert!(
+            task_id.is_some(),
+            "gate persisted after concurrent scheduling"
+        );
     }
 
     // ── alloc_id ───────────────────────────────────────────────────────
@@ -622,6 +766,44 @@ mod tests {
             (Some(7), vec![8]),
             "stale completion must not advance the gate"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_skips_unregistered_queue_ids() {
+        let s = sched();
+        let db = MockDb::default();
+        // task_id=7 live; queue [8] unregistered (e.g. a cancel_queued
+        // persist failure left it dangling), [9] live.
+        let l = link(1, 10, Some(7), vec![8, 9]);
+        db.put(&l);
+        s.tasks.insert(7, TaskKind::FastPing);
+        s.tasks.insert(9, TaskKind::FastPing);
+
+        s.complete(&l, TaskKind::FastPing, &db).await;
+
+        assert!(!s.tasks.contains_key(&7), "completed task removed");
+        let (task_id, queue) = db.state_of(&l);
+        assert_eq!(
+            task_id,
+            Some(9),
+            "promotion skips the unregistered id and advances to the next live one"
+        );
+        assert_eq!(queue, Vec::<u16>::new(), "dead id dropped from the queue");
+    }
+
+    #[tokio::test]
+    async fn complete_all_queued_dead_clears_gate() {
+        let s = sched();
+        let db = MockDb::default();
+        let l = link(1, 10, Some(7), vec![8]);
+        db.put(&l);
+        s.tasks.insert(7, TaskKind::FastPing);
+
+        s.complete(&l, TaskKind::FastPing, &db).await;
+
+        let (task_id, queue) = db.state_of(&l);
+        assert_eq!(task_id, None, "no live id remains — gate cleared");
+        assert!(queue.is_empty());
     }
 
     // ── cancel_queued ──────────────────────────────────────────────────
