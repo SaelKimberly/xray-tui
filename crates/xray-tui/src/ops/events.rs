@@ -38,6 +38,18 @@ fn same_local_day(a: jiff::Timestamp, b: jiff::Timestamp) -> bool {
     a.to_zoned(tz.clone()).date() == b.to_zoned(tz).date()
 }
 
+/// True when `protocol_id` belongs to the currently connected endpoint — the
+/// stale-event guard shared by the events handler and the disconnect flush:
+/// only the connected session's poller may write traffic.
+fn is_connected_protocol(state: &AppState, protocol_id: i64) -> bool {
+    let Some(eid) = state.connected_protocol_id else {
+        return false;
+    };
+    state.endpoints.iter().any(|row| {
+        row.endpoint.id.get() == eid && row.links.iter().any(|l| l.protocol_id.get() == protocol_id)
+    })
+}
+
 /// The persisted `error.kind` bucket for a test type: fast-class tests
 /// (TCP/UDP) land in `Fast`, data-plane tests (real ping, speed) in `Real`.
 /// Name-resolution failures surface on real attempts and share the real
@@ -126,12 +138,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // endpoint does not own (left over from a profile switch, or
                 // still in the channel after disconnect) must not accumulate
                 // into the row or drive the actions-log deltas.
-                let Some(eid) = state.connected_protocol_id else {
-                    continue;
-                };
-                let current = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
-                    .is_some_and(|row| row.endpoint.id.get() == eid);
-                if !current {
+                if !is_connected_protocol(state, protocol_id) {
                     continue;
                 }
                 // protocol_id is a Protocol row id — match the row whose links
@@ -746,12 +753,18 @@ fn apply_stats_delta(
 /// Drain the core-event channel of `StatsUpdate` events the poller sent
 /// before disconnect — the event loop (which drains once per frame) may not
 /// have processed them yet, so the final session delta could otherwise be
-/// lost when the task is aborted. Each pending delta is accumulated into its
-/// owning link; returns the final link row state for the caller to persist
-/// once. Non-stats events are left in the channel (the event loop drains
-/// them normally after disconnect).
-pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Option<ProfileStats> {
-    let mut last_protocol: Option<i64> = None;
+/// lost when the task is aborted. Only deltas belonging to the connected
+/// session are accumulated (the same guard as the events handler); returns
+/// the final row state of every touched link for the caller to persist.
+///
+/// Non-stats events are NOT dropped: they are buffered and re-sent through
+/// the channel so the event loop still delivers them after disconnect — a
+/// pending `SubscriptionsUpdated`/`SpeedTestResult`/`EndpointInfoUpdated`
+/// must not be lost (e.g. a `SubscriptionsUpdated` whose
+/// `updating_groups.remove` never runs would leave the group spinner stuck).
+pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileStats> {
+    let mut touched: Vec<ProfileStats> = Vec::new();
+    let mut non_stats: Vec<CoreEvent> = Vec::new();
     loop {
         let Some(rx) = state.core_event_rx.as_mut() else {
             break;
@@ -767,22 +780,41 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Option<Profil
             total_up,
             total_down,
         } = event
-            && apply_stats_delta(
+        {
+            if !is_connected_protocol(state, protocol_id) {
+                continue;
+            }
+            if apply_stats_delta(
                 &mut state.endpoints,
                 protocol_id,
                 today_up,
                 today_down,
                 total_up,
                 total_down,
-            )
-        {
-            last_protocol = Some(protocol_id);
+            ) && let Some(link) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
+                .and_then(|row| {
+                    row.links
+                        .iter()
+                        .find(|l| l.protocol_id.get() == protocol_id)
+                })
+            {
+                // Keep only the final state per link (a protocol can appear
+                // more than once if several ticks were pending).
+                touched.retain(|l| l.protocol_id != link.protocol_id);
+                touched.push(link.clone());
+            }
+        } else {
+            non_stats.push(event);
         }
     }
-    let pid = last_protocol?;
-    endpoint_row_for_protocol(&mut state.endpoints, pid)
-        .and_then(|row| row.links.iter().find(|l| l.protocol_id.get() == pid))
-        .cloned()
+    // Re-send non-stats events in drain order (channel capacity is 65536 in
+    // production; a drop here is bounded by a full queue, not by the drain).
+    if let Some(tx) = &state.core_event_tx {
+        for event in non_stats {
+            let _ = tx.try_send(event);
+        }
+    }
+    touched
 }
 
 #[cfg(test)]
@@ -1052,6 +1084,120 @@ mod tests {
         assert!(state.poll_core_events().await);
         assert_eq!(state.endpoints[0].links[0].traffic.total_up, 100);
         assert_eq!(state.current_traffic_up, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_flush_preserves_non_stats_events() {
+        // The disconnect flush must not eat non-stats events: a pending
+        // SubscriptionsUpdated that is dropped would leave updating_groups
+        // stuck (spinner forever). Use an aligned channel pair — the drain
+        // re-sends through `core_event_tx`, so send + rx must share it.
+        let (mut state, _orig_tx) = event_state().await;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        state.core_event_rx = Some(rx);
+        state.core_event_tx = Some(tx.clone());
+        let row = row_with_protocols(100, 1, 7);
+        state.endpoints = vec![row];
+        state.connected_protocol_id = Some(100);
+        // A group update is in flight when disconnect happens.
+        state.updating_groups.insert("g1".to_string());
+
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 7,
+            today_up: 5,
+            today_down: 10,
+            total_up: 5,
+            total_down: 10,
+        })
+        .await
+        .unwrap();
+        tx.send(CoreEvent::SubscriptionsUpdated {
+            group_id: "g1".to_string(),
+            count: 3,
+            error: None,
+            summary: xray_tui_config::import_export::ValidationSummary::default(),
+        })
+        .await
+        .unwrap();
+
+        // Disconnect flush: the stats delta is accumulated...
+        let flushed = super::drain_pending_stats_updates(&mut state);
+        assert_eq!(flushed.len(), 1, "stats delta flushed");
+        assert_eq!(state.endpoints[0].links[0].traffic.total_up, 5);
+        // ... and the non-stats event was re-sent: the event loop still
+        // delivers it (the handler clears the in-flight group).
+        assert!(state.poll_core_events().await);
+        assert!(
+            !state.updating_groups.contains("g1"),
+            "subscription result delivered post-drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_flush_guards_connected_session_and_flushes_all_links() {
+        let (mut state, _orig_tx) = event_state().await;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        state.core_event_rx = Some(rx);
+        state.core_event_tx = Some(tx.clone());
+        // Endpoint 100 owns protocols 7 + 8; endpoint 200 owns protocol 9.
+        let mut row = row_with_protocols(100, 2, 7);
+        let other = row_with_protocols(200, 1, 9);
+        state.endpoints = vec![row, other];
+        state.connected_protocol_id = Some(100);
+
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 7,
+            today_up: 10,
+            today_down: 20,
+            total_up: 10,
+            total_down: 20,
+        })
+        .await
+        .unwrap();
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 8,
+            today_up: 30,
+            today_down: 40,
+            total_up: 30,
+            total_down: 40,
+        })
+        .await
+        .unwrap();
+        // A foreign session's tick (endpoint 200) must be rejected by the
+        // same guard the events handler applies.
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 9,
+            today_up: 99,
+            today_down: 99,
+            total_up: 99,
+            total_down: 99,
+        })
+        .await
+        .unwrap();
+
+        let flushed = super::drain_pending_stats_updates(&mut state);
+        // Every owned link touched by the drain is returned for persistence.
+        let mut pids: Vec<i64> = flushed.iter().map(|l| l.protocol_id.get()).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![7, 8], "both owned links flushed");
+        let p7 = state.endpoints[0]
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 7)
+            .unwrap();
+        assert_eq!(p7.traffic.total_up, 10);
+        let p8 = state.endpoints[0]
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 8)
+            .unwrap();
+        assert_eq!(p8.traffic.total_up, 30);
+        let p9 = state.endpoints[1]
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 9)
+            .unwrap();
+        assert_eq!(p9.traffic.total_up, 0, "foreign-session delta rejected");
     }
 
     #[tokio::test]

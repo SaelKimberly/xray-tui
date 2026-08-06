@@ -438,11 +438,14 @@ pub fn disconnect(state: &mut AppState) {
     // (≤ one poll interval — 3s xray / 1s sing-box) was never captured as an
     // event and is dropped by design; the T21 handler already persisted
     // every processed tick, so the row is current as of the last tick.
-    if let Some(link) = crate::ops::events::drain_pending_stats_updates(state) {
+    let flushed = crate::ops::events::drain_pending_stats_updates(state);
+    if !flushed.is_empty() {
         let db = state.db.clone();
         tokio::spawn(async move {
-            if let Err(e) = db.upsert_link(&link).await {
-                tracing::warn!(target: "tui::ops::connect", "final stats flush failed: {e}");
+            for link in flushed {
+                if let Err(e) = db.upsert_link(&link).await {
+                    tracing::warn!(target: "tui::ops::connect", "final stats flush failed: {e}");
+                }
             }
         });
     }
