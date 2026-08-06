@@ -6,21 +6,28 @@ use std::sync::atomic::{AtomicBool, AtomicU16};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use toasty::Deferred;
+use toasty::{Deferred, Json};
 use xray_tui_config::AppConfig;
-use xray_tui_config::import_export::Profile;
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{CorePool, CoreType};
 use xray_tui_db::Database;
-use xray_tui_db::models::{Endpoint, Group, ProtocolRow, PurgatoryView, RoutingRule};
+use xray_tui_db::hash::stable_hash;
+use xray_tui_db::models::{
+    ConfigType, Endpoint, EndpointGroup, EndpointId, Group, HostType, ProfileStats, Protocol,
+    ProtocolId, PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
+};
+use xray_tui_proto::proto_spec::common::TransportConfig;
+use xray_tui_proto::proto_spec::{
+    ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,
+};
 
 use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, settings, subscriptions, updates};
 use crate::types::{
-    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointPingStatus, EndpointRow, LogLine,
-    SettingsSection, SortColumn, SplitRightPane, Tab,
+    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, SettingsSection,
+    SortColumn, SplitRightPane, Tab,
 };
 
 /// Global UI/connection state. The many `bool` fields are orthogonal flags
@@ -131,95 +138,219 @@ pub struct AppState {
     pub host_features: Option<Arc<xray_tui_host_features::HostFeaturesChecker>>,
     /// Per-endpoint enrichment data; survives profile reloads.
     pub endpoint_info: HashMap<i64, EndpointInfo>,
-    /// Per-endpoint per-type ping rounds; drives the red `[fast]`/`[real]`
-    /// labels in the profiles Test column. Session-only.
-    pub ping_status: HashMap<i64, EndpointPingStatus>,
     /// TTL (secs) for the DNS-resolution cache; default 300.
     pub dns_cache_ttl_secs: i64,
 }
 
-/// Convert a `Profile` to `Endpoint` + `ProtocolRow` (thin wrapper over `ParsedProtocol` conversion).
-pub fn profile_to_endpoint_protocol(profile: &Profile) -> (Endpoint, ProtocolRow) {
-    let parsed = xray_tui_config::import_export::ParsedProtocol {
-        host: profile.address.clone(),
-        port: profile.port as u16,
-        host_type: if profile.address.parse::<std::net::IpAddr>().is_ok() {
-            if profile.address.contains(':') {
-                "ipv6".into()
-            } else {
-                "ipv4".into()
-            }
-        } else {
-            "dns".into()
-        },
-        config_type: profile.config_type,
-        proto_kind: profile.proto_kind.clone(),
-        sig: profile.sig,
-        cred_hash: profile.cred_hash,
-        spec_blob: profile.spec_blob.clone(),
-        core_type: profile.core_type.clone(),
-        transport: profile.transport.clone(),
-        security: profile.security.clone(),
-        remarks: profile.remarks.clone(),
-        created_at: profile.created_at,
+/// Derive the typed [`Transport`] embed from a protocol config: the transport
+/// kind plus the exact [`TransportConfig`] payload for the deferred JSON
+/// column. Only vless/vmess/trojan carry a transport field; the quic-family
+/// protocols (hy/hy2/tuic) are [`TransportConfig::Quic`]; everything else is
+/// TCP — mirroring the `ProtoSpec::transport_type` accessor.
+fn transport_embed(config: &ProtocolConfig) -> Transport {
+    let transport = match config {
+        ProtocolConfig::Vless(c) => c.transport.clone(),
+        ProtocolConfig::Vmess(c) => c.transport.clone(),
+        ProtocolConfig::Trojan(c) => c.transport.clone(),
+        ProtocolConfig::Hysteria2(_) | ProtocolConfig::Tuic(_) | ProtocolConfig::Hysteria1(_) => {
+            TransportConfig::Quic
+        }
+        _ => TransportConfig::Tcp,
     };
-    parsed_to_endpoint_protocol(&parsed)
+    let r#type = transport
+        .type_str()
+        .parse::<xray_tui_proto::proto_spec::TransportType>()
+        .unwrap_or(xray_tui_proto::proto_spec::TransportType::Tcp);
+    Transport {
+        r#type,
+        data: Deferred::from(Json(transport)),
+    }
 }
 
-/// Convert a `ParsedProtocol` directly to `Endpoint` + `ProtocolRow` (no Profile intermediary).
-pub fn parsed_to_endpoint_protocol(
-    parsed: &xray_tui_config::import_export::ParsedProtocol,
-) -> (Endpoint, ProtocolRow) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let host_type = if parsed.host_type.is_empty() {
-        if parsed.host.parse::<std::net::IpAddr>().is_ok() {
-            if parsed.host.contains(':') {
-                "ipv6"
-            } else {
-                "ipv4"
-            }
-        } else {
-            "dns"
-        }
-    } else {
-        &parsed.host_type
+/// Derive the typed [`Security`] embed from a protocol config: the security
+/// kind plus the queryable `sni`/`fp`/`insecure` columns and the exact
+/// [`xray_tui_proto::proto_spec::SecurityConfig`] payload for the deferred
+/// JSON column. The columns are populated from the same `config.security()`
+/// accessors the UI reads, so they are queryable without loading the
+/// deferred `config` JSON.
+fn security_embed(config: &ProtocolConfig) -> Security {
+    let security = config.security().cloned().unwrap_or_default();
+    let r#type = match security.type_str() {
+        Some("tls") => xray_tui_proto::proto_spec::SecurityType::Tls,
+        Some("reality") => xray_tui_proto::proto_spec::SecurityType::Reality,
+        _ => xray_tui_proto::proto_spec::SecurityType::None,
+    };
+    Security {
+        r#type,
+        sni: security.sni().map(str::to_string),
+        fp: security.fp().map(str::to_string),
+        insecure: security.insecure(),
+        data: Deferred::from(Json(security)),
     }
-    .to_string();
-    let endpoint = Endpoint {
-        id: xray_tui_db::hash::stable_hash(&parsed.host, i64::from(parsed.port)),
-        host: parsed.host.clone(),
-        host_type,
-        port: i32::from(parsed.port),
-        port_spec_str: None,
+}
+
+/// Build a typed `Endpoint` row from parse-boundary endpoint essentials:
+/// id = `stable_hash(host, port)`, host kind from the address family.
+pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
+    Endpoint {
+        id: EndpointId::new(stable_hash(&ep.host, i64::from(ep.port))),
+        host: ep.host.clone(),
+        host_type: match ep.host_type {
+            HostKind::Ipv4 => HostType::Ipv4,
+            HostKind::Ipv6 => HostType::Ipv6,
+            HostKind::Dns => HostType::Dns,
+            HostKind::Undefined => HostType::Undefined,
+        },
+        port: ep.port,
+        ports: ep.ports.clone(),
         parent_id: None,
         last_source: None,
-        created_at: now,
         manual_protocol_override: None,
-        resolved_as: None,
+        resolved_as: Vec::new(),
         resolved_at: None,
-    };
-    let protocol = ProtocolRow {
-        id: parsed.sig ^ parsed.cred_hash,
-        endpoint_id: endpoint.id,
-        sig: parsed.sig,
-        cred_hash: parsed.cred_hash,
-        proto_kind: parsed.proto_kind.clone(),
-        spec_blob: parsed.spec_blob.clone(),
-        config_type: parsed.config_type,
-        core_type: parsed.core_type.clone(),
-        transport: parsed.transport.clone(),
-        security: parsed.security.clone(),
+        created_at: jiff::Timestamp::now(),
+        links: Deferred::default(),
+        group_links: Deferred::default(),
+    }
+}
+
+/// Build a typed `Protocol` row from a parse result: id = `uid()`, with the
+/// `config`/`transport.data`/`security.data` deferred JSON loaded so it is
+/// ready for `Database::upsert_protocol`.
+pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
+    Protocol {
+        id: ProtocolId::new(parsed.uid()),
+        sig: parsed.sig(),
+        cred_hash: parsed.cred_hash(),
+        proto_kind: parsed.protocol.proto_kind,
+        transport: transport_embed(&parsed.protocol.config),
+        security: security_embed(&parsed.protocol.config),
+        config: Deferred::from(Json(parsed.protocol.config.clone())),
+        created_at: jiff::Timestamp::now(),
+        links: Deferred::default(),
+    }
+}
+
+/// The per-pair `ProfileStats` link for one parsed endpoint.
+fn link_from_parsed(parsed: &ParsedProto, ep: &EndpointEssentials) -> ProfileStats {
+    let now = jiff::Timestamp::now();
+    ProfileStats {
+        protocol_id: ProtocolId::new(parsed.uid()),
+        endpoint_id: EndpointId::new(stable_hash(&ep.host, i64::from(ep.port))),
+        core_type: parsed.protocol.core_type,
+        config_type: match parsed.protocol.config_type {
+            ConfigKind::ShareUrl => ConfigType::ShareUrl,
+            ConfigKind::Form => ConfigType::Form,
+        },
         last_used_at: None,
-        created_at: now,
         last_seen_at: now,
+        task_id: None,
+        task_queue: Vec::new(),
+        latency: None,
+        speed_bps: None,
+        error: None,
+        traffic: TrafficStats {
+            today_up: 0,
+            today_down: 0,
+            total_up: 0,
+            total_down: 0,
+        },
+        created_at: now,
+        updated_at: now,
+        version: 1,
+        protocol: Deferred::default(),
         endpoint: Deferred::default(),
-        extension: Deferred::default(),
-        server_stat: Deferred::default(),
-    };
-    (endpoint, protocol)
+    }
+}
+
+/// Convert a typed parse result into db rows: one `(Endpoint, Protocol,
+/// ProfileStats)` triple per parsed endpoint. Encrypted configs that carry no
+/// endpoint produce an empty vec (nothing to store).
+pub fn parsed_to_rows(parsed: &ParsedProto) -> Vec<(Endpoint, Protocol, ProfileStats)> {
+    parsed
+        .endpoints
+        .iter()
+        .map(|ep| {
+            let endpoint = endpoint_from_essentials(ep);
+            (
+                endpoint.clone(),
+                protocol_from_parsed(parsed),
+                link_from_parsed(parsed, ep),
+            )
+        })
+        .collect()
+}
+
+/// Persist a parsed protocol as typed rows: one endpoint per parsed endpoint,
+/// one shared protocol row, one per-pair link, plus the endpoint-group link
+/// when `group_id` is `Some`. Returns the number of endpoints persisted.
+///
+/// Dedup is natural: endpoint ids (`stable_hash(host, port)`) and protocol
+/// ids (`uid()`) are deterministic, so re-imports update the existing rows
+/// instead of duplicating — profiles missing from a later fetch keep their
+/// old `last_seen_at` and age into the Stale view (old orphan-to-purgatory
+/// semantics via the typed staleness clock).
+///
+/// # Errors
+///
+/// Propagates the first failed upsert.
+pub async fn persist_parsed(
+    db: &Database,
+    parsed: &ParsedProto,
+    group_id: Option<&str>,
+    core_override: Option<xray_tui_proto::proto_spec::CoreType>,
+) -> Result<usize, xray_tui_db::DatabaseError> {
+    let rows = parsed_to_rows(parsed);
+    let mut count = 0usize;
+    for (endpoint, protocol, mut link) in rows {
+        if let Some(core) = core_override {
+            link.core_type = core;
+        }
+        db.upsert_endpoint(&endpoint).await?;
+        db.upsert_protocol(&protocol).await?;
+        db.upsert_link(&link).await?;
+        if let Some(gid) = group_id {
+            db.upsert_endpoint_group_link(&EndpointGroup {
+                endpoint_id: endpoint.id,
+                group_id: gid.to_string(),
+                last_seen_at: link.last_seen_at,
+                sort_order: None,
+                endpoint: Deferred::default(),
+                group: Deferred::default(),
+            })
+            .await?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// A link carries a persisted failure marker (`error.kind` — the old
+/// in-memory round maps were replaced by persisted errors in T17). Drives the
+/// "Remove Bad Servers" flow.
+#[must_use]
+pub const fn link_is_failed(link: &ProfileStats) -> bool {
+    link.error.is_some()
+}
+
+/// Load a `Protocol` row with its deferred `config`/`transport.data`/
+/// `security.data` JSON included. Default read paths exclude deferred columns
+/// (the `EndpointRow` list ships unloaded `Protocol`s); `ConfigBuilder::build`
+/// and `Database::upsert_protocol` require them loaded. Returns `Ok(None)`
+/// when no such protocol row exists.
+pub async fn load_protocol_with_config(
+    db: &Database,
+    id: ProtocolId,
+) -> Result<Option<Protocol>, xray_tui_db::DatabaseError> {
+    let mut conn = db.connection().await?;
+    let protocol = Protocol::filter_by_id(id)
+        .include(Protocol::fields().config())
+        .include(Protocol::fields().transport().data())
+        .include(Protocol::fields().security().data())
+        .first()
+        .exec(&mut conn)
+        .await?;
+    Ok(protocol)
 }
 impl AppState {
     pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
@@ -296,7 +427,6 @@ impl AppState {
             dns_resolver: None,
             host_features: None,
             endpoint_info: HashMap::new(),
-            ping_status: HashMap::new(),
             dns_cache_ttl_secs: 300,
         };
         // Cheap constructors — no I/O until first lookup.
@@ -454,7 +584,7 @@ impl AppState {
         }
     }
     /// Resolve which core a profile row should use, considering (in order):
-    ///   1. Per-profile override (`row.active_protocol().core_type`)
+    ///   1. Per-pair override (`link.core_type` — resolved at parse time)
     ///   2. Per-protocol config override (`config.core.protocol_core_overrides`)
     ///   3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
     pub fn resolved_core(&self, row: &EndpointRow) -> CoreType {
@@ -578,35 +708,9 @@ impl AppState {
     pub fn stop_speed_test(&mut self) {
         ping::stop_speed_test(self);
     }
-    pub fn start_batch_ping(&mut self) {
-        ping::start_batch_ping(self);
-    }
-    pub fn start_batch_then_real_ping(&mut self) {
-        ping::start_batch_then_real_ping(self);
-    }
-    /// Two-phase batch ping: Fast Ping (TCP/UDP/QUIC handshake), then optional Real Ping.
-    /// Uses DB-backed `ping_sessions` table for queue management.
-    /// Phase 1 drains fast-pingable profiles quickly; Phase 2 handles remaining via temp core.
-    pub fn start_batch_sieve(&mut self, real_ping_enabled: bool) {
-        let profile_order = self
-            .filtered_profiles()
-            .enumerate()
-            .map(|(i, r)| (r.active_protocol().id, i as i32))
-            .collect();
-        ping::start_sieve(self, real_ping_enabled, profile_order, true);
-    }
-
-    /// Fast-ping every protocol of the selected endpoint (endpoint-scoped batch).
-    pub fn start_endpoint_batch_ping(&mut self) {
-        ping::start_endpoint_batch_ping(self);
-    }
-
-    /// Real-ping every protocol of the selected endpoint (endpoint-scoped batch).
-    pub fn start_endpoint_batch_real_ping(&mut self) {
-        ping::start_endpoint_batch_real_ping(self);
-    }
-
-    /// Remove profiles whose extension.delay == Some(-1) (failed TCP ping).
+    /// Remove profiles whose links carry a persisted failure marker
+    /// (`error.kind` — the round-map labels were replaced by persisted errors
+    /// in T17; batch machinery is removed until T19 rebuilds it).
     pub async fn remove_failed_servers(&mut self) {
         ping::remove_failed_servers(self).await;
     }

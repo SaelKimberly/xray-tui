@@ -25,7 +25,6 @@ pub use types::*;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use xray_tui_config::import_export::{Profile, profile_config};
 use xray_tui_proto::proto_spec::ProtoSpec;
 
 /// Helper to send a `CoreEvent` with a warning on channel full.
@@ -44,10 +43,23 @@ fn common_field_defaults() -> Vec<(String, String)> {
     ]
 }
 
-pub(crate) fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
+/// Populate the add/edit-server form fields from a typed [`Protocol`] row and
+/// its endpoint.
+///
+/// The `Protocol` must be loaded with its deferred `config` JSON included
+/// (edit flow reads via `.include(Protocol::fields().config())`); the
+/// [`xray_tui_db::Database::upsert_protocol`] write has the same requirement.
+/// `core_type` is seeded "auto" by [`common_field_defaults`] — the caller
+/// post-sets it from the link's `core_type` (the per-pair override), which
+/// this function does not receive.
+pub(crate) fn profile_to_fields(
+    protocol: &xray_tui_db::models::Protocol,
+    endpoint: &xray_tui_db::models::Endpoint,
+) -> Vec<(String, String)> {
     let mut fields = common_field_defaults();
-    if let Some(config) = profile_config(profile) {
-        if let Some(v) = xray_tui_config::import_export::profile_user_id(&config) {
+    if !protocol.config.is_unloaded() {
+        let config = &protocol.config.get().0;
+        if let Some(v) = xray_tui_config::import_export::profile_user_id(config) {
             set_field(&mut fields, "user_id", &v);
         }
         if let Some(v) = config.security_type() {
@@ -57,18 +69,33 @@ pub(crate) fn profile_to_fields(profile: &Profile) -> Vec<(String, String)> {
             set_field(&mut fields, "network", v);
         }
         let (_ps, ss) = config.to_settings();
-        xray_tui_config::import_export::flatten_json_to_fields(&ss, &mut fields);
+        flatten_json_to_fields(&ss, &mut fields);
     }
-    // Cached fields not in spec_blob
-
-    if !profile.address.is_empty() {
-        set_field(&mut fields, "address", &profile.address);
+    if !endpoint.host.is_empty() {
+        set_field(&mut fields, "address", &endpoint.host);
     }
-    if profile.port > 0 {
-        set_field(&mut fields, "port", &profile.port.to_string());
+    if endpoint.port > 0 {
+        set_field(&mut fields, "port", &endpoint.port.to_string());
     }
-    set_field(&mut fields, "core_type", &profile.core_type);
     fields
+}
+
+/// Flatten a settings JSON object into `(key, value)` form fields (ported from
+/// the removed `xray_tui_config::import_export::flatten_json_to_fields`).
+/// String/bool/number leaf values are kept; nested objects and arrays are
+/// skipped — the form fields are flat keys.
+fn flatten_json_to_fields(json: &serde_json::Value, fields: &mut Vec<(String, String)>) {
+    if let serde_json::Value::Object(obj) = json {
+        for (k, v) in obj {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            fields.push((k.clone(), val));
+        }
+    }
 }
 
 fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -87,22 +114,6 @@ pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.clone())
         .filter(|v| !v.is_empty())
-}
-
-pub(crate) fn format_now() -> String {
-    use std::time::SystemTime;
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Convert Unix timestamp to civil date using Howard Hinnant's
-    // chrono-compatible algorithm (public domain).
-    let (year, month, day) = civil_from_days(secs / 86400);
-    let remaining = secs % 86400;
-    let hour = remaining / 3600;
-    let minute = (remaining % 3600) / 60;
-    let second = remaining % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 const fn civil_from_days(z: u64) -> (u64, u64, u64) {
@@ -238,13 +249,6 @@ pub fn parse_core_log_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_now() {
-        let s = format_now();
-        assert!(s.len() == 20, "expected ISO 8601 length 20: {s}");
-        assert!(s.ends_with('Z'), "expected UTC: {s}");
-    }
 
     #[test]
     fn test_common_field_defaults() {

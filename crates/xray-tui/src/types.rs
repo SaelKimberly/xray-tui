@@ -1,9 +1,9 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ratatui_cheese::tree::TreeState;
-use xray_tui_config::import_export::{Profile, ValidationSummary};
+use xray_tui_config::import_export::{ParsedProfile, ValidationSummary};
 use xray_tui_core::CoreType;
 use xray_tui_core::grpc_client;
 use xray_tui_core::speed_test::TestType;
@@ -196,40 +196,6 @@ impl std::fmt::Display for SettingsSection {
     }
 }
 
-/// One test round for an endpoint and ping type: which protocols reported a
-/// result and which of those failed.
-///
-/// `seen` starts empty at round start and is rebuilt as results arrive; a
-/// batch resets it, single pings accumulate.
-#[derive(Debug, Clone, Default)]
-pub struct PingRound {
-    /// Protocol ids that reported a result this round.
-    pub seen: HashSet<i64>,
-    /// Protocol ids among `seen` whose ping failed.
-    pub failed: HashSet<i64>,
-}
-
-impl PingRound {
-    /// All protocols of the endpoint were attempted and every attempt failed.
-    /// `protocol_count` is the endpoint's protocol count; a round that only
-    /// covered part of the endpoint (single pings, cancelled batches) never
-    /// reports all-unreachable.
-    #[must_use]
-    pub fn all_unreachable(&self, protocol_count: usize) -> bool {
-        !self.seen.is_empty()
-            && self.seen.len() == protocol_count
-            && self.failed.len() == self.seen.len()
-    }
-}
-
-/// Per-endpoint ping round state driving the red `[fast]`/`[real]` labels in
-/// the profiles Test column. Session-only; reset on batch start.
-#[derive(Debug, Clone, Default)]
-pub struct EndpointPingStatus {
-    pub fast: PingRound,
-    pub real: PingRound,
-}
-
 /// Enrichment data for one endpoint (inbound host), computed lazily in the
 /// background by `ops::enrich`. Survives profile reloads (`AppState.endpoint_info`).
 #[derive(Debug, Clone, Default)]
@@ -304,7 +270,7 @@ pub enum AppMode {
 #[derive(Debug, Clone)]
 pub struct BatchImportItem {
     pub url: String,
-    pub profile: Option<Profile>,
+    pub profile: Option<ParsedProfile>,
     pub error: Option<String>,
     pub imported: bool,
 }

@@ -2,14 +2,13 @@ use std::path::Path;
 
 use tokio::sync::mpsc;
 
-use xray_tui_config::import_export::Profile;
 use xray_tui_core::grpc_client;
-use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{
     BuildParams, CLASH_API_PORT, ConfigBuilder, CoreType, RealCoreManager,
-    config_builder::clash_mixin::parse_clash_mixin, find_binary, resolve_core, shadowsocks_method,
+    config_builder::clash_mixin::parse_clash_mixin, find_binary,
 };
-use xray_tui_db::models::{DnsSetting, RoutingRule};
+use xray_tui_db::models::{DnsSetting, EndpointId, RoutingRule};
+use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
 
 use crate::AppState;
 use crate::parse_core_log_line;
@@ -18,59 +17,42 @@ use crate::{ClashTraffic, try_send_or_warn};
 use futures_util::StreamExt;
 
 /// Connect to a profile by starting the appropriate core (xray-core or sing-box).
-pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
+pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     if state.connecting {
         return;
     }
 
-    let (endpoint, protocol_row, profile, profile_override) = if let Some(r) = state
-        .endpoints
-        .iter()
-        .find(|r| r.endpoint.id == protocol_id)
-    {
-        let p = r.active_protocol();
-        let profile = Profile {
-            id: p.id,
-            sig: p.sig,
-            cred_hash: p.cred_hash,
-            proto_kind: p.proto_kind.clone(),
-            spec_blob: p.spec_blob.clone(),
-            config_type: p.config_type,
-            core_type: p.core_type.clone(),
-            address: r.endpoint.host.clone(),
-            port: r.endpoint.port,
-            transport: p.transport.clone(),
-            security: p.security.clone(),
-            created_at: p.created_at,
-            remarks: None,
+    let (endpoint, link, protocol_id) = {
+        let Some(row) = state
+            .endpoints
+            .iter()
+            .find(|r| r.endpoint.id.get() == endpoint_id)
+        else {
+            state.log_trace(
+                "error",
+                "tui::ops::connect",
+                "Profile not found for connection",
+            );
+            return;
         };
-        let core_override = p.core_type.parse::<CoreType>().ok();
-        (r.endpoint.clone(), p.clone(), profile, core_override)
-    } else {
-        state.log_trace(
-            "error",
-            "tui::ops::connect",
-            "Profile not found for connection",
-        );
-        return;
+        let Some((link, _protocol)) = row.active_protocol() else {
+            // T8+9: linkless endpoints are valid rows — nothing to connect.
+            state.log_trace(
+                "error",
+                "tui::ops::connect",
+                "Endpoint has no protocol links to connect",
+            );
+            return;
+        };
+        (row.endpoint.clone(), link.clone(), link.protocol_id)
     };
 
-    let protocol = if let Some(p) = Protocol::try_from_i32(profile.config_type) {
-        p
-    } else {
-        state.log_trace(
-            "error",
-            "tui::ops::connect",
-            &format!("Unknown protocol: {}", profile.config_type),
-        );
-        return;
+    // The link's `core_type` is the per-pair override resolved at parse time
+    // (never Auto) — it drives both the backend build and the params flags.
+    let core_type = match link.core_type {
+        ProtoCoreType::Xray => CoreType::Xray,
+        ProtoCoreType::SingBox => CoreType::SingBox,
     };
-
-    let core_type = resolve_core(
-        protocol,
-        profile_override,
-        shadowsocks_method(&protocol_row).as_deref(),
-    );
 
     // If already connected/disconnecting, send stop signal first
     if let Some(tx) = state.disconnect_tx.take() {
@@ -81,23 +63,24 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     state.disconnect_tx = Some(stop_tx);
     state.connecting = true;
-    state.connected_protocol_id = Some(protocol_id);
+    state.connected_protocol_id = Some(endpoint_id);
     state.connection_error = None;
 
     // Deferred-resolution trigger: connect does real networking, so resolve
     // the inbound host now (force — bypasses the TTL cache).
-    crate::ops::enrich::spawn_dns_resolve(state, endpoint.id, true);
+    crate::ops::enrich::spawn_dns_resolve(state, endpoint.id.get(), true);
 
     // "Last Used" = connect initiation: DB write + in-memory row so the
-    // sub-table refreshes without a reload.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let lu_protocol_id = protocol_row.id;
+    // sub-table refreshes without a reload. `update_last_used` sets both
+    // `last_used_at` and `last_seen_at` to the same ts (old semantics).
+    let now = jiff::Timestamp::now();
+    let lu_endpoint_id = EndpointId::new(endpoint.id.get());
     let lu_db = state.db.clone();
     tokio::spawn(async move {
-        if let Err(e) = lu_db.update_last_used(lu_protocol_id, now).await {
+        if let Err(e) = lu_db
+            .update_last_used(protocol_id, lu_endpoint_id, now)
+            .await
+        {
             tracing::warn!(target: "tui::ops::connect", "update_last_used failed: {e}");
         }
     });
@@ -105,13 +88,12 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         .endpoints
         .iter_mut()
         .find(|r| r.endpoint.id == endpoint.id)
-        && let Some(pr) = r.protocols.iter_mut().find(|pr| pr.id == lu_protocol_id)
+        && let Some(link) = r.links.iter_mut().find(|l| l.protocol_id == protocol_id)
     {
-        pr.last_used_at = Some(now);
-        // Mirror the DB write (update_last_used sets both columns to the
-        // same ts) so the sub-table's displayed last_seen matches the DB
-        // staleness classification between reloads.
-        pr.last_seen_at = now;
+        link.last_used_at = Some(now);
+        // Mirror the DB write so the sub-table's displayed last_seen matches
+        // the DB staleness classification between reloads.
+        link.last_seen_at = now;
     }
     let tx = if let Some(tx) = &state.core_event_tx {
         tx.clone()
@@ -126,8 +108,8 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
     };
 
     let params = BuildParams {
-        v2ray_api_enabled: matches!(core_type, CoreType::Xray),
-        clash_api_enabled: matches!(core_type, CoreType::SingBox),
+        v2ray_api_enabled: matches!(link.core_type, ProtoCoreType::Xray),
+        clash_api_enabled: matches!(link.core_type, ProtoCoreType::SingBox),
         log_level: state.config.core.log_level.clone(),
         socks_port: state.config.inbound.socks_port,
         http_port: state.config.inbound.http_port,
@@ -153,19 +135,10 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
         skip_cert_verify: state.config.core.skip_cert_verify,
     };
 
-    // Default DNS and routing for first pass
-    let dns = DnsSetting {
-        id: "default".to_string(),
-        name: None,
-        servers: None,
-        hosts: None,
-        query_strategy: None,
-        disable_cache: None,
-        disable_fallback: None,
-        client_ip: None,
-        cache_ttl_secs: None,
-    };
-    let routing: Vec<RoutingRule> = vec![];
+    // Routing comes from the already-loaded rules; DNS settings are loaded
+    // inside the task (async read) with a typed default fallback.
+    let routing: Vec<RoutingRule> = state.routing_rules.clone();
+    let db = state.db.clone();
 
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| Path::new(".").to_path_buf())
@@ -177,25 +150,55 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
     let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
     let state_log_sender = state.log_sender_tx.clone();
     let handle = tokio::spawn(async move {
-        // 1. Build config
-        let backend_config = match ConfigBuilder::build(
-            &endpoint,
-            &protocol_row,
-            core_type,
-            &params,
-            &routing,
-            &dns,
-        ) {
-            Ok(c) => c,
+        // 0. Load the Protocol row with config included (the EndpointRow
+        //    list ships unloaded deferred JSON).
+        let protocol = match crate::state::load_protocol_with_config(&db, protocol_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                try_send_or_warn(
+                    &tx,
+                    CoreEvent::Error("Protocol row not found for connection".to_string()),
+                    "protocol_not_found",
+                );
+                return;
+            }
             Err(e) => {
                 try_send_or_warn(
                     &tx,
-                    CoreEvent::Error(format!("Config build failed: {e}")),
-                    "config_build_error",
+                    CoreEvent::Error(format!("Failed to load protocol: {e}")),
+                    "protocol_load_error",
                 );
                 return;
             }
         };
+        let dns = match db.get_dns_settings().await {
+            Ok(Some(d)) => d,
+            _ => DnsSetting {
+                id: "default".to_string(),
+                name: None,
+                servers: Vec::new(),
+                hosts: Vec::new(),
+                query_strategy: None,
+                disable_cache: false,
+                disable_fallback: false,
+                client_ip: None,
+                cache_ttl_secs: None,
+            },
+        };
+
+        // 1. Build config
+        let backend_config =
+            match ConfigBuilder::build(&endpoint, &link, &protocol, &params, &routing, &dns) {
+                Ok(c) => c,
+                Err(e) => {
+                    try_send_or_warn(
+                        &tx,
+                        CoreEvent::Error(format!("Config build failed: {e}")),
+                        "config_build_error",
+                    );
+                    return;
+                }
+            };
 
         // 2. Find binary
         let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
@@ -279,7 +282,7 @@ pub fn connect_to_profile(state: &mut AppState, protocol_id: i64) {
             }
         });
 
-        let profile_id = profile.id;
+        let profile_id = protocol_id.get();
 
         if core_type == CoreType::Xray {
             // === gRPC polling loop (xray-core) ===

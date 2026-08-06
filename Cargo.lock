@@ -7219,6 +7219,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "humantime",
+ "jiff",
  "ratatui",
  "ratatui-cheese",
  "ratatui-themes",

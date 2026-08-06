@@ -12,6 +12,7 @@ xray-tui-geoip = { path = "../xray-tui-geoip" }
 xray-tui-dns = { path = "../xray-tui-dns" }
 xray-tui-host-features = { path = "../xray-tui-host-features" }
 toasty = "0.9"
+jiff.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true

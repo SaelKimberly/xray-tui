@@ -9,54 +9,24 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use xray_tui_db::models::{Endpoint, ProtocolRow};
+use xray_tui_db::models::{Endpoint, HostType, Protocol};
 use xray_tui_host_features::HostFeatures;
 
 use crate::AppState;
-use crate::profile_to_fields;
 use crate::types::{CoreEvent, EndpointInfo};
 
-/// One enrichment target: endpoint id, endpoint, its active protocol, a
-/// persisted `resolved_as` string, and the persisted `resolved_at` timestamp.
-type EnrichTarget = (i64, Endpoint, ProtocolRow, Option<String>, Option<i64>);
-
-/// Rebuild the same `Profile` connect.rs builds from an endpoint row + protocol.
-#[must_use]
-pub fn protocol_row_to_profile(
-    ep: &Endpoint,
-    p: &ProtocolRow,
-) -> xray_tui_config::import_export::Profile {
-    xray_tui_config::import_export::Profile {
-        id: p.id,
-        sig: p.sig,
-        cred_hash: p.cred_hash,
-        proto_kind: p.proto_kind.clone(),
-        spec_blob: p.spec_blob.clone(),
-        config_type: p.config_type,
-        core_type: p.core_type.clone(),
-        address: ep.host.clone(),
-        port: ep.port,
-        transport: p.transport.clone(),
-        security: p.security.clone(),
-        created_at: p.created_at,
-        remarks: None,
-    }
-}
-
-/// SNI from the profile's typed config: `security().sni()` covers both
-/// `tls` and `reality` variants. Falls back to the form-field path (first key
-/// "sni" or "*.sni") for opaque/legacy blobs.
-fn extract_sni(profile: &xray_tui_config::import_export::Profile) -> Option<String> {
+/// SNI from a typed protocol row: the `security.sni` column, populated at
+/// write time from `config.security().sni()` (covers both `tls` and `reality`
+/// variants). The column is queryable without loading the deferred `config`
+/// JSON; when the config IS loaded, the typed accessor chain is equivalent.
+fn extract_sni(protocol: &Protocol) -> Option<String> {
     use xray_tui_proto::proto_spec::ProtoSpec;
-    if let Some(config) = xray_tui_config::import_export::profile_config(profile)
-        && let Some(sni) = config.security().and_then(|s| s.sni())
+    if !protocol.config.is_unloaded()
+        && let Some(sni) = protocol.config.get().0.security().and_then(|s| s.sni())
     {
         return Some(sni.to_string());
     }
-    profile_to_fields(profile)
-        .into_iter()
-        .find(|(k, _)| k == "sni" || k.rsplit_once('.').is_some_and(|(_, ext)| ext == "sni"))
-        .map(|(_, v)| v)
+    protocol.security.sni.clone()
 }
 
 /// True when a resolution must run: no entry, or a DNS entry older than the
@@ -155,7 +125,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let Some(row) = state
         .endpoints
         .iter()
-        .find(|r| r.endpoint.id == endpoint_id)
+        .find(|r| r.endpoint.id.get() == endpoint_id)
     else {
         return;
     };
@@ -172,23 +142,22 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
     let host = row.endpoint.host.clone();
-    let host_type = row.endpoint.host_type.clone();
-    let active = row.active_protocol().clone();
-    let ep = row.endpoint.clone();
-    let sni = extract_sni(&protocol_row_to_profile(&ep, &active));
+    let host_type = row.endpoint.host_type;
+    let sni = row.active_protocol().and_then(|(_, p)| extract_sni(p));
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
         let now = unix_now();
         // DNS lookup or direct IP parse
-        let (ips, resolved_at) = match host_type.as_str() {
-            "ipv4" | "ipv6" => (
+        let (ips, resolved_at) = match host_type {
+            HostType::Ipv4 | HostType::Ipv6 => (
                 host.parse::<IpAddr>()
                     .map(|ip| vec![ip])
                     .unwrap_or_default(),
                 None,
             ),
-            _ => {
+            HostType::Undefined => (Vec::new(), Some(now)),
+            HostType::Dns => {
                 if is_resolvable_hostname(&host) {
                     match &dns {
                         Some(r) => {
@@ -282,21 +251,24 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 /// `resolved_as` (from the endpoints table; no network). Geo + whitelist
 /// features are filled in the same task.
 pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
-    let targets: Vec<EnrichTarget> = state
+    // One target per endpoint: endpoint id, the endpoint, its persisted
+    // `resolved_as` list, the persisted `resolved_at` (unix secs), and the
+    // SNI of its active protocol (None for linkless endpoints).
+    let targets: Vec<(i64, Endpoint, Vec<String>, Option<i64>, Option<String>)> = state
         .endpoints
         .iter()
         .filter(|r| {
-            let ht = r.endpoint.host_type.as_str();
-            ht == "ipv4" || ht == "ipv6" || r.endpoint.resolved_as.is_some()
+            matches!(r.endpoint.host_type, HostType::Ipv4 | HostType::Ipv6)
+                || !r.endpoint.resolved_as.is_empty()
         })
-        .filter(|r| !state.endpoint_info.contains_key(&r.endpoint.id))
+        .filter(|r| !state.endpoint_info.contains_key(&r.endpoint.id.get()))
         .map(|r| {
             (
-                r.endpoint.id,
+                r.endpoint.id.get(),
                 r.endpoint.clone(),
-                r.active_protocol().clone(),
                 r.endpoint.resolved_as.clone(),
-                r.endpoint.resolved_at,
+                r.endpoint.resolved_at.map(|t| t.as_second()),
+                r.active_protocol().and_then(|(_, p)| extract_sni(p)),
             )
         })
         .collect();
@@ -309,13 +281,12 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
-        for (endpoint_id, ep, active, cached_as, cached_at) in targets {
-            let sni = extract_sni(&protocol_row_to_profile(&ep, &active));
-            let mut info = if let Some(as_str) = cached_as {
+        for (endpoint_id, ep, cached_as, cached_at, sni) in targets {
+            let mut info = if !cached_as.is_empty() {
                 // DNS host with a persisted resolution — reuse it, no network.
                 EndpointInfo {
-                    resolved_ips: as_str
-                        .split(',')
+                    resolved_ips: cached_as
+                        .iter()
                         .filter_map(|s| s.parse::<IpAddr>().ok())
                         .collect(),
                     country: None,
@@ -365,17 +336,16 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
     let Some(checker) = state.host_features.clone() else {
         return;
     };
-    let targets: Vec<(i64, Endpoint, ProtocolRow, EndpointInfo)> = state
+    let targets: Vec<(i64, Option<String>, EndpointInfo)> = state
         .endpoints
         .iter()
         .map(|r| {
             (
-                r.endpoint.id,
-                r.endpoint.clone(),
-                r.active_protocol().clone(),
+                r.endpoint.id.get(),
+                r.active_protocol().and_then(|(_, p)| extract_sni(p)),
                 state
                     .endpoint_info
-                    .get(&r.endpoint.id)
+                    .get(&r.endpoint.id.get())
                     .cloned()
                     .unwrap_or_default(),
             )
@@ -387,8 +357,7 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
-        for (endpoint_id, ep, active, mut info) in targets {
-            let sni = extract_sni(&protocol_row_to_profile(&ep, &active));
+        for (endpoint_id, sni, mut info) in targets {
             let selected = info
                 .resolved_ips
                 .iter()
@@ -422,8 +391,12 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
     let Some(endpoint_id) = state
         .endpoints
         .iter()
-        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
-        .map(|r| r.endpoint.id)
+        .find(|r| {
+            r.links
+                .iter()
+                .any(|l| l.protocol_id == xray_tui_db::models::ProtocolId::new(protocol_id))
+        })
+        .map(|r| r.endpoint.id.get())
     else {
         return;
     };
@@ -560,27 +533,15 @@ mod tests {
 
     #[test]
     fn test_extract_sni() {
-        // Real vless+reality URL → typed spec blob → SecurityConfig::sni()
+        // Real vless+reality URL → typed rows → Security embed sni column
         let parsed = xray_tui_config::import_export::parse_share_url(
             "vless://550e8400-e29b-41d4-a716-446655440000@example.com:443?security=reality&sni=chat.example.com&encryption=none&type=tcp",
             &xray_tui_config::import_export::ValidationSettings::default(),
         )
         .expect("parse vless url");
-        let profile = xray_tui_config::import_export::Profile {
-            id: parsed.sig ^ parsed.cred_hash,
-            sig: parsed.sig,
-            cred_hash: parsed.cred_hash,
-            proto_kind: parsed.proto_kind,
-            spec_blob: parsed.spec_blob,
-            config_type: parsed.config_type,
-            core_type: parsed.core_type,
-            address: parsed.host,
-            port: i32::from(parsed.port),
-            transport: parsed.transport,
-            security: parsed.security,
-            created_at: 0,
-            remarks: None,
-        };
-        assert_eq!(extract_sni(&profile).as_deref(), Some("chat.example.com"));
+        let (_, protocol, _) = crate::state::parsed_to_rows(&parsed.parsed)
+            .pop()
+            .expect("typed rows");
+        assert_eq!(extract_sni(&protocol).as_deref(), Some("chat.example.com"));
     }
 }
