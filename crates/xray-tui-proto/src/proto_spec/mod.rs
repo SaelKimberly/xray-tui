@@ -935,42 +935,6 @@ impl ProtoIdentity for PlaceholderConfig {
 }
 
 #[cfg(test)]
-pub(crate) mod test_helpers {
-    use super::ProtoSpec;
-    use crate::urlx::RawUrlX;
-
-    pub fn check_roundtrip<T>(url: &str)
-    where
-        T: ProtoSpec + std::fmt::Debug + PartialEq,
-    {
-        let raw = RawUrlX::from(url);
-        let parsed = T::try_parse(&raw).unwrap_or_else(|e| panic!("parse failed for {url}: {e}"));
-        let reconstructed = parsed
-            .reconstruct()
-            .unwrap_or_else(|e| panic!("reconstruct failed for {url}: {e}"));
-        let re_raw = RawUrlX::from(reconstructed.as_str());
-        let reparsed = T::try_parse(&re_raw)
-            .unwrap_or_else(|e| panic!("reparse failed for {reconstructed}: {e}"));
-        assert_eq!(parsed, reparsed, "roundtrip failed for: {url}");
-    }
-
-    /// Test Clash roundtrip: parse URL -> config -> `to_clash` -> `try_from_clash` -> config
-    pub fn check_clash_roundtrip<T>(url: &str)
-    where
-        T: ProtoSpec + std::fmt::Debug + PartialEq,
-    {
-        let raw = crate::urlx::RawUrlX::from(url);
-        let parsed = T::try_parse(&raw).unwrap_or_else(|e| panic!("parse failed for {url}: {e}"));
-        let clash = parsed
-            .to_clash()
-            .unwrap_or_else(|e| panic!("to_clash failed for {url}: {e}"));
-        let reparsed = T::try_from_clash(&clash)
-            .unwrap_or_else(|e| panic!("try_from_clash failed for {url}: {e}"));
-        assert_eq!(parsed, reparsed, "clash roundtrip failed for: {url}");
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

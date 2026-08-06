@@ -506,13 +506,6 @@ pub(crate) fn security_to_clash_reality(security: &SecurityConfig) -> Option<Cla
     }
 }
 
-/// Clash server string to `HostSpec`.
-pub(crate) fn clash_server_to_host(server: &str) -> Result<HostSpec, ParseError> {
-    let (_, host) = crate::utils::host_port::host(server.as_bytes())
-        .map_err(|_| ParseError::InvalidHost(format!("invalid clash server: {server}").into()))?;
-    Ok(host.to_owned())
-}
-
 /// Clash `server` string + `port` → [`EndpointEssentials`], using the same
 /// host-kind rule as the URL parsers ([`host_kind_for`]). The raw server
 /// string is stored verbatim so `to_clash_proto` round-trips it unchanged.
@@ -730,18 +723,6 @@ pub(crate) fn transport_to_clash(
 pub(crate) fn clash_alpn_as_str(alpn: Option<&Vec<String>>) -> Option<&str> {
     alpn.and_then(|v| v.first())
         .map(std::string::String::as_str)
-}
-
-/// Convert a Clash server string to `HostSpec`.
-pub(crate) fn host_spec_to_string(h: &HostSpec) -> String {
-    match h {
-        HostSpec::IpAddress(ip) => match ip {
-            rustls::pki_types::IpAddr::V4(v4) => std::net::Ipv4Addr::from(*v4).to_string(),
-            rustls::pki_types::IpAddr::V6(v6) => std::net::Ipv6Addr::from(*v6).to_string(),
-        },
-        HostSpec::DnsName(dns) => dns.as_ref().to_owned(),
-        _ => String::new(),
-    }
 }
 
 /// Build xray-core `streamSettings` JSON from typed security + transport.

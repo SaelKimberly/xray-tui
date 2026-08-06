@@ -1,9 +1,6 @@
 mod port_spec;
 mod schemex;
-mod serde_util;
 mod split_url;
-
-pub(crate) use serde_util::{host_serde, port_serde};
 
 pub type TinyText = smartstring::SmartString<smartstring::LazyCompact>;
 pub(crate) type HostSpec = rustls::pki_types::ServerName<'static>;

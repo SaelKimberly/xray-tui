@@ -26,22 +26,25 @@ use serde::{Deserialize, Serialize};
 use crate::clash::{ClashProxy, ClashTailscale};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
-use crate::proto_spec::common::{clash_server_to_host, host_spec_to_string};
+use crate::proto_spec::common::clash_to_endpoint;
+use crate::proto_spec::core_mapping;
 use crate::proto_spec::utils;
-use crate::proto_spec::{ParseError, ProtoIdentity, ProtoSpec};
-use crate::urlx::HostSpec;
-use crate::urlx::TinyText;
-use crate::urlx::{host_serde, port_serde};
+use crate::proto_spec::{
+    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoIdentity, ProtoSpec,
+    ProtocolConfig, ProtocolEssentials, ProtocolKind,
+};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
+/// Tailscale protocol configuration — the identity payload (sans host/port).
+///
+/// Tailscale has no share URL format, so parsing only ever arrives through the
+/// Clash path: `server`/`port` become the [`EndpointEssentials`] and this
+/// struct carries only endpoint-free protocol parameters.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct TailscaleConfig {
-    #[serde(with = "host_serde")]
-    pub host: HostSpec,
-    #[serde(with = "port_serde")]
-    pub port: u16,
     pub hostname: Option<String>,
     pub auth_key: Option<String>,
     pub control_url: Option<String>,
@@ -56,9 +59,94 @@ pub struct TailscaleConfig {
     pub remarks: Option<TinyText>,
 }
 
+impl TailscaleConfig {
+    /// Tailscale does not support URL format — always returns an error.
+    pub fn try_parse_proto(_raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
+        Err(ParseError::Unknown(
+            "Tailscale does not support URL format".into(),
+        ))
+    }
+
+    /// Tailscale does not support URL format — always returns an error.
+    pub fn reconstruct_proto(&self, _endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+        Err(ParseError::Unknown(
+            "Tailscale does not support URL format".into(),
+        ))
+    }
+
+    /// Serialize this endpoint-free config plus the endpoint to a Clash proxy
+    /// entry. Endpoint host/port are taken from `endpoint`.
+    pub fn to_clash_proto(
+        &self,
+        endpoint: &EndpointEssentials,
+    ) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        Ok(ClashProxy::Tailscale(ClashTailscale {
+            name,
+            server: endpoint.host.clone(),
+            port: endpoint.port,
+            hostname: self.hostname.clone().unwrap_or_default(),
+            auth_key: self.auth_key.clone(),
+            control_url: self.control_url.clone(),
+            state_dir: self.state_directory.clone(),
+            ephemeral: self.ephemeral.unwrap_or(false),
+            accept_routes: self.accept_routes.unwrap_or(false),
+            exit_node: self.exit_node.clone(),
+            exit_node_allow_lan_access: self.exit_node_allow_lan_access,
+        }))
+    }
+
+    /// Parse a Clash proxy entry into the parse boundary: `server`/`port`
+    /// become the endpoint essentials (the only parse source for Tailscale);
+    /// the config payload is endpoint-free.
+    pub fn try_from_clash_proto(proxy: &ClashProxy) -> Result<ParsedProto, ParseError> {
+        match proxy {
+            ClashProxy::Tailscale(c) => {
+                let config = Self {
+                    hostname: match c.hostname.as_str() {
+                        "" => None,
+                        s => Some(s.to_string()),
+                    },
+                    auth_key: c.auth_key.clone(),
+                    control_url: c.control_url.clone(),
+                    state_directory: c.state_dir.clone(),
+                    ephemeral: Some(c.ephemeral),
+                    accept_routes: Some(c.accept_routes),
+                    exit_node: c.exit_node.clone(),
+                    exit_node_allow_lan_access: c.exit_node_allow_lan_access,
+                    advertise_routes: None,
+                    security: SecurityConfig::default(),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                };
+                Ok(ParsedProto {
+                    endpoints: vec![clash_to_endpoint(&c.server, c.port)],
+                    protocol: ProtocolEssentials {
+                        proto_kind: ProtocolKind::Tailscale,
+                        config_type: ConfigKind::ShareUrl,
+                        core_type: core_mapping::resolve_core(ProtocolKind::Tailscale, None, None),
+                        config: ProtocolConfig::Tailscale(config),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected tailscale clash proxy".into())),
+        }
+    }
+}
+
+/// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
+/// `Proto`/`ParseResult` consumers in xray-tui-config) compile unchanged.
+///
+/// DEGRADED PATH (documented): `try_from_clash` still works by delegating to
+/// the `*_proto` variant and discarding the parsed endpoints; `to_clash`/
+/// `reconstruct` return errors because the config no longer stores host/port.
+/// Import/export rewires to the `*_proto` variants in T11 (phase D builders
+/// take the endpoint separately).
 impl ProtoSpec for TailscaleConfig {
     /// Tailscale does not support URL format — always returns an error.
-    fn try_parse(_raw: &crate::urlx::RawUrlX<'_>) -> Result<Self, ParseError> {
+    fn try_parse(_raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
         Err(ParseError::Unknown(
             "Tailscale does not support URL format".into(),
         ))
@@ -71,16 +159,18 @@ impl ProtoSpec for TailscaleConfig {
         ))
     }
 
-    fn schema(&self) -> crate::urlx::SchemeX {
-        crate::urlx::SchemeX::Tailscale
+    fn schema(&self) -> SchemeX {
+        SchemeX::Tailscale
     }
 
+    /// `None` — the endpoint host moved to [`EndpointEssentials`] (T5).
     fn host(&self) -> Option<&HostSpec> {
-        Some(&self.host)
+        None
     }
 
+    /// `None` — the endpoint port moved to [`EndpointEssentials`] (T5).
     fn port(&self) -> Option<u16> {
-        Some(self.port)
+        None
     }
 
     fn remarks(&self) -> Option<&str> {
@@ -91,48 +181,28 @@ impl ProtoSpec for TailscaleConfig {
         None
     }
 
+    /// # Errors
+    ///
+    /// If the Clash proxy doesn't match this protocol type.
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
-        match proxy {
-            ClashProxy::Tailscale(c) => Ok(Self {
-                host: clash_server_to_host(&c.server)?,
-                port: c.port,
-                hostname: match c.hostname.as_str() {
-                    "" => None,
-                    s => Some(s.to_string()),
-                },
-                auth_key: c.auth_key.clone(),
-                control_url: c.control_url.clone(),
-                state_directory: c.state_dir.clone(),
-                ephemeral: Some(c.ephemeral),
-                accept_routes: Some(c.accept_routes),
-                exit_node: c.exit_node.clone(),
-                exit_node_allow_lan_access: c.exit_node_allow_lan_access,
-                advertise_routes: None,
-                security: SecurityConfig::default(),
-                remarks: match c.name.as_str() {
-                    "" => None,
-                    s => Some(TinyText::from(s)),
-                },
-            }),
-            _ => Err(ParseError::Unknown("expected tailscale clash proxy".into())),
+        let parsed = Self::try_from_clash_proto(proxy)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Tailscale(config) => Ok(config),
+            _ => Err(ParseError::Unknown(
+                "tailscale clash proxy parsed to a non-tailscale config".into(),
+            )),
         }
     }
 
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::to_clash_proto`] with the endpoint.
     fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
-        let name = self.remarks.as_deref().unwrap_or("").to_string();
-        Ok(ClashProxy::Tailscale(ClashTailscale {
-            name,
-            server: host_spec_to_string(&self.host),
-            port: self.port,
-            hostname: self.hostname.clone().unwrap_or_default(),
-            auth_key: self.auth_key.clone(),
-            control_url: self.control_url.clone(),
-            state_dir: self.state_directory.clone(),
-            ephemeral: self.ephemeral.unwrap_or(false),
-            accept_routes: self.accept_routes.unwrap_or(false),
-            exit_node: self.exit_node.clone(),
-            exit_node_allow_lan_access: self.exit_node_allow_lan_access,
-        }))
+        Err(ProtoSpecError::Unsupported(
+            "tailscale config no longer stores host/port; use TailscaleConfig::to_clash_proto(endpoint)"
+                .into(),
+        ))
     }
 }
 
@@ -153,14 +223,88 @@ impl ProtoIdentity for TailscaleConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{ConfigKind, CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::TailscaleConfig;
-    use crate::proto_spec::ProtoSpec;
-    use crate::urlx::RawUrlX;
+    use crate::urlx::{RawUrlX, SchemeX};
 
     #[test]
     fn test_tailscale_no_url() {
         let url = "tailscale://host:100";
         let raw = RawUrlX::from(url);
         assert!(TailscaleConfig::try_parse(&raw).is_err());
+        assert!(TailscaleConfig::try_parse_proto(&raw).is_err());
+    }
+
+    #[test]
+    fn clash_import_builds_endpoint_and_config() {
+        use crate::clash::{ClashProxy, ClashTailscale};
+
+        let proxy = ClashProxy::Tailscale(ClashTailscale {
+            name: "ts-node".into(),
+            server: "100.64.0.1".into(),
+            port: 100,
+            hostname: "node1".into(),
+            auth_key: Some("tskey-auth-abc".into()),
+            control_url: Some("https://control.example.com".into()),
+            state_dir: Some("/var/lib/tailscale".into()),
+            ephemeral: true,
+            accept_routes: true,
+            exit_node: Some("100.64.0.2".into()),
+            exit_node_allow_lan_access: Some(true),
+        });
+        let parsed = TailscaleConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(parsed.endpoints.len(), 1);
+        assert_eq!(parsed.endpoints[0].host, "100.64.0.1");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Ipv4);
+        assert_eq!(parsed.endpoints[0].port, 100);
+
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Tailscale);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
+        assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
+        let cfg = match &parsed.protocol.config {
+            ProtocolConfig::Tailscale(c) => c,
+            other => panic!("expected TailscaleConfig, got {other:?}"),
+        };
+        assert_eq!(cfg.hostname.as_deref(), Some("node1"));
+        assert_eq!(cfg.auth_key.as_deref(), Some("tskey-auth-abc"));
+        assert_eq!(cfg.ephemeral, Some(true));
+        // The identity payload must be endpoint-free: no top-level host/port keys.
+        let json = serde_json::to_value(cfg).expect("serialize");
+        let obj = json.as_object().expect("config is an object");
+        assert!(!obj.contains_key("host"), "{json}");
+        assert!(!obj.contains_key("port"), "{json}");
+
+        // to_clash_proto round-trips the clash entry unchanged.
+        let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
+        match (out, proxy) {
+            (ClashProxy::Tailscale(out), ClashProxy::Tailscale(orig)) => assert_eq!(out, orig),
+            _ => panic!("expected tailscale clash proxy"),
+        }
+    }
+
+    #[test]
+    fn legacy_bridge_clash_extracts_config_but_reconstruct_errors() {
+        use crate::clash::{ClashProxy, ClashTailscale};
+
+        let proxy = ClashProxy::Tailscale(ClashTailscale {
+            name: "ts-node".into(),
+            server: "100.64.0.1".into(),
+            port: 100,
+            hostname: "node1".into(),
+            auth_key: None,
+            control_url: None,
+            state_dir: None,
+            ephemeral: false,
+            accept_routes: false,
+            exit_node: None,
+            exit_node_allow_lan_access: None,
+        });
+        let bridged = TailscaleConfig::try_from_clash(&proxy).expect("bridged clash parse");
+        assert_eq!(bridged.schema(), SchemeX::Tailscale);
+        assert_eq!(bridged.hostname.as_deref(), Some("node1"));
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
+        assert!(bridged.reconstruct().is_err());
+        assert!(bridged.to_clash().is_err());
     }
 }
