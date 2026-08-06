@@ -32,16 +32,19 @@
 //! - Xray-core: `proxy/socks/config.proto`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::SecurityConfig;
+use super::common::{
+    SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashSocks5};
 use crate::proto_spec::ProtoSpecError;
@@ -321,6 +324,58 @@ impl ProtoIdentity for Socks5Config {
     }
 }
 
+impl InjectToCoreConf for Socks5Config {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("socks".into(), other)),
+        }
+    }
+}
+
+impl Socks5Config {
+    /// xray-core outbound for this config, ported field-by-field from the old
+    /// xray builder's `Protocol::Socks` arm (including `add_user_if_present`:
+    /// users emitted only when both username and password are non-empty).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "socks"));
+        };
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
+        let mut server = json!({
+            "address": ep.host,
+            "port": ep.port,
+        });
+        if let (Some(u), Some(p)) = (&self.username, &self.password)
+            && !u.is_empty()
+            && !p.is_empty()
+        {
+            server["users"] = json!([{ "user": u, "pass": p }]);
+        }
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "socks",
+            "settings": { "servers": [server] },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -531,5 +586,77 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    fn socks_auth() -> Socks5Config {
+        config(parse("socks://user:pass@1.2.3.4:1080"))
+    }
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound_with_users() {
+        let cfg = socks_auth();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("1.2.3.4", 1080)),
+            InjectOptions::default(),
+        )
+        .expect("socks inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "socks");
+        let server = &conf["settings"]["servers"][0];
+        assert_eq!(server["address"], "1.2.3.4");
+        assert_eq!(server["port"], 1080);
+        assert_eq!(server["users"][0]["user"], "user");
+        assert_eq!(server["users"][0]["pass"], "pass");
+        assert!(conf.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_inject_no_auth_omits_users() {
+        let cfg = config(parse("socks://1.2.3.4:1080"));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("1.2.3.4", 1080)),
+            InjectOptions::default(),
+        )
+        .expect("socks inject");
+        let server = &conf["settings"]["servers"][0];
+        assert!(server.get("users").is_none());
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = socks_auth();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan socks must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "socks")));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = socks_auth();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("1.2.3.4", 1080)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "socks"
+        ));
     }
 }

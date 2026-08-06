@@ -27,16 +27,20 @@
 //! - subconverter: `subparser.cpp` `explodeHTTP()`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::common::{
+    SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
+    should_skip_endpoint_param, to_xray_stream_settings,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashHttp, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
@@ -369,6 +373,58 @@ impl ProtoIdentity for HttpClientConfig {
     }
 }
 
+impl InjectToCoreConf for HttpClientConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("http".into(), other)),
+        }
+    }
+}
+
+impl HttpClientConfig {
+    /// xray-core outbound for this config, ported field-by-field from the old
+    /// xray builder's `Protocol::Http` arm (including `add_user_if_present`:
+    /// users emitted only when both username and password are non-empty).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "http"));
+        };
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
+        let mut server = json!({
+            "address": ep.host,
+            "port": ep.port,
+        });
+        if let (Some(u), Some(p)) = (&self.username, &self.password)
+            && !u.is_empty()
+            && !p.is_empty()
+        {
+            server["users"] = json!([{ "user": u, "pass": p }]);
+        }
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "http",
+            "settings": { "servers": [server] },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -588,5 +644,82 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    fn http_auth() -> HttpClientConfig {
+        config(parse("http://user:pass@1.2.3.4:8080"))
+    }
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound_with_users() {
+        let cfg = http_auth();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+            InjectOptions::default(),
+        )
+        .expect("http inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "http");
+        let server = &conf["settings"]["servers"][0];
+        assert_eq!(server["address"], "1.2.3.4");
+        assert_eq!(server["port"], 8080);
+        assert_eq!(server["users"][0]["user"], "user");
+        assert_eq!(server["users"][0]["pass"], "pass");
+        assert!(conf.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_inject_https_tls_stream_settings() {
+        let cfg = config(parse(
+            "http://user:pass@example.com:8443?security=tls&sni=cdn.example.com",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 8443)),
+            InjectOptions::default(),
+        )
+        .expect("http inject");
+        assert_eq!(conf["streamSettings"]["security"], "tls");
+        assert_eq!(
+            conf["streamSettings"]["tlsSettings"]["serverName"],
+            "cdn.example.com"
+        );
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = http_auth();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan http must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "http")));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = http_auth();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "http"
+        ));
     }
 }

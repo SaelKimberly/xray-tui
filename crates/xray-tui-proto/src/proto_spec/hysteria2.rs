@@ -51,16 +51,20 @@
 //! - sing-box: `protocol/hysteria2/outbound.go`, `option/hysteria2.go`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::common::{
+    SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
+    should_skip_endpoint_param, to_xray_stream_settings,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashHysteria2, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
@@ -451,6 +455,54 @@ impl ProtoIdentity for Hysteria2Config {
     }
 }
 
+impl InjectToCoreConf for Hysteria2Config {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("hy2".into(), other)),
+        }
+    }
+}
+
+impl Hysteria2Config {
+    /// xray-core outbound for this config, ported field-by-field from the old
+    /// xray builder's `Protocol::Hysteria2` arm (`version`/`address`/`port`/
+    /// `auth`). The typed config carries no transport — only the TLS block
+    /// can appear in streamSettings (QUIC network is implied).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "hy2"));
+        };
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "hysteria2",
+            "settings": {
+                "version": 2,
+                "address": ep.host,
+                "port": ep.port,
+                "auth": self.auth
+            },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::common::TlsConfig;
@@ -689,5 +741,89 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    fn hy2_tls() -> Hysteria2Config {
+        config(parse(
+            "hy2://linux.do@[2a01:4f9:4b:f378::1]:13599?security=tls&insecure=1&sni=www.bing.com",
+        ))
+    }
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound() {
+        let cfg = hy2_tls();
+        let ep = EndpointEssentials::new("2a01:4f9:4b:f378::1", 13599);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&ep),
+            InjectOptions::default(),
+        )
+        .expect("hy2 inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "hysteria2");
+        assert_eq!(conf["settings"]["version"], 2);
+        assert_eq!(conf["settings"]["address"], "2a01:4f9:4b:f378::1");
+        assert_eq!(conf["settings"]["port"], 13599);
+        assert_eq!(conf["settings"]["auth"], "linux.do");
+        // TLS block from the typed security (no transport — tcp network)
+        assert_eq!(conf["streamSettings"]["security"], "tls");
+        assert_eq!(
+            conf["streamSettings"]["tlsSettings"]["serverName"],
+            "www.bing.com"
+        );
+        assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
+    }
+
+    #[test]
+    fn xray_inject_skip_cert_verify_forces_allow_insecure() {
+        let cfg = config(parse(
+            "hy2://linux.do@example.com:13599?security=tls&sni=x.com",
+        ));
+        assert_eq!(cfg.security.insecure(), None);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 13599)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("hy2 inject");
+        assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = hy2_tls();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan hy2 must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "hy2")));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = hy2_tls();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("2a01:4f9:4b:f378::1", 13599)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "hy2"
+        ));
     }
 }

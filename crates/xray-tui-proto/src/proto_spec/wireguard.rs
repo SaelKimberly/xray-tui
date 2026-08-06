@@ -33,16 +33,19 @@
 //! - wireguard-go: `device/uapi.go`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::SecurityConfig;
+use super::common::{
+    SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashWireGuard};
 use crate::proto_spec::ProtoSpecError;
@@ -430,6 +433,81 @@ impl ProtoIdentity for WireguardConfig {
     }
 }
 
+impl InjectToCoreConf for WireguardConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("wireguard".into(), other)),
+        }
+    }
+}
+
+impl WireguardConfig {
+    /// xray-core outbound for this config. The old builder never constructed
+    /// wireguard (it errored as unsupported), so this follows xray-core's
+    /// `proxy/wireguard/config.proto` shape: `secretKey`/`address`/`peers`
+    /// (+ optional `mtu`). The peer endpoint is `host:port` from `endpoint`.
+    ///
+    /// `address` (T12 F5: no form source — URL imports always carry it) is
+    /// emitted as-is, possibly empty. `reserved`/`dns`/`remote_dns_resolve`
+    /// have no xray outbound key and are dropped (sing-box-only concepts).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "wireguard"));
+        };
+        if self.private_key.trim().is_empty() {
+            return Err(SupportError::Config(
+                "WireGuard private key is empty; xray-core cannot build the outbound \
+                 without a secret key"
+                    .to_string(),
+            ));
+        }
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
+        let mut peer = json!({
+            "publicKey": self.public_key,
+            "endpoint": format!("{}:{}", ep.host, ep.port),
+            "allowedIPs": ["0.0.0.0/0", "::/0"],
+        });
+        if let Some(psk) = &self.preshared_key {
+            peer["preSharedKey"] = json!(psk);
+        }
+        if let Some(ka) = self.persistent_keepalive {
+            peer["keepAlive"] = json!(ka);
+        }
+        let mut settings = json!({
+            "secretKey": self.private_key,
+            "address": [self.address.as_str()],
+            "peers": [peer],
+        });
+        if let Some(mtu) = &self.mtu
+            && let Ok(v) = mtu.as_str().parse::<u32>()
+        {
+            settings["mtu"] = json!(v);
+        }
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "wireguard",
+            "settings": settings,
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -437,6 +515,7 @@ mod tests {
     };
     use super::WireguardConfig;
     use crate::urlx::{RawUrlX, SchemeX};
+    use serde_json::json;
 
     const WG_URL: &str = "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280";
 
@@ -654,5 +733,96 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound() {
+        let cfg = config(parse(WG_URL));
+        let ep = EndpointEssentials::new("162.159.192.1", 2408);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&ep),
+            InjectOptions::default(),
+        )
+        .expect("wireguard inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "wireguard");
+        let settings = &conf["settings"];
+        // secretKey = private key from userinfo
+        assert_eq!(
+            settings["secretKey"],
+            "eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j+wAPSEH4="
+        );
+        // interface address emitted as-is (URL import carries it)
+        assert_eq!(settings["address"], json!(["172.16.0.2/32"]));
+        assert_eq!(settings["mtu"], 1280);
+        let peer = &settings["peers"][0];
+        assert_eq!(
+            peer["publicKey"],
+            "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+        );
+        assert_eq!(peer["endpoint"], "162.159.192.1:2408");
+        assert_eq!(peer["allowedIPs"], json!(["0.0.0.0/0", "::/0"]));
+        // empty presharedkey → preSharedKey omitted
+        assert!(peer.get("preSharedKey").is_none());
+        // reserved has no xray key → dropped
+        assert!(settings.get("reserved").is_none());
+        assert!(conf.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_inject_without_private_key_is_rejected() {
+        let mut cfg = config(parse(WG_URL));
+        cfg.private_key = String::new();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::Xray,
+                Some(&EndpointEssentials::new("162.159.192.1", 2408)),
+                InjectOptions::default(),
+            )
+            .expect_err("empty private key must be rejected");
+        assert!(
+            err.to_string().contains("private key"),
+            "error must mention the private key: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse(WG_URL));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan wireguard must be rejected");
+        assert!(matches!(
+            err,
+            SupportError::MissingField("server", "wireguard")
+        ));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = config(parse(WG_URL));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("162.159.192.1", 2408)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "wireguard"
+        ));
     }
 }

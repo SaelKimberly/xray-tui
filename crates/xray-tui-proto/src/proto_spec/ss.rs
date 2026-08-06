@@ -49,16 +49,19 @@ use std::collections::HashMap;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::SecurityConfig;
+use super::common::{
+    SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashSS};
 use crate::proto_spec::ProtoSpecError;
@@ -408,6 +411,65 @@ impl ProtoIdentity for SsConfig {
     }
 }
 
+impl InjectToCoreConf for SsConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("ss".into(), other)),
+        }
+    }
+}
+
+impl SsConfig {
+    /// xray-core outbound for this config, ported field-by-field from the old
+    /// xray builder's `Protocol::Shadowsocks | Protocol::Shadowsocks2022` arm.
+    /// xray-core's CipherType enum only covers AEAD + 2022-blake3; refusing
+    /// here prevents the core from dying on startup with "unknown cipher
+    /// method" (build-time validation).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "ss"));
+        };
+        if !core_mapping::xray_supports_ss_method(self.method.as_str()) {
+            return Err(SupportError::Config(format!(
+                "Shadowsocks cipher '{}' is not supported by xray-core; \
+                 supported: aes-128-gcm, aes-256-gcm, chacha20-poly1305, \
+                 xchacha20-poly1305, 2022-blake3-*",
+                self.method.as_str()
+            )));
+        }
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &TransportConfig::Tcp);
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{
+                    "address": ep.host,
+                    "port": ep.port,
+                    "method": self.method.as_str(),
+                    "password": self.password
+                }]
+            },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
@@ -662,5 +724,103 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    fn ss_aead() -> SsConfig {
+        config(parse("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8080"))
+    }
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound() {
+        let cfg = ss_aead();
+        let ep = EndpointEssentials::new("1.2.3.4", 8080);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&ep),
+            InjectOptions::default(),
+        )
+        .expect("ss inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "shadowsocks");
+        let server = &conf["settings"]["servers"][0];
+        assert_eq!(server["address"], "1.2.3.4");
+        assert_eq!(server["port"], 8080);
+        assert_eq!(server["method"], "aes-256-gcm");
+        assert_eq!(server["password"], "password");
+        // No TLS/transport → no streamSettings
+        assert!(conf.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_inject_2022_blake3_method_builds() {
+        let cfg = config(parse(
+            "ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206cGFzc3dvcmQ@1.2.3.4:8080",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+            InjectOptions::default(),
+        )
+        .expect("2022-blake3 inject");
+        assert_eq!(
+            conf["settings"]["servers"][0]["method"],
+            "2022-blake3-aes-128-gcm"
+        );
+    }
+
+    #[test]
+    fn xray_inject_rejects_legacy_cipher() {
+        // aes-256-cfb is not in xray-core's CipherType enum; the build must
+        // refuse instead of the core dying on startup.
+        let cfg = config(parse("ss://YWVzLTI1Ni1jZmI6cGFzc3dvcmQ@1.2.3.4:8080"));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::Xray,
+                Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+                InjectOptions::default(),
+            )
+            .expect_err("aes-256-cfb must be rejected for xray");
+        assert!(
+            err.to_string().contains("aes-256-cfb"),
+            "error must name the cipher: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = ss_aead();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan ss must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "ss")));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = ss_aead();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("1.2.3.4", 8080)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "ss"
+        ));
     }
 }

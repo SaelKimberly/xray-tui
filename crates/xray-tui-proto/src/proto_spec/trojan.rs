@@ -37,18 +37,20 @@
 //! - subconverter: `subparser.cpp` `explodeTrojan()`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
 use super::common::{
-    RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_endpoint_param,
+    RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
+    should_skip_endpoint_param, to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashTrojan};
 use crate::proto_spec::ProtoSpecError;
@@ -557,6 +559,60 @@ impl ProtoIdentity for TrojanConfig {
     }
 }
 
+impl InjectToCoreConf for TrojanConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("trojan".into(), other)),
+        }
+    }
+}
+
+impl TrojanConfig {
+    /// xray-core outbound for this config, ported field-by-field from the old
+    /// xray builder's `Protocol::Trojan` arm. Transport host left unset by the
+    /// host-free parse mandate is filled at build time via
+    /// `TransportConfig::with_host` (never mutating the stored config).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "trojan"));
+        };
+        validate_xray_reality(&self.security)?;
+        let transport = self
+            .transport
+            .clone()
+            .with_host(Some(ep.host.clone()), None, None);
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &transport);
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "trojan",
+            "settings": {
+                "servers": [{
+                    "address": ep.host,
+                    "port": ep.port,
+                    "password": self.password
+                }]
+            },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -848,5 +904,110 @@ mod tests {
         // Degraded legacy paths error instead of fabricating a host.
         assert!(bridged.reconstruct().is_err());
         assert!(bridged.to_clash().is_err());
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    fn trojan_ws_tls() -> TrojanConfig {
+        config(parse(&format!(
+            "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org"
+        )))
+    }
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound() {
+        let cfg = trojan_ws_tls();
+        let ep = EndpointEssentials::new("172.64.152.23", 443);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&ep),
+            InjectOptions::default(),
+        )
+        .expect("trojan inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "trojan");
+        let server = &conf["settings"]["servers"][0];
+        assert_eq!(server["address"], "172.64.152.23");
+        assert_eq!(server["port"], 443);
+        assert_eq!(server["password"], "humanity");
+        let expected = crate::proto_spec::common::to_xray_stream_settings(
+            &cfg.security,
+            &cfg.transport
+                .clone()
+                .with_host(Some("172.64.152.23".into()), None, None),
+        )
+        .expect("ws+tls stream settings");
+        assert_eq!(conf["streamSettings"], expected);
+    }
+
+    #[test]
+    fn xray_inject_security_none_no_stream_settings() {
+        // Trojan defaults to TLS; security=none yields a bare tcp outbound.
+        let cfg = config(parse(
+            "trojan://humanity@example.com:443?type=tcp&security=none",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("trojan inject");
+        assert!(conf.get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn xray_inject_skip_cert_verify_forces_allow_insecure() {
+        let cfg = config(parse(
+            "trojan://humanity@example.com:443?security=tls&type=tcp&allowInsecure=0",
+        ));
+        assert_eq!(cfg.security.insecure(), Some(false));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("trojan inject");
+        assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = trojan_ws_tls();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan trojan must be rejected");
+        assert!(matches!(
+            err,
+            SupportError::MissingField("server", "trojan")
+        ));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = trojan_ws_tls();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("172.64.152.23", 443)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "trojan"
+        ));
     }
 }
