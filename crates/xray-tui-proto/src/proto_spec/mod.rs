@@ -300,6 +300,12 @@ impl ProtocolConfig {
     ///
     /// For full protocol config types, builds from typed fields.
     /// For [`PlaceholderConfig`] stubs, extracts from the opaque `settings_json` blob.
+    ///
+    /// KEPT (Task 16 audit): still consumed by the TUI's `profile_to_fields`
+    /// (`crates/xray-tui/src/lib.rs`, mid-break until T17 rewires it) and by
+    /// proto tests as a stream-settings reference oracle
+    /// (`common.rs::vless_to_settings_*`). The config builders (T13) and
+    /// import/export (T11) no longer call it.
     #[must_use]
     pub fn to_settings(&self) -> (serde_json::Value, serde_json::Value) {
         match self {
@@ -636,8 +642,8 @@ pub struct InjectOptions {
 ///
 /// Standalone by design: deliberately NOT a supertrait of [`ProtoSpec`] (no
 /// coupling). Task 6 adds the trait plus the [`ProtocolConfig`] dispatch; the
-/// per-config implementations land in Tasks 14/15 (stubs in `inject_stub.rs`
-/// error with [`SupportError::UnsupportedProtocol`] until then).
+/// per-config implementations land in Tasks 14/15 (the interim `inject_stub`
+/// errors with [`SupportError::UnsupportedProtocol`] until then).
 pub trait InjectToCoreConf {
     /// # Errors
     ///
