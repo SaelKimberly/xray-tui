@@ -5,9 +5,15 @@ edition.workspace = true
 
 [dependencies]
 # ============ ORM ============
-toasty = { version = "0.9", features = ["turso", "serde"] }
+toasty = { version = "0.9", features = ["turso", "serde", "jiff"] }
 toasty-driver-turso = "0.9"
 toasty-core = "0.9"
+
+# ============ Time ============
+jiff = { workspace = true }
+
+# ============ Typed proto configs ============
+xray-tui-proto = { path = "../xray-tui-proto" }
 
 # ============ Serialization ============
 serde.workspace = true
@@ -30,6 +36,8 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
-toasty = { version = "0.9", features = ["turso", "serde"] }
+toasty = { version = "0.9", features = ["turso", "serde", "jiff"] }
+jiff = { workspace = true }
+xray-tui-proto = { path = "../xray-tui-proto" }
 serde_json = "1"
 tempfile = "3"

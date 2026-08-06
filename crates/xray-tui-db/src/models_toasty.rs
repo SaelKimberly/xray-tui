@@ -1,4 +1,4 @@
-use toasty::Deferred;
+use toasty::{Deferred, Json};
 
 /// `ProfileExtension.delay_source` provenance values.
 pub const DELAY_SOURCE_FAST: i32 = 0;
@@ -331,6 +331,157 @@ pub enum PurgatoryView {
     All,
 }
 
+// ── Typed embed types (Task 8's 7-table model rewrite) ──────────────────
+//
+// Toasty embeds flatten into columns of the owning table (no separate
+// tables). Proto's typed configs are stored opaque as deferred JSON columns.
+// The legacy string/i32 columns in the models above stay until Task 8 removes
+// them; these types are added now and exercised by the scratch-model tests.
+
+use xray_tui_proto::proto_spec::common::TransportConfig;
+use xray_tui_proto::proto_spec::{SecurityConfig, SecurityType, TransportType};
+
+/// Endpoint id. Non-zero invariant — toasty has no `NonZero` column support,
+/// so the constructor enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub struct EndpointId(pub i64);
+
+impl EndpointId {
+    /// Construct a new id. Panics (debug builds) when `v == 0`.
+    #[must_use]
+    pub const fn new(v: i64) -> Self {
+        debug_assert!(v != 0, "EndpointId must be non-zero");
+        Self(v)
+    }
+}
+
+/// Protocol row id. Non-zero invariant — see [`EndpointId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub struct ProtocolId(pub i64);
+
+impl ProtocolId {
+    /// Construct a new id. Panics (debug builds) when `v == 0`.
+    #[must_use]
+    pub const fn new(v: i64) -> Self {
+        debug_assert!(v != 0, "ProtocolId must be non-zero");
+        Self(v)
+    }
+}
+
+/// Endpoint host kind (replaces the legacy `host_type` string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum HostType {
+    Ipv4,
+    Ipv6,
+    Dns,
+    Undefined,
+}
+
+/// How a protocol row was configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum ConfigType {
+    ShareUrl,
+    Form,
+}
+
+/// Kind of latency/ping task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum TaskKind {
+    FastPing,
+    RealPing,
+    UdpPing,
+    UdpTest,
+    SpeedTest,
+}
+
+/// Which error bucket a profile error belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum ProfileErr {
+    Real,
+    Fast,
+    Name,
+}
+
+/// Group status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum GroupStatus {
+    Ok,
+    Error,
+    Never,
+}
+
+/// Group core type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum GroupCoreType {
+    Auto,
+    Xray,
+    SingBox,
+}
+
+/// IP selection strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum QueryStrategy {
+    UseIp,
+    UseIpv4,
+    UseIpv6,
+}
+
+/// Conversion target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum ConvertTarget {
+    Clash,
+}
+
+/// Error info attached to a failed test.
+#[derive(Debug, Clone, PartialEq, Eq, toasty::Embed)]
+pub struct ErrorInfo {
+    pub kind: ProfileErr,
+    pub text: String,
+}
+
+/// Traffic accounting for an endpoint/group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub struct TrafficStats {
+    pub today_up: i64,
+    pub today_down: i64,
+    pub total_up: i64,
+    pub total_down: i64,
+}
+
+/// Transport-layer config. `data` is deferred + opaque JSON (not queryable).
+#[derive(Debug, Clone, toasty::Embed)]
+pub struct Transport {
+    pub r#type: TransportType,
+    #[column(type = text)]
+    pub data: Deferred<Json<TransportConfig>>,
+}
+
+/// Security (TLS/Reality) config. `data` is deferred + opaque JSON.
+#[derive(Debug, Clone, toasty::Embed)]
+pub struct Security {
+    pub r#type: SecurityType,
+    pub sni: Option<String>,
+    pub fp: Option<String>,
+    pub insecure: Option<bool>,
+    #[column(type = text)]
+    pub data: Deferred<Json<SecurityConfig>>,
+}
+
+/// Latency of one probe, real or fast. Both variants share the `delay`
+/// column (`latency_delay`); `ip` exists only on `Real` (`latency_ip`).
+#[derive(Debug, Clone, PartialEq, toasty::Embed)]
+pub enum Latency {
+    Real {
+        #[shared(delay)]
+        delay: i32,
+        ip: Option<String>,
+    },
+    Fast {
+        #[shared(delay)]
+        delay: i32,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +631,271 @@ mod tests {
         ]);
         // Best = real-ok (tier 0), latency 200
         assert_eq!(r.best_test_priority_key(false, None), (0, 200, -1, 10));
+    }
+
+    // ── Scratch-model probes: typed embeds end-to-end in SQLite ──────────
+    //
+    // Task 8 rewires the real models onto the typed embed types above; these
+    // tests pin the embed behavior (shared columns, deferred JSON,
+    // enum/struct round-trips) in an in-memory DB now, before the rewrite.
+
+    use xray_tui_proto::proto_spec::common::WebSocketConfig;
+    use xray_tui_proto::proto_spec::{TlsConfig, TlsOpts};
+
+    #[derive(Debug, toasty::Model)]
+    struct ScratchEmbedProbe {
+        #[key]
+        #[auto]
+        id: i64,
+        latency: Option<Latency>,
+        transport: Transport,
+        security: Security,
+        traffic: TrafficStats,
+        kind: TaskKind,
+        err: Option<ErrorInfo>,
+    }
+
+    /// Fresh in-memory DB holding only the scratch probe model.
+    async fn probe_db() -> toasty::Db {
+        let driver = toasty_driver_turso::Turso::in_memory();
+        let db = toasty::Db::builder()
+            .models(toasty::models!(ScratchEmbedProbe))
+            .build(driver)
+            .await
+            .expect("build db");
+        db.push_schema().await.expect("push schema");
+        db
+    }
+
+    fn tcp_transport() -> Transport {
+        Transport {
+            r#type: TransportType::Tcp,
+            data: Deferred::from(Json(TransportConfig::Tcp)),
+        }
+    }
+
+    fn no_security() -> Security {
+        Security {
+            r#type: SecurityType::None,
+            sni: None,
+            fp: None,
+            insecure: None,
+            data: Deferred::from(Json(SecurityConfig::default())),
+        }
+    }
+
+    /// Zeroed traffic stats — the flattened columns default to 0 anyway, but
+    /// the create! validation requires the non-Option embed field.
+    fn zero_traffic() -> TrafficStats {
+        TrafficStats {
+            today_up: 0,
+            today_down: 0,
+            total_up: 0,
+            total_down: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn latency_shared_delay_column_roundtrip() {
+        let mut db = probe_db().await;
+
+        let mut created = toasty::create!(ScratchEmbedProbe {
+            latency: Some(Latency::Real {
+                delay: 42,
+                ip: Some("1.2.3.4".to_string()),
+            }),
+            transport: tcp_transport(),
+            security: no_security(),
+            traffic: zero_traffic(),
+            kind: TaskKind::RealPing,
+        })
+        .exec(&mut db)
+        .await
+        .expect("create");
+
+        assert_eq!(
+            created.latency,
+            Some(Latency::Real {
+                delay: 42,
+                ip: Some("1.2.3.4".to_string()),
+            })
+        );
+
+        // Round-trips as Real (shared delay column + variant ip column).
+        let read = ScratchEmbedProbe::filter_by_id(created.id)
+            .get(&mut db)
+            .await
+            .expect("read back");
+        assert_eq!(
+            read.latency,
+            Some(Latency::Real {
+                delay: 42,
+                ip: Some("1.2.3.4".to_string()),
+            })
+        );
+
+        // Variant switch Real -> Fast: the shared `latency_delay` column
+        // carries 99 into the new variant; `latency_ip` clears to NULL.
+        toasty::update!(created {
+            latency: Some(Latency::Fast { delay: 99 }),
+        })
+        .exec(&mut db)
+        .await
+        .expect("update");
+
+        let read = ScratchEmbedProbe::filter_by_id(created.id)
+            .get(&mut db)
+            .await
+            .expect("read back");
+        assert_eq!(read.latency, Some(Latency::Fast { delay: 99 }));
+    }
+
+    #[tokio::test]
+    async fn transport_security_json_roundtrip() {
+        let mut db = probe_db().await;
+
+        let ws = TransportConfig::Ws(WebSocketConfig {
+            host: Some("x".into()),
+            path: Some("/p".into()),
+            headers: None,
+            ..Default::default()
+        });
+        let tls = SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts {
+                sni: Some("example.com".into()),
+                alpn: None,
+                fp: Some("chrome".into()),
+                insecure: Some(true),
+                ..Default::default()
+            })),
+            enc: None,
+        };
+
+        let created = toasty::create!(ScratchEmbedProbe {
+            transport: Transport {
+                r#type: TransportType::Ws,
+                data: Deferred::from(Json(ws.clone())),
+            },
+            security: Security {
+                r#type: SecurityType::Tls,
+                sni: Some("example.com".to_string()),
+                fp: Some("chrome".to_string()),
+                insecure: Some(true),
+                data: Deferred::from(Json(tls.clone())),
+            },
+            traffic: zero_traffic(),
+            kind: TaskKind::SpeedTest,
+        })
+        .exec(&mut db)
+        .await
+        .expect("create");
+
+        // INSERT ... RETURNING echoes the supplied values — deferred JSON
+        // arrives loaded.
+        assert!(!created.transport.data.is_unloaded());
+        assert_eq!(&ws, &created.transport.data.get().0);
+        assert!(!created.security.data.is_unloaded());
+        assert_eq!(&tls, &created.security.data.get().0);
+
+        // A default read leaves the deferred JSON unloaded; `.include()`
+        // loads the same query.
+        let read = ScratchEmbedProbe::filter_by_id(created.id)
+            .include(ScratchEmbedProbe::fields().transport().data())
+            .include(ScratchEmbedProbe::fields().security().data())
+            .get(&mut db)
+            .await
+            .expect("read back");
+        assert!(!read.transport.data.is_unloaded());
+        assert_eq!(&ws, &read.transport.data.get().0);
+        assert_eq!(read.transport.r#type, TransportType::Ws);
+        assert!(!read.security.data.is_unloaded());
+        assert_eq!(&tls, &read.security.data.get().0);
+        assert_eq!(read.security.r#type, SecurityType::Tls);
+        assert_eq!(read.security.sni.as_deref(), Some("example.com"));
+        assert_eq!(read.security.fp.as_deref(), Some("chrome"));
+        assert_eq!(read.security.insecure, Some(true));
+    }
+
+    #[tokio::test]
+    async fn task_kind_and_error_roundtrip() {
+        let mut db = probe_db().await;
+
+        let mut created = toasty::create!(ScratchEmbedProbe {
+            transport: tcp_transport(),
+            security: no_security(),
+            traffic: TrafficStats {
+                today_up: 1,
+                today_down: 2,
+                total_up: 3,
+                total_down: 4,
+            },
+            kind: TaskKind::UdpTest,
+            err: Some(ErrorInfo {
+                kind: ProfileErr::Real,
+                text: "timeout".to_string(),
+            }),
+        })
+        .exec(&mut db)
+        .await
+        .expect("create");
+
+        let read = ScratchEmbedProbe::filter_by_id(created.id)
+            .get(&mut db)
+            .await
+            .expect("read back");
+        assert_eq!(read.kind, TaskKind::UdpTest);
+        assert_eq!(
+            read.err,
+            Some(ErrorInfo {
+                kind: ProfileErr::Real,
+                text: "timeout".to_string(),
+            })
+        );
+        assert_eq!(
+            read.traffic,
+            TrafficStats {
+                today_up: 1,
+                today_down: 2,
+                total_up: 3,
+                total_down: 4,
+            }
+        );
+
+        // Every TaskKind variant round-trips through the discriminant column.
+        for kind in [
+            TaskKind::FastPing,
+            TaskKind::RealPing,
+            TaskKind::UdpPing,
+            TaskKind::UdpTest,
+            TaskKind::SpeedTest,
+        ] {
+            toasty::update!(created { kind: kind })
+                .exec(&mut db)
+                .await
+                .expect("update kind");
+            let read = ScratchEmbedProbe::filter_by_id(created.id)
+                .get(&mut db)
+                .await
+                .expect("read back");
+            assert_eq!(read.kind, kind);
+        }
+    }
+
+    #[test]
+    fn endpoint_id_accepts_nonzero() {
+        assert_eq!(EndpointId::new(42).0, 42);
+        assert_eq!(ProtocolId::new(7).0, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "EndpointId must be non-zero")]
+    fn endpoint_id_rejects_zero() {
+        let _ = EndpointId::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ProtocolId must be non-zero")]
+    fn protocol_id_rejects_zero() {
+        let _ = ProtocolId::new(0);
     }
 }
