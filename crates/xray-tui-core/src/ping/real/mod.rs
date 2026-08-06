@@ -10,14 +10,12 @@ pub use pool::CorePool;
 pub use pool::SinglePingReq;
 
 use super::PingResult;
-use crate::config_builder::shadowsocks_method;
-use crate::core_type::CoreType;
 use crate::protocol::Protocol;
-use crate::protocol_core_mapping::resolve_core;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+use xray_tui_db::models::{Endpoint, ProfileStats, Protocol as DbProtocol};
 
 /// Configuration and context for running real pings via temporary core instances.
 #[derive(Clone, Debug)]
@@ -41,24 +39,29 @@ impl RealPingManager {
         self.next_ping_port.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Run real ping for a single profile. Builds config for the resolved core,
+    /// Run real ping for a single profile. The core is taken from
+    /// `link.core_type` — the per-pair override resolved at parse time.
     pub async fn real_ping(
         &self,
-        endpoint: &xray_tui_db::models::Endpoint,
-        protocol: &xray_tui_db::models::ProtocolRow,
-        config_type: i32,
+        endpoint: &Endpoint,
+        link: &ProfileStats,
+        protocol: &DbProtocol,
     ) -> PingResult {
-        let proto = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
-        let core = resolve_core(proto, None, shadowsocks_method(protocol).as_deref());
-        match core {
-            CoreType::Xray => xray::real_ping(endpoint, protocol, self).await,
-            CoreType::SingBox => singbox::real_ping(endpoint, protocol, self).await,
-            CoreType::Auto => {
-                tracing::warn!("resolve_core returned Auto, falling back to xray");
-                xray::real_ping(endpoint, protocol, self).await
+        match link.core_type {
+            xray_tui_proto::proto_spec::CoreType::Xray => {
+                xray::real_ping(endpoint, link, protocol, self).await
+            }
+            xray_tui_proto::proto_spec::CoreType::SingBox => {
+                singbox::real_ping(endpoint, link, protocol, self).await
             }
         }
     }
+}
+
+/// Legacy `config_type` integer for `ProfileKey`, derived from the typed
+/// `proto_kind` (the old `ProtocolRow.config_type`).
+pub(super) fn config_type(protocol: &DbProtocol) -> i32 {
+    Protocol::from(protocol.proto_kind).to_i32()
 }
 
 #[cfg(test)]

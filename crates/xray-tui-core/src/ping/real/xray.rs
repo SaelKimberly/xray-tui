@@ -1,17 +1,17 @@
 use super::super::{PingResult, ProfileKey};
 use super::RealPingManager;
 use crate::bin_manager::find_binary;
-use crate::config_builder::{BuildParams, ConfigBuilder, shadowsocks_method};
+use crate::config_builder::{BuildParams, ConfigBuilder};
+use crate::core_type::CoreType;
 use crate::process::RealCoreManager;
-use crate::protocol::Protocol;
-use crate::protocol_core_mapping::resolve_core;
 use tokio::sync::mpsc;
-use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow};
+use xray_tui_db::models::{DnsSetting, Endpoint, ProfileStats, Protocol};
 
 /// Run a real ping through a temp xray-core instance.
 pub(super) async fn real_ping(
     endpoint: &Endpoint,
-    protocol: &ProtocolRow,
+    link: &ProfileStats,
+    protocol: &Protocol,
     ctx: &RealPingManager,
 ) -> PingResult {
     let endpoint = endpoint.clone();
@@ -23,15 +23,12 @@ pub(super) async fn real_ping(
     let retries = ctx.retries;
     let bin_dir = ctx.bin_dir.clone();
     let bin_configs_dir = ctx.bin_configs_dir.clone();
-    let r#type = protocol.config_type;
+    let r#type = super::config_type(&protocol);
 
     let outcome = async {
         let temp_dir =
             tempfile::TempDir::new_in(&bin_configs_dir).map_err(|e| format!("Temp dir: {e}"))?;
         let temp_dir_path = temp_dir.path().to_path_buf();
-
-        let proto = Protocol::try_from_i32(r#type).unwrap_or(Protocol::Custom);
-        let resolved_core = resolve_core(proto, None, shadowsocks_method(&protocol).as_deref());
 
         let proxy_port = ctx.allocate_port();
 
@@ -52,21 +49,20 @@ pub(super) async fn real_ping(
         let dns = DnsSetting {
             id: "default".to_string(),
             name: None,
-            servers: None,
-            hosts: None,
+            servers: Vec::new(),
+            hosts: Vec::new(),
             query_strategy: None,
-            disable_cache: None,
-            disable_fallback: None,
+            disable_cache: false,
+            disable_fallback: false,
             client_ip: None,
             cache_ttl_secs: None,
         };
 
-        let backend_config =
-            ConfigBuilder::build(&endpoint, &protocol, resolved_core, &params, &[], &dns)
-                .map_err(|_| "Build config failed".to_string())?;
+        let backend_config = ConfigBuilder::build(&endpoint, link, &protocol, &params, &[], &dns)
+            .map_err(|_| "Build config failed".to_string())?;
 
         let bin_path =
-            find_binary(resolved_core, &bin_dir).ok_or_else(|| "Binary not found".to_string())?;
+            find_binary(CoreType::Xray, &bin_dir).ok_or_else(|| "Binary not found".to_string())?;
 
         let (log_line_tx, mut log_rx) = mpsc::channel(512);
         // Spawn reader to capture xray-core stderr for diagnostics
@@ -79,7 +75,7 @@ pub(super) async fn real_ping(
         });
         let mut manager = RealCoreManager::new(temp_dir_path.clone(), log_line_tx);
         manager
-            .start(resolved_core, &backend_config, &bin_path, None)
+            .start(CoreType::Xray, &backend_config, &bin_path, None)
             .await
             .map_err(|e| format!("Core start: {e}"))?;
 

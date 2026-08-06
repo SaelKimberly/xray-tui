@@ -1,11 +1,12 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
+use xray_tui_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
+use xray_tui_proto::proto_spec::{CoreType, InjectToCoreConf};
 
-use crate::protocol::Protocol;
-use crate::protocol_core_mapping::xray_supports_ss_method;
-
-use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
+use super::{
+    BuildError, BuildParams, MultiInboundItem, build_hosts_map, endpoint_essentials,
+    protocol_config,
+};
 
 // ── Xray JSON config structs ────────────────────────────────────────
 
@@ -42,13 +43,18 @@ pub struct Inbound {
     pub tag: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// A proxy outbound. The protocol-specific block (settings + streamSettings)
+/// is produced by `protocol.config.inject_to(...)` (Tasks 14/15) and
+/// deserialized here; `settings`/`stream_settings` tolerate absence so
+/// injectors may omit stream settings for plain-TCP outbounds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Outbound {
     pub tag: String,
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub settings: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_settings: Option<Value>,
 }
 
@@ -91,56 +97,24 @@ pub struct PolicyConfig {
 pub struct XrayConfigBuilder;
 
 impl XrayConfigBuilder {
+    /// Build an xray-core config. `core_type` (Xray, already resolved from the
+    /// per-pair link) is handed to `inject_to` for the proxy outbound.
     pub fn build(
         endpoint: &Endpoint,
-        protocol: &ProtocolRow,
+        protocol: &Protocol,
+        core_type: CoreType,
         params: &BuildParams,
         routing: &[RoutingRule],
         dns: &DnsSetting,
     ) -> Result<XrayConfig, BuildError> {
-        let outbounds = vec![
-            build_proxy_outbound(endpoint, protocol)?,
+        let mut config = skeleton(params, routing, dns);
+        config.outbounds = vec![
+            build_proxy_outbound(endpoint, protocol, core_type)?,
             build_dns_outbound(),
             build_direct_outbound(),
             build_block_outbound(),
         ];
-
-        let (stats, api, policy) = if params.v2ray_api_enabled {
-            (
-                Some(StatsConfig {}),
-                Some(ApiConfig {
-                    tag: "api",
-                    services: vec!["HandlerService", "LoggerService", "StatsService"],
-                }),
-                Some(PolicyConfig {
-                    levels: json!({
-                        "0": {
-                            "statsUserUplink": true,
-                            "statsUserDownlink": true
-                        }
-                    }),
-                    system: json!({
-                        "statsInboundUplink": true,
-                        "statsOutboundUplink": true
-                    }),
-                }),
-            )
-        } else {
-            (None, None, None)
-        };
-
-        Ok(XrayConfig {
-            log: LogConfig {
-                loglevel: params.log_level.clone(),
-            },
-            inbounds: build_inbounds(params),
-            outbounds,
-            routing: build_routing(routing, params.v2ray_api_enabled),
-            dns: build_dns(dns),
-            stats,
-            api,
-            policy,
-        })
+        Ok(config)
     }
 
     /// Build a multi-inbound config for batch real ping.
@@ -175,7 +149,8 @@ impl XrayConfigBuilder {
                 tag: inbound_tag.clone(),
             });
 
-            let mut outbound = build_proxy_outbound(item.endpoint, item.protocol)?;
+            let mut outbound =
+                build_proxy_outbound(item.endpoint, item.protocol, item.link.core_type)?;
             outbound.tag = tag.clone();
             proxy_outbounds.push(outbound);
 
@@ -208,6 +183,47 @@ impl XrayConfigBuilder {
             api: None,
             policy: None,
         })
+    }
+}
+
+/// Assemble the outbound-free skeleton: log, inbounds, routing, DNS, and the
+/// stats/api/policy block. `build` fills in the outbounds afterwards.
+fn skeleton(params: &BuildParams, routing: &[RoutingRule], dns: &DnsSetting) -> XrayConfig {
+    let (stats, api, policy) = if params.v2ray_api_enabled {
+        (
+            Some(StatsConfig {}),
+            Some(ApiConfig {
+                tag: "api",
+                services: vec!["HandlerService", "LoggerService", "StatsService"],
+            }),
+            Some(PolicyConfig {
+                levels: json!({
+                    "0": {
+                        "statsUserUplink": true,
+                        "statsUserDownlink": true
+                    }
+                }),
+                system: json!({
+                    "statsInboundUplink": true,
+                    "statsOutboundUplink": true
+                }),
+            }),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    XrayConfig {
+        log: LogConfig {
+            loglevel: params.log_level.clone(),
+        },
+        inbounds: build_inbounds(params),
+        outbounds: vec![],
+        routing: build_routing(routing, params.v2ray_api_enabled),
+        dns: build_dns(dns),
+        stats,
+        api,
+        policy,
     }
 }
 
@@ -256,319 +272,25 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
 }
 
 // ── Outbound construction ────────────────────────────────────────────
+
+/// The proxy outbound: `protocol.config.inject_to(...)` writes the
+/// protocol-specific block (settings + streamSettings) into `conf`, which is
+/// then deserialized into [`Outbound`]. The tag is owned by the builder
+/// ("proxy" single / "proxy-{i}" multi).
 fn build_proxy_outbound(
     endpoint: &Endpoint,
-    protocol: &ProtocolRow,
+    protocol: &Protocol,
+    core_type: CoreType,
 ) -> Result<Outbound, BuildError> {
-    let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
-        BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
-    })?;
-
-    let address = endpoint.host.as_str();
-    let port = endpoint.port as u16;
-    let (p_settings, s_settings_raw) = parse_settings(protocol);
-    let user_id = p_settings
-        .get("id")
-        .or_else(|| p_settings.get("uuid"))
-        .or_else(|| p_settings.get("password"))
-        .or_else(|| p_settings.get("pass"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let s_settings = build_xray_stream_settings(protocol, s_settings_raw);
-
-    // A `security: "reality"` stream setting without a usable realitySettings
-    // kills the core at startup ("REALITY: Empty \"realitySettings\"" when the
-    // object is absent, `empty "password"` when publicKey is missing) — refuse
-    // to emit such a config. Realities need at least the server's public key
-    // and an SNI; both are unrecoverable if absent from the profile.
-    if let Some(ss) = &s_settings
-        && ss.get("security").and_then(|v| v.as_str()) == Some("reality")
-    {
-        let rs = ss.get("realitySettings").and_then(|v| v.as_object());
-        let has = |key: &str| {
-            rs.is_some_and(|r| {
-                r.get(key)
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty())
-            })
-        };
-        if !has("publicKey") || !has("serverName") {
-            return Err(BuildError::InvalidProfile(
-                "REALITY profile is missing required stream settings \
-                 (realitySettings.publicKey / serverName); \
-                 security is 'reality' but the reality settings are incomplete"
-                    .to_string(),
-            ));
-        }
-    }
-
-    match proto {
-        Protocol::Vmess => Ok(Outbound {
-            tag: "proxy".to_string(),
-            protocol: "vmess".to_string(),
-            settings: json!({
-                "vnext": [{
-                    "address": address,
-                    "port": port,
-                    "users": [{
-                        "id": user_id,
-                        "security": protocol.security.as_deref().unwrap_or("auto")
-                    }]
-                }]
-            }),
-            stream_settings: s_settings,
-        }),
-        Protocol::Vless => {
-            let flow = p_settings
-                .get("flow")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "vless".to_string(),
-                settings: json!({
-                    "vnext": [{
-                        "address": address,
-                        "port": port,
-                        "users": [{
-                            "id": user_id,
-                            "encryption": "none",
-                            "flow": flow
-                        }]
-                    }]
-                }),
-                stream_settings: s_settings,
-            })
-        }
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => {
-            let method = p_settings
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("aes-256-gcm");
-            // xray-core's CipherType enum only covers AEAD + 2022-blake3;
-            // refusing here prevents the core from dying on startup with
-            // "unknown cipher method".
-            if !xray_supports_ss_method(method) {
-                return Err(BuildError::InvalidProfile(format!(
-                    "Shadowsocks cipher '{method}' is not supported by xray-core; \
-                     supported: aes-128-gcm, aes-256-gcm, chacha20-poly1305, \
-                     xchacha20-poly1305, 2022-blake3-*"
-                )));
-            }
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "shadowsocks".to_string(),
-                settings: json!({
-                    "servers": [{
-                        "address": address,
-                        "port": port,
-                        "method": method,
-                        "password": user_id
-                    }]
-                }),
-                stream_settings: s_settings.clone(),
-            })
-        }
-        Protocol::Trojan => Ok(Outbound {
-            tag: "proxy".to_string(),
-            protocol: "trojan".to_string(),
-            settings: json!({
-                "servers": [{
-                    "address": address,
-                    "port": port,
-                    "password": user_id
-                }]
-            }),
-            stream_settings: s_settings,
-        }),
-        Protocol::Socks => {
-            let mut server = json!({
-                "address": address,
-                "port": port,
-            });
-            add_user_if_present(&mut server, &p_settings);
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "socks".to_string(),
-                settings: json!({ "servers": [server] }),
-                stream_settings: s_settings.clone(),
-            })
-        }
-        Protocol::Http => {
-            let mut server = json!({
-                "address": address,
-                "port": port,
-            });
-            add_user_if_present(&mut server, &p_settings);
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "http".to_string(),
-                settings: json!({ "servers": [server] }),
-                stream_settings: s_settings.clone(),
-            })
-        }
-        Protocol::Hysteria2 => {
-            let auth = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            Ok(Outbound {
-                tag: "proxy".to_string(),
-                protocol: "hysteria2".to_string(),
-                settings: json!({
-                    "version": 2,
-                    "address": address,
-                    "port": port,
-                    "auth": auth
-                }),
-                stream_settings: s_settings.clone(),
-            })
-        }
-        _ => Err(BuildError::InvalidProfile(format!(
-            "Protocol {proto:?} not supported for xray outbound"
-        ))),
-    }
-}
-
-/// xray-shaped `streamSettings` for a profile. Typed configs (Vmess/Vless/
-/// Trojan) build from SecurityConfig+TransportConfig; legacy
-/// PlaceholderConfig blobs carry a homegrown dotted-key format
-/// ("ws.path", "tls.enable", "realitySettings.publicKey", ...) that must be
-/// expanded into the xray shape.
-fn build_xray_stream_settings(
-    protocol: &ProtocolRow,
-    s_settings_raw: serde_json::Value,
-) -> Option<serde_json::Value> {
-    use xray_tui_proto::proto_spec::Proto;
-    match serde_json::from_slice::<Proto>(&protocol.spec_blob) {
-        Ok(proto) => match proto.config() {
-            xray_tui_proto::proto_spec::ProtocolConfig::Vmess(c) => {
-                xray_tui_proto::proto_spec::common::to_xray_stream_settings(
-                    &c.security,
-                    &c.transport,
-                )
-            }
-            xray_tui_proto::proto_spec::ProtocolConfig::Vless(c) => {
-                xray_tui_proto::proto_spec::common::to_xray_stream_settings(
-                    &c.security,
-                    &c.transport,
-                )
-            }
-            xray_tui_proto::proto_spec::ProtocolConfig::Trojan(c) => {
-                xray_tui_proto::proto_spec::common::to_xray_stream_settings(
-                    &c.security,
-                    &c.transport,
-                )
-            }
-            _ => legacy_stream_settings_to_xray(s_settings_raw, protocol.transport.as_deref()),
-        },
-        Err(_) => legacy_stream_settings_to_xray(s_settings_raw, protocol.transport.as_deref()),
-    }
-}
-
-/// Expand the legacy dotted-key stream_settings format into xray shape.
-fn legacy_stream_settings_to_xray(
-    raw: serde_json::Value,
-    network: Option<&str>,
-) -> Option<serde_json::Value> {
-    let obj = raw.as_object()?;
-    if obj.is_empty() {
-        return None;
-    }
-    let mut ss: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    let get = |k: &str| obj.get(k).cloned();
-
-    if let Some(net) = network.filter(|n| !n.is_empty() && *n != "tcp") {
-        ss.insert("network".into(), serde_json::json!(net));
-    }
-    // Legacy `security` == "reality" (the only value the legacy parser stored).
-    if get("security").as_ref().and_then(|v| v.as_str()) == Some("reality") {
-        ss.insert("security".into(), serde_json::json!("reality"));
-    } else if get("tls.enable").as_ref().and_then(|v| v.as_bool()) == Some(true)
-        || get("tls.enable")
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("true"))
-    {
-        ss.insert("security".into(), serde_json::json!("tls"));
-    }
-    let mut tls = serde_json::Map::new();
-    if let Some(v) = get("sni").and_then(|v| v.as_str().map(str::to_string)) {
-        tls.insert("serverName".into(), serde_json::json!(v));
-    }
-    // Legacy emitters write the plain "allow_insecure" key (vmess QR insecure,
-    // vless allowInsecure query param, forms.rs); "tls.allow_insecure" is the
-    // dotted legacy variant — accept both, preferring the plain key.
-    if let Some(v) = get("allow_insecure")
-        .or_else(|| get("tls.allow_insecure"))
-        .and_then(|v| v.as_bool())
-    {
-        tls.insert("allowInsecure".into(), serde_json::json!(v));
-    }
-    if let Some(v) = get("fingerprint").and_then(|v| v.as_str().map(str::to_string)) {
-        tls.insert("fingerprint".into(), serde_json::json!(v));
-    }
-    if let Some(v) = get("alpn").and_then(|v| v.as_str().map(str::to_string)) {
-        let list: Vec<&str> = v.split(',').map(str::trim).collect();
-        tls.insert("alpn".into(), serde_json::json!(list));
-    }
-    if ss.get("security") == Some(&serde_json::json!("reality")) {
-        // realitySettings already xray-shaped in legacy output
-        if let Some(rs) = obj.get("realitySettings").cloned() {
-            ss.insert("realitySettings".into(), rs);
-        }
-        if let Some(server_name) = tls.get("serverName").cloned()
-            && let Some(rs) = ss
-                .get_mut("realitySettings")
-                .and_then(|v| v.as_object_mut())
-        {
-            rs.insert("serverName".into(), server_name);
-        }
-    } else if !tls.is_empty() {
-        ss.insert("tlsSettings".into(), serde_json::Value::Object(tls));
-    }
-    // Transport blocks
-    let mut ws = serde_json::Map::new();
-    if let Some(v) = get("ws.path").and_then(|v| v.as_str().map(str::to_string)) {
-        ws.insert("path".into(), serde_json::json!(v));
-    }
-    if let Some(v) = get("ws.host").and_then(|v| v.as_str().map(str::to_string)) {
-        // Top-level `host` — xray-core deprecates `headers.Host`
-        // ("will be removed soon").
-        ws.insert("host".into(), serde_json::json!(v));
-    }
-    if !ws.is_empty() {
-        ss.insert("wsSettings".into(), serde_json::Value::Object(ws));
-    }
-    let mut grpc = serde_json::Map::new();
-    if let Some(v) = get("grpc.serviceName").and_then(|v| v.as_str().map(str::to_string)) {
-        grpc.insert("serviceName".into(), serde_json::json!(v));
-    }
-    if !grpc.is_empty() {
-        ss.insert("grpcSettings".into(), serde_json::Value::Object(grpc));
-    }
-    if ss.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(ss))
-    }
-}
-
-fn add_user_if_present(server: &mut Value, p_settings: &Value) {
-    let username = p_settings
-        .get("username")
-        .or_else(|| p_settings.get("user"))
-        .and_then(|v| v.as_str());
-    let password = p_settings
-        .get("password")
-        .or_else(|| p_settings.get("pass"))
-        .and_then(|v| v.as_str());
-    if let (Some(u), Some(p)) = (username, password)
-        && !u.is_empty()
-        && !p.is_empty()
-    {
-        server["users"] = json!([{ "user": u, "pass": p }]);
-    }
+    let mut conf = json!({});
+    protocol_config(protocol)?.inject_to(
+        &mut conf,
+        core_type,
+        Some(&endpoint_essentials(endpoint)),
+    )?;
+    let mut outbound: Outbound = serde_json::from_value(conf)?;
+    outbound.tag = "proxy".to_string();
+    Ok(outbound)
 }
 
 fn build_dns_outbound() -> Outbound {
@@ -614,37 +336,37 @@ fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfi
     json_rules.extend(rules.iter().filter_map(|r| {
         // xray-core 26+ rejects routing rules with no match condition
         // (domain/ip/inboundTag/port/sourcePort/network/protocol). Skip them.
-        let has_matcher = r.domains.is_some()
-            || r.ips.is_some()
-            || r.inbound_tags.is_some()
-            || r.port.is_some()
-            || r.source_ports.is_some()
+        let has_matcher = !r.domains.is_empty()
+            || !r.ips.is_empty()
+            || !r.inbound_tags.is_empty()
+            || !r.ports.is_empty()
+            || !r.source_ports.is_empty()
             || r.network.is_some()
-            || r.protocols.is_some();
+            || !r.protocols.is_empty();
         if !has_matcher {
             return None;
         }
         let mut rule = json!({ "type": "field" });
-        if let Some(domains) = &r.domains {
-            rule["domain"] = json!(parse_comma_list(domains));
+        if !r.domains.is_empty() {
+            rule["domain"] = json!(r.domains);
         }
-        if let Some(ips) = &r.ips {
-            rule["ip"] = json!(parse_comma_list(ips));
+        if !r.ips.is_empty() {
+            rule["ip"] = json!(r.ips);
         }
-        if let Some(inbound_tags) = &r.inbound_tags {
-            rule["inboundTag"] = json!(parse_comma_list(inbound_tags));
+        if !r.inbound_tags.is_empty() {
+            rule["inboundTag"] = json!(r.inbound_tags);
         }
-        if let Some(port) = &r.port {
-            rule["port"] = json!(port);
+        if !r.ports.is_empty() {
+            rule["port"] = json!(r.ports);
         }
-        if let Some(source_ports) = &r.source_ports {
-            rule["sourcePort"] = json!(source_ports);
+        if !r.source_ports.is_empty() {
+            rule["sourcePort"] = json!(r.source_ports);
         }
         if let Some(network) = &r.network {
             rule["network"] = json!(network);
         }
-        if let Some(protocols) = &r.protocols {
-            rule["protocol"] = json!(parse_comma_list(protocols));
+        if !r.protocols.is_empty() {
+            rule["protocol"] = json!(r.protocols);
         }
         if let Some(matcher) = &r.domain_matcher {
             rule["domainMatcher"] = json!(matcher);
@@ -670,28 +392,11 @@ fn build_routing(rules: &[RoutingRule], v2ray_api_enabled: bool) -> RoutingConfi
 // ── DNS ──────────────────────────────────────────────────────────────
 
 fn build_dns(dns: &DnsSetting) -> DnsConfig {
-    let servers: Vec<Value> = dns
-        .servers
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-
-    let hosts: Value = dns
-        .hosts
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
-
-    DnsConfig { servers, hosts }
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-fn parse_comma_list(s: &str) -> Vec<&str> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect()
+    let servers: Vec<Value> = dns.servers.iter().map(|s| json!(s)).collect();
+    DnsConfig {
+        servers,
+        hosts: build_hosts_map(&dns.hosts),
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -699,89 +404,9 @@ fn parse_comma_list(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
-
-    fn test_endpoint_and_protocol(config_type: i32) -> (Endpoint, ProtocolRow) {
-        let endpoint = Endpoint {
-            id: 0,
-            host: "example.com".to_string(),
-            host_type: "dns".to_string(),
-            port: 443,
-            port_spec_str: None,
-            parent_id: None,
-            last_source: None,
-            created_at: 0,
-            manual_protocol_override: None,
-            resolved_as: None,
-            resolved_at: None,
-        };
-        let extra = serde_json::json!({
-            "remarks": "test",
-            "user_id": "test-uuid-or-pass",
-        });
-        let protocol = ProtocolRow {
-            id: 0,
-            endpoint_id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            last_used_at: None,
-            spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
-            config_type,
-            core_type: String::new(),
-            transport: Some("tcp".to_string()),
-            security: Some("auto".to_string()),
-            created_at: 0,
-            last_seen_at: 0,
-            extension: Default::default(),
-            endpoint: Default::default(),
-            server_stat: Default::default(),
-        };
-        (endpoint, protocol)
-    }
-
-    fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
-        let params = BuildParams {
-            v2ray_api_enabled: true,
-            clash_api_enabled: false,
-            log_level: "warning".to_string(),
-            socks_port: 10808,
-            http_port: None,
-            listen: "127.0.0.1".to_string(),
-            sniffing: false,
-            clash_api_port: None,
-            mux: None,
-            clash_mixin: None,
-            skip_cert_verify: false,
-        };
-        let rules = vec![];
-        let dns = DnsSetting {
-            id: "default".to_string(),
-            name: None,
-            servers: None,
-            hosts: None,
-            query_strategy: None,
-            disable_cache: None,
-            disable_fallback: None,
-            client_ip: None,
-            cache_ttl_secs: None,
-        };
-        (params, rules, dns)
-    }
-
-    fn set_stream_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
-        let mut extra: serde_json::Value =
-            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["stream_settings"] = serde_json::from_str(json_str).unwrap_or_default();
-        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
-    }
-
-    fn set_protocol_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
-        let mut extra: serde_json::Value =
-            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["protocol_settings"] = serde_json::from_str(json_str).unwrap_or_default();
-        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
-    }
+    use xray_tui_db::models::RoutingRule;
+    use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
+    use xray_tui_proto::proto_spec::ProtocolKind;
 
     fn assert_xray_top_level(json: &Value) {
         assert!(json.get("log").is_some(), "missing log");
@@ -794,188 +419,87 @@ mod tests {
         assert!(json.get("policy").is_some(), "missing policy");
     }
 
-    fn assert_proxy_outbound(json: &Value, expected_protocol: &str) {
-        let outbounds = json["outbounds"].as_array().expect("outbounds array");
-        let proxy = outbounds
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy outbound");
-        assert_eq!(
-            proxy["protocol"].as_str().unwrap(),
-            expected_protocol,
-            "protocol mismatch"
-        );
+    fn test_endpoint_protocol_link() -> (Endpoint, Protocol, crate::config_builder::ProfileStats) {
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol =
+            super::super::tests::protocol(ProtocolKind::Vless, super::super::tests::vless_config());
+        let link = super::super::tests::link(ProtoCoreType::Xray);
+        (endpoint, protocol, link)
+    }
+
+    fn domain_rule() -> RoutingRule {
+        RoutingRule {
+            id: "r1".to_string(),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: vec!["example.com".to_string(), "test.org".to_string()],
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
+            network: Some("tcp".to_string()),
+            protocols: Vec::new(),
+            domain_strategy: None,
+            outbound_tag: Some("direct".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: Some(0),
+        }
+    }
+
+    #[test]
+    fn xray_build_returns_unsupported_protocol_until_inject() {
+        // flip to success assertions in T16 (real inject_to lands in T14/15)
+        let (endpoint, protocol, link) = test_endpoint_protocol_link();
+        let (params, rules, dns) = super::super::tests::default_params();
+        let result =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns);
+        match result {
+            Err(BuildError::Support(
+                xray_tui_proto::proto_spec::SupportError::UnsupportedProtocol(kind, core),
+            )) => {
+                assert_eq!(kind, "vless");
+                assert_eq!(core, ProtoCoreType::Xray);
+            }
+            other => panic!("expected UnsupportedProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xray_build_unloaded_config_returns_error() {
+        use toasty::Deferred;
+        let (endpoint, mut protocol, link) = test_endpoint_protocol_link();
+        protocol.config = Deferred::default();
+        let (params, rules, dns) = super::super::tests::default_params();
+        let err =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+                .expect_err("unloaded config must be rejected");
         assert!(
-            proxy["settings"].is_object(),
-            "proxy settings should be an object"
-        );
-    }
-
-    fn assert_has_standard_outbounds(json: &Value) {
-        let outbounds = json["outbounds"].as_array().expect("outbounds array");
-        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
-        assert!(tags.contains(&"dns-out"), "missing dns-out");
-        assert!(tags.contains(&"direct"), "missing direct");
-        assert!(tags.contains(&"block"), "missing block");
-    }
-
-    #[test]
-    fn xray_vmess_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "vmess");
-        assert_has_standard_outbounds(&json);
-    }
-
-    #[test]
-    fn xray_vless_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "vless");
-    }
-
-    #[test]
-    fn xray_shadowsocks_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "shadowsocks");
-    }
-
-    #[test]
-    fn xray_rejects_reality_without_reality_settings() {
-        // dump-2: 6× "REALITY: Empty \"realitySettings\"" — legacy blobs with
-        // stream_settings.security=reality but no realitySettings object make
-        // the core die at startup. The builder must refuse instead.
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"security": "reality", "sni": "cdn.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let err = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect_err("security=reality without realitySettings must be rejected");
-        assert!(
-            err.to_string().contains("reality"),
-            "error must mention reality: {err}"
+            err.to_string().contains("not loaded"),
+            "error must mention the unloaded config: {err}"
         );
     }
 
     #[test]
-    fn xray_rejects_reality_without_public_key() {
-        // Typed vless:// URL with security=reality but no pbk: the typed path
-        // emits realitySettings {} (no publicKey) — xray's client Build()
-        // rejects that with `empty "password"` at startup.
-        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?security=reality&type=tcp#r";
-        let settings = xray_tui_config::import_export::ValidationSettings {
-            allow_private_ips: false,
-            reject_insecure: false,
-        };
-        let parsed =
-            xray_tui_config::import_export::parse_share_url(url, &settings).expect("parse url");
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        protocol.spec_blob = parsed.spec_blob;
-        let (params, rules, dns) = default_params();
-        let err = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect_err("reality without publicKey must be rejected");
-        assert!(
-            err.to_string().contains("reality"),
-            "error must mention reality: {err}"
-        );
-    }
-
-    #[test]
-    fn xray_shadowsocks_rejects_unsupported_cipher() {
-        // aes-256-cfb is not in xray-core's CipherType enum; the builder must
-        // refuse to emit the config instead of the core dying on startup.
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"method": "aes-256-cfb"}"#);
-        let (params, rules, dns) = default_params();
-        let err = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect_err("xray-core cannot build aes-256-cfb");
-        assert!(
-            err.to_string().contains("aes-256-cfb"),
-            "error must name the cipher: {err}"
-        );
-    }
-
-    #[test]
-    fn xray_shadowsocks2022_builds() {
-        // xray-core builds 2022-blake3 ciphers under protocol "shadowsocks".
-        let (endpoint, mut protocol) =
-            test_endpoint_and_protocol(Protocol::Shadowsocks2022.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"method": "2022-blake3-aes-128-gcm"}"#);
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let proxy = json["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .unwrap();
-        assert_eq!(proxy["protocol"], "shadowsocks");
-        assert_eq!(
-            proxy["settings"]["servers"][0]["method"],
-            "2022-blake3-aes-128-gcm"
-        );
-    }
-
-    #[test]
-    fn xray_trojan_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Trojan.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+    fn xray_top_level_skeleton() {
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = skeleton(&params, &rules, &dns);
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "trojan");
-    }
-
-    #[test]
-    fn xray_socks_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Socks.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "socks");
-    }
-
-    #[test]
-    fn xray_http_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Http.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "http");
-    }
-
-    #[test]
-    fn xray_hysteria2_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "hysteria2");
+        // Skeleton carries the API inbound + API routing rule
+        let inbounds = json["inbounds"].as_array().unwrap();
+        assert!(inbounds.iter().any(|i| i["tag"] == "api"));
+        let routing_rules = json["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["inboundTag"][0], "api");
     }
 
     #[test]
     fn xray_inbounds_default() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let inbounds = json["inbounds"].as_array().unwrap();
+        let (params, _, _) = super::super::tests::default_params();
+        let json = serde_json::to_value(build_inbounds(&params)).unwrap();
+        let inbounds = json.as_array().unwrap();
         assert_eq!(inbounds.len(), 2, "should have 2 inbounds (SOCKS + API)");
         assert_eq!(inbounds[0]["protocol"], "socks");
         assert_eq!(inbounds[0]["port"], 10808);
@@ -985,12 +509,10 @@ mod tests {
 
     #[test]
     fn xray_inbounds_with_http() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (mut params, rules, dns) = default_params();
+        let (mut params, _, _) = super::super::tests::default_params();
         params.http_port = Some(10809);
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let inbounds = json["inbounds"].as_array().unwrap();
+        let json = serde_json::to_value(build_inbounds(&params)).unwrap();
+        let inbounds = json.as_array().unwrap();
         assert_eq!(
             inbounds.len(),
             3,
@@ -1005,52 +527,19 @@ mod tests {
     }
 
     #[test]
-    fn xray_unknown_protocol_returns_error() {
-        // Protocol::WireGuard = 9 — not in our supported list
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::WireGuard.to_i32());
-        let (params, rules, dns) = default_params();
-        let result = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns);
-        assert!(result.is_err(), "unsupported protocol should return error");
-        match result {
-            Err(BuildError::InvalidProfile(_)) => {} // expected
-            _ => panic!("expected InvalidProfile error"),
-        }
-    }
-
-    #[test]
     fn xray_routing_with_domain_rule() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (params, _, dns) = default_params();
-        let rules = vec![RoutingRule {
-            id: "r1".to_string(),
-            group_id: None,
-            r#type: 0,
-            domain_matcher: None,
-            domains: Some("example.com,test.org".to_string()),
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: None,
-            network: Some("tcp".to_string()),
-            protocols: None,
-            domain_strategy: None,
-            outbound_tag: Some("direct".to_string()),
-            balancer_tag: None,
-            rule_set_file: None,
-            rule_set_url: None,
-            sort_order: Some(0),
-        }];
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let routing_rules = json["routing"]["rules"].as_array().unwrap();
+        let rules = vec![domain_rule()];
+        let routing = build_routing(&rules, true);
+        let json_rules = &routing.rules;
         // First rule is the mandatory API routing rule
-        assert_eq!(routing_rules.len(), 2);
-        assert_eq!(routing_rules[0]["inboundTag"][0], "api");
-        assert_eq!(routing_rules[0]["outboundTag"], "api");
+        assert_eq!(json_rules.len(), 2);
+        assert_eq!(json_rules[0]["inboundTag"][0], "api");
+        assert_eq!(json_rules[0]["outboundTag"], "api");
         // Second rule is the user-defined domain rule
-        assert_eq!(routing_rules[1]["domain"][0], "example.com");
-        assert_eq!(routing_rules[1]["network"], "tcp");
-        assert_eq!(routing_rules[1]["outboundTag"], "direct");
+        assert_eq!(json_rules[1]["domain"][0], "example.com");
+        assert_eq!(json_rules[1]["domain"][1], "test.org");
+        assert_eq!(json_rules[1]["network"], "tcp");
+        assert_eq!(json_rules[1]["outboundTag"], "direct");
     }
 
     #[test]
@@ -1060,13 +549,13 @@ mod tests {
             group_id: None,
             r#type: 0,
             domain_matcher: None,
-            domains: None,
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: None,
+            domains: Vec::new(),
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
             network: None,
-            protocols: None,
+            protocols: Vec::new(),
             domain_strategy: None,
             outbound_tag: Some("direct".to_string()),
             balancer_tag: None,
@@ -1085,13 +574,13 @@ mod tests {
             group_id: None,
             r#type: 0,
             domain_matcher: Some("linear".to_string()),
-            domains: Some("example.com".to_string()),
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: None,
+            domains: vec!["example.com".to_string()],
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
             network: Some("tcp".to_string()),
-            protocols: Some("http,tls".to_string()),
+            protocols: vec!["http".to_string(), "tls".to_string()],
             domain_strategy: None,
             outbound_tag: Some("proxy".to_string()),
             balancer_tag: None,
@@ -1114,13 +603,13 @@ mod tests {
             group_id: None,
             r#type: 0,
             domain_matcher: None,
-            domains: None,
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: Some("8080".to_string()),
+            domains: Vec::new(),
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: vec![8080],
             network: None,
-            protocols: None,
+            protocols: Vec::new(),
             domain_strategy: None,
             outbound_tag: Some("direct".to_string()),
             balancer_tag: None,
@@ -1130,153 +619,25 @@ mod tests {
         };
         let routing = build_routing(&[rule], false);
         assert_eq!(routing.rules.len(), 1);
-        assert_eq!(routing.rules[0]["sourcePort"], "8080");
+        assert_eq!(routing.rules[0]["sourcePort"], json!([8080]));
         assert_eq!(routing.rules[0]["outboundTag"], "direct");
     }
 
     #[test]
-    fn xray_stream_settings_passed_through() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let outbounds = json["outbounds"].as_array().unwrap();
-        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();
-        // stream_settings from spec_blob not yet wired up (TODO)
-        assert!(proxy.get("streamSettings").is_none());
-    }
-
-    #[test]
-    fn legacy_vless_ws_tls_produces_xray_stream_settings() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        protocol.transport = Some("ws".to_string());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"tls.enable": true, "sni": "cdn.example.com", "ws.path": "/ws", "ws.host": "cdn.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
-        let json = serde_json::to_value(&config).unwrap();
-        let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy");
-        let ss = proxy["streamSettings"]
-            .as_object()
-            .expect("streamSettings present");
-        assert_eq!(ss["network"], "ws");
-        assert_eq!(ss["security"], "tls");
-        assert_eq!(ss["tlsSettings"]["serverName"], "cdn.example.com");
-        assert_eq!(ss["wsSettings"]["path"], "/ws");
-        // Top-level `host`, not deprecated `headers.Host`.
-        assert_eq!(ss["wsSettings"]["host"], "cdn.example.com");
-        assert!(
-            ss["wsSettings"].get("headers").is_none(),
-            "headers.Host must not be emitted"
-        );
-    }
-
-    #[test]
-    fn legacy_tls_enable_string_parsing_is_strict() {
-        // Falsy string values must NOT enable TLS (a blanket
-        // as_str().is_some() branch used to treat "false"/"0" as enabled).
-        for raw in [
-            r#"{"tls.enable": "false", "sni": "cdn.example.com"}"#,
-            r#"{"tls.enable": "0", "sni": "cdn.example.com"}"#,
-        ] {
-            let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-            protocol.transport = Some("tcp".to_string());
-            set_stream_settings_json(&mut protocol, raw);
-            let (params, rules, dns) = default_params();
-            let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-                .expect("build");
-            let json = serde_json::to_value(&config).unwrap();
-            let outbounds = json["outbounds"].as_array().expect("outbounds");
-            let proxy = outbounds
-                .iter()
-                .find(|o| o["tag"] == "proxy")
-                .expect("proxy");
-            let ss = proxy["streamSettings"]
-                .as_object()
-                .expect("streamSettings present");
-            assert_ne!(ss.get("security").and_then(|v| v.as_str()), Some("tls"));
-        }
-        // The string "true" (case-insensitive) still enables TLS.
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        protocol.transport = Some("tcp".to_string());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"tls.enable": "TRUE", "sni": "cdn.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
-        let json = serde_json::to_value(&config).unwrap();
-        let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy");
-        let ss = proxy["streamSettings"]
-            .as_object()
-            .expect("streamSettings present");
-        assert_eq!(ss["security"], "tls");
-    }
-
-    #[test]
-    fn legacy_vless_tls_allow_insecure_produces_allow_insecure() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        protocol.transport = Some("tcp".to_string());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"tls.enable": true, "sni": "cdn.example.com", "allow_insecure": true}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
-        let json = serde_json::to_value(&config).unwrap();
-        let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy");
-        let ss = proxy["streamSettings"]
-            .as_object()
-            .expect("streamSettings present");
-        assert_eq!(ss["security"], "tls");
-        assert_eq!(ss["tlsSettings"]["allowInsecure"], true);
-    }
-
-    #[test]
-    fn vless_reality_stream_settings_passed_through() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_xray_top_level(&json);
-        assert_proxy_outbound(&json, "vless");
-        let outbounds = json["outbounds"].as_array().unwrap();
-        let proxy = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();
-        // stream_settings from spec_blob not yet wired up (TODO)
-        assert!(proxy.get("streamSettings").is_none());
-    }
-
-    #[test]
-    fn xray_hysteria2_outbound_includes_auth() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"password": "hy2-secret"}"#);
-        let (params, rules, dns) = default_params();
-        let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).expect("build");
-        let json = serde_json::to_value(&config).unwrap();
-        let proxy = json["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy");
-        assert_eq!(proxy["settings"]["auth"].as_str().unwrap(), "hy2-secret");
+    fn xray_dns_skeleton_from_typed_settings() {
+        let dns = DnsSetting {
+            id: "default".to_string(),
+            name: None,
+            servers: vec!["1.1.1.1".to_string(), "tls://8.8.8.8".to_string()],
+            hosts: vec!["example.com:1.2.3.4".to_string()],
+            query_strategy: None,
+            disable_cache: false,
+            disable_fallback: false,
+            client_ip: None,
+            cache_ttl_secs: None,
+        };
+        let config = build_dns(&dns);
+        assert_eq!(json!(config.servers), json!(["1.1.1.1", "tls://8.8.8.8"]));
+        assert_eq!(config.hosts["example.com"], "1.2.3.4");
     }
 }

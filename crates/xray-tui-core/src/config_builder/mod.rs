@@ -3,8 +3,12 @@ pub mod xray;
 
 pub mod clash_mixin;
 use crate::core_type::CoreType;
-use crate::protocol::Protocol;
-use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
+use serde::Serialize;
+use serde_json::{Value, json};
+use xray_tui_db::models::{DnsSetting, Endpoint, HostType, ProfileStats, Protocol, RoutingRule};
+use xray_tui_proto::proto_spec::{
+    CoreType as ProtoCoreType, EndpointEssentials, HostKind, ProtocolConfig, SupportError,
+};
 
 /// Port for the gRPC Stats API (shared by xray-core and sing-box).
 pub const API_PORT: u16 = 62789;
@@ -27,49 +31,81 @@ pub struct BuildParams {
     pub clash_mixin: Option<serde_json::Value>,
 }
 
-use serde::Serialize;
-use serde_json::{Value, json};
-
-/// Shared: extract (p_settings, s_settings) from a protocol row's spec_blob.
-/// Tries typed Proto (transparent to ProtocolConfig) first; falls back to raw
-/// JSON extraction.
-pub(crate) fn parse_settings(protocol: &ProtocolRow) -> (Value, Value) {
-    if let Ok(proto) =
-        serde_json::from_slice::<xray_tui_proto::proto_spec::Proto>(&protocol.spec_blob)
-    {
-        return proto.config().to_settings();
-    }
-    let extra: Value = serde_json::from_slice(&protocol.spec_blob).unwrap_or_else(|_| json!({}));
-    let mut p_settings = extra.get("protocol_settings").cloned().unwrap_or(json!({}));
-    // Inject `user_id` as `id` into p_settings if absent (legacy parsers store
-    // UUID/PW at top level, not inside protocol_settings).
-    if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str())
-        && let Some(obj) = p_settings.as_object_mut()
-        && !obj.contains_key("id")
-        && !obj.contains_key("uuid")
-    {
-        obj.entry("id".to_string())
-            .or_insert(serde_json::Value::String(user_id.to_string()));
-    }
-    let s_settings = extra.get("stream_settings").cloned().unwrap_or(json!({}));
-    (p_settings, s_settings)
-}
-
 /// The profile's shadowsocks method string when the protocol is
 /// Shadowsocks/Shadowsocks2022 — used for cipher-aware core resolution and
 /// builder validation. `None` for other protocols or a missing method.
-pub fn shadowsocks_method(protocol: &ProtocolRow) -> Option<String> {
+///
+/// Reads the typed [`Protocol::config`] deferred JSON. Returns `None` when the
+/// config is unloaded (the caller must pass a `Protocol` loaded with `config`
+/// included) so cipher-aware core resolution falls back to the default; the
+/// config builders themselves refuse unloaded configs with a
+/// [`BuildError::InvalidProfile`] instead of panicking.
+pub fn shadowsocks_method(protocol: &Protocol) -> Option<String> {
+    use xray_tui_proto::proto_spec::ProtocolKind;
     if !matches!(
-        Protocol::try_from_i32(protocol.config_type),
-        Some(Protocol::Shadowsocks) | Some(Protocol::Shadowsocks2022)
+        protocol.proto_kind,
+        ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022
     ) {
         return None;
     }
-    parse_settings(protocol)
-        .0
-        .get("method")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+    if protocol.config.is_unloaded() {
+        return None;
+    }
+    match &protocol.config.get().0 {
+        ProtocolConfig::Ss(config) => Some(config.method.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// Map a db [`Endpoint`] to the proto [`EndpointEssentials`] the outbound
+/// injectors consume (host, host kind, and the full port spec). The db
+/// [`HostType`] mirrors proto [`HostKind`] 1:1.
+#[must_use]
+pub fn endpoint_essentials(e: &Endpoint) -> EndpointEssentials {
+    EndpointEssentials {
+        host: e.host.clone(),
+        host_type: match e.host_type {
+            HostType::Ipv4 => HostKind::Ipv4,
+            HostType::Ipv6 => HostKind::Ipv6,
+            HostType::Dns => HostKind::Dns,
+            HostType::Undefined => HostKind::Undefined,
+        },
+        port: e.port,
+        ports: e.ports.clone(),
+    }
+}
+
+/// Borrow the typed [`ProtocolConfig`] from a `Protocol`'s deferred JSON
+/// column, refusing unloaded rows with a clear error instead of panicking on
+/// [`toasty::Deferred::get`]. Callers (T17 connect/ping paths) must pass a
+/// `Protocol` loaded with `config` included — DB read paths exclude deferred
+/// columns by default.
+pub(crate) fn protocol_config(protocol: &Protocol) -> Result<&ProtocolConfig, BuildError> {
+    if protocol.config.is_unloaded() {
+        return Err(BuildError::InvalidProfile(format!(
+            "protocol {:?} config not loaded (pass a Protocol with `config` included)",
+            protocol.proto_kind
+        )));
+    }
+    Ok(&protocol.config.get().0)
+}
+
+/// Convert typed `DnsSetting.hosts` entries (each `"domain:ip"`) into the
+/// core JSON `hosts` object shape (`{ "domain": "ip" }`). The split is on the
+/// FIRST colon — everything after it (IPv6 colons included) is the address —
+/// so IPv6 values survive intact. Entries without a `:` separator are skipped.
+pub(crate) fn build_hosts_map(hosts: &[String]) -> Value {
+    let mut map = serde_json::Map::new();
+    for entry in hosts {
+        if let Some((domain, ip)) = entry.split_once(':') {
+            let domain = domain.trim();
+            let ip = ip.trim();
+            if !domain.is_empty() && !ip.is_empty() {
+                map.insert(domain.to_string(), json!(ip));
+            }
+        }
+    }
+    Value::Object(map)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,11 +125,13 @@ impl BackendConfig {
 }
 
 /// A single profile in a multi-inbound batch config.
-/// Bundles the endpoint, protocol, and the pre-assigned SOCKS5 port.
+/// Bundles the endpoint, its per-pair link (core type), and the protocol,
+/// plus the pre-assigned SOCKS5 port.
 #[derive(Debug, Clone)]
 pub struct MultiInboundItem<'a> {
     pub endpoint: &'a Endpoint,
-    pub protocol: &'a ProtocolRow,
+    pub link: &'a ProfileStats,
+    pub protocol: &'a Protocol,
     pub assigned_port: u16,
 }
 
@@ -103,33 +141,51 @@ pub enum BuildError {
     InvalidProfile(String),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Support(#[from] SupportError),
 }
 
 pub struct ConfigBuilder;
 
 impl ConfigBuilder {
+    /// Build a backend config for one profile.
+    ///
+    /// The core is taken from `link.core_type` — the per-pair override,
+    /// resolved at parse time (never `Auto`). The outbound block is produced
+    /// by `protocol.config.inject_to(...)`, which until Tasks 14/15 errors
+    /// with [`SupportError::UnsupportedProtocol`] (surfaced as
+    /// [`BuildError::Support`]).
     pub fn build(
         endpoint: &Endpoint,
-        protocol: &ProtocolRow,
-        core_type: CoreType,
+        link: &ProfileStats,
+        protocol: &Protocol,
         params: &BuildParams,
         routing: &[RoutingRule],
         dns: &DnsSetting,
     ) -> Result<BackendConfig, BuildError> {
-        match core_type {
-            CoreType::Xray => {
-                let config =
-                    xray::XrayConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
+        match link.core_type {
+            ProtoCoreType::Xray => {
+                let config = xray::XrayConfigBuilder::build(
+                    endpoint,
+                    protocol,
+                    link.core_type,
+                    params,
+                    routing,
+                    dns,
+                )?;
                 Ok(BackendConfig::Xray(config))
             }
-            CoreType::SingBox => {
-                let config =
-                    singbox::SingBoxConfigBuilder::build(endpoint, protocol, params, routing, dns)?;
+            ProtoCoreType::SingBox => {
+                let config = singbox::SingBoxConfigBuilder::build(
+                    endpoint,
+                    protocol,
+                    link.core_type,
+                    params,
+                    routing,
+                    dns,
+                )?;
                 Ok(BackendConfig::SingBox(config))
             }
-            CoreType::Auto => Err(BuildError::InvalidProfile(
-                "Auto core type must be resolved before building config".to_string(),
-            )),
         }
     }
 
@@ -141,24 +197,35 @@ impl ConfigBuilder {
     ///
     /// Pattern from v2rayN's `LoadCoreConfigSpeedtest(List<ServerTestItem>)` —
     /// one core serves an entire batch page instead of spawning one core per profile.
+    ///
+    /// All items must share one `link.core_type` (a batch page runs on a
+    /// single core); the dispatch derives the core from the items.
     pub fn build_multi(
         items: &[MultiInboundItem],
-        core_type: CoreType,
         base_params: &BuildParams,
         dns: &DnsSetting,
     ) -> Result<BackendConfig, BuildError> {
+        let core_type = items
+            .first()
+            .map(|item| item.link.core_type)
+            .ok_or_else(|| {
+                BuildError::InvalidProfile("build_multi: empty item list".to_string())
+            })?;
+        if let Some(mismatch) = items.iter().find(|item| item.link.core_type != core_type) {
+            return Err(BuildError::InvalidProfile(format!(
+                "build_multi: mixed core types in one batch ({core_type} vs {})",
+                mismatch.link.core_type
+            )));
+        }
         match core_type {
-            CoreType::Xray => {
+            ProtoCoreType::Xray => {
                 let config = xray::XrayConfigBuilder::build_multi(items, base_params, dns)?;
                 Ok(BackendConfig::Xray(config))
             }
-            CoreType::SingBox => {
+            ProtoCoreType::SingBox => {
                 let config = singbox::SingBoxConfigBuilder::build_multi(items, base_params, dns)?;
                 Ok(BackendConfig::SingBox(config))
             }
-            CoreType::Auto => Err(BuildError::InvalidProfile(
-                "Auto core type must be resolved before building config".to_string(),
-            )),
         }
     }
 }
@@ -166,48 +233,109 @@ impl ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Protocol;
+    use toasty::{Deferred, Json};
+    use xray_tui_db::models::{ConfigType, TrafficStats, Transport};
+    use xray_tui_proto::proto_spec::common::TransportConfig;
+    use xray_tui_proto::proto_spec::{
+        CoreType as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+        VlessConfig,
+    };
 
-    fn test_endpoint_and_protocol(config_type: i32) -> (Endpoint, ProtocolRow) {
-        let endpoint = Endpoint {
-            id: 0,
-            host: "example.com".to_string(),
-            host_type: "dns".to_string(),
-            port: 443,
-            port_spec_str: None,
-            parent_id: None,
-            last_source: None,
-            created_at: 0,
-            manual_protocol_override: None,
-            resolved_as: None,
-            resolved_at: None,
-        };
-        let extra = serde_json::json!({
-            "remarks": "smoke test",
-            "user_id": "test-uuid",
-        });
-        let protocol = ProtocolRow {
-            id: 0,
-            endpoint_id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            last_used_at: None,
-            spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
-            config_type,
-            core_type: String::new(),
-            transport: Some("tcp".to_string()),
-            security: Some("auto".to_string()),
-            created_at: 0,
-            last_seen_at: 0,
-            extension: Default::default(),
-            endpoint: Default::default(),
-            server_stat: Default::default(),
-        };
-        (endpoint, protocol)
+    pub(super) fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(secs).expect("valid ts")
     }
 
-    fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
+    pub(super) fn tcp_transport() -> Transport {
+        Transport {
+            r#type: TransportType::Tcp,
+            data: Deferred::from(Json(TransportConfig::Tcp)),
+        }
+    }
+
+    pub(super) fn no_security() -> xray_tui_db::models::Security {
+        xray_tui_db::models::Security {
+            r#type: SecurityType::None,
+            sni: None,
+            fp: None,
+            insecure: None,
+            data: Deferred::from(Json(SecurityConfig::default())),
+        }
+    }
+
+    pub(super) fn vless_config() -> ProtocolConfig {
+        ProtocolConfig::Vless(VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            uuid_origin: None,
+            security: SecurityConfig::default(),
+            transport: TransportConfig::Tcp,
+            encryption: None,
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        })
+    }
+
+    pub(super) fn endpoint(host: &str, port: u16) -> Endpoint {
+        Endpoint {
+            id: xray_tui_db::models::EndpointId::new(1),
+            host: host.to_string(),
+            host_type: HostType::Dns,
+            port,
+            ports: Vec::new(),
+            parent_id: None,
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_as: Vec::new(),
+            resolved_at: None,
+            created_at: ts(0),
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        }
+    }
+
+    pub(super) fn protocol(proto_kind: ProtocolKind, config: ProtocolConfig) -> Protocol {
+        Protocol {
+            id: xray_tui_db::models::ProtocolId::new(1),
+            sig: 0,
+            cred_hash: 0,
+            proto_kind,
+            transport: tcp_transport(),
+            security: no_security(),
+            config: Deferred::from(Json(config)),
+            created_at: ts(0),
+            links: Deferred::default(),
+        }
+    }
+
+    pub(super) fn link(core_type: ProtoCoreType) -> ProfileStats {
+        ProfileStats {
+            protocol_id: xray_tui_db::models::ProtocolId::new(1),
+            endpoint_id: xray_tui_db::models::EndpointId::new(1),
+            core_type,
+            config_type: ConfigType::ShareUrl,
+            last_used_at: None,
+            last_seen_at: ts(0),
+            task_id: None,
+            task_queue: Vec::new(),
+            latency: None,
+            speed_bps: None,
+            error: None,
+            traffic: TrafficStats {
+                today_up: 0,
+                today_down: 0,
+                total_up: 0,
+                total_down: 0,
+            },
+            created_at: ts(0),
+            updated_at: ts(0),
+            version: 1,
+            protocol: Deferred::default(),
+            endpoint: Deferred::default(),
+        }
+    }
+
+    pub(super) fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
         let params = BuildParams {
             v2ray_api_enabled: true,
             clash_api_enabled: false,
@@ -225,183 +353,126 @@ mod tests {
         let dns = DnsSetting {
             id: "default".to_string(),
             name: None,
-            servers: None,
-            hosts: None,
+            servers: Vec::new(),
+            hosts: Vec::new(),
             query_strategy: None,
-            disable_cache: None,
-            disable_fallback: None,
+            disable_cache: false,
+            disable_fallback: false,
             client_ip: None,
             cache_ttl_secs: None,
         };
         (params, rules, dns)
     }
 
+    fn assert_unsupported(
+        result: Result<BackendConfig, BuildError>,
+        kind: &str,
+        core: ProtoCoreType,
+    ) {
+        match result {
+            Err(BuildError::Support(SupportError::UnsupportedProtocol(k, c))) => {
+                assert_eq!(k, kind);
+                assert_eq!(c, core);
+            }
+            other => panic!("expected UnsupportedProtocol({kind}, {core:?}), got {other:?}"),
+        }
+    }
+
     #[test]
     fn build_xray_via_dispatch() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
+        // flip to success assertions in T16 (real inject_to lands in T14/15)
+        let endpoint = endpoint("example.com", 443);
+        let protocol = protocol(ProtocolKind::Vless, vless_config());
+        let link = link(ProtoCoreType::Xray);
         let (params, rules, dns) = default_params();
-        let config =
-            ConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
-                .unwrap();
-        assert!(matches!(config, BackendConfig::Xray(_)));
+        assert_unsupported(
+            ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns),
+            "vless",
+            ProtoCoreType::Xray,
+        );
     }
 
     #[test]
     fn build_singbox_tuic_via_dispatch() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
+        // flip to success assertions in T16 (real inject_to lands in T14/15)
+        let endpoint = endpoint("example.com", 443);
+        let tuic = ProtocolConfig::Tuic(xray_tui_proto::proto_spec::TuicConfig {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            password: "pw".to_string(),
+            congestion_control: None,
+            udp_relay_mode: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        });
+        let protocol = protocol(ProtocolKind::Tuic, tuic);
+        let link = link(ProtoCoreType::SingBox);
         let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(
-            &endpoint,
-            &protocol,
-            CoreType::SingBox,
-            &params,
-            &rules,
-            &dns,
-        )
-        .unwrap();
-        assert!(matches!(config, BackendConfig::SingBox(_)));
+        assert_unsupported(
+            ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns),
+            "tuic",
+            ProtoCoreType::SingBox,
+        );
     }
 
     #[test]
-    fn build_common_protocol_forced_to_singbox() {
-        // Shadowsocks is supported by both xray and sing-box builders
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
+    fn build_with_unloaded_config_returns_clear_error() {
+        // Deferred config rows (default DB read paths) must error clearly,
+        // never panic on `Deferred::get`.
+        let endpoint = endpoint("example.com", 443);
+        let mut protocol = protocol(ProtocolKind::Vless, vless_config());
+        protocol.config = Deferred::default();
+        let link = link(ProtoCoreType::Xray);
         let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(
-            &endpoint,
-            &protocol,
-            CoreType::SingBox,
-            &params,
-            &rules,
-            &dns,
-        )
-        .unwrap();
-        assert!(matches!(config, BackendConfig::SingBox(_)));
+        let err = ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns)
+            .expect_err("unloaded config must be rejected");
+        assert!(
+            err.to_string().contains("not loaded"),
+            "error must mention the unloaded config: {err}"
+        );
     }
 
     #[test]
-    fn build_auto_returns_error() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (params, rules, dns) = default_params();
-        let result =
-            ConfigBuilder::build(&endpoint, &protocol, CoreType::Auto, &params, &rules, &dns);
-        assert!(result.is_err());
+    fn endpoint_essentials_maps_host_type() {
+        let e = endpoint("example.com", 443);
+        let ess = endpoint_essentials(&e);
+        assert_eq!(ess.host, "example.com");
+        assert_eq!(ess.port, 443);
+        assert_eq!(ess.host_type, HostKind::Dns);
+        assert_eq!(ess.ports, Vec::<u16>::new());
     }
 
     #[test]
-    fn parse_settings_empty_blob() {
-        let protocol = ProtocolRow {
-            spec_blob: vec![],
-            config_type: 0,
-            id: 0,
-            endpoint_id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            last_used_at: None,
-            core_type: String::new(),
-            transport: None,
-            security: None,
-            created_at: 0,
-            last_seen_at: 0,
-            endpoint: Default::default(),
-            extension: Default::default(),
-            server_stat: Default::default(),
-        };
-        let (p, s) = parse_settings(&protocol);
-        assert_eq!(p, serde_json::json!({}));
-        assert_eq!(s, serde_json::json!({}));
+    fn shadowsocks_method_reads_typed_config() {
+        let ss = ProtocolConfig::Ss(xray_tui_proto::proto_spec::SsConfig {
+            method: "aes-256-gcm".into(),
+            password: "pw".to_string(),
+            security: SecurityConfig::default(),
+            remarks: None,
+            plugin: None,
+            plugin_opts: None,
+        });
+        let protocol = protocol(ProtocolKind::Shadowsocks, ss);
+        assert_eq!(
+            shadowsocks_method(&protocol).as_deref(),
+            Some("aes-256-gcm")
+        );
     }
 
     #[test]
-    fn parse_settings_legacy_format() {
-        let blob = serde_json::to_vec(&serde_json::json!({
-            "user_id": "some-uuid",
-            "stream_settings": {"network": "ws"}
-        }))
-        .unwrap();
-        let protocol = ProtocolRow {
-            spec_blob: blob,
-            config_type: 0,
-            id: 0,
-            endpoint_id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            last_used_at: None,
-            core_type: String::new(),
-            transport: None,
-            security: None,
-            created_at: 0,
-            last_seen_at: 0,
-            endpoint: Default::default(),
-            extension: Default::default(),
-            server_stat: Default::default(),
-        };
-        let (p, s) = parse_settings(&protocol);
-        assert_eq!(s.get("network").and_then(|v| v.as_str()), Some("ws"));
-        assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("some-uuid"));
+    fn shadowsocks_method_none_for_other_kinds() {
+        let protocol = protocol(ProtocolKind::Vless, vless_config());
+        assert_eq!(shadowsocks_method(&protocol), None);
     }
 
     #[test]
-    fn build_xray_vmess_json_structure() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            ConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
-                .unwrap();
-        match config {
-            BackendConfig::Xray(xray_config) => {
-                let json = serde_json::to_value(&xray_config).unwrap();
-                assert!(
-                    json.get("outbounds").is_some(),
-                    "xray config missing outbounds"
-                );
-                assert!(
-                    json.get("inbounds").is_some(),
-                    "xray config missing inbounds"
-                );
-                assert!(json.get("routing").is_some(), "xray config missing routing");
-                assert!(json.get("dns").is_some(), "xray config missing dns");
-                // Verify outbounds is a non-empty array
-                let outbounds = json.get("outbounds").and_then(|v| v.as_array()).unwrap();
-                assert!(!outbounds.is_empty(), "outbounds should not be empty");
-            }
-            _ => panic!("expected BackendConfig::Xray"),
-        }
-    }
-
-    #[test]
-    fn build_singbox_tuic_json_structure() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        let (params, rules, dns) = default_params();
-        let config = ConfigBuilder::build(
-            &endpoint,
-            &protocol,
-            CoreType::SingBox,
-            &params,
-            &rules,
-            &dns,
-        )
-        .unwrap();
-        match config {
-            BackendConfig::SingBox(singbox_config) => {
-                let json = serde_json::to_value(&singbox_config).unwrap();
-                assert!(
-                    json.get("outbounds").is_some(),
-                    "singbox config missing outbounds"
-                );
-                assert!(
-                    json.get("inbounds").is_some(),
-                    "singbox config missing inbounds"
-                );
-                assert!(json.get("route").is_some(), "singbox config missing route");
-                assert!(json.get("dns").is_some(), "singbox config missing dns");
-                // Verify outbounds is a non-empty array
-                let outbounds = json.get("outbounds").and_then(|v| v.as_array()).unwrap();
-                assert!(!outbounds.is_empty(), "outbounds should not be empty");
-            }
-            _ => panic!("expected BackendConfig::SingBox"),
-        }
+    fn build_hosts_map_parses_domain_ip_entries() {
+        let hosts = build_hosts_map(&[
+            "example.com:1.2.3.4".to_string(),
+            "ipv6.test:2001:db8::1".to_string(),
+            "malformed".to_string(),
+        ]);
+        assert_eq!(hosts["example.com"], "1.2.3.4");
+        assert_eq!(hosts["ipv6.test"], "2001:db8::1");
+        assert!(hosts.get("malformed").is_none());
     }
 }

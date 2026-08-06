@@ -61,3 +61,5 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 xray-tui-config = { path = "../xray-tui-config" }
+toasty = "0.9"
+jiff.workspace = true

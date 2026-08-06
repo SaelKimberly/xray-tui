@@ -55,6 +55,43 @@ impl From<Protocol> for ProtocolKind {
     }
 }
 
+/// Core-side conversion: [`ProtocolKind`] → [`Protocol`] — inverse of the
+/// above. Used by the typed ping engine to derive the legacy `config_type`
+/// integer (via `Protocol::to_i32`) for `ProfileKey`.
+impl From<ProtocolKind> for Protocol {
+    fn from(kind: ProtocolKind) -> Self {
+        match kind {
+            ProtocolKind::Vmess => Self::Vmess,
+            ProtocolKind::Vless => Self::Vless,
+            ProtocolKind::Shadowsocks => Self::Shadowsocks,
+            ProtocolKind::Shadowsocks2022 => Self::Shadowsocks2022,
+            ProtocolKind::Socks => Self::Socks,
+            ProtocolKind::Http => Self::Http,
+            ProtocolKind::Trojan => Self::Trojan,
+            ProtocolKind::WireGuard => Self::WireGuard,
+            ProtocolKind::Hysteria2 => Self::Hysteria2,
+            ProtocolKind::DokodemoDoor => Self::DokodemoDoor,
+            ProtocolKind::Freedom => Self::Freedom,
+            ProtocolKind::Blackhole => Self::Blackhole,
+            ProtocolKind::Dns => Self::Dns,
+            ProtocolKind::Loopback => Self::Loopback,
+            ProtocolKind::Custom => Self::Custom,
+            ProtocolKind::Tuic => Self::Tuic,
+            ProtocolKind::Hysteria => Self::Hysteria,
+            ProtocolKind::Naive => Self::Naive,
+            ProtocolKind::AnyTls => Self::AnyTls,
+            ProtocolKind::ShadowTls => Self::ShadowTls,
+            ProtocolKind::Tor => Self::Tor,
+            ProtocolKind::Ssh => Self::Ssh,
+            ProtocolKind::Tailscale => Self::Tailscale,
+            ProtocolKind::ShadowsocksR => Self::ShadowsocksR,
+            ProtocolKind::Redirect => Self::Redirect,
+            ProtocolKind::TProxy => Self::TProxy,
+            ProtocolKind::Mixed => Self::Mixed,
+        }
+    }
+}
+
 /// Resolves which core a given protocol should use.
 ///
 /// - `Some(CoreType::Auto)` or `None` → auto-detect from protocol

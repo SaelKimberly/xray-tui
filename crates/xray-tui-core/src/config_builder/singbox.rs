@@ -1,11 +1,12 @@
 use serde::Serialize;
 use serde_json::{Value, json};
-use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
+use xray_tui_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
+use xray_tui_proto::proto_spec::{CoreType, InjectToCoreConf};
 
-use crate::protocol::Protocol;
-use crate::protocol_core_mapping::singbox_supports_ss_method;
-
-use super::{BuildError, BuildParams, MultiInboundItem, parse_settings};
+use super::{
+    BuildError, BuildParams, MultiInboundItem, build_hosts_map, endpoint_essentials,
+    protocol_config,
+};
 
 // ── Sing-box JSON config structs ──────────────────────────────────
 
@@ -87,48 +88,23 @@ pub struct ClashApiOptions {
 
 pub struct SingBoxConfigBuilder;
 impl SingBoxConfigBuilder {
+    /// Build a sing-box config. `core_type` (SingBox, already resolved from
+    /// the per-pair link) is handed to `inject_to` for the proxy outbound.
     pub fn build(
         endpoint: &Endpoint,
-        protocol: &ProtocolRow,
+        protocol: &Protocol,
+        core_type: CoreType,
         params: &BuildParams,
         routing: &[RoutingRule],
         dns: &DnsSetting,
     ) -> Result<SingBoxConfig, BuildError> {
-        let outbounds = vec![
-            build_proxy_outbound(endpoint, protocol, params)?,
+        let mut config = skeleton(params, routing, dns);
+        config.outbounds = vec![
+            build_proxy_outbound(endpoint, protocol, core_type, params)?,
             build_direct_outbound(),
             build_block_outbound(),
         ];
-        Ok(SingBoxConfig {
-            log: SingBoxLogConfig {
-                level: params.log_level.clone(),
-            },
-            inbounds: vec![SingBoxInbound {
-                type_: "socks",
-                tag: "socks-in".to_string(),
-                listen: params.listen.clone(),
-                listen_port: params.socks_port,
-                sniff: params.sniffing,
-            }],
-            outbounds,
-            route: build_routing(routing),
-            dns: build_dns(dns),
-            experimental: Some(ExperimentalConfig {
-                v2ray_api: params.v2ray_api_enabled.then(|| V2RayApi {
-                    listen: format!("127.0.0.1:{}", super::API_PORT),
-                    stats: StatsConfig {
-                        enabled: true,
-                        outbounds: vec!["proxy", "direct"],
-                    },
-                }),
-                clash_api: params.clash_api_enabled.then(|| ClashApiOptions {
-                    external_controller: format!(
-                        "127.0.0.1:{}",
-                        params.clash_api_port.unwrap_or(super::CLASH_API_PORT)
-                    ),
-                }),
-            }),
-        })
+        Ok(config)
     }
 
     /// Build a multi-inbound config for batch real ping.
@@ -153,7 +129,12 @@ impl SingBoxConfigBuilder {
                 sniff: false,
             });
 
-            let mut outbound = build_proxy_outbound(item.endpoint, item.protocol, base_params)?;
+            let mut outbound = build_proxy_outbound(
+                item.endpoint,
+                item.protocol,
+                item.link.core_type,
+                base_params,
+            )?;
             if let Some(obj) = outbound.as_object_mut() {
                 obj.insert("tag".to_string(), json!(tag.clone()));
             }
@@ -187,581 +168,63 @@ impl SingBoxConfigBuilder {
     }
 }
 
+/// Assemble the outbound-free skeleton: log, socks inbound, routing, DNS, and
+/// the experimental (v2ray/clash API) block. `build` fills in the outbounds
+/// afterwards.
+fn skeleton(params: &BuildParams, routing: &[RoutingRule], dns: &DnsSetting) -> SingBoxConfig {
+    SingBoxConfig {
+        log: SingBoxLogConfig {
+            level: params.log_level.clone(),
+        },
+        inbounds: vec![SingBoxInbound {
+            type_: "socks",
+            tag: "socks-in".to_string(),
+            listen: params.listen.clone(),
+            listen_port: params.socks_port,
+            sniff: params.sniffing,
+        }],
+        outbounds: vec![],
+        route: build_routing(routing),
+        dns: build_dns(dns),
+        experimental: Some(ExperimentalConfig {
+            v2ray_api: params.v2ray_api_enabled.then(|| V2RayApi {
+                listen: format!("127.0.0.1:{}", super::API_PORT),
+                stats: StatsConfig {
+                    enabled: true,
+                    outbounds: vec!["proxy", "direct"],
+                },
+            }),
+            clash_api: params.clash_api_enabled.then(|| ClashApiOptions {
+                external_controller: format!(
+                    "127.0.0.1:{}",
+                    params.clash_api_port.unwrap_or(super::CLASH_API_PORT)
+                ),
+            }),
+        }),
+    }
+}
+
+/// The proxy outbound: `protocol.config.inject_to(...)` writes the
+/// protocol-specific block (type/server/... + TLS) into `conf`; the builder
+/// owns the tag ("proxy" single / "proxy-{i}" multi) and the multiplex block.
 fn build_proxy_outbound(
     endpoint: &Endpoint,
-    protocol: &ProtocolRow,
+    protocol: &Protocol,
+    core_type: CoreType,
     params: &BuildParams,
 ) -> Result<Value, BuildError> {
-    let proto = Protocol::try_from_i32(protocol.config_type).ok_or_else(|| {
-        BuildError::InvalidProfile(format!("Unknown config_type: {}", protocol.config_type))
-    })?;
-    let address = endpoint.host.as_str();
-    let port = endpoint.port as u16;
-    let (p_settings, _s_settings) = parse_settings(protocol);
-    // Credentials live in p_settings (typed to_settings puts id/uuid/password
-    // there; the legacy path injects user_id as "id"). Same extraction as the
-    // xray builder.
-    let user_id = p_settings
-        .get("id")
-        .or_else(|| p_settings.get("uuid"))
-        .or_else(|| p_settings.get("password"))
-        .or_else(|| p_settings.get("pass"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let mut out = match proto {
-        Protocol::Tuic => {
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            json!({
-                "tag": "proxy",
-                "type": "tuic",
-                "server": address,
-                "server_port": port,
-                "uuid": user_id,
-                "password": password,
-                "tls": {
-                    "enabled": true,
-                    "server_name": address
-                }
-            })
-        }
-        Protocol::Hysteria2 => {
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or(user_id);
-            let up_mbps = p_settings
-                .get("up_mbps")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(100);
-            let down_mbps = p_settings
-                .get("down_mbps")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(100);
-            json!({
-                "tag": "proxy",
-                "type": "hysteria2",
-                "server": address,
-                "server_port": port,
-                "password": password,
-                "up_mbps": up_mbps,
-                "down_mbps": down_mbps,
-                "tls": {
-                    "enabled": true,
-                    "server_name": address
-                }
-            })
-        }
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => {
-            let method = p_settings
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("aes-256-gcm");
-            // sing-box accepts modern + legacy methods; anything else (e.g.
-            // salsa20) is refused here so the config is never written invalid.
-            if !singbox_supports_ss_method(method) {
-                return Err(BuildError::InvalidProfile(format!(
-                    "Shadowsocks cipher '{method}' is not supported by sing-box; \
-                     supported: modern AEAD/2022-blake3 + legacy cfb/ctr/rc4-md5 \
-                     methods"
-                )));
-            }
-            json!({
-                "tag": "proxy",
-                "type": "shadowsocks",
-                "server": address,
-                "server_port": port,
-                "method": method,
-                "password": user_id
-            })
-        }
-        Protocol::Socks => {
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "socks",
-                "server": address,
-                "server_port": port
-            });
-            if let Some(username) = p_settings
-                .get("username")
-                .or_else(|| p_settings.get("user"))
-                && let Some(u) = username.as_str()
-                && !u.is_empty()
-            {
-                out["username"] = json!(u);
-                if let Some(password) = p_settings
-                    .get("password")
-                    .or_else(|| p_settings.get("pass"))
-                    .and_then(|v| v.as_str())
-                    && !password.is_empty()
-                {
-                    out["password"] = json!(password);
-                }
-            }
-            out
-        }
-        Protocol::Http => {
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "http",
-                "server": address,
-                "server_port": port
-            });
-            if let Some(username) = p_settings
-                .get("username")
-                .or_else(|| p_settings.get("user"))
-                && let Some(u) = username.as_str()
-                && !u.is_empty()
-            {
-                out["username"] = json!(u);
-                if let Some(password) = p_settings
-                    .get("password")
-                    .or_else(|| p_settings.get("pass"))
-                    .and_then(|v| v.as_str())
-                    && !password.is_empty()
-                {
-                    out["password"] = json!(password);
-                }
-            }
-            out
-        }
-        Protocol::ShadowsocksR => {
-            let method = p_settings
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("aes-256-cfb");
-            json!({
-                "tag": "proxy",
-                "type": "shadowsocksr",
-                "server": address,
-                "server_port": port,
-                "method": method,
-                "password": user_id,
-                "obfs": p_settings.get("obfs").and_then(|v| v.as_str()).unwrap_or(""),
-                "obfs_param": p_settings.get("obfs_param").and_then(|v| v.as_str()).unwrap_or(""),
-                "protocol": p_settings.get("protocol").and_then(|v| v.as_str()).unwrap_or(""),
-                "protocol_param": p_settings.get("protocol_param").and_then(|v| v.as_str()).unwrap_or(""),
-            })
-        }
-        Protocol::Hysteria => {
-            let auth = p_settings
-                .get("auth")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let up = p_settings
-                .get("up_mbps")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(100);
-            let down = p_settings
-                .get("down_mbps")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(100);
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "hysteria",
-                "server": address,
-                "server_port": port,
-                "up_mbps": up,
-                "down_mbps": down,
-            });
-            if !auth.is_empty() {
-                out["auth_str"] = json!(auth);
-            }
-            if let Some(obfs) = p_settings
-                .get("obfs")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                out["obfs"] = json!(obfs);
-            }
-            // Hysteria v1 always uses TLS
-            let mut tls = serde_json::Map::new();
-            tls.insert("enabled".into(), json!(true));
-            let sni = p_settings
-                .get("sni")
-                .and_then(|v| v.as_str())
-                .unwrap_or(address);
-            tls.insert("server_name".into(), json!(sni));
-            if p_settings
-                .get("insecure")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                tls.insert("insecure".into(), json!(true));
-            }
-            out["tls"] = json!(tls);
-            out
-        }
-        Protocol::Naive => {
-            let username = p_settings
-                .get("user")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or(user_id);
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "naive",
-                "server": address,
-                "server_port": port,
-                "password": password,
-            });
-            if !username.is_empty() {
-                out["username"] = json!(username);
-            }
-            if let Some(tls) = build_tls(endpoint, protocol, params) {
-                out["tls"] = tls;
-            }
-            out
-        }
-        Protocol::AnyTls => {
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "anytls",
-                "server": address,
-                "server_port": port,
-                "password": password,
-            });
-            if let Some(tls) = build_tls(endpoint, protocol, params) {
-                out["tls"] = tls;
-            }
-            out
-        }
-        Protocol::ShadowTls => {
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let version = p_settings
-                .get("version")
-                .and_then(serde_json::Value::as_i64)
-                .or_else(|| {
-                    p_settings
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<i64>().ok())
-                })
-                .unwrap_or(3);
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "shadowtls",
-                "server": address,
-                "server_port": port,
-                "password": password,
-                "version": version,
-            });
-            if let Some(tls) = build_tls(endpoint, protocol, params) {
-                out["tls"] = tls;
-            }
-            out
-        }
-        Protocol::Tor => {
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "tor",
-            });
-            if let Some(data_dir) = p_settings
-                .get("data_dir")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                out["data_directory"] = json!(data_dir);
-            }
-            out
-        }
-        Protocol::Ssh => {
-            let ssh_host = p_settings
-                .get("host")
-                .and_then(|v| v.as_str())
-                .unwrap_or(address);
-            let ssh_port = p_settings
-                .get("ssh_port")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_else(|| u64::from(port));
-            let username = p_settings
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("root");
-            let password = p_settings
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let private_key = p_settings
-                .get("private_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "ssh",
-                "server": ssh_host,
-                "server_port": ssh_port,
-                "user": username,
-            });
-            if !password.is_empty() {
-                out["password"] = json!(password);
-            }
-            if !private_key.is_empty() {
-                out["private_key"] = json!([private_key]);
-            }
-            out
-        }
-        Protocol::Tailscale => {
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "tailscale",
-            });
-            if let Some(key) = p_settings
-                .get("auth_key")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                out["auth_key"] = json!(key);
-            }
-            if let Some(url) = p_settings
-                .get("control_url")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                out["control_url"] = json!(url);
-            }
-            if p_settings
-                .get("ephemeral")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                out["ephemeral"] = json!(true);
-            }
-            out
-        }
-        Protocol::Vmess => {
-            let security = "auto"; // TODO: from ProtocolConfig
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "vmess",
-                "server": address,
-                "server_port": port,
-                "uuid": user_id,
-                "security": security,
-            });
-            if let Some(tls) = build_tls(endpoint, protocol, params) {
-                out["tls"] = tls;
-            }
-            out
-        }
-        Protocol::Vless => {
-            let flow = p_settings
-                .get("flow")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "vless",
-                "server": address,
-                "server_port": port,
-                "uuid": user_id,
-            });
-            if !flow.is_empty() {
-                out["flow"] = json!(flow);
-            }
-            if let Some(tls) = build_tls(endpoint, protocol, params) {
-                out["tls"] = tls;
-            }
-            out
-        }
-        Protocol::Trojan => {
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "trojan",
-                "server": address,
-                "server_port": port,
-                "password": user_id,
-            });
-            if let Some(tls) = build_tls(endpoint, protocol, params) {
-                out["tls"] = tls;
-            }
-            out
-        }
-        Protocol::WireGuard => {
-            let private_key = p_settings
-                .get("private_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let public_key = p_settings
-                .get("public_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let allowed_ips = p_settings
-                .get("allowed_ips")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0.0.0.0/0")
-                .to_string();
-
-            let mtu = p_settings
-                .get("mtu")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(1420);
-
-            // Address (CIDR) is stored in p_settings for form-created profiles,
-            // or on WireguardConfig.address for URL-imported profiles.
-            let address_str = p_settings
-                .get("address")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("");
-            let address: Vec<String> = if !address_str.is_empty() {
-                address_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            // Workers, udp_timeout, system flags
-            let workers = p_settings
-                .get("workers")
-                .and_then(serde_json::Value::as_u64);
-            let udp_timeout = p_settings
-                .get("udp_timeout")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok());
-            let system = p_settings
-                .get("system")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-
-            // Peer endpoint: URL import sets endpoint.host:port; form stores in protocol_settings["endpoint"]
-            let endpoint_addr = (!endpoint.host.is_empty()).then_some(endpoint.host.as_str());
-            let (peer_addr, peer_port): (String, u16) = if let Some(addr) = endpoint_addr {
-                (addr.to_string(), port)
-            } else if let Some(ep) = p_settings.get("endpoint").and_then(|v| v.as_str()) {
-                if let Some((host, port_str)) = ep.rsplit_once(':') {
-                    (host.to_string(), port_str.parse::<u16>().unwrap_or(51820))
-                } else {
-                    (ep.to_string(), 51820)
-                }
-            } else {
-                (String::new(), 0u16)
-            };
-
-            // Preshared key and reserved bytes
-            let preshared_key = p_settings
-                .get("preshared_key")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let reserved_str = p_settings
-                .get("reserved")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let persistent_keepalive = p_settings
-                .get("persistent_keepalive")
-                .and_then(serde_json::Value::as_u64);
-
-            // Build peers array: use JSON override or fall back to single peer
-            let peers_json = p_settings
-                .get("peers")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            let peers: Value = if let Some(json_str) = peers_json {
-                serde_json::from_str(json_str).unwrap_or_else(|_| {
-                    // Build single peer from form fields
-                    build_single_wireguard_peer(
-                        &peer_addr,
-                        peer_port,
-                        &public_key,
-                        &allowed_ips,
-                        preshared_key.as_deref(),
-                        reserved_str.as_deref(),
-                        persistent_keepalive,
-                    )
-                })
-            } else {
-                // Build single peer from form fields
-                build_single_wireguard_peer(
-                    &peer_addr,
-                    peer_port,
-                    &public_key,
-                    &allowed_ips,
-                    preshared_key.as_deref(),
-                    reserved_str.as_deref(),
-                    persistent_keepalive,
-                )
-            };
-
-            let mut out = json!({
-                "tag": "proxy",
-                "type": "wireguard",
-                "server": address,
-                "server_port": port,
-                "address": address,
-                "mtu": mtu,
-                "private_key": private_key,
-                "peers": peers,
-            });
-
-            if let Some(w) = workers {
-                out["workers"] = json!(w);
-            }
-            if let Some(t) = udp_timeout {
-                out["udp_timeout"] = json!(t);
-            }
-            if system {
-                out["system"] = json!(true);
-            }
-            out
-        }
-        _ => {
-            return Err(BuildError::InvalidProfile(format!(
-                "Protocol {proto:?} not supported for sing-box outbound"
-            )));
-        }
-    };
+    let mut out = json!({});
+    protocol_config(protocol)?.inject_to(
+        &mut out,
+        core_type,
+        Some(&endpoint_essentials(endpoint)),
+    )?;
+    out["tag"] = json!("proxy");
     // Inject multiplex block if configured
     if let Some(mux_val) = &params.mux {
         out["multiplex"] = mux_val.clone();
     }
     Ok(out)
-}
-
-/// Build a single WireGuard peer object from form fields.
-fn build_single_wireguard_peer(
-    server: &str,
-    port: u16,
-    public_key: &str,
-    allowed_ips: &str,
-    preshared_key: Option<&str>,
-    reserved: Option<&str>,
-    persistent_keepalive: Option<u64>,
-) -> Value {
-    let mut peer = json!({
-        "address": server,
-        "port": port,
-        "public_key": public_key,
-        "allowed_ips": [allowed_ips],
-    });
-    if let Some(psk) = preshared_key {
-        peer["pre_shared_key"] = json!(psk);
-    }
-    if let Some(r) = reserved {
-        peer["reserved"] = json!(r);
-    }
-    if let Some(k) = persistent_keepalive {
-        peer["persistent_keepalive_interval"] = json!(k);
-    }
-    json!([peer])
 }
 
 fn build_direct_outbound() -> Value {
@@ -789,38 +252,33 @@ fn build_routing(rules: &[RoutingRule]) -> RouteConfig {
             // NOTE: source_ports is NOT a matcher here — the sing-box builder
             // does not emit a source_port field, so a source_ports-only rule
             // would otherwise slip through as a catch-all rule.
-            let has_matcher = r.domains.is_some()
-                || r.ips.is_some()
-                || r.inbound_tags.is_some()
-                || r.port.is_some()
+            let has_matcher = !r.domains.is_empty()
+                || !r.ips.is_empty()
+                || !r.inbound_tags.is_empty()
+                || !r.ports.is_empty()
                 || r.network.is_some()
-                || r.protocols.is_some();
+                || !r.protocols.is_empty();
             if !has_matcher {
                 return None;
             }
             let mut rule = json!({});
-            if let Some(domains) = &r.domains {
-                rule["domain"] = json!(parse_comma_list(domains));
+            if !r.domains.is_empty() {
+                rule["domain"] = json!(r.domains);
             }
-            if let Some(ips) = &r.ips {
-                rule["ip_cidr"] = json!(parse_comma_list(ips));
+            if !r.ips.is_empty() {
+                rule["ip_cidr"] = json!(r.ips);
             }
-            if let Some(inbound_tags) = &r.inbound_tags {
-                rule["inbound"] = json!(parse_comma_list(inbound_tags));
+            if !r.inbound_tags.is_empty() {
+                rule["inbound"] = json!(r.inbound_tags);
             }
-            if let Some(port) = &r.port {
-                // Parse port range string into array of values
-                if let Ok(p) = port.parse::<u16>() {
-                    rule["port"] = json!([p]);
-                } else {
-                    rule["port"] = json!([port]);
-                }
+            if !r.ports.is_empty() {
+                rule["port"] = json!(r.ports);
             }
             if let Some(network) = &r.network {
                 rule["network"] = json!([network]);
             }
-            if let Some(protocols) = &r.protocols {
-                rule["protocol"] = json!(parse_comma_list(protocols));
+            if !r.protocols.is_empty() {
+                rule["protocol"] = json!(r.protocols);
             }
             if let Some(matcher) = &r.domain_matcher {
                 rule["domain_matcher"] = json!(matcher);
@@ -846,202 +304,11 @@ fn build_routing(rules: &[RoutingRule]) -> RouteConfig {
 // ── DNS ──────────────────────────────────────────────────────────────
 
 fn build_dns(dns: &DnsSetting) -> SingBoxDnsConfig {
-    let servers: Vec<Value> = dns
-        .servers
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-
-    let hosts: Value = dns
-        .hosts
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
-
-    SingBoxDnsConfig { servers, hosts }
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-fn parse_comma_list(s: &str) -> Vec<&str> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) -> Option<Value> {
-    let (p_settings, s_settings) = parse_settings(protocol);
-
-    let enabled = p_settings
-        .get("sni")
-        .and_then(|v| v.as_str())
-        .as_ref()
-        .is_some_and(|s| !s.is_empty())
-        || s_settings
-            .get("tls.enable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        || s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
-        || s_settings
-            .get("reality.show")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-    if !enabled {
-        return None;
+    let servers: Vec<Value> = dns.servers.iter().map(|s| json!(s)).collect();
+    SingBoxDnsConfig {
+        servers,
+        hosts: build_hosts_map(&dns.hosts),
     }
-
-    let mut tls = serde_json::Map::new();
-    tls.insert("enabled".into(), json!(true));
-
-    // server_name: protocol.sni > stream.sni > endpoint.host
-    let sni = p_settings
-        .get("sni")
-        .and_then(|v| v.as_str())
-        .or_else(|| s_settings.get("sni").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty())
-        .or_else(|| (!endpoint.host.is_empty()).then_some(endpoint.host.as_str()));
-    if let Some(sni) = sni {
-        tls.insert("server_name".into(), json!(sni));
-    }
-
-    // insecure: global skip > protocol.insecure > protocol.allow_insecure > stream.allow_insecure
-    let insecure = params.skip_cert_verify
-        || p_settings
-            .get("insecure")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        || p_settings
-            .get("allow_insecure")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        || s_settings
-            .get("allow_insecure")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-    if insecure {
-        tls.insert("insecure".into(), json!(true));
-    }
-
-    // alpn: comma-separated string
-    let alpn = p_settings
-        .get("alpn")
-        .and_then(|v| v.as_str())
-        .or_else(|| s_settings.get("alpn").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty());
-    if let Some(a) = alpn {
-        let parts: Vec<&str> = a
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !parts.is_empty() {
-            tls.insert("alpn".into(), json!(parts));
-        }
-    }
-
-    // utls.fingerprint: stream.fingerprint
-    if let Some(fp) = s_settings
-        .get("fingerprint")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        let mut utls = serde_json::Map::new();
-        utls.insert("enabled".into(), json!(true));
-        utls.insert("fingerprint".into(), json!(fp));
-        tls.insert("utls".into(), json!(utls));
-    }
-
-    // ech: stream.ech.enable + stream.ech.config
-    let ech_enabled = s_settings
-        .get("ech.enable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || p_settings
-            .get("ech.enable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-    if ech_enabled {
-        let mut ech = serde_json::Map::new();
-        ech.insert("enabled".into(), json!(true));
-        if let Some(config) = s_settings
-            .get("ech.config")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                p_settings
-                    .get("ech.config")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-            })
-        {
-            ech.insert("config".into(), json!(config));
-        }
-        tls.insert("ech".into(), json!(ech));
-    }
-
-    // tls.fragment: emit fragment: true + record_fragment when enabled
-    let fragment_enabled = s_settings
-        .get("fragment.enable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || p_settings
-            .get("fragment.enable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-    if fragment_enabled {
-        tls.insert("fragment".into(), json!(true));
-    }
-
-    // reality: check both URL-import (security) and form (reality.show) paths
-    let is_reality = s_settings.get("security").and_then(|v| v.as_str()) == Some("reality")
-        || s_settings
-            .get("reality.show")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-    if is_reality {
-        let mut reality = serde_json::Map::new();
-        reality.insert("enabled".into(), json!(true));
-        // stream_settings reality keys: URL import uses flat "pbk"/"sid"/"spx"
-        // realitySettings sub-object also checked for backwards compat
-        if let Some(pbk) = s_settings
-            .get("pbk")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                s_settings
-                    .get("realitySettings")
-                    .and_then(|v| v.as_object())
-                    .and_then(|m| m.get("publicKey").and_then(|v| v.as_str()))
-            })
-        {
-            reality.insert("public_key".into(), json!(pbk));
-        }
-        if let Some(sid) = s_settings
-            .get("sid")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                s_settings
-                    .get("realitySettings")
-                    .and_then(|v| v.as_object())
-                    .and_then(|m| m.get("shortId").and_then(|v| v.as_str()))
-            })
-        {
-            reality.insert("short_id".into(), json!(sid));
-        }
-        // NOTE: sing-box's OutboundRealityOptions has no spider_x field
-        // (option/tls.go — only enabled/public_key/short_id), so spiderX from
-        // the URL is intentionally dropped — it is xray-only. It must never
-        // be written into short_id (that corrupted the real short_id).
-        // Only add reality block if it has meaningful content beyond "enabled"
-        if reality.len() > 1 {
-            tls.insert("reality".into(), json!(reality));
-        }
-    }
-
-    Some(json!(tls))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1049,89 +316,10 @@ fn build_tls(endpoint: &Endpoint, protocol: &ProtocolRow, params: &BuildParams) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xray_tui_db::models::{DnsSetting, Endpoint, ProtocolRow, RoutingRule};
-
-    fn test_endpoint_and_protocol(config_type: i32) -> (Endpoint, ProtocolRow) {
-        let endpoint = Endpoint {
-            id: 0,
-            host: "example.com".to_string(),
-            host_type: "dns".to_string(),
-            port: 443,
-            port_spec_str: None,
-            parent_id: None,
-            last_source: None,
-            created_at: 0,
-            manual_protocol_override: None,
-            resolved_as: None,
-            resolved_at: None,
-        };
-        let extra = serde_json::json!({
-            "remarks": "test",
-            "user_id": "test-uuid-or-pass",
-        });
-        let protocol = ProtocolRow {
-            id: 0,
-            endpoint_id: 0,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: String::new(),
-            last_used_at: None,
-            spec_blob: serde_json::to_vec(&extra).unwrap_or_default(),
-            transport: Some("tcp".to_string()),
-            security: Some("auto".to_string()),
-            config_type,
-            core_type: "auto".to_string(),
-            endpoint: Default::default(),
-            created_at: 0,
-            last_seen_at: 0,
-            extension: Default::default(),
-            server_stat: Default::default(),
-        };
-        (endpoint, protocol)
-    }
-
-    fn default_params() -> (BuildParams, Vec<RoutingRule>, DnsSetting) {
-        let params = BuildParams {
-            v2ray_api_enabled: true,
-            clash_api_enabled: false,
-            log_level: "warning".to_string(),
-            socks_port: 10808,
-            http_port: None,
-            listen: "127.0.0.1".to_string(),
-            sniffing: false,
-            clash_api_port: None,
-            mux: None,
-            clash_mixin: None,
-            skip_cert_verify: false,
-        };
-        let rules = vec![];
-        let dns = DnsSetting {
-            id: "default".to_string(),
-            name: None,
-            servers: None,
-            hosts: None,
-            query_strategy: None,
-            disable_cache: None,
-            disable_fallback: None,
-            client_ip: None,
-            cache_ttl_secs: None,
-        };
-        (params, rules, dns)
-    }
-
-    fn set_protocol_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
-        let mut extra: serde_json::Value =
-            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["protocol_settings"] = serde_json::from_str(json_str).unwrap_or_default();
-        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
-    }
-
-    fn set_stream_settings_json(protocol: &mut ProtocolRow, json_str: &str) {
-        let mut extra: serde_json::Value =
-            serde_json::from_slice(&protocol.spec_blob).unwrap_or_default();
-        extra["stream_settings"] = serde_json::from_str(json_str).unwrap_or_default();
-        protocol.spec_blob = serde_json::to_vec(&extra).unwrap_or_default();
-    }
+    use xray_tui_db::models::RoutingRule;
+    use xray_tui_proto::proto_spec::ProtocolKind;
+    use xray_tui_proto::proto_spec::common::SecurityConfig;
+    use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ProtocolConfig};
 
     fn assert_singbox_top_level(json: &Value) {
         assert!(json.get("log").is_some(), "missing log");
@@ -1142,198 +330,106 @@ mod tests {
         assert!(json.get("experimental").is_some(), "missing experimental");
     }
 
-    fn assert_proxy_outbound(json: &Value, expected_type: &str) {
-        let outbounds = json["outbounds"].as_array().expect("outbounds array");
-        let proxy = outbounds
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy outbound");
-        assert_eq!(
-            proxy["type"].as_str().unwrap(),
-            expected_type,
-            "type mismatch"
-        );
+    fn test_endpoint_protocol_link() -> (Endpoint, Protocol, crate::config_builder::ProfileStats) {
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let tuic = ProtocolConfig::Tuic(xray_tui_proto::proto_spec::TuicConfig {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            password: "pw".to_string(),
+            congestion_control: None,
+            udp_relay_mode: None,
+            security: SecurityConfig::default(),
+            remarks: None,
+        });
+        let protocol = super::super::tests::protocol(ProtocolKind::Tuic, tuic);
+        let link = super::super::tests::link(ProtoCoreType::SingBox);
+        (endpoint, protocol, link)
     }
 
-    fn assert_has_standard_outbounds(json: &Value) {
-        let outbounds = json["outbounds"].as_array().expect("outbounds array");
-        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
-        assert!(tags.contains(&"direct"), "missing direct");
-        assert!(tags.contains(&"block"), "missing block");
-    }
-
-    #[test]
-    fn proxy_outbound_uses_protocol_credentials_not_empty_user_id() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        // Typed TUIC to_settings puts uuid+password in p_settings.
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"uuid": "11111111-2222-3333-4444-555555555555", "password": "sekrit"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        let outbounds = json["outbounds"].as_array().expect("outbounds");
-        let proxy = outbounds
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .expect("proxy");
-        assert_eq!(
-            proxy["uuid"].as_str().unwrap(),
-            "11111111-2222-3333-4444-555555555555"
-        );
-        assert_eq!(proxy["password"].as_str().unwrap(), "sekrit");
+    fn domain_rule() -> RoutingRule {
+        RoutingRule {
+            id: "r1".to_string(),
+            group_id: None,
+            r#type: 0,
+            domain_matcher: None,
+            domains: vec!["example.com".to_string()],
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
+            network: None,
+            protocols: Vec::new(),
+            domain_strategy: None,
+            outbound_tag: Some("direct".to_string()),
+            balancer_tag: None,
+            rule_set_file: None,
+            rule_set_url: None,
+            sort_order: Some(0),
+        }
     }
 
     #[test]
-    fn singbox_tuic_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "tuic");
-        assert_has_standard_outbounds(&json);
-    }
-
-    #[test]
-    fn singbox_hysteria2_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria2.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"password": "sekret", "up_mbps": 50, "down_mbps": 200}"#,
+    fn singbox_build_returns_unsupported_protocol_until_inject() {
+        // flip to success assertions in T16 (real inject_to lands in T14/15)
+        let (endpoint, protocol, link) = test_endpoint_protocol_link();
+        let (params, rules, dns) = super::super::tests::default_params();
+        let result = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
         );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "hysteria2");
-
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["up_mbps"], 50);
-        assert_eq!(proxy["down_mbps"], 200);
+        match result {
+            Err(BuildError::Support(
+                xray_tui_proto::proto_spec::SupportError::UnsupportedProtocol(kind, core),
+            )) => {
+                assert_eq!(kind, "tuic");
+                assert_eq!(core, ProtoCoreType::SingBox);
+            }
+            other => panic!("expected UnsupportedProtocol, got {other:?}"),
+        }
     }
 
     #[test]
-    fn singbox_shadowsocks_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "shadowsocks");
-    }
-
-    #[test]
-    fn singbox_reality_short_id_not_overwritten_by_spider_x() {
-        // sing-box's OutboundRealityOptions has no spider_x field (unlike
-        // xray's realitySettings); the old code wrote the spx value into
-        // short_id, corrupting it.
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"security": "reality", "sni": "cdn.example.com", "pbk": "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg", "sid": "a7ec6c3316eddb11", "spx": "/foo"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let proxy = json["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .unwrap();
-        let reality = &proxy["tls"]["reality"];
-        assert_eq!(
-            reality["public_key"],
-            "S4WFc-SD_FpmmQdM21Of7O6XmYaLlmwcmlbgO4lZQQg"
-        );
-        assert_eq!(reality["short_id"], "a7ec6c3316eddb11");
-        assert!(reality.get("spider_x").is_none());
-    }
-
-    #[test]
-    fn singbox_shadowsocks_rejects_unsupported_cipher() {
-        // salsa20 is supported by neither core; the builder must refuse it.
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Shadowsocks.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"method": "salsa20"}"#);
-        let (params, rules, dns) = default_params();
-        let err = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns)
-            .expect_err("salsa20 is not a sing-box method");
+    fn singbox_build_unloaded_config_returns_error() {
+        use toasty::Deferred;
+        let (endpoint, mut protocol, link) = test_endpoint_protocol_link();
+        protocol.config = Deferred::default();
+        let (params, rules, dns) = super::super::tests::default_params();
+        let err = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
+        )
+        .expect_err("unloaded config must be rejected");
         assert!(
-            err.to_string().contains("salsa20"),
-            "error must name the cipher: {err}"
+            err.to_string().contains("not loaded"),
+            "error must mention the unloaded config: {err}"
         );
     }
 
     #[test]
-    fn singbox_shadowsocks2022_builds() {
-        // sing-box 2022 methods flow through type "shadowsocks".
-        let (endpoint, mut protocol) =
-            test_endpoint_and_protocol(Protocol::Shadowsocks2022.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"method": "2022-blake3-aes-128-gcm"}"#);
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let proxy = json["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|o| o["tag"] == "proxy")
-            .unwrap();
-        assert_eq!(proxy["type"], "shadowsocks");
-        assert_eq!(proxy["method"], "2022-blake3-aes-128-gcm");
-    }
-
-    #[test]
-    fn singbox_socks_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Socks.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+    fn singbox_top_level_skeleton() {
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = skeleton(&params, &rules, &dns);
         let json = serde_json::to_value(&config).unwrap();
         assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "socks");
-    }
-
-    #[test]
-    fn singbox_http_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Http.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "http");
-    }
-
-    #[test]
-    fn singbox_tuic_with_tls() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        set_protocol_settings_json(&mut protocol, r#"{"password": "pass123"}"#);
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["tls"]["enabled"], true);
-        assert_eq!(proxy["tls"]["server_name"], "example.com");
-        assert_eq!(proxy["password"], "pass123");
+        let exp = &json["experimental"];
+        assert!(
+            exp["v2ray_api"].is_object(),
+            "v2ray_api should be present when enabled"
+        );
+        assert!(exp["clash_api"].is_null(), "clash_api should be absent");
     }
 
     #[test]
     fn singbox_default_inbound() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = skeleton(&params, &rules, &dns);
         let json = serde_json::to_value(&config).unwrap();
         let inbounds = json["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 1);
@@ -1342,33 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn singbox_experimental_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let exp = &json["experimental"];
-        let v2ray = &exp["v2ray_api"];
-        assert_eq!(
-            v2ray["listen"],
-            format!("127.0.0.1:{}", crate::config_builder::API_PORT)
-        );
-        assert_eq!(v2ray["stats"]["enabled"], true);
-        // clash_api should be absent when clash_api_enabled is false
-        assert!(exp["clash_api"].is_null(), "clash_api should be absent");
-    }
-
-    #[test]
     fn singbox_clash_api_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        let (mut params, rules, dns) = default_params();
+        let (mut params, rules, dns) = super::super::tests::default_params();
         params.clash_api_enabled = true;
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
+        let config = skeleton(&params, &rules, &dns);
         let json = serde_json::to_value(&config).unwrap();
         let exp = &json["experimental"];
-        // clash_api should be present when clash_api_enabled is true
         assert_eq!(
             exp["clash_api"]["external_controller"],
             format!("127.0.0.1:{}", crate::config_builder::CLASH_API_PORT)
@@ -1378,277 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn singbox_shadowsocksr_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::ShadowsocksR.to_i32());
-        protocol.config_type = Protocol::ShadowsocksR.to_i32();
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"method":"aes-256-cfb","obfs":"tls1.2_ticket_auth","obfs_param":"www.example.com","protocol":"auth_aes128_md5","protocol_param":"test"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "shadowsocksr");
-        assert_has_standard_outbounds(&json);
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["method"], "aes-256-cfb");
-        assert_eq!(proxy["obfs"], "tls1.2_ticket_auth");
-    }
-
-    #[test]
-    fn singbox_hysteria_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Hysteria.to_i32());
-        protocol.config_type = Protocol::Hysteria.to_i32();
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"auth":"test123","up_mbps":50,"down_mbps":100,"sni":"custom.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "hysteria");
-        assert_has_standard_outbounds(&json);
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["auth_str"], "test123");
-        assert_eq!(proxy["up_mbps"], 50);
-        assert_eq!(proxy["down_mbps"], 100);
-        assert_eq!(proxy["tls"]["server_name"], "custom.example.com");
-    }
-
-    #[test]
-    fn singbox_naive_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Naive.to_i32());
-        protocol.config_type = Protocol::Naive.to_i32();
-        set_protocol_settings_json(&mut protocol, r#"{"user":"me","password":"pass456"}"#);
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "naive");
-        assert_has_standard_outbounds(&json);
-    }
-
-    #[test]
-    fn singbox_anytls_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::AnyTls.to_i32());
-        protocol.config_type = Protocol::AnyTls.to_i32();
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"password":"any-secret","sni":"tls.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "anytls");
-        assert_has_standard_outbounds(&json);
-    }
-
-    #[test]
-    fn singbox_shadowtls_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::ShadowTls.to_i32());
-        protocol.config_type = Protocol::ShadowTls.to_i32();
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"password":"shadow-pw","version":"3","sni":"shadow.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "shadowtls");
-        assert_has_standard_outbounds(&json);
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["version"], 3);
-    }
-
-    #[test]
-    fn singbox_tor_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tor.to_i32());
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "tor");
-        assert_has_standard_outbounds(&json);
-    }
-
-    #[test]
-    fn singbox_ssh_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Ssh.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"host":"ssh.example.com","ssh_port":2222,"username":"admin","password":"ssh-pw"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "ssh");
-        assert_has_standard_outbounds(&json);
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["server"], "ssh.example.com");
-        assert_eq!(proxy["server_port"], 2222);
-        assert_eq!(proxy["user"], "admin");
-    }
-
-    #[test]
-    fn singbox_tailscale_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Tailscale.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"auth_key":"tskey-auth-xxxx","control_url":"https://control.tailscale.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "tailscale");
-        assert_has_standard_outbounds(&json);
-    }
-
-    #[test]
-    fn singbox_vmess_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vmess.to_i32());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"tls.enable":true,"sni":"vmess.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "vmess");
-        assert_has_standard_outbounds(&json);
-        assert_eq!(
-            json["outbounds"].as_array().unwrap()[0]["tls"]["enabled"],
-            true
-        );
-    }
-
-    #[test]
-    fn singbox_vless_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Vless.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"flow":"xtls-rprx-vision","sni":"vless.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "vless");
-        assert_has_standard_outbounds(&json);
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["flow"], "xtls-rprx-vision");
-        assert_eq!(proxy["tls"]["server_name"], "vless.example.com");
-    }
-
-    #[test]
-    fn singbox_trojan_config() {
-        let (endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::Trojan.to_i32());
-        set_stream_settings_json(
-            &mut protocol,
-            r#"{"tls.enable":true,"sni":"trojan.example.com"}"#,
-        );
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "trojan");
-        assert_has_standard_outbounds(&json);
-        assert_eq!(
-            json["outbounds"].as_array().unwrap()[0]["tls"]["server_name"],
-            "trojan.example.com"
-        );
-    }
-
-    #[test]
-    fn singbox_wireguard_config() {
-        let (mut endpoint, mut protocol) = test_endpoint_and_protocol(Protocol::WireGuard.to_i32());
-        set_protocol_settings_json(
-            &mut protocol,
-            r#"{"private_key":"abc123def456","public_key":"pubkey789","allowed_ips":"0.0.0.0/0","mtu":1380,"endpoint":"wg.example.com:51820","address":"10.0.0.1/24","preshared_key":"psk_value","persistent_keepalive":25,"reserved":"1,2,3","workers":2,"udp_timeout":"30","system":true}"#,
-        );
-        endpoint.host = String::new();
-        endpoint.port = 0;
-        let (params, rules, dns) = default_params();
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_singbox_top_level(&json);
-        assert_proxy_outbound(&json, "wireguard");
-        assert_has_standard_outbounds(&json);
-        let proxy = &json["outbounds"].as_array().unwrap()[0];
-        assert_eq!(proxy["mtu"], 1380);
-        assert_eq!(proxy["peers"][0]["address"], "wg.example.com");
-        assert_eq!(proxy["peers"][0]["port"], 51820);
-        assert_eq!(proxy["peers"][0]["pre_shared_key"], "psk_value");
-        assert_eq!(proxy["peers"][0]["persistent_keepalive_interval"], 25);
-        assert_eq!(proxy["peers"][0]["reserved"], "1,2,3");
-        assert_eq!(proxy["address"], json!(["10.0.0.1/24"]));
-        assert_eq!(proxy["workers"], 2);
-        assert_eq!(proxy["udp_timeout"], 30);
-        assert_eq!(proxy["system"], true);
-    }
-
-    #[test]
-    fn singbox_truly_unsupported_protocol_returns_error() {
-        // Dns is xray-only, not supported by sing-box outbound builder
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Dns.to_i32());
-        let (params, rules, dns) = default_params();
-        let result = SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns);
-        assert!(result.is_err(), "unsupported protocol should return error");
-        match result {
-            Err(BuildError::InvalidProfile(_)) => {} // expected
-            _ => panic!("expected InvalidProfile error"),
-        }
-    }
-
-    #[test]
     fn singbox_route_config() {
-        let (endpoint, protocol) = test_endpoint_and_protocol(Protocol::Tuic.to_i32());
-        let (params, _, dns) = default_params();
-        let rules = vec![RoutingRule {
-            id: "r1".to_string(),
-            group_id: None,
-            r#type: 0,
-            domain_matcher: None,
-            domains: Some("example.com".to_string()),
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: None,
-            network: None,
-            protocols: None,
-            domain_strategy: None,
-            outbound_tag: Some("direct".to_string()),
-            balancer_tag: None,
-            rule_set_file: None,
-            rule_set_url: None,
-            sort_order: Some(0),
-        }];
-        let config =
-            SingBoxConfigBuilder::build(&endpoint, &protocol, &params, &rules, &dns).unwrap();
-        let json = serde_json::to_value(&config).unwrap();
-        let route = &json["route"];
-        assert_eq!(route["rules"].as_array().unwrap().len(), 1);
-        assert_eq!(route["rules"][0]["domain"][0], "example.com");
-        assert_eq!(route["rules"][0]["outbound"], "direct");
-        assert_eq!(route["final"], "proxy");
+        let rules = vec![domain_rule()];
+        let route = build_routing(&rules);
+        let json = serde_json::to_value(&route).unwrap();
+        assert_eq!(json["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(json["rules"][0]["domain"][0], "example.com");
+        assert_eq!(json["rules"][0]["outbound"], "direct");
+        assert_eq!(json["final"], "proxy");
     }
 
     #[test]
@@ -1658,13 +470,13 @@ mod tests {
             group_id: None,
             r#type: 0,
             domain_matcher: None,
-            domains: None,
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: None,
+            domains: Vec::new(),
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
             network: None,
-            protocols: None,
+            protocols: Vec::new(),
             domain_strategy: None,
             outbound_tag: Some("direct".to_string()),
             balancer_tag: None,
@@ -1683,13 +495,13 @@ mod tests {
             group_id: None,
             r#type: 0,
             domain_matcher: Some("linear".to_string()),
-            domains: Some("example.com".to_string()),
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: None,
+            domains: vec!["example.com".to_string()],
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: Vec::new(),
             network: Some("tcp".to_string()),
-            protocols: Some("http,tls".to_string()),
+            protocols: vec!["http".to_string(), "tls".to_string()],
             domain_strategy: None,
             outbound_tag: Some("proxy".to_string()),
             balancer_tag: None,
@@ -1713,13 +525,13 @@ mod tests {
             group_id: None,
             r#type: 0,
             domain_matcher: None,
-            domains: None,
-            ips: None,
-            inbound_tags: None,
-            port: None,
-            source_ports: Some("8080".to_string()),
+            domains: Vec::new(),
+            ips: Vec::new(),
+            inbound_tags: Vec::new(),
+            ports: Vec::new(),
+            source_ports: vec![8080],
             network: None,
-            protocols: None,
+            protocols: Vec::new(),
             domain_strategy: None,
             outbound_tag: Some("direct".to_string()),
             balancer_tag: None,
@@ -1729,5 +541,23 @@ mod tests {
         };
         let routing = build_routing(&[rule]);
         assert!(routing.rules.is_empty());
+    }
+
+    #[test]
+    fn singbox_dns_skeleton_from_typed_settings() {
+        let dns = DnsSetting {
+            id: "default".to_string(),
+            name: None,
+            servers: vec!["1.1.1.1".to_string()],
+            hosts: vec!["example.com:1.2.3.4".to_string()],
+            query_strategy: None,
+            disable_cache: false,
+            disable_fallback: false,
+            client_ip: None,
+            cache_ttl_secs: None,
+        };
+        let config = build_dns(&dns);
+        assert_eq!(json!(config.servers), json!(["1.1.1.1"]));
+        assert_eq!(config.hosts["example.com"], "1.2.3.4");
     }
 }
