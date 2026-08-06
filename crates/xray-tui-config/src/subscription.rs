@@ -3,11 +3,11 @@
 use std::mem::MaybeUninit;
 
 use crate::import_export::{
-    ImportError, ParsedProtocol, ValidationSettings, ValidationSummary, parse_share_url,
+    ImportError, ParsedProfile, ValidationSettings, ValidationSummary, parse_share_url,
 };
 use aho_corasick::AhoCorasick;
 use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use xray_tui_proto::proto_spec::ProtocolConfig;
+use xray_tui_proto::proto_spec::ProtoSpec;
 
 /// Maximum input chunk size for `StreamingDecoder::feed()`.
 const INPUT_CHUNK_SIZE: usize = 65536;
@@ -385,7 +385,7 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
 pub fn parse_subscription_data(
     data: &[u8],
     settings: &ValidationSettings,
-) -> Result<(Vec<ParsedProtocol>, ValidationSummary), String> {
+) -> Result<(Vec<ParsedProfile>, ValidationSummary), String> {
     let mut decoder = StreamingDecoder::new();
     let mut all_urls = Vec::new();
 
@@ -399,8 +399,8 @@ pub fn parse_subscription_data(
     let urls = decoder.finalize()?;
     all_urls.extend(urls);
 
-    // Parse each URL into a Profile
-    let mut profiles: Vec<ParsedProtocol> = Vec::new();
+    // Parse each URL into a typed ParsedProfile
+    let mut profiles: Vec<ParsedProfile> = Vec::new();
     let mut summary = ValidationSummary::default();
     for url in &all_urls {
         match parse_share_url(url, settings) {
@@ -427,17 +427,18 @@ pub fn parse_subscription_data(
         }
     }
 
-    // Scan parsed profiles for allow_insecure / insecure settings
+    // Scan parsed profiles for allow_insecure / insecure settings (typed
+    // security accessor — legacy spec_blob/to_settings check removed in T11;
+    // the full flow rework lands in T12).
     summary.security_warning_count = profiles
         .iter()
         .filter(|p| {
-            serde_json::from_slice::<ProtocolConfig>(&p.spec_blob).is_ok_and(|config| {
-                let (_, s_settings) = config.to_settings();
-                s_settings
-                    .get("allow_insecure")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            })
+            p.parsed
+                .protocol
+                .config
+                .security()
+                .and_then(|s| s.insecure())
+                == Some(true)
         })
         .count();
 
