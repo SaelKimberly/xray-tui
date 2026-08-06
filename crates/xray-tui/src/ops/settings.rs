@@ -276,6 +276,22 @@ pub async fn build_settings_fields(
                         .real_ping_test_all_protocols
                         .to_string(),
                 ),
+                (
+                    "task_queue_limit".into(),
+                    state.config.speed_test.task_queue_limit.to_string(),
+                ),
+                (
+                    "dns_failure_defer_secs".into(),
+                    state.config.speed_test.dns_failure_defer_secs.to_string(),
+                ),
+                (
+                    "error_ttl_hours".into(),
+                    state
+                        .config
+                        .speed_test
+                        .error_ttl_hours
+                        .map_or_else(String::new, |h| h.to_string()),
+                ),
                 ("geoip_url".into(), state.config.geo.geoip_url.clone()),
                 ("geosite_url".into(), state.config.geo.geosite_url.clone()),
                 (
@@ -492,6 +508,15 @@ fn apply_settings_fields(
             }
             state.config.speed_test.real_ping_test_all_protocols =
                 get_str("real_ping_test_all_protocols") == "true";
+            if let Ok(v) = get_str("task_queue_limit").parse::<u16>() {
+                state.config.speed_test.task_queue_limit = v;
+            }
+            if let Ok(v) = get_str("dns_failure_defer_secs").parse::<i64>() {
+                state.config.speed_test.dns_failure_defer_secs = v;
+            }
+            // Empty = never (None); a non-empty field must parse as hours.
+            state.config.speed_test.error_ttl_hours =
+                get_opt("error_ttl_hours").and_then(|s| s.parse::<i64>().ok());
             if !get_str("geoip_url").is_empty() {
                 state.config.geo.geoip_url = get("geoip_url");
             }
@@ -556,6 +581,12 @@ pub fn save_settings_form(
     fields: &[(String, String)],
 ) {
     apply_settings_fields(state, section, fields);
+    // The scheduler limits are runtime-settable: apply the persisted values
+    // so the next batch honors them without a restart.
+    state.scheduler.set_limits(
+        state.config.speed_test.task_queue_limit,
+        state.config.speed_test.dns_failure_defer_secs,
+    );
     if let Err(e) = state.config.save() {
         state.log_trace(
             "error",

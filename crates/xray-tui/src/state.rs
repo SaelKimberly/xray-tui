@@ -37,9 +37,11 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
     /// Per-(protocol, endpoint) task gate (design §6.2): one live task per
-    /// link, FIFO queue, orphan sweep, DNS-deferral. Defaults `(3, 5)` for
-    /// now — T21 wires the config's queue_limit/dns_defer_secs. Wrapped in
-    /// `Arc` so the T19 batch pipeline can clone it into its spawned task.
+    /// link, FIFO queue, orphan sweep, DNS-deferral. Limits come from
+    /// `config.speed_test` (queue limit, DNS deferral window) and stay
+    /// runtime-settable via `TaskScheduler::set_limits` on settings save.
+    /// Wrapped in `Arc` so the T19 batch pipeline can clone it into its
+    /// spawned task.
     pub scheduler: Arc<scheduler::TaskScheduler>,
     /// Currently selected theme name from config or UI selection.
     pub theme_name: ratatui_themes::ThemeName,
@@ -363,10 +365,15 @@ impl AppState {
         let (core_tx, core_rx) = tokio::sync::mpsc::channel(65536);
         let purgatory_ttl_secs = (config.purgatory.ttl_days * 86400) as i64;
         let purgatory_retention_secs = (config.purgatory.retention_days * 86400) as i64;
+        // Scheduler limits come from the speed-test config (T21); they stay
+        // runtime-settable afterwards via `TaskScheduler::set_limits` on
+        // settings save.
+        let queue_limit = config.speed_test.task_queue_limit;
+        let dns_defer_secs = config.speed_test.dns_failure_defer_secs;
         let mut state = Self {
             db,
             config,
-            scheduler: Arc::new(scheduler::TaskScheduler::new(3, 5)), // T21: config queue_limit/dns_defer_secs
+            scheduler: Arc::new(scheduler::TaskScheduler::new(queue_limit, dns_defer_secs)),
             theme_name,
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),

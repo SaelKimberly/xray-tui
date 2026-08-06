@@ -29,6 +29,13 @@ pub(crate) fn endpoint_row_for_protocol(
         .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id))
 }
 
+/// True when `a` and `b` fall on the same civil day in the system local
+/// time zone — the "today" boundary for the daily traffic reset.
+fn same_local_day(a: jiff::Timestamp, b: jiff::Timestamp) -> bool {
+    let tz = jiff::tz::TimeZone::system();
+    a.to_zoned(tz.clone()).date() == b.to_zoned(tz).date()
+}
+
 /// The persisted `error.kind` bucket for a test type: fast-class tests
 /// (TCP/UDP) land in `Fast`, data-plane tests (real ping, speed) in `Real`.
 /// Name-resolution failures surface on real attempts and share the real
@@ -118,12 +125,26 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .iter_mut()
                         .find(|l| l.protocol_id.get() == protocol_id)
                 {
-                    link.traffic = TrafficStats {
-                        today_up,
-                        today_down,
-                        total_up,
-                        total_down,
+                    // The poller reports deltas since the last poll
+                    // (`query_stats(..., reset = true)`); accumulate them
+                    // into the persisted row. The "today" counters reset
+                    // when the row's last-write day differs from today (jiff
+                    // civil-date comparison) — totals never reset. The row
+                    // day boundary is the row's `updated_at`, refreshed
+                    // here so consecutive same-day writes accumulate.
+                    let now = jiff::Timestamp::now();
+                    let (base_up, base_down) = if same_local_day(link.updated_at, now) {
+                        (link.traffic.today_up, link.traffic.today_down)
+                    } else {
+                        (0, 0)
                     };
+                    link.traffic = TrafficStats {
+                        today_up: base_up + today_up,
+                        today_down: base_down + today_down,
+                        total_up: link.traffic.total_up + total_up,
+                        total_down: link.traffic.total_down + total_down,
+                    };
+                    link.updated_at = now;
                     if let Err(e) = state.db.upsert_link(link).await {
                         state.log_trace(
                             "error",
@@ -789,6 +810,79 @@ mod tests {
         // Endpoint ids are not protocol ids — the lookup must not match them.
         assert!(endpoint_row_for_protocol(&mut rows, 100).is_none());
         assert!(endpoint_row_for_protocol(&mut rows, 999).is_none());
+    }
+
+    #[tokio::test]
+    async fn stats_update_resets_today_on_day_change_and_keeps_totals() {
+        let (mut state, tx) = event_state().await;
+        let mut row = row_with_protocols(100, 1, 7); // one link, protocol 7
+        let link = &mut row.links[0];
+        link.traffic = TrafficStats {
+            today_up: 100,
+            today_down: 200,
+            total_up: 1_000,
+            total_down: 2_000,
+        };
+        // Last write 48h ago — a different civil day in any time zone.
+        let now = jiff::Timestamp::now();
+        link.updated_at =
+            jiff::Timestamp::from_second(now.as_second() - 48 * 3600).expect("valid ts");
+        state.endpoints = vec![row];
+
+        // Day changed: today counters reset before the delta is added,
+        // totals keep accumulating.
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 7,
+            today_up: 5,
+            today_down: 10,
+            total_up: 5,
+            total_down: 10,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        let link = &state.endpoints[0].links[0];
+        assert_eq!(link.traffic.today_up, 5, "today_up reset on day change");
+        assert_eq!(
+            link.traffic.today_down, 10,
+            "today_down reset on day change"
+        );
+        assert_eq!(link.traffic.total_up, 1_005, "total_up keeps accumulating");
+        assert_eq!(
+            link.traffic.total_down, 2_010,
+            "total_down keeps accumulating"
+        );
+
+        // Same day: the next delta accumulates on top of today's counters.
+        tx.send(CoreEvent::StatsUpdate {
+            protocol_id: 7,
+            today_up: 3,
+            today_down: 4,
+            total_up: 3,
+            total_down: 4,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        let link = &state.endpoints[0].links[0];
+        assert_eq!(link.traffic.today_up, 8, "same-day write accumulates");
+        assert_eq!(link.traffic.today_down, 14);
+        assert_eq!(link.traffic.total_up, 1_008);
+        assert_eq!(link.traffic.total_down, 2_014);
+
+        // The accumulated row was persisted (upsert_link) — re-read it.
+        let mut conn = state.db.connection().await.unwrap();
+        let stored = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            xray_tui_db::models::ProtocolId::new(7),
+            xray_tui_db::models::EndpointId::new(100),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .unwrap()
+        .expect("link persisted");
+        assert_eq!(stored.traffic.today_up, 8);
+        assert_eq!(stored.traffic.total_up, 1_008);
     }
 
     #[tokio::test]

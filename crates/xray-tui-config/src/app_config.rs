@@ -347,6 +347,31 @@ mod tests {
     }
 
     #[test]
+    fn speed_test_queue_and_dns_defer_defaults_and_round_trip() {
+        // Defaults: queue limit 3, deferral 5s.
+        let original = AppConfig::default();
+        assert_eq!(original.speed_test.task_queue_limit, 3);
+        assert_eq!(original.speed_test.dns_failure_defer_secs, 5);
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.speed_test.task_queue_limit, 3);
+        assert_eq!(restored.speed_test.dns_failure_defer_secs, 5);
+
+        // Explicit values round-trip through the speed-test section; absent
+        // fields fall back to the defaults.
+        let json = r#"{"core":{},"gui":{},"inbound":{},"speed_test":{"task_queue_limit":1,"dns_failure_defer_secs":30}}"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.speed_test.task_queue_limit, 1);
+        assert_eq!(config.speed_test.dns_failure_defer_secs, 30);
+
+        // 0 queue limit = no queueing; 0 deferral = no DNS deferral.
+        let json = r#"{"core":{},"gui":{},"inbound":{},"speed_test":{"task_queue_limit":0,"dns_failure_defer_secs":0}}"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.speed_test.task_queue_limit, 0);
+        assert_eq!(config.speed_test.dns_failure_defer_secs, 0);
+    }
+
+    #[test]
     fn core_type_field_accepts_null() {
         // When core_type is absent in JSON, it should become None
         let json = r#"{"core":{},"gui":{},"inbound":{}}"#;
@@ -502,9 +527,20 @@ pub struct SpeedTestConfig {
     /// older than this many hours are swept, anchored on `updated_at`.
     /// `None` (the default) = errors survive until the next test overwrites
     /// them. The TUI sweeps on profile reload and after batch completion;
-    /// T21 wires the settings form.
+    /// the settings form edits this.
     #[serde(default)]
     pub error_ttl_hours: Option<i64>,
+    /// Max queued tasks per link for the batch scheduler; `0` disables
+    /// queueing (busy links are skipped this round). Applied to the runtime
+    /// scheduler on config load and settings save.
+    #[serde(default = "default_task_queue_limit")]
+    pub task_queue_limit: u16,
+    /// DNS-failure deferral window in seconds: endpoints whose DNS failed
+    /// recently are skipped by the batch scheduler for this long
+    /// (`<= 0` disables deferral). Applied to the runtime scheduler on
+    /// config load and settings save.
+    #[serde(default = "default_dns_failure_defer_secs")]
+    pub dns_failure_defer_secs: i64,
 }
 
 fn default_ping_url() -> String {
@@ -547,6 +583,14 @@ const fn default_real_ping_test_all_protocols() -> bool {
     false
 }
 
+const fn default_task_queue_limit() -> u16 {
+    3
+}
+
+const fn default_dns_failure_defer_secs() -> i64 {
+    5
+}
+
 impl Default for SpeedTestConfig {
     fn default() -> Self {
         Self {
@@ -561,6 +605,8 @@ impl Default for SpeedTestConfig {
             fast_ping_concurrency: default_fast_ping_concurrency(),
             real_ping_test_all_protocols: default_real_ping_test_all_protocols(),
             error_ttl_hours: None,
+            task_queue_limit: default_task_queue_limit(),
+            dns_failure_defer_secs: default_dns_failure_defer_secs(),
         }
     }
 }

@@ -116,30 +116,13 @@ pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-const fn civil_from_days(z: u64) -> (u64, u64, u64) {
-    let z = z as i64 + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as u64, m, d)
-}
-
-/// Unix seconds → "YYYY-MM-DDTHH:MM:SS" (UTC). Callers render "—" for 0/None.
+/// `Timestamp` → "YYYY-MM-DD HH:MM:SS" in the system local time zone.
+/// Callers render "—" for `None`.
 #[must_use]
-pub fn format_ts(secs: i64) -> String {
-    let days = secs.div_euclid(86_400) as u64;
-    let rem = secs.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    let second = rem % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+pub fn format_ts(ts: &jiff::Timestamp) -> String {
+    ts.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// "US" → "🇺🇸"; anything not exactly 2 ASCII alpha chars → "🏴" (U+1F3F4).
@@ -282,5 +265,24 @@ mod tests {
         assert_eq!(get_field(&fields, "port"), Some("8443".to_string()));
         // Empty value should return None
         assert_eq!(get_field(&fields, "nonexistent"), None);
+    }
+
+    #[test]
+    fn format_ts_renders_local_yyyymmdd_hhmmss() {
+        // The agreed shape is "YYYY-MM-DD HH:MM:SS" in the system local
+        // zone — a fixed Timestamp renders its zoned civil time, so the
+        // expectation is derived through the same conversion (TZ-agnostic).
+        let ts = jiff::Timestamp::from_second(1_752_595_200).expect("valid ts");
+        let expected = ts
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(format_ts(&ts), expected);
+        assert_eq!(expected.len(), 19, "YYYY-MM-DD HH:MM:SS is 19 chars");
+        assert_eq!(&expected[4..5], "-");
+        assert_eq!(&expected[7..8], "-");
+        assert_eq!(&expected[10..11], " ");
+        assert_eq!(&expected[13..14], ":");
+        assert_eq!(&expected[16..17], ":");
     }
 }

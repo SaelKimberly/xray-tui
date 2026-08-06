@@ -36,7 +36,7 @@
 //! adds no serialization beyond what SQLite's single-writer model already
 //! imposes.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
 
 use dashmap::DashMap;
 use jiff::Timestamp;
@@ -120,9 +120,13 @@ pub struct TaskScheduler {
     /// Next candidate id; wraps around, skipping `0` and live ids.
     next_id: AtomicU16,
     /// Max queued tasks per link; `0` disables queueing (busy -> skipped).
-    queue_limit: u16,
+    /// Runtime-settable via [`Self::set_limits`] (config load / settings
+    /// save); every `schedule` reads it fresh.
+    queue_limit: AtomicU16,
     /// DNS-failure deferral window in seconds (`<= 0` disables deferral).
-    dns_defer_secs: i64,
+    /// Runtime-settable via [`Self::set_limits`]; the deferral checks read
+    /// it fresh.
+    dns_defer_secs: AtomicI64,
     /// Endpoints whose DNS failed recently, by last failure time.
     dns_failures: DashMap<EndpointId, Timestamp>,
     /// Serializes every gate transition ([`Self::schedule`], [`Self::complete`],
@@ -141,11 +145,25 @@ impl TaskScheduler {
         Self {
             tasks: DashMap::new(),
             next_id: AtomicU16::new(0),
-            queue_limit,
-            dns_defer_secs,
+            queue_limit: AtomicU16::new(queue_limit),
+            dns_defer_secs: AtomicI64::new(dns_defer_secs),
             dns_failures: DashMap::new(),
             gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Update the queue limit and DNS-deferral window at runtime. Applied on
+    /// config load and settings save; the next `schedule`/deferral check
+    /// reads the new values — no re-construction needed.
+    pub fn set_limits(&self, queue_limit: u16, dns_defer_secs: i64) {
+        self.queue_limit.store(queue_limit, Ordering::Relaxed);
+        self.dns_defer_secs.store(dns_defer_secs, Ordering::Relaxed);
+    }
+
+    /// Clear any DNS-failure marker for `endpoint` (e.g. a resolution that
+    /// just succeeded). No-op when no marker exists.
+    pub fn clear_dns_failure(&self, endpoint: EndpointId) {
+        self.dns_failures.remove(&endpoint);
     }
 
     /// Decide whether a new task for `link` may run now, and persist the
@@ -186,8 +204,10 @@ impl TaskScheduler {
         };
 
         if self.tasks.contains_key(&current) {
-            // A live task holds the gate: queue if there is room.
-            if self.queue_limit == 0 || link.task_queue.len() >= usize::from(self.queue_limit) {
+            // A live task holds the gate: queue if there is room (the limit
+            // is read per-schedule so `set_limits` takes effect at once).
+            let queue_limit = self.queue_limit.load(Ordering::Relaxed);
+            if queue_limit == 0 || link.task_queue.len() >= usize::from(queue_limit) {
                 warn!(
                     target: "tui::scheduler",
                     "Cannot schedule {kind:?} on xray-tui://{:x}: queue full",
@@ -309,12 +329,12 @@ impl TaskScheduler {
         self.tasks.get(&id).map(|k| *k)
     }
 
-    /// The DNS-deferral window (seconds) this scheduler was constructed with.
-    /// The batch pipeline sleeps this long before re-scheduling a
-    /// `DnsDeferred` link.
+    /// The current DNS-deferral window (seconds). The batch pipeline sleeps
+    /// this long before re-scheduling a `DnsDeferred` link; the value is
+    /// runtime-settable via [`Self::set_limits`].
     #[must_use]
-    pub const fn dns_defer_secs(&self) -> i64 {
-        self.dns_defer_secs
+    pub fn dns_defer_secs(&self) -> i64 {
+        self.dns_defer_secs.load(Ordering::Relaxed)
     }
 
     /// Sibling cancel: drop every queued id whose registry entry is `kind`
@@ -431,15 +451,17 @@ impl TaskScheduler {
     }
 
     /// Whether `endpoint` is inside its DNS-deferral window at `now`. Expired
-    /// entries are dropped lazily. `dns_defer_secs <= 0` never defers.
+    /// entries are dropped lazily. `dns_defer_secs <= 0` never defers (the
+    /// window is read per call so `set_limits` takes effect at once).
     fn is_dns_deferred(&self, endpoint: EndpointId, now: Timestamp) -> bool {
-        if self.dns_defer_secs <= 0 {
+        let defer_secs = self.dns_defer_secs.load(Ordering::Relaxed);
+        if defer_secs <= 0 {
             return false;
         }
         let Some(entry) = self.dns_failures.get(&endpoint) else {
             return false;
         };
-        if now.as_second() - entry.as_second() < self.dns_defer_secs {
+        if now.as_second() - entry.as_second() < defer_secs {
             return true;
         }
         drop(entry);
@@ -449,12 +471,13 @@ impl TaskScheduler {
 
     /// Drop all DNS-failure entries older than the deferral window.
     fn sweep_dns_failures(&self, now: Timestamp) {
-        if self.dns_defer_secs <= 0 {
+        let defer_secs = self.dns_defer_secs.load(Ordering::Relaxed);
+        if defer_secs <= 0 {
             self.dns_failures.clear();
             return;
         }
         self.dns_failures
-            .retain(|_, ts| now.as_second() - ts.as_second() < self.dns_defer_secs);
+            .retain(|_, ts| now.as_second() - ts.as_second() < defer_secs);
     }
 }
 
@@ -905,6 +928,66 @@ mod tests {
         let s = TaskScheduler::new(3, 0);
         let endpoint = EndpointId::new(10);
         s.dns_failures.insert(endpoint, ts(100));
+        assert!(!s.is_dns_deferred(endpoint, ts(100)));
+    }
+
+    #[test]
+    fn clear_dns_failure_removes_deferral() {
+        let s = sched();
+        let endpoint = EndpointId::new(10);
+        s.mark_dns_failure(endpoint);
+        assert!(s.is_dns_deferred(endpoint, jiff::Timestamp::now()));
+
+        s.clear_dns_failure(endpoint);
+        assert!(!s.is_dns_deferred(endpoint, jiff::Timestamp::now()));
+        assert!(!s.dns_failures.contains_key(&endpoint));
+        // Clearing an absent entry is a no-op.
+        s.clear_dns_failure(EndpointId::new(99));
+    }
+
+    #[tokio::test]
+    async fn set_limits_takes_effect_on_next_schedule() {
+        let s = TaskScheduler::new(3, 5);
+        let db = MockDb::default();
+        let live = 1u16;
+        let l = link(1, 10, Some(live), vec![2, 3, 4]);
+        db.put(&l);
+        for q in [live, 2, 3, 4] {
+            s.tasks.insert(q, TaskKind::FastPing);
+        }
+
+        // Default limit 3: the queue is already full.
+        let out = s.schedule(&l, TaskKind::UdpPing, &db).await;
+        assert_eq!(out, ScheduleOutcome::QueueFull);
+
+        // Raise the limit at runtime: room for one more, no reconstruction.
+        s.set_limits(4, 5);
+        let out = s.schedule(&l, TaskKind::UdpPing, &db).await;
+        assert!(
+            matches!(out, ScheduleOutcome::Queued(_)),
+            "expected Queued after raising the limit, got {out:?}"
+        );
+
+        // Back to 0 (queueing disabled): busy -> skipped again.
+        s.set_limits(0, 5);
+        let out = s.schedule(&l, TaskKind::UdpPing, &db).await;
+        assert_eq!(out, ScheduleOutcome::QueueFull);
+    }
+
+    #[test]
+    fn set_limits_changes_dns_window() {
+        let s = TaskScheduler::new(3, 5);
+        let endpoint = EndpointId::new(10);
+        s.dns_failures.insert(endpoint, ts(100));
+        // Inside the 5s window.
+        assert!(s.is_dns_deferred(endpoint, ts(103)));
+
+        // Widen the window at runtime: still deferred beyond the old edge.
+        s.set_limits(3, 60);
+        assert!(s.is_dns_deferred(endpoint, ts(150)));
+
+        // Disable deferral at runtime: the check stops deferring at once.
+        s.set_limits(3, 0);
         assert!(!s.is_dns_deferred(endpoint, ts(100)));
     }
 

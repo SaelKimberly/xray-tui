@@ -569,6 +569,17 @@ fn form_field_defs_for_section(
                 "Real Ping Test All Protocols",
                 "Boolean",
             ),
+            (
+                "task_queue_limit",
+                "Task Queue Limit (0=no queue)",
+                "Number",
+            ),
+            (
+                "dns_failure_defer_secs",
+                "DNS Failure Defer (secs)",
+                "Number",
+            ),
+            ("error_ttl_hours", "Error TTL Hours (empty=never)", "Number"),
             ("geoip_url", "GeoIP URL", "Url"),
             ("geosite_url", "GeoSite URL", "Url"),
             ("geo_auto_update", "Geo Auto Update", "Boolean"),

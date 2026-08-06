@@ -141,6 +141,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let dns = state.dns_resolver.clone();
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
+    let scheduler = state.scheduler.clone();
     let host = row.endpoint.host.clone();
     let host_type = row.endpoint.host_type;
     let sni = row.active_protocol().and_then(|(_, p)| extract_sni(p));
@@ -148,6 +149,10 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 
     tokio::spawn(async move {
         let now = unix_now();
+        // Whether the resolution produced a usable answer; `false` feeds the
+        // scheduler's DNS-failure gate below. IP hosts and hosts without a
+        // resolver configured count as fine.
+        let mut resolved_ok = true;
         // DNS lookup or direct IP parse
         let (ips, resolved_at) = match host_type {
             HostType::Ipv4 | HostType::Ipv6 => (
@@ -156,7 +161,10 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                     .unwrap_or_default(),
                 None,
             ),
-            HostType::Undefined => (Vec::new(), Some(now)),
+            HostType::Undefined => {
+                resolved_ok = false;
+                (Vec::new(), Some(now))
+            }
             HostType::Dns => {
                 if is_resolvable_hostname(&host) {
                     match &dns {
@@ -179,6 +187,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                                     (ips, Some(now))
                                 }
                                 Ok(Err(e)) => {
+                                    resolved_ok = false;
                                     if e.to_string().contains("no records found") {
                                         // Host without any DNS record — the
                                         // UI flag carries the signal; don't
@@ -196,6 +205,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                                     (Vec::new(), Some(now))
                                 }
                                 Err(_) => {
+                                    resolved_ok = false;
                                     tracing::warn!(
                                         target: "tui::ops::enrich",
                                         "DNS lookup of {host} timed out"
@@ -210,6 +220,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                     // Plugin URLs / garbage hostnames can never resolve;
                     // record a failed attempt (TTL-gated) instead of firing
                     // hickory parse errors on every refresh.
+                    resolved_ok = false;
                     tracing::debug!(
                         target: "tui::ops::enrich",
                         "Skipping DNS lookup for invalid hostname: {host}"
@@ -218,6 +229,16 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                 }
             }
         };
+
+        // Feed the scheduler's DNS-failure gate: a failed resolution marks
+        // the endpoint so the batch scheduler skips it for the deferral
+        // window; a successful one clears the marker (resolvable again).
+        let scheduler_endpoint = xray_tui_db::models::EndpointId::new(endpoint_id);
+        if resolved_ok {
+            scheduler.clear_dns_failure(scheduler_endpoint);
+        } else {
+            scheduler.mark_dns_failure(scheduler_endpoint);
+        }
 
         let mut info = EndpointInfo {
             resolved_ips: ips,
@@ -437,7 +458,6 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format_ts;
 
     #[test]
     fn resolvable_hostname_accepts_valid_domains() {
@@ -472,12 +492,6 @@ mod tests {
         ] {
             assert!(!is_resolvable_hostname(host), "{host:?} should be rejected");
         }
-    }
-
-    #[test]
-    fn test_format_ts() {
-        assert_eq!(format_ts(1_752_595_200), "2025-07-15T16:00:00");
-        assert_eq!(format_ts(0), "1970-01-01T00:00:00");
     }
 
     #[test]

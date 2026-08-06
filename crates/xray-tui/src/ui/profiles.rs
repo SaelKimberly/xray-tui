@@ -547,10 +547,10 @@ fn build_display_rows(
                             "○".to_string()
                         },
                         proto_id_hex: format!("{:08x}", link.protocol_id.get() as u32),
-                        last_seen: format_ts(link.last_seen_at.as_second()),
+                        last_seen: format_ts(&link.last_seen_at),
                         last_used: link
                             .last_used_at
-                            .map_or_else(|| "—".to_string(), |ts| format_ts(ts.as_second())),
+                            .map_or_else(|| "—".to_string(), |ts| format_ts(&ts)),
                         config_type,
                         delay,
                         speed,

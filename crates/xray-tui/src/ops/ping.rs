@@ -1233,7 +1233,8 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
     let error_ttl_hours = state.config.speed_test.error_ttl_hours;
     // Sleep the full deferral window once, then re-schedule (the window is
-    // measured in whole seconds; T21 wires the configured value).
+    // measured in whole seconds and comes from the speed-test config via
+    // `TaskScheduler::set_limits`).
     let defer_delay = Duration::from_secs(scheduler.dns_defer_secs().max(1) as u64);
 
     tokio::spawn(run_batch(BatchParams {
