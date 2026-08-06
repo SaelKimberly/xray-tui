@@ -163,6 +163,48 @@ async fn get_active_endpoints_assembles_rows_with_links_and_protocols() {
 }
 
 #[tokio::test]
+async fn large_page_loads_via_batched_in_list() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // 1000 endpoints, each with exactly one link. `load_endpoint_rows`
+    // batches the link load with ONE `endpoint_id IN (1000 ids)` statement —
+    // comfortably below SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (default
+    // 32766; the T8+9 note's ">32k" ceiling). A page at or above the limit
+    // would need chunking; 1000 proves the batched path at a realistic
+    // large-page scale without a slow 32k+ test.
+    for i in 0..1000 {
+        seed_endpoint(
+            &mut conn,
+            i + 1,
+            10_000 + i,
+            &format!("10.0.{}.{}", i / 250, i % 250),
+            HostType::Ipv4,
+            443,
+            50,
+        )
+        .await;
+    }
+
+    let rows = db.get_active_endpoints(ts(0)).await.expect("page");
+    assert_eq!(rows.len(), 1000, "every endpoint on the page");
+    assert!(
+        rows.iter().all(|r| r.links.len() == 1),
+        "each endpoint carries its single link through the batched in_list load"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.endpoint.id.get()).min(),
+        Some(1),
+        "page ordered by id"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.endpoint.id.get()).max(),
+        Some(1000),
+        "page ordered by id"
+    );
+}
+
+#[tokio::test]
 async fn rows_are_sorted_by_test_priority() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
@@ -300,6 +342,95 @@ async fn active_and_stale_windows() {
     assert_eq!(count, 1);
 }
 
+#[tokio::test]
+async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let now = 10_000i64;
+    let active = now - 3_600; // 6400
+    let stale = now - 7_200; // 2800
+
+    // 1: active — fresh link (>= active_threshold).
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
+    // 2: stale — both links inside [stale_threshold, active_threshold).
+    seed_endpoint(
+        &mut conn,
+        2,
+        2001,
+        "2.2.2.2",
+        HostType::Ipv4,
+        443,
+        now - 5_000,
+    )
+    .await;
+    seed_link(&mut conn, 2, 2002, now - 6_000).await;
+    // 3: expired — all links older than stale_threshold.
+    seed_endpoint(
+        &mut conn,
+        3,
+        3001,
+        "3.3.3.3",
+        HostType::Ipv4,
+        443,
+        now - 10_000,
+    )
+    .await;
+    seed_link(&mut conn, 3, 3002, now - 12_000).await;
+    // 4: linkless — vacuously outside both windows (never stale).
+    toasty::create!(Endpoint {
+        id: EndpointId::new(4),
+        host: "4.4.4.4".to_string(),
+        host_type: HostType::Ipv4,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("linkless endpoint");
+    // 5: active — one stale-aged link plus one fresh link (max decides).
+    seed_endpoint(
+        &mut conn,
+        5,
+        5001,
+        "5.5.5.5",
+        HostType::Ipv4,
+        443,
+        now - 6_000,
+    )
+    .await;
+    seed_link(&mut conn, 5, 5002, now - 1_000).await;
+    // 6: boundary — max exactly == stale_threshold -> stale.
+    seed_endpoint(&mut conn, 6, 6001, "6.6.6.6", HostType::Ipv4, 443, stale).await;
+    // 7: boundary — max exactly == active_threshold -> NOT stale.
+    seed_endpoint(&mut conn, 7, 7001, "7.7.7.7", HostType::Ipv4, 443, active).await;
+
+    let stale_ids = db.get_stale_ids(ts(active), ts(stale)).await.expect("ids");
+    let count = db
+        .get_stale_count(ts(active), ts(stale))
+        .await
+        .expect("count");
+    let rows = db
+        .get_stale_endpoints(ts(active), ts(stale))
+        .await
+        .expect("rows");
+
+    let expected: Vec<i64> = vec![2, 6];
+    let mut got: Vec<i64> = stale_ids.iter().map(|id| id.get()).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "id-only path selects exactly the stale window"
+    );
+    assert_eq!(count, expected.len(), "count == id-only path length");
+    let mut row_ids: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect();
+    row_ids.sort_unstable();
+    assert_eq!(
+        row_ids, expected,
+        "id-only path agrees with the assembled-row count"
+    );
+}
+
 // ── Group filter ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -375,6 +506,47 @@ async fn get_endpoint_and_get_by_protocol_id() {
             .await
             .expect("missing")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn get_endpoint_returns_linkless_row_with_empty_links() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // Endpoint with NO profile_stats rows. Pre-T8+9 this was an INNER JOIN
+    // that returned None; the typed path must return Some with empty links.
+    toasty::create!(Endpoint {
+        id: EndpointId::new(41),
+        host: "linkless.example".to_string(),
+        host_type: HostType::Dns,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("linkless endpoint");
+
+    let row = db
+        .get_endpoint(EndpointId::new(41))
+        .await
+        .expect("get")
+        .expect("linkless endpoint resolves to Some");
+    assert!(row.links.is_empty(), "no ProfileStats rows -> empty links");
+    assert!(row.protocols.is_empty(), "protocols map empty");
+    assert!(row.active_link().is_none(), "no links -> no active link");
+    assert!(
+        row.active_protocol().is_none(),
+        "no links -> no active protocol"
+    );
+
+    assert!(
+        db.get_endpoint(EndpointId::new(999_999))
+            .await
+            .expect("missing")
+            .is_none(),
+        "nonexistent id -> None"
     );
 }
 
@@ -986,4 +1158,206 @@ async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
     .expect("link");
     assert_eq!(link.task_id, None);
     assert_eq!(link.task_queue, vec![40]);
+}
+
+#[tokio::test]
+async fn subscription_upsert_flow_assembles_group_rows() {
+    let db = test_db().await;
+
+    // The TUI's persist_parsed sequence: endpoint, protocol, link, and
+    // group-link upserts in dependency order.
+    db.upsert_endpoint(&Endpoint {
+        id: EndpointId::new(1),
+        host: "sub.example".to_string(),
+        host_type: HostType::Dns,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        parent_id: None,
+        last_source: Some("g1".to_string()),
+        manual_protocol_override: None,
+        resolved_as: Vec::<String>::new(),
+        resolved_at: None,
+        created_at: ts(0),
+        links: Deferred::default(),
+        group_links: Deferred::default(),
+    })
+    .await
+    .expect("upsert endpoint");
+
+    db.upsert_protocol(&Protocol {
+        id: ProtocolId::new(1001),
+        sig: 1001,
+        cred_hash: 0,
+        proto_kind: ProtocolKind::Vless,
+        transport: tcp_transport(),
+        security: no_security(),
+        config: Deferred::from(Json(vless_config())),
+        created_at: ts(0),
+        links: Deferred::default(),
+    })
+    .await
+    .expect("upsert protocol");
+
+    let link = ProfileStats {
+        protocol_id: ProtocolId::new(1001),
+        endpoint_id: EndpointId::new(1),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_used_at: None,
+        last_seen_at: ts(50),
+        task_id: None,
+        task_queue: Vec::<u16>::new(),
+        latency: None,
+        speed_bps: None,
+        error: None,
+        traffic: zero_traffic(),
+        created_at: ts(0),
+        updated_at: ts(0),
+        version: 1,
+        protocol: Deferred::default(),
+        endpoint: Deferred::default(),
+    };
+    // Twice: the composite-key upsert must dedup by (endpoint_id, protocol_id).
+    db.upsert_link(&link).await.expect("upsert link");
+    db.upsert_link(&link).await.expect("upsert link again");
+
+    db.upsert_endpoint_group_link(&EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "g1".to_string(),
+        last_seen_at: ts(50),
+        sort_order: None,
+        endpoint: Deferred::default(),
+        group: Deferred::default(),
+    })
+    .await
+    .expect("upsert group link");
+
+    // The subscription-shaped sequence assembles into one group row.
+    let rows = db
+        .get_active_endpoints_by_group("g1", ts(0))
+        .await
+        .expect("group");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.endpoint.id, EndpointId::new(1));
+    assert_eq!(row.links.len(), 1, "dedup by (endpoint_id, protocol_id)");
+    assert_eq!(row.links[0].protocol_id, ProtocolId::new(1001));
+    let (active_link, proto) = row.active_protocol().expect("active protocol");
+    assert_eq!(active_link.protocol_id, ProtocolId::new(1001));
+    assert_eq!(proto.proto_kind, ProtocolKind::Vless);
+
+    // A threshold past the link's last_seen_at drops the endpoint.
+    assert!(
+        db.get_active_endpoints_by_group("g1", ts(100))
+            .await
+            .expect("fresh threshold")
+            .is_empty()
+    );
+}
+
+// ── Schema behavior ─────────────────────────────────────────────────────
+
+/// Extract the first INTEGER column of the first row (PRAGMA reads).
+fn first_i64(rows: &[toasty::stmt::Value]) -> Option<i64> {
+    rows.first().and_then(|v| match v {
+        toasty::stmt::Value::Record(fields) => fields.first().and_then(|f| match f {
+            toasty::stmt::Value::I64(n) => Some(*n),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn fresh_open_creates_schema_and_sets_user_version_tag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fresh.db");
+
+    let db = Database::open(&path).await.expect("fresh open");
+    let mut conn = db.connection().await.expect("connection");
+
+    // Fresh open writes the 7-table schema AND tags it user_version=5 so a
+    // reopen can skip push_schema.
+    let rows = toasty::sql::query("PRAGMA user_version")
+        .exec(&mut conn)
+        .await
+        .expect("read version");
+    assert_eq!(
+        first_i64(&rows),
+        Some(5),
+        "fresh open must tag the schema user_version=5"
+    );
+    let rows = toasty::sql::query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('endpoints', 'protocols', 'profile_stats', \
+                       'endpoint_groups', 'groups', 'routing_rules', 'dns_settings')",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("count tables");
+    assert_eq!(first_i64(&rows), Some(7), "7-table schema created");
+
+    // Seed data, then reopen: the tag preserves both schema and data.
+    toasty::create!(Endpoint {
+        id: EndpointId::new(9),
+        host: "9.9.9.9".to_string(),
+        host_type: HostType::Ipv4,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("seed endpoint");
+    drop(conn);
+    drop(db);
+
+    let db2 = Database::open(&path).await.expect("reopen");
+    let mut conn = db2.connection().await.expect("connection");
+    let rows = toasty::sql::query("PRAGMA user_version")
+        .exec(&mut conn)
+        .await
+        .expect("read version");
+    assert_eq!(first_i64(&rows), Some(5), "reopen keeps the schema tag");
+    assert!(
+        Endpoint::filter_by_id(EndpointId::new(9))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_some(),
+        "reopen preserves data"
+    );
+}
+
+#[tokio::test]
+async fn in_memory_db_has_full_schema_and_roundtrips() {
+    let db = Database::in_memory().await.expect("in-memory db");
+    let mut conn = db.connection().await.expect("connection");
+
+    let rows = toasty::sql::query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('endpoints', 'protocols', 'profile_stats', \
+                       'endpoint_groups', 'groups', 'routing_rules', 'dns_settings')",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("count tables");
+    assert_eq!(
+        first_i64(&rows),
+        Some(7),
+        "in_memory() has the 7-table schema"
+    );
+
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 50).await;
+    let row = db
+        .get_endpoint(EndpointId::new(1))
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(
+        row.links.len(),
+        1,
+        "write + read roundtrip through in_memory()"
+    );
 }

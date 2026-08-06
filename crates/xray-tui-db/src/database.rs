@@ -284,15 +284,46 @@ impl Database {
         Ok(rows)
     }
 
+    /// Stale endpoint ids only (`max(last_seen_at)` in
+    /// `[stale_threshold, active_threshold)`), without loading any links.
+    ///
+    /// The COUNT path never pays for link load + row assembly: the stale
+    /// window is pushed into SQL as `has-a-link >= stale_threshold AND NOT
+    /// has-a-link >= active_threshold`, which is exactly
+    /// `stale_threshold <= max(last_seen_at) < active_threshold` (linkless
+    /// endpoints fail the first branch, matching the in-memory filter of
+    /// [`Self::get_stale_endpoints`]).
+    pub async fn get_stale_ids(
+        &self,
+        active_threshold: Timestamp,
+        stale_threshold: Timestamp,
+    ) -> Result<Vec<EndpointId>> {
+        let mut conn = self.conn().await?;
+        let endpoints: Vec<Endpoint> = Endpoint::filter(
+            Endpoint::fields()
+                .links()
+                .any(ProfileStats::fields().last_seen_at().ge(stale_threshold))
+                .and(
+                    Endpoint::fields()
+                        .links()
+                        .any(ProfileStats::fields().last_seen_at().ge(active_threshold))
+                        .not(),
+                ),
+        )
+        .exec(&mut conn)
+        .await?;
+        Ok(endpoints.into_iter().map(|e| e.id).collect())
+    }
+
     pub async fn get_stale_count(
         &self,
         active_threshold: Timestamp,
         stale_threshold: Timestamp,
     ) -> Result<usize> {
-        Ok(self
-            .get_stale_endpoints(active_threshold, stale_threshold)
-            .await?
-            .len())
+        let ids = self
+            .get_stale_ids(active_threshold, stale_threshold)
+            .await?;
+        Ok(ids.len())
     }
 
     /// Single endpoint by id with all links and protocols.
@@ -411,6 +442,12 @@ impl Database {
     /// (`sort_links_by_test_priority`); the `protocols` map is built from the
     /// included relations. `dns_unresolved` is endpoint-level: `Dns` host
     /// with no cached `resolved_as` sinks all its links to tier 5.
+    ///
+    /// Page ceiling: the step-2 `IN` list is bounded by SQLite's
+    /// `SQLITE_MAX_VARIABLE_NUMBER` (default 32766 parameters — the T8+9
+    /// note's ">32k" limit). Real TUI pages are hundreds of endpoints, far
+    /// below it; a page larger than the limit would need chunking. The
+    /// batched path is exercised at 1000 endpoints in the integration suite.
     async fn load_endpoint_rows(
         &self,
         endpoints: Vec<Endpoint>,
