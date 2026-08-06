@@ -28,27 +28,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts};
+use super::common::{SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param};
+use super::core_mapping;
 use super::utils;
-use super::{ParseError, ProtoSpec};
+use super::{
+    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
+    ProtocolEssentials, ProtocolKind,
+};
 use crate::clash::{ClashHttp, ClashProxy};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{
-    clash_server_to_host, clash_tls_to_security, host_spec_to_string, security_to_clash_tls,
+    clash_tls_to_security, clash_to_endpoint, host_kind_for, security_to_clash_tls,
 };
 
+/// HTTP client protocol configuration — the identity payload (sans host/port).
+///
+/// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
+/// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
+/// parameters, so the same config pointed at different servers shares one
+/// identity.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct HttpClientConfig {
-    #[serde(with = "host_serde")]
-    pub host: HostSpec,
-    #[serde(with = "port_serde")]
-    pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
@@ -56,8 +62,12 @@ pub struct HttpClientConfig {
     pub remarks: Option<TinyText>,
 }
 
-impl ProtoSpec for HttpClientConfig {
-    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+impl HttpClientConfig {
+    /// Parse an HTTP proxy URL into the parse boundary: [`ParsedProto`] with
+    /// the endpoint essentials (host/port) split out and the identity payload
+    /// ([`ProtocolEssentials::config`]) holding only endpoint-free protocol
+    /// parameters.
+    pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         // Userinfo is optional for HTTP.
         // When present (URL has `@`): raw.userinfo = "user:pass", raw.hostport = "host:port"
         // When absent (no `@`): raw.userinfo == raw.hostport (both are "host:port")
@@ -84,6 +94,10 @@ impl ProtoSpec for HttpClientConfig {
             let host = utils::parse_host(hostport)?;
             (host, 80)
         };
+
+        // Endpoint essentials: host/port live here, never in the config payload.
+        let mut endpoint = EndpointEssentials::new(parsed_host.to_str().into_owned(), parsed_port);
+        endpoint.host_type = host_kind_for(&parsed_host);
 
         let query = utils::parse_query(raw.query);
 
@@ -121,22 +135,31 @@ impl ProtoSpec for HttpClientConfig {
 
         let remarks = utils::decode_fragment(raw)?;
 
-        Ok(Self {
-            host: parsed_host,
-            port: parsed_port,
+        let config = Self {
             username,
             password,
             security,
             remarks,
+        };
+        Ok(ParsedProto {
+            endpoints: vec![endpoint],
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Http,
+                config_type: ConfigKind::ShareUrl,
+                core_type: core_mapping::resolve_core(ProtocolKind::Http, None, None),
+                config: ProtocolConfig::Http(config),
+            },
         })
     }
 
-    fn reconstruct(&self) -> Result<String, ParseError> {
-        let host = self.host.to_str();
-        let hostport = if host.contains(':') {
-            format!("[{host}]:{}", self.port)
+    /// Rebuild the share URL from this endpoint-free config plus the endpoint
+    /// essentials. Endpoint host/port come from `endpoint`.
+    pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+        let endpoint_host = endpoint.host.as_str();
+        let hostport = if endpoint_host.contains(':') {
+            format!("[{endpoint_host}]:{}", endpoint.port)
         } else {
-            format!("{host}:{}", self.port)
+            format!("{endpoint_host}:{}", endpoint.port)
         };
 
         let auth = match (&self.username, &self.password) {
@@ -154,7 +177,7 @@ impl ProtoSpec for HttpClientConfig {
                     parts.push("security=tls".to_string());
                 }
                 if let Some(v) = &opts.sni
-                    && !super::common::should_skip_param(&self.host, v)
+                    && !should_skip_endpoint_param(endpoint_host, v)
                 {
                     parts.push(format!("sni={}", urlencoding::encode(v)));
                 }
@@ -180,17 +203,112 @@ impl ProtoSpec for HttpClientConfig {
 
         Ok(format!("http://{auth}{hostport}{query_string}{fragment}"))
     }
+}
+
+impl HttpClientConfig {
+    /// Serialize this endpoint-free config plus the endpoint to a Clash proxy
+    /// entry. Endpoint host/port are taken from `endpoint`.
+    pub fn to_clash_proto(
+        &self,
+        endpoint: &EndpointEssentials,
+    ) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let (tls, servername, skip_cert_verify, _, _) = security_to_clash_tls(&self.security);
+        Ok(ClashProxy::Http(ClashHttp {
+            name,
+            server: endpoint.host.clone(),
+            port: endpoint.port,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            tls,
+            servername,
+            skip_cert_verify,
+            headers: None,
+        }))
+    }
+
+    /// Parse a Clash proxy entry into the parse boundary: `server`/`port`
+    /// become the endpoint essentials; the config payload is endpoint-free.
+    pub fn try_from_clash_proto(proxy: &ClashProxy) -> Result<ParsedProto, ParseError> {
+        match proxy {
+            ClashProxy::Http(c) => {
+                let config = Self {
+                    username: c.username.clone(),
+                    password: c.password.clone(),
+                    security: clash_tls_to_security(
+                        c.tls,
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        None,
+                        None,
+                        None,
+                    ),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                };
+                Ok(ParsedProto {
+                    endpoints: vec![clash_to_endpoint(&c.server, c.port)],
+                    protocol: ProtocolEssentials {
+                        proto_kind: ProtocolKind::Http,
+                        config_type: ConfigKind::ShareUrl,
+                        core_type: core_mapping::resolve_core(ProtocolKind::Http, None, None),
+                        config: ProtocolConfig::Http(config),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected http clash proxy".into())),
+        }
+    }
+}
+
+/// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
+/// `Proto`/`ParseResult` consumers in xray-tui-config) compile unchanged.
+///
+/// DEGRADED PATH (documented): `try_parse`/`try_from_clash` still work by
+/// delegating to the `*_proto` variants and discarding the parsed endpoints;
+/// `to_clash`/`reconstruct` return errors because the config no longer stores
+/// host/port. Import/export rewires to the `*_proto` variants in T11 (phase D
+/// builders take the endpoint separately).
+impl ProtoSpec for HttpClientConfig {
+    /// # Errors
+    ///
+    /// If either the URL is invalid or the external configuration is invalid.
+    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+        let parsed = Self::try_parse_proto(raw)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Http(config) => Ok(config),
+            // Parser invariant: an http URL always yields an HttpClientConfig.
+            _ => Err(ParseError::Unknown(
+                "http URL parsed to a non-http config".into(),
+            )),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::reconstruct_proto`] with the endpoint.
+    fn reconstruct(&self) -> Result<String, ParseError> {
+        Err(ParseError::InvalidHost(
+            "http config no longer stores host/port; use HttpClientConfig::reconstruct_proto(endpoint)"
+                .into(),
+        ))
+    }
 
     fn schema(&self) -> SchemeX {
         SchemeX::Http
     }
 
+    /// `None` — the endpoint host moved to [`EndpointEssentials`] (T5).
     fn host(&self) -> Option<&HostSpec> {
-        Some(&self.host)
+        None
     }
 
+    /// `None` — the endpoint port moved to [`EndpointEssentials`] (T5).
     fn port(&self) -> Option<u16> {
-        Some(self.port)
+        None
     }
 
     fn remarks(&self) -> Option<&str> {
@@ -209,44 +327,28 @@ impl ProtoSpec for HttpClientConfig {
         }
     }
 
+    /// # Errors
+    ///
+    /// If the Clash proxy doesn't match this protocol type.
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
-        match proxy {
-            ClashProxy::Http(c) => Ok(Self {
-                host: clash_server_to_host(&c.server)?,
-                port: c.port,
-                username: c.username.clone(),
-                password: c.password.clone(),
-                security: clash_tls_to_security(
-                    c.tls,
-                    c.servername.as_deref(),
-                    c.skip_cert_verify,
-                    None,
-                    None,
-                    None,
-                ),
-                remarks: match c.name.as_str() {
-                    "" => None,
-                    s => Some(TinyText::from(s)),
-                },
-            }),
-            _ => Err(ParseError::Unknown("expected http clash proxy".into())),
+        let parsed = Self::try_from_clash_proto(proxy)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Http(config) => Ok(config),
+            _ => Err(ParseError::Unknown(
+                "http clash proxy parsed to a non-http config".into(),
+            )),
         }
     }
 
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::to_clash_proto`] with the endpoint.
     fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
-        let name = self.remarks.as_deref().unwrap_or("").to_string();
-        let (tls, servername, skip_cert_verify, _, _) = security_to_clash_tls(&self.security);
-        Ok(ClashProxy::Http(ClashHttp {
-            name,
-            server: host_spec_to_string(&self.host),
-            port: self.port,
-            username: self.username.clone(),
-            password: self.password.clone(),
-            tls,
-            servername,
-            skip_cert_verify,
-            headers: None,
-        }))
+        Err(ProtoSpecError::Unsupported(
+            "http config no longer stores host/port; use HttpClientConfig::to_clash_proto(endpoint)"
+                .into(),
+        ))
     }
 }
 
@@ -255,8 +357,8 @@ impl ProtoIdentity for HttpClientConfig {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"http");
-        hasher.write(self.host.to_str().as_bytes());
-        hasher.write(&self.port.to_le_bytes());
+        // Endpoint (host/port) intentionally absent from the identity — it
+        // lives on the ParsedProto boundary, never in the config payload (T5).
         hasher.finish()
     }
     fn compute_cred_hash(&self) -> u64 {
@@ -269,102 +371,222 @@ impl ProtoIdentity for HttpClientConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ProtoSpec;
-    use crate::urlx::SchemeX;
+    use super::super::{
+        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+    };
+    use super::HttpClientConfig;
+    use crate::urlx::{RawUrlX, SchemeX};
+
+    fn parse(url: &str) -> ParsedProto {
+        HttpClientConfig::try_parse_proto(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"))
+    }
+
+    fn config(parsed: ParsedProto) -> HttpClientConfig {
+        match parsed.protocol.config {
+            ProtocolConfig::Http(c) => c,
+            other => panic!("expected HttpClientConfig, got {other:?}"),
+        }
+    }
+
+    /// The identity payload must be endpoint-free: no top-level `host`/`port`
+    /// keys in the serialized config.
+    fn assert_no_top_level_host_port(cfg: &HttpClientConfig) {
+        let json = serde_json::to_value(cfg).expect("serialize");
+        let obj = json.as_object().expect("config is an object");
+        assert!(
+            !obj.contains_key("host"),
+            "config payload must not carry a top-level host key: {json}"
+        );
+        assert!(
+            !obj.contains_key("port"),
+            "config payload must not carry a top-level port key: {json}"
+        );
+    }
+
+    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
+    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    fn assert_reconstruct_roundtrip(url: &str) {
+        let parsed = parse(url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed.clone());
+        let out = cfg
+            .reconstruct_proto(&endpoint)
+            .unwrap_or_else(|e| panic!("reconstruct failed for {url}: {e}"));
+        let reparsed = parse(&out);
+        assert_eq!(parsed, reparsed, "reconstruct round-trip failed for: {url}");
+    }
+
+    // ── URL parse: endpoints + config ─────────────────────────────────────
 
     #[test]
     fn test_http_basic() {
         let url = "http://user:pass@1.2.3.4:8080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = super::HttpClientConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.schema(), SchemeX::Http);
-        assert_eq!(config.host.to_str(), "1.2.3.4");
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.username.as_deref(), Some("user"));
-        assert_eq!(config.password.as_deref(), Some("pass"));
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints.len(), 1);
+        let ep = &parsed.endpoints[0];
+        assert_eq!(ep.host, "1.2.3.4");
+        assert_eq!(ep.host_type, HostKind::Ipv4);
+        assert_eq!(ep.port, 8080);
+
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Http);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let cfg = config(parsed);
+        assert_eq!(cfg.username.as_deref(), Some("user"));
+        assert_eq!(cfg.password.as_deref(), Some("pass"));
+        assert_no_top_level_host_port(&cfg);
     }
 
     #[test]
     fn test_http_no_auth() {
         let url = "http://1.2.3.4:8080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = super::HttpClientConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.schema(), SchemeX::Http);
-        assert_eq!(config.host.to_str(), "1.2.3.4");
-        assert_eq!(config.port, 8080);
-        assert!(config.username.is_none());
-        assert!(config.password.is_none());
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints[0].host, "1.2.3.4");
+        assert_eq!(parsed.endpoints[0].port, 8080);
+        let cfg = config(parsed);
+        assert!(cfg.username.is_none());
+        assert!(cfg.password.is_none());
     }
 
     #[test]
     fn test_http_default_port() {
         let url = "http://user:pass@1.2.3.4";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = super::HttpClientConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.port, 80);
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints[0].port, 80);
     }
 
     #[test]
     fn test_http_username_only() {
         let url = "http://user@1.2.3.4:8080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = super::HttpClientConfig::try_parse(&raw).expect("failed");
-        assert_eq!(config.username.as_deref(), Some("user"));
-        assert!(config.password.is_none());
+        let cfg = config(parse(url));
+        assert_eq!(cfg.username.as_deref(), Some("user"));
+        assert!(cfg.password.is_none());
     }
 
     #[test]
-    fn test_reconstruct_roundtrip() {
-        let input = "http://user:pass@1.2.3.4:8080";
-        let raw = crate::urlx::RawUrlX::from(input);
-        let parsed = super::HttpClientConfig::try_parse(&raw).expect("failed to parse");
-        let reconstructed = parsed.reconstruct().expect("failed to reconstruct");
-
-        let raw2 = crate::urlx::RawUrlX::from(reconstructed.as_str());
-        let reparsed = super::HttpClientConfig::try_parse(&raw2).expect("failed to re-parse");
-
-        assert_eq!(parsed.host, reparsed.host, "host mismatch");
-        assert_eq!(parsed.port, reparsed.port, "port mismatch");
-        assert_eq!(parsed.username, reparsed.username, "username mismatch");
-        assert_eq!(parsed.password, reparsed.password, "password mismatch");
+    fn test_http_tls_security() {
+        let url = "http://user:pass@example.com:443?security=tls&sni=cdn.example.com";
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints[0].host, "example.com");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Dns);
+        let cfg = config(parsed);
+        assert_eq!(cfg.security.type_str(), Some("tls"));
+        assert_eq!(cfg.security.sni(), Some("cdn.example.com"));
+        assert_no_top_level_host_port(&cfg);
     }
+
+    // ── Identity: endpoint-free uid ───────────────────────────────────────
+
+    #[test]
+    fn uid_identical_across_servers_different_across_credentials() {
+        let url_a = "http://user:pass@a.example.com:8080";
+        let url_b = "http://user:pass@b.example.com:8081";
+        let url_c = "http://other:pass@a.example.com:8080";
+        let a = parse(url_a);
+        let b = parse(url_b);
+        let c = parse(url_c);
+        assert_eq!(
+            a.uid(),
+            b.uid(),
+            "same protocol on different servers must dedup to one uid"
+        );
+        assert_ne!(a.uid(), c.uid(), "different credentials -> different uid");
+        assert_ne!(a.sig(), 0);
+    }
+
+    // ── Reconstruct round-trip via endpoint ───────────────────────────────
+
+    #[test]
+    fn reconstruct_roundtrip_via_endpoint() {
+        assert_reconstruct_roundtrip("http://user:pass@1.2.3.4:8080");
+        assert_reconstruct_roundtrip("http://1.2.3.4:8080");
+        assert_reconstruct_roundtrip("http://user@example.com:80#my-server");
+        assert_reconstruct_roundtrip(
+            "http://user:pass@example.com:443?security=tls&sni=cdn.example.com",
+        );
+    }
+
+    // ── Clash round-trip via *_proto ──────────────────────────────────────
+
+    #[test]
+    fn clash_roundtrip_from_url_via_proto() {
+        let url = "http://user:pass@1.2.3.4:8080";
+        let parsed = parse(url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
+        let reparsed = HttpClientConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(
+            reparsed.endpoints[0], endpoint,
+            "endpoint round-trips through clash"
+        );
+        assert_eq!(
+            reparsed.protocol.config,
+            ProtocolConfig::Http(cfg),
+            "config round-trips through clash"
+        );
+    }
+
+    #[test]
+    fn clash_proxy_roundtrip_via_proto() {
+        use crate::clash::{ClashHttp, ClashProxy};
+
+        let proxy = ClashProxy::Http(ClashHttp {
+            name: "test".into(),
+            server: "example.com".into(),
+            port: 8080,
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            tls: Some(true),
+            servername: Some("cdn.example.com".into()),
+            skip_cert_verify: None,
+            headers: None,
+        });
+        let parsed = HttpClientConfig::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(parsed.endpoints[0].host, "example.com");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Dns);
+        assert_eq!(parsed.endpoints[0].port, 8080);
+        let cfg = match &parsed.protocol.config {
+            ProtocolConfig::Http(c) => c,
+            other => panic!("expected HttpClientConfig, got {other:?}"),
+        };
+        assert_eq!(cfg.username.as_deref(), Some("user"));
+        assert_eq!(cfg.password.as_deref(), Some("pass"));
+        // Explicit Clash servername stays in the config (host-free mandate).
+        assert_eq!(cfg.security.sni(), Some("cdn.example.com"));
+        assert_no_top_level_host_port(cfg);
+        let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
+        match (out, proxy) {
+            (ClashProxy::Http(out), ClashProxy::Http(orig)) => assert_eq!(out, orig),
+            _ => panic!("expected http clash proxy"),
+        }
+    }
+
+    // ── Serde ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_serde_roundtrip() {
-        let input = "http://user:pass@1.2.3.4:8080";
-        let raw = crate::urlx::RawUrlX::from(input);
-        let parsed = super::HttpClientConfig::try_parse(&raw).expect("failed");
-        let json = serde_json::to_string(&parsed).expect("serialize");
-        let deserialized: super::HttpClientConfig =
-            serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.host, deserialized.host);
-        assert_eq!(parsed.username, deserialized.username);
-        assert_eq!(parsed.password, deserialized.password);
+        let cfg = config(parse("http://user:pass@1.2.3.4:8080"));
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let deserialized: HttpClientConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, deserialized);
+        assert_no_top_level_host_port(&deserialized);
     }
 
-    use super::super::test_helpers::check_roundtrip;
+    // ── Legacy trait bridge ───────────────────────────────────────────────
 
     #[test]
-    fn test_roundtrip() {
-        check_roundtrip::<super::HttpClientConfig>("http://user:pass@1.2.3.4:8080");
-    }
-
-    #[test]
-    fn test_clash_roundtrip() {
-        use super::super::test_helpers::check_clash_roundtrip;
-        check_clash_roundtrip::<super::HttpClientConfig>("http://user:pass@1.2.3.4:8080");
-    }
-
-    #[test]
-    fn test_http_with_remarks() {
-        let url = "http://user:pass@example.com:80#my-server";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = super::HttpClientConfig::try_parse(&raw).unwrap();
-        assert_eq!(config.remarks.as_deref(), Some("my-server"));
-        let rebuilt = config.reconstruct().unwrap();
-        assert!(
-            rebuilt.contains("#my-server"),
-            "reconstruct should preserve fragment: {rebuilt}"
-        );
+    fn legacy_bridge_parse_works_but_reconstruct_to_clash_error() {
+        let url = "http://user:pass@1.2.3.4:8080";
+        let bridged = HttpClientConfig::try_parse(&RawUrlX::from(url)).expect("bridged parse");
+        assert_eq!(bridged.schema(), SchemeX::Http);
+        assert_eq!(bridged.username.as_deref(), Some("user"));
+        // host/port accessors are gone — the endpoint lives on ParsedProto.
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
+        // Degraded legacy paths error instead of fabricating a host.
+        assert!(bridged.reconstruct().is_err());
+        assert!(bridged.to_clash().is_err());
     }
 }

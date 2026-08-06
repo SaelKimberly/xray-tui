@@ -33,27 +33,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText, host_serde, port_serde};
+use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
 use super::common::SecurityConfig;
+use super::core_mapping;
 use super::utils;
-use super::{ParseError, ProtoSpec};
+use super::{
+    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
+    ProtocolEssentials, ProtocolKind,
+};
 use crate::clash::{ClashProxy, ClashSocks5};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::{
-    clash_server_to_host, clash_tls_to_security, host_spec_to_string, security_to_clash_tls,
+    clash_tls_to_security, clash_to_endpoint, host_kind_for, security_to_clash_tls,
 };
 
+/// SOCKS5 protocol configuration — the identity payload (sans host/port).
+///
+/// The endpoint (server host/port) lives in [`EndpointEssentials`] on the
+/// [`ParsedProto`] boundary; this struct only carries endpoint-free protocol
+/// parameters, so the same config pointed at different servers shares one
+/// identity.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub struct Socks5Config {
-    #[serde(with = "host_serde")]
-    pub host: HostSpec,
-    #[serde(with = "port_serde")]
-    pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
@@ -61,8 +67,11 @@ pub struct Socks5Config {
     pub remarks: Option<TinyText>,
 }
 
-impl ProtoSpec for Socks5Config {
-    /// Parse a SOCKS5 URL.
+impl Socks5Config {
+    /// Parse a SOCKS5 URL into the parse boundary: [`ParsedProto`] with the
+    /// endpoint essentials (host/port) split out and the identity payload
+    /// ([`ProtocolEssentials::config`]) holding only endpoint-free protocol
+    /// parameters.
     ///
     /// Two code paths:
     /// 1. Hostport present (standard): userinfo from `raw.userinfo` (may be empty/
@@ -72,7 +81,7 @@ impl ProtoSpec for Socks5Config {
     ///
     /// Userinfo is split at the first `:` for username:password. A lone username
     /// (no colon) is stored with password = `None`.
-    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+    pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         let (userinfo, hostport_str) = if let Some(hostport) = raw.hostport {
             // Standard: socks://[user:pass@]host:port[#remarks]
             (raw.userinfo, hostport)
@@ -99,29 +108,45 @@ impl ProtoSpec for Socks5Config {
             }
         };
 
-        let (parsed_host, parsed_port) = utils::parse_hostport(hostport_str)?;
-        let parsed_port = parsed_port
+        let (parsed_host, parsed_port_spec) = utils::parse_hostport(hostport_str)?;
+        let parsed_port = parsed_port_spec
             .first()
             .ok_or_else(|| ParseError::InvalidPort("empty port spec".into()))?;
 
+        // Endpoint essentials: host/port live here, never in the config payload.
+        let mut endpoint = EndpointEssentials::new(parsed_host.to_str().into_owned(), parsed_port);
+        endpoint.host_type = host_kind_for(&parsed_host);
+        if parsed_port_spec.length() > 1 {
+            endpoint.ports = parsed_port_spec.iter().collect();
+        }
+
         let remarks = utils::decode_fragment(raw)?;
 
-        Ok(Self {
-            host: parsed_host,
-            port: parsed_port,
+        let config = Self {
             username,
             password,
             security: SecurityConfig::default(),
             remarks,
+        };
+        Ok(ParsedProto {
+            endpoints: vec![endpoint],
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Socks,
+                config_type: ConfigKind::ShareUrl,
+                core_type: core_mapping::resolve_core(ProtocolKind::Socks, None, None),
+                config: ProtocolConfig::Socks(config),
+            },
         })
     }
 
-    fn reconstruct(&self) -> Result<String, ParseError> {
-        let host = self.host.to_str();
+    /// Rebuild the share URL from this endpoint-free config plus the endpoint
+    /// essentials. Endpoint host/port come from `endpoint`.
+    pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
+        let host = endpoint.host.as_str();
         let hostport = if host.contains(':') {
-            format!("[{host}]:{}", self.port)
+            format!("[{host}]:{}", endpoint.port)
         } else {
-            format!("{host}:{}", self.port)
+            format!("{host}:{}", endpoint.port)
         };
 
         let auth = match (&self.username, &self.password) {
@@ -138,17 +163,112 @@ impl ProtoSpec for Socks5Config {
 
         Ok(format!("socks://{auth}{hostport}{fragment}"))
     }
+}
+
+impl Socks5Config {
+    /// Serialize this endpoint-free config plus the endpoint to a Clash proxy
+    /// entry. Endpoint host/port are taken from `endpoint`.
+    pub fn to_clash_proto(
+        &self,
+        endpoint: &EndpointEssentials,
+    ) -> Result<ClashProxy, ProtoSpecError> {
+        let name = self.remarks.as_deref().unwrap_or("").to_string();
+        let (tls, servername, skip_cert_verify, _, _) = security_to_clash_tls(&self.security);
+        Ok(ClashProxy::Socks5(ClashSocks5 {
+            name,
+            server: endpoint.host.clone(),
+            port: endpoint.port,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            tls,
+            servername,
+            skip_cert_verify,
+            udp: None,
+        }))
+    }
+
+    /// Parse a Clash proxy entry into the parse boundary: `server`/`port`
+    /// become the endpoint essentials; the config payload is endpoint-free.
+    pub fn try_from_clash_proto(proxy: &ClashProxy) -> Result<ParsedProto, ParseError> {
+        match proxy {
+            ClashProxy::Socks5(c) => {
+                let config = Self {
+                    username: c.username.clone(),
+                    password: c.password.clone(),
+                    security: clash_tls_to_security(
+                        c.tls,
+                        c.servername.as_deref(),
+                        c.skip_cert_verify,
+                        None,
+                        None,
+                        None,
+                    ),
+                    remarks: match c.name.as_str() {
+                        "" => None,
+                        s => Some(TinyText::from(s)),
+                    },
+                };
+                Ok(ParsedProto {
+                    endpoints: vec![clash_to_endpoint(&c.server, c.port)],
+                    protocol: ProtocolEssentials {
+                        proto_kind: ProtocolKind::Socks,
+                        config_type: ConfigKind::ShareUrl,
+                        core_type: core_mapping::resolve_core(ProtocolKind::Socks, None, None),
+                        config: ProtocolConfig::Socks(config),
+                    },
+                })
+            }
+            _ => Err(ParseError::Unknown("expected socks5 clash proxy".into())),
+        }
+    }
+}
+
+/// Legacy [`ProtoSpec`] bridge — kept so `ProtocolConfig` dispatch (and the
+/// `Proto`/`ParseResult` consumers in xray-tui-config) compile unchanged.
+///
+/// DEGRADED PATH (documented): `try_parse`/`try_from_clash` still work by
+/// delegating to the `*_proto` variants and discarding the parsed endpoints;
+/// `to_clash`/`reconstruct` return errors because the config no longer stores
+/// host/port. Import/export rewires to the `*_proto` variants in T11 (phase D
+/// builders take the endpoint separately).
+impl ProtoSpec for Socks5Config {
+    /// # Errors
+    ///
+    /// If either the URL is invalid or the external configuration is invalid.
+    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
+        let parsed = Self::try_parse_proto(raw)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Socks(config) => Ok(config),
+            // Parser invariant: a socks URL always yields a Socks5Config.
+            _ => Err(ParseError::Unknown(
+                "socks URL parsed to a non-socks config".into(),
+            )),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::reconstruct_proto`] with the endpoint.
+    fn reconstruct(&self) -> Result<String, ParseError> {
+        Err(ParseError::InvalidHost(
+            "socks config no longer stores host/port; use Socks5Config::reconstruct_proto(endpoint)"
+                .into(),
+        ))
+    }
 
     fn schema(&self) -> SchemeX {
         SchemeX::Socks
     }
 
+    /// `None` — the endpoint host moved to [`EndpointEssentials`] (T5).
     fn host(&self) -> Option<&HostSpec> {
-        Some(&self.host)
+        None
     }
 
+    /// `None` — the endpoint port moved to [`EndpointEssentials`] (T5).
     fn port(&self) -> Option<u16> {
-        Some(self.port)
+        None
     }
 
     fn remarks(&self) -> Option<&str> {
@@ -159,44 +279,28 @@ impl ProtoSpec for Socks5Config {
         None
     }
 
+    /// # Errors
+    ///
+    /// If the Clash proxy doesn't match this protocol type.
     fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
-        match proxy {
-            ClashProxy::Socks5(c) => Ok(Self {
-                host: clash_server_to_host(&c.server)?,
-                port: c.port,
-                username: c.username.clone(),
-                password: c.password.clone(),
-                security: clash_tls_to_security(
-                    c.tls,
-                    c.servername.as_deref(),
-                    c.skip_cert_verify,
-                    None,
-                    None,
-                    None,
-                ),
-                remarks: match c.name.as_str() {
-                    "" => None,
-                    s => Some(TinyText::from(s)),
-                },
-            }),
-            _ => Err(ParseError::Unknown("expected socks5 clash proxy".into())),
+        let parsed = Self::try_from_clash_proto(proxy)?;
+        match parsed.protocol.config {
+            ProtocolConfig::Socks(config) => Ok(config),
+            _ => Err(ParseError::Unknown(
+                "socks clash proxy parsed to a non-socks config".into(),
+            )),
         }
     }
 
+    /// # Errors
+    ///
+    /// Always — host/port are no longer stored on the config; use
+    /// [`Self::to_clash_proto`] with the endpoint.
     fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
-        let name = self.remarks.as_deref().unwrap_or("").to_string();
-        let (tls, servername, skip_cert_verify, _, _) = security_to_clash_tls(&self.security);
-        Ok(ClashProxy::Socks5(ClashSocks5 {
-            name,
-            server: host_spec_to_string(&self.host),
-            port: self.port,
-            username: self.username.clone(),
-            password: self.password.clone(),
-            tls,
-            servername,
-            skip_cert_verify,
-            udp: None,
-        }))
+        Err(ProtoSpecError::Unsupported(
+            "socks config no longer stores host/port; use Socks5Config::to_clash_proto(endpoint)"
+                .into(),
+        ))
     }
 }
 
@@ -205,8 +309,8 @@ impl ProtoIdentity for Socks5Config {
         use rapidhash::v3::RapidStreamHasherV3;
         let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
         hasher.write(b"socks5");
-        hasher.write(self.host.to_str().as_bytes());
-        hasher.write(&self.port.to_le_bytes());
+        // Endpoint (host/port) intentionally absent from the identity — it
+        // lives on the ParsedProto boundary, never in the config payload (T5).
         hasher.finish()
     }
     fn compute_cred_hash(&self) -> u64 {
@@ -219,107 +323,213 @@ impl ProtoIdentity for Socks5Config {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::check_roundtrip;
-    use super::super::{Proto, ProtoSpec, ProtocolConfig};
+    use super::super::{
+        ConfigKind, CoreType, HostKind, ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig,
+        ProtocolKind,
+    };
     use super::Socks5Config;
-    use crate::urlx::SchemeX;
+    use crate::urlx::{RawUrlX, SchemeX};
+
+    fn parse(url: &str) -> ParsedProto {
+        Socks5Config::try_parse_proto(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"))
+    }
+
+    fn config(parsed: ParsedProto) -> Socks5Config {
+        match parsed.protocol.config {
+            ProtocolConfig::Socks(c) => c,
+            other => panic!("expected Socks5Config, got {other:?}"),
+        }
+    }
+
+    /// The identity payload must be endpoint-free: no top-level `host`/`port`
+    /// keys in the serialized config.
+    fn assert_no_top_level_host_port(cfg: &Socks5Config) {
+        let json = serde_json::to_value(cfg).expect("serialize");
+        let obj = json.as_object().expect("config is an object");
+        assert!(
+            !obj.contains_key("host"),
+            "config payload must not carry a top-level host key: {json}"
+        );
+        assert!(
+            !obj.contains_key("port"),
+            "config payload must not carry a top-level port key: {json}"
+        );
+    }
+
+    /// Reconstruct round-trip via the endpoint: parse → reconstruct_proto(endpoint)
+    /// → re-parse must reproduce the same ParsedProto (endpoints + config).
+    fn assert_reconstruct_roundtrip(url: &str) {
+        let parsed = parse(url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed.clone());
+        let out = cfg
+            .reconstruct_proto(&endpoint)
+            .unwrap_or_else(|e| panic!("reconstruct failed for {url}: {e}"));
+        let reparsed = parse(&out);
+        assert_eq!(parsed, reparsed, "reconstruct round-trip failed for: {url}");
+    }
+
+    // ── URL parse: endpoints + config ─────────────────────────────────────
 
     #[test]
     fn test_basic() {
         let url = "socks://user:pass@1.2.3.4:1080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = Socks5Config::try_parse(&raw).expect("failed to parse");
-        assert_eq!(config.schema(), SchemeX::Socks);
-        assert_eq!(config.host.to_str(), "1.2.3.4");
-        assert_eq!(config.port, 1080);
-        assert_eq!(config.username.as_deref(), Some("user"));
-        assert_eq!(config.password.as_deref(), Some("pass"));
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints.len(), 1);
+        let ep = &parsed.endpoints[0];
+        assert_eq!(ep.host, "1.2.3.4");
+        assert_eq!(ep.host_type, HostKind::Ipv4);
+        assert_eq!(ep.port, 1080);
+
+        assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Socks);
+        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
+        assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+        let cfg = config(parsed);
+        assert_eq!(cfg.username.as_deref(), Some("user"));
+        assert_eq!(cfg.password.as_deref(), Some("pass"));
+        assert_no_top_level_host_port(&cfg);
     }
 
     #[test]
     fn test_no_auth() {
         let url = "socks://1.2.3.4:1080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = Socks5Config::try_parse(&raw).expect("failed to parse");
-        assert_eq!(config.host.to_str(), "1.2.3.4");
-        assert_eq!(config.port, 1080);
-        assert!(config.username.is_none());
-        assert!(config.password.is_none());
-    }
-
-    #[test]
-    fn socks_no_credentials_uid_equals_sig() {
-        // No credentials -> cred_hash is 0 -> uid == sig (per the uid mandate:
-        // "when cred_hash could not be computed, we stay with just sig == uid").
-        let raw = crate::urlx::RawUrlX::from("socks://1.2.3.4:1080");
-        let proto = Proto::new(ProtocolConfig::Socks(
-            Socks5Config::try_parse(&raw).expect("failed to parse"),
-        ));
-        assert_eq!(proto.cred_hash(), 0, "no credentials -> cred_hash 0");
-        assert_eq!(proto.uid(), proto.sig(), "uid == sig when cred_hash is 0");
-        assert_ne!(proto.sig(), 0);
-        assert_ne!(proto.uid(), 0, "uid must never be zero");
-    }
-
-    #[test]
-    fn socks_credentials_change_cred_hash_not_sig() {
-        let raw_noauth = crate::urlx::RawUrlX::from("socks://1.2.3.4:1080");
-        let raw_auth = crate::urlx::RawUrlX::from("socks://user:pass@1.2.3.4:1080");
-        let noauth = Proto::new(ProtocolConfig::Socks(
-            Socks5Config::try_parse(&raw_noauth).expect("failed to parse"),
-        ));
-        let auth = Proto::new(ProtocolConfig::Socks(
-            Socks5Config::try_parse(&raw_auth).expect("failed to parse"),
-        ));
-        assert_eq!(noauth.sig(), auth.sig(), "creds are not part of sig");
-        assert_ne!(noauth.cred_hash(), auth.cred_hash());
-        assert_ne!(noauth.uid(), auth.uid());
-    }
-
-    #[test]
-    fn socks_host_port_are_identity_in_sig() {
-        let raw_a = crate::urlx::RawUrlX::from("socks://1.2.3.4:1080");
-        let raw_b = crate::urlx::RawUrlX::from("socks://1.2.3.4:1081");
-        let a = Proto::new(ProtocolConfig::Socks(
-            Socks5Config::try_parse(&raw_a).expect("failed to parse"),
-        ));
-        let b = Proto::new(ProtocolConfig::Socks(
-            Socks5Config::try_parse(&raw_b).expect("failed to parse"),
-        ));
-        assert_ne!(a.sig(), b.sig(), "different port -> different sig");
-        assert_eq!(a.cred_hash(), b.cred_hash(), "no creds either way");
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints[0].host, "1.2.3.4");
+        assert_eq!(parsed.endpoints[0].port, 1080);
+        let cfg = config(parsed);
+        assert!(cfg.username.is_none());
+        assert!(cfg.password.is_none());
     }
 
     #[test]
     fn test_ipv6() {
         let url = "socks://[2001:db8::1]:1080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let config = Socks5Config::try_parse(&raw).expect("failed to parse");
-        assert_eq!(config.host.to_str(), "2001:db8::1");
-        assert_eq!(config.port, 1080);
+        let parsed = parse(url);
+        assert_eq!(parsed.endpoints[0].host, "2001:db8::1");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Ipv6);
+        assert_eq!(parsed.endpoints[0].port, 1080);
+    }
+
+    // ── Identity: endpoint-free uid ───────────────────────────────────────
+
+    #[test]
+    fn uid_identical_across_servers_different_across_credentials() {
+        let url_a = "socks://user:pass@a.example.com:1080";
+        let url_b = "socks://user:pass@b.example.com:1081";
+        let url_c = "socks://other:pass@a.example.com:1080";
+        let a = parse(url_a);
+        let b = parse(url_b);
+        let c = parse(url_c);
+        assert_eq!(
+            a.uid(),
+            b.uid(),
+            "same protocol on different servers must dedup to one uid"
+        );
+        assert_ne!(a.uid(), c.uid(), "different credentials -> different uid");
+        assert_ne!(a.sig(), 0);
     }
 
     #[test]
-    fn test_roundtrip() {
-        check_roundtrip::<Socks5Config>("socks://user:pass@1.2.3.4:1080");
+    fn socks_credentials_change_cred_hash_not_sig() {
+        let noauth = config(parse("socks://1.2.3.4:1080"));
+        let auth = config(parse("socks://user:pass@1.2.3.4:1080"));
+        assert_eq!(
+            noauth.compute_sig(),
+            auth.compute_sig(),
+            "creds are not part of sig"
+        );
+        assert_ne!(noauth.compute_cred_hash(), auth.compute_cred_hash());
+    }
+
+    // ── Reconstruct round-trip via endpoint ───────────────────────────────
+
+    #[test]
+    fn reconstruct_roundtrip_via_endpoint() {
+        assert_reconstruct_roundtrip("socks://user:pass@1.2.3.4:1080");
+        assert_reconstruct_roundtrip("socks://1.2.3.4:1080");
+        assert_reconstruct_roundtrip("socks://user@example.com:1080#my-server");
+        assert_reconstruct_roundtrip("socks://[2001:db8::1]:1080");
+    }
+
+    // ── Clash round-trip via *_proto ──────────────────────────────────────
+
+    #[test]
+    fn clash_roundtrip_from_url_via_proto() {
+        let url = "socks://user:pass@1.2.3.4:1080";
+        let parsed = parse(url);
+        let endpoint = parsed.endpoints[0].clone();
+        let cfg = config(parsed);
+        let proxy = cfg.to_clash_proto(&endpoint).expect("to clash");
+        let reparsed = Socks5Config::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(
+            reparsed.endpoints[0], endpoint,
+            "endpoint round-trips through clash"
+        );
+        assert_eq!(
+            reparsed.protocol.config,
+            ProtocolConfig::Socks(cfg),
+            "config round-trips through clash"
+        );
     }
 
     #[test]
-    fn test_clash_roundtrip() {
-        use super::super::test_helpers::check_clash_roundtrip;
-        check_clash_roundtrip::<Socks5Config>("socks://user:pass@1.2.3.4:1080");
+    fn clash_proxy_roundtrip_via_proto() {
+        use crate::clash::{ClashProxy, ClashSocks5};
+
+        let proxy = ClashProxy::Socks5(ClashSocks5 {
+            name: "test".into(),
+            server: "1.2.3.4".into(),
+            port: 1080,
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            tls: None,
+            servername: None,
+            skip_cert_verify: None,
+            udp: None,
+        });
+        let parsed = Socks5Config::try_from_clash_proto(&proxy).expect("clash parse");
+        assert_eq!(parsed.endpoints[0].host, "1.2.3.4");
+        assert_eq!(parsed.endpoints[0].host_type, HostKind::Ipv4);
+        assert_eq!(parsed.endpoints[0].port, 1080);
+        let cfg = match &parsed.protocol.config {
+            ProtocolConfig::Socks(c) => c,
+            other => panic!("expected Socks5Config, got {other:?}"),
+        };
+        assert_eq!(cfg.username.as_deref(), Some("user"));
+        assert_eq!(cfg.password.as_deref(), Some("pass"));
+        assert_no_top_level_host_port(cfg);
+        let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
+        match (out, proxy) {
+            (ClashProxy::Socks5(out), ClashProxy::Socks5(orig)) => assert_eq!(out, orig),
+            _ => panic!("expected socks5 clash proxy"),
+        }
     }
+
+    // ── Serde ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_serde_roundtrip() {
-        let url = "socks://user:pass@1.2.3.4:1080";
-        let raw = crate::urlx::RawUrlX::from(url);
-        let parsed = Socks5Config::try_parse(&raw).expect("failed");
-        let json = serde_json::to_string(&parsed).expect("serialize");
+        let cfg = config(parse("socks://user:pass@1.2.3.4:1080"));
+        let json = serde_json::to_string(&cfg).expect("serialize");
         let deserialized: Socks5Config = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.host, deserialized.host);
-        assert_eq!(parsed.port, deserialized.port);
-        assert_eq!(parsed.username, deserialized.username);
-        assert_eq!(parsed.password, deserialized.password);
+        assert_eq!(cfg, deserialized);
+        assert_no_top_level_host_port(&deserialized);
+    }
+
+    // ── Legacy trait bridge ───────────────────────────────────────────────
+
+    #[test]
+    fn legacy_bridge_parse_works_but_reconstruct_to_clash_error() {
+        let url = "socks://user:pass@1.2.3.4:1080";
+        let bridged = Socks5Config::try_parse(&RawUrlX::from(url)).expect("bridged parse");
+        assert_eq!(bridged.schema(), SchemeX::Socks);
+        assert_eq!(bridged.username.as_deref(), Some("user"));
+        // host/port accessors are gone — the endpoint lives on ParsedProto.
+        assert_eq!(bridged.host(), None);
+        assert_eq!(bridged.port(), None);
+        // Degraded legacy paths error instead of fabricating a host.
+        assert!(bridged.reconstruct().is_err());
+        assert!(bridged.to_clash().is_err());
     }
 }

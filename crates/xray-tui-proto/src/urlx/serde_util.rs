@@ -1,4 +1,4 @@
-use super::{HostSpec, PortSpec};
+use super::HostSpec;
 
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) mod host_serde {
@@ -59,26 +59,5 @@ pub(crate) mod port_serde {
         S: serde::Serializer,
     {
         s.serialize_u16(*v)
-    }
-}
-
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) mod port_spec_serde {
-    use serde::Deserialize;
-
-    pub fn deserialize<'de, D>(d: D) -> Result<super::PortSpec, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(d)?;
-        s.parse()
-            .map_err(|e| serde::de::Error::custom(format!("invalid port spec: {e}")))
-    }
-
-    pub fn serialize<S>(v: &super::PortSpec, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        s.serialize_str(&v.to_string())
     }
 }

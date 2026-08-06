@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
 
-use crate::urlx::{HostSpec, PortSpec, TinyText};
+use crate::urlx::{HostSpec, TinyText};
 
 /// Clash TLS fields as returned by `security_to_clash_tls`.
 type SecurityClashTls = (
@@ -742,11 +742,6 @@ pub(crate) fn host_spec_to_string(h: &HostSpec) -> String {
         HostSpec::DnsName(dns) => dns.as_ref().to_owned(),
         _ => String::new(),
     }
-}
-
-/// Get the first port from `PortSpec`, or default.
-pub(crate) fn port_spec_first(p: &PortSpec) -> u16 {
-    p.iter().next().unwrap_or(443)
 }
 
 /// Build xray-core `streamSettings` JSON from typed security + transport.
