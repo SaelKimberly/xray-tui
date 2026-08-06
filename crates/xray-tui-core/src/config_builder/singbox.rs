@@ -371,26 +371,36 @@ mod tests {
     }
 
     #[test]
-    fn singbox_build_returns_unsupported_protocol_until_inject() {
-        // flip to success assertions in T16 (real inject_to lands in T14/15)
+    fn singbox_build_tuic_full_config() {
+        // Real inject_to (T15) now builds the full tuic outbound; assert the
+        // complete config, not an error.
         let (endpoint, protocol, link) = test_endpoint_protocol_link();
         let (params, rules, dns) = super::super::tests::default_params();
-        let result = SingBoxConfigBuilder::build(
+        let config = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
             link.core_type,
             &params,
             &rules,
             &dns,
-        );
-        match result {
-            Err(BuildError::Support(
-                xray_tui_proto::proto_spec::SupportError::UnsupportedProtocol(kind, core),
-            )) => {
-                assert_eq!(kind, "tuic");
-                assert_eq!(core, ProtoCoreType::SingBox);
-            }
-            other => panic!("expected UnsupportedProtocol, got {other:?}"),
+        )
+        .expect("tuic sing-box build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        let outbounds = json["outbounds"].as_array().unwrap();
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy outbound");
+        assert_eq!(proxy["type"], "tuic");
+        assert_eq!(proxy["uuid"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(proxy["server"], "example.com");
+        assert_eq!(proxy["server_port"], 443);
+        assert_eq!(proxy["tls"]["enabled"], true);
+        assert_eq!(proxy["tls"]["server_name"], "example.com");
+        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
+        for required in ["direct", "block"] {
+            assert!(tags.contains(&required), "missing {required} outbound");
         }
     }
 
@@ -413,6 +423,181 @@ mod tests {
             err.to_string().contains("not loaded"),
             "error must mention the unloaded config: {err}"
         );
+    }
+
+    #[test]
+    fn singbox_shadowsocks_rejects_unsupported_cipher() {
+        // salsa20 is supported by neither core — build-time refusal (old
+        // builder behavior).
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Shadowsocks,
+            super::super::tests::ss_config("salsa20"),
+        );
+        let link = super::super::tests::link(ProtoCoreType::SingBox);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let err = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
+        )
+        .expect_err("salsa20 is not a sing-box method");
+        assert!(
+            err.to_string().contains("salsa20"),
+            "error must name the cipher: {err}"
+        );
+    }
+
+    #[test]
+    fn singbox_legacy_cipher_builds() {
+        // aes-256-cfb is a legacy cipher xray-core cannot build but sing-box
+        // supports — must succeed (old builder behavior).
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Shadowsocks,
+            super::super::tests::ss_config("aes-256-cfb"),
+        );
+        let link = super::super::tests::link(ProtoCoreType::SingBox);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
+        )
+        .expect("legacy cipher sing-box build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["type"], "shadowsocks");
+        assert_eq!(proxy["method"], "aes-256-cfb");
+    }
+
+    #[test]
+    fn singbox_shadowsocks2022_builds() {
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Shadowsocks2022,
+            super::super::tests::ss_config("2022-blake3-aes-128-gcm"),
+        );
+        let link = super::super::tests::link(ProtoCoreType::SingBox);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
+        )
+        .expect("ss-2022 sing-box build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["type"], "shadowsocks");
+        assert_eq!(proxy["method"], "2022-blake3-aes-128-gcm");
+    }
+
+    #[test]
+    fn singbox_wireguard_full_config() {
+        // Restores the old wireguard full-config test on the typed config:
+        // endpoint is endpoint-less (wg peers carry the server), reserved/mtu/
+        // peers/address fields all present.
+        let endpoint = super::super::tests::endpoint("", 0);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::WireGuard,
+            super::super::tests::wg_config(),
+        );
+        let link = super::super::tests::link(ProtoCoreType::SingBox);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
+        )
+        .expect("wireguard sing-box build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy outbound");
+        assert_eq!(proxy["type"], "wireguard");
+        assert_eq!(proxy["mtu"], 1380);
+        assert_eq!(proxy["peers"][0]["public_key"], "pubkey789");
+        assert_eq!(proxy["peers"][0]["pre_shared_key"], "psk_value");
+        assert_eq!(proxy["peers"][0]["reserved"], json!([1, 2, 3]));
+        assert_eq!(proxy["address"], json!(["10.0.0.1/24"]));
+    }
+
+    #[test]
+    fn singbox_hysteria2_full_config() {
+        // Restores the old hy2 full-config test on the typed config.
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Hysteria2,
+            super::super::tests::hy2_config(),
+        );
+        let link = super::super::tests::link(ProtoCoreType::SingBox);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = SingBoxConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            link.core_type,
+            &params,
+            &rules,
+            &dns,
+        )
+        .expect("hy2 sing-box build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        assert_singbox_top_level(&json);
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy outbound");
+        assert_eq!(proxy["type"], "hysteria2");
+        assert_eq!(proxy["password"], "hy2-secret");
+        assert_eq!(proxy["up_mbps"], 100);
+        assert_eq!(proxy["down_mbps"], 100);
+        // mandatory TLS block (empty security -> defaults to endpoint host).
+        assert_eq!(proxy["tls"]["enabled"], true);
+        assert_eq!(proxy["tls"]["server_name"], "example.com");
+    }
+
+    #[test]
+    fn singbox_v2ray_api_values() {
+        // Restores the T13-removed value-level v2ray_api assertions
+        // (listen port + stats.enabled + tracked outbounds).
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config = skeleton(&params, &rules, &dns);
+        let json = serde_json::to_value(&config).unwrap();
+        let api = &json["experimental"]["v2ray_api"];
+        assert_eq!(
+            api["listen"],
+            format!("127.0.0.1:{}", crate::config_builder::API_PORT)
+        );
+        assert_eq!(api["stats"]["enabled"], true);
+        assert_eq!(api["stats"]["outbounds"], json!(["proxy", "direct"]));
     }
 
     #[test]

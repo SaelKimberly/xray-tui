@@ -642,9 +642,241 @@ mod tests {
         assert_eq!(stopped.load(Ordering::Relaxed), 1);
     }
 
-    // NOTE: `concurrent_pings_do_not_reload_core_mid_ping` (M7 lock regression)
-    // was removed in Task 13: it drove the reuse path through
-    // `ConfigBuilder::build`, which cannot succeed until the real `inject_to`
-    // impls land (T14/15) — every outbound currently returns
-    // `UnsupportedProtocol`. Restore the test in T16 once builds succeed.
+    // ── M7 lock regression (restored in T16) ───────────────────────────────
+
+    fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(secs).expect("valid ts")
+    }
+
+    /// A buildable vless profile for the pool reuse path: the real `inject_to`
+    /// (T14) makes `ConfigBuilder::build` succeed, which the M7 regression
+    /// needs to reach the fake socks server mid-`real_ping`.
+    fn vless_endpoint_link_protocol() -> (Endpoint, ProfileStats, DbProtocol) {
+        use toasty::{Deferred, Json};
+        use xray_tui_db::models::{ConfigType, HostType, TrafficStats, Transport};
+        use xray_tui_proto::proto_spec::common::TransportConfig;
+        use xray_tui_proto::proto_spec::{
+            ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType, VlessConfig,
+        };
+
+        let endpoint = Endpoint {
+            id: xray_tui_db::models::EndpointId::new(1),
+            host: "example.com".to_string(),
+            host_type: HostType::Dns,
+            port: 443,
+            ports: Vec::new(),
+            parent_id: None,
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_as: Vec::new(),
+            resolved_at: None,
+            created_at: ts(0),
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        };
+        let link = ProfileStats {
+            protocol_id: xray_tui_db::models::ProtocolId::new(1),
+            endpoint_id: xray_tui_db::models::EndpointId::new(1),
+            core_type: xray_tui_proto::proto_spec::CoreType::Xray,
+            config_type: ConfigType::ShareUrl,
+            last_used_at: None,
+            last_seen_at: ts(0),
+            task_id: None,
+            task_queue: Vec::new(),
+            latency: None,
+            speed_bps: None,
+            error: None,
+            traffic: TrafficStats {
+                today_up: 0,
+                today_down: 0,
+                total_up: 0,
+                total_down: 0,
+            },
+            created_at: ts(0),
+            updated_at: ts(0),
+            version: 1,
+            protocol: Deferred::default(),
+            endpoint: Deferred::default(),
+        };
+        let protocol = DbProtocol {
+            id: xray_tui_db::models::ProtocolId::new(1),
+            sig: 0,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: xray_tui_db::models::Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
+                uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport: TransportConfig::Tcp,
+                encryption: None,
+                flow: None,
+                path: None,
+                splice: None,
+                remarks: None,
+            }))),
+            created_at: ts(0),
+            links: Deferred::default(),
+        };
+        (endpoint, link, protocol)
+    }
+
+    /// Minimal fake SOCKS5 listener for the concurrency regression test.
+    ///
+    /// Answers the SOCKS5 greeting (`[0x05, 0x00]`) so `wait_for_socks5`
+    /// passes, then holds open any connection that sends a CONNECT request
+    /// (the real-ping connection — the readiness probe closes right after the
+    /// greeting reply) without answering, until [`HoldingSocks::release_all`].
+    /// This gives the test a deterministic window during which the pooled
+    /// core is mid-`real_ping`.
+    struct HoldingSocks {
+        /// Signaled once a real-ping connection is being held open.
+        mid_ping: Arc<tokio::sync::Notify>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl HoldingSocks {
+        /// Bind the fake server on `127.0.0.1:10801` — the port the pooled
+        /// core from [`pool_with_core`] uses.
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 10801))
+                .await
+                .expect("bind fake socks5 server on pool core port");
+            let (release, release_rx) = tokio::sync::watch::channel(false);
+            let mid_ping = Arc::new(tokio::sync::Notify::new());
+            let mid_ping_task = mid_ping.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut release_rx = release_rx.clone();
+                    let mid_ping = mid_ping_task.clone();
+                    tokio::spawn(async move {
+                        let mut greeting = [0u8; 3];
+                        if stream.read_exact(&mut greeting).await.is_err() {
+                            return;
+                        }
+                        if stream.write_all(&[0x05, 0x00]).await.is_err() {
+                            return;
+                        }
+                        // Read the CONNECT header to tell the real-ping
+                        // connection apart from the readiness probe, which is
+                        // dropped right after the greeting reply.
+                        let mut head = [0u8; 4];
+                        if stream.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        mid_ping.notify_one();
+                        // Hold without answering CONNECT until released.
+                        while !*release_rx.borrow() {
+                            if release_rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self { mid_ping, release }
+        }
+
+        /// Wait until the first real-ping connection is held open — the first
+        /// ping is in flight with the pool lock held.
+        async fn await_mid_ping(&self) {
+            self.mid_ping.notified().await;
+        }
+
+        /// Close every held connection, failing the in-flight pings.
+        fn release_all(&self) {
+            let _ = self.release.send(true);
+        }
+    }
+
+    fn spawn_ping(
+        pool: Arc<CorePool>,
+        endpoint: Arc<Endpoint>,
+        link: Arc<ProfileStats>,
+        protocol: Arc<DbProtocol>,
+    ) -> tokio::task::JoinHandle<super::super::super::PingResult> {
+        tokio::spawn(async move {
+            // IP-literal URLs: reqwest's `socks5://` proxy resolves hostnames
+            // client-side, and the test must not depend on DNS.
+            pool.ping(
+                &endpoint,
+                &link,
+                &protocol,
+                SinglePingReq {
+                    ping_url: "http://127.0.0.1/",
+                    ip_api_url: "http://127.0.0.1/ip",
+                    timeout: Duration::from_secs(10),
+                    retries: 1,
+                },
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_pings_do_not_reload_core_mid_ping() {
+        // Regression (M7): with the pool lock held across the HTTP ping, a
+        // concurrent single ping must not be able to reload (stop/restart or
+        // SIGHUP) the same pooled core while the first ping's requests are in
+        // flight. The fake socks server holds the first ping mid-`real_ping`;
+        // if the lock were dropped early, the second ping would reload the
+        // core (a second stop) while the first was still in flight.
+        // Restored in T16: the reuse path drives ConfigBuilder::build, which
+        // only succeeds since the real inject_to impls (T14/15).
+        let server = HoldingSocks::start().await;
+        let (pool, stopped) = pool_with_core(Instant::now());
+        let pool = Arc::new(pool);
+        let (endpoint, link, protocol) = vless_endpoint_link_protocol();
+        let endpoint = Arc::new(endpoint);
+        let link = Arc::new(link);
+        let protocol = Arc::new(protocol);
+
+        let first = spawn_ping(
+            pool.clone(),
+            endpoint.clone(),
+            link.clone(),
+            protocol.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), server.await_mid_ping())
+            .await
+            .expect("first ping never reached real_ping");
+
+        let second = spawn_ping(
+            pool.clone(),
+            endpoint.clone(),
+            link.clone(),
+            protocol.clone(),
+        );
+        // Give the second ping time to reach the pool lock. With the fix it
+        // blocks there; without it, it would reload the core immediately.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            stopped.load(Ordering::Relaxed),
+            1,
+            "second ping must not reload the core while the first is in flight"
+        );
+
+        // Fail both in-flight pings, then let the second one run its reload.
+        server.release_all();
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.expect("first ping task panicked");
+        second_result.expect("second ping task panicked");
+
+        // Both pings eventually reloaded the core: exactly 2 stops total.
+        assert_eq!(stopped.load(Ordering::Relaxed), 2);
+    }
 }

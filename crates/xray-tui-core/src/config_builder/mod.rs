@@ -364,37 +364,144 @@ mod tests {
         (params, rules, dns)
     }
 
-    fn assert_unsupported(
+    pub(super) fn ss_config(method: &str) -> ProtocolConfig {
+        ProtocolConfig::Ss(xray_tui_proto::proto_spec::SsConfig {
+            method: method.into(),
+            password: "pw".to_string(),
+            security: SecurityConfig::default(),
+            remarks: None,
+            plugin: None,
+            plugin_opts: None,
+        })
+    }
+
+    /// A VLESS config whose security is `reality` without publicKey/SNI —
+    /// xray-core refuses it at build time (empty "realitySettings"/publicKey
+    /// kills the core at startup; the old builder rejected it too).
+    pub(super) fn vless_reality_without_key_config() -> ProtocolConfig {
+        ProtocolConfig::Vless(VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            uuid_origin: None,
+            security: SecurityConfig {
+                tls: Some(xray_tui_proto::proto_spec::common::TlsConfig::Reality(
+                    xray_tui_proto::proto_spec::common::RealityOpts::default(),
+                )),
+                enc: None,
+            },
+            transport: TransportConfig::Tcp,
+            encryption: None,
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        })
+    }
+
+    pub(super) fn hy2_config() -> ProtocolConfig {
+        ProtocolConfig::Hysteria2(xray_tui_proto::proto_spec::Hysteria2Config {
+            auth: "hy2-secret".to_string(),
+            security: SecurityConfig::default(),
+            obfs: None,
+            obfs_password: None,
+            up: None,
+            down: None,
+            hop_interval: None,
+            pin_sha256: None,
+            remarks: None,
+        })
+    }
+
+    pub(super) fn wg_config() -> ProtocolConfig {
+        ProtocolConfig::Wireguard(xray_tui_proto::proto_spec::WireguardConfig {
+            private_key: "abc123def456".to_string(),
+            security: SecurityConfig::default(),
+            address: "10.0.0.1/24".into(),
+            public_key: "pubkey789".to_string(),
+            preshared_key: Some("psk_value".to_string()),
+            reserved: Some("1,2,3".into()),
+            mtu: Some("1380".into()),
+            persistent_keepalive: Some(25),
+            dns: None,
+            remote_dns_resolve: None,
+            remarks: None,
+        })
+    }
+
+    /// Assert a successful dispatch build and the full-config skeleton: the
+    /// proxy outbound is present with the right protocol/type name, the
+    /// standard outbounds are present, and the top-level skeleton is intact.
+    fn assert_ok_dispatch(
         result: Result<BackendConfig, BuildError>,
-        kind: &str,
-        core: ProtoCoreType,
-    ) {
-        match result {
-            Err(BuildError::Support(SupportError::UnsupportedProtocol(k, c))) => {
-                assert_eq!(k, kind);
-                assert_eq!(c, core);
+        expected_core: ProtoCoreType,
+        expected_protocol: &str,
+        proxy_field: &str,
+    ) -> serde_json::Value {
+        let backend = result.unwrap_or_else(|e| panic!("build must succeed: {e}"));
+        assert_eq!(
+            backend.core_type(),
+            match expected_core {
+                ProtoCoreType::Xray => crate::core_type::CoreType::Xray,
+                ProtoCoreType::SingBox => crate::core_type::CoreType::SingBox,
             }
-            other => panic!("expected UnsupportedProtocol({kind}, {core:?}), got {other:?}"),
+        );
+        let json = match &backend {
+            BackendConfig::Xray(config) => serde_json::to_value(config).unwrap(),
+            BackendConfig::SingBox(config) => serde_json::to_value(config).unwrap(),
+        };
+        assert!(json.get("log").is_some(), "missing log");
+        assert!(json.get("inbounds").is_some(), "missing inbounds");
+        assert!(json.get("outbounds").is_some(), "missing outbounds");
+        assert!(json.get("dns").is_some(), "missing dns");
+        // xray uses "routing", sing-box uses "route".
+        assert!(
+            json.get("routing").is_some() || json.get("route").is_some(),
+            "missing routing/route"
+        );
+        let outbounds = json["outbounds"].as_array().expect("outbounds array");
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy outbound");
+        assert_eq!(
+            proxy[proxy_field].as_str().unwrap(),
+            expected_protocol,
+            "proxy protocol mismatch"
+        );
+        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
+        for required in ["direct", "block"] {
+            assert!(tags.contains(&required), "missing {required} outbound");
         }
+        json
     }
 
     #[test]
     fn build_xray_via_dispatch() {
-        // flip to success assertions in T16 (real inject_to lands in T14/15)
         let endpoint = endpoint("example.com", 443);
         let protocol = protocol(ProtocolKind::Vless, vless_config());
         let link = link(ProtoCoreType::Xray);
         let (params, rules, dns) = default_params();
-        assert_unsupported(
+        let json = assert_ok_dispatch(
             ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns),
-            "vless",
             ProtoCoreType::Xray,
+            "vless",
+            "protocol",
         );
+        // xray skeleton extras: stats/api/policy + the api inbound.
+        assert!(json.get("stats").is_some(), "missing stats");
+        assert!(json.get("api").is_some(), "missing api");
+        assert!(json.get("policy").is_some(), "missing policy");
+        let inbounds = json["inbounds"].as_array().unwrap();
+        assert!(inbounds.iter().any(|i| i["tag"] == "api"));
+        // vless identity in the settings block.
+        assert_eq!(
+            json["outbounds"][0]["settings"]["vnext"][0]["address"],
+            "example.com"
+        );
+        assert_eq!(json["outbounds"][0]["settings"]["vnext"][0]["port"], 443);
     }
 
     #[test]
     fn build_singbox_tuic_via_dispatch() {
-        // flip to success assertions in T16 (real inject_to lands in T14/15)
         let endpoint = endpoint("example.com", 443);
         let tuic = ProtocolConfig::Tuic(xray_tui_proto::proto_spec::TuicConfig {
             uuid: "00000000-0000-0000-0000-000000000000".to_string(),
@@ -407,11 +514,23 @@ mod tests {
         let protocol = protocol(ProtocolKind::Tuic, tuic);
         let link = link(ProtoCoreType::SingBox);
         let (params, rules, dns) = default_params();
-        assert_unsupported(
+        let json = assert_ok_dispatch(
             ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns),
-            "tuic",
             ProtoCoreType::SingBox,
+            "tuic",
+            "type",
         );
+        // sing-box skeleton extras: experimental.v2ray_api (listen + stats).
+        let exp = &json["experimental"];
+        assert_eq!(exp["v2ray_api"]["listen"], format!("127.0.0.1:{API_PORT}"));
+        assert_eq!(exp["v2ray_api"]["stats"]["enabled"], true);
+        // tuic identity in the outbound.
+        assert_eq!(
+            json["outbounds"][0]["uuid"],
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(json["outbounds"][0]["server"], "example.com");
+        assert_eq!(json["outbounds"][0]["server_port"], 443);
     }
 
     #[test]

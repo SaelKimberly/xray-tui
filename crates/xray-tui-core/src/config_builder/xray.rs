@@ -457,20 +457,31 @@ mod tests {
     }
 
     #[test]
-    fn xray_build_returns_unsupported_protocol_until_inject() {
-        // flip to success assertions in T16 (real inject_to lands in T14/15)
+    fn xray_build_vless_full_config() {
+        // Real inject_to (T14) now builds the full vless outbound; assert the
+        // complete config, not an error.
         let (endpoint, protocol, link) = test_endpoint_protocol_link();
         let (params, rules, dns) = super::super::tests::default_params();
-        let result =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns);
-        match result {
-            Err(BuildError::Support(
-                xray_tui_proto::proto_spec::SupportError::UnsupportedProtocol(kind, core),
-            )) => {
-                assert_eq!(kind, "vless");
-                assert_eq!(core, ProtoCoreType::Xray);
-            }
-            other => panic!("expected UnsupportedProtocol, got {other:?}"),
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+                .expect("vless xray build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        assert_xray_top_level(&json);
+        let outbounds = json["outbounds"].as_array().unwrap();
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy outbound");
+        assert_eq!(proxy["protocol"], "vless");
+        assert_eq!(proxy["settings"]["vnext"][0]["address"], "example.com");
+        assert_eq!(proxy["settings"]["vnext"][0]["port"], 443);
+        assert_eq!(
+            proxy["settings"]["vnext"][0]["users"][0]["id"],
+            "00000000-0000-0000-0000-000000000000"
+        );
+        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
+        for required in ["dns-out", "direct", "block"] {
+            assert!(tags.contains(&required), "missing {required} outbound");
         }
     }
 
@@ -486,6 +497,114 @@ mod tests {
         assert!(
             err.to_string().contains("not loaded"),
             "error must mention the unloaded config: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_rejects_reality_without_public_key() {
+        // Restores the T13-removed old-builder test: a vless reality profile
+        // without publicKey/SNI kills xray-core at startup (empty
+        // "realitySettings"/"password"), so the builder refuses it as a
+        // SupportError::Config — real validation, not a stub error.
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Vless,
+            super::super::tests::vless_reality_without_key_config(),
+        );
+        let link = super::super::tests::link(ProtoCoreType::Xray);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let err =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+                .expect_err("reality without publicKey must be rejected");
+        assert!(
+            err.to_string().contains("reality"),
+            "error must mention reality: {err}"
+        );
+        assert!(matches!(
+            err,
+            BuildError::Support(xray_tui_proto::proto_spec::SupportError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn xray_shadowsocks_rejects_unsupported_cipher() {
+        // aes-256-cfb is not in xray-core's CipherType enum — build-time
+        // refusal (old builder behavior: the core would die on startup).
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Shadowsocks,
+            super::super::tests::ss_config("aes-256-cfb"),
+        );
+        let link = super::super::tests::link(ProtoCoreType::Xray);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let err =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+                .expect_err("xray-core cannot build aes-256-cfb");
+        assert!(
+            err.to_string().contains("aes-256-cfb"),
+            "error must name the cipher: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_shadowsocks2022_builds() {
+        // xray-core builds 2022-blake3 ciphers under protocol "shadowsocks".
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Shadowsocks2022,
+            super::super::tests::ss_config("2022-blake3-aes-128-gcm"),
+        );
+        let link = super::super::tests::link(ProtoCoreType::Xray);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+                .expect("ss-2022 xray build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["protocol"], "shadowsocks");
+        assert_eq!(
+            proxy["settings"]["servers"][0]["method"],
+            "2022-blake3-aes-128-gcm"
+        );
+    }
+
+    #[test]
+    fn xray_hysteria2_full_config() {
+        // Restores the old xray_hysteria2_config test on the typed config.
+        let endpoint = super::super::tests::endpoint("example.com", 443);
+        let protocol = super::super::tests::protocol(
+            ProtocolKind::Hysteria2,
+            super::super::tests::hy2_config(),
+        );
+        let link = super::super::tests::link(ProtoCoreType::Xray);
+        let (params, rules, dns) = super::super::tests::default_params();
+        let config =
+            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+                .expect("hy2 xray build must succeed");
+        let json = serde_json::to_value(&config).unwrap();
+        assert_xray_top_level(&json);
+        let proxy = json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy outbound");
+        assert_eq!(proxy["protocol"], "hysteria2");
+        assert_eq!(proxy["settings"]["auth"], "hy2-secret");
+        assert_eq!(proxy["settings"]["version"], 2);
+        // TLS placement (Task 16): xray-core hysteria settings carry no TLS
+        // (HysteriaClientConfig = {version, address, port}); TLS belongs in
+        // streamSettings only.
+        assert!(proxy["settings"].get("tls").is_none(), "no TLS in settings");
+        assert!(
+            proxy["stream_settings"].is_null(),
+            "no streamSettings without TLS/transport: {}",
+            proxy["stream_settings"]
         );
     }
 
