@@ -585,10 +585,10 @@ fn validate_required_fields(parsed: &ParsedProto) -> Result<(), String> {
 
 /// Validate the primary endpoint host is not unspecified/private/loopback/link-local.
 ///
-/// The typed parse boundary already rejects private/loopback/link-local and
-/// "localhost" hosts (T4/T5); this layer additionally enforces the hard
-/// unspecified-address rule and the `allow_private_ips` setting for any host
-/// that reached the config layer.
+/// This config layer is the single authority for host policy (T11 moved it
+/// out of the parse boundary): the hard unspecified-address rule applies to
+/// every host, and the `allow_private_ips` setting gates private, loopback,
+/// link-local, and "localhost" hosts.
 fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<(), ImportError> {
     let Some(endpoint) = parsed.endpoints.first() else {
         return Ok(()); // no address to validate

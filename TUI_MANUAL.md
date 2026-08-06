@@ -33,7 +33,7 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | `]=>{`       | 4     | Bracket decoration                          |
 | (config)     | 12    | `transport/security`, center-aligned        |
 | `}=>`        | 3     | Bracket decoration                          |
-| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (every protocol of the endpoint unreachable for that test). Labels come from the persisted per-protocol failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
+| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (any protocol of the endpoint carries that persisted failure marker; real over fast precedence). Labels come from the persisted per-link failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
 | `[`          | 1     | Bracket decoration (Outbound opener)        |
 | `Outbound`   | 16    | Exit IP from the last real ping (`—` none)  |
 | `Country`    | 7     | Exit country flag + ISO (`—` none)          |
@@ -546,7 +546,7 @@ appended when updates are available for installed backends.
 3. **Edit:** select a group, press `e`, modify fields, `Enter` saves
 4. **Update:** press `u` to fetch the latest subscriptions for every group
 5. **Delete:** select a group, press `d`, confirm with `y`, cancel with `n`/`Esc`
-6. Press `Esc` to return to the settings menu (or `q`/`Ctrl+C` to leave Settings)
+6. Press `Esc` twice to return to the profile list, or `Ctrl+C` to quit the app
 
 Group filtering on the Profiles tab is done with `p` (cycle Active → Stale →
 All views) and `/` (search); the per-group filter keys were removed.

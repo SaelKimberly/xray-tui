@@ -433,10 +433,12 @@ pub fn collapse_expand(state: &mut AppState) {
 /// The settings JSON is assembled with the same key routing the legacy
 /// producer used (so `build_typed_config` accepts it), with the F6 fix from
 /// T12: the tuic `password` field routes into `protocol_settings.password`
-/// instead of clobbering the top-level `user_id` (uuid). The form's
-/// `core_type` selection is returned separately — it flows into the per-pair
-/// `link.core_type` (the config builder takes the core from the link), never
-/// into the typed config.
+/// instead of clobbering the top-level `user_id` (uuid). The vmess/vless
+/// form's transport `network` select routes into
+/// `protocol_settings.network` (I1) — the T12 mapper builds the typed
+/// transport from it. The form's `core_type` selection is returned
+/// separately — it flows into the per-pair `link.core_type` (the config
+/// builder takes the core from the link), never into the typed config.
 ///
 /// # Errors
 ///
@@ -473,9 +475,18 @@ pub fn fields_to_parsed(
             serde_json::Value::String(value.clone())
         };
         match key.as_str() {
+            // The vmess/vless form's transport `network` select is a real
+            // setting: routed into `protocol_settings.network` so the T12
+            // mapper builds the typed transport from it (network=kcp → Kcp;
+            // network=tcp with stale ws.*/grpc.* keys stays Tcp). Other
+            // kinds' `network` fields are Profile columns — dropped (edit
+            // forms seed network from `transport_type()`, e.g. trojan "tcp",
+            // hy/hy2/tuic "quic", and those mappers do not accept the key).
+            "network" if matches!(kind, ProtocolKind::Vless | ProtocolKind::Vmess) => {
+                proto_map.insert(key.clone(), json_val);
+            }
             // Profile-column / edit-form plumbing fields — never in the
-            // settings JSON (the mapper infers transport from ws/grpc keys;
-            // vmess encryption defaults to auto).
+            // settings JSON (vmess encryption defaults to auto).
             "address" | "port" | "security" | "network" | "config_type" => {}
             "core_type" => core_type.clone_from(value),
             // F6: tuic's `password` is a protocol_setting credential (its

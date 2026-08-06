@@ -79,8 +79,10 @@ pub struct ProtocolEssentials {
   protocol (encrypted config). Zero-endpoint protocols produce an orphan
   `Protocol` row (no `ProfileStats` link) — schema must allow it. TUI
   presentation of orphan protocols is deferred until such a protocol exists.
-- Natural keys prevent duplicate protocol configs: endpoint natural key is
-  `(host, host_type, ports)`; protocol natural key is `uid`.
+- Natural keys prevent duplicate protocol configs: endpoint id is
+  `stable_hash(host, primary_port)` — `host_type` is host-derived, and
+  multi-port specs sharing a primary port merge (last import wins on
+  `ports`); protocol natural key is `uid`.
 - `ProtocolEssentials.config` is the identity-hashed payload; the DB's cached
   `transport`/`security` embed columns (type, sni, fp, insecure + JSON data)
   are derived from it at write time via config accessors
@@ -173,7 +175,7 @@ column (`latency_delay`); only the active variant's columns are non-null.
 ```rust
 #[derive(toasty::Model)]
 struct Endpoint {
-    #[key] id: EndpointId,                  // newtype(i64), never zero; stable_hash(host, host_type, ports)
+    #[key] id: EndpointId,                  // newtype(i64), never zero; stable_hash(host, primary_port)
     host: String,
     host_type: HostType,
     port: u16,                              // primary port; 0 for undefined
@@ -379,9 +381,10 @@ replaced by per-pair tasks:
 
 ### 6.4 Labels and persistence
 
-- `[real]` / `[fast]` labels render when every protocol of the endpoint has
-  `error.kind == Real` / `Fast` for that test. `[name]` renders when the
-  endpoint is DNS-unresolved (`resolved_as` empty). Tier/sort logic reads
+- Labels render from the persisted per-link `error.kind` markers: `[real]`
+  when any link carries a Real marker, `[fast]` when any carries Fast (real
+  over fast precedence), `[name]` when the endpoint is DNS-unresolved
+  (`resolved_as` empty). Tier/sort logic reads
   persisted rows (`latency`, `error.kind`, `resolved_as`) instead of
   session-only round sets. Note: the tier fn checks the endpoint-level
   `resolved_as`-empty flag FIRST (tier 5); `error.kind == ProfileErr::Name` on

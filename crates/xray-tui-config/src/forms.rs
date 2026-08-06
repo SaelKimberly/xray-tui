@@ -1510,36 +1510,53 @@ fn tls_opts_always_tls(ps: &SettingsMap, ss: &SettingsMap, with_alpn: bool) -> T
     }
 }
 
-/// Transport from the form's stream keys. Presence of `ws.*`/`grpc.*` keys
-/// selects that transport — the form's `network` select is a Profile column
-/// that `fields_to_profile` drops, so it is unrecoverable here; defaults to
-/// Tcp. Returns the top-level `path` the vless/vmess configs carry for
-/// reconstruct parity (ws path / grpc serviceName).
-fn transport_and_path(ss: &SettingsMap) -> (TransportConfig, Option<TinyText>) {
-    if ss.contains_key("ws.path") || ss.contains_key("ws.host") {
-        let path = opt_text(ss.get("ws.path"));
-        (
-            TransportConfig::Ws(WebSocketConfig {
-                path: path.clone(),
-                host: opt_text(ss.get("ws.host")),
-                ..Default::default()
-            }),
-            path,
-        )
-    } else if let Some(sn) = opt_text(ss.get("grpc.serviceName")) {
+/// Transport from the form's stream keys and `network` select. The form's
+/// `network` select is routed by `fields_to_parsed` into
+/// `protocol_settings.network` and is authoritative when present: network=kcp
+/// selects `Kcp`, network=tcp overrides leftover `ws.*`/`grpc.*` keys, and
+/// the `ws.*`/`grpc.*` payload keys still fill their configs. When `network`
+/// is absent (legacy producers) transport is inferred from key presence;
+/// defaults to Tcp. Returns the top-level `path` the vless/vmess configs
+/// carry for reconstruct parity (ws path / grpc serviceName).
+fn transport_and_path(ps: &SettingsMap, ss: &SettingsMap) -> (TransportConfig, Option<TinyText>) {
+    let ws_payload = || {
+        TransportConfig::Ws(WebSocketConfig {
+            path: opt_text(ss.get("ws.path")),
+            host: opt_text(ss.get("ws.host")),
+            ..Default::default()
+        })
+    };
+    let grpc_payload = || {
         // serviceName doubles as the gRPC path (share-link convention) so
         // reconstruct emits `path=` while the builders emit `serviceName`.
-        (
-            TransportConfig::Grpc(GrpcConfig {
-                service_name: Some(sn.clone()),
-                path: Some(sn.clone()),
-                ..Default::default()
-            }),
-            Some(sn),
-        )
-    } else {
-        (TransportConfig::Tcp, None)
-    }
+        let sn = opt_string(ss.get("grpc.serviceName"));
+        TransportConfig::Grpc(GrpcConfig {
+            service_name: sn.clone().map(TinyText::from),
+            path: sn.clone().map(TinyText::from),
+            ..Default::default()
+        })
+    };
+    let transport = match opt_string(ps.get("network")).as_deref() {
+        // Explicit form selection — authoritative over key presence.
+        Some("ws" | "websocket") => ws_payload(),
+        Some("grpc") => grpc_payload(),
+        // kcp/http/h2/quic (and httpupgrade) map to their typed variants via
+        // the parser's transport mapping; unknown values degrade to Tcp.
+        Some(other) => TransportConfig::from_type_and_path(Some(other), None)
+            .ok()
+            .flatten()
+            .unwrap_or(TransportConfig::Tcp),
+        // No `network` key (legacy producers): infer from ws/grpc keys.
+        None if ss.contains_key("ws.path") || ss.contains_key("ws.host") => ws_payload(),
+        None if opt_string(ss.get("grpc.serviceName")).is_some() => grpc_payload(),
+        None => TransportConfig::Tcp,
+    };
+    let path = match &transport {
+        TransportConfig::Ws(ws) => ws.path.clone(),
+        TransportConfig::Grpc(g) => g.path.clone(),
+        _ => None,
+    };
+    (transport, path)
 }
 
 /// Endpoint essentials from the form's address/port — host-kind detection
@@ -1644,6 +1661,8 @@ fn vless_from_form(
         "vless",
         ps,
         &[
+            // The producer routes the form's `network` select here (I1).
+            "network",
             "flow",
             "pin_sha256",
             "ech.enable",
@@ -1669,7 +1688,7 @@ fn vless_from_form(
         ],
     )?;
     let uuid = req_string("vless", "user_id", user_id)?;
-    let (transport, path) = transport_and_path(ss);
+    let (transport, path) = transport_and_path(ps, ss);
     let security = tls_security_from_stream(ps, ss);
     Ok(VlessConfig {
         uuid,
@@ -1714,6 +1733,8 @@ fn vmess_from_form(
         "vmess",
         ps,
         &[
+            // The producer routes the form's `network` select here (I1).
+            "network",
             "pin_sha256",
             "ech.enable",
             "ech.config",
@@ -1744,7 +1765,7 @@ fn vmess_from_form(
         ],
     )?;
     let uuid = req_string("vmess", "user_id", user_id)?;
-    let (transport, path) = transport_and_path(ss);
+    let (transport, path) = transport_and_path(ps, ss);
     let mut security = tls_security_from_stream(ps, ss);
     // Encryption is a Profile column in fields_to_profile (never lands in the
     // settings JSON); "auto" is the parser default and what the vmess builder
@@ -2270,9 +2291,12 @@ mod tests {
 
     // ── T12: typed config builders ────────────────────────────────────
 
-    /// Replicates `fields_to_profile` (crates/xray-tui/src/ops/profiles.rs)
+    /// Replicates `fields_to_parsed` (crates/xray-tui/src/ops/profiles.rs)
     /// EXACTLY: empty values skipped; `user_id`/`password`/`uuid` → top-level
-    /// `user_id`; `address`/`port`/`core_type`/`security`/`network` are
+    /// `user_id`; `network` → `protocol_settings` (the vmess/vless transport
+    /// select; placeholder kinds accept any key in their raw passthrough, so
+    /// the unconditional routing is equivalent for them — the real producer
+    /// gates it to Vless/Vmess); `address`/`port`/`core_type`/`security` are
     /// profile columns (never in the maps); `tls.`/`ws.`/`grpc.`/`reality.`/
     /// `tcp.` prefixes + exact `sni`/`alpn`/`fingerprint`/`allow_insecure` →
     /// `stream_settings`; everything else → `protocol_settings`. "true"/
@@ -2296,7 +2320,10 @@ mod tests {
             };
             match key {
                 "user_id" | "password" | "uuid" => user_id = Some(value.to_string()),
-                "address" | "port" | "core_type" | "security" | "network" => {}
+                "network" => {
+                    proto_map.insert(key.to_string(), json_val);
+                }
+                "address" | "port" | "core_type" | "security" => {}
                 _ if key.starts_with("tls.")
                     || key.starts_with("ws.")
                     || key.starts_with("grpc.")
@@ -2462,6 +2489,116 @@ mod tests {
         assert_eq!(g.service_name.as_deref(), Some("myservice"));
         // path doubles as serviceName (share-link convention).
         assert_eq!(c.path.as_deref(), Some("myservice"));
+    }
+
+    #[test]
+    fn build_vless_network_ws_with_path() {
+        // The form's `network` select routes to protocol_settings.network
+        // (I1); network=ws selects Ws even though ws.* keys also present.
+        let parsed = built(
+            ProtocolKind::Vless,
+            &producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("network", "ws"),
+                ("ws.path", "/ws"),
+                ("ws.host", "cdn.example.com"),
+            ]),
+        );
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        let TransportConfig::Ws(ws) = &c.transport else {
+            panic!("expected ws transport (network=ws)");
+        };
+        assert_eq!(ws.path.as_deref(), Some("/ws"));
+        assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+        assert_eq!(c.path.as_deref(), Some("/ws"));
+    }
+
+    #[test]
+    fn build_vless_network_kcp() {
+        // network=kcp selects the Kcp variant (no ws/grpc keys involved).
+        let parsed = built(
+            ProtocolKind::Vless,
+            &producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("network", "kcp"),
+            ]),
+        );
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        assert!(matches!(c.transport, TransportConfig::Kcp(_)));
+        assert_eq!(c.path, None);
+    }
+
+    #[test]
+    fn build_vmess_network_tcp_ignores_stale_ws() {
+        // network=tcp is authoritative: leftover ws.* keys must not override
+        // the explicit TCP selection (the I1 regression).
+        let parsed = built(
+            ProtocolKind::Vmess,
+            &producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("network", "tcp"),
+                ("ws.path", "/stale"),
+                ("ws.host", "old.example.com"),
+            ]),
+        );
+        let ProtocolConfig::Vmess(c) = &parsed.protocol.config else {
+            panic!("expected Vmess config");
+        };
+        assert!(matches!(c.transport, TransportConfig::Tcp));
+        assert_eq!(c.path, None);
+        assert_eq!(c.security.enc.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn build_vless_network_h2_maps_http() {
+        // h2 has no dedicated TransportConfig variant — maps to Http (the
+        // closest real variant, same as the parser's from_type_and_path).
+        let parsed = built(
+            ProtocolKind::Vless,
+            &producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("network", "h2"),
+            ]),
+        );
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        assert!(matches!(c.transport, TransportConfig::Http(_)));
+    }
+
+    #[test]
+    fn build_vless_network_quic() {
+        let parsed = built(
+            ProtocolKind::Vless,
+            &producer_settings(&[
+                ("user_id", "6202b230-417c-4d8e-b624-0f71afa9c75d"),
+                ("network", "quic"),
+            ]),
+        );
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        assert!(matches!(c.transport, TransportConfig::Quic));
+    }
+
+    #[test]
+    fn build_vless_network_unknown_falls_back_tcp() {
+        // A raw (non-producer) settings payload with an unknown network value
+        // degrades to Tcp instead of erroring — same policy as the parser.
+        let raw = raw_settings(
+            Some("uuid"),
+            &[("network", Value::String("bogus".into()))],
+            &[],
+        );
+        let parsed = built(ProtocolKind::Vless, &raw);
+        let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
+            panic!("expected Vless config");
+        };
+        assert!(matches!(c.transport, TransportConfig::Tcp));
     }
 
     #[test]
