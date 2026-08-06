@@ -270,19 +270,26 @@ mod tests {
     #[test]
     fn format_ts_renders_local_yyyymmdd_hhmmss() {
         // The agreed shape is "YYYY-MM-DD HH:MM:SS" in the system local
-        // zone — a fixed Timestamp renders its zoned civil time, so the
-        // expectation is derived through the same conversion (TZ-agnostic).
+        // zone. The output is TZ-dependent by design, so the shape is pinned
+        // and correctness is verified by a round-trip: parsing the rendered
+        // local civil time in the system zone must recover the exact instant
+        // (a UTC-only formatter would fail this whenever TZ != UTC).
         let ts = jiff::Timestamp::from_second(1_752_595_200).expect("valid ts");
-        let expected = ts
+        let s = format_ts(&ts);
+        assert_eq!(s.len(), 19, "YYYY-MM-DD HH:MM:SS is 19 chars");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], " ");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+        let parsed = jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", &s)
+            .expect("parse format_ts output")
             .to_zoned(jiff::tz::TimeZone::system())
-            .strftime("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        assert_eq!(format_ts(&ts), expected);
-        assert_eq!(expected.len(), 19, "YYYY-MM-DD HH:MM:SS is 19 chars");
-        assert_eq!(&expected[4..5], "-");
-        assert_eq!(&expected[7..8], "-");
-        assert_eq!(&expected[10..11], " ");
-        assert_eq!(&expected[13..14], ":");
-        assert_eq!(&expected[16..17], ":");
+            .expect("local zoned conversion")
+            .timestamp();
+        assert_eq!(
+            parsed, ts,
+            "rendered local time must round-trip to the same instant"
+        );
     }
 }

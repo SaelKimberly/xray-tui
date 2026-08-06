@@ -16,6 +16,23 @@ use crate::types::CoreEvent;
 use crate::{ClashTraffic, try_send_or_warn};
 use futures_util::StreamExt;
 
+/// Map one sing-box clash `/traffic` line to its `StatsUpdate` event.
+///
+/// sing-box emits one JSON line per second with that second's traffic delta
+/// since the previous line, so the event carries the per-line delta — the
+/// same semantics as the xray gRPC poller (`query_stats(..., reset = true)`).
+/// The events handler accumulates deltas into the persisted row; sending a
+/// cumulative session total here would double-count on every event.
+fn clash_stats_event(protocol_id: i64, t: &ClashTraffic) -> CoreEvent {
+    CoreEvent::StatsUpdate {
+        protocol_id,
+        today_up: t.up,
+        today_down: t.down,
+        total_up: t.up,
+        total_down: t.down,
+    }
+}
+
 /// Connect to a profile by starting the appropriate core (xray-core or sing-box).
 pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     if state.connecting {
@@ -353,8 +370,6 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                 Ok(resp) => {
                     let mut stream = Box::pin(resp.bytes_stream());
                     let mut buf = Vec::new();
-                    let mut session_up: i64 = 0;
-                    let mut session_down: i64 = 0;
                     loop {
                         tokio::select! {
                             _ = &mut stop_rx => break,
@@ -366,15 +381,18 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                                             let line = buf.drain(..=pos).collect::<Vec<_>>();
                                             let trimmed = line.as_slice().trim_ascii();
                                             if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
-                                                session_up += t.up;
-                                                session_down += t.down;
-                                                try_send_or_warn(&tx, CoreEvent::StatsUpdate {
-                                                    protocol_id: profile_id,
-                                                    today_up: session_up,
-                                                    today_down: session_down,
-                                                    total_up: session_up,
-                                                    total_down: session_down,
-                                                }, "clash_stats_update");
+                                                // Per-line deltas (sing-box
+                                                // emits each second's traffic
+                                                // since the last line) — the
+                                                // same delta semantics as the
+                                                // xray gRPC poller, so the
+                                                // stats handler's accumulation
+                                                // never double-counts.
+                                                try_send_or_warn(
+                                                    &tx,
+                                                    clash_stats_event(profile_id, &t),
+                                                    "clash_stats_update",
+                                                );
                                             }
                                         }
                                     }
@@ -423,4 +441,45 @@ pub fn disconnect(state: &mut AppState) {
     state.connected_protocol_id = None;
     state.connecting = false;
     state.log_trace("info", "core::process", "Disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clash_traffic_lines_map_to_per_line_deltas() {
+        // sing-box `/traffic` emits one JSON line per second carrying that
+        // second's delta. Two lines must produce two delta events (100, 50) —
+        // never the running session total (100, 150) — or the stats handler's
+        // accumulation would double-count on every event.
+        let lines = [
+            br#"{"up":100,"down":200}"#.as_slice(),
+            br#"{"up":50,"down":75}"#.as_slice(),
+        ];
+        let events: Vec<CoreEvent> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_slice::<ClashTraffic>(line).ok())
+            .map(|t| clash_stats_event(7, &t))
+            .collect();
+        assert_eq!(events.len(), 2, "both lines parsed");
+        let fields: Vec<(i64, i64, i64, i64, i64)> = events
+            .iter()
+            .map(|e| match e {
+                CoreEvent::StatsUpdate {
+                    protocol_id,
+                    today_up,
+                    today_down,
+                    total_up,
+                    total_down,
+                } => (*protocol_id, *today_up, *today_down, *total_up, *total_down),
+                other => panic!("expected StatsUpdate, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![(7, 100, 200, 100, 200), (7, 50, 75, 50, 75)],
+            "each event carries only that line's delta"
+        );
+    }
 }
