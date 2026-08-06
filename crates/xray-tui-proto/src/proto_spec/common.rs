@@ -996,6 +996,118 @@ pub(crate) fn to_singbox_tls_or_default(
     })
 }
 
+/// Build the sing-box `transport` block (`V2RayTransportOptions`) for the
+/// vless/vmess/trojan outbounds.
+///
+/// Shape per `thirdparty/sing-box/option/v2ray_transport.go` +
+/// `docs/configuration/shared/v2ray-transport.md`:
+///
+/// | Typed transport | sing-box emission |
+/// |-----------------|--------------------|
+/// | `Tcp`           | `None` — tcp is the sing-box default, no `transport` key |
+/// | `Ws`            | `{ type: "ws", path, headers: { Host, … }, max_early_data, early_data_header_name }` |
+/// | `Grpc`          | `{ type: "grpc", service_name }` (share-link convention: the typed `path` doubles as the service name) |
+/// | `Http`          | `{ type: "http", host: [...], path, method, headers }` |
+/// | `HttpUpgrade`   | `{ type: "httpupgrade", host, path, headers }` |
+/// | `Quic`          | `{ type: "quic" }` |
+/// | `Kcp`/`XHttp`   | build-time refusal — not in the vendored sing-box transport set |
+///
+/// Host-bearing fields come from the (host-injected) transport; callers apply
+/// `TransportConfig::with_host(endpoint.host, …)` first so unset host fields
+/// filled from the endpoint at build time (host-free parse mandate).
+///
+/// # Errors
+///
+/// Returns [`SupportError::Config`] when the transport cannot be mapped to
+/// the vendored sing-box transport set (`kcp`/`xhttp`).
+pub(crate) fn to_singbox_transport(
+    transport: &TransportConfig,
+) -> Result<Option<serde_json::Value>, SupportError> {
+    let mut obj = serde_json::Map::new();
+    match transport {
+        TransportConfig::Tcp => return Ok(None),
+        TransportConfig::Ws(cfg) => {
+            obj.insert("type".into(), serde_json::json!("ws"));
+            if let Some(p) = &cfg.path {
+                obj.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            // sing-box has no top-level ws host field — the vhost goes into
+            // the `headers` map (Host header), merged over any extra headers.
+            let mut headers = cfg.headers.clone().unwrap_or_default();
+            if let Some(h) = &cfg.host {
+                headers.insert("Host".to_string(), h.to_string());
+            }
+            if !headers.is_empty() {
+                obj.insert("headers".into(), serde_json::json!(headers));
+            }
+            if let Some(med) = cfg.max_early_data {
+                obj.insert("max_early_data".into(), serde_json::json!(med));
+            }
+            if let Some(name) = &cfg.early_data_header_name {
+                obj.insert(
+                    "early_data_header_name".into(),
+                    serde_json::json!(name.as_str()),
+                );
+            }
+        }
+        TransportConfig::Grpc(cfg) => {
+            obj.insert("type".into(), serde_json::json!("grpc"));
+            // `service_name` for forms-built configs; URL share links carry
+            // the service name in `path` (share-link convention).
+            if let Some(sn) = cfg.service_name.as_ref().or(cfg.path.as_ref()) {
+                obj.insert("service_name".into(), serde_json::json!(sn.as_str()));
+            }
+        }
+        TransportConfig::Http(cfg) => {
+            obj.insert("type".into(), serde_json::json!("http"));
+            if let Some(host) = &cfg.host {
+                obj.insert("host".into(), serde_json::json!([host.as_str()]));
+            }
+            if let Some(p) = &cfg.path {
+                obj.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            if let Some(m) = &cfg.method {
+                obj.insert("method".into(), serde_json::json!(m.as_str()));
+            }
+            if let Some(headers) = &cfg.headers
+                && !headers.is_empty()
+            {
+                obj.insert("headers".into(), serde_json::json!(headers));
+            }
+        }
+        TransportConfig::HttpUpgrade(cfg) => {
+            obj.insert("type".into(), serde_json::json!("httpupgrade"));
+            if let Some(host) = &cfg.host {
+                obj.insert("host".into(), serde_json::json!(host.as_str()));
+            }
+            if let Some(p) = &cfg.path {
+                obj.insert("path".into(), serde_json::json!(p.as_str()));
+            }
+            if let Some(headers) = &cfg.headers
+                && !headers.is_empty()
+            {
+                obj.insert("headers".into(), serde_json::json!(headers));
+            }
+        }
+        TransportConfig::Quic => {
+            obj.insert("type".into(), serde_json::json!("quic"));
+        }
+        TransportConfig::Kcp(_) => {
+            return Err(SupportError::Config(
+                "kcp transport is not supported by sing-box (no mKCP in the vendored transport set)"
+                    .into(),
+            ));
+        }
+        TransportConfig::XHttp(_) => {
+            return Err(SupportError::Config(
+                "xhttp/splithttp transport is not supported by sing-box (no XHTTP in the vendored transport set)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(Some(serde_json::Value::Object(obj)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

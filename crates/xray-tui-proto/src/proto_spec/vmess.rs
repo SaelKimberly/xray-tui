@@ -59,7 +59,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure, to_singbox_tls,
-    to_xray_stream_settings, validate_xray_reality,
+    to_singbox_transport, to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
@@ -699,8 +699,10 @@ impl VmessConfig {
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Vmess` arm (`uuid` + hard-coded `security`
     /// "auto" — here sourced from the typed `enc`, which the old builder
-    /// TODO'd — plus TLS via the shared helper). The typed `transport`/
-    /// `alter_id` have no sing-box emission (the old builder dropped them).
+    /// TODO'd — plus TLS via the shared helper) and the typed `transport`
+    /// (sing-box `V2RayTransportOptions`; `kcp`/`xhttp` refuse at build
+    /// time). `alter_id` has no sing-box emission (the old builder dropped
+    /// it).
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
@@ -711,6 +713,13 @@ impl VmessConfig {
             return Err(SupportError::MissingField("server", "vmess"));
         };
         let enc = self.security.enc.as_deref().unwrap_or("auto");
+        // Transport host left unset by the host-free parse mandate is filled
+        // at build time (never mutating the stored config) — same rule as the
+        // xray arm.
+        let transport = self
+            .transport
+            .clone()
+            .with_host(Some(ep.host.clone()), None, None);
         let mut out = json!({
             "tag": "proxy",
             "type": "vmess",
@@ -721,6 +730,9 @@ impl VmessConfig {
         });
         if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
             out["tls"] = tls;
+        }
+        if let Some(transport) = to_singbox_transport(&transport)? {
+            out["transport"] = transport;
         }
         *core_conf = out;
         Ok(())
@@ -1344,6 +1356,29 @@ mod tests {
         )
         .expect("vmess sing-box inject");
         assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_grpc_transport() {
+        // grpc service name rides in the share-link `path`; the mapper emits
+        // the sing-box V2RayGRPCOptions.service_name.
+        let cfg = config(parse(&vmess_url(
+            "example.com",
+            443,
+            UUID,
+            &[("net", "grpc"), ("path", "svc")],
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("vmess grpc sing-box inject");
+        let transport = &conf["transport"];
+        assert_eq!(transport["type"], "grpc");
+        assert_eq!(transport["service_name"], "svc");
     }
 
     #[test]

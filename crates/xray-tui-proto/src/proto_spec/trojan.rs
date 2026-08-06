@@ -44,7 +44,8 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
-    should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings, validate_xray_reality,
+    should_skip_endpoint_param, to_singbox_tls, to_singbox_transport, to_xray_stream_settings,
+    validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
@@ -614,8 +615,8 @@ impl TrojanConfig {
 
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Trojan` arm (`password` + TLS via the shared
-    /// helper). The typed `transport` has no sing-box emission (the old
-    /// builder dropped it too).
+    /// helper) plus the typed `transport` (sing-box `V2RayTransportOptions`;
+    /// `kcp`/`xhttp` refuse at build time).
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
@@ -625,6 +626,13 @@ impl TrojanConfig {
         let Some(ep) = endpoint else {
             return Err(SupportError::MissingField("server", "trojan"));
         };
+        // Transport host left unset by the host-free parse mandate is filled
+        // at build time (never mutating the stored config) — same rule as the
+        // xray arm.
+        let transport = self
+            .transport
+            .clone()
+            .with_host(Some(ep.host.clone()), None, None);
         let mut out = json!({
             "tag": "proxy",
             "type": "trojan",
@@ -634,6 +642,9 @@ impl TrojanConfig {
         });
         if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
             out["tls"] = tls;
+        }
+        if let Some(transport) = to_singbox_transport(&transport)? {
+            out["transport"] = transport;
         }
         *core_conf = out;
         Ok(())
@@ -1054,6 +1065,29 @@ mod tests {
         )
         .expect("trojan sing-box inject");
         assert_eq!(conf["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn singbox_inject_tcp_omits_transport() {
+        // Plain TCP is the sing-box default — no transport key, even when a
+        // TLS block is present.
+        let cfg = config(parse(
+            "trojan://humanity@172.64.152.23:443?security=tls&type=tcp&sni=www.creationlong.org",
+        ));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("172.64.152.23", 443)),
+            InjectOptions::default(),
+        )
+        .expect("trojan tcp sing-box inject");
+        assert_eq!(conf["type"], "trojan");
+        assert_eq!(conf["tls"]["enabled"], true);
+        assert!(
+            conf.get("transport").is_none(),
+            "tcp must not emit a transport key: {conf}"
+        );
     }
 
     #[test]

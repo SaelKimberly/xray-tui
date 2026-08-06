@@ -475,6 +475,13 @@ impl Hysteria2Config {
     /// xray builder's `Protocol::Hysteria2` arm (`version`/`address`/`port`/
     /// `auth`). The typed config carries no transport — only the TLS block
     /// can appear in streamSettings (QUIC network is implied).
+    ///
+    /// TLS placement (Task 16 ruling): xray-core's hysteria outbound settings
+    /// schema (`infra/conf/hysteria.go` `HysteriaClientConfig`) is
+    /// `{version, address, port}` — no TLS keys; TLS is uniformly a
+    /// streamSettings concern (`security` + `tlsSettings` via
+    /// `StreamConfig.Build`). streamSettings is therefore correct; `settings`
+    /// must never carry TLS.
     fn inject_xray(
         &self,
         core_conf: &mut Value,
@@ -823,13 +830,23 @@ mod tests {
         assert_eq!(conf["settings"]["address"], "2a01:4f9:4b:f378::1");
         assert_eq!(conf["settings"]["port"], 13599);
         assert_eq!(conf["settings"]["auth"], "linux.do");
-        // TLS block from the typed security (no transport — tcp network)
+        // TLS placement (Task 16 verification): xray-core's hysteria
+        // ClientConfig settings block has no TLS keys (`version`/`address`/
+        // `port` only — infra/conf/hysteria.go); TLS is uniformly a
+        // streamSettings concern (`security` + `tlsSettings`, per
+        // infra/conf/transport_internet.go StreamConfig.Build). So the TLS
+        // block must live in streamSettings and never in settings.
         assert_eq!(conf["streamSettings"]["security"], "tls");
         assert_eq!(
             conf["streamSettings"]["tlsSettings"]["serverName"],
             "www.bing.com"
         );
         assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
+        assert!(
+            conf["settings"].get("tls").is_none(),
+            "TLS must not leak into settings: {}",
+            conf["settings"]
+        );
     }
 
     #[test]

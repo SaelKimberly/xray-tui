@@ -49,7 +49,8 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
-    should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings, validate_xray_reality,
+    should_skip_endpoint_param, to_singbox_tls, to_singbox_transport, to_xray_stream_settings,
+    validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
@@ -726,8 +727,8 @@ impl VlessConfig {
 
     /// sing-box outbound for this config, ported field-by-field from the old
     /// builder's `Protocol::Vless` arm (`uuid` + `flow` when non-empty + TLS
-    /// via the shared helper). The typed `transport` has no sing-box emission
-    /// yet (the old builder dropped it too) — only the TLS block appears.
+    /// via the shared helper) plus the typed `transport` (sing-box
+    /// `V2RayTransportOptions`; `kcp`/`xhttp` refuse at build time).
     fn inject_singbox(
         &self,
         core_conf: &mut Value,
@@ -737,6 +738,13 @@ impl VlessConfig {
         let Some(ep) = endpoint else {
             return Err(SupportError::MissingField("server", "vless"));
         };
+        // Transport host left unset by the host-free parse mandate is filled
+        // at build time (never mutating the stored config) — same rule as the
+        // xray arm.
+        let transport = self
+            .transport
+            .clone()
+            .with_host(Some(ep.host.clone()), None, None);
         let mut out = json!({
             "tag": "proxy",
             "type": "vless",
@@ -749,6 +757,9 @@ impl VlessConfig {
         }
         if let Some(tls) = to_singbox_tls(&self.security, ep, opts.skip_cert_verify) {
             out["tls"] = tls;
+        }
+        if let Some(transport) = to_singbox_transport(&transport)? {
+            out["transport"] = transport;
         }
         *core_conf = out;
         Ok(())
@@ -1517,5 +1528,128 @@ mod tests {
             .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
             .expect_err("orphan vless must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "vless")));
+    }
+
+    #[test]
+    fn singbox_inject_ws_transport_with_endpoint_host() {
+        // ws host unset by the host-free parse mandate -> endpoint host fills
+        // the sing-box headers.Host at build time (V2RayTransportOptions ws).
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:8443?security=tls&encryption=none&type=ws&path=%2Fws"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 8443)),
+            InjectOptions::default(),
+        )
+        .expect("vless ws sing-box inject");
+        let transport = &conf["transport"];
+        assert_eq!(transport["type"], "ws");
+        assert_eq!(transport["path"], "/ws");
+        assert_eq!(transport["headers"]["Host"], "example.com");
+    }
+
+    #[test]
+    fn singbox_inject_httpupgrade_transport() {
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?type=httpupgrade&path=%2Fup&host=cdn.example.com"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("vless httpupgrade sing-box inject");
+        let transport = &conf["transport"];
+        assert_eq!(transport["type"], "httpupgrade");
+        assert_eq!(transport["path"], "/up");
+        // explicit host param is a protocol parameter (not overwritten by the
+        // endpoint host).
+        assert_eq!(transport["host"], "cdn.example.com");
+    }
+
+    #[test]
+    fn singbox_inject_quic_transport() {
+        let cfg = config(parse(&format!("vless://{UUID}@example.com:443?type=quic")));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("vless quic sing-box inject");
+        assert_eq!(conf["transport"]["type"], "quic");
+    }
+
+    #[test]
+    fn singbox_inject_tcp_omits_transport() {
+        // Tcp is the sing-box default — no transport key (like the old
+        // builder and the v2ray-core "no TCP transport" doc note).
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?security=tls&encryption=none&type=tcp"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("vless tcp sing-box inject");
+        assert!(
+            conf.get("transport").is_none(),
+            "tcp must not emit a transport key: {conf}"
+        );
+    }
+
+    #[test]
+    fn singbox_inject_kcp_is_rejected() {
+        // mKCP is not in the vendored sing-box transport set — build-time
+        // refusal so the config is never written invalid.
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?type=kcp&path=seed"
+        )));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("example.com", 443)),
+                InjectOptions::default(),
+            )
+            .expect_err("kcp must be refused by sing-box");
+        assert!(
+            err.to_string().contains("kcp"),
+            "error must mention kcp: {err}"
+        );
+        assert!(matches!(err, SupportError::Config(_)));
+    }
+
+    #[test]
+    fn singbox_inject_xhttp_is_rejected() {
+        // XHTTP is not in the vendored sing-box transport set — build-time
+        // refusal.
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?type=xhttp&path=%2Fs"
+        )));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("example.com", 443)),
+                InjectOptions::default(),
+            )
+            .expect_err("xhttp must be refused by sing-box");
+        assert!(
+            err.to_string().contains("xhttp"),
+            "error must mention xhttp: {err}"
+        );
+        assert!(matches!(err, SupportError::Config(_)));
     }
 }
