@@ -33,7 +33,7 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | `]=>{`       | 4     | Bracket decoration                          |
 | (config)     | 12    | `transport/security`, center-aligned        |
 | `}=>`        | 3     | Bracket decoration                          |
-| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (every protocol of the endpoint unreachable for that test) |
+| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (every protocol of the endpoint unreachable for that test). Labels come from the persisted per-protocol failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
 | `[`          | 1     | Bracket decoration (Outbound opener)        |
 | `Outbound`   | 16    | Exit IP from the last real ping (`—` none)  |
 | `Country`    | 7     | Exit country flag + ISO (`—` none)          |
@@ -89,9 +89,9 @@ from the remaining "deferred" sections.
 8. TUN Mode — enabled, interface name, MTU
 9. Mux — multiplexing settings
 10. Statistics — enable/disable stats collection
-11. Speed Test — ping URL, IP API URL, timeouts, batch concurrency
+11. Speed Test — ping URL, IP API URL, timeouts, batch concurrency, per-profile task queue limit, DNS-failure deferral, error-label TTL
 12. Logging — log level, log-to-file path, log retention
-13. Subscriptions — group list, add/edit/delete/update
+13. Subscriptions — group list, add/edit/delete/update (`g` from Profiles jumps here)
 14. Updates — check and install backend updates
 
 **Form navigation within a section:**
@@ -151,32 +151,23 @@ connection status). Data sourced from the backend's gRPC/V2Ray API when availabl
 
 ---
 
-### Groups Overlay
+### Subscriptions (Settings)
 
-Modal overlay opened with `g` from the Profiles tab. Lists subscription groups
-with columns:
+Group management lives in Settings → Subscriptions. Press `g` on the Profiles
+tab to jump straight there; `Esc` returns to the settings menu.
 
-| Column        | Content                           |
-| ------------- | --------------------------------- |
-| `Name`        | Group name                        |
-| `URL`         | Subscription URL (truncated)      |
-| `Ena`         | Enabled/Disabled                  |
-| `Status`      | Last update status                |
-| `Last Updated`| Timestamp of last fetch           |
+Lists subscription groups with columns: Name, URL (truncated), Enabled,
+Status, Last Updated.
 
-**Actions** (shown in footer):
+**Actions:**
 
-| Key        | Action                            |
-| ---------- | --------------------------------- |
-| `a`        | Add new group                     |
-| `e`        | Edit selected group               |
-| `d`        | Delete selected group (y/n confirm)|
-|| `u`        | Update single group's subscriptions                          |
-|| `Shift+U`  | Update all groups                                           |
-|| `Enter`    | Filter profiles by selected group                            |
-|| `[`        | Cycle to previous group in filter (wraps, skips purgatory)   |
-|| `]`        | Cycle to next group in filter (wraps, skips purgatory)       |
-|| `Esc`      | Close overlay                                                |
+| Key             | Action                            |
+| --------------- | --------------------------------- |
+| `a`             | Add new group                     |
+| `e`             | Edit selected group               |
+| `d`             | Delete selected group (y/n confirm)|
+| `u`             | Update all groups' subscriptions  |
+| `Esc`           | Return to settings menu           |
 
 **Group form** — fields: `name`, `subscription_url`, `user_agent`,
 `update_interval`, `core_type`. `Tab`/`Shift+Tab` navigates, `Enter` saves,
@@ -266,6 +257,19 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 - `s` — stop running tests (works when progress shown in status bar)
 
 Progress is shown in the status bar during batch tests (`Testing: {completed}/{total}` or `Testing...`).
+
+**Batch behavior (Fast Ping / Real Ping / Fast+Real on All Visible):** the
+batch runs on a per-profile (protocol, endpoint) task queue — one live test
+per profile, further tests queued FIFO up to `task_queue_limit` (default 3,
+`0` disables queueing). Profiles whose queue is full are skipped with a
+warning. Profiles whose DNS failed recently are deferred and retried after
+`dns_failure_defer_secs` (default 5s). Both settings live in Settings → Speed
+Test and apply immediately.
+
+**Error labels:** failed tests mark the profile (`[fast]`/`[real]`/`[name]`
+in the Test column). Markers persist across restarts; `error_ttl_hours`
+(empty = never) clears them automatically on profile reload and at batch
+finish.
 
 ---
 
@@ -395,9 +399,10 @@ appended when updates are available for installed backends.
 | `e`              | Edit selected server                |
 | `d`              | Delete selected server(s)           |
 | `c`              | Clone selected server               |
-| `g`              | Manage subscription groups          |
+| `g`              | Open Subscriptions (Settings → Subscriptions) |
 | `t`              | Open speed test menu                |
 | `x`              | Resolve DNS of selected endpoint    |
+| `p`              | Cycle view: Active → Stale → All (purgatory) |
 | `o`              | Cycle sort column (8 columns)       |
 | `/`              | Focus search/filter input           |
 | `Ctrl+V`         | Import share URL                    |
@@ -515,6 +520,12 @@ appended when updates are available for installed backends.
 5. Results populate the expanded panel's per-protocol sub-table; real-ping
    exit IPs fill the single-line Outbound/Country columns
 
+   Batch runs (All Visible) go through the per-profile task queue: a profile
+   already being tested queues further tests up to `task_queue_limit` (queue
+   full = skipped with a warning), and profiles whose DNS failed recently are
+   retried after `dns_failure_defer_secs`. Failed tests leave `[name]`/
+   `[fast]`/`[real]` markers that persist until `error_ttl_hours` sweeps them.
+
 ### Connecting/Disconnecting
 
 **Connect:**
@@ -530,14 +541,15 @@ appended when updates are available for installed backends.
 
 ### Subscription group management
 
-1. From Profiles tab, press `g` to open group overlay
+1. From the Profiles tab, press `g` to jump to Settings → Subscriptions
 2. **Add:** press `a`, fill fields (name, URL, user_agent, update_interval, core_type), `Enter` saves
 3. **Edit:** select a group, press `e`, modify fields, `Enter` saves
-4. **Update:** select a group, press `u` to fetch latest subscriptions
-5. **Update all:** press `Shift+U` to update every group
-6. **Filter:** select a group, press `Enter` to filter profiles by that group
-7. **Delete:** select a group, press `d`, confirm with `y`, cancel with `n`/`Esc`
-8. Press `Esc` to close the overlay and return to the profile list
+4. **Update:** press `u` to fetch the latest subscriptions for every group
+5. **Delete:** select a group, press `d`, confirm with `y`, cancel with `n`/`Esc`
+6. Press `Esc` to return to the settings menu (or `q`/`Ctrl+C` to leave Settings)
+
+Group filtering on the Profiles tab is done with `p` (cycle Active → Stale →
+All views) and `/` (search); the per-group filter keys were removed.
 
 ---
 
@@ -747,10 +759,10 @@ launch_tui(
 )
 wait_for_stable(session_id: "sub-test")
 
-# Open group overlay
+# Open Subscriptions (Settings -> Subscriptions)
 send_keys(session_id: "sub-test", keys: "g")
 wait_for_stable(session_id: "sub-test")
-assert_contains(text: "Groups")
+assert_contains(text: "Subscriptions")
 
 # Add group: press 'a'
 send_keys(session_id: "sub-test", keys: "a")
@@ -772,7 +784,7 @@ send_special_keys(session_id: "sub-test", keys: ["down"])
 send_keys(session_id: "sub-test", keys: "u")
 expect_text(session_id: "sub-test", pattern: "Profiles", timeout: 15)
 
-# Close overlay
+# Back to settings menu (Esc), then quit the app
 send_keys(session_id: "sub-test", keys: "\x1b")
 wait_for_stable(session_id: "sub-test")
 
