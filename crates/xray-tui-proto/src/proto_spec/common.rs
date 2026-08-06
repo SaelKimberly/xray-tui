@@ -1,7 +1,7 @@
 use crate::clash::{
     ClashGrpcOpts, ClashH2Opts, ClashHttpOpts, ClashKcpOpts, ClashRealityOpts, ClashWSOpts,
 };
-use crate::proto_spec::{EndpointEssentials, HostKind, ParseError};
+use crate::proto_spec::{EndpointEssentials, HostKind, ParseError, SupportError};
 use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
@@ -850,6 +850,51 @@ pub fn to_xray_stream_settings(
     } else {
         Some(serde_json::Value::Object(ss))
     }
+}
+
+/// Build-time override copy of `security` for the xray `inject_to` impls:
+/// when `skip_cert_verify` is set, TLS `insecure` is forced on (the TUI's
+/// "skip cert verify" toggle → `tlsSettings.allowInsecure`). Reality has no
+/// insecure knob and is returned unchanged. Never mutates the stored config.
+#[must_use]
+pub(crate) fn security_force_insecure(
+    security: &SecurityConfig,
+    skip_cert_verify: bool,
+) -> SecurityConfig {
+    if !skip_cert_verify {
+        return security.clone();
+    }
+    let mut sec = security.clone();
+    if let Some(TlsConfig::Tls(opts)) = &mut sec.tls {
+        opts.insecure = Some(true);
+    }
+    sec
+}
+
+/// Build-time reality validation, ported from the old xray builder: a
+/// `security: "reality"` stream setting without a usable realitySettings
+/// kills the core at startup ("REALITY: Empty \"realitySettings\"" when the
+/// object is absent, `empty "password"` when publicKey is missing). Realities
+/// need at least the server's public key and an SNI; both are unrecoverable
+/// if absent from the profile.
+///
+/// # Errors
+///
+/// Returns [`SupportError::Config`] when the security is reality but the
+/// reality settings are incomplete.
+pub(crate) fn validate_xray_reality(security: &SecurityConfig) -> Result<(), SupportError> {
+    if let Some(TlsConfig::Reality(opts)) = &security.tls {
+        let has = |v: Option<&str>| v.is_some_and(|s| !s.is_empty());
+        if !has(opts.pbk.as_deref()) || !has(opts.sni.as_deref()) {
+            return Err(SupportError::Config(
+                "REALITY profile is missing required stream settings \
+                 (realitySettings.publicKey / serverName); \
+                 security is 'reality' but the reality settings are incomplete"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

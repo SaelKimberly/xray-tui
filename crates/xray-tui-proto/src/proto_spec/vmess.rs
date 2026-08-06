@@ -52,16 +52,20 @@
 //! - subconverter: `subparser.cpp` `explodeVmessConf()`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
-use super::common::{SecurityConfig, TlsConfig, TlsOpts, TransportConfig};
+use super::common::{
+    SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
+    to_xray_stream_settings, validate_xray_reality,
+};
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashVmess};
 use crate::proto_spec::ProtoSpecError;
@@ -634,6 +638,65 @@ impl ProtoIdentity for VmessConfig {
     }
 }
 
+impl InjectToCoreConf for VmessConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("vmess".into(), other)),
+        }
+    }
+}
+
+impl VmessConfig {
+    /// xray-core outbound for this config, ported field-by-field from the old
+    /// xray builder's `Protocol::Vmess` arm. The user's `security` is the
+    /// vmess encryption method (`scy`, default "auto"); transport host left
+    /// unset by the host-free parse mandate is filled at build time via
+    /// `TransportConfig::with_host` (never mutating the stored config).
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "vmess"));
+        };
+        validate_xray_reality(&self.security)?;
+        let transport = self
+            .transport
+            .clone()
+            .with_host(Some(ep.host.clone()), None, None);
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &transport);
+        let enc = self.security.enc.as_deref().unwrap_or("auto");
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": ep.host,
+                    "port": ep.port,
+                    "users": [{
+                        "id": self.uuid,
+                        "security": enc
+                    }]
+                }]
+            },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
@@ -1128,5 +1191,108 @@ mod tests {
             let cfg = config(parse(&url));
             assert_no_top_level_host_port(&cfg);
         }
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound() {
+        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
+        let ep = EndpointEssentials::new("192.200.160.16", 8443);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&ep),
+            InjectOptions::default(),
+        )
+        .expect("vmess inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "vmess");
+        let users = &conf["settings"]["vnext"][0]["users"][0];
+        assert_eq!(users["id"], UUID);
+        // scy=auto → vmess encryption method
+        assert_eq!(users["security"], "auto");
+        assert_eq!(conf["settings"]["vnext"][0]["address"], "192.200.160.16");
+        assert_eq!(conf["settings"]["vnext"][0]["port"], 8443);
+        // streamSettings == to_xray_stream_settings output
+        let expected = crate::proto_spec::common::to_xray_stream_settings(
+            &cfg.security,
+            &cfg.transport
+                .clone()
+                .with_host(Some("192.200.160.16".into()), None, None),
+        )
+        .expect("ws+tls stream settings");
+        assert_eq!(conf["streamSettings"], expected);
+        assert_eq!(conf["streamSettings"]["network"], "ws");
+        assert_eq!(conf["streamSettings"]["security"], "tls");
+    }
+
+    #[test]
+    fn xray_inject_explicit_scy_is_emitted() {
+        let cfg = config(parse(&vmess_url(
+            "example.com",
+            443,
+            UUID,
+            &[("scy", "chacha20-poly1305")],
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("vmess inject");
+        assert_eq!(
+            conf["settings"]["vnext"][0]["users"][0]["security"],
+            "chacha20-poly1305"
+        );
+    }
+
+    #[test]
+    fn xray_inject_skip_cert_verify_forces_allow_insecure() {
+        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("192.200.160.16", 8443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("vmess inject");
+        assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan vmess must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "vmess")));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = config(parse(&format!("vmess://{BASIC_B64}")));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&EndpointEssentials::new("192.200.160.16", 8443)),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            err,
+            SupportError::UnsupportedProtocol(ref kind, CoreType::SingBox) if kind == "vmess"
+        ));
     }
 }

@@ -1388,18 +1388,47 @@ mod tests {
         ]
     }
 
+    /// Core whose dispatch arm still reports `UnsupportedProtocol` for a
+    /// variant: Xray-native protocols (real `inject_to` landed in T14 for
+    /// Xray) still error for sing-box until T15; sing-box-only protocols
+    /// error for Xray permanently.
+    fn reject_core_for(config: &ProtocolConfig) -> CoreType {
+        match config {
+            ProtocolConfig::Vless(_)
+            | ProtocolConfig::Vmess(_)
+            | ProtocolConfig::Trojan(_)
+            | ProtocolConfig::Hysteria2(_)
+            | ProtocolConfig::Ss(_)
+            | ProtocolConfig::Wireguard(_)
+            | ProtocolConfig::Socks(_)
+            | ProtocolConfig::Http(_) => CoreType::SingBox,
+            _ => CoreType::Xray,
+        }
+    }
+
     #[test]
     fn dispatch_routes_to_variant() {
+        // vless: the Xray arm now lands (T14); the sing-box arm still reports
+        // the dispatch kind until T15.
         let vless = ProtocolConfig::Vless(vless_config());
+        let endpoint = EndpointEssentials::new("1.2.3.4", 443);
+        vless
+            .inject_to(
+                &mut json!({}),
+                CoreType::Xray,
+                Some(&endpoint),
+                InjectOptions::default(),
+            )
+            .expect("xray inject must succeed in T14");
         match vless.inject_to(
             &mut json!({}),
-            CoreType::Xray,
-            None,
+            CoreType::SingBox,
+            Some(&endpoint),
             InjectOptions::default(),
         ) {
             Err(SupportError::UnsupportedProtocol(kind, core)) => {
                 assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
-                assert_eq!(core, CoreType::Xray, "error reports the requested core");
+                assert_eq!(core, CoreType::SingBox, "error reports the requested core");
             }
             other => panic!("expected UnsupportedProtocol, got {other:?}"),
         }
@@ -1422,35 +1451,56 @@ mod tests {
     }
 
     #[test]
-    fn xray_and_singbox_both_error_today() {
-        // NOTE: replaced in T14/T15 when real per-config `inject_to` impls land.
+    fn xray_implemented_singbox_still_stubbed() {
+        // vless inject_to landed for Xray in T14; the sing-box shape lands in
+        // T15.
         let vless = ProtocolConfig::Vless(vless_config());
-        for core in [CoreType::Xray, CoreType::SingBox] {
-            match vless.inject_to(&mut json!({}), core, None, InjectOptions::default()) {
-                Err(SupportError::UnsupportedProtocol(kind, got)) => {
-                    assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
-                    assert_eq!(got, core, "error reports the requested core");
-                }
-                other => panic!("expected UnsupportedProtocol for {core:?}, got {other:?}"),
+        let endpoint = EndpointEssentials::new("1.2.3.4", 443);
+        vless
+            .inject_to(
+                &mut json!({}),
+                CoreType::Xray,
+                Some(&endpoint),
+                InjectOptions::default(),
+            )
+            .expect("xray inject must succeed in T14");
+        match vless.inject_to(
+            &mut json!({}),
+            CoreType::SingBox,
+            Some(&endpoint),
+            InjectOptions::default(),
+        ) {
+            Err(SupportError::UnsupportedProtocol(kind, got)) => {
+                assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
+                assert_eq!(got, CoreType::SingBox, "error reports the requested core");
             }
+            other => panic!("expected UnsupportedProtocol for sing-box, got {other:?}"),
         }
     }
 
     #[test]
     fn endpoint_param_accepted() {
+        // Orphan configs (no endpoint) cannot build an xray outbound that
+        // needs a server — the impl must reject, never panic.
         let vless = ProtocolConfig::Vless(vless_config());
         let endpoint = EndpointEssentials::new("1.2.3.4", 443);
-        for endpoint in [None, Some(&endpoint)] {
-            match vless.inject_to(
+        vless
+            .inject_to(
                 &mut json!({}),
                 CoreType::Xray,
-                endpoint,
+                Some(&endpoint),
                 InjectOptions::default(),
-            ) {
-                Err(SupportError::UnsupportedProtocol(..)) => {}
-                other => panic!("expected UnsupportedProtocol, got {other:?}"),
-            }
-        }
+            )
+            .expect("endpoint-bearing inject must succeed");
+        let err = vless
+            .inject_to(
+                &mut json!({}),
+                CoreType::Xray,
+                None,
+                InjectOptions::default(),
+            )
+            .expect_err("orphan inject must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "vless")));
     }
 
     #[test]
@@ -1459,12 +1509,10 @@ mod tests {
         assert_eq!(variants.len(), 20, "all 20 dispatch arms must be covered");
         let mut kinds = Vec::new();
         for (config, expected) in &variants {
-            match config.inject_to(
-                &mut json!({}),
-                CoreType::Xray,
-                None,
-                InjectOptions::default(),
-            ) {
+            // Xray-native variants route via their sing-box arm (still
+            // stubbed until T15); sing-box-only variants via their Xray arm.
+            let core = reject_core_for(config);
+            match config.inject_to(&mut json!({}), core, None, InjectOptions::default()) {
                 Err(SupportError::UnsupportedProtocol(kind, _)) => {
                     assert_eq!(
                         kind.as_str(),
@@ -1473,7 +1521,9 @@ mod tests {
                     );
                     kinds.push(kind);
                 }
-                other => panic!("expected UnsupportedProtocol for {config:?}, got {other:?}"),
+                other => panic!(
+                    "expected UnsupportedProtocol for {config:?} via {core:?}, got {other:?}"
+                ),
             }
         }
         kinds.sort_unstable();

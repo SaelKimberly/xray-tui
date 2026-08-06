@@ -17,7 +17,7 @@ use super::{
     AnyTlsConfig, CoreType, EndpointEssentials, HttpClientConfig, Hysteria1Config, Hysteria2Config,
     InjectOptions, InjectToCoreConf, NaiveConfig, PlaceholderConfig, ShadowTlsConfig, Socks5Config,
     SsConfig, SshConfig, SsrConfig, SupportError, TailscaleConfig, TorConfig, TrojanConfig,
-    TuicConfig, VlessConfig, VmessConfig, WireguardConfig,
+    TuicConfig, WireguardConfig,
 };
 
 /// Stub `inject_to` for one config: always `UnsupportedProtocol(kind, core)`.
@@ -38,8 +38,6 @@ macro_rules! stub_inject {
     };
 }
 
-stub_inject!(VlessConfig, "vless");
-stub_inject!(VmessConfig, "vmess");
 stub_inject!(TrojanConfig, "trojan");
 stub_inject!(Hysteria2Config, "hy2");
 stub_inject!(SsConfig, "ss");

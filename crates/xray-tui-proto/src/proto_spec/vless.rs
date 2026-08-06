@@ -42,18 +42,20 @@
 //! - outbound: `dialer/v2ray/v2ray.go` `ParseVlessURL`
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
 use super::common::{
-    RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, should_skip_endpoint_param,
+    RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
+    should_skip_endpoint_param, to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
 use super::utils;
 use super::{
-    ConfigKind, EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig,
-    ProtocolEssentials, ProtocolKind,
+    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashVless};
 use crate::proto_spec::ProtoSpecError;
@@ -660,6 +662,69 @@ fn recover_xhttp_mode(mode: &str) -> Option<&'static str> {
         .map(|v| v as _)
 }
 
+impl InjectToCoreConf for VlessConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        match core_type {
+            CoreType::Xray => self.inject_xray(core_conf, endpoint, opts),
+            other => Err(SupportError::UnsupportedProtocol("vless".into(), other)),
+        }
+    }
+}
+
+impl VlessConfig {
+    /// xray-core outbound for this config. `endpoint` supplies the server
+    /// host/port (the outbound always needs it — there is no orphan form);
+    /// transport host/authority left unset by the host-free parse mandate is
+    /// filled at build time via `TransportConfig::with_host` (never mutating
+    /// the stored config). Ported field-by-field from the old xray builder's
+    /// `Protocol::Vless` arm.
+    fn inject_xray(
+        &self,
+        core_conf: &mut Value,
+        endpoint: Option<&EndpointEssentials>,
+        opts: InjectOptions,
+    ) -> Result<(), SupportError> {
+        let Some(ep) = endpoint else {
+            return Err(SupportError::MissingField("server", "vless"));
+        };
+        // A `reality` security without publicKey/serverName kills the core at
+        // startup — refuse to emit such a config (old builder behavior).
+        validate_xray_reality(&self.security)?;
+        let transport = self
+            .transport
+            .clone()
+            .with_host(Some(ep.host.clone()), None, None);
+        let security = security_force_insecure(&self.security, opts.skip_cert_verify);
+        let stream = to_xray_stream_settings(&security, &transport);
+        let flow = self.flow.as_deref().unwrap_or("");
+        *core_conf = json!({
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": ep.host,
+                    "port": ep.port,
+                    "users": [{
+                        "id": self.uuid,
+                        "encryption": "none",
+                        "flow": flow
+                    }]
+                }]
+            },
+        });
+        if let Some(ss) = stream {
+            core_conf["streamSettings"] = ss;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -1224,5 +1289,142 @@ mod tests {
             let cfg = config(parse(&url));
             assert_no_top_level_host_port(&cfg);
         }
+    }
+
+    // ── Xray inject_to (Task 14) ──────────────────────────────────────────
+
+    use super::super::{EndpointEssentials, InjectOptions, InjectToCoreConf, SupportError};
+
+    fn vless_ws_tls() -> VlessConfig {
+        config(parse(&format!(
+            "vless://{UUID}@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws"
+        )))
+    }
+
+    fn endpoint() -> EndpointEssentials {
+        EndpointEssentials::new("159.223.24.65", 443)
+    }
+
+    #[test]
+    fn xray_inject_writes_proxy_outbound() {
+        let cfg = vless_ws_tls();
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&endpoint()),
+            InjectOptions::default(),
+        )
+        .expect("vless inject");
+        assert_eq!(conf["tag"], "proxy");
+        assert_eq!(conf["protocol"], "vless");
+        let users = &conf["settings"]["vnext"][0]["users"][0];
+        assert_eq!(users["id"], UUID);
+        assert_eq!(users["encryption"], "none");
+        assert_eq!(users["flow"], "");
+        assert_eq!(conf["settings"]["vnext"][0]["address"], "159.223.24.65");
+        assert_eq!(conf["settings"]["vnext"][0]["port"], 443);
+        // streamSettings == to_xray_stream_settings output
+        let expected = super::super::common::to_xray_stream_settings(
+            &cfg.security,
+            &cfg.transport
+                .clone()
+                .with_host(Some("159.223.24.65".into()), None, None),
+        )
+        .expect("ws+tls stream settings");
+        assert_eq!(conf["streamSettings"], expected);
+        assert_eq!(conf["streamSettings"]["network"], "ws");
+        assert_eq!(conf["streamSettings"]["security"], "tls");
+    }
+
+    #[test]
+    fn xray_inject_flow_and_host_free_injection() {
+        // flow present; ws host unset → filled from endpoint at build time
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:8443?security=tls&encryption=none&type=ws&path=%2Fws&flow=xtls-rprx-vision"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 8443)),
+            InjectOptions::default(),
+        )
+        .expect("vless inject");
+        assert_eq!(
+            conf["settings"]["vnext"][0]["users"][0]["flow"],
+            "xtls-rprx-vision"
+        );
+        assert_eq!(conf["streamSettings"]["wsSettings"]["host"], "example.com");
+    }
+
+    #[test]
+    fn xray_inject_skip_cert_verify_forces_allow_insecure() {
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?security=tls&encryption=none&type=tcp"
+        )));
+        assert_eq!(cfg.security.insecure(), None);
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::Xray,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions {
+                skip_cert_verify: true,
+            },
+        )
+        .expect("vless inject");
+        assert_eq!(conf["streamSettings"]["security"], "tls");
+        assert_eq!(conf["streamSettings"]["tlsSettings"]["allowInsecure"], true);
+    }
+
+    #[test]
+    fn xray_inject_reality_without_public_key_is_rejected() {
+        // Restores the T13-flipped reality semantics at the proto level:
+        // reality without publicKey/serverName must fail at build time.
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?security=reality&encryption=none&type=tcp&flow=xtls-rprx-vision"
+        )));
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::Xray,
+                Some(&endpoint()),
+                InjectOptions::default(),
+            )
+            .expect_err("reality without pbk/sni must be rejected");
+        assert!(
+            err.to_string().contains("reality"),
+            "error must mention reality: {err}"
+        );
+    }
+
+    #[test]
+    fn xray_inject_without_endpoint_is_rejected() {
+        let cfg = vless_ws_tls();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(&mut conf, CoreType::Xray, None, InjectOptions::default())
+            .expect_err("orphan vless must be rejected");
+        assert!(matches!(err, SupportError::MissingField("server", "vless")));
+    }
+
+    #[test]
+    fn xray_inject_singbox_errors_until_t15() {
+        let cfg = vless_ws_tls();
+        let mut conf = serde_json::json!({});
+        let err = cfg
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&endpoint()),
+                InjectOptions::default(),
+            )
+            .expect_err("sing-box shape lands in T15");
+        assert!(matches!(
+            &err,
+            SupportError::UnsupportedProtocol(kind, CoreType::SingBox) if kind == "vless"
+        ));
     }
 }
