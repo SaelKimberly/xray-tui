@@ -1,15 +1,19 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use toasty::stmt::IntoStatement;
 use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
+use crate::hash::stable_hash;
 use crate::models_toasty::{
     DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, Group, HostType, ProfileStats,
-    Protocol, ProtocolId, RoutingRule,
+    Protocol, ProtocolId, RoutingRule, TrafficStats,
 };
+use crate::retry_on_busy;
 
 // ── Database handle ─────────────────────────────────────────────────────
 
@@ -454,6 +458,471 @@ impl Database {
         // Deterministic page order (the newtype id path cannot be ordered in SQL).
         rows.sort_by_key(|r| r.endpoint.id);
         Ok(rows)
+    }
+}
+
+// ── Write methods (public API) ─────────────────────────────────────────
+
+impl Database {
+    // ── Upserts (idempotent, natural-key dedup) ──────────────────────────
+
+    /// Insert or update one endpoint by id.
+    ///
+    /// Replaces the endpoint's identity fields (`host`, `host_type`, `port`,
+    /// `ports`, `parent_id`, `last_source`). The DNS-resolution cache
+    /// (`resolved_as` / `resolved_at`) and the manual protocol override are
+    /// owned by their dedicated writes ([`Self::update_endpoint_resolution`],
+    /// [`Self::set_manual_override`]) and are preserved on update — this
+    /// matches the old subscription path, which never clobbered an existing
+    /// endpoint's resolution state (INSERT OR IGNORE).
+    pub async fn upsert_endpoint(&self, e: &Endpoint) -> Result<()> {
+        let mut conn = self.conn().await?;
+        Endpoint::upsert_by_id(e.id)
+            .host(e.host.clone())
+            .host_type(e.host_type)
+            .port(e.port)
+            .ports(e.ports.clone())
+            .parent_id(e.parent_id)
+            .last_source(e.last_source.clone())
+            .on_create(|create| create.resolved_as(Vec::<String>::new()))
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert or update one protocol row by id.
+    pub async fn upsert_protocol(&self, p: &Protocol) -> Result<()> {
+        let mut conn = self.conn().await?;
+        Protocol::upsert_by_id(p.id)
+            .sig(p.sig)
+            .cred_hash(p.cred_hash)
+            .proto_kind(p.proto_kind)
+            .transport(p.transport.clone())
+            .security(p.security.clone())
+            .config(p.config.get().0.clone())
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert or update one per-pair link row by its composite key
+    /// `(protocol_id, endpoint_id)`.
+    ///
+    /// Replaces the link's source- and result-state fields (`core_type`,
+    /// `config_type`, `last_seen_at`, `latency`, `speed_bps`, `error`,
+    /// `traffic`). Scheduler state (`task_id`, `task_queue`) and the activity
+    /// timestamp (`last_used_at`) are owned by
+    /// [`Self::update_scheduler_state`] / [`Self::update_last_used`] and are
+    /// preserved on update; new rows start with an empty queue.
+    pub async fn upsert_link(&self, s: &ProfileStats) -> Result<()> {
+        let mut conn = self.conn().await?;
+        ProfileStats::upsert_by_protocol_id_and_endpoint_id(s.protocol_id, s.endpoint_id)
+            .core_type(s.core_type)
+            .config_type(s.config_type)
+            .last_seen_at(s.last_seen_at)
+            .latency(s.latency.clone())
+            .speed_bps(s.speed_bps)
+            .error(s.error.clone())
+            .traffic(s.traffic)
+            .on_create(|create| create.task_queue(Vec::<u16>::new()))
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert or update one endpoint↔group link by its composite key
+    /// `(endpoint_id, group_id)`.
+    pub async fn upsert_endpoint_group_link(&self, eg: &EndpointGroup) -> Result<()> {
+        let mut conn = self.conn().await?;
+        EndpointGroup::upsert_by_endpoint_id_and_group_id(eg.endpoint_id, eg.group_id.clone())
+            .last_seen_at(eg.last_seen_at)
+            .sort_order(eg.sort_order)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert or update one group by id (replaces `insert_group` +
+    /// `update_group`).
+    pub async fn upsert_group(&self, g: &Group) -> Result<()> {
+        let mut conn = self.conn().await?;
+        Group::upsert_by_id(g.id.clone())
+            .name(g.name.clone())
+            .url(g.url.clone())
+            .enabled(g.enabled)
+            .user_agent(g.user_agent.clone())
+            .convert_target(g.convert_target)
+            .core_type(g.core_type)
+            .sort_order(g.sort_order)
+            .last_refreshed(g.last_refreshed)
+            .status(g.status)
+            .error_message(g.error_message.clone())
+            .refresh_interval(g.refresh_interval)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    // ── Activity ─────────────────────────────────────────────────────────
+
+    /// Record active use of a link: sets `last_used_at` AND `last_seen_at`
+    /// to `ts`, so active use keeps a profile out of Stale/purge (old
+    /// `update_last_used` semantics).
+    pub async fn update_last_used(
+        &self,
+        protocol_id: ProtocolId,
+        endpoint_id: EndpointId,
+        ts: Timestamp,
+    ) -> Result<()> {
+        let mut conn = self.conn().await?;
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(protocol_id, endpoint_id)
+            .update()
+            .last_used_at(Some(ts))
+            .last_seen_at(ts)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the DNS resolution of an endpoint host: `resolved_as = ips`,
+    /// `resolved_at = at`. Survives launches so the TUI does not re-resolve
+    /// DNS hosts on startup. Retried on write contention (the enrichment
+    /// pipeline resolves many endpoints concurrently), as the old code did.
+    pub async fn update_endpoint_resolution(
+        &self,
+        endpoint_id: EndpointId,
+        ips: Vec<String>,
+        at: Timestamp,
+    ) -> Result<()> {
+        let db = self;
+        retry_on_busy(
+            move || {
+                let ips = ips.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    Endpoint::filter_by_id(endpoint_id)
+                        .update()
+                        .resolved_as(ips)
+                        .resolved_at(Some(at))
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// Refresh the resolved-IP children of a DNS endpoint: insert-or-ignore
+    /// one child `Endpoint` per IP (host = IP string, `host_type` from the
+    /// address family, port 443, `parent_id` = parent), then delete children
+    /// whose IP is no longer in `ips` (old `resolve_endpoint_dns` /
+    /// `upsert_resolved_ips` behavior, in one transaction).
+    ///
+    /// Child id is `stable_hash(ip, 0)` (deterministic across refreshes), so
+    /// re-resolving with a still-present IP keeps the existing child row —
+    /// including any links it has accumulated.
+    pub async fn upsert_resolved_ip_children(
+        &self,
+        parent_id: EndpointId,
+        ips: &[IpAddr],
+    ) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let mut tx = conn.transaction().await?;
+
+        for ip in ips {
+            let id = EndpointId::new(stable_hash(ip.to_string(), 0i64));
+            let host_type = match ip {
+                IpAddr::V4(_) => HostType::Ipv4,
+                IpAddr::V6(_) => HostType::Ipv6,
+            };
+            Endpoint::upsert_by_id(id)
+                .host(ip.to_string())
+                .host_type(host_type)
+                .port(443)
+                .ports(Vec::<u16>::new())
+                .parent_id(Some(parent_id))
+                .resolved_as(Vec::<String>::new())
+                .or_ignore()
+                .exec(&mut tx)
+                .await?;
+        }
+
+        // Remove children whose IP is no longer in the resolution set.
+        let children: Vec<Endpoint> =
+            Endpoint::filter(Endpoint::fields().parent_id().eq(parent_id))
+                .exec(&mut tx)
+                .await?;
+        let keep: Vec<String> = ips.iter().map(ToString::to_string).collect();
+        for child in children {
+            if !keep.contains(&child.host) {
+                child.delete().exec(&mut tx).await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set or clear (`None`) the manual protocol override of an endpoint —
+    /// the old `set_protocol_override` + `clear_protocol_override` merged.
+    pub async fn set_manual_override(
+        &self,
+        endpoint_id: EndpointId,
+        protocol_id: Option<ProtocolId>,
+    ) -> Result<()> {
+        let mut conn = self.conn().await?;
+        Endpoint::filter_by_id(endpoint_id)
+            .update()
+            .manual_protocol_override(protocol_id)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    // ── Purge / delete ───────────────────────────────────────────────────
+
+    /// Purge endpoints where EVERY link's `last_seen_at < cutoff` — the old
+    /// `COALESCE(MAX(p.last_seen_at), 0) < cutoff` predicate, including
+    /// linkless endpoints (`links().all(...)` is vacuously true for them).
+    /// Returns the number of deleted endpoints.
+    ///
+    /// Cascade, in one transaction: the endpoints' `endpoint_groups` links,
+    /// their `profile_stats` links, then the endpoints themselves, then
+    /// orphan `protocol` rows (those left with zero links).
+    pub async fn purge_expired(&self, cutoff: Timestamp) -> Result<usize> {
+        let mut conn = self.conn().await?;
+        let mut tx = conn.transaction().await?;
+
+        let expired: Vec<Endpoint> = Endpoint::filter(
+            Endpoint::fields()
+                .links()
+                .all(ProfileStats::fields().last_seen_at().lt(cutoff)),
+        )
+        .exec(&mut tx)
+        .await?;
+        let count = expired.len();
+
+        if count > 0 {
+            let ids: Vec<EndpointId> = expired.iter().map(|e| e.id).collect();
+            EndpointGroup::filter(toasty::stmt::in_list(
+                EndpointGroup::fields().endpoint_id(),
+                ids.clone(),
+            ))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+            ProfileStats::filter(toasty::stmt::in_list(
+                ProfileStats::fields().endpoint_id(),
+                ids.clone(),
+            ))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+            Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids))
+                .delete()
+                .exec(&mut tx)
+                .await?;
+            Self::purge_orphan_protocols(&mut tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Delete an endpoint and cascade: its `profile_stats` links, its
+    /// `endpoint_groups` links, the endpoint row, then orphan `protocol`
+    /// rows (those whose last link just died). One transaction.
+    pub async fn delete_endpoint(&self, endpoint_id: EndpointId) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let mut tx = conn.transaction().await?;
+
+        EndpointGroup::filter(EndpointGroup::fields().endpoint_id().eq(endpoint_id))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(endpoint_id))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        Endpoint::filter_by_id(endpoint_id)
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        Self::purge_orphan_protocols(&mut tx).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove all endpoint↔group links for `group_id` (the old `clear_group`),
+    /// returning the number of links removed. Endpoints and their links stay.
+    pub async fn clear_group_endpoints(&self, group_id: &str) -> Result<usize> {
+        let mut conn = self.conn().await?;
+        let rows: Vec<EndpointGroup> =
+            EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
+                .exec(&mut conn)
+                .await?;
+        let count = rows.len();
+        EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
+            .delete()
+            .exec(&mut conn)
+            .await?;
+        Ok(count)
+    }
+
+    /// Delete a group: its `endpoint_groups` links, then the group row.
+    /// One transaction.
+    ///
+    /// Note: the old `delete_group` also purged endpoints of this group that
+    /// no longer belonged to ANY group. The typed model keeps group-less
+    /// endpoints (the All view shows them, and `clear_group_endpoints`
+    /// unlinks without deleting) — endpoint cleanup is left to
+    /// [`Self::purge_expired`] by staleness, so deleting a group never
+    /// silently destroys endpoints.
+    pub async fn delete_group(&self, group_id: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let mut tx = conn.transaction().await?;
+
+        EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        Group::filter_by_id(group_id.to_string())
+            .delete()
+            .exec(&mut tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ── Stats / restore ─────────────────────────────────────────────────
+
+    /// Zero traffic (`today_up/down`, `total_up/down`) and clear
+    /// `latency`, `speed_bps`, and `error` on EVERY `profile_stats` row
+    /// (query-based update, one statement; the old `clear_all_stats` wiped
+    /// server stats + extensions' delay/speed).
+    pub async fn clear_all_stats(&self) -> Result<()> {
+        let mut conn = self.conn().await?;
+        ProfileStats::all()
+            .update()
+            .traffic(TrafficStats {
+                today_up: 0,
+                today_down: 0,
+                total_up: 0,
+                total_down: 0,
+            })
+            .latency(None)
+            .error(None)
+            .speed_bps(None)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Restore a stale endpoint by setting `last_seen_at = now` on all its
+    /// links (old `restore_endpoint`).
+    pub async fn restore_endpoint(&self, endpoint_id: EndpointId) -> Result<()> {
+        let now = Timestamp::now();
+        let mut conn = self.conn().await?;
+        ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(endpoint_id))
+            .update()
+            .last_seen_at(now)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    // ── Scheduler (OCC) ─────────────────────────────────────────────────
+
+    /// Read-modify-write the scheduler state of one link: set `task_id` and
+    /// REPLACE the whole `task_queue` vector.
+    ///
+    /// The mutation is optimistic-concurrency guarded: the link is loaded,
+    /// the write is applied as a `#[version]`-checked instance update, and a
+    /// `condition_failed` conflict (another writer raced us between load and
+    /// update) triggers a reload + retry, bounded to 5 attempts with a small
+    /// sleep. `SQLite` write contention is retried via [`retry_on_busy`].
+    /// Query-based updates on `ProfileStats` (which bump `version` without
+    /// checking) are fine here — the OCC check matters for this
+    /// read-modify-write racing another writer.
+    pub async fn update_scheduler_state(
+        &self,
+        protocol_id: ProtocolId,
+        endpoint_id: EndpointId,
+        task_id: Option<u16>,
+        queue: &[u16],
+    ) -> Result<()> {
+        const MAX_SCHEDULER_ATTEMPTS: usize = 5;
+
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                for attempt in 0..MAX_SCHEDULER_ATTEMPTS {
+                    let mut conn = db.conn().await?;
+                    let Some(mut link) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                        protocol_id,
+                        endpoint_id,
+                    )
+                    .first()
+                    .exec(&mut conn)
+                    .await?
+                    else {
+                        return Err(DatabaseError::Generic(format!(
+                            "scheduler state: no profile_stats row for protocol_id={} endpoint_id={}",
+                            protocol_id.get(),
+                            endpoint_id.get(),
+                        )));
+                    };
+
+                    match toasty::update!(link {
+                        task_id,
+                        task_queue: queue.to_vec(),
+                    })
+                    .exec(&mut conn)
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(err) if err.is_condition_failed() => {
+                            // Another writer won the race; reload and retry.
+                            if attempt + 1 < MAX_SCHEDULER_ATTEMPTS {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                Err(DatabaseError::Generic(
+                    "scheduler state: OCC conflict retries exhausted".into(),
+                ))
+            },
+            5,
+        )
+        .await
+    }
+}
+
+impl Database {
+    /// Delete `Protocol` rows with no remaining `profile_stats` links — the
+    /// shared protocol table's orphan cleanup (the old per-row model had no
+    /// shared table to clean). Runs inside the caller's transaction.
+    ///
+    /// `links().all(FALSE)` is vacuously true exactly when the links
+    /// collection is empty, lowering to `id NOT IN (SELECT protocol_id FROM
+    /// profile_stats)`. Returns the number of protocols deleted.
+    async fn purge_orphan_protocols(tx: &mut dyn toasty::Executor) -> Result<usize> {
+        let never: toasty::stmt::Expr<bool> =
+            toasty::stmt::Expr::from_untyped(toasty_core::stmt::Expr::FALSE);
+        let orphans: Vec<Protocol> = Protocol::filter(Protocol::fields().links().all(never))
+            .exec(tx)
+            .await?;
+        let count = orphans.len();
+        for protocol in orphans {
+            protocol.delete().exec(tx).await?;
+        }
+        Ok(count)
     }
 }
 
@@ -1033,6 +1502,539 @@ mod tests {
         assert_eq!(
             row.active_link().unwrap().protocol_id,
             ProtocolId::new(1002)
+        );
+    }
+
+    // ── Typed writes (Task 10) ───────────────────────────────────────────
+
+    /// A full `Endpoint` struct for the typed write methods.
+    fn endpoint_struct(id: i64, host: &str, host_type: HostType, port: u16) -> Endpoint {
+        Endpoint {
+            id: EndpointId::new(id),
+            host: host.to_string(),
+            host_type,
+            port,
+            ports: Vec::new(),
+            parent_id: None,
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_as: Vec::new(),
+            resolved_at: None,
+            created_at: ts(0),
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        }
+    }
+
+    /// A full `ProfileStats` struct for the typed write methods.
+    fn link_struct(protocol_id: i64, endpoint_id: i64, last_seen: i64) -> ProfileStats {
+        ProfileStats {
+            protocol_id: ProtocolId::new(protocol_id),
+            endpoint_id: EndpointId::new(endpoint_id),
+            core_type: CoreType::Xray,
+            config_type: ConfigType::ShareUrl,
+            last_used_at: None,
+            last_seen_at: ts(last_seen),
+            task_id: None,
+            task_queue: Vec::new(),
+            latency: None,
+            speed_bps: None,
+            error: None,
+            traffic: zero_traffic(),
+            created_at: ts(0),
+            updated_at: ts(0),
+            version: 1,
+            protocol: Deferred::default(),
+            endpoint: Deferred::default(),
+        }
+    }
+
+    /// A full, loaded `Protocol` struct (deferred JSON included) for
+    /// `upsert_protocol`.
+    fn protocol_struct(id: i64) -> Protocol {
+        Protocol {
+            id: ProtocolId::new(id),
+            sig: id,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: tcp_transport(),
+            security: no_security(),
+            config: Deferred::from(Json(vless_config())),
+            created_at: ts(0),
+            links: Deferred::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_endpoint_is_idempotent() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+            .await
+            .expect("upsert");
+        db.upsert_endpoint(&endpoint_struct(1, "9.9.9.9", HostType::Ipv4, 8443))
+            .await
+            .expect("upsert again");
+
+        let mut conn = db.connection().await.expect("connection");
+        let count = Endpoint::all()
+            .count()
+            .exec(&mut conn)
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "second upsert must not duplicate the row");
+
+        let ep = Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(ep.host, "9.9.9.9", "identity fields refresh on re-upsert");
+        assert_eq!(ep.port, 8443);
+
+        // Owned state (resolution cache, manual override) survives re-upserts.
+        db.update_endpoint_resolution(EndpointId::new(1), vec!["1.1.1.1".to_string()], ts(77))
+            .await
+            .expect("resolve");
+        db.set_manual_override(EndpointId::new(1), Some(ProtocolId::new(99)))
+            .await
+            .expect("override");
+        db.upsert_endpoint(&endpoint_struct(1, "9.9.9.9", HostType::Ipv4, 8443))
+            .await
+            .expect("upsert after resolution");
+        let ep = Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            ep.resolved_as,
+            vec!["1.1.1.1".to_string()],
+            "resolution cache preserved"
+        );
+        assert_eq!(ep.resolved_at, Some(ts(77)));
+        assert_eq!(
+            ep.manual_protocol_override,
+            Some(ProtocolId::new(99)),
+            "manual override preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_link_is_idempotent_and_updates_fields() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+            .await
+            .expect("endpoint");
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("protocol");
+
+        let mut link = link_struct(1001, 1, 100);
+        link.traffic = TrafficStats {
+            today_up: 5,
+            today_down: 6,
+            total_up: 7,
+            total_down: 8,
+        };
+        db.upsert_link(&link).await.expect("upsert link");
+        db.upsert_link(&link).await.expect("upsert link again");
+
+        let count = ProfileStats::all()
+            .count()
+            .exec(&mut conn)
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "composite-key upsert must not duplicate");
+
+        // Second upsert replaces the result-state fields (e.g. latency).
+        link.latency = Some(Latency::Fast { delay: 42 });
+        link.last_seen_at = ts(200);
+        db.upsert_link(&link)
+            .await
+            .expect("upsert link with latency");
+
+        let stored = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(stored.latency, Some(Latency::Fast { delay: 42 }));
+        assert_eq!(stored.last_seen_at, ts(200));
+        assert_eq!(stored.traffic, link.traffic);
+    }
+
+    #[tokio::test]
+    async fn upsert_link_preserves_scheduler_and_activity_state() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+            .await
+            .expect("endpoint");
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("protocol");
+
+        db.upsert_link(&link_struct(1001, 1, 100))
+            .await
+            .expect("upsert link");
+        db.update_scheduler_state(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+            Some(7),
+            &[1, 2, 3],
+        )
+        .await
+        .expect("scheduler state");
+        db.update_last_used(ProtocolId::new(1001), EndpointId::new(1), ts(300))
+            .await
+            .expect("last used");
+
+        // A re-upsert must not clobber scheduler or activity state.
+        db.upsert_link(&link_struct(1001, 1, 150))
+            .await
+            .expect("re-upsert");
+
+        let stored = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(stored.task_id, Some(7), "scheduler task_id survives upsert");
+        assert_eq!(
+            stored.task_queue,
+            vec![1, 2, 3],
+            "scheduler queue survives upsert"
+        );
+        assert_eq!(
+            stored.last_used_at,
+            Some(ts(300)),
+            "activity timestamp survives upsert"
+        );
+        assert_eq!(
+            stored.last_seen_at,
+            ts(150),
+            "link last_seen replaces on upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_last_used_refreshes_both_columns() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
+
+        db.update_last_used(ProtocolId::new(1001), EndpointId::new(1), ts(500))
+            .await
+            .expect("update");
+
+        let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(link.last_used_at, Some(ts(500)));
+        assert_eq!(
+            link.last_seen_at,
+            ts(500),
+            "active use keeps the link out of Stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_endpoint_resolution_sets_cache() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+
+        db.update_endpoint_resolution(
+            EndpointId::new(1),
+            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()],
+            ts(100),
+        )
+        .await
+        .expect("resolve");
+
+        let ep = Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            ep.resolved_as,
+            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()]
+        );
+        assert_eq!(ep.resolved_at, Some(ts(100)));
+    }
+
+    #[tokio::test]
+    async fn upsert_resolved_ip_children_upserts_and_prunes() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        toasty::create!(Endpoint {
+            id: EndpointId::new(50),
+            host: "dns.example".to_string(),
+            host_type: HostType::Dns,
+            port: 443,
+            ports: Vec::<u16>::new(),
+            resolved_as: Vec::<String>::new(),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("parent");
+
+        let ip1: IpAddr = "1.1.1.1".parse().expect("ip");
+        let ip2: IpAddr = "2.2.2.2".parse().expect("ip");
+        db.upsert_resolved_ip_children(EndpointId::new(50), &[ip1, ip2])
+            .await
+            .expect("upsert children");
+
+        let children = db
+            .endpoints_by_parent(EndpointId::new(50))
+            .await
+            .expect("children");
+        assert_eq!(children.len(), 2);
+        let cid1 = EndpointId::new(stable_hash("1.1.1.1".to_string(), 0i64));
+        let cid2 = EndpointId::new(stable_hash("2.2.2.2".to_string(), 0i64));
+        let mut by_host: HashMap<&str, &Endpoint> =
+            children.iter().map(|c| (c.host.as_str(), c)).collect();
+        for (host, id) in [("1.1.1.1", cid1), ("2.2.2.2", cid2)] {
+            let child = by_host.remove(host).expect("child");
+            assert_eq!(child.id, id, "deterministic id from IP");
+            assert_eq!(child.host_type, HostType::Ipv4);
+            assert_eq!(child.port, 443);
+            assert_eq!(child.parent_id, Some(EndpointId::new(50)));
+        }
+
+        // A child accumulates a link; re-resolving with the same IP must keep it.
+        toasty::create!(Protocol {
+            id: ProtocolId::new(9001),
+            sig: 9001,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: tcp_transport(),
+            security: no_security(),
+            config: Deferred::from(Json(vless_config())),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("child protocol");
+        toasty::create!(ProfileStats {
+            protocol_id: ProtocolId::new(9001),
+            endpoint_id: cid1,
+            core_type: CoreType::Xray,
+            config_type: ConfigType::ShareUrl,
+            last_seen_at: ts(1),
+            task_queue: Vec::<u16>::new(),
+            traffic: zero_traffic(),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("child link");
+
+        // Prune: only ip1 stays, and its accumulated link survives.
+        db.upsert_resolved_ip_children(EndpointId::new(50), &[ip1])
+            .await
+            .expect("prune children");
+        let children = db
+            .endpoints_by_parent(EndpointId::new(50))
+            .await
+            .expect("children");
+        assert_eq!(children.len(), 1, "stale child removed");
+        assert_eq!(children[0].host, "1.1.1.1");
+        let kept = ProfileStats::filter_by_protocol_id_and_endpoint_id(ProtocolId::new(9001), cid1)
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("link");
+        assert_eq!(
+            kept.endpoint_id, cid1,
+            "re-resolution keeps the child row + links"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_manual_override_sets_and_clears() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "10.10.10.10", HostType::Ipv4, 53, 10).await;
+        seed_link(&mut conn, 1, 1002, 20).await;
+
+        db.set_manual_override(EndpointId::new(1), Some(ProtocolId::new(1001)))
+            .await
+            .expect("set");
+        let ep = Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(ep.manual_protocol_override, Some(ProtocolId::new(1001)));
+
+        db.set_manual_override(EndpointId::new(1), None)
+            .await
+            .expect("clear");
+        let ep = Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(ep.manual_protocol_override, None);
+    }
+
+    #[tokio::test]
+    async fn restore_endpoint_bumps_last_seen() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
+        seed_link(&mut conn, 1, 1002, 20).await;
+
+        db.restore_endpoint(EndpointId::new(1))
+            .await
+            .expect("restore");
+
+        let now = Timestamp::now().as_second();
+        let links: Vec<ProfileStats> =
+            ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(EndpointId::new(1)))
+                .exec(&mut conn)
+                .await
+                .expect("links");
+        assert_eq!(links.len(), 2);
+        for link in links {
+            assert!(
+                link.last_seen_at.as_second() >= now - 60,
+                "every link of the endpoint is refreshed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_group_replaces_row() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        let mut g = Group {
+            id: "g1".to_string(),
+            name: Some("A".to_string()),
+            url: Some("https://example.com/sub".to_string()),
+            enabled: true,
+            user_agent: None,
+            convert_target: None,
+            core_type: None,
+            sort_order: Some(0),
+            last_refreshed: None,
+            status: None,
+            error_message: None,
+            refresh_interval: Some(30),
+        };
+        db.upsert_group(&g).await.expect("insert");
+
+        g.name = Some("B".to_string());
+        g.enabled = false;
+        db.upsert_group(&g).await.expect("update");
+
+        let rows: Vec<Group> = Group::filter(Group::fields().id().eq("g1".to_string()))
+            .exec(&mut conn)
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "upsert replaces insert_group/update_group");
+        let stored = Group::filter_by_id("g1".to_string())
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.name.as_deref(), Some("B"));
+        assert!(!stored.enabled);
+    }
+
+    #[tokio::test]
+    async fn clear_group_endpoints_and_delete_group() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
+        toasty::create!(EndpointGroup {
+            endpoint_id: EndpointId::new(1),
+            group_id: "g-a".to_string(),
+            last_seen_at: ts(1),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("link a");
+        toasty::create!(EndpointGroup {
+            endpoint_id: EndpointId::new(1),
+            group_id: "g-b".to_string(),
+            last_seen_at: ts(1),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("link b");
+
+        let n = db.clear_group_endpoints("g-a").await.expect("clear");
+        assert_eq!(n, 1, "clear_group returns the link count");
+        let remaining: Vec<EndpointGroup> =
+            EndpointGroup::all().exec(&mut conn).await.expect("rows");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].group_id, "g-b");
+
+        // delete_group removes the remaining links + the group, keeps endpoints.
+        db.upsert_group(&Group {
+            id: "g-b".to_string(),
+            name: None,
+            url: None,
+            enabled: true,
+            user_agent: None,
+            convert_target: None,
+            core_type: None,
+            sort_order: None,
+            last_refreshed: None,
+            status: None,
+            error_message: None,
+            refresh_interval: None,
+        })
+        .await
+        .expect("group b");
+        db.delete_group("g-b").await.expect("delete group");
+
+        let count = EndpointGroup::all()
+            .count()
+            .exec(&mut conn)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "group links deleted");
+        assert!(
+            Group::filter_by_id("g-b".to_string())
+                .first()
+                .exec(&mut conn)
+                .await
+                .expect("read")
+                .is_none(),
+            "group deleted"
+        );
+        assert!(
+            Endpoint::filter_by_id(EndpointId::new(1))
+                .first()
+                .exec(&mut conn)
+                .await
+                .expect("read")
+                .is_some(),
+            "endpoint + links survive group deletion"
         );
     }
 }

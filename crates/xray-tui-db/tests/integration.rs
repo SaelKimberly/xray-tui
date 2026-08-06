@@ -15,8 +15,9 @@ use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, Group, HostType, Latency,
-    ProfileStats, Protocol, ProtocolId, RoutingRule, Security, TrafficStats, Transport,
+    ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, ErrorInfo, Group, HostType,
+    Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, RoutingRule, Security, TrafficStats,
+    Transport,
 };
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
@@ -620,4 +621,369 @@ async fn seed_link_latency(
     .exec(conn)
     .await
     .expect("create link");
+}
+
+// ── Typed writes (Task 10) ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // Endpoint 1: every link older than the cutoff; group link to cascade.
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 100).await;
+    seed_link(&mut conn, 1, 1002, 200).await;
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "g1".to_string(),
+        last_seen_at: ts(50),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group link");
+
+    // Endpoint 2: linkless — vacuously expired (old COALESCE(MAX,0) < cutoff).
+    toasty::create!(Endpoint {
+        id: EndpointId::new(2),
+        host: "2.2.2.2".to_string(),
+        host_type: HostType::Ipv4,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("linkless endpoint");
+
+    // Endpoint 3: shares protocol 1002 with endpoint 1, but has a fresh link.
+    seed_endpoint(&mut conn, 3, 3001, "3.3.3.3", HostType::Ipv4, 443, 1500).await;
+    toasty::create!(ProfileStats {
+        protocol_id: ProtocolId::new(1002),
+        endpoint_id: EndpointId::new(3),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_seen_at: ts(1600),
+        task_queue: Vec::<u16>::new(),
+        traffic: zero_traffic(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("shared link on fresh endpoint");
+
+    let purged = db.purge_expired(ts(1000)).await.expect("purge");
+    assert_eq!(purged, 2, "endpoint 1 + linkless endpoint 2 purged");
+
+    // Endpoints 1 and 2 gone; endpoint 3 survives with its links.
+    assert!(
+        Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        Endpoint::filter_by_id(EndpointId::new(2))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        Endpoint::filter_by_id(EndpointId::new(3))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_some()
+    );
+
+    // Cascade: endpoint 1's links and group links are gone.
+    let links1: Vec<ProfileStats> =
+        ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(EndpointId::new(1)))
+            .exec(&mut conn)
+            .await
+            .expect("links");
+    assert!(links1.is_empty(), "expired endpoint's links cascade");
+    let groups1: Vec<EndpointGroup> =
+        EndpointGroup::filter(EndpointGroup::fields().endpoint_id().eq(EndpointId::new(1)))
+            .exec(&mut conn)
+            .await
+            .expect("group links");
+    assert!(groups1.is_empty(), "expired endpoint's group links cascade");
+
+    // Orphan protocol cleanup: 1001 has zero remaining links -> deleted;
+    // 1002 still has endpoint 3's link -> survives.
+    assert!(
+        Protocol::filter_by_id(ProtocolId::new(1001))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none(),
+        "orphan protocol purged"
+    );
+    assert!(
+        Protocol::filter_by_id(ProtocolId::new(1002))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_some(),
+        "protocol with a surviving link kept"
+    );
+}
+
+#[tokio::test]
+async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+
+    // Endpoint 1: links to 1001 and 1002; group link.
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
+    seed_link(&mut conn, 1, 1002, 20).await;
+    toasty::create!(EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "g1".to_string(),
+        last_seen_at: ts(5),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("group link");
+
+    // Endpoint 2: shares protocol 1002 (survives while its link remains) and
+    // owns protocol 3001.
+    toasty::create!(Endpoint {
+        id: EndpointId::new(2),
+        host: "2.2.2.2".to_string(),
+        host_type: HostType::Ipv4,
+        port: 443,
+        ports: Vec::<u16>::new(),
+        resolved_as: Vec::<String>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("endpoint 2");
+    toasty::create!(ProfileStats {
+        protocol_id: ProtocolId::new(1002),
+        endpoint_id: EndpointId::new(2),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_seen_at: ts(30),
+        task_queue: Vec::<u16>::new(),
+        traffic: zero_traffic(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("shared link");
+    seed_link(&mut conn, 2, 3001, 40).await;
+
+    db.delete_endpoint(EndpointId::new(1))
+        .await
+        .expect("delete");
+
+    // Endpoint 1 gone; links + group links cascade.
+    assert!(
+        Endpoint::filter_by_id(EndpointId::new(1))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    let links1: Vec<ProfileStats> =
+        ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(EndpointId::new(1)))
+            .exec(&mut conn)
+            .await
+            .expect("links");
+    assert!(links1.is_empty());
+    let groups1: Vec<EndpointGroup> =
+        EndpointGroup::filter(EndpointGroup::fields().endpoint_id().eq(EndpointId::new(1)))
+            .exec(&mut conn)
+            .await
+            .expect("group links");
+    assert!(groups1.is_empty());
+
+    // 1001 is now orphaned -> deleted; 1002 survives via endpoint 2.
+    assert!(
+        Protocol::filter_by_id(ProtocolId::new(1001))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none(),
+        "protocol orphaned by the delete is cleaned up"
+    );
+    assert!(
+        Protocol::filter_by_id(ProtocolId::new(1002))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_some(),
+        "protocol with a remaining link survives"
+    );
+
+    // Deleting the last endpoint holding 1002 orphans it too.
+    db.delete_endpoint(EndpointId::new(2))
+        .await
+        .expect("delete 2");
+    assert!(
+        Protocol::filter_by_id(ProtocolId::new(1002))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        Protocol::filter_by_id(ProtocolId::new(3001))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn clear_all_stats_zeroes_traffic_and_clears_results() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
+    seed_link_latency(
+        &mut conn,
+        1,
+        1002,
+        20,
+        Some(Latency::Real {
+            delay: 12,
+            ip: None,
+        }),
+    )
+    .await;
+    seed_endpoint(&mut conn, 2, 2001, "2.2.2.2", HostType::Ipv4, 443, 30).await;
+
+    for pid in [1001, 1002, 2001] {
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(pid),
+            EndpointId::new(if pid == 2001 { 2 } else { 1 }),
+        )
+        .update()
+        .traffic(TrafficStats {
+            today_up: 1,
+            today_down: 2,
+            total_up: 3,
+            total_down: 4,
+        })
+        .speed_bps(Some(5_000))
+        .error(Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "boom".to_string(),
+        }))
+        .exec(&mut conn)
+        .await
+        .expect("seed stats");
+    }
+
+    db.clear_all_stats().await.expect("clear");
+
+    let links: Vec<ProfileStats> = ProfileStats::all().exec(&mut conn).await.expect("links");
+    assert_eq!(links.len(), 3);
+    for link in links {
+        assert_eq!(link.traffic, zero_traffic(), "traffic zeroed on every row");
+        assert_eq!(link.latency, None, "latency cleared");
+        assert_eq!(link.speed_bps, None, "speed cleared");
+        assert_eq!(link.error, None, "error cleared");
+    }
+}
+
+#[tokio::test]
+async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
+
+    // Two handles loaded at the same version.
+    let mut h1 = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(1001),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("link");
+    let mut h2 = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(1001),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("link");
+    assert_eq!(
+        h1.version, h2.version,
+        "both handles start at the same version"
+    );
+
+    // Writer A wins via an instance update.
+    toasty::update!(h1 {
+        task_id: Some(1),
+        task_queue: vec![10, 11],
+    })
+    .exec(&mut conn)
+    .await
+    .expect("writer A");
+
+    // Writer B from the same stale snapshot is rejected by the #[version] guard.
+    let err = toasty::update!(h2 {
+        task_id: Some(2),
+        task_queue: vec![20, 21],
+    })
+    .exec(&mut conn)
+    .await
+    .expect_err("stale writer must fail the version check");
+    assert!(err.is_condition_failed(), "OCC must reject the stale write");
+
+    // The scheduler write reloads (fresh version) and succeeds; the final
+    // state is the last writer's.
+    db.update_scheduler_state(
+        ProtocolId::new(1001),
+        EndpointId::new(1),
+        Some(3),
+        &[30, 31],
+    )
+    .await
+    .expect("scheduler update");
+
+    let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(1001),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("read")
+    .expect("link");
+    assert_eq!(link.task_id, Some(3));
+    assert_eq!(link.task_queue, vec![30, 31], "whole vector replaced");
+
+    // Whole-vector replace + clearing task_id.
+    db.update_scheduler_state(ProtocolId::new(1001), EndpointId::new(1), None, &[40])
+        .await
+        .expect("scheduler replace");
+    let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(1001),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("read")
+    .expect("link");
+    assert_eq!(link.task_id, None);
+    assert_eq!(link.task_queue, vec![40]);
 }
