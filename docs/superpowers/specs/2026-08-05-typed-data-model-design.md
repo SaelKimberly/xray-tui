@@ -427,7 +427,14 @@ pub trait InjectToCoreConf {
 ## 8. Zero Raw SQL
 
 Remaining raw SQL: `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`,
-`PRAGMA foreign_keys=ON` on connection setup. Everything else typed:
+`PRAGMA foreign_keys=ON`, plus a minimal `PRAGMA user_version` schema TAG on
+connection setup. The tag is NOT migration machinery — it is a binary
+same-schema discriminator required because toasty 0.9's `push_schema` emits
+`CREATE TABLE` without `IF NOT EXISTS` (running it on an existing DB fails and
+would wipe data on reopen): tag == current → skip `push_schema`; anything else
+(fresh DB or pre-redesign DB) → `push_schema`, and on failure wipe + rebuild +
+re-tag. A future schema change must bump the tag. No `ALTER TABLE`,
+`ensure_column`, or index shims exist.
 
 - **Reads:** the 36-column JOIN queries become typed queries with relation
   preloads: `Endpoint::filter(...).include(endpoint.links())` with
