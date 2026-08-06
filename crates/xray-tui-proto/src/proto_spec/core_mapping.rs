@@ -1,6 +1,7 @@
-//! Core resolution for protocol kinds — canonical logic, moved from
-//! `xray-tui-core`'s `protocol_core_mapping.rs` (which is now an adapter shim
-//! over this module, converting core's `Protocol`/`CoreType` types).
+//! Core resolution for protocol kinds — canonical logic. The core crate's
+//! `protocol_core_mapping.rs` adapter shim (which converted core's
+//! `Protocol`/`CoreType` types) was deleted in T23; `xray-tui-core` now
+//! re-exports this module verbatim.
 
 use crate::proto_spec::{CoreType, ProtocolKind};
 
@@ -70,9 +71,10 @@ pub fn ss_method_supported(method: &str) -> bool {
     xray_supports_ss_method(method) || singbox_supports_ss_method(method)
 }
 
-/// Protocol kinds that only sing-box implements — mirror of the core crate's
-/// `SINGBOX_ONLY_PROTOCOLS` over [`ProtocolKind`].
-const SINGBOX_ONLY_KINDS: &[ProtocolKind] = &[
+/// Protocol kinds that only sing-box implements — the canonical sing-box-only
+/// set (the core crate's `SINGBOX_ONLY_PROTOCOLS` was deleted with the legacy
+/// `Protocol` enum in T23; consumers use this list over [`ProtocolKind`]).
+pub const SINGBOX_ONLY_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Tuic,
     ProtocolKind::Hysteria,
     ProtocolKind::Naive,

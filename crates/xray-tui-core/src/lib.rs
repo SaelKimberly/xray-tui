@@ -15,8 +15,6 @@ pub mod grpc_client;
 pub mod log_heed;
 pub mod ping;
 pub mod process;
-pub mod protocol;
-pub mod protocol_core_mapping;
 pub mod speed_test;
 pub mod updater;
 
@@ -39,9 +37,10 @@ pub use ping::{
     RealPingManager, SinglePingReq, TcpPingAdapter, UdpPingAdapter,
 };
 pub use process::{CoreManager, MockCoreManager, ProcessError, RealCoreManager};
-pub use protocol::Protocol;
-pub use protocol::SINGBOX_ONLY_PROTOCOLS;
-pub use protocol_core_mapping::resolve_core;
 pub use speed_test::{
     SpeedTestError, TestType, real_ping, speed_test, tcp_ping, udp_ping, udp_test, wait_for_socks5,
+};
+pub use xray_tui_proto::proto_spec::core_mapping::{
+    SINGBOX_ONLY_KINDS, SINGBOX_SS_METHODS, XRAY_SS_METHODS, resolve_core,
+    singbox_supports_ss_method, ss_method_supported, xray_supports_ss_method,
 };

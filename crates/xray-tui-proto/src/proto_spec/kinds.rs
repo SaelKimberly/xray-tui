@@ -46,6 +46,78 @@ pub enum ProtocolKind {
 }
 
 impl ProtocolKind {
+    /// Maps v2rayN `EConfigType` integer values to protocol kinds (the legacy
+    /// `config_type` column of the removed core `Protocol` enum, moved here in
+    /// T23 so `ProfileKey`/fast-ping dispatch stay i32-based).
+    #[must_use]
+    pub const fn try_from_i32(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Vmess),
+            2 => Some(Self::Custom),
+            3 => Some(Self::Shadowsocks),
+            4 => Some(Self::Socks),
+            5 => Some(Self::Vless),
+            6 => Some(Self::Trojan),
+            7 => Some(Self::Hysteria2),
+            8 => Some(Self::Tuic),
+            9 => Some(Self::WireGuard),
+            10 => Some(Self::Http),
+            11 => Some(Self::AnyTls),
+            12 => Some(Self::Naive),
+            13 => Some(Self::ShadowsocksR),
+            14 => Some(Self::Hysteria),
+            15 => Some(Self::ShadowTls),
+            16 => Some(Self::Tor),
+            17 => Some(Self::Ssh),
+            18 => Some(Self::Tailscale),
+            19 => Some(Self::Redirect),
+            20 => Some(Self::TProxy),
+            21 => Some(Self::Mixed),
+            22 => Some(Self::DokodemoDoor),
+            23 => Some(Self::Freedom),
+            24 => Some(Self::Blackhole),
+            25 => Some(Self::Dns),
+            26 => Some(Self::Loopback),
+            27 => Some(Self::Shadowsocks2022),
+            _ => None,
+        }
+    }
+
+    /// Inverse of [`Self::try_from_i32`] — the legacy `config_type` integer
+    /// for a protocol kind (used by `ProfileKey` and the fast-ping adapters).
+    #[must_use]
+    pub const fn to_i32(self) -> i32 {
+        match self {
+            Self::Vmess => 1,
+            Self::Custom => 2,
+            Self::Shadowsocks => 3,
+            Self::Socks => 4,
+            Self::Vless => 5,
+            Self::Trojan => 6,
+            Self::Hysteria2 => 7,
+            Self::Tuic => 8,
+            Self::WireGuard => 9,
+            Self::Http => 10,
+            Self::AnyTls => 11,
+            Self::Naive => 12,
+            Self::ShadowsocksR => 13,
+            Self::Hysteria => 14,
+            Self::ShadowTls => 15,
+            Self::Tor => 16,
+            Self::Ssh => 17,
+            Self::Tailscale => 18,
+            Self::Redirect => 19,
+            Self::TProxy => 20,
+            Self::Mixed => 21,
+            Self::DokodemoDoor => 22,
+            Self::Freedom => 23,
+            Self::Blackhole => 24,
+            Self::Dns => 25,
+            Self::Loopback => 26,
+            Self::Shadowsocks2022 => 27,
+        }
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

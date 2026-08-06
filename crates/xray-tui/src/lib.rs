@@ -25,7 +25,7 @@ pub use types::*;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use xray_tui_proto::proto_spec::ProtoSpec;
+use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig};
 
 /// Helper to send a `CoreEvent` with a warning on channel full.
 /// Prevents silent event loss.
@@ -68,8 +68,17 @@ pub(crate) fn profile_to_fields(
         if let Some(v) = config.transport_type() {
             set_field(&mut fields, "network", v);
         }
-        let (_ps, ss) = config.to_settings();
-        flatten_json_to_fields(&ss, &mut fields);
+        // Stream-settings fields for the edit form: typed protocols expose
+        // their flat `network`/`security` keys via the accessors above;
+        // placeholder protocols (Redirect/TProxy/Mixed) carry their stream
+        // settings as an opaque blob — pass those through unchanged.
+        if let ProtocolConfig::Redirect(c) | ProtocolConfig::TProxy(c) | ProtocolConfig::Mixed(c) =
+            config
+            && let Ok(blob) = serde_json::from_slice::<serde_json::Value>(&c.settings_json)
+            && let Some(ss) = blob.get("stream_settings")
+        {
+            flatten_json_to_fields(ss, &mut fields);
+        }
     }
     if !endpoint.host.is_empty() {
         set_field(&mut fields, "address", &endpoint.host);

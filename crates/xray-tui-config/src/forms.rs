@@ -1,5 +1,4 @@
 use serde_json::{Map, Value};
-use xray_tui_core::protocol::Protocol;
 use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
 use xray_tui_proto::proto_spec::core_mapping;
 use xray_tui_proto::proto_spec::{
@@ -43,7 +42,7 @@ pub enum FieldSection {
 
 /// Returns the form fields for a given protocol.
 #[must_use]
-pub fn form_fields_for(protocol: Protocol) -> Vec<FormField> {
+pub fn form_fields_for(protocol: ProtocolKind) -> Vec<FormField> {
     let mut fields = common_fields();
     fields.extend(protocol_specific_fields(protocol));
     fields
@@ -78,9 +77,9 @@ fn common_fields() -> Vec<FormField> {
     ]
 }
 
-fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
+fn protocol_specific_fields(protocol: ProtocolKind) -> Vec<FormField> {
     match protocol {
-        Protocol::Vmess => vec![
+        ProtocolKind::Vmess => vec![
             field(
                 "user_id",
                 "User ID",
@@ -244,7 +243,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::StreamSetting,
             ),
         ],
-        Protocol::Vless => vec![
+        ProtocolKind::Vless => vec![
             field(
                 "user_id",
                 "User ID",
@@ -392,19 +391,19 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::StreamSetting,
             ),
         ],
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => vec![
+        ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022 => vec![
             field(
                 "method",
                 "Method",
                 FormFieldType::Select(match protocol {
-                    Protocol::Shadowsocks => &[
+                    ProtocolKind::Shadowsocks => &[
                         "aes-256-gcm",
                         "aes-128-gcm",
                         "chacha20-ietf-poly1305",
                         "xchacha20-ietf-poly1305",
                         "none",
                     ],
-                    Protocol::Shadowsocks2022 => {
+                    ProtocolKind::Shadowsocks2022 => {
                         // 2022-blake3 only — no "none" (neither core has a
                         // plain 2022 mode; the 2022 spec requires a key).
                         &[
@@ -444,7 +443,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::StreamSetting,
             ),
         ],
-        Protocol::Socks => vec![
+        ProtocolKind::Socks => vec![
             field(
                 "username",
                 "Username",
@@ -470,7 +469,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Http => vec![
+        ProtocolKind::Http => vec![
             field(
                 "username",
                 "Username",
@@ -504,7 +503,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Trojan => vec![
+        ProtocolKind::Trojan => vec![
             field(
                 "password",
                 "Password",
@@ -612,7 +611,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::WireGuard => vec![
+        ProtocolKind::WireGuard => vec![
             field(
                 "private_key",
                 "Private Key",
@@ -718,7 +717,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Hysteria2 => vec![
+        ProtocolKind::Hysteria2 => vec![
             field(
                 "password",
                 "Password",
@@ -776,7 +775,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Hysteria => vec![
+        ProtocolKind::Hysteria => vec![
             field(
                 "protocol",
                 "Protocol",
@@ -834,7 +833,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Tuic => vec![
+        ProtocolKind::Tuic => vec![
             field(
                 "uuid",
                 "UUID",
@@ -892,7 +891,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Naive => vec![
+        ProtocolKind::Naive => vec![
             field(
                 "user",
                 "User",
@@ -926,7 +925,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::AnyTls => vec![
+        ProtocolKind::AnyTls => vec![
             field(
                 "password",
                 "Password",
@@ -960,7 +959,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::ShadowTls => vec![
+        ProtocolKind::ShadowTls => vec![
             field(
                 "password",
                 "Password",
@@ -986,7 +985,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Tor => vec![
+        ProtocolKind::Tor => vec![
             field(
                 "socks_port",
                 "SOCKS Port",
@@ -1020,7 +1019,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Ssh => vec![
+        ProtocolKind::Ssh => vec![
             field(
                 "host",
                 "SSH Host",
@@ -1062,7 +1061,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Tailscale => vec![
+        ProtocolKind::Tailscale => vec![
             field(
                 "auth_key",
                 "Auth Key",
@@ -1088,7 +1087,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::ShadowsocksR => vec![
+        ProtocolKind::ShadowsocksR => vec![
             field(
                 "method",
                 "Method",
@@ -1144,7 +1143,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::DokodemoDoor => vec![
+        ProtocolKind::DokodemoDoor => vec![
             field(
                 "doko_address",
                 "Target Address",
@@ -1170,7 +1169,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Freedom => vec![
+        ProtocolKind::Freedom => vec![
             field(
                 "domain_strategy",
                 "Domain Strategy",
@@ -1188,7 +1187,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Blackhole => vec![field(
+        ProtocolKind::Blackhole => vec![field(
             "response_type",
             "Response",
             FormFieldType::Select(&["none", "http"]),
@@ -1196,7 +1195,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
             false,
             FieldSection::ProtocolSetting,
         )],
-        Protocol::Loopback => vec![field(
+        ProtocolKind::Loopback => vec![field(
             "proxy_tag",
             "Proxy Tag",
             FormFieldType::Text,
@@ -1204,7 +1203,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
             false,
             FieldSection::ProtocolSetting,
         )],
-        Protocol::Dns => vec![
+        ProtocolKind::Dns => vec![
             field(
                 "network",
                 "Network",
@@ -1222,7 +1221,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Redirect => vec![
+        ProtocolKind::Redirect => vec![
             field(
                 "redirect_address",
                 "Address",
@@ -1240,7 +1239,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
                 FieldSection::ProtocolSetting,
             ),
         ],
-        Protocol::Custom => vec![field(
+        ProtocolKind::Custom => vec![field(
             "config_json",
             "Config JSON",
             FormFieldType::Text,
@@ -1248,7 +1247,7 @@ fn protocol_specific_fields(protocol: Protocol) -> Vec<FormField> {
             true,
             FieldSection::ProtocolSetting,
         )],
-        Protocol::TProxy | Protocol::Mixed => {
+        ProtocolKind::TProxy | ProtocolKind::Mixed => {
             // Inbound-only protocols — no outbound form
             vec![]
         }
@@ -1275,20 +1274,20 @@ const fn field(
 
 /// URL scheme prefix for each protocol's share link.
 #[must_use]
-pub const fn url_scheme_for(protocol: Protocol) -> &'static str {
+pub const fn url_scheme_for(protocol: ProtocolKind) -> &'static str {
     match protocol {
-        Protocol::Vmess => "vmess://",
-        Protocol::Vless => "vless://",
-        Protocol::Shadowsocks | Protocol::Shadowsocks2022 => "ss://",
-        Protocol::Trojan => "trojan://",
-        Protocol::Socks => "socks://",
-        Protocol::Hysteria2 => "hysteria2://",
-        Protocol::Hysteria => "hysteria://",
-        Protocol::Tuic => "tuic://",
-        Protocol::Naive => "naive+https://",
-        Protocol::AnyTls => "anytls://",
-        Protocol::ShadowTls => "shadowtls://",
-        Protocol::WireGuard => "wireguard://",
+        ProtocolKind::Vmess => "vmess://",
+        ProtocolKind::Vless => "vless://",
+        ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022 => "ss://",
+        ProtocolKind::Trojan => "trojan://",
+        ProtocolKind::Socks => "socks://",
+        ProtocolKind::Hysteria2 => "hysteria2://",
+        ProtocolKind::Hysteria => "hysteria://",
+        ProtocolKind::Tuic => "tuic://",
+        ProtocolKind::Naive => "naive+https://",
+        ProtocolKind::AnyTls => "anytls://",
+        ProtocolKind::ShadowTls => "shadowtls://",
+        ProtocolKind::WireGuard => "wireguard://",
         _ => "",
     }
 }
@@ -1300,8 +1299,8 @@ pub const fn url_scheme_for(protocol: Protocol) -> &'static str {
 // settings JSON consumed here: `{ "user_id"?, "protocol_settings": {…},
 // "stream_settings": {…} }` — `user_id` is the credential form field
 // (`user_id`/`uuid`/`password`), which `fields_to_profile` keeps OUT of the
-// two settings maps. These builders are the reverse of
-// `ProtocolConfig::to_settings()` for the typed config structs, and wrap
+// two settings maps. These builders are the reverse of the typed config
+// structs' parse boundaries, and wrap
 // outbound-only kinds in a `PlaceholderConfig`.
 //
 // HOST-FREE rule: the endpoint `address` never enters transport/security
@@ -1528,7 +1527,7 @@ fn transport_and_path(ss: &SettingsMap) -> (TransportConfig, Option<TinyText>) {
         )
     } else if let Some(sn) = opt_text(ss.get("grpc.serviceName")) {
         // serviceName doubles as the gRPC path (share-link convention) so
-        // reconstruct emits `path=` and to_settings emits `serviceName`.
+        // reconstruct emits `path=` while the builders emit `serviceName`.
         (
             TransportConfig::Grpc(GrpcConfig {
                 service_name: Some(sn.clone()),
@@ -1599,8 +1598,8 @@ fn kind_for_ss_method(method: &str) -> ProtocolKind {
 }
 
 /// Outbound-only / non-URL kinds: raw settings passthrough in a
-/// [`PlaceholderConfig`] (same semantics as the legacy `from_legacy_parse`
-/// path), endpoints from address/port. Redirect/TProxy/Mixed get their
+/// [`PlaceholderConfig`] (the legacy raw-settings passthrough), endpoints
+/// from address/port. Redirect/TProxy/Mixed get their
 /// dedicated [`ProtocolConfig`] variants; the other outbound-only kinds share
 /// the Mixed placeholder variant (the only one that can carry them — the
 /// `proto_kind` stays the real kind).
@@ -1747,7 +1746,8 @@ fn vmess_from_form(
     let (transport, path) = transport_and_path(ss);
     let mut security = tls_security_from_stream(ps, ss);
     // Encryption is a Profile column in fields_to_profile (never lands in the
-    // settings JSON); "auto" is the parser default and what to_settings emits.
+    // settings JSON); "auto" is the parser default and what the vmess builder
+    // emits.
     security.enc = Some(TinyText::from("auto"));
     Ok(VmessConfig {
         uuid,
@@ -2186,31 +2186,31 @@ mod tests {
     #[test]
     fn form_fields_all_protocols() {
         for proto in &[
-            Protocol::Vmess,
-            Protocol::Vless,
-            Protocol::Shadowsocks,
-            Protocol::Shadowsocks2022,
-            Protocol::Socks,
-            Protocol::Http,
-            Protocol::Trojan,
-            Protocol::WireGuard,
-            Protocol::Hysteria2,
-            Protocol::Hysteria,
-            Protocol::Tuic,
-            Protocol::Naive,
-            Protocol::AnyTls,
-            Protocol::ShadowTls,
-            Protocol::Tor,
-            Protocol::Ssh,
-            Protocol::Tailscale,
-            Protocol::ShadowsocksR,
-            Protocol::DokodemoDoor,
-            Protocol::Freedom,
-            Protocol::Blackhole,
-            Protocol::Loopback,
-            Protocol::Dns,
-            Protocol::Redirect,
-            Protocol::Custom,
+            ProtocolKind::Vmess,
+            ProtocolKind::Vless,
+            ProtocolKind::Shadowsocks,
+            ProtocolKind::Shadowsocks2022,
+            ProtocolKind::Socks,
+            ProtocolKind::Http,
+            ProtocolKind::Trojan,
+            ProtocolKind::WireGuard,
+            ProtocolKind::Hysteria2,
+            ProtocolKind::Hysteria,
+            ProtocolKind::Tuic,
+            ProtocolKind::Naive,
+            ProtocolKind::AnyTls,
+            ProtocolKind::ShadowTls,
+            ProtocolKind::Tor,
+            ProtocolKind::Ssh,
+            ProtocolKind::Tailscale,
+            ProtocolKind::ShadowsocksR,
+            ProtocolKind::DokodemoDoor,
+            ProtocolKind::Freedom,
+            ProtocolKind::Blackhole,
+            ProtocolKind::Loopback,
+            ProtocolKind::Dns,
+            ProtocolKind::Redirect,
+            ProtocolKind::Custom,
         ] {
             let fields = form_fields_for(*proto);
             assert!(!fields.is_empty(), "{proto} should have fields");
@@ -2241,17 +2241,17 @@ mod tests {
 
     #[test]
     fn form_fields_inbound_only_have_common() {
-        let tproxy = form_fields_for(Protocol::TProxy);
+        let tproxy = form_fields_for(ProtocolKind::TProxy);
         assert_eq!(tproxy.len(), 3); // common fields (remarks removed)
         assert!(tproxy.iter().all(|f| f.section == FieldSection::Common));
-        let mixed = form_fields_for(Protocol::Mixed);
+        let mixed = form_fields_for(ProtocolKind::Mixed);
         assert_eq!(mixed.len(), 3);
         assert!(mixed.iter().all(|f| f.section == FieldSection::Common));
     }
 
     #[test]
     fn vmess_required_fields() {
-        let fields = form_fields_for(Protocol::Vmess);
+        let fields = form_fields_for(ProtocolKind::Vmess);
         let user_id = fields.iter().find(|f| f.key == "user_id").unwrap();
         assert!(user_id.required);
         assert!(matches!(user_id.field_type, FormFieldType::Text));
@@ -2261,12 +2261,12 @@ mod tests {
 
     #[test]
     fn url_scheme_mapping() {
-        assert_eq!(url_scheme_for(Protocol::Vmess), "vmess://");
-        assert_eq!(url_scheme_for(Protocol::Vless), "vless://");
-        assert_eq!(url_scheme_for(Protocol::Shadowsocks), "ss://");
-        assert_eq!(url_scheme_for(Protocol::Trojan), "trojan://");
-        assert_eq!(url_scheme_for(Protocol::WireGuard), "wireguard://");
-        assert_eq!(url_scheme_for(Protocol::Freedom), "");
+        assert_eq!(url_scheme_for(ProtocolKind::Vmess), "vmess://");
+        assert_eq!(url_scheme_for(ProtocolKind::Vless), "vless://");
+        assert_eq!(url_scheme_for(ProtocolKind::Shadowsocks), "ss://");
+        assert_eq!(url_scheme_for(ProtocolKind::Trojan), "trojan://");
+        assert_eq!(url_scheme_for(ProtocolKind::WireGuard), "wireguard://");
+        assert_eq!(url_scheme_for(ProtocolKind::Freedom), "");
     }
 
     // ── T12: typed config builders ────────────────────────────────────
@@ -3150,70 +3150,40 @@ mod tests {
 
     // ── producer-accurate end-to-end: real form defaults must build ─────
 
-    /// `form_fields_for` `Protocol` → `ProtocolKind`.
-    fn kind_for_proto(p: Protocol) -> ProtocolKind {
-        match p {
-            Protocol::Vmess => ProtocolKind::Vmess,
-            Protocol::Vless => ProtocolKind::Vless,
-            Protocol::Shadowsocks => ProtocolKind::Shadowsocks,
-            Protocol::Shadowsocks2022 => ProtocolKind::Shadowsocks2022,
-            Protocol::Socks => ProtocolKind::Socks,
-            Protocol::Http => ProtocolKind::Http,
-            Protocol::Trojan => ProtocolKind::Trojan,
-            Protocol::WireGuard => ProtocolKind::WireGuard,
-            Protocol::Hysteria2 => ProtocolKind::Hysteria2,
-            Protocol::DokodemoDoor => ProtocolKind::DokodemoDoor,
-            Protocol::Freedom => ProtocolKind::Freedom,
-            Protocol::Blackhole => ProtocolKind::Blackhole,
-            Protocol::Dns => ProtocolKind::Dns,
-            Protocol::Loopback => ProtocolKind::Loopback,
-            Protocol::Custom => ProtocolKind::Custom,
-            Protocol::Tuic => ProtocolKind::Tuic,
-            Protocol::Hysteria => ProtocolKind::Hysteria,
-            Protocol::Naive => ProtocolKind::Naive,
-            Protocol::AnyTls => ProtocolKind::AnyTls,
-            Protocol::ShadowTls => ProtocolKind::ShadowTls,
-            Protocol::Tor => ProtocolKind::Tor,
-            Protocol::Ssh => ProtocolKind::Ssh,
-            Protocol::Tailscale => ProtocolKind::Tailscale,
-            Protocol::ShadowsocksR => ProtocolKind::ShadowsocksR,
-            Protocol::Redirect => ProtocolKind::Redirect,
-            Protocol::TProxy => ProtocolKind::TProxy,
-            Protocol::Mixed => ProtocolKind::Mixed,
-        }
-    }
-
     /// The form's own default field values, with empty-default REQUIRED
     /// fields filled so the builder's required-credential backstop does not
     /// trip (the TUI validates required fields before submission).
-    fn form_default_fields(proto: Protocol) -> Vec<(&'static str, String)> {
+    fn form_default_fields(proto: ProtocolKind) -> Vec<(&'static str, String)> {
         let mut fields: Vec<(&'static str, String)> = form_fields_for(proto)
             .iter()
             .map(|f| (f.key, f.default.to_string()))
             .collect();
         for (key, value) in &mut fields {
             match (proto, *key) {
-                (Protocol::Vmess | Protocol::Vless | Protocol::Tuic, "user_id" | "uuid") => {
+                (
+                    ProtocolKind::Vmess | ProtocolKind::Vless | ProtocolKind::Tuic,
+                    "user_id" | "uuid",
+                ) => {
                     *value = "6202b230-417c-4d8e-b624-0f71afa9c75d".into();
                 }
                 (
-                    Protocol::Shadowsocks
-                    | Protocol::Shadowsocks2022
-                    | Protocol::ShadowsocksR
-                    | Protocol::Trojan
-                    | Protocol::Naive
-                    | Protocol::AnyTls
-                    | Protocol::ShadowTls,
+                    ProtocolKind::Shadowsocks
+                    | ProtocolKind::Shadowsocks2022
+                    | ProtocolKind::ShadowsocksR
+                    | ProtocolKind::Trojan
+                    | ProtocolKind::Naive
+                    | ProtocolKind::AnyTls
+                    | ProtocolKind::ShadowTls,
                     "password",
                 ) => {
                     *value = "secret".into();
                 }
-                (Protocol::Ssh, "host") => *value = "ssh.example.com".into(),
-                (Protocol::Ssh, "username") => *value = "root".into(),
-                (Protocol::WireGuard, "private_key") => *value = "aGVsbG8=".into(),
-                (Protocol::WireGuard, "public_key") => *value = "d29ybGQ=".into(),
-                (Protocol::Dns, "dns_address") => *value = "1.1.1.1".into(),
-                (Protocol::Custom, "config_json") => *value = "{}".into(),
+                (ProtocolKind::Ssh, "host") => *value = "ssh.example.com".into(),
+                (ProtocolKind::Ssh, "username") => *value = "root".into(),
+                (ProtocolKind::WireGuard, "private_key") => *value = "aGVsbG8=".into(),
+                (ProtocolKind::WireGuard, "public_key") => *value = "d29ybGQ=".into(),
+                (ProtocolKind::Dns, "dns_address") => *value = "1.1.1.1".into(),
+                (ProtocolKind::Custom, "config_json") => *value = "{}".into(),
                 _ => {}
             }
         }
@@ -3228,38 +3198,38 @@ mod tests {
     #[test]
     fn form_defaults_build_cleanly_for_all_protocols() {
         for proto in [
-            Protocol::Vmess,
-            Protocol::Vless,
-            Protocol::Shadowsocks,
-            Protocol::Shadowsocks2022,
-            Protocol::Socks,
-            Protocol::Http,
-            Protocol::Trojan,
-            Protocol::WireGuard,
-            Protocol::Hysteria2,
-            Protocol::Hysteria,
-            Protocol::Tuic,
-            Protocol::Naive,
-            Protocol::AnyTls,
-            Protocol::ShadowTls,
-            Protocol::Tor,
-            Protocol::Ssh,
-            Protocol::Tailscale,
-            Protocol::ShadowsocksR,
-            Protocol::DokodemoDoor,
-            Protocol::Freedom,
-            Protocol::Blackhole,
-            Protocol::Loopback,
-            Protocol::Dns,
-            Protocol::Redirect,
-            Protocol::Custom,
-            Protocol::TProxy,
-            Protocol::Mixed,
+            ProtocolKind::Vmess,
+            ProtocolKind::Vless,
+            ProtocolKind::Shadowsocks,
+            ProtocolKind::Shadowsocks2022,
+            ProtocolKind::Socks,
+            ProtocolKind::Http,
+            ProtocolKind::Trojan,
+            ProtocolKind::WireGuard,
+            ProtocolKind::Hysteria2,
+            ProtocolKind::Hysteria,
+            ProtocolKind::Tuic,
+            ProtocolKind::Naive,
+            ProtocolKind::AnyTls,
+            ProtocolKind::ShadowTls,
+            ProtocolKind::Tor,
+            ProtocolKind::Ssh,
+            ProtocolKind::Tailscale,
+            ProtocolKind::ShadowsocksR,
+            ProtocolKind::DokodemoDoor,
+            ProtocolKind::Freedom,
+            ProtocolKind::Blackhole,
+            ProtocolKind::Loopback,
+            ProtocolKind::Dns,
+            ProtocolKind::Redirect,
+            ProtocolKind::Custom,
+            ProtocolKind::TProxy,
+            ProtocolKind::Mixed,
         ] {
             let fields = form_default_fields(proto);
             let pairs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let settings = producer_settings(&pairs);
-            let result = build_typed_config(kind_for_proto(proto), "1.2.3.4", 443, &settings);
+            let result = build_typed_config(proto, "1.2.3.4", 443, &settings);
             assert!(
                 result.is_ok(),
                 "{proto:?} default form must build without error: {:?}",
@@ -3273,7 +3243,7 @@ mod tests {
     /// `tcp.headerType=none`) builds, and sni/tls still map.
     #[test]
     fn vmess_form_defaults_build() {
-        let fields = form_default_fields(Protocol::Vmess);
+        let fields = form_default_fields(ProtocolKind::Vmess);
         let pairs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let settings = producer_settings(&pairs);
         let parsed = build_typed_config(ProtocolKind::Vmess, "1.2.3.4", 443, &settings)

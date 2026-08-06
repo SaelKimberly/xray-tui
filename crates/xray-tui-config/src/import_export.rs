@@ -8,9 +8,9 @@
 //! and the format entry point ([`format_share_url`] →
 //! [`ProtocolConfig::reconstruct_proto`]).
 //!
-//! The legacy `Profile` struct, `spec_blob` machinery, per-protocol
-//! `XxxFmt` parsers/formatters, and settings-JSON round-trips were removed
-//! in T11 (see the task report for the deleted public API surface).
+//! The legacy `Profile` struct, per-protocol `XxxFmt` parsers/formatters,
+//! and settings-JSON round-trips were removed in T11 (see the task report
+//! for the deleted public API surface).
 
 use std::net::IpAddr;
 

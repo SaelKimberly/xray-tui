@@ -7,8 +7,8 @@ mod tcp;
 mod udp;
 
 use super::{PingCapability, PingError};
-use crate::protocol::Protocol;
 use std::time::Duration;
+use xray_tui_proto::ProtocolKind;
 
 /// Transport-level ping adapter. Each impl handles one transport method
 /// (TCP, UDP, QUIC) and declares which protocols it supports.
@@ -20,8 +20,8 @@ use std::time::Duration;
 pub trait FastPingAdapter: Send + Sync + std::fmt::Debug {
     fn transport(&self) -> PingCapability;
     fn name(&self) -> &'static str;
-    /// Whether this adapter can ping the given protocol.
-    fn supports(&self, protocol: Protocol) -> bool;
+    /// Whether this adapter can ping the given protocol kind.
+    fn supports(&self, protocol: ProtocolKind) -> bool;
     /// Run a ping against `addr:port`, returning latency on success.
     async fn ping(&self, addr: &str, port: u16, timeout: Duration) -> Result<Duration, PingError>;
 }
@@ -67,8 +67,8 @@ impl FastPingManager {
         self.adapters.push(adapter);
     }
 
-    /// Find the first adapter that supports this protocol.
-    pub fn adapter_for(&self, protocol: Protocol) -> Option<&dyn FastPingAdapter> {
+    /// Find the first adapter that supports this protocol kind.
+    pub fn adapter_for(&self, protocol: ProtocolKind) -> Option<&dyn FastPingAdapter> {
         self.adapters
             .iter()
             .find(|a| a.supports(protocol))
@@ -77,7 +77,7 @@ impl FastPingManager {
 
     /// Capability for a protocol — for TUI indicator display.
     pub fn capability_for(&self, config_type: i32) -> PingCapability {
-        let protocol = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
+        let protocol = ProtocolKind::try_from_i32(config_type).unwrap_or(ProtocolKind::Custom);
         self.adapter_for(protocol)
             .map_or(PingCapability::None, |a| a.transport())
     }
@@ -89,7 +89,7 @@ impl FastPingManager {
         addr: &str,
         port: u16,
     ) -> Result<Duration, PingError> {
-        let protocol = Protocol::try_from_i32(config_type).unwrap_or(Protocol::Custom);
+        let protocol = ProtocolKind::try_from_i32(config_type).unwrap_or(ProtocolKind::Custom);
         match self.adapter_for(protocol) {
             Some(adapter) => adapter.ping(addr, port, self.timeout).await,
             None => Err(PingError::NotSupported),
@@ -106,12 +106,12 @@ mod tests {
     fn adapter_for_tcp_protocols() {
         let fmgr = FastPingManager::new(Duration::from_secs(5));
         for proto in &[
-            Protocol::Vmess,
-            Protocol::Vless,
-            Protocol::Shadowsocks,
-            Protocol::Socks,
-            Protocol::Http,
-            Protocol::Trojan,
+            ProtocolKind::Vmess,
+            ProtocolKind::Vless,
+            ProtocolKind::Shadowsocks,
+            ProtocolKind::Socks,
+            ProtocolKind::Http,
+            ProtocolKind::Trojan,
         ] {
             let adapter = fmgr.adapter_for(*proto);
             assert!(adapter.is_some(), "no adapter for {proto:?}");
@@ -123,7 +123,7 @@ mod tests {
     fn adapter_for_udp_protocols() {
         let fmgr = FastPingManager::new(Duration::from_secs(5));
         // WireGuard is UDP-only (not in TcpPingAdapter)
-        let adapter = fmgr.adapter_for(Protocol::WireGuard);
+        let adapter = fmgr.adapter_for(ProtocolKind::WireGuard);
         assert!(adapter.is_some(), "no adapter for WireGuard");
         assert_eq!(adapter.unwrap().transport(), PingCapability::Udp);
     }
@@ -132,21 +132,23 @@ mod tests {
     fn adapter_for_unsupported_returns_none() {
         let fmgr = FastPingManager::new(Duration::from_secs(5));
         // Freedom, Blackhole, Dns, Loopback, Tailscale have no adapters
-        assert!(fmgr.adapter_for(Protocol::Freedom).is_none());
+        assert!(fmgr.adapter_for(ProtocolKind::Freedom).is_none());
     }
 
     #[test]
     fn capability_matches_adapter() {
         let fmgr = FastPingManager::new(Duration::from_secs(5));
-        // config_type 0 -> Protocol::Custom -> TcpPingAdapter
+        // config_type 0 -> ProtocolKind::Custom -> TcpPingAdapter
         assert_eq!(fmgr.capability_for(0), PingCapability::Tcp);
     }
 
     #[tokio::test]
     async fn ping_unsupported_returns_error() {
         let fmgr = FastPingManager::new(Duration::from_secs(5));
-        // Protocol::Freedom has no adapter
-        let result = fmgr.ping(Protocol::Freedom.to_i32(), "1.2.3.4", 80).await;
+        // ProtocolKind::Freedom has no adapter
+        let result = fmgr
+            .ping(ProtocolKind::Freedom.to_i32(), "1.2.3.4", 80)
+            .await;
         assert!(matches!(result, Err(PingError::NotSupported)));
     }
 }

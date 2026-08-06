@@ -1,7 +1,7 @@
 use super::{FastPingAdapter, PingCapability, PingError};
-use crate::protocol::Protocol;
 use async_trait::async_trait;
 use std::time::Duration;
+use xray_tui_proto::ProtocolKind;
 
 /// Direct UDP ping. Supports protocols where the endpoint accepts UDP traffic.
 #[derive(Debug)]
@@ -17,8 +17,11 @@ impl FastPingAdapter for UdpPingAdapter {
         "UDP"
     }
 
-    fn supports(&self, protocol: Protocol) -> bool {
-        matches!(protocol, Protocol::WireGuard | Protocol::ShadowsocksR)
+    fn supports(&self, protocol: ProtocolKind) -> bool {
+        matches!(
+            protocol,
+            ProtocolKind::WireGuard | ProtocolKind::ShadowsocksR
+        )
     }
 
     async fn ping(&self, addr: &str, port: u16, timeout: Duration) -> Result<Duration, PingError> {

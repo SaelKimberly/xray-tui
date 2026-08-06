@@ -6,8 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::HashMap;
 use xray_tui_config::forms::{FieldSection, FormFieldType, form_fields_for};
-use xray_tui_core::SINGBOX_ONLY_PROTOCOLS;
-use xray_tui_core::protocol::Protocol;
+use xray_tui_core::SINGBOX_ONLY_KINDS;
+use xray_tui_proto::proto_spec::ProtocolKind;
 
 use crate::ui::theme::ThemeStyles;
 use crate::{AppMode, AppState};
@@ -19,58 +19,58 @@ use ratatui_cheese::theme::Palette;
 use tui_popup::{KnownSizeWrapper, Popup};
 
 /// Protocol picker layout groups
-const XRAY_PROTOCOLS: &[Protocol] = &[
-    Protocol::Vmess,
-    Protocol::Vless,
-    Protocol::Shadowsocks,
-    Protocol::Shadowsocks2022,
-    Protocol::Socks,
-    Protocol::Http,
-    Protocol::Trojan,
-    Protocol::WireGuard,
-    Protocol::Hysteria2,
-    Protocol::DokodemoDoor,
-    Protocol::Freedom,
-    Protocol::Blackhole,
-    Protocol::Dns,
-    Protocol::Loopback,
-    Protocol::Custom,
+const XRAY_PROTOCOLS: &[ProtocolKind] = &[
+    ProtocolKind::Vmess,
+    ProtocolKind::Vless,
+    ProtocolKind::Shadowsocks,
+    ProtocolKind::Shadowsocks2022,
+    ProtocolKind::Socks,
+    ProtocolKind::Http,
+    ProtocolKind::Trojan,
+    ProtocolKind::WireGuard,
+    ProtocolKind::Hysteria2,
+    ProtocolKind::DokodemoDoor,
+    ProtocolKind::Freedom,
+    ProtocolKind::Blackhole,
+    ProtocolKind::Dns,
+    ProtocolKind::Loopback,
+    ProtocolKind::Custom,
 ];
 
-fn singbox_protocols() -> Vec<Protocol> {
-    SINGBOX_ONLY_PROTOCOLS
+fn singbox_protocols() -> Vec<ProtocolKind> {
+    SINGBOX_ONLY_KINDS
         .iter()
-        .filter(|p| !matches!(p, Protocol::TProxy | Protocol::Mixed))
+        .filter(|p| !matches!(p, ProtocolKind::TProxy | ProtocolKind::Mixed))
         .copied()
         .collect()
 }
 
-const ALL_PICKER_PROTOCOLS: &[Protocol] = &[
-    Protocol::Vmess,
-    Protocol::Vless,
-    Protocol::Shadowsocks,
-    Protocol::Shadowsocks2022,
-    Protocol::Socks,
-    Protocol::Http,
-    Protocol::Trojan,
-    Protocol::WireGuard,
-    Protocol::Hysteria2,
-    Protocol::DokodemoDoor,
-    Protocol::Freedom,
-    Protocol::Blackhole,
-    Protocol::Dns,
-    Protocol::Loopback,
-    Protocol::Custom,
-    Protocol::Tuic,
-    Protocol::Hysteria,
-    Protocol::Naive,
-    Protocol::AnyTls,
-    Protocol::ShadowTls,
-    Protocol::Tor,
-    Protocol::Ssh,
-    Protocol::Tailscale,
-    Protocol::ShadowsocksR,
-    Protocol::Redirect,
+const ALL_PICKER_PROTOCOLS: &[ProtocolKind] = &[
+    ProtocolKind::Vmess,
+    ProtocolKind::Vless,
+    ProtocolKind::Shadowsocks,
+    ProtocolKind::Shadowsocks2022,
+    ProtocolKind::Socks,
+    ProtocolKind::Http,
+    ProtocolKind::Trojan,
+    ProtocolKind::WireGuard,
+    ProtocolKind::Hysteria2,
+    ProtocolKind::DokodemoDoor,
+    ProtocolKind::Freedom,
+    ProtocolKind::Blackhole,
+    ProtocolKind::Dns,
+    ProtocolKind::Loopback,
+    ProtocolKind::Custom,
+    ProtocolKind::Tuic,
+    ProtocolKind::Hysteria,
+    ProtocolKind::Naive,
+    ProtocolKind::AnyTls,
+    ProtocolKind::ShadowTls,
+    ProtocolKind::Tor,
+    ProtocolKind::Ssh,
+    ProtocolKind::Tailscale,
+    ProtocolKind::ShadowsocksR,
+    ProtocolKind::Redirect,
 ];
 
 // ── Render dispatch ──────────────────────────────────────────────────────
@@ -106,8 +106,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         } => {
             let proto = crate::get_field(fields, "config_type")
                 .and_then(|v| v.parse::<i32>().ok())
-                .and_then(Protocol::try_from_i32)
-                .unwrap_or(Protocol::Custom);
+                .and_then(ProtocolKind::try_from_i32)
+                .unwrap_or(ProtocolKind::Custom);
             render_form(
                 frame,
                 area,
@@ -205,7 +205,7 @@ fn render_protocol_picker(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_form(
     frame: &mut Frame,
     area: Rect,
-    protocol: Protocol,
+    protocol: ProtocolKind,
     fields: &[(String, String)],
     focus_index: usize,
     form_errors: &HashMap<String, String>,
@@ -425,10 +425,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             .await
             .ok()
             .flatten()
-            .and_then(|p| {
-                p.active_protocol()
-                    .map(|(_, proto)| Protocol::from(proto.proto_kind))
-            }),
+            .and_then(|p| p.active_protocol().map(|(_, proto)| proto.proto_kind)),
         _ => None,
     };
 

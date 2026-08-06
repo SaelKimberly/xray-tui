@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
-use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_core::{CorePool, SinglePingReq};
 use xray_tui_db::Database;
@@ -83,8 +82,8 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
 
     state.testing_details.insert(protocol_id, TestType::TcpPing);
     state.testing_profiles.insert(protocol_id);
-    // The fast-ping adapters dispatch on the core Protocol kind.
-    let config_type = Protocol::from(proto.proto_kind).to_i32();
+    // The fast-ping adapters dispatch on the protocol kind.
+    let config_type = proto.proto_kind.to_i32();
     let timeout_dur = *state.config.speed_test.tcp_timeout_secs;
 
     tokio::spawn(async move {
@@ -597,7 +596,7 @@ impl From<BatchParams> for BatchShared {
             .map(|pl| {
                 (
                     (pl.link.protocol_id, pl.link.endpoint_id),
-                    Protocol::from(pl.protocol.proto_kind).to_i32(),
+                    pl.protocol.proto_kind.to_i32(),
                 )
             })
             .collect();

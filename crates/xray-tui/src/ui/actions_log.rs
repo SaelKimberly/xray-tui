@@ -1,5 +1,5 @@
 use xray_tui_core::grpc_client::format_bytes;
-use xray_tui_core::protocol::Protocol;
+use xray_tui_proto::proto_spec::ProtocolKind;
 
 use crate::AppState;
 use crate::ui::theme::ThemeStyles;
@@ -47,7 +47,7 @@ fn server_summary(state: &AppState) -> (String, String, u16, String) {
         |r| {
             let proto = r
                 .active_protocol()
-                .map_or(Protocol::Custom, |(_, p)| Protocol::from(p.proto_kind));
+                .map_or(ProtocolKind::Custom, |(_, p)| p.proto_kind);
             let addr = r.endpoint.host.clone();
             let port = r.endpoint.port;
             let core = state.resolved_core(r).to_string();

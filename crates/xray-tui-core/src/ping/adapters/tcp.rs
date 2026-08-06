@@ -1,7 +1,7 @@
 use super::{FastPingAdapter, PingCapability, PingError};
-use crate::protocol::Protocol;
 use async_trait::async_trait;
 use std::time::Duration;
+use xray_tui_proto::ProtocolKind;
 
 /// TCP handshake ping. Supports all TCP-based proxy protocols.
 #[derive(Debug)]
@@ -17,27 +17,27 @@ impl FastPingAdapter for TcpPingAdapter {
         "TCP"
     }
 
-    fn supports(&self, protocol: Protocol) -> bool {
+    fn supports(&self, protocol: ProtocolKind) -> bool {
         matches!(
             protocol,
-            Protocol::Vmess
-                | Protocol::Vless
-                | Protocol::Shadowsocks
-                | Protocol::Shadowsocks2022
-                | Protocol::Socks
-                | Protocol::Http
-                | Protocol::Trojan
-                | Protocol::DokodemoDoor
-                | Protocol::Custom
-                | Protocol::Naive
-                | Protocol::AnyTls
-                | Protocol::ShadowTls
-                | Protocol::Tor
-                | Protocol::Ssh
-                | Protocol::ShadowsocksR
-                | Protocol::Redirect
-                | Protocol::TProxy
-                | Protocol::Mixed
+            ProtocolKind::Vmess
+                | ProtocolKind::Vless
+                | ProtocolKind::Shadowsocks
+                | ProtocolKind::Shadowsocks2022
+                | ProtocolKind::Socks
+                | ProtocolKind::Http
+                | ProtocolKind::Trojan
+                | ProtocolKind::DokodemoDoor
+                | ProtocolKind::Custom
+                | ProtocolKind::Naive
+                | ProtocolKind::AnyTls
+                | ProtocolKind::ShadowTls
+                | ProtocolKind::Tor
+                | ProtocolKind::Ssh
+                | ProtocolKind::ShadowsocksR
+                | ProtocolKind::Redirect
+                | ProtocolKind::TProxy
+                | ProtocolKind::Mixed
         )
     }
 

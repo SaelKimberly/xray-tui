@@ -228,8 +228,8 @@ pub enum AppMode {
     },
     /// Adding a new server
     AddServer {
-        /// Selected protocol (None while protocol picker shown)
-        protocol: Option<xray_tui_core::protocol::Protocol>,
+        /// Selected protocol kind (None while protocol picker shown)
+        protocol: Option<xray_tui_proto::proto_spec::ProtocolKind>,
         /// Raw form field values: map of field key -> current input
         fields: Vec<(String, String)>,
         /// Index of the focused field

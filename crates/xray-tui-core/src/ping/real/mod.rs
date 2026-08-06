@@ -10,7 +10,6 @@ pub use pool::CorePool;
 pub use pool::SinglePingReq;
 
 use super::PingResult;
-use crate::protocol::Protocol;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -59,9 +58,9 @@ impl RealPingManager {
 }
 
 /// Legacy `config_type` integer for `ProfileKey`, derived from the typed
-/// `proto_kind` (the old `ProtocolRow.config_type`).
+/// `proto_kind`.
 pub(super) fn config_type(protocol: &DbProtocol) -> i32 {
-    Protocol::from(protocol.proto_kind).to_i32()
+    protocol.proto_kind.to_i32()
 }
 
 #[cfg(test)]

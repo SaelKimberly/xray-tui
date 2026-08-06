@@ -204,8 +204,8 @@ pub struct Endpoint {
     pub group_links: Deferred<Vec<EndpointGroup>>,
 }
 
-/// `Protocol`: a protocol configuration. Replaces the old `ProtocolRow`.
-/// PK = uid = sig ^ `cred_hash` (same as old Profile.id).
+/// `Protocol`: a protocol configuration.
+/// PK = uid = sig ^ `cred_hash`.
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "protocols"]
 pub struct Protocol {
@@ -225,8 +225,7 @@ pub struct Protocol {
     pub links: Deferred<Vec<ProfileStats>>,
 }
 
-/// Per endpoint-protocol pair state (replaces `ProtocolRow.last_seen_at` +
-/// `ProfileExtension` + `ServerStat`).
+/// Per endpoint-protocol pair state (traffic, latency, errors).
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "profile_stats"]
 #[key(protocol_id, endpoint_id)]

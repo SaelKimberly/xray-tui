@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use smallvec::SmallVec;
 
 use crate::clash::ClashProxy;
@@ -82,15 +82,6 @@ pub enum ParseError {
     UnsupportedScheme(SchemeX),
     #[error("not a proxy config URL (promotion or navigation link)")]
     PromotionUrl,
-    /// Private/reserved/loopback IP address as the server host.
-    ///
-    /// No longer raised by the parsers: host *policy* (private/loopback/
-    /// link-local/localhost rejection, gated by `allow_private_ips`) moved to
-    /// the config layer (`xray-tui-config::import_export::validate_host`) in
-    /// T11, which is the single host-policy authority. Kept for API
-    /// compatibility; slated for removal with the legacy surface in T23.
-    #[error("private/reserved host: {0}")]
-    InvalidPrivateHost(Cow<'static, str>),
     /// The protocol is recognized but not yet implemented as a placeholder.
     #[error("protocol not yet implemented: {0}")]
     Unimplemented(&'static str),
@@ -270,262 +261,6 @@ impl ProtocolConfig {
     /// rendered.
     pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
         dispatch!(self, reconstruct_proto, endpoint)
-    }
-
-    /// Construct a `ProtocolConfig` from legacy parser fields.
-    ///
-    /// Wraps the protocol-specific settings as a [`PlaceholderConfig`] with an
-    /// opaque JSON blob. This lets the existing config builders continue to work
-    /// by reading from `to_settings()`.
-    #[must_use]
-    pub fn from_legacy_parse(proto_name: &str, settings_json: Vec<u8>) -> Self {
-        let placeholder = |name: &str, json: Vec<u8>| PlaceholderConfig {
-            proto_name: name.to_string(),
-            settings_json: json,
-        };
-        // Only for protocols that don't have URL format (PlaceholderConfig variants).
-        // Full-protocol types must use ProtocolConfig::try_parse().
-        match proto_name.to_lowercase().as_str() {
-            "redirect" => Self::Redirect(placeholder(proto_name, settings_json)),
-            "tproxy" => Self::TProxy(placeholder(proto_name, settings_json)),
-            "mixed" => Self::Mixed(placeholder(proto_name, settings_json)),
-            p => {
-                // Unknown/unparsed protocol — wrap as Mixed for backward compat
-                Self::Mixed(placeholder(p, settings_json))
-            }
-        }
-    }
-
-    /// Extract `protocol_settings` and `stream_settings` as JSON Values.
-    ///
-    /// For full protocol config types, builds from typed fields.
-    /// For [`PlaceholderConfig`] stubs, extracts from the opaque `settings_json` blob.
-    ///
-    /// KEPT (Task 16 audit): still consumed by the TUI's `profile_to_fields`
-    /// (`crates/xray-tui/src/lib.rs`, mid-break until T17 rewires it) and by
-    /// proto tests as a stream-settings reference oracle
-    /// (`common.rs::vless_to_settings_*`). The config builders (T13) and
-    /// import/export (T11) no longer call it.
-    #[must_use]
-    pub fn to_settings(&self) -> (serde_json::Value, serde_json::Value) {
-        match self {
-            // Placeholder-based protocols: extract from settings_json
-            Self::Redirect(c) | Self::TProxy(c) | Self::Mixed(c) => {
-                let extra: serde_json::Value =
-                    serde_json::from_slice(&c.settings_json).unwrap_or_default();
-                let mut p = extra
-                    .get("protocol_settings")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                // Inject `user_id` as `id` into p_settings if absent (legacy
-                // parsers store UUID/PW at top level, not inside protocol_settings).
-                if let Some(user_id) = extra.get("user_id").and_then(|v| v.as_str())
-                    && let Some(obj) = p.as_object_mut()
-                    && !obj.contains_key("id")
-                    && !obj.contains_key("uuid")
-                {
-                    obj.entry("id".to_string())
-                        .or_insert(serde_json::Value::String(user_id.to_string()));
-                }
-                let s = extra
-                    .get("stream_settings")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                (p, s)
-            }
-            // Typed protocols: build from typed config fields
-            Self::Vmess(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("id".into(), json!(c.uuid));
-                if let Some(sec) = c.security.type_str() {
-                    p.insert("security".into(), json!(sec));
-                }
-                p.insert("encryption".into(), json!("auto"));
-                (
-                    Value::Object(p),
-                    common::to_xray_stream_settings(&c.security, &c.transport)
-                        .unwrap_or_else(|| json!({})),
-                )
-            }
-            Self::Vless(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("id".into(), json!(c.uuid));
-                p.insert(
-                    "encryption".into(),
-                    json!(c.encryption.as_deref().unwrap_or("none")),
-                );
-                if let Some(ref flow) = c.flow {
-                    p.insert("flow".into(), json!(flow));
-                }
-                (
-                    Value::Object(p),
-                    common::to_xray_stream_settings(&c.security, &c.transport)
-                        .unwrap_or_else(|| json!({})),
-                )
-            }
-            Self::Trojan(c) => (
-                json!({"password": c.password}),
-                common::to_xray_stream_settings(&c.security, &c.transport)
-                    .unwrap_or_else(|| json!({})),
-            ),
-            Self::Hysteria2(c) => {
-                let mut p = serde_json::Map::new();
-                // Hysteria2 auth token is the password
-                p.insert("password".into(), json!(c.auth));
-                if let Some(ref up) = c.up
-                    && let Ok(v) = up.as_str().parse::<u64>()
-                {
-                    p.insert("up_mbps".into(), json!(v));
-                }
-                if let Some(ref down) = c.down
-                    && let Ok(v) = down.as_str().parse::<u64>()
-                {
-                    p.insert("down_mbps".into(), json!(v));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Ss(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("password".into(), json!(c.password));
-                p.insert("method".into(), json!(c.method));
-                if let Some(ref plugin) = c.plugin {
-                    p.insert("plugin".into(), json!(plugin.as_str()));
-                }
-                if let Some(ref opts) = c.plugin_opts {
-                    let joined: String = opts
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect::<Vec<_>>()
-                        .join(";");
-                    p.insert("plugin_opts".into(), json!(joined));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Ssr(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("password".into(), json!(c.password));
-                p.insert("method".into(), json!(c.method));
-                for (k, v) in &c.params {
-                    p.insert(k.clone(), json!(v));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Tuic(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("uuid".into(), json!(c.uuid));
-                p.insert("password".into(), json!(c.password));
-                if let Some(ref cc) = c.congestion_control {
-                    p.insert("congestion_control".into(), json!(cc.as_str()));
-                }
-                if let Some(ref urm) = c.udp_relay_mode {
-                    p.insert("udp_relay_mode".into(), json!(urm.as_str()));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Wireguard(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("private_key".into(), json!(c.private_key));
-                p.insert("public_key".into(), json!(c.public_key));
-                p.insert("address".into(), json!(c.address.as_str()));
-                if let Some(ref pk) = c.preshared_key {
-                    p.insert("preshared_key".into(), json!(pk));
-                }
-                if let Some(ref r) = c.reserved {
-                    p.insert("reserved".into(), json!(r.as_str()));
-                }
-                if let Some(ref mtu) = c.mtu {
-                    p.insert("mtu".into(), json!(mtu.as_str()));
-                }
-                if let Some(ref k) = c.persistent_keepalive {
-                    p.insert("persistent_keepalive".into(), json!(k));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Socks(c) => {
-                let mut p = serde_json::Map::new();
-                if let Some(ref user) = c.username {
-                    p.insert("username".into(), json!(user));
-                }
-                if let Some(ref pass) = c.password {
-                    p.insert("password".into(), json!(pass));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Http(c) => {
-                let mut p = serde_json::Map::new();
-                if let Some(ref user) = c.username {
-                    p.insert("username".into(), json!(user));
-                }
-                if let Some(ref pass) = c.password {
-                    p.insert("password".into(), json!(pass));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Naive(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("username".into(), json!(c.username));
-                p.insert("password".into(), json!(c.password));
-                (Value::Object(p), json!({}))
-            }
-            Self::AnyTls(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("password".into(), json!(c.password));
-                (Value::Object(p), json!({}))
-            }
-            Self::ShadowTls(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("password".into(), json!(c.password));
-                if let Some(ref ver) = c.version {
-                    p.insert("version".into(), json!(ver.as_str()));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Tor(c) => {
-                let mut p = serde_json::Map::new();
-                if let Some(ref dir) = c.data_directory {
-                    p.insert("data_dir".into(), json!(dir));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Ssh(c) => {
-                let mut p = serde_json::Map::new();
-                if let Some(ref user) = c.user {
-                    p.insert("username".into(), json!(user));
-                }
-                if let Some(ref pass) = c.password {
-                    p.insert("password".into(), json!(pass));
-                }
-                if let Some(ref key) = c.private_key {
-                    p.insert("private_key".into(), json!(key));
-                }
-                (Value::Object(p), json!({}))
-            }
-            Self::Tailscale(c) => {
-                let mut p = serde_json::Map::new();
-                p.insert("auth_key".into(), json!(c.auth_key));
-                if let Some(ref url) = c.control_url {
-                    p.insert("control_url".into(), json!(url));
-                }
-                p.insert("ephemeral".into(), json!(c.ephemeral));
-                (Value::Object(p), json!({}))
-            }
-            Self::Hysteria1(c) => {
-                let mut p = serde_json::Map::new();
-                if let Some(ref a) = c.auth {
-                    p.insert("auth".into(), json!(a));
-                }
-                if let Some(up) = c.up_mbps {
-                    p.insert("up_mbps".into(), json!(up));
-                }
-                if let Some(down) = c.down_mbps {
-                    p.insert("down_mbps".into(), json!(down));
-                }
-                if let Some(ref obfs) = c.obfs {
-                    p.insert("obfs".into(), json!(obfs.as_str()));
-                }
-                (Value::Object(p), json!({}))
-            }
-        }
     }
 }
 
@@ -797,9 +532,9 @@ struct Identity {
 /// A [`ProtocolConfig`] paired with its lazily-materialized identity.
 ///
 /// `sig`/`cred_hash`/`uid` are computed once (atomically, on first access) and
-/// cached. Serializes byte-identical to the wrapped [`ProtocolConfig`]
-/// (`spec_blob` format), so deserializing a stored spec produces an identical
-/// [`Proto`] whose identity starts deferred (empty `OnceLock`).
+/// cached. Serializes byte-identical to the wrapped [`ProtocolConfig`], so
+/// deserializing a stored spec produces an identical [`Proto`] whose identity
+/// starts deferred (empty `OnceLock`).
 #[derive(Debug)]
 pub struct Proto {
     config: ProtocolConfig,
@@ -977,7 +712,7 @@ impl InjectToCoreConf for PlaceholderConfig {
     ) -> Result<(), SupportError> {
         // Redirect / TProxy / Mixed share this one type; the variant is carried
         // in `proto_name` ("redirect" / "tproxy" / "mixed" as written by
-        // `from_legacy_parse` and `try_parse_proto`), so it is the kind string.
+        // `PlaceholderConfig::new` and `try_parse_proto`), so it is the kind string.
         //
         // Both cores error: sing-box has NO redirect/tproxy/mixed OUTBOUND
         // type (option/redir.go is inbound-only; the design doc §7 raw
@@ -1008,8 +743,8 @@ impl PlaceholderConfig {
     /// no URL format and no endpoint. `endpoints` EMPTY is legal for these.
     ///
     /// The kind is derived from `proto_name`; unknown names fall back to
-    /// [`ProtocolKind::Mixed`], the same backward-compat rule as
-    /// [`ProtocolConfig::from_legacy_parse`].
+    /// [`ProtocolKind::Mixed`], the same backward-compat rule the legacy
+    /// parser passthrough used.
     #[must_use]
     pub fn try_parse_proto(&self) -> ParsedProto {
         let (proto_kind, config) = match self.proto_name.to_lowercase().as_str() {
@@ -1099,6 +834,7 @@ impl ProtoIdentity for PlaceholderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn placeholder_try_parse_proto_emits_endpointless_parsed_proto() {
@@ -1127,7 +863,7 @@ mod tests {
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::TProxy);
         assert_eq!(parsed.protocol.config, ProtocolConfig::TProxy(tproxy));
 
-        // Unknown proto_name falls back to Mixed (from_legacy_parse rule).
+        // Unknown proto_name falls back to Mixed (legacy passthrough rule).
         let mixed = PlaceholderConfig::new("wireguard".into(), json);
         let parsed = mixed.try_parse_proto();
         assert!(parsed.endpoints.is_empty());
@@ -1163,16 +899,22 @@ mod tests {
             "stream_settings": {}
         });
         let json = serde_json::to_vec(&blob).unwrap();
-        let a = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json.clone()));
-        let b = Proto::new(ProtocolConfig::from_legacy_parse("wireguard", json));
-        let c = Proto::new(ProtocolConfig::from_legacy_parse(
-            "wireguard",
+        let a = Proto::new(ProtocolConfig::Mixed(PlaceholderConfig::new(
+            "wireguard".into(),
+            json.clone(),
+        )));
+        let b = Proto::new(ProtocolConfig::Mixed(PlaceholderConfig::new(
+            "wireguard".into(),
+            json,
+        )));
+        let c = Proto::new(ProtocolConfig::Mixed(PlaceholderConfig::new(
+            "wireguard".into(),
             serde_json::to_vec(&serde_json::json!({
                 "protocol_settings": {"password": "other"},
                 "stream_settings": {}
             }))
             .unwrap(),
-        ));
+        )));
         assert_ne!(a.sig(), 0, "sig must never be zero");
         assert_eq!(a.sig(), b.sig(), "same body -> same sig (dedup)");
         assert_ne!(a.sig(), c.sig(), "different body -> different sig");
@@ -1192,7 +934,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&proto).unwrap(),
             serde_json::to_string(&config).unwrap(),
-            "Proto must serialize byte-identical to ProtocolConfig (spec_blob format)"
+            "Proto must serialize byte-identical to ProtocolConfig"
         );
         let bytes = serde_json::to_vec(&proto).unwrap();
         let reparsed: Proto = serde_json::from_slice(&bytes).unwrap();
@@ -1298,7 +1040,13 @@ mod tests {
         use crate::clash::{ClashProxy, ClashSsh, ClashTailscale, ClashTor};
 
         let placeholder = |name: &str| {
-            ProtocolConfig::from_legacy_parse(name, serde_json::to_vec(&json!({})).unwrap())
+            let body = serde_json::to_vec(&json!({})).unwrap();
+            let pc = PlaceholderConfig::new(name.to_string(), body);
+            match name {
+                "redirect" => ProtocolConfig::Redirect(pc),
+                "tproxy" => ProtocolConfig::TProxy(pc),
+                _ => ProtocolConfig::Mixed(pc),
+            }
         };
         let tor = TorConfig::try_from_clash_proto(&ClashProxy::Tor(ClashTor {
             name: "tor-node".into(),
@@ -1418,23 +1166,6 @@ mod tests {
             (placeholder("tproxy"), "tproxy"),
             (placeholder("mixed"), "mixed"),
         ]
-    }
-
-    /// Core whose dispatch arm reports `UnsupportedProtocol` for a variant:
-    /// the sing-box-only protocols (real sing-box `inject_to` landed in T15)
-    /// have no Xray shape and error for Xray permanently.
-    fn reject_core_for(config: &ProtocolConfig) -> CoreType {
-        match config {
-            ProtocolConfig::Vless(_)
-            | ProtocolConfig::Vmess(_)
-            | ProtocolConfig::Trojan(_)
-            | ProtocolConfig::Hysteria2(_)
-            | ProtocolConfig::Ss(_)
-            | ProtocolConfig::Wireguard(_)
-            | ProtocolConfig::Socks(_)
-            | ProtocolConfig::Http(_) => CoreType::SingBox,
-            _ => CoreType::Xray,
-        }
     }
 
     /// Cores that can build an outbound for the variant (T14 xray + T15

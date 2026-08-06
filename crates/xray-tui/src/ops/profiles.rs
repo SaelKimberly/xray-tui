@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use jiff::Timestamp;
 use xray_tui_config::forms::build_typed_config;
 use xray_tui_config::import_export::{ParsedProfile, ValidationSettings, parse_share_url};
-use xray_tui_core::protocol::Protocol;
 use xray_tui_core::{CoreType, resolve_core};
 
 use crate::AppState;
@@ -256,21 +255,28 @@ pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
     let Some((link, protocol)) = row.active_protocol() else {
         return CoreType::Auto;
     };
-    let core_protocol = Protocol::from(protocol.proto_kind);
     let config_override = state
         .config
         .core
         .protocol_core_overrides
-        .get(&core_protocol.to_string())
+        .get(&protocol.proto_kind.to_string())
         .and_then(|s| s.parse::<CoreType>().ok());
-    resolve_core(
-        core_protocol,
-        config_override.or(match link.core_type {
-            ProtoCoreType::Xray => Some(CoreType::Xray),
-            ProtoCoreType::SingBox => Some(CoreType::SingBox),
-        }),
+    let override_ = match config_override.or(match link.core_type {
+        ProtoCoreType::Xray => Some(CoreType::Xray),
+        ProtoCoreType::SingBox => Some(CoreType::SingBox),
+    }) {
+        Some(CoreType::Auto) | None => None,
+        Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
+        Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
+    };
+    match resolve_core(
+        protocol.proto_kind,
+        override_,
         xray_tui_core::shadowsocks_method(protocol).as_deref(),
-    )
+    ) {
+        ProtoCoreType::Xray => CoreType::Xray,
+        ProtoCoreType::SingBox => CoreType::SingBox,
+    }
 }
 
 pub fn start_add_server(state: &mut AppState) {
@@ -437,10 +443,9 @@ pub fn collapse_expand(state: &mut AppState) {
 /// If the address/port are missing or `build_typed_config` rejects the
 /// settings (unknown keys, missing credentials).
 pub fn fields_to_parsed(
-    protocol: Protocol,
+    kind: ProtocolKind,
     fields: &[(String, String)],
 ) -> Result<(ParsedProto, Option<ProtoCoreType>), String> {
-    let kind = ProtocolKind::from(protocol);
     let address = get_field(fields, "address").unwrap_or_default();
     let port = get_field(fields, "port")
         .and_then(|p| p.parse::<u16>().ok())
@@ -530,7 +535,7 @@ pub fn fields_to_parsed(
 /// Validation shared by add/edit: address/port presence and required
 /// credentials for the credential-bearing protocols.
 fn validate_form_fields(
-    protocol: Protocol,
+    protocol: ProtocolKind,
     fields: &[(String, String)],
     errors: &mut HashMap<String, String>,
 ) {
@@ -544,17 +549,17 @@ fn validate_form_fields(
     }
     let user_id = get_field(fields, "user_id").unwrap_or_default();
     match protocol {
-        Protocol::Vmess
-        | Protocol::Vless
-        | Protocol::Trojan
-        | Protocol::Shadowsocks
-        | Protocol::Shadowsocks2022
-        | Protocol::ShadowsocksR
+        ProtocolKind::Vmess
+        | ProtocolKind::Vless
+        | ProtocolKind::Trojan
+        | ProtocolKind::Shadowsocks
+        | ProtocolKind::Shadowsocks2022
+        | ProtocolKind::ShadowsocksR
             if user_id.is_empty() =>
         {
             errors.insert("user_id".into(), "ID/Password required".into());
         }
-        Protocol::Tuic => {
+        ProtocolKind::Tuic => {
             // uuid is the tuic credential; password is optional.
             let uuid = get_field(fields, "uuid").unwrap_or_default();
             if uuid.is_empty() {
@@ -684,7 +689,7 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         );
         return;
     };
-    let protocol = Protocol::from(protocol.proto_kind);
+    let protocol = protocol.proto_kind;
 
     let mut errors: HashMap<String, String> = HashMap::new();
     validate_form_fields(protocol, &fields, &mut errors);
@@ -813,7 +818,7 @@ fn form_from_parsed(state: &mut AppState, parsed: &ParsedProfile) {
     let protocol = protocol_from_parsed(&parsed.parsed);
     let mut fields = profile_to_fields(&protocol, &endpoint);
     set_core_field(&mut fields, parsed.parsed.protocol.core_type);
-    let core_protocol = Protocol::from(parsed.parsed.protocol.proto_kind);
+    let core_protocol = parsed.parsed.protocol.proto_kind;
     state.mode = AppMode::AddServer {
         protocol: Some(core_protocol),
         fields,

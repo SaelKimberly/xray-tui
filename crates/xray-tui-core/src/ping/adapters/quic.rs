@@ -1,8 +1,8 @@
 use super::{FastPingAdapter, PingCapability, PingError};
-use crate::protocol::Protocol;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
+use xray_tui_proto::ProtocolKind;
 
 /// QUIC handshake ping. Supports TUIC, Hysteria, Hysteria2.
 /// Opens a QUIC connection to the server endpoint, measures handshake time.
@@ -19,10 +19,10 @@ impl FastPingAdapter for QuicPingAdapter {
         "QUIC"
     }
 
-    fn supports(&self, protocol: Protocol) -> bool {
+    fn supports(&self, protocol: ProtocolKind) -> bool {
         matches!(
             protocol,
-            Protocol::Tuic | Protocol::Hysteria | Protocol::Hysteria2
+            ProtocolKind::Tuic | ProtocolKind::Hysteria | ProtocolKind::Hysteria2
         )
     }
 

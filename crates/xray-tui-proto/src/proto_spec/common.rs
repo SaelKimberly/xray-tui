@@ -1115,13 +1115,13 @@ mod tests {
     use crate::urlx::RawUrlX;
 
     #[test]
-    fn vless_to_settings_emits_xray_stream_settings() {
+    fn vless_stream_settings_emits_xray_stream_settings() {
         let raw = RawUrlX::from(
             "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?security=tls&type=ws&path=%2Fws&host=cdn.example.com#r",
         );
         let config = VlessConfig::try_parse(&raw).expect("parse vless URL");
-        let (_, s_settings) = ProtocolConfig::Vless(config).to_settings();
-        let ss = s_settings.as_object().expect("streamSettings present");
+        let ss = to_xray_stream_settings(&config.security, &config.transport)
+            .expect("streamSettings present");
         assert_eq!(ss["network"], "ws");
         assert_eq!(ss["security"], "tls");
         assert_eq!(ss["wsSettings"]["path"], "/ws");
@@ -1135,26 +1135,26 @@ mod tests {
     }
 
     #[test]
-    fn vless_to_settings_emits_splithttp_network() {
+    fn vless_stream_settings_emits_splithttp_network() {
         let raw = RawUrlX::from(
             "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?security=tls&type=splithttp&path=%2Fs#r",
         );
         let config = VlessConfig::try_parse(&raw).expect("parse vless URL");
-        let (_, s_settings) = ProtocolConfig::Vless(config).to_settings();
-        let ss = s_settings.as_object().expect("streamSettings present");
+        let ss = to_xray_stream_settings(&config.security, &config.transport)
+            .expect("streamSettings present");
         // xray-core only recognizes "splithttp" as the network name.
         assert_eq!(ss["network"], "splithttp");
         assert_eq!(ss["splithttpSettings"]["path"], "/s");
     }
 
     #[test]
-    fn vless_to_settings_emits_httpupgrade_host_string() {
+    fn vless_stream_settings_emits_httpupgrade_host_string() {
         let raw = RawUrlX::from(
             "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@cdn.example.com:443?type=httpupgrade&path=%2Fup&host=cdn.example.com#r",
         );
         let config = VlessConfig::try_parse(&raw).expect("parse vless URL");
-        let (_, s_settings) = ProtocolConfig::Vless(config).to_settings();
-        let ss = s_settings.as_object().expect("streamSettings present");
+        let ss = to_xray_stream_settings(&config.security, &config.transport)
+            .expect("streamSettings present");
         assert_eq!(ss["network"], "httpupgrade");
         let host = &ss["httpupgradeSettings"]["host"];
         assert!(

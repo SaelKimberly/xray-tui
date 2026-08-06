@@ -428,8 +428,7 @@ pub fn parse_subscription_data(
     }
 
     // Scan parsed profiles for allow_insecure / insecure settings (typed
-    // security accessor — legacy spec_blob/to_settings check removed in T11;
-    // the full flow rework lands in T12).
+    // security accessor — the full flow rework lands in T12).
     summary.security_warning_count = profiles
         .iter()
         .filter(|p| {

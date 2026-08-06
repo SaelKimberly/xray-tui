@@ -4,8 +4,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
-use xray_tui_core::protocol::Protocol;
 use xray_tui_core::speed_test::TestType;
+use xray_tui_proto::proto_spec::ProtocolKind;
 
 use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
@@ -407,7 +407,7 @@ fn build_display_rows(
 
         let protocol = row
             .active_protocol()
-            .map_or(Protocol::Custom, |(_, p)| Protocol::from(p.proto_kind));
+            .map_or(ProtocolKind::Custom, |(_, p)| p.proto_kind);
         let is_multi = state.multi_select.contains(&row.endpoint.id.get());
 
         let idx_str = if is_multi {
