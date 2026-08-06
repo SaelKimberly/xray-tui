@@ -1,17 +1,13 @@
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use toasty::Deferred;
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_db::models::{
-    DELAY_SOURCE_FAST, DELAY_SOURCE_REAL, DELAY_SOURCE_UDP, EndpointRow, ProfileExtension,
-    ServerStat,
-};
+use xray_tui_db::models::{EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, TrafficStats};
 
 use crate::AppState;
-use crate::format_now;
-use crate::ops::profiles::{endpoint_dns_unresolved, session_rounds};
+use crate::ops::profiles::endpoint_dns_unresolved;
 use crate::types::{AppMode, CoreEvent, SettingsMode, SplitRightPane};
 
 /// Format a profile ID as a URL-like hex identifier.
@@ -19,9 +15,9 @@ fn fmt_profile_id(id: i64) -> String {
     format!("xray-tui://{id:x}")
 }
 
-/// Find the endpoint row whose protocols list owns `protocol_id`
-/// (a `ProtocolRow` id). Endpoint ids (stable hashes of host:port) are
-/// unrelated to protocol ids, so the match scans `r.protocols`.
+/// Find the endpoint row whose links own `protocol_id` (a `Protocol` row id).
+/// Endpoint ids (stable hashes of host:port) are unrelated to protocol ids,
+/// so the match scans `r.links`.
 #[must_use]
 pub(crate) fn endpoint_row_for_protocol(
     endpoints: &mut [EndpointRow],
@@ -29,7 +25,18 @@ pub(crate) fn endpoint_row_for_protocol(
 ) -> Option<&mut EndpointRow> {
     endpoints
         .iter_mut()
-        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
+        .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id))
+}
+
+/// The persisted `error.kind` bucket for a test type: fast-class tests
+/// (TCP/UDP) land in `Fast`, data-plane tests (real ping, speed) in `Real`.
+/// Name-resolution failures surface on real attempts and share the real
+/// bucket (the tier model already maps `Name` under real-err).
+const fn err_kind_for(test_type: TestType) -> ProfileErr {
+    match test_type {
+        TestType::TcpPing | TestType::UdpTest => ProfileErr::Fast,
+        TestType::RealPing | TestType::SpeedTest => ProfileErr::Real,
+    }
 }
 
 /// Poll core event channel and update state accordingly.
@@ -38,8 +45,8 @@ pub(crate) fn endpoint_row_for_protocol(
 /// batch-progress bar cleared), so the caller can trigger an immediate redraw
 /// instead of waiting for the idle refresh cadence.
 pub async fn poll_core_events(state: &mut AppState) -> bool {
-    // Clean up stale batch_progress when the task has finished silently
-    // (e.g., create_ping_batch returned 0, no TestTypeUpdate events were ever sent).
+    // Clean up stale batch_progress when a batch task has finished silently
+    // (the batch pipeline is removed in T17; T19 rebuilds it).
     let mut handled = if state.batch_progress.is_some()
         && state.testing_profiles.is_empty()
         && state
@@ -100,27 +107,29 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 total_down,
             } => {
                 state.connection_error = None;
-                let record = ServerStat {
-                    protocol_id,
-                    today_up: Some(today_up),
-                    today_down: Some(today_down),
-                    total_up: Some(total_up),
-                    total_down: Some(total_down),
-                    last_updated: Some(format_now()),
-                    protocol_row: Deferred::default(),
-                };
-                if let Err(e) = state.db.upsert_server_stats(&record).await {
-                    state.log_trace(
-                        "error",
-                        "tui::ops::events",
-                        &format!("Failed to save stats: {e}"),
-                    );
-                }
-                // Update in-memory endpoint row to avoid full reload.
-                // protocol_id is a ProtocolRow id — match the row whose
-                // protocols list owns it (never the endpoint id).
-                if let Some(row) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id) {
-                    row.stats.insert(protocol_id, record);
+                // protocol_id is a Protocol row id — match the row whose links
+                // own it (never the endpoint id). Patch the link's traffic
+                // in-memory and persist via `upsert_link` (the gRPC stats
+                // poller writes these).
+                if let Some(row) = endpoint_row_for_protocol(&mut state.endpoints, protocol_id)
+                    && let Some(link) = row
+                        .links
+                        .iter_mut()
+                        .find(|l| l.protocol_id.get() == protocol_id)
+                {
+                    link.traffic = TrafficStats {
+                        today_up,
+                        today_down,
+                        total_up,
+                        total_down,
+                    };
+                    if let Err(e) = state.db.upsert_link(link).await {
+                        state.log_trace(
+                            "error",
+                            "tui::ops::events",
+                            &format!("Failed to save stats: {e}"),
+                        );
+                    }
                 }
                 state.current_traffic_up = total_up;
                 state.current_traffic_down = total_down;
@@ -210,81 +219,78 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 let (ep_id, ep_host_is_dns) = state
                     .endpoints
                     .iter()
-                    .find(|r| r.protocols.iter().any(|p| p.id == protocol_id))
+                    .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id))
                     .map_or((0, false), |r| {
-                        (r.endpoint.id, r.endpoint.host_type == "dns")
+                        use xray_tui_db::models::HostType;
+                        (r.endpoint.id.get(), r.endpoint.host_type == HostType::Dns)
                     });
                 let ip_info_clone = ip_info.clone();
-
-                // Feed the per-endpoint ping round used by the profiles Test
-                // column `[fast]`/`[real]` labels. A protocol succeeds on any
-                // result without error; failures accumulate per round.
-                let round = match test_type {
-                    TestType::TcpPing => {
-                        Some(&mut state.ping_status.entry(ep_id).or_default().fast)
-                    }
-                    TestType::RealPing => {
-                        Some(&mut state.ping_status.entry(ep_id).or_default().real)
-                    }
-                    TestType::SpeedTest | TestType::UdpTest => None,
-                };
-                if let Some(round) = round {
-                    round.seen.insert(protocol_id);
-                    // A stopped test is not a failure: the stop path emits
-                    // `error: Some("Cancelled")` for sessions that never ran,
-                    // and counting them failed would paint `[fast]`/`[real]`
-                    // red on endpoints whose tests were merely abandoned.
-                    if error.is_some() && error.as_deref() != Some("Cancelled") {
-                        round.failed.insert(protocol_id);
-                    } else {
-                        round.failed.remove(&protocol_id);
-                    }
-                }
 
                 let name = {
                     let row = state
                         .endpoints
                         .iter_mut()
-                        .find(|r| r.protocols.iter().any(|p| p.id == protocol_id));
+                        .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id));
                     match row {
                         Some(row) => {
-                            // An error event mutates nothing: no in-memory
-                            // measurement, no delay_source provenance, and no
-                            // DB write. (Gating the whole block — not just the
-                            // upsert — keeps a Cancelled RealPing from marking
-                            // a never-tested protocol as real-ok tier 0.)
-                            if error.is_none() {
-                                let ext = row.extensions.entry(protocol_id).or_insert_with(|| {
-                                    ProfileExtension {
-                                        protocol_id,
-                                        delay: None,
-                                        speed: None,
-                                        sort_order: None,
-                                        ip_info: None,
-                                        delay_source: None,
-                                        protocol_row: Deferred::default(),
+                            if let Some(link) = row
+                                .links
+                                .iter_mut()
+                                .find(|l| l.protocol_id.get() == protocol_id)
+                            {
+                                // A stopped test is not a failure: the stop path
+                                // emits `error: Some("Cancelled")` for sessions
+                                // that never ran, and persisting a failure
+                                // marker would paint `[fast]`/`[real]` red on
+                                // endpoints whose tests were merely abandoned.
+                                if error.is_some() && error.as_deref() != Some("Cancelled") {
+                                    // Persisted failure marker — the profiles
+                                    // Test column renders `[fast]`/`[real]`
+                                    // from `link.error.kind` (round maps
+                                    // removed in T17).
+                                    link.error = Some(ErrorInfo {
+                                        kind: err_kind_for(test_type),
+                                        text: error.clone().unwrap_or_default(),
+                                    });
+                                    if let Err(e) = state.db.upsert_link(link).await {
+                                        state.log_trace(
+                                            "error",
+                                            "tui::ops::events",
+                                            &format!("Failed to save ping error: {e}"),
+                                        );
                                     }
-                                });
-                                match test_type {
-                                    TestType::RealPing => {
-                                        ext.delay = latency_ms.map(|v| v as i32);
-                                        ext.delay_source = Some(DELAY_SOURCE_REAL);
-                                        ext.ip_info = ip_info;
-                                    }
-                                    TestType::TcpPing | TestType::UdpTest => {
-                                        ext.delay = latency_ms.map(|v| v as i32);
-                                        ext.delay_source =
-                                            Some(if test_type == TestType::UdpTest {
-                                                DELAY_SOURCE_UDP
-                                            } else {
-                                                DELAY_SOURCE_FAST
+                                } else if error.is_none() {
+                                    // Success: record the measurement and clear
+                                    // any previous failure marker.
+                                    match test_type {
+                                        TestType::RealPing => {
+                                            link.latency = latency_ms.map(|ms| Latency::Real {
+                                                delay: ms as i32,
+                                                ip: ip_info
+                                                    .as_deref()
+                                                    .and_then(|s| s.split('|').next())
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(str::to_string),
                                             });
+                                        }
+                                        TestType::TcpPing | TestType::UdpTest => {
+                                            link.latency = latency_ms
+                                                .map(|ms| Latency::Fast { delay: ms as i32 });
+                                        }
+                                        TestType::SpeedTest => {
+                                            link.speed_bps = speed_bps.map(|v| v as i64);
+                                        }
                                     }
-                                    TestType::SpeedTest => {
-                                        ext.speed = speed_bps.map(|v| v as i64);
+                                    link.error = None;
+                                    if let Err(e) = state.db.upsert_link(link).await {
+                                        state.log_trace(
+                                            "error",
+                                            "tui::ops::events",
+                                            &format!("Failed to save ping result: {e}"),
+                                        );
                                     }
                                 }
-                                let _ = state.db.upsert_profile_extension(ext).await;
                             }
                             fmt_profile_id(protocol_id)
                         }
@@ -315,18 +321,18 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     );
                 }
 
-                // Live sub-table ordering: re-sort the endpoint's protocols by
-                // test priority after every fast/real ping result. `selected_sub`
-                // follows its protocol to its new index (only when this result's
-                // endpoint is the one currently selected).
+                // Live sub-table ordering: re-sort the endpoint's links by test
+                // priority after every fast/real ping result. `selected_sub`
+                // follows its protocol to its new index (only when this
+                // result's endpoint is the one currently selected).
                 if matches!(test_type, TestType::TcpPing | TestType::RealPing) {
                     let keep = if state.selected_profile_id() == Some(ep_id) {
                         state.selected_sub.and_then(|n| {
                             state
                                 .endpoints
                                 .iter()
-                                .find(|r| r.endpoint.id == ep_id)
-                                .and_then(|r| r.protocols.get(n).map(|p| p.id))
+                                .find(|r| r.endpoint.id.get() == ep_id)
+                                .and_then(|r| r.links.get(n).map(|l| l.protocol_id))
                         })
                     } else {
                         None
@@ -334,17 +340,17 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     let dns_unresolved = state
                         .endpoints
                         .iter()
-                        .find(|r| r.endpoint.id == ep_id)
+                        .find(|r| r.endpoint.id.get() == ep_id)
                         .is_some_and(|r| endpoint_dns_unresolved(state, r));
-                    let rounds = state
+                    if let Some(row) = state
                         .endpoints
-                        .iter()
-                        .find(|r| r.endpoint.id == ep_id)
-                        .and_then(|r| session_rounds(&state.ping_status, r));
-                    if let Some(row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id) {
-                        row.sort_protocols_by_test_priority(dns_unresolved, rounds);
+                        .iter_mut()
+                        .find(|r| r.endpoint.id.get() == ep_id)
+                    {
+                        row.sort_links_by_test_priority(dns_unresolved);
                         if let Some(pid) = keep {
-                            state.selected_sub = row.protocols.iter().position(|p| p.id == pid);
+                            state.selected_sub =
+                                row.links.iter().position(|l| l.protocol_id == pid);
                         }
                     }
                     state.filter_cache_valid.set(false);
@@ -534,7 +540,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // would block the startup seeding pass and make
                 // `should_resolve` treat the endpoint as a never-retried IP
                 // host.
-                let mut persist: Option<(String, Option<i64>)> = None;
+                let mut persist: Option<(Vec<String>, jiff::Timestamp)> = None;
                 if !info.resolved_ips.is_empty()
                     || info.sni_whitelisted.is_some()
                     || info.outbound_ip.is_some()
@@ -564,9 +570,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                     .resolved_ips
                                     .iter()
                                     .map(std::string::ToString::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(","),
-                                entry.resolved_at_secs,
+                                    .collect::<Vec<_>>(),
+                                jiff::Timestamp::from_second(entry.resolved_at_secs.unwrap_or(0))
+                                    .unwrap_or_else(|_| jiff::Timestamp::now()),
                             ));
                         }
                     } else if info.resolved_at_secs.is_some() {
@@ -584,21 +590,28 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     }
                 }
                 // Persist DNS resolutions (DNS hosts only) so launches don't
-                // re-resolve; the TTL gate applies across restarts.
+                // re-resolve; the TTL gate applies across restarts. The typed
+                // write also refreshes the resolved-IP child endpoints (port
+                // 443, per the T10 decision).
                 if let Some((resolved_as, resolved_at)) = persist {
                     let db = state.db.clone();
+                    let ip_addrs: Vec<IpAddr> =
+                        resolved_as.iter().filter_map(|s| s.parse().ok()).collect();
                     tokio::spawn(async move {
+                        let eid = EndpointId::new(endpoint_id);
                         if let Err(e) = db
-                            .update_endpoint_resolution(
-                                endpoint_id,
-                                Some(&resolved_as),
-                                resolved_at,
-                            )
+                            .update_endpoint_resolution(eid, resolved_as, resolved_at)
                             .await
                         {
                             tracing::warn!(
                                 target: "tui::ops::events",
                                 "update_endpoint_resolution failed: {e}"
+                            );
+                        }
+                        if let Err(e) = db.upsert_resolved_ip_children(eid, &ip_addrs).await {
+                            tracing::warn!(
+                                target: "tui::ops::events",
+                                "upsert_resolved_ip_children failed: {e}"
                             );
                         }
                     });
@@ -611,16 +624,12 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     .get(&endpoint_id)
                     .is_some_and(|i| !i.resolved_ips.is_empty());
                 if !was_resolved && is_resolved {
-                    let rounds = state
-                        .ping_status
-                        .get(&endpoint_id)
-                        .map(|ps| (&ps.fast.failed, &ps.real.failed));
                     if let Some(row) = state
                         .endpoints
                         .iter_mut()
-                        .find(|r| r.endpoint.id == endpoint_id)
+                        .find(|r| r.endpoint.id.get() == endpoint_id)
                     {
-                        row.sort_protocols_by_test_priority(false, rounds);
+                        row.sort_links_by_test_priority(false);
                     }
                     state.filter_cache_valid.set(false);
                 }
@@ -651,84 +660,43 @@ pub(crate) fn merge_host_features(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use toasty::Deferred;
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{Endpoint, ProtocolRow};
+    use xray_tui_db::models::{EndpointRow, HostType, Latency};
 
+    use crate::ops::profiles::test_support::fake_row;
     use crate::types::EndpointInfo;
 
     use super::*;
 
-    /// `EndpointRow` fixture: one endpoint owning one protocol.
-    fn row_with_protocol(endpoint_id: i64, protocol_id: i64) -> EndpointRow {
-        EndpointRow {
-            endpoint: Endpoint {
-                id: endpoint_id,
-                host: format!("h{endpoint_id}.example"),
-                host_type: "ipv4".to_string(),
-                port: 443,
-                port_spec_str: None,
-                parent_id: None,
-                last_source: None,
-                created_at: 0,
-                manual_protocol_override: None,
-                resolved_as: None,
-                resolved_at: None,
-            },
-            protocols: vec![ProtocolRow {
-                id: protocol_id,
-                endpoint_id,
-                sig: 0,
-                cred_hash: 0,
-                proto_kind: String::new(),
-                spec_blob: Vec::new(),
-                config_type: 1,
-                core_type: "xray".to_string(),
-                transport: None,
-                security: None,
-                last_used_at: None,
-                created_at: 0,
-                last_seen_at: 0,
-                endpoint: Deferred::from(None::<Endpoint>),
-                extension: Deferred::from(None::<ProfileExtension>),
-                server_stat: Deferred::from(None::<ServerStat>),
-            }],
-            extensions: HashMap::new(),
-            stats: HashMap::new(),
-            selected_protocol: 0,
-            expanded: false,
-        }
-    }
-
-    /// Multi-protocol endpoint fixture. Protocols get ids `[start..start+n]`.
+    /// Multi-protocol endpoint fixture. Protocol ids `[start..start+n]`.
     fn row_with_protocols(endpoint_id: i64, n: usize, start: i64) -> EndpointRow {
-        let mut row = row_with_protocol(endpoint_id, start); // single-proto fixture
-        for i in 1..n {
-            row.protocols.push(ProtocolRow {
-                id: start + i as i64,
-                endpoint_id,
-                ..row.protocols[0].clone()
+        let mut row = fake_row(endpoint_id, &format!("h{endpoint_id}.example"), n);
+        // Rebase the link protocol ids onto `start` so tests control the ids.
+        for (i, link) in row.links.iter_mut().enumerate() {
+            let new_pid = start + i as i64;
+            let protocol = row.protocols.remove(&link.protocol_id).unwrap_or_else(|| {
+                crate::ops::profiles::xray_tui_db_helper::vless_protocol(new_pid)
             });
+            link.protocol_id = xray_tui_db::models::ProtocolId::new(new_pid);
+            row.protocols.insert(link.protocol_id, protocol);
         }
         row
     }
 
-    fn set_delay(row: &mut EndpointRow, pid: i64, delay: i32, source: Option<i32>) {
-        row.extensions.insert(
-            pid,
-            ProfileExtension {
-                protocol_id: pid,
-                delay: Some(delay),
-                speed: None,
-                sort_order: None,
-                ip_info: None,
-                delay_source: source,
-                protocol_row: Deferred::from(None::<ProtocolRow>),
-            },
-        );
+    /// Pre-set a link's latency (fast or real) before a result event lands.
+    fn set_delay(row: &mut EndpointRow, pid: i64, delay: i32, real: bool) {
+        let link = row
+            .links
+            .iter_mut()
+            .find(|l| l.protocol_id.get() == pid)
+            .expect("link exists");
+        link.latency = if real {
+            Some(Latency::Real { delay, ip: None })
+        } else {
+            Some(Latency::Fast { delay })
+        };
     }
 
     async fn event_state() -> (AppState, tokio::sync::mpsc::Sender<CoreEvent>) {
@@ -792,15 +760,15 @@ mod tests {
 
     #[test]
     fn endpoint_row_for_protocol_matches_protocol_id_not_endpoint_id() {
-        // endpoint id 100 has protocol id 7; endpoint id 101 has protocol id 9
-        let mut rows = vec![row_with_protocol(100, 7), row_with_protocol(101, 9)];
+        // endpoint id 100 has link protocol 7; endpoint id 101 has link 9
+        let mut rows = vec![row_with_protocols(100, 1, 7), row_with_protocols(101, 1, 9)];
 
         assert_eq!(
-            endpoint_row_for_protocol(&mut rows, 9).map(|r| r.endpoint.id),
+            endpoint_row_for_protocol(&mut rows, 9).map(|r| r.endpoint.id.get()),
             Some(101)
         );
         assert_eq!(
-            endpoint_row_for_protocol(&mut rows, 7).map(|r| r.endpoint.id),
+            endpoint_row_for_protocol(&mut rows, 7).map(|r| r.endpoint.id.get()),
             Some(100)
         );
         // Endpoint ids are not protocol ids — the lookup must not match them.
@@ -812,8 +780,8 @@ mod tests {
     async fn real_ping_result_restores_sub_table_and_remaps_selection() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 3, 7); // p7, p8, p9
-        set_delay(&mut row, 9, 50, Some(DELAY_SOURCE_FAST)); // fast-ok
-        row.endpoint.host_type = "ipv4".to_string();
+        set_delay(&mut row, 9, 50, false); // fast-ok
+        row.endpoint.host_type = HostType::Ipv4;
         state.endpoints = vec![row];
         state.selected_index = 0;
         state.selected_sub = Some(2); // points at p9 before the sort
@@ -835,21 +803,26 @@ mod tests {
         assert!(state.poll_core_events().await);
 
         // p8 (real 120) above p9 (fast 50) — tier beats latency; p7 untested last.
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![8, 9, 7]);
         // selected_sub followed p9 to its new index 1.
         assert_eq!(state.selected_sub, Some(1));
-        assert_eq!(
-            state.endpoints[0].extensions[&8].delay_source,
-            Some(DELAY_SOURCE_REAL)
-        );
+        // p8's latency persisted as a Real measurement (with the ip part).
+        assert!(matches!(
+            state.endpoints[0].links[0].latency,
+            Some(Latency::Real { delay: 120, ip: Some(ref s) }) if s == "1.2.3.4"
+        ));
     }
 
     #[tokio::test]
     async fn real_ping_failure_demotes_below_untested() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
-        set_delay(&mut row, 7, 50, Some(DELAY_SOURCE_REAL)); // stored real-ok
+        set_delay(&mut row, 7, 50, true); // stored real-ok
         state.endpoints = vec![row];
         state.selected_index = 0;
         state.selected_sub = None;
@@ -868,15 +841,24 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
 
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![8, 7]); // fresh real failure sinks below untested
+        // The failure persisted as a Real-kind error marker.
+        assert_eq!(
+            state.endpoints[0].links[1].error.as_ref().map(|e| e.kind),
+            Some(ProfileErr::Real)
+        );
     }
 
     #[tokio::test]
     async fn fast_ping_result_sorts_sub_table() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
-        set_delay(&mut row, 7, 200, Some(DELAY_SOURCE_REAL));
+        set_delay(&mut row, 7, 200, true); // real-ok
         state.endpoints = vec![row];
         state.selected_index = 0;
         state.selected_sub = None;
@@ -895,19 +877,23 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
 
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![7, 8]); // real-ok 200 still above fast-ok 15
-        assert_eq!(
-            state.endpoints[0].extensions[&8].delay_source,
-            Some(DELAY_SOURCE_FAST)
-        );
+        assert!(matches!(
+            state.endpoints[0].links[1].latency,
+            Some(Latency::Fast { delay: 15 })
+        ));
     }
 
     #[tokio::test]
-    async fn udp_result_does_not_resort_and_records_udp_provenance() {
+    async fn udp_result_does_not_resort_and_records_udp_latency() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
-        set_delay(&mut row, 7, 200, Some(DELAY_SOURCE_FAST)); // fast-ok
+        set_delay(&mut row, 7, 200, false); // fast-ok
         state.endpoints = vec![row];
         state.selected_index = 0;
         state.selected_sub = None;
@@ -927,26 +913,26 @@ mod tests {
         assert!(state.poll_core_events().await);
 
         // UDP must not trigger a re-sort: p8 (udp-ok 50ms) stays below p7
-        // (fast-ok 200ms). Without the `TcpPing | RealPing` gate, the sort
-        // would put p8 in the same tier 1 and rank it above p7 by latency ->
-        // [8, 7].
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        // (fast-ok 200ms) in the CURRENT (unsorted) order.
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![7, 8]);
-        // Provenance recorded: udp delay_source + latency persisted (tier 1
-        // fast-ok semantics).
-        assert_eq!(
-            state.endpoints[0].extensions[&8].delay_source,
-            Some(DELAY_SOURCE_UDP)
-        );
-        assert_eq!(state.endpoints[0].extensions[&8].delay, Some(50));
+        // Latency persisted (fast-class semantics).
+        assert!(matches!(
+            state.endpoints[0].links[1].latency,
+            Some(Latency::Fast { delay: 50 })
+        ));
     }
 
     #[tokio::test]
     async fn dns_unresolved_endpoint_sinks_after_result() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
-        set_delay(&mut row, 7, 50, Some(DELAY_SOURCE_REAL));
-        row.endpoint.host_type = "dns".to_string();
+        set_delay(&mut row, 7, 50, true); // real-ok
+        row.endpoint.host_type = HostType::Dns;
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
         state.selected_index = 0;
         state.selected_sub = None;
@@ -965,11 +951,14 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
 
-        // dns tier sinks both protocols to the bottom. Without the dns flag
-        // p8 (fresh real-ok, 10ms) would outrank p7 (real-ok, 50ms) -> [8, 7];
-        // with it, both fall to tier 5, whose within-tier tiebreak is
-        // `last_seen_at desc, then id asc` (Task 2 adjudicated spec) -> [7, 8].
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        // dns tier sinks both protocols to the bottom. Within the dns tier the
+        // tiebreak is `last_seen_at desc, then id asc`; both links share
+        // last_seen ts(0), so id asc wins -> [7, 8].
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![7, 8]);
     }
 
@@ -995,14 +984,20 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
 
-        // An error event must not mutate the extension: no delay, no
-        // delay_source — p8 stays untested and is never hoisted to the
-        // real-ok tier. (Without the gate, delay_source=Some(REAL) would rank
-        // it tier 0 and flip the order to [8, 7].)
-        let ext = state.endpoints[0].extensions.get(&8);
-        assert!(ext.and_then(|e| e.delay_source).is_none());
-        assert!(ext.and_then(|e| e.delay).is_none());
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        // A Cancelled event mutates nothing: no latency, no error marker —
+        // p8 stays untested and is never hoisted to the real-ok tier.
+        let link = state.endpoints[0]
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 8)
+            .unwrap();
+        assert!(link.latency.is_none());
+        assert!(link.error.is_none());
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![7, 8]); // order unchanged, still untested tier
     }
 
@@ -1010,9 +1005,9 @@ mod tests {
     async fn endpoint_info_flip_to_resolved_restores_priority_order() {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
-        set_delay(&mut row, 7, 50, Some(DELAY_SOURCE_FAST)); // fast-ok
-        set_delay(&mut row, 8, 10, Some(DELAY_SOURCE_REAL)); // real-ok
-        row.endpoint.host_type = "dns".to_string();
+        set_delay(&mut row, 7, 50, false); // fast-ok
+        set_delay(&mut row, 8, 10, true); // real-ok
+        row.endpoint.host_type = HostType::Dns;
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
         state.selected_index = 0;
         state.selected_sub = None;
@@ -1031,7 +1026,11 @@ mod tests {
 
         // Unresolved: both sink to the dns tier ([7, 8] by id). Once the DNS
         // flip resolves, p8 (real-ok) rises above p7 (fast-ok) -> [8, 7].
-        let ids: Vec<i64> = state.endpoints[0].protocols.iter().map(|p| p.id).collect();
+        let ids: Vec<i64> = state.endpoints[0]
+            .links
+            .iter()
+            .map(|l| l.protocol_id.get())
+            .collect();
         assert_eq!(ids, vec![8, 7]);
     }
 }

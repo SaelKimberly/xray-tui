@@ -5,12 +5,31 @@ use std::time::Duration;
 
 use xray_tui_config::import_export::{ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
-use xray_tui_db::models::{Endpoint, Group, ProtocolRow};
+use xray_tui_db::models::{Group, GroupCoreType, GroupStatus};
 
 use crate::AppState;
 
 use crate::types::{CoreEvent, SplitRightPane};
-use crate::{format_now, get_field, try_send_or_warn};
+use crate::{get_field, try_send_or_warn};
+
+/// Map the typed group core enum to the form's select values.
+fn group_core_to_str(c: GroupCoreType) -> &'static str {
+    match c {
+        GroupCoreType::Auto => "auto",
+        GroupCoreType::Xray => "Xray",
+        GroupCoreType::SingBox => "SingBox",
+    }
+}
+
+/// Map the form's select value to the typed group core (auto → `None`, the
+/// model's "unset" state).
+fn group_core_from_str(s: &str) -> Option<GroupCoreType> {
+    match s {
+        "xray" => Some(GroupCoreType::Xray),
+        "sing-box" | "singbox" => Some(GroupCoreType::SingBox),
+        _ => None,
+    }
+}
 
 pub fn start_add_group(state: &mut AppState) {
     let fields = vec![
@@ -47,13 +66,23 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
         },
     );
     let fields = vec![
-        ("name".into(), group.name.unwrap_or_default()),
-        ("subscription_url".into(), group.url.unwrap_or_default()),
-        ("user_agent".into(), group.user_agent.unwrap_or_default()),
+        ("name".into(), group.name.clone().unwrap_or_default()),
+        (
+            "subscription_url".into(),
+            group.url.clone().unwrap_or_default(),
+        ),
+        (
+            "user_agent".into(),
+            group.user_agent.clone().unwrap_or_default(),
+        ),
         ("update_interval".into(), update_interval_value),
         (
             "core_type".into(),
-            group.core_type.unwrap_or_else(|| "auto".into()),
+            group
+                .core_type
+                .map(group_core_to_str)
+                .unwrap_or("auto")
+                .to_string(),
         ),
     ];
     if let crate::AppMode::Settings {
@@ -80,24 +109,26 @@ pub async fn confirm_add_group(state: &mut AppState) {
         } => fields.clone(),
         _ => return,
     };
-    let interval: i32 = get_field(&fields, "update_interval")
+    let interval: i64 = get_field(&fields, "update_interval")
         .and_then(|v| humantime::parse_duration(&v).ok())
-        .map_or(60, |d| (d.as_secs() / 60) as i32);
+        .map_or(60, |d| (d.as_secs() / 60) as i64);
     let group = Group {
         id: uuid::Uuid::new_v4().to_string(),
         name: get_field(&fields, "name"),
         url: get_field(&fields, "subscription_url"),
-        enabled: Some(1),
+        enabled: true,
         user_agent: get_field(&fields, "user_agent"),
         convert_target: None,
-        core_type: get_field(&fields, "core_type"),
+        core_type: get_field(&fields, "core_type")
+            .as_deref()
+            .and_then(group_core_from_str),
         sort_order: Some((state.groups.len() + 1) as i32),
         refresh_interval: Some(interval),
         last_refreshed: None,
-        status: Some("idle".into()),
+        status: None,
         error_message: None,
     };
-    if let Err(e) = state.db.insert_group(&group).await {
+    if let Err(e) = state.db.upsert_group(&group).await {
         state.log_trace(
             "error",
             "tui::ops::subscriptions",
@@ -151,12 +182,14 @@ pub async fn confirm_edit_group(state: &mut AppState) {
     group.name = get_field(&fields, "name");
     group.url = get_field(&fields, "subscription_url");
     group.user_agent = get_field(&fields, "user_agent");
-    group.core_type = get_field(&fields, "core_type");
-    let interval: i32 = get_field(&fields, "update_interval")
+    group.core_type = get_field(&fields, "core_type")
+        .as_deref()
+        .and_then(group_core_from_str);
+    let interval: i64 = get_field(&fields, "update_interval")
         .and_then(|v| humantime::parse_duration(&v).ok())
-        .map_or(60, |d| (d.as_secs() / 60) as i32);
+        .map_or(60, |d| (d.as_secs() / 60) as i64);
     group.refresh_interval = Some(interval);
-    if let Err(e) = state.db.update_group(&group).await {
+    if let Err(e) = state.db.upsert_group(&group).await {
         state.log_trace(
             "error",
             "tui::ops::subscriptions",
@@ -193,7 +226,7 @@ pub async fn delete_group(state: &mut AppState, group_id: &str) {
 }
 
 pub async fn clear_group(state: &mut AppState, group_id: &str) {
-    match state.db.clear_group(group_id).await {
+    match state.db.clear_group_endpoints(group_id).await {
         Ok(count) => {
             state.log_trace(
                 "info",
@@ -345,35 +378,35 @@ async fn do_update_subscription(
     if profiles.is_empty() {
         tracing::info!(target: "tui::ops::subscriptions", "Subscription returned 0 usable profiles — all URLs may have failed validation");
     }
-    let pairs: Vec<(Endpoint, Vec<ProtocolRow>)> = profiles
-        .into_iter()
-        .map(|p| {
-            let (endpoint, protocol) = crate::state::parsed_to_endpoint_protocol(&p);
-            (endpoint, vec![protocol])
-        })
-        .collect();
-    tracing::info!(
-        target: "tui::ops::subscriptions",
-        "Starting DB upsert for {} profiles",
-        pairs.len()
-    );
-    if let Err(e) = db.subscription_upsert(&group_id, &pairs).await {
-        tracing::error!(target: "tui::ops::subscriptions", "DB upsert failed: {e}");
-        return (group_id, 0, summary, Some(format!("DB upsert: {e}")));
+    // Persist every parsed profile with the typed upserts. Dedup is natural:
+    // endpoint ids (`stable_hash(host, port)`) and protocol ids (`uid()`) are
+    // deterministic, so re-imports of the same (endpoint id, uid) pair update
+    // the existing rows instead of duplicating. Profiles missing from this
+    // fetch keep their old `last_seen_at` and age into the Stale view —
+    // preserving the old move-orphans-to-purgatory semantics through the
+    // typed staleness clock (purge_expired reclaims them after retention).
+    let mut count = 0usize;
+    for parsed in &profiles {
+        match crate::state::persist_parsed(&db, &parsed.parsed, Some(&group_id), None).await {
+            Ok(n) => count += n,
+            Err(e) => {
+                tracing::error!(target: "tui::ops::subscriptions", "profile upsert failed: {e}");
+            }
+        }
     }
     tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded");
 
-    // Update group metadata (last_refreshed, status) — merged from old Subscription
+    // Update group metadata (last_refreshed, status)
     if let Ok(groups) = db.get_all_groups().await
         && let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id)
     {
-        grp.last_refreshed = Some(format_now());
-        grp.status = Some("ok".into());
+        grp.last_refreshed = Some(jiff::Timestamp::now());
+        grp.status = Some(GroupStatus::Ok);
         grp.error_message = None;
-        let _ = db.update_group(&grp).await;
+        let _ = db.upsert_group(&grp).await;
     }
 
-    (group_id, pairs.len(), summary, None)
+    (group_id, count, summary, None)
 }
 
 pub fn update_all_subscriptions(state: &mut AppState) {

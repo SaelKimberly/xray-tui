@@ -353,39 +353,31 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     _ => 0,
                 };
                 state.mode = crate::AppMode::List;
-                // Resolve the target protocol id + row shape before dispatch.
-                // Collapsed endpoint rows with >1 protocols run an
-                // endpoint-scoped batch; sub-rows ping the exact protocol.
+                // Resolve the target protocol id before dispatch. Sub-rows
+                // ping the exact protocol; full rows ping the active link.
+                // (The batch menu items were removed in T17 — the batch
+                // pipeline is rebuilt in T19; until then every test here is
+                // single-protocol.)
                 let on_sub = state.is_on_sub_row();
-                let (proto_id, multi) = {
+                let proto_id = {
                     let ep_id = state.selected_profile_id();
-                    let row =
-                        ep_id.and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id == id));
-                    let multi = row.is_some_and(|r| r.protocols.len() > 1);
-                    let pid = if on_sub {
+                    let row = ep_id
+                        .and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id.get() == id));
+                    if on_sub {
                         state.selected_sub_protocol_id()
                     } else {
-                        row.map(|r| r.active_protocol().id)
-                    };
-                    (pid, multi)
+                        row.and_then(|r| r.active_protocol().map(|(_, p)| p.id.get()))
+                    }
                 };
                 match selected {
                     0 => {
-                        if on_sub || !multi {
-                            if let Some(id) = proto_id {
-                                state.start_tcp_ping(id);
-                            }
-                        } else {
-                            state.start_endpoint_batch_ping();
+                        if let Some(id) = proto_id {
+                            state.start_tcp_ping(id);
                         }
                     }
                     1 => {
-                        if on_sub || !multi {
-                            if let Some(id) = proto_id {
-                                state.start_real_ping(id);
-                            }
-                        } else {
-                            state.start_endpoint_batch_real_ping();
+                        if let Some(id) = proto_id {
+                            state.start_real_ping(id);
                         }
                     }
                     2 => {
@@ -399,23 +391,17 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         }
                     }
                     5 => {
-                        state.start_batch_ping();
-                    }
-                    6 => {
-                        state.start_batch_then_real_ping();
-                    }
-                    7 => {
                         state.sort_column = SortColumn::Test;
                         state.sort_ascending = true;
                         state.filter_cache_valid.set(false);
                     }
-                    8 => {
+                    6 => {
                         state.remove_failed_servers().await;
                     }
-                    10 => {
+                    8 => {
                         state.stop_speed_test();
                     }
-                    12 => {
+                    10 => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
@@ -600,7 +586,10 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            let ids: Vec<i64> = state.filtered_profiles().map(|r| r.endpoint.id).collect();
+            let ids: Vec<i64> = state
+                .filtered_profiles()
+                .map(|r| r.endpoint.id.get())
+                .collect();
             for id in ids {
                 state.multi_select.insert(id);
             }
@@ -652,7 +641,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.filter_cache_valid.set(false);
             // Restore selection by profile ID
             if let Some(pid) = selected_id {
-                let pos = state.filtered_profiles().position(|r| r.endpoint.id == pid);
+                let pos = state
+                    .filtered_profiles()
+                    .position(|r| r.endpoint.id.get() == pid);
                 if let Some(pos) = pos {
                     state.selected_index = pos;
                 }
@@ -690,7 +681,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 xray_tui_db::models::PurgatoryView::Stale
             ) && let Some(id) = state.selected_profile_id()
             {
-                state.db.restore_endpoint(id).await.unwrap_or_default();
+                state
+                    .db
+                    .restore_endpoint(crate::ops::profiles::endpoint_id_from_raw(id))
+                    .await
+                    .unwrap_or_default();
                 state.reload_profiles().await;
             }
         }
@@ -701,7 +696,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 let host = state
                     .endpoints
                     .iter()
-                    .find(|r| r.endpoint.id == ep_id)
+                    .find(|r| r.endpoint.id.get() == ep_id)
                     .map(|r| r.endpoint.host.clone())
                     .unwrap_or_default();
                 crate::ops::enrich::spawn_dns_resolve(state, ep_id, true);
@@ -757,27 +752,32 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 && key.modifiers.contains(KeyModifiers::SHIFT)
                 && state.current_tab == Tab::Profiles =>
         {
-            if let Some(url) = state.selected_profile_id().and_then(|id| {
-                let row = state.filtered_profiles().find(|r| r.endpoint.id == id)?;
-                let active = row.active_protocol();
-                let parsed = xray_tui_config::import_export::ParsedProtocol {
-                    host: row.endpoint.host.clone(),
-                    port: row.endpoint.port as u16,
-                    host_type: row.endpoint.host_type.clone(),
-                    config_type: active.config_type,
-                    proto_kind: active.proto_kind.clone(),
-                    sig: active.sig,
-                    cred_hash: active.cred_hash,
-                    spec_blob: active.spec_blob.clone(),
-                    core_type: active.core_type.clone(),
-                    transport: active.transport.clone(),
-                    security: active.security.clone(),
-                    remarks: None,
-                    created_at: active.created_at,
-                };
-                xray_tui_config::import_export::format_share_url(&parsed).ok()
+            // Copy the active protocol's share URL. The typed
+            // `format_share_url(&ParsedProto, &EndpointEssentials)` equivalent
+            // is `ProtocolConfig::reconstruct_proto(&endpoint_essentials)` —
+            // the config must be loaded WITH its deferred data included.
+            let (endpoint, pid) = match state.selected_profile_id().and_then(|id| {
+                let row = state
+                    .filtered_profiles()
+                    .find(|r| r.endpoint.id.get() == id)?;
+                let (_, protocol) = row.active_protocol()?;
+                Some((row.endpoint.clone(), protocol.id))
             }) {
-                match arboard::Clipboard::new() {
+                Some(pair) => pair,
+                None => {
+                    state.log_trace("warn", "tui::ui", "No active protocol to copy");
+                    return;
+                }
+            };
+            let essentials = xray_tui_core::config_builder::endpoint_essentials(&endpoint);
+            let url = match crate::state::load_protocol_with_config(&state.db, pid).await {
+                Ok(Some(p)) if !p.config.is_unloaded() => {
+                    p.config.get().0.reconstruct_proto(&essentials).ok()
+                }
+                _ => None,
+            };
+            match url {
+                Some(url) => match arboard::Clipboard::new() {
                     Ok(mut cb) => {
                         if let Err(e) = cb.set_text(url) {
                             state.log_trace("error", "tui::ui", &format!("Copy failed: {e}"));
@@ -786,7 +786,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     Err(e) => {
                         state.log_trace("error", "tui::ui", &format!("Clipboard unavailable: {e}"));
                     }
-                }
+                },
+                None => state.log_trace(
+                    "error",
+                    "tui::ui",
+                    "Failed to reconstruct share URL for this profile",
+                ),
             }
         }
         KeyCode::Esc => {
@@ -1019,8 +1024,6 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Speed Test (Selected)"),
     SpeedTestMenuItem::Item("UDP Test (Selected)"),
     SpeedTestMenuItem::Separator,
-    SpeedTestMenuItem::Item("Fast Ping (All Visible)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (All Visible)"),
     SpeedTestMenuItem::Item("Sort by Test"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,

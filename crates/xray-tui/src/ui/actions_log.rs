@@ -31,7 +31,7 @@ fn server_summary(state: &AppState) -> (String, String, u16, String) {
     let from_connected = state
         .connected_protocol_id
         .as_ref()
-        .and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id == *id));
+        .and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id.get() == *id));
 
     // Fall back to selected profile
     let row = from_connected.or_else(|| {
@@ -45,10 +45,11 @@ fn server_summary(state: &AppState) -> (String, String, u16, String) {
     row.map_or_else(
         || ("-".to_string(), String::new(), 0u16, String::new()),
         |r| {
-            let proto =
-                Protocol::try_from_i32(r.active_protocol().config_type).unwrap_or(Protocol::Custom);
+            let proto = r
+                .active_protocol()
+                .map_or(Protocol::Custom, |(_, p)| Protocol::from(p.proto_kind));
             let addr = r.endpoint.host.clone();
-            let port = r.endpoint.port as u16;
+            let port = r.endpoint.port;
             let core = state.resolved_core(r).to_string();
             (proto.to_string(), addr, port, core)
         },

@@ -291,24 +291,37 @@ const TEST_WARN_MS: i32 = 500;
 const TEST_BAD_MS: i32 = 1000;
 
 /// Compute the Test cell for one endpoint row: `[value]` with the active
-/// protocol's last measured delay, colored by magnitude, or the red problem
+/// link's last measured delay, colored by magnitude, or the red problem
 /// labels — `[name]` when the DNS name could not be resolved, `[fast]`/`[real]`
-/// when every protocol of the endpoint failed that test type in the current
-/// round. Blank when no measurement exists.
+/// when any of the endpoint's links carries a persisted failure marker of
+/// that class (round maps removed in T17 — the labels now come from
+/// `link.error.kind`).
 fn compute_test_cell(
     row: &EndpointRow,
     resolved: bool,
-    state: &AppState,
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
+    use xray_tui_db::models::ProfileErr;
+    let mut fast_failed = false;
+    let mut real_failed = false;
+    for link in &row.links {
+        match link.error.as_ref().map(|e| e.kind) {
+            Some(ProfileErr::Fast) => fast_failed = true,
+            Some(ProfileErr::Real | ProfileErr::Name) => real_failed = true,
+            None => {}
+        }
+    }
+    let active_delay = row.active_link().and_then(|l| match l.latency {
+        Some(xray_tui_db::models::Latency::Real { delay, .. })
+        | Some(xray_tui_db::models::Latency::Fast { delay }) => Some(delay),
+        None => None,
+    });
     test_cell_content(
-        row.endpoint.host_type == "dns",
+        row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
         resolved,
-        state.ping_status.get(&row.endpoint.id),
-        row.protocols.len(),
-        row.extensions
-            .get(&row.active_protocol().id)
-            .and_then(|e| e.delay),
+        fast_failed,
+        real_failed,
+        active_delay,
         palette,
     )
 }
@@ -318,8 +331,8 @@ fn compute_test_cell(
 fn test_cell_content(
     host_is_dns: bool,
     resolved: bool,
-    status: Option<&crate::types::EndpointPingStatus>,
-    protocol_count: usize,
+    fast_failed: bool,
+    real_failed: bool,
     active_delay: Option<i32>,
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
@@ -327,13 +340,11 @@ fn test_cell_content(
     if host_is_dns && !resolved {
         return (format!("[{}]", center_cell("name", 4)), bad);
     }
-    if let Some(status) = status {
-        if status.fast.all_unreachable(protocol_count) {
-            return (format!("[{}]", center_cell("fast", 4)), bad);
-        }
-        if status.real.all_unreachable(protocol_count) {
-            return (format!("[{}]", center_cell("real", 4)), bad);
-        }
+    if fast_failed {
+        return (format!("[{}]", center_cell("fast", 4)), bad);
+    }
+    if real_failed {
+        return (format!("[{}]", center_cell("real", 4)), bad);
     }
     match active_delay {
         Some(d) if d >= 0 => {
@@ -358,7 +369,7 @@ fn build_display_rows(
 ) -> Vec<DisplayRowData> {
     let mut result = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id);
+        let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id.get());
         let base_style = match (i == selected, is_connected) {
             (true, true) => ThemeStyles::table_row_connected(palette)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED),
@@ -368,21 +379,21 @@ fn build_display_rows(
         };
 
         // Indicator: connected → ●; else active protocol's test glyph; else the
-        // first protocol under test (endpoint-scoped batches test non-active
-        // protocols too).
+        // first protocol under test.
         let (indicator, indicator_fg) = if is_connected {
             ("●".to_string(), ThemeStyles::success(palette))
         } else {
-            let active_id = row.active_protocol().id;
-            let glyph = state
-                .testing_details
-                .get(&active_id)
-                .copied()
-                .map(test_glyph)
+            let active_id = row.active_link().map(|l| l.protocol_id.get());
+            let glyph = active_id
+                .and_then(|id| state.testing_details.get(&id).copied().map(test_glyph))
                 .or_else(|| {
-                    row.protocols
-                        .iter()
-                        .find_map(|p| state.testing_details.get(&p.id).copied().map(test_glyph))
+                    row.links.iter().find_map(|l| {
+                        state
+                            .testing_details
+                            .get(&l.protocol_id.get())
+                            .copied()
+                            .map(test_glyph)
+                    })
                 });
             glyph.map_or_else(
                 || (String::new(), Style::default()),
@@ -390,9 +401,10 @@ fn build_display_rows(
             )
         };
 
-        let protocol =
-            Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
-        let is_multi = state.multi_select.contains(&row.endpoint.id);
+        let protocol = row
+            .active_protocol()
+            .map_or(Protocol::Custom, |(_, p)| Protocol::from(p.proto_kind));
+        let is_multi = state.multi_select.contains(&row.endpoint.id.get());
 
         let idx_str = if is_multi {
             "  *".to_string()
@@ -400,7 +412,7 @@ fn build_display_rows(
             format!("{:>3}", i + 1)
         };
 
-        let info = state.endpoint_info.get(&row.endpoint.id);
+        let info = state.endpoint_info.get(&row.endpoint.id.get());
         let resolved = info.is_some_and(|i| !i.resolved_ips.is_empty());
 
         let type_str = format!("{protocol:.12}");
@@ -411,15 +423,16 @@ fn build_display_rows(
             truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 36);
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
         // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
-        let ip_feature = if row.endpoint.host_type == "dns" && !resolved {
-            "\u{1F3C1}".to_string()
-        } else if info
-            .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
-        {
-            "\u{1F3F3}\u{FE0F}".to_string()
-        } else {
-            String::new()
-        };
+        let ip_feature =
+            if row.endpoint.host_type == xray_tui_db::models::HostType::Dns && !resolved {
+                "\u{1F3C1}".to_string()
+            } else if info
+                .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
+            {
+                "\u{1F3F3}\u{FE0F}".to_string()
+            } else {
+                String::new()
+            };
         let sni_feature = if info.and_then(|i| i.sni_whitelisted).unwrap_or(false) {
             "\u{1F3F3}\u{FE0F}".to_string()
         } else {
@@ -430,11 +443,14 @@ fn build_display_rows(
             truncate_pad(&ip_feature, 2),
             truncate_pad(&sni_feature, 2)
         );
-        let (test_str, test_style) = compute_test_cell(row, resolved, state, palette);
+        let (test_str, test_style) = compute_test_cell(row, resolved, palette);
 
-        let active = row.active_protocol();
-        let t = active.transport.as_deref().filter(|s| !s.is_empty());
-        let s = active.security.as_deref().filter(|s| !s.is_empty());
+        let (t, s) = row.active_protocol().map_or((None, None), |(_, p)| {
+            (
+                Some(p.transport.r#type.as_str()),
+                Some(p.security.r#type.as_str()),
+            )
+        });
         let config_type = match (t, s) {
             (None, None) => "-".to_string(),
             (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
@@ -462,7 +478,7 @@ fn build_display_rows(
             })
             .unwrap_or_default();
         let (panel_ips, panel_resolve_hint) = if panel_ips.is_empty() {
-            if row.endpoint.host_type == "dns" {
+            if row.endpoint.host_type == xray_tui_db::models::HostType::Dns {
                 ("[?]".to_string(), true)
             } else {
                 (panel_ips, false)
@@ -472,61 +488,65 @@ fn build_display_rows(
         };
 
         let panel_rows: Vec<PanelRow> = if row.expanded {
-            let active_id = row.active_protocol().id;
-            row.protocols
+            let active_id = row.active_link().map(|l| l.protocol_id);
+            row.links
                 .iter()
-                .map(|p| {
-                    let ext = row.extensions.get(&p.id);
-                    let delay = ext
-                        .and_then(|e| e.delay)
-                        .map_or_else(|| "-".to_string(), |d| format!("{d}ms"));
-                    let speed = ext
-                        .and_then(|e| e.speed)
+                .map(|link| {
+                    let proto = row.protocols.get(&link.protocol_id);
+                    let delay = match link.latency {
+                        Some(xray_tui_db::models::Latency::Real { delay, .. })
+                        | Some(xray_tui_db::models::Latency::Fast { delay }) => {
+                            format!("{delay}ms")
+                        }
+                        None => "-".to_string(),
+                    };
+                    let speed = link
+                        .speed_bps
                         .map_or_else(|| "-".to_string(), |s| format_traffic(s as u64));
-                    let traffic = row.stats.get(&p.id).map_or_else(
-                        || "-".to_string(),
-                        |st| {
-                            let total = st.total_down.unwrap_or(0) + st.total_up.unwrap_or(0);
+                    let traffic = {
+                        let total = link.traffic.total_down + link.traffic.total_up;
+                        if total == 0 {
+                            "-".to_string()
+                        } else {
                             format_traffic(total as u64)
-                        },
-                    );
-                    let (outbound, outbound_country) = ext
-                        .and_then(|e| e.ip_info.as_deref())
-                        .and_then(|ip_info| ip_info.split_once('|'))
+                        }
+                    };
+                    let (outbound, outbound_country) = link
+                        .latency
+                        .as_ref()
+                        .and_then(|l| match l {
+                            xray_tui_db::models::Latency::Real { ip, .. } => ip.clone(),
+                            xray_tui_db::models::Latency::Fast { .. } => None,
+                        })
+                        .and_then(|ip| {
+                            ip.split_once('|')
+                                .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+                        })
                         .map_or_else(
                             || ("—".to_string(), "—".to_string()),
-                            |(ip, country)| {
-                                (ip.trim().to_string(), truncate_pad(country.trim(), 7))
-                            },
+                            |(ip, country)| (ip, truncate_pad(&country, 7)),
                         );
-                    let t = p.transport.as_deref().filter(|s| !s.is_empty());
-                    let s = p.security.as_deref().filter(|s| !s.is_empty());
+                    let (t, s) = proto.map_or((None, None), |p| {
+                        (
+                            Some(p.transport.r#type.as_str()),
+                            Some(p.security.r#type.as_str()),
+                        )
+                    });
                     let config_type = match (t, s) {
                         (None, None) => "-".to_string(),
                         (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
                     };
                     PanelRow {
-                        marker: if p.id == active_id {
+                        marker: if Some(link.protocol_id) == active_id {
                             "●".to_string()
                         } else {
                             "○".to_string()
                         },
-                        proto_id_hex: format!("{:08x}", p.id as u32),
-                        last_seen: if p.last_seen_at > 0 {
-                            format_ts(p.last_seen_at)
-                        } else {
-                            "—".to_string()
-                        },
-                        last_used: p.last_used_at.map_or_else(
-                            || "—".to_string(),
-                            |ts| {
-                                if ts > 0 {
-                                    format_ts(ts)
-                                } else {
-                                    "—".to_string()
-                                }
-                            },
-                        ),
+                        proto_id_hex: format!("{:08x}", link.protocol_id.get() as u32),
+                        last_seen: format_ts(link.last_seen_at.as_second()),
+                        last_used: link
+                            .last_used_at
+                            .map_or_else(|| "—".to_string(), |ts| format_ts(ts.as_second())),
                         config_type,
                         delay,
                         speed,
@@ -553,7 +573,7 @@ fn build_display_rows(
             test_style,
             outbound_addr,
             outbound_country,
-            has_sub_rows: row.protocols.len() > 1,
+            has_sub_rows: row.links.len() > 1,
             expanded: row.expanded,
             row_style: base_style,
             panel_selected_style: ThemeStyles::panel_row_selected(palette),
@@ -823,7 +843,7 @@ fn render_confirmation_overlays(
         Some(ConfirmAction::DeleteProfile(ref delete_id)) => {
             let profile_name = rows
                 .iter()
-                .find(|r| r.endpoint.id == *delete_id)
+                .find(|r| r.endpoint.id.get() == *delete_id)
                 .map(|r| format!("{}:{}", r.endpoint.host, r.endpoint.port))
                 .unwrap_or_default();
             render_confirmation_overlay(
@@ -1058,27 +1078,28 @@ mod tests {
     }
 
     /// Minimal `EndpointRow` with just enough to be filtered and described:
-    /// host + port drive the search filter; protocols are irrelevant here.
+    /// host + port drive the search filter; no links (linkless endpoints must
+    /// render without sub-rows and without an active protocol).
     fn endpoint_row(id: i64, host: &str, port: i32) -> EndpointRow {
-        use std::collections::HashMap;
         use xray_tui_db::models::Endpoint;
         EndpointRow {
             endpoint: Endpoint {
-                id,
+                id: xray_tui_db::models::EndpointId::new(id),
                 host: host.to_string(),
-                host_type: "ipv4".to_string(),
-                port,
-                port_spec_str: None,
+                host_type: xray_tui_db::models::HostType::Ipv4,
+                port: port as u16,
+                ports: Vec::new(),
                 parent_id: None,
                 last_source: None,
-                created_at: 0,
                 manual_protocol_override: None,
-                resolved_as: None,
+                resolved_as: Vec::new(),
                 resolved_at: None,
+                created_at: crate::ops::profiles::test_support::ts(0),
+                links: toasty::Deferred::default(),
+                group_links: toasty::Deferred::default(),
             },
-            protocols: Vec::new(),
-            extensions: HashMap::new(),
-            stats: HashMap::new(),
+            links: Vec::new(),
+            protocols: std::collections::HashMap::new(),
             selected_protocol: 0,
             expanded: false,
         }
@@ -1109,7 +1130,7 @@ mod tests {
         // Only "beta.example" survives the filter, so filtered index 0 is the
         // row at endpoints[1]; the old code showed alpha.example:443 instead.
         let row = footer_row(&state).expect("filtered row should exist");
-        assert_eq!(row.endpoint.id, 2);
+        assert_eq!(row.endpoint.id.get(), 2);
         assert_eq!(row.endpoint.host, "beta.example");
 
         // Selection past the filtered end → none selected, even though
@@ -1122,23 +1143,16 @@ mod tests {
         crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight)
     }
 
-    fn round(ids: &[i64]) -> crate::types::PingRound {
-        crate::types::PingRound {
-            seen: ids.iter().copied().collect(),
-            failed: ids.iter().copied().collect(),
-        }
-    }
-
     #[test]
     fn test_cell_colors_delay_by_threshold() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(false, true, None, 1, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, false, false, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
         assert_eq!(s.fg, Some(palette.success));
-        let (t, s) = test_cell_content(false, true, None, 1, Some(612), &palette);
+        let (t, s) = test_cell_content(false, true, false, false, Some(612), &palette);
         assert_eq!(t, "[ 612]");
         assert_eq!(s.fg, Some(ratatui::style::Color::Yellow));
-        let (t, s) = test_cell_content(false, true, None, 1, Some(1234), &palette);
+        let (t, s) = test_cell_content(false, true, false, false, Some(1234), &palette);
         assert_eq!(t, "[1234]");
         assert_eq!(s.fg, Some(palette.error));
     }
@@ -1146,60 +1160,34 @@ mod tests {
     #[test]
     fn test_cell_blank_without_measurement() {
         let palette = test_palette();
-        let (t, _) = test_cell_content(false, true, None, 1, None, &palette);
-        assert_eq!(t, "      ");
-        // Legacy -1 failure marker never renders as a delay.
-        let (t, _) = test_cell_content(false, true, None, 1, Some(-1), &palette);
+        let (t, _) = test_cell_content(false, true, false, false, None, &palette);
         assert_eq!(t, "      ");
     }
 
     #[test]
     fn test_cell_shows_name_when_dns_unresolved() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(true, false, None, 1, Some(12), &palette);
+        let (t, s) = test_cell_content(true, false, false, false, Some(12), &palette);
         assert_eq!(t, "[name]");
         assert_eq!(s.fg, Some(palette.error));
         // Resolved DNS name behaves like a normal host.
-        let (t, _) = test_cell_content(true, true, None, 1, Some(12), &palette);
+        let (t, _) = test_cell_content(true, true, false, false, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
     }
 
     #[test]
-    fn test_cell_labels_rounds_where_every_protocol_failed() {
+    fn test_cell_labels_persisted_failure_markers() {
         let palette = test_palette();
-        // Fast round: all 2 protocols failed → [fast], wins over [real].
-        let status = crate::types::EndpointPingStatus {
-            fast: round(&[101, 102]),
-            real: round(&[101, 102]),
-        };
-        let (t, s) = test_cell_content(false, true, Some(&status), 2, None, &palette);
+        // Any link with a fast-class failure marker → [fast] (wins over [real]
+        // and over any latency).
+        let (t, s) = test_cell_content(false, true, true, true, Some(12), &palette);
         assert_eq!(t, "[fast]");
         assert_eq!(s.fg, Some(palette.error));
-        // Only the real round all-failed → [real].
-        let status = crate::types::EndpointPingStatus {
-            real: round(&[101, 102]),
-            ..Default::default()
-        };
-        let (t, _) = test_cell_content(false, true, Some(&status), 2, None, &palette);
+        // Only a real-class failure marker → [real].
+        let (t, _) = test_cell_content(false, true, false, true, Some(12), &palette);
         assert_eq!(t, "[real]");
-    }
-
-    #[test]
-    fn test_cell_partial_round_never_labels() {
-        let palette = test_palette();
-        // 1 of 2 protocols attempted (single ping / cancelled batch) → no
-        // all-unreachable label; the active protocol's delay still shows.
-        let status = crate::types::EndpointPingStatus {
-            fast: round(&[101]),
-            ..Default::default()
-        };
-        let (t, _) = test_cell_content(false, true, Some(&status), 2, Some(30), &palette);
-        assert_eq!(t, "[ 30 ]");
-        // Success after failure clears the round's failed set → no label.
-        let mut status = crate::types::EndpointPingStatus::default();
-        status.fast.seen = std::collections::HashSet::from([101, 102]);
-        status.fast.failed = std::collections::HashSet::from([101]);
-        let (t, _) = test_cell_content(false, true, Some(&status), 2, Some(30), &palette);
+        // No failure markers → the delay shows even when untested links exist.
+        let (t, _) = test_cell_content(false, true, false, false, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
     }
 }

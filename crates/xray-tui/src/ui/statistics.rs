@@ -44,11 +44,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(traffic_fieldset, chunks[0]);
 
     let mut traffic_lines: Vec<Line> = Vec::new();
-    if let Some(stats) = profile.stats.get(&(profile.active_protocol().id)) {
-        let today_up = stats.today_up.unwrap_or(0);
-        let today_down = stats.today_down.unwrap_or(0);
-        let total_up = stats.total_up.unwrap_or(0);
-        let total_down = stats.total_down.unwrap_or(0);
+    if let Some(link) = profile.active_link() {
+        let today_up = link.traffic.today_up;
+        let today_down = link.traffic.today_down;
+        let total_up = link.traffic.total_up;
+        let total_down = link.traffic.total_down;
 
         traffic_lines.push(Line::from(vec![
             Span::raw("  Today:  "),
@@ -132,53 +132,17 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use toasty::Deferred;
     use xray_tui_config::AppConfig;
     use xray_tui_core::CoreType;
-    use xray_tui_db::models::{Endpoint, EndpointRow, ProfileExtension, ProtocolRow, ServerStat};
+    use xray_tui_db::models::EndpointRow;
 
-    /// Minimal `EndpointRow` with one protocol (statistics render calls
-    /// `active_protocol()`); host + port drive the search filter.
+    /// Minimal typed `EndpointRow` with one link (statistics render calls
+    /// `active_link()`); host + port drive the search filter.
     fn endpoint_row(id: i64, host: &str, port: i32) -> EndpointRow {
-        EndpointRow {
-            endpoint: Endpoint {
-                id,
-                host: host.to_string(),
-                host_type: "ipv4".to_string(),
-                port,
-                port_spec_str: None,
-                parent_id: None,
-                last_source: None,
-                created_at: 0,
-                manual_protocol_override: None,
-                resolved_as: None,
-                resolved_at: None,
-            },
-            protocols: vec![ProtocolRow {
-                id: id * 100,
-                endpoint_id: id,
-                sig: 0,
-                cred_hash: 0,
-                proto_kind: String::new(),
-                spec_blob: Vec::new(),
-                config_type: 1,
-                core_type: "xray".to_string(),
-                transport: None,
-                security: None,
-                last_used_at: None,
-                created_at: 0,
-                last_seen_at: 0,
-                endpoint: Deferred::from(None::<Endpoint>),
-                extension: Deferred::from(None::<ProfileExtension>),
-                server_stat: Deferred::from(None::<ServerStat>),
-            }],
-            extensions: HashMap::new(),
-            stats: HashMap::new(),
-            selected_protocol: 0,
-            expanded: false,
-        }
+        let mut row = crate::ops::profiles::test_support::fake_row(id, host, 1);
+        row.endpoint.port = port as u16;
+        row
     }
 
     async fn filtered_state(search: &str) -> AppState {

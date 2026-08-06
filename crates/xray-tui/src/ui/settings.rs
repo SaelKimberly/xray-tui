@@ -922,6 +922,48 @@ fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Routing list ────────────────────────────────────────────────────────
 
+/// Persist a full sort-order pass: each rule's `sort_order` is the index in
+/// `ids`. The typed model has no bulk reorder write, so each rule is updated
+/// through the pooled connection (best-effort — failures log via tracing).
+async fn reorder_routing_rules(state: &AppState, ids: &[(String, i32)]) {
+    let mut conn = match state.db.connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "tui::ui::settings", "Failed to open DB for reorder: {e}");
+            return;
+        }
+    };
+    for (id, order) in ids {
+        if let Err(e) = xray_tui_db::models::RoutingRule::filter_by_id(id.clone())
+            .update()
+            .sort_order(Some(*order))
+            .exec(&mut conn)
+            .await
+        {
+            tracing::warn!(target: "tui::ui::settings", "Failed to reorder rule {id}: {e}");
+            return;
+        }
+    }
+}
+
+/// Delete one routing rule by id through the pooled connection.
+async fn delete_routing_rule(state: &AppState, id: &str) {
+    let mut conn = match state.db.connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "tui::ui::settings", "Failed to open DB for delete: {e}");
+            return;
+        }
+    };
+    if let Err(e) = xray_tui_db::models::RoutingRule::filter_by_id(id.to_string())
+        .delete()
+        .exec(&mut conn)
+        .await
+    {
+        tracing::warn!(target: "tui::ui::settings", "Failed to delete routing rule: {e}");
+    }
+}
+
 async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
     let selected = match &state.mode {
         AppMode::Settings {
@@ -959,7 +1001,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                 for (idx, (_, order)) in ids.iter_mut().enumerate() {
                     *order = idx as i32;
                 }
-                let _ = state.db.reorder_routing_rules(&ids).await;
+                reorder_routing_rules(state, &ids).await;
                 if let AppMode::Settings {
                     mode:
                         SettingsMode::Split {
@@ -994,7 +1036,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                 for (idx, (_, order)) in ids.iter_mut().enumerate() {
                     *order = idx as i32;
                 }
-                let _ = state.db.reorder_routing_rules(&ids).await;
+                reorder_routing_rules(state, &ids).await;
                 if let AppMode::Settings {
                     mode:
                         SettingsMode::Split {
@@ -1082,7 +1124,7 @@ async fn handle_routing_list_key(state: &mut AppState, key: &KeyEvent) {
                 (None, 0)
             };
             if let Some(id) = rule_id {
-                let _ = state.db.delete_routing_rule(&id).await;
+                delete_routing_rule(state, &id).await;
                 state.log_trace("info", "tui::ui::settings", "Routing rule deleted");
                 let new_max = list_len.saturating_sub(2);
                 if let AppMode::Settings {
@@ -1127,7 +1169,7 @@ fn routing_rule_fields(rule: Option<&xray_tui_db::models::RoutingRule>) -> Vec<(
         "domains",
         "ips",
         "inbound_tags",
-        "port",
+        "ports",
         "source_ports",
         "network",
         "protocols",
@@ -1142,13 +1184,24 @@ fn routing_rule_fields(rule: Option<&xray_tui_db::models::RoutingRule>) -> Vec<(
             let val = rule.map_or_else(String::new, |r| match *k {
                 "type" => r.r#type.to_string(),
                 "domain_matcher" => r.domain_matcher.as_deref().unwrap_or("").to_string(),
-                "domains" => r.domains.as_deref().unwrap_or("").to_string(),
-                "ips" => r.ips.as_deref().unwrap_or("").to_string(),
-                "inbound_tags" => r.inbound_tags.as_deref().unwrap_or("").to_string(),
-                "port" => r.port.as_deref().unwrap_or("").to_string(),
-                "source_ports" => r.source_ports.as_deref().unwrap_or("").to_string(),
+                // Vec fields render comma-joined in the form; split back on save.
+                "domains" => r.domains.join(","),
+                "ips" => r.ips.join(","),
+                "inbound_tags" => r.inbound_tags.join(","),
+                "ports" => r
+                    .ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "source_ports" => r
+                    .source_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
                 "network" => r.network.as_deref().unwrap_or("").to_string(),
-                "protocols" => r.protocols.as_deref().unwrap_or("").to_string(),
+                "protocols" => r.protocols.join(","),
                 "domain_strategy" => r.domain_strategy.as_deref().unwrap_or("").to_string(),
                 "outbound_tag" => r.outbound_tag.as_deref().unwrap_or("").to_string(),
                 "balancer_tag" => r.balancer_tag.as_deref().unwrap_or("").to_string(),
@@ -1164,13 +1217,13 @@ fn routing_rule_fields(rule: Option<&xray_tui_db::models::RoutingRule>) -> Vec<(
 const ROUTING_FIELD_DEFS: &[(&str, &str, &str)] = &[
     ("type", "Type", "Number"),
     ("domain_matcher", "Domain Matcher", "Text"),
-    ("domains", "Domains", "Text"),
-    ("ips", "IPs", "Text"),
-    ("inbound_tags", "Inbound Tags", "Text"),
-    ("port", "Port", "Text"),
-    ("source_ports", "Source Ports", "Text"),
+    ("domains", "Domains (comma-sep)", "Text"),
+    ("ips", "IPs (comma-sep)", "Text"),
+    ("inbound_tags", "Inbound Tags (comma-sep)", "Text"),
+    ("ports", "Ports (comma-sep)", "Text"),
+    ("source_ports", "Source Ports (comma-sep)", "Text"),
     ("network", "Network", "Text"),
-    ("protocols", "Protocols", "Text"),
+    ("protocols", "Protocols (comma-sep)", "Text"),
     ("domain_strategy", "Domain Strategy", "Text"),
     ("outbound_tag", "Outbound Tag", "Text"),
     ("balancer_tag", "Balancer Tag", "Text"),
@@ -1449,14 +1502,14 @@ fn render_routing_list_inner(
         .iter()
         .enumerate()
         .map(|(i, rule)| {
-            let domains = rule.domains.as_deref().unwrap_or("");
-            let ips = rule.ips.as_deref().unwrap_or("");
+            let domains = rule.domains.join(",");
+            let ips = rule.ips.join(",");
             let targets = if !domains.is_empty() && !ips.is_empty() {
                 format!("{domains}, {ips}")
             } else if !domains.is_empty() {
-                domains.to_string()
+                domains
             } else {
-                ips.to_string()
+                ips
             };
             RoutingRuleItem {
                 index: i + 1,
@@ -1588,7 +1641,12 @@ fn render_group_list_inner(
         .iter()
         .enumerate()
         .map(|(i, g)| {
-            let status = g.status.as_deref().unwrap_or("never");
+            use xray_tui_db::models::GroupStatus;
+            let status = match g.status {
+                Some(GroupStatus::Ok) => "ok",
+                Some(GroupStatus::Error) => "error",
+                Some(GroupStatus::Never) | None => "never",
+            };
             let url = g.url.as_deref().unwrap_or("");
             // Truncate long URLs for display
             let url_display = if url.len() > 38 {

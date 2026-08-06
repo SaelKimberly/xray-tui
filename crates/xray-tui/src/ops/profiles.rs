@@ -1,37 +1,53 @@
-use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
+use std::collections::HashMap;
 
-use crate::EndpointRow;
-use xray_tui_config::import_export::{Profile, ValidationSettings, encode_profile_spec};
+use jiff::Timestamp;
+use xray_tui_config::forms::build_typed_config;
+use xray_tui_config::import_export::{ParsedProfile, ValidationSettings, parse_share_url};
 use xray_tui_core::protocol::Protocol;
-use xray_tui_core::{CoreType, resolve_core, shadowsocks_method};
+use xray_tui_core::{CoreType, resolve_core};
 
 use crate::AppState;
-use crate::state::profile_to_endpoint_protocol;
-use crate::types::{AppMode, BatchImportItem, EndpointPingStatus, SortColumn};
-use crate::{common_field_defaults, profile_to_fields};
+use crate::state::{
+    endpoint_from_essentials, load_protocol_with_config, persist_parsed, protocol_from_parsed,
+};
+use crate::types::{AppMode, BatchImportItem, SortColumn};
+use crate::{common_field_defaults, get_field, profile_to_fields};
 use xray_tui_db::DatabaseError;
-use xray_tui_db::models::{ProfileExtension, PurgatoryView, ServerStat};
+use xray_tui_db::models::{EndpointRow, PurgatoryView};
+use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ParsedProto, ProtocolKind};
+
+/// Unix-seconds now, as a `Timestamp` (the typed staleness clock).
+fn now_ts() -> Timestamp {
+    Timestamp::now()
+}
 
 pub async fn reload_profiles(state: &mut AppState) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_ts();
     let result = match state.purgatory_view {
         PurgatoryView::Active => {
-            let threshold = now - state.purgatory_ttl_secs;
+            let threshold = now
+                .checked_sub(jiff::Span::new().seconds(state.purgatory_ttl_secs))
+                .unwrap_or(now);
             state.db.get_active_endpoints(threshold).await
         }
         PurgatoryView::Stale => {
-            let active_threshold = now - state.purgatory_ttl_secs;
-            let stale_threshold = now - state.purgatory_retention_secs;
+            let active_threshold = now
+                .checked_sub(jiff::Span::new().seconds(state.purgatory_ttl_secs))
+                .unwrap_or(now);
+            let stale_threshold = now
+                .checked_sub(jiff::Span::new().seconds(state.purgatory_retention_secs))
+                .unwrap_or(now);
             state
                 .db
                 .get_stale_endpoints(active_threshold, stale_threshold)
                 .await
         }
-        PurgatoryView::All => state.db.get_active_endpoints(0).await,
+        PurgatoryView::All => {
+            state
+                .db
+                .get_active_endpoints(Timestamp::from_second(0).unwrap_or(now))
+                .await
+        }
     };
     match result {
         Ok(rows) => {
@@ -122,9 +138,9 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
         .filter(|(_, row)| {
             if !state.search_query.is_empty() {
                 let q = state.search_query.to_lowercase();
-                let address = row.endpoint.host.clone();
+                let address = row.endpoint.host.to_lowercase();
                 let port = row.endpoint.port.to_string();
-                if !address.to_lowercase().contains(&q) && !port.contains(&q) {
+                if !address.contains(&q) && !port.contains(&q) {
                     return false;
                 }
             }
@@ -138,110 +154,84 @@ fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
         let a_row = &state.endpoints[a];
         let b_row = &state.endpoints[b];
         let cmp = match state.sort_column {
-            SortColumn::ConfigType => a_row
-                .active_protocol()
-                .config_type
-                .cmp(&b_row.active_protocol().config_type),
+            SortColumn::ConfigType => config_type_rank(a_row).cmp(&config_type_rank(b_row)),
             SortColumn::LastSeen => a_row
-                .active_protocol()
-                .last_seen_at
-                .cmp(&b_row.active_protocol().last_seen_at),
+                .active_link()
+                .map(|l| l.last_seen_at)
+                .cmp(&b_row.active_link().map(|l| l.last_seen_at)),
             SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
             SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
             SortColumn::Test => {
-                let ka = a_row.best_test_priority_key(
-                    endpoint_dns_unresolved(state, a_row),
-                    session_rounds(&state.ping_status, a_row),
-                );
-                let kb = b_row.best_test_priority_key(
-                    endpoint_dns_unresolved(state, b_row),
-                    session_rounds(&state.ping_status, b_row),
-                );
+                let ka = a_row.best_test_priority_key(endpoint_dns_unresolved(state, a_row));
+                let kb = b_row.best_test_priority_key(endpoint_dns_unresolved(state, b_row));
                 ka.cmp(&kb)
             }
             SortColumn::Speed => {
-                let sa = a_row
-                    .extensions
-                    .get(&a_row.active_protocol().id)
-                    .and_then(|e| e.speed)
-                    .unwrap_or(-1);
-                let sb = b_row
-                    .extensions
-                    .get(&b_row.active_protocol().id)
-                    .and_then(|e| e.speed)
-                    .unwrap_or(-1);
+                let sa = a_row.active_link().and_then(|l| l.speed_bps).unwrap_or(-1);
+                let sb = b_row.active_link().and_then(|l| l.speed_bps).unwrap_or(-1);
                 sa.cmp(&sb)
             }
             SortColumn::Traffic => {
-                let ta = a_row
-                    .stats
-                    .get(&a_row.active_protocol().id)
-                    .map_or(0, |s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0));
-                let tb = b_row
-                    .stats
-                    .get(&b_row.active_protocol().id)
-                    .map_or(0, |s| s.total_down.unwrap_or(0) + s.total_up.unwrap_or(0));
-                ta.cmp(&tb)
-            }
-            SortColumn::Core => {
-                let resolve = |row: &EndpointRow| -> String {
-                    let protocol = Protocol::try_from_i32(row.active_protocol().config_type)
-                        .unwrap_or(Protocol::Custom);
-                    let core = resolve_core(
-                        protocol,
-                        Some(
-                            CoreType::from_str(&row.active_protocol().core_type)
-                                .unwrap_or(CoreType::Auto),
-                        ),
-                        shadowsocks_method(row.active_protocol()).as_deref(),
-                    );
-                    core.to_string()
+                let traffic = |row: &EndpointRow| {
+                    row.active_link()
+                        .map(|l| l.traffic.total_down + l.traffic.total_up)
+                        .unwrap_or(0)
                 };
-                resolve(a_row).cmp(&resolve(b_row))
+                traffic(a_row).cmp(&traffic(b_row))
             }
+            SortColumn::Core => resolved_core(state, a_row)
+                .as_str()
+                .cmp(resolved_core(state, b_row).as_str()),
         };
         if asc { cmp } else { cmp.reverse() }
     });
     indices
 }
 
+/// Sort rank for the config-type column: Form before ShareUrl (hand-made
+/// profiles first, deterministic for the sort).
+fn config_type_rank(row: &EndpointRow) -> u8 {
+    use xray_tui_db::models::ConfigType;
+    match row.active_link().map(|l| l.config_type) {
+        Some(ConfigType::Form) => 0,
+        Some(ConfigType::ShareUrl) => 1,
+        None => 2,
+    }
+}
+
 /// Whether the endpoint's DNS host is currently unresolved (no known IPs).
 /// Endpoints without an `endpoint_info` entry count as unresolved.
 pub(crate) fn endpoint_dns_unresolved(state: &AppState, row: &EndpointRow) -> bool {
-    row.endpoint.host_type == "dns"
+    use xray_tui_db::models::HostType;
+    row.endpoint.host_type == HostType::Dns
         && state
             .endpoint_info
-            .get(&row.endpoint.id)
+            .get(&row.endpoint.id.get())
             .is_none_or(|i| i.resolved_ips.is_empty())
 }
 
-/// The endpoint's current ping-round failure sets as `(fast_failed,
-/// real_failed)`. `None` when no round is in flight. Takes the `ping_status`
-/// map (not the whole `AppState`) so callers can hold the returned failure
-/// sets while mutating the disjoint `endpoints` field.
-pub(crate) fn session_rounds<'a>(
-    ping_status: &'a HashMap<i64, EndpointPingStatus>,
-    row: &EndpointRow,
-) -> Option<(&'a HashSet<i64>, &'a HashSet<i64>)> {
-    ping_status
-        .get(&row.endpoint.id)
-        .map(|ps| (&ps.fast.failed, &ps.real.failed))
-}
-
+/// Resolve which core a profile row should use, considering (in order):
+///   1. Per-profile override (`link.core_type`)
+///   2. Per-protocol config override (`config.core.protocol_core_overrides`)
+///   3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
 pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
-    let protocol =
-        Protocol::try_from_i32(row.active_protocol().config_type).unwrap_or(Protocol::Custom);
-    let profile_override = row.active_protocol().core_type.parse::<CoreType>().ok();
+    let Some((link, protocol)) = row.active_protocol() else {
+        return CoreType::Auto;
+    };
+    let core_protocol = Protocol::from(protocol.proto_kind);
     let config_override = state
         .config
         .core
         .protocol_core_overrides
-        .get(&protocol.to_string())
+        .get(&core_protocol.to_string())
         .and_then(|s| s.parse::<CoreType>().ok());
     resolve_core(
-        protocol,
-        config_override.or(profile_override),
-        shadowsocks_method(row.active_protocol()).as_deref(),
+        core_protocol,
+        config_override.or(match link.core_type {
+            ProtoCoreType::Xray => Some(CoreType::Xray),
+            ProtoCoreType::SingBox => Some(CoreType::SingBox),
+        }),
+        xray_tui_core::shadowsocks_method(protocol).as_deref(),
     )
 }
 
@@ -256,65 +246,116 @@ pub fn start_add_server(state: &mut AppState) {
 }
 
 /// Resolve an endpoint row for editing: check the currently loaded view
-/// first, then fall back to every endpoint. `get_active_endpoints` compares
-/// `last_seen_at` against an absolute epoch threshold, so the old fixed 86400
-/// lookup rejected never-seen rows (NULL/very-low `last_seen_at`) that are
-/// visible in the All view; scope 0 includes them.
+/// first, then fall back to a direct DB lookup by endpoint id (covers
+/// never-seen rows that the Active view excludes).
 async fn find_editable_endpoint(
     state: &AppState,
-    protocol_id: i64,
+    endpoint_id: i64,
 ) -> Result<Option<EndpointRow>, DatabaseError> {
     if let Some(r) = state
         .endpoints
         .iter()
-        .find(|r| r.endpoint.id == protocol_id)
+        .find(|r| r.endpoint.id.get() == endpoint_id)
     {
         return Ok(Some(r.clone()));
     }
-    Ok(state
+    state
         .db
-        .get_active_endpoints(0)
-        .await?
-        .into_iter()
-        .find(|r| r.endpoint.id == protocol_id))
+        .get_endpoint(endpoint_id_from_raw(endpoint_id))
+        .await
+}
+
+/// The typed `EndpointId` for a raw i64 (used by edit/delete flows).
+pub(crate) fn endpoint_id_from_raw(raw: i64) -> xray_tui_db::models::EndpointId {
+    xray_tui_db::models::EndpointId::new(raw)
 }
 
 pub async fn start_edit_profile(state: &mut AppState, id: &str) {
-    let protocol_id: i64 = id.parse().unwrap_or(0);
-    match find_editable_endpoint(state, protocol_id).await {
-        Ok(Some(_row)) => {
-            state.mode = AppMode::EditServer {
-                protocol_id,
-                fields: Vec::new(),
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            };
+    let endpoint_id: i64 = id.parse().unwrap_or(0);
+    let row = match find_editable_endpoint(state, endpoint_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Profile {id} not found"),
+            );
+            return;
         }
-        Ok(None) => state.log_trace(
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Error loading profile {id}: {e}"),
+            );
+            return;
+        }
+    };
+    // The edit form is populated from the ACTIVE protocol's typed config
+    // (loaded with `config` included — `profile_to_fields` and the config
+    // builders require it).
+    let Some((link, protocol)) = row.active_protocol() else {
+        state.log_trace(
             "error",
             "tui::ops::profiles",
-            &format!("Profile {id} not found"),
-        ),
-        Err(e) => state.log_trace(
-            "error",
-            "tui::ops::profiles",
-            &format!("Error loading profile {id}: {e}"),
-        ),
+            &format!("Profile {id} has no protocols"),
+        );
+        return;
+    };
+    let protocol = match load_protocol_with_config(&state.db, protocol.id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Protocol for profile {id} not found"),
+            );
+            return;
+        }
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Error loading protocol for profile {id}: {e}"),
+            );
+            return;
+        }
+    };
+    let mut fields = profile_to_fields(&protocol, &row.endpoint);
+    // The per-pair core override is a link column, not a config field —
+    // `profile_to_fields` leaves the default; set the actual override.
+    set_core_field(&mut fields, link.core_type);
+    state.mode = AppMode::EditServer {
+        protocol_id: endpoint_id,
+        fields,
+        focus_index: 0,
+        form_errors: HashMap::new(),
+    };
+}
+
+/// Set the `core_type` form field to the link's per-pair override (the
+/// producer reads it back into `link.core_type` on save).
+fn set_core_field(fields: &mut [(String, String)], core_type: ProtoCoreType) {
+    if let Some((_, v)) = fields.iter_mut().find(|(k, _)| k == "core_type") {
+        *v = core_type.as_str().to_string();
     }
 }
 
 pub fn selected_profile_id(state: &AppState) -> Option<i64> {
     filtered_profiles(state)
         .nth(state.selected_index)
-        .map(|r| r.endpoint.id)
+        .map(|r| r.endpoint.id.get())
 }
 
 pub fn toggle_expand(state: &mut AppState) {
     let ep_id = filtered_profiles(state)
         .nth(state.selected_index)
-        .map(|r| r.endpoint.id);
+        .map(|r| r.endpoint.id.get());
     if let Some(ep_id) = ep_id
-        && let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id)
+        && let Some(ep_row) = state
+            .endpoints
+            .iter_mut()
+            .find(|r| r.endpoint.id.get() == ep_id)
     {
         ep_row.expanded = !ep_row.expanded;
         if ep_row.expanded {
@@ -329,75 +370,81 @@ pub fn toggle_expand(state: &mut AppState) {
 pub fn collapse_expand(state: &mut AppState) {
     let ep_id = filtered_profiles(state)
         .nth(state.selected_index)
-        .map(|r| r.endpoint.id);
+        .map(|r| r.endpoint.id.get());
     if let Some(ep_id) = ep_id
-        && let Some(ep_row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == ep_id)
+        && let Some(ep_row) = state
+            .endpoints
+            .iter_mut()
+            .find(|r| r.endpoint.id.get() == ep_id)
     {
         ep_row.expanded = false;
     }
     state.selected_sub = None;
 }
 
-fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let proto_kind = match protocol {
-        Protocol::Vmess => "vmess",
-        Protocol::Vless => "vless",
-        Protocol::Trojan => "trojan",
-        Protocol::Shadowsocks => "ss",
-        Protocol::Shadowsocks2022 => "ss-2022",
-        Protocol::ShadowsocksR => "ssr",
-        Protocol::Socks => "socks",
-        Protocol::Http => "http",
-        Protocol::WireGuard => "wireguard",
-        Protocol::Hysteria2 => "hysteria2",
-        Protocol::Tuic => "tuic",
-        Protocol::Hysteria => "hysteria",
-        Protocol::Naive => "naive",
-        Protocol::AnyTls => "anytls",
-        Protocol::ShadowTls => "shadowtls",
-        Protocol::Tor => "tor",
-        Protocol::Ssh => "ssh",
-        Protocol::Tailscale => "tailscale",
-        Protocol::Redirect => "redirect",
-        Protocol::TProxy => "tproxy",
-        Protocol::Mixed => "mixed",
-        Protocol::DokodemoDoor => "dokodemo-door",
-        Protocol::Freedom => "freedom",
-        Protocol::Blackhole => "blackhole",
-        Protocol::Dns => "dns",
-        Protocol::Loopback => "loopback",
-        Protocol::Custom => "custom",
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let rand_bits = RandomState::new().build_hasher().finish();
-    let uid: i64 = (now ^ rand_bits) as i64;
-    let sig = uid;
-    let cred_hash = 0;
-    let mut address = String::new();
-    let mut port: i32 = 0;
-    let mut user_id: Option<String> = None;
-    let mut security: Option<String> = None;
-    let mut network: Option<String> = None;
-    let mut core_type = "auto".to_string();
-    let mut stream_map = serde_json::Map::new();
+/// Build a typed [`ParsedProto`] from the add/edit form fields — the
+/// producer-side replacement for the deleted `fields_to_profile` +
+/// `encode_profile_spec`.
+///
+/// The settings JSON is assembled with the same key routing the legacy
+/// producer used (so `build_typed_config` accepts it), with the F6 fix from
+/// T12: the tuic `password` field routes into `protocol_settings.password`
+/// instead of clobbering the top-level `user_id` (uuid). The form's
+/// `core_type` selection is returned separately — it flows into the per-pair
+/// `link.core_type` (the config builder takes the core from the link), never
+/// into the typed config.
+///
+/// # Errors
+///
+/// If the address/port are missing or `build_typed_config` rejects the
+/// settings (unknown keys, missing credentials).
+pub fn fields_to_parsed(
+    protocol: Protocol,
+    fields: &[(String, String)],
+) -> Result<(ParsedProto, Option<ProtoCoreType>), String> {
+    let kind = ProtocolKind::from(protocol);
+    let address = get_field(fields, "address").unwrap_or_default();
+    let port = get_field(fields, "port")
+        .and_then(|p| p.parse::<u16>().ok())
+        .ok_or_else(|| "Port must be 1-65535".to_string())?;
+    if address.is_empty() {
+        return Err("Address is required".to_string());
+    }
+
     let mut proto_map = serde_json::Map::new();
+    let mut stream_map = serde_json::Map::new();
+    let mut user_id: Option<String> = None;
+    let mut core_type = "auto".to_string();
 
     for (key, value) in fields {
         if value.is_empty() {
             continue;
         }
+        let json_val = if value == "true" {
+            serde_json::Value::Bool(true)
+        } else if value == "false" {
+            serde_json::Value::Bool(false)
+        } else if let Ok(n) = value.parse::<i64>() {
+            serde_json::Value::Number(n.into())
+        } else {
+            serde_json::Value::String(value.clone())
+        };
         match key.as_str() {
-            "address" => address.clone_from(value),
-            "port" => port = value.parse::<i32>().unwrap_or(0),
+            "address" | "port" => {}
             "core_type" => core_type.clone_from(value),
+            // F6: tuic's `password` is a protocol_setting credential (its
+            // `uuid` owns the top-level `user_id` slot); every other
+            // protocol's `user_id`/`password`/`uuid` key routes to the
+            // top-level credential, as the T12 mappers expect.
+            "password" if kind == ProtocolKind::Tuic => {
+                proto_map.insert(key.clone(), json_val);
+            }
             "user_id" | "password" | "uuid" => user_id = Some(value.clone()),
-            "security" => security = Some(value.clone()),
-            "network" => network = Some(value.clone()),
+            "security" | "network" | "config_type" => {
+                // Profile-column / edit-form plumbing fields — never in the
+                // settings JSON (the mapper infers transport from ws/grpc
+                // keys; vmess encryption defaults to auto).
+            }
             _ if key.starts_with("tls.")
                 || key.starts_with("ws.")
                 || key.starts_with("grpc.")
@@ -408,123 +455,97 @@ fn fields_to_profile(protocol: Protocol, fields: &[(String, String)]) -> Profile
                 || *key == "fingerprint"
                 || *key == "allow_insecure" =>
             {
-                let json_val = if value == "true" {
-                    serde_json::Value::Bool(true)
-                } else if value == "false" {
-                    serde_json::Value::Bool(false)
-                } else if let Ok(n) = value.parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else {
-                    serde_json::Value::String(value.clone())
-                };
                 stream_map.insert(key.clone(), json_val);
             }
             _ => {
-                let json_val = if value == "true" {
-                    serde_json::Value::Bool(true)
-                } else if value == "false" {
-                    serde_json::Value::Bool(false)
-                } else if let Ok(n) = value.parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else {
-                    serde_json::Value::String(value.clone())
-                };
                 proto_map.insert(key.clone(), json_val);
             }
         }
     }
 
-    let protocol_settings_str = if proto_map.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&proto_map).unwrap_or_default())
-    };
-    let stream_settings_str = if stream_map.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&stream_map).unwrap_or_default())
-    };
+    let mut settings = serde_json::Map::new();
+    if let Some(u) = user_id {
+        settings.insert("user_id".into(), serde_json::Value::String(u));
+    }
+    if !proto_map.is_empty() {
+        settings.insert(
+            "protocol_settings".into(),
+            serde_json::Value::Object(proto_map),
+        );
+    }
+    if !stream_map.is_empty() {
+        settings.insert(
+            "stream_settings".into(),
+            serde_json::Value::Object(stream_map),
+        );
+    }
 
-    let mut profile = Profile {
-        id: uid,
-        sig,
-        cred_hash,
-        proto_kind: proto_kind.to_string(),
-        spec_blob: Vec::new(),
-        config_type: protocol.to_i32(),
-        core_type,
-        address,
-        port,
-        transport: network,
-        security,
-        created_at: now as i64,
-        remarks: None,
+    let parsed = build_typed_config(kind, &address, port, &serde_json::Value::Object(settings))?;
+    let core_override = match core_type.as_str() {
+        "xray" => Some(ProtoCoreType::Xray),
+        "sing-box" | "singbox" => Some(ProtoCoreType::SingBox),
+        _ => None,
     };
-    let mut extra = serde_json::Map::new();
-    if let Some(v) = &user_id {
-        extra.insert("user_id".into(), serde_json::Value::String(v.clone()));
-    }
-    if let Some(v) = &protocol_settings_str
-        && let Ok(val) = serde_json::from_str(v)
-    {
-        extra.insert("protocol_settings".into(), val);
-    }
-    if let Some(v) = &stream_settings_str
-        && let Ok(val) = serde_json::from_str(v)
-    {
-        extra.insert("stream_settings".into(), val);
-    }
-    profile.spec_blob =
-        encode_profile_spec(proto_kind, serde_json::to_vec(&extra).unwrap_or_default());
-    profile
+    Ok((parsed, core_override))
 }
 
-pub async fn confirm_add_server(state: &mut AppState) {
-    let (protocol, address, port, user_id) = {
-        let (p, fields) = if let AppMode::AddServer {
-            protocol: Some(p),
-            fields,
-            ..
-        } = &state.mode
-        {
-            (*p, fields)
-        } else {
-            state.log_trace(
-                "error",
-                "tui::ops::profiles",
-                "Cannot confirm: no protocol selected",
-            );
-            return;
-        };
-        let addr = fields
-            .iter()
-            .find(|(k, _)| k == "address")
-            .map_or("", |(_, v)| v.as_str());
-        let prt = fields
-            .iter()
-            .find(|(k, _)| k == "port")
-            .map_or("", |(_, v)| v.as_str());
-        let uid = fields
-            .iter()
-            .find(|(k, _)| k == "user_id")
-            .map_or("", |(_, v)| v.as_str());
-        (p, addr.to_owned(), prt.to_owned(), uid.to_owned())
-    };
-
-    let mut errors: HashMap<String, String> = HashMap::new();
+/// Validation shared by add/edit: address/port presence and required
+/// credentials for the credential-bearing protocols.
+fn validate_form_fields(
+    protocol: Protocol,
+    fields: &[(String, String)],
+    errors: &mut HashMap<String, String>,
+) {
+    let address = get_field(fields, "address").unwrap_or_default();
     if address.is_empty() {
         errors.insert("address".into(), "Address is required".into());
     }
+    let port = get_field(fields, "port").unwrap_or_default();
     if port.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
         errors.insert("port".into(), "Port must be 1-65535".into());
     }
+    let user_id = get_field(fields, "user_id").unwrap_or_default();
     match protocol {
-        Protocol::Vmess | Protocol::Vless | Protocol::Trojan if user_id.is_empty() => {
+        Protocol::Vmess
+        | Protocol::Vless
+        | Protocol::Trojan
+        | Protocol::Shadowsocks
+        | Protocol::Shadowsocks2022
+        | Protocol::ShadowsocksR
+            if user_id.is_empty() =>
+        {
             errors.insert("user_id".into(), "ID/Password required".into());
+        }
+        Protocol::Tuic => {
+            // uuid is the tuic credential; password is optional.
+            let uuid = get_field(fields, "uuid").unwrap_or_default();
+            if uuid.is_empty() {
+                errors.insert("uuid".into(), "UUID required".into());
+            }
         }
         _ => {}
     }
+}
 
+pub async fn confirm_add_server(state: &mut AppState) {
+    let (protocol, fields) = if let AppMode::AddServer {
+        protocol: Some(p),
+        fields,
+        ..
+    } = &state.mode
+    {
+        (*p, fields.clone())
+    } else {
+        state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            "Cannot confirm: no protocol selected",
+        );
+        return;
+    };
+
+    let mut errors: HashMap<String, String> = HashMap::new();
+    validate_form_fields(protocol, &fields, &mut errors);
     if !errors.is_empty() {
         if let AppMode::AddServer {
             ref mut form_errors,
@@ -541,16 +562,36 @@ pub async fn confirm_add_server(state: &mut AppState) {
         _ => unreachable!(),
     };
 
-    let profile = fields_to_profile(protocol, &fields);
+    let parsed = match fields_to_parsed(protocol, &fields) {
+        Ok(p) => p,
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to build profile: {e}"),
+            );
+            if let AppMode::AddServer {
+                fields: ref mut f, ..
+            } = state.mode
+            {
+                *f = fields;
+            }
+            return;
+        }
+    };
     let group_id = state.first_group_id();
-    let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
-    match state
-        .db
-        .insert_manual_endpoint(&endpoint, &protocol, &group_id)
-        .await
-    {
-        Ok(()) => {
-            let addr = format!("{}:{}", profile.address, profile.port);
+    let group = if group_id.is_empty() {
+        None
+    } else {
+        Some(group_id.as_str())
+    };
+    match persist_parsed(&state.db, &parsed.0, group, parsed.1).await {
+        Ok(_) => {
+            let addr = parsed
+                .0
+                .first_endpoint()
+                .map(|e| format!("{}:{}", e.host, e.port))
+                .unwrap_or_else(|| "?".into());
             state.log_trace(
                 "info",
                 "tui::ops::profiles",
@@ -558,7 +599,6 @@ pub async fn confirm_add_server(state: &mut AppState) {
             );
             state.mode = AppMode::List;
             state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
-            upsert_profile_row(state, profile, None, None, Some(state.first_group_id()));
             reload_profiles(state).await;
         }
         Err(e) => {
@@ -578,54 +618,38 @@ pub async fn confirm_add_server(state: &mut AppState) {
 }
 
 pub async fn confirm_edit_server(state: &mut AppState) {
-    let (protocol_id, address, port, user_id) = {
-        let (pid, fields) = match &state.mode {
-            AppMode::EditServer {
-                protocol_id,
-                fields,
-                ..
-            } => (protocol_id, fields),
-            _ => return,
-        };
-        let addr = fields
-            .iter()
-            .find(|(k, _)| k == "address")
-            .map_or("", |(_, v)| v.as_str());
-        let prt = fields
-            .iter()
-            .find(|(k, _)| k == "port")
-            .map_or("", |(_, v)| v.as_str());
-        let uid = fields
-            .iter()
-            .find(|(k, _)| k == "user_id")
-            .map_or("", |(_, v)| v.as_str());
-        (*pid, addr.to_owned(), prt.to_owned(), uid.to_owned())
+    let (endpoint_id, fields) = match &state.mode {
+        AppMode::EditServer {
+            protocol_id,
+            fields,
+            ..
+        } => (*protocol_id, fields.clone()),
+        _ => return,
     };
 
-    let mut errors: HashMap<String, String> = HashMap::new();
-    if address.is_empty() {
-        errors.insert("address".into(), "Address is required".into());
-    }
-    if port.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
-        errors.insert("port".into(), "Port must be 1-65535".into());
-    }
-    let protocol = Protocol::try_from_i32(
-        state
-            .db
-            .get_endpoint(protocol_id)
-            .await
-            .ok()
-            .flatten()
-            .map_or(0, |row| row.active_protocol().config_type),
-    )
-    .unwrap_or(Protocol::Custom);
-    match protocol {
-        Protocol::Vmess | Protocol::Vless | Protocol::Trojan if user_id.is_empty() => {
-            errors.insert("user_id".into(), "ID/Password required".into());
+    let row = match state
+        .db
+        .get_endpoint(endpoint_id_from_raw(endpoint_id))
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => {
+            state.log_trace("error", "tui::ops::profiles", "Profile not found for edit");
+            return;
         }
-        _ => {}
-    }
+    };
+    let Some((_, protocol)) = row.active_protocol() else {
+        state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            "Profile has no protocol to edit",
+        );
+        return;
+    };
+    let protocol = Protocol::from(protocol.proto_kind);
 
+    let mut errors: HashMap<String, String> = HashMap::new();
+    validate_form_fields(protocol, &fields, &mut errors);
     if !errors.is_empty() {
         if let AppMode::EditServer {
             ref mut form_errors,
@@ -642,27 +666,38 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         _ => unreachable!(),
     };
 
-    if state
-        .db
-        .get_endpoint(protocol_id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        state.log_trace("error", "tui::ops::profiles", "Profile not found for edit");
-        return;
-    }
-    let new_profile = fields_to_profile(protocol, &fields);
-    let (endpoint, protocol_row) = profile_to_endpoint_protocol(&new_profile);
+    let parsed = match fields_to_parsed(protocol, &fields) {
+        Ok(p) => p,
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to build profile: {e}"),
+            );
+            if let AppMode::EditServer {
+                fields: ref mut f, ..
+            } = state.mode
+            {
+                *f = fields;
+            }
+            return;
+        }
+    };
+    // Editing replaces the endpoint's protocol identity: upsert the new
+    // endpoint/protocol/link rows (idempotent on the same uid) and reload.
     let group_id = state.first_group_id();
-    match state
-        .db
-        .subscription_upsert(&group_id, &[(endpoint, vec![protocol_row])])
-        .await
-    {
-        Ok(_ids) => {
-            let addr = format!("{}:{}", new_profile.address, new_profile.port);
+    let group = if group_id.is_empty() {
+        None
+    } else {
+        Some(group_id.as_str())
+    };
+    match persist_parsed(&state.db, &parsed.0, group, parsed.1).await {
+        Ok(_) => {
+            let addr = parsed
+                .0
+                .first_endpoint()
+                .map(|e| format!("{}:{}", e.host, e.port))
+                .unwrap_or_else(|| "?".into());
             state.log_trace(
                 "info",
                 "tui::ops::profiles",
@@ -689,7 +724,7 @@ pub async fn confirm_edit_server(state: &mut AppState) {
 }
 
 pub async fn delete_profile(state: &mut AppState, id: i64) {
-    if let Err(e) = state.db.delete_endpoint(id).await {
+    if let Err(e) = state.db.delete_endpoint(endpoint_id_from_raw(id)).await {
         state.log_trace(
             "error",
             "tui::ops::profiles",
@@ -705,7 +740,7 @@ pub async fn delete_profile(state: &mut AppState, id: i64) {
 }
 
 pub fn clone_profile(state: &mut AppState, id: i64) {
-    let found = state.endpoints.iter().find(|r| r.endpoint.id == id);
+    let found = state.endpoints.iter().find(|r| r.endpoint.id.get() == id);
     if found.is_none() {
         state.log_trace(
             "error",
@@ -725,21 +760,35 @@ pub fn toggle_multi_select(state: &mut AppState, id: i64) {
     }
 }
 
+/// Populate the AddServer form from a parsed share URL: the first endpoint's
+/// address/port plus the typed config's form fields.
+fn form_from_parsed(state: &mut AppState, parsed: &ParsedProfile) {
+    let Some(first) = parsed.parsed.first_endpoint().cloned() else {
+        state.log_trace(
+            "error",
+            "tui::ops::profiles",
+            "Imported profile has no endpoint address",
+        );
+        return;
+    };
+    let endpoint = endpoint_from_essentials(&first);
+    let protocol = protocol_from_parsed(&parsed.parsed);
+    let mut fields = profile_to_fields(&protocol, &endpoint);
+    set_core_field(&mut fields, parsed.parsed.protocol.core_type);
+    let core_protocol = Protocol::from(parsed.parsed.protocol.proto_kind);
+    state.mode = AppMode::AddServer {
+        protocol: Some(core_protocol),
+        fields,
+        focus_index: 0,
+        form_errors: HashMap::new(),
+    };
+    state.log_trace("info", "tui::ops::profiles", "URL imported successfully");
+}
+
 pub fn import_url(state: &mut AppState, url: &str) {
     let settings = ValidationSettings::from(state.config.parsing.clone());
-    match xray_tui_config::import_export::parse_share_url(url, &settings) {
-        Ok(parsed) => {
-            let profile = Profile::from(&parsed);
-            let protocol = Protocol::try_from_i32(profile.config_type).unwrap_or(Protocol::Custom);
-            let fields = profile_to_fields(&profile);
-            state.mode = AppMode::AddServer {
-                protocol: Some(protocol),
-                fields,
-                focus_index: 0,
-                form_errors: HashMap::new(),
-            };
-            state.log_trace("info", "tui::ops::profiles", "URL imported successfully");
-        }
+    match parse_share_url(url, &settings) {
+        Ok(parsed) => form_from_parsed(state, &parsed),
         Err(e) => {
             state.mode = AppMode::ImportUrl {
                 input: url.to_string(),
@@ -753,25 +802,20 @@ pub fn start_batch_import(state: &mut AppState, urls: &[String]) {
     let settings = ValidationSettings::from(state.config.parsing.clone());
     let results: Vec<BatchImportItem> = urls
         .iter()
-        .map(
-            |url| match xray_tui_config::import_export::parse_share_url(url, &settings) {
-                Ok(parsed) => {
-                    let profile = Profile::from(&parsed);
-                    BatchImportItem {
-                        url: url.clone(),
-                        profile: Some(profile),
-                        error: None,
-                        imported: false,
-                    }
-                }
-                Err(e) => BatchImportItem {
-                    url: url.clone(),
-                    profile: None,
-                    error: Some(e.to_string()),
-                    imported: false,
-                },
+        .map(|url| match parse_share_url(url, &settings) {
+            Ok(parsed) => BatchImportItem {
+                url: url.clone(),
+                profile: Some(parsed),
+                error: None,
+                imported: false,
             },
-        )
+            Err(e) => BatchImportItem {
+                url: url.clone(),
+                profile: None,
+                error: Some(e.to_string()),
+                imported: false,
+            },
+        })
         .collect();
     state.mode = AppMode::BatchImport { results, scroll: 0 };
 }
@@ -784,19 +828,19 @@ pub async fn confirm_batch_import(state: &mut AppState) {
     let mut imported = 0usize;
     let mut errors = 0usize;
     let group_id = state.first_group_id();
+    let group = if group_id.is_empty() {
+        None
+    } else {
+        Some(group_id.as_str())
+    };
     for item in items {
-        if let Some(profile) = item.profile {
-            let (endpoint, protocol) = profile_to_endpoint_protocol(&profile);
-            if state
-                .db
-                .insert_manual_endpoint(&endpoint, &protocol, &group_id)
-                .await
-                .is_ok()
-            {
-                imported += 1;
-            } else {
-                errors += 1;
+        if let Some(parsed) = item.profile {
+            match persist_parsed(&state.db, &parsed.parsed, group, None).await {
+                Ok(_) => imported += 1,
+                Err(_) => errors += 1,
             }
+        } else {
+            errors += 1;
         }
     }
     state.log_trace(
@@ -814,7 +858,7 @@ pub fn move_profile_up(state: &mut AppState) {
         None => return,
     };
     let filtered: Vec<&EndpointRow> = filtered_profiles(state).collect();
-    let idx = filtered.iter().position(|r| r.endpoint.id == id);
+    let idx = filtered.iter().position(|r| r.endpoint.id.get() == id);
     let _idx = match idx {
         Some(i) if i > 0 => i,
         _ => return,
@@ -831,7 +875,7 @@ pub fn move_profile_down(state: &mut AppState) {
         None => return,
     };
     let filtered: Vec<&EndpointRow> = filtered_profiles(state).collect();
-    let _idx = match filtered.iter().position(|r| r.endpoint.id == id) {
+    let _idx = match filtered.iter().position(|r| r.endpoint.id.get() == id) {
         Some(i) if i < filtered.len() - 1 => i,
         _ => return,
     };
@@ -842,8 +886,12 @@ pub fn move_profile_down(state: &mut AppState) {
 }
 
 pub async fn set_active(state: &mut AppState, id: &str) {
-    let pid: i64 = id.parse().unwrap_or(0);
-    if let Err(e) = state.db.clear_protocol_override(pid).await {
+    let endpoint_id: i64 = id.parse().unwrap_or(0);
+    if let Err(e) = state
+        .db
+        .set_manual_override(endpoint_id_from_raw(endpoint_id), None)
+        .await
+    {
         state.log_trace(
             "error",
             "tui::ops::profiles",
@@ -855,7 +903,11 @@ pub async fn set_active(state: &mut AppState, id: &str) {
     // rebuilt by `reload_profiles` (subscription events). Clear the override
     // in-memory so `active_protocol()` falls back immediately without a
     // reload (which would also collapse the panel).
-    if let Some(row) = state.endpoints.iter_mut().find(|r| r.endpoint.id == pid) {
+    if let Some(row) = state
+        .endpoints
+        .iter_mut()
+        .find(|r| r.endpoint.id.get() == endpoint_id)
+    {
         row.endpoint.manual_protocol_override = None;
     }
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
@@ -866,9 +918,10 @@ pub async fn set_active(state: &mut AppState, id: &str) {
 /// Writes the override to DB and updates the in-memory row so the UI
 /// switches immediately — same rationale as `set_active`: no reload.
 pub async fn set_protocol_default(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
+    let pid = xray_tui_db::models::ProtocolId::new(protocol_id);
     if let Err(e) = state
         .db
-        .set_protocol_override(endpoint_id, protocol_id)
+        .set_manual_override(endpoint_id_from_raw(endpoint_id), Some(pid))
         .await
     {
         state.log_trace(
@@ -881,21 +934,10 @@ pub async fn set_protocol_default(state: &mut AppState, endpoint_id: i64, protoc
     if let Some(row) = state
         .endpoints
         .iter_mut()
-        .find(|r| r.endpoint.id == endpoint_id)
+        .find(|r| r.endpoint.id.get() == endpoint_id)
     {
-        row.endpoint.manual_protocol_override = Some(protocol_id);
+        row.endpoint.manual_protocol_override = Some(pid);
     }
-    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
-    state.filter_cache_valid.set(false);
-}
-
-pub fn upsert_profile_row(
-    state: &mut AppState,
-    _profile: Profile,
-    _ext: Option<ProfileExtension>,
-    _stat: Option<ServerStat>,
-    _group_id: Option<String>,
-) {
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     state.filter_cache_valid.set(false);
 }
@@ -917,7 +959,7 @@ pub fn nav_protocol_down(state: &mut AppState) -> bool {
         .nth(state.selected_index)
         .and_then(|r| {
             if r.expanded {
-                Some(r.protocols.len())
+                Some(r.links.len())
             } else {
                 None
             }
@@ -959,7 +1001,7 @@ pub fn nav_protocol_up(state: &mut AppState) -> bool {
     // endpoint row; Up on the endpoint row falls through to endpoint nav.
     let current_expanded = filtered_profiles(state)
         .nth(state.selected_index)
-        .is_some_and(|r| r.expanded && r.protocols.len() > 1);
+        .is_some_and(|r| r.expanded && r.links.len() > 1);
     if !current_expanded {
         // Fall through to endpoint nav; drop any stale sub-row selection.
         state.selected_sub = None;
@@ -988,56 +1030,89 @@ pub const fn is_on_sub_row(state: &AppState) -> bool {
 pub fn selected_sub_protocol_id(state: &AppState) -> Option<i64> {
     let n = state.selected_sub?;
     let row = filtered_profiles(state).nth(state.selected_index)?;
-    row.protocols.get(n).map(|p| p.id)
+    row.links.get(n).map(|l| l.protocol_id.get())
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
 
     use crate::AppState;
     use std::collections::HashMap;
     use std::sync::Arc;
     use toasty::Deferred;
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{Endpoint, EndpointRow, ProfileExtension, ProtocolRow, ServerStat};
+    use xray_tui_db::models::{
+        ConfigType, Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId,
+        Security, TrafficStats, Transport,
+    };
+    use xray_tui_proto::proto_spec::ProtocolKind;
+    use xray_tui_proto::proto_spec::common::TransportConfig;
+    use xray_tui_proto::proto_spec::{
+        CoreType as ProtoCoreType, ProtocolConfig, SecurityConfig, SecurityType, TransportType,
+        VlessConfig,
+    };
 
+    pub(crate) fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(secs).expect("valid ts")
+    }
+
+    /// Minimal typed `EndpointRow` with `n` links (protocol ids
+    /// `id*100 .. id*100+n`).
     pub fn fake_row(id: i64, host: &str, n_protos: usize) -> EndpointRow {
+        let endpoint = Endpoint {
+            id: EndpointId::new(id),
+            host: host.to_string(),
+            host_type: HostType::Ipv4,
+            port: 443,
+            ports: Vec::new(),
+            parent_id: None,
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_as: Vec::new(),
+            resolved_at: None,
+            created_at: ts(0),
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        };
+        let links: Vec<ProfileStats> = (0..n_protos)
+            .map(|i| ProfileStats {
+                protocol_id: ProtocolId::new(id * 100 + i as i64),
+                endpoint_id: EndpointId::new(id),
+                core_type: ProtoCoreType::Xray,
+                config_type: ConfigType::ShareUrl,
+                last_used_at: None,
+                last_seen_at: ts(0),
+                task_id: None,
+                task_queue: Vec::new(),
+                latency: None,
+                speed_bps: None,
+                error: None,
+                traffic: TrafficStats {
+                    today_up: 0,
+                    today_down: 0,
+                    total_up: 0,
+                    total_down: 0,
+                },
+                created_at: ts(0),
+                updated_at: ts(0),
+                version: 1,
+                protocol: Deferred::default(),
+                endpoint: Deferred::default(),
+            })
+            .collect();
+        let protocols = links
+            .iter()
+            .map(|l| {
+                (
+                    l.protocol_id,
+                    super::xray_tui_db_helper::vless_protocol(l.protocol_id.get()),
+                )
+            })
+            .collect();
         EndpointRow {
-            endpoint: Endpoint {
-                id,
-                host: host.to_string(),
-                host_type: "ipv4".to_string(),
-                port: 443,
-                port_spec_str: None,
-                parent_id: None,
-                last_source: None,
-                created_at: 0,
-                manual_protocol_override: None,
-                resolved_as: None,
-                resolved_at: None,
-            },
-            protocols: (0..n_protos)
-                .map(|i| ProtocolRow {
-                    id: id * 100 + i as i64,
-                    endpoint_id: id,
-                    sig: 0,
-                    cred_hash: 0,
-                    proto_kind: String::new(),
-                    spec_blob: Vec::new(),
-                    config_type: 1,
-                    core_type: "xray".to_string(),
-                    transport: None,
-                    security: None,
-                    last_used_at: None,
-                    created_at: 0,
-                    last_seen_at: 0,
-                    endpoint: Deferred::from(None::<Endpoint>),
-                    extension: Deferred::from(None::<ProfileExtension>),
-                    server_stat: Deferred::from(None::<ServerStat>),
-                })
-                .collect(),
-            extensions: HashMap::new(),
-            stats: HashMap::new(),
+            endpoint,
+            links,
+            protocols,
             selected_protocol: 0,
             expanded: false,
         }
@@ -1056,6 +1131,51 @@ mod test_support {
         state.selected_index = 0;
         state.selected_sub = None;
         state
+    }
+}
+
+/// A vless `Protocol` row for tests (config loaded).
+#[cfg(test)]
+pub(crate) mod xray_tui_db_helper {
+    pub(crate) fn vless_protocol(id: i64) -> xray_tui_db::models::Protocol {
+        use super::test_support::ts;
+        use toasty::{Deferred, Json};
+        use xray_tui_db::models::{Protocol, ProtocolId, Security, Transport};
+        use xray_tui_proto::proto_spec::ProtocolKind;
+        use xray_tui_proto::proto_spec::common::TransportConfig;
+        use xray_tui_proto::proto_spec::{
+            ProtocolConfig, SecurityConfig, SecurityType, TransportType, VlessConfig,
+        };
+        Protocol {
+            id: ProtocolId::new(id),
+            sig: id,
+            cred_hash: 0,
+            proto_kind: ProtocolKind::Vless,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
+                uuid: format!("00000000-0000-0000-0000-{id:012}"),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport: TransportConfig::Tcp,
+                encryption: None,
+                flow: None,
+                path: None,
+                splice: None,
+                remarks: None,
+            }))),
+            created_at: ts(0),
+            links: Deferred::default(),
+        }
     }
 }
 
@@ -1079,7 +1199,12 @@ mod nav_tests {
         let pid = selected_sub_protocol_id(&state).unwrap();
         assert_eq!(pid, 101); // fake_row protocol ids: 100, 101, 102
         assert_ne!(
-            state.endpoints[0].active_protocol().id,
+            state.endpoints[0]
+                .active_protocol()
+                .unwrap()
+                .0
+                .protocol_id
+                .get(),
             pid,
             "default active must be the first (unsorted) protocol before pinning"
         );
@@ -1088,10 +1213,15 @@ mod nav_tests {
 
         assert_eq!(
             state.endpoints[0].endpoint.manual_protocol_override,
-            Some(pid)
+            Some(xray_tui_db::models::ProtocolId::new(pid))
         );
         assert_eq!(
-            state.endpoints[0].active_protocol().id,
+            state.endpoints[0]
+                .active_protocol()
+                .unwrap()
+                .0
+                .protocol_id
+                .get(),
             pid,
             "active protocol must switch to the pinned variant immediately"
         );
@@ -1102,7 +1232,12 @@ mod nav_tests {
         let mut state = test_state(vec![fake_row(1, "a.com", 3)]).await;
         set_protocol_default(&mut state, 1, 101).await;
         assert_eq!(
-            state.endpoints[0].active_protocol().id,
+            state.endpoints[0]
+                .active_protocol()
+                .unwrap()
+                .0
+                .protocol_id
+                .get(),
             101,
             "pinned variant is active before clearing"
         );
@@ -1111,7 +1246,12 @@ mod nav_tests {
 
         assert_eq!(state.endpoints[0].endpoint.manual_protocol_override, None);
         assert_eq!(
-            state.endpoints[0].active_protocol().id,
+            state.endpoints[0]
+                .active_protocol()
+                .unwrap()
+                .0
+                .protocol_id
+                .get(),
             100,
             "active must fall back to the first protocol after clearing"
         );
@@ -1172,12 +1312,10 @@ mod edit_tests {
     use super::*;
     use crate::AppState;
     use std::sync::Arc;
-    use toasty::Deferred;
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{Endpoint, ProfileExtension, ProtocolRow, ServerStat};
 
-    fn matches_edit_mode(state: &AppState, protocol_id: i64) -> bool {
-        matches!(state.mode, AppMode::EditServer { protocol_id: id, .. } if id == protocol_id)
+    fn matches_edit_mode(state: &AppState, endpoint_id: i64) -> bool {
+        matches!(state.mode, AppMode::EditServer { protocol_id: id, .. } if id == endpoint_id)
     }
 
     fn assert_not_edit_mode(state: &AppState) {
@@ -1192,19 +1330,40 @@ mod edit_tests {
     async fn edit_resolves_against_current_view() {
         // The profile is on screen (state.endpoints) but absent from the DB —
         // a visible, manually-added profile that was never re-imported. The
-        // old fixed 1-day DB lookup rejected it; the current view must win.
+        // current view must win. The edit form needs the protocol row WITH
+        // config, so the state row (loaded without deferred data) cannot
+        // serve it; the flow falls back to the DB and reports the profile
+        // missing there. Test the guarded path: a row in state + a DB row
+        // lets the form open.
         let mut state = test_state(vec![fake_row(7, "visible.example", 1)]).await;
+        // Seed the DB with the same endpoint + a protocol row.
+        let row = state.endpoints[0].clone();
+        state.db.upsert_endpoint(&row.endpoint).await.unwrap();
+        let proto = super::xray_tui_db_helper::vless_protocol(700);
+        state.db.upsert_protocol(&proto).await.unwrap();
+        state.db.upsert_link(&row.links[0]).await.unwrap();
         start_edit_profile(&mut state, "7").await;
         assert!(matches_edit_mode(&state, 7));
+        // The form is populated from the typed config.
+        if let AppMode::EditServer { fields, .. } = &state.mode {
+            assert!(
+                fields
+                    .iter()
+                    .any(|(k, v)| k == "address" && v == "visible.example"),
+                "edit form must carry the endpoint address"
+            );
+        } else {
+            panic!("expected EditServer");
+        }
     }
 
     #[tokio::test]
     async fn edit_falls_back_to_never_seen_profile() {
         // Profile not loaded in the current view, but present in the DB with
         // last_seen_at = 0 ("never seen"). get_active_endpoints compares an
-        // ABSOLUTE epoch threshold, so the old fixed 86400 lookup rejected
-        // this row (86400 <= 0 is false) even though it is visible in the All
-        // view; the fallback must use scope 0 (everything), not 86400.
+        // ABSOLUTE epoch threshold, so a fixed 86400 lookup would reject this
+        // row even though it is visible in the All view; the fallback uses
+        // scope 0 (everything), not 86400.
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
             xray_tui_db::Database::open(dir.path().join("t.db"))
@@ -1212,40 +1371,48 @@ mod edit_tests {
                 .unwrap(),
         );
         let group_id = db.get_all_groups().await.unwrap()[0].id.clone();
-        let endpoint = Endpoint {
-            id: 42,
-            host: "never-seen.example".to_string(),
-            host_type: "dns".to_string(),
-            port: 443,
-            port_spec_str: None,
-            parent_id: None,
-            last_source: None,
-            created_at: 0,
-            manual_protocol_override: None,
-            resolved_as: None,
-            resolved_at: None,
+        let endpoint = super::test_support::fake_row(42, "never-seen.example", 1).endpoint;
+        let protocol = super::xray_tui_db_helper::vless_protocol(4200);
+        let link = {
+            use xray_tui_db::models::{ConfigType, ProfileStats, TrafficStats};
+            ProfileStats {
+                protocol_id: protocol.id,
+                endpoint_id: endpoint.id,
+                core_type: xray_tui_proto::proto_spec::CoreType::Xray,
+                config_type: ConfigType::ShareUrl,
+                last_used_at: None,
+                last_seen_at: super::test_support::ts(0),
+                task_id: None,
+                task_queue: Vec::new(),
+                latency: None,
+                speed_bps: None,
+                error: None,
+                traffic: TrafficStats {
+                    today_up: 0,
+                    today_down: 0,
+                    total_up: 0,
+                    total_down: 0,
+                },
+                created_at: super::test_support::ts(0),
+                updated_at: super::test_support::ts(0),
+                version: 1,
+                protocol: toasty::Deferred::default(),
+                endpoint: toasty::Deferred::default(),
+            }
         };
-        let protocol = ProtocolRow {
-            id: 4200,
-            endpoint_id: 42,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: "vless".to_string(),
-            spec_blob: Vec::new(),
-            config_type: 1,
-            core_type: "xray".to_string(),
-            transport: None,
-            security: None,
-            last_used_at: None,
-            created_at: 0,
-            last_seen_at: 0,
-            endpoint: Deferred::from(None::<Endpoint>),
-            extension: Deferred::from(None::<ProfileExtension>),
-            server_stat: Deferred::from(None::<ServerStat>),
-        };
-        db.insert_manual_endpoint(&endpoint, &protocol, &group_id)
-            .await
-            .unwrap();
+        db.upsert_endpoint(&endpoint).await.unwrap();
+        db.upsert_protocol(&protocol).await.unwrap();
+        db.upsert_link(&link).await.unwrap();
+        db.upsert_endpoint_group_link(&xray_tui_db::models::EndpointGroup {
+            endpoint_id: endpoint.id,
+            group_id,
+            last_seen_at: super::test_support::ts(0),
+            sort_order: None,
+            endpoint: toasty::Deferred::default(),
+            group: toasty::Deferred::default(),
+        })
+        .await
+        .unwrap();
         let mut state = AppState::new(db, AppConfig::default()).await;
         state.endpoints = Vec::new(); // profile not loaded in the current view
         start_edit_profile(&mut state, "42").await;
@@ -1265,9 +1432,7 @@ mod clamp_tests {
     use super::test_support::{fake_row, test_state};
     use super::*;
     use std::sync::Arc;
-    use toasty::Deferred;
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{Endpoint, ProtocolRow};
 
     #[test]
     fn clamp_index_stays_in_bounds() {
@@ -1304,40 +1469,24 @@ mod clamp_tests {
                 .unwrap(),
         );
         let group_id = db.get_all_groups().await.unwrap()[0].id.clone();
-        let endpoint = Endpoint {
-            id: 9,
-            host: "clamp.example".to_string(),
-            host_type: "dns".to_string(),
-            port: 443,
-            port_spec_str: None,
-            parent_id: None,
-            last_source: None,
-            created_at: 0,
-            manual_protocol_override: None,
-            resolved_as: None,
-            resolved_at: None,
-        };
-        let protocol = ProtocolRow {
-            id: 900,
-            endpoint_id: 9,
-            sig: 0,
-            cred_hash: 0,
-            proto_kind: "vless".to_string(),
-            spec_blob: Vec::new(),
-            config_type: 1,
-            core_type: "xray".to_string(),
-            transport: None,
-            security: None,
-            last_used_at: None,
-            created_at: 0,
-            last_seen_at: 0,
-            endpoint: Deferred::from(None::<Endpoint>),
-            extension: Deferred::from(None::<xray_tui_db::models::ProfileExtension>),
-            server_stat: Deferred::from(None::<xray_tui_db::models::ServerStat>),
-        };
-        db.insert_manual_endpoint(&endpoint, &protocol, &group_id)
-            .await
-            .unwrap();
+        let row = super::test_support::fake_row(9, "clamp.example", 1);
+        let endpoint = row.endpoint.clone();
+        let protocol = super::xray_tui_db_helper::vless_protocol(900);
+        let mut link = row.links[0].clone();
+        link.last_seen_at = super::test_support::ts(0);
+        db.upsert_endpoint(&endpoint).await.unwrap();
+        db.upsert_protocol(&protocol).await.unwrap();
+        db.upsert_link(&link).await.unwrap();
+        db.upsert_endpoint_group_link(&xray_tui_db::models::EndpointGroup {
+            endpoint_id: endpoint.id,
+            group_id,
+            last_seen_at: super::test_support::ts(0),
+            sort_order: None,
+            endpoint: toasty::Deferred::default(),
+            group: toasty::Deferred::default(),
+        })
+        .await
+        .unwrap();
         let mut state = AppState::new(db, AppConfig::default()).await;
         state.purgatory_view = PurgatoryView::All; // includes never-seen rows
         state.selected_index = 5; // stale: list reloads to a single row
@@ -1349,26 +1498,36 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod sort_tests {
-    use super::test_support::fake_row;
+    use super::test_support::{fake_row, ts};
     use super::*;
     use crate::AppState;
     use std::sync::Arc;
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{DELAY_SOURCE_FAST, DELAY_SOURCE_REAL};
+    use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
 
-    fn set_delay(row: &mut EndpointRow, proto_id: i64, delay: i32, source: Option<i32>) {
-        row.extensions.insert(
-            proto_id,
-            ProfileExtension {
-                protocol_id: proto_id,
-                delay: Some(delay),
-                speed: None,
-                sort_order: None,
-                ip_info: None,
-                delay_source: source,
-                protocol_row: toasty::Deferred::from(None::<xray_tui_db::models::ProtocolRow>),
-            },
-        );
+    fn set_delay(row: &mut EndpointRow, proto_id: i64, delay: i32, real: bool) {
+        let link = row
+            .links
+            .iter_mut()
+            .find(|l| l.protocol_id.get() == proto_id)
+            .expect("link exists");
+        link.latency = if real {
+            Some(Latency::Real { delay, ip: None })
+        } else {
+            Some(Latency::Fast { delay })
+        };
+    }
+
+    fn set_error(row: &mut EndpointRow, proto_id: i64, kind: ProfileErr) {
+        let link = row
+            .links
+            .iter_mut()
+            .find(|l| l.protocol_id.get() == proto_id)
+            .expect("link exists");
+        link.error = Some(ErrorInfo {
+            kind,
+            text: "boom".into(),
+        });
     }
 
     #[tokio::test]
@@ -1382,16 +1541,19 @@ mod sort_tests {
         let mut state = AppState::new(db, AppConfig::default()).await;
         // E1: real-ok 300ms; E2: fast-ok 100ms; E3: untested.
         let mut e1 = fake_row(1, "e1.example", 1);
-        set_delay(&mut e1, 100, 300, Some(DELAY_SOURCE_REAL));
+        set_delay(&mut e1, 100, 300, true);
         let mut e2 = fake_row(2, "e2.example", 1);
-        set_delay(&mut e2, 200, 100, Some(DELAY_SOURCE_FAST));
+        set_delay(&mut e2, 200, 100, false);
         let e3 = fake_row(3, "e3.example", 1);
         state.endpoints = vec![e1, e2, e3];
         state.sort_column = SortColumn::Test;
         state.sort_ascending = true;
         state.filter_cache_valid.set(false);
 
-        let order: Vec<i64> = state.filtered_profiles().map(|r| r.endpoint.id).collect();
+        let order: Vec<i64> = state
+            .filtered_profiles()
+            .map(|r| r.endpoint.id.get())
+            .collect();
         assert_eq!(order, vec![1, 2, 3]); // real beats fast beats untested
     }
 
@@ -1404,31 +1566,51 @@ mod sort_tests {
                 .unwrap(),
         );
         let mut state = AppState::new(db, AppConfig::default()).await;
-        // E1 untested; E2 fast-ok but real-failed this round; E3 dns-unresolved.
+        // E1 untested; E2 fast-ok but real-failed; E3 dns-unresolved.
         let e1 = fake_row(1, "e1.example", 1);
         let mut e2 = fake_row(2, "e2.example", 1);
-        set_delay(&mut e2, 200, 100, Some(DELAY_SOURCE_FAST));
+        set_delay(&mut e2, 200, 100, false);
+        set_error(&mut e2, 200, ProfileErr::Real);
         let mut e3 = fake_row(3, "dns.example", 1);
-        e3.endpoint.host_type = "dns".to_string();
+        e3.endpoint.host_type = xray_tui_db::models::HostType::Dns;
         state.endpoints = vec![e1, e2, e3];
-        state.ping_status.insert(
-            2,
-            crate::types::EndpointPingStatus {
-                fast: crate::types::PingRound {
-                    seen: std::collections::HashSet::new(),
-                    failed: std::collections::HashSet::new(),
-                },
-                real: crate::types::PingRound {
-                    seen: std::collections::HashSet::new(),
-                    failed: std::collections::HashSet::from([200]),
-                },
-            },
-        );
         state.sort_column = SortColumn::Test;
         state.sort_ascending = true;
         state.filter_cache_valid.set(false);
 
-        let order: Vec<i64> = state.filtered_profiles().map(|r| r.endpoint.id).collect();
+        let order: Vec<i64> = state
+            .filtered_profiles()
+            .map(|r| r.endpoint.id.get())
+            .collect();
         assert_eq!(order, vec![1, 2, 3]); // untested above real-failure above dns
+    }
+
+    #[tokio::test]
+    async fn test_sort_traffic_uses_active_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        let mut e1 = fake_row(1, "e1.example", 1);
+        e1.links[0].traffic = xray_tui_db::models::TrafficStats {
+            today_up: 0,
+            today_down: 0,
+            total_up: 100,
+            total_down: 200,
+        };
+        let e2 = fake_row(2, "e2.example", 1); // zero traffic
+        state.endpoints = vec![e1, e2];
+        state.sort_column = SortColumn::Traffic;
+        state.sort_ascending = true;
+        state.filter_cache_valid.set(false);
+
+        let order: Vec<i64> = state
+            .filtered_profiles()
+            .map(|r| r.endpoint.id.get())
+            .collect();
+        assert_eq!(order, vec![2, 1]); // 0 before 300
     }
 }

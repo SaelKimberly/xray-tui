@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use ratatui_cheese::tree::TreeState;
 use xray_tui_core::CoreType;
-use xray_tui_db::models::{DnsSetting, RoutingRule};
+use xray_tui_db::models::RoutingRule;
 
 use crate::AppState;
 use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
@@ -291,23 +291,27 @@ pub async fn build_settings_fields(
         Dns => {
             if let Ok(Some(dns)) = state.db.get_dns_settings().await {
                 vec![
-                    ("servers".into(), dns.servers.unwrap_or_default()),
-                    ("hosts".into(), dns.hosts.unwrap_or_default()),
+                    // Vec fields render comma-joined in the form; split back
+                    // on save (join/split at the form boundary).
+                    ("servers".into(), dns.servers.join(",")),
+                    ("hosts".into(), dns.hosts.join(",")),
                     (
                         "query_strategy".into(),
-                        dns.query_strategy.unwrap_or_default(),
+                        match dns.query_strategy {
+                            Some(xray_tui_db::models::QueryStrategy::UseIp) => "UseIP".into(),
+                            Some(xray_tui_db::models::QueryStrategy::UseIpv4) => "UseIPv4".into(),
+                            Some(xray_tui_db::models::QueryStrategy::UseIpv6) => "UseIPv6".into(),
+                            None => String::new(),
+                        },
                     ),
-                    (
-                        "disable_cache".into(),
-                        dns.disable_cache.map(|v| v.to_string()).unwrap_or_default(),
-                    ),
-                    (
-                        "disable_fallback".into(),
-                        dns.disable_fallback
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ),
+                    ("disable_cache".into(), dns.disable_cache.to_string()),
+                    ("disable_fallback".into(), dns.disable_fallback.to_string()),
                     ("client_ip".into(), dns.client_ip.unwrap_or_default()),
+                    (
+                        "cache_ttl_secs".into(),
+                        dns.cache_ttl_secs
+                            .map_or_else(String::new, |t| t.to_string()),
+                    ),
                 ]
             } else {
                 vec![
@@ -317,6 +321,7 @@ pub async fn build_settings_fields(
                     ("disable_cache".into(), String::new()),
                     ("disable_fallback".into(), String::new()),
                     ("client_ip".into(), String::new()),
+                    ("cache_ttl_secs".into(), String::new()),
                 ]
             }
         }
@@ -584,18 +589,34 @@ pub async fn save_routing_rule(
             Some(v.to_owned())
         }
     };
+    // Vec fields are comma-joined in the form; split at the form boundary.
+    // `ports`/`source_ports` are u16 lists; the other lists are strings.
+    let split = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let split_u16 = |v: &str| -> Vec<u16> {
+        v.split(',')
+            .filter_map(|t| t.trim().parse::<u16>().ok())
+            .collect()
+    };
+    let ports = split_u16(get_str("ports"));
+    let source_ports = split_u16(get_str("source_ports"));
     let rule = RoutingRule {
         id,
         group_id: None,
         r#type: get_str("type").parse::<i32>().unwrap_or(0),
         domain_matcher: get_opt("domain_matcher"),
-        domains: get_opt("domains"),
-        ips: get_opt("ips"),
-        inbound_tags: get_opt("inbound_tags"),
-        port: get_opt("port"),
-        source_ports: get_opt("source_ports"),
+        domains: split(get_str("domains")),
+        ips: split(get_str("ips")),
+        inbound_tags: split(get_str("inbound_tags")),
+        ports,
+        source_ports,
         network: get_opt("network"),
-        protocols: get_opt("protocols"),
+        protocols: split(get_str("protocols")),
         domain_strategy: get_opt("domain_strategy"),
         outbound_tag: get_opt("outbound_tag"),
         balancer_tag: get_opt("balancer_tag"),
@@ -607,13 +628,13 @@ pub async fn save_routing_rule(
     // neither core builder emits them yet (xray has no rule-set support;
     // sing-box rule_set emission is intentionally out of scope for now). The
     // fields remain persisted for future sing-box rule-set support.
-    let has_matcher = rule.domains.is_some()
-        || rule.ips.is_some()
-        || rule.inbound_tags.is_some()
-        || rule.port.is_some()
-        || rule.source_ports.is_some()
+    let has_matcher = !rule.domains.is_empty()
+        || !rule.ips.is_empty()
+        || !rule.inbound_tags.is_empty()
+        || !rule.ports.is_empty()
+        || !rule.source_ports.is_empty()
         || rule.network.is_some()
-        || rule.protocols.is_some()
+        || !rule.protocols.is_empty()
         || rule.rule_set_file.is_some()
         || rule.rule_set_url.is_some();
     if !has_matcher {
@@ -624,11 +645,33 @@ pub async fn save_routing_rule(
         );
         return;
     }
-    let result = if rule_id.is_some() {
-        state.db.update_routing_rule(&rule).await
-    } else {
-        state.db.insert_routing_rule(&rule).await
-    };
+    // The typed model has no dedicated routing-rule write; upsert through the
+    // pooled connection (upsert is idempotent for add and edit alike).
+    let result: Result<(), String> = async {
+        let mut conn = state.db.connection().await.map_err(|e| e.to_string())?;
+        xray_tui_db::models::RoutingRule::upsert_by_id(rule.id.clone())
+            .group_id(rule.group_id.clone())
+            .r#type(rule.r#type)
+            .domain_matcher(rule.domain_matcher.clone())
+            .domains(rule.domains.clone())
+            .ips(rule.ips.clone())
+            .inbound_tags(rule.inbound_tags.clone())
+            .ports(rule.ports.clone())
+            .source_ports(rule.source_ports.clone())
+            .network(rule.network.clone())
+            .protocols(rule.protocols.clone())
+            .domain_strategy(rule.domain_strategy.clone())
+            .outbound_tag(rule.outbound_tag.clone())
+            .balancer_tag(rule.balancer_tag.clone())
+            .rule_set_file(rule.rule_set_file.clone())
+            .rule_set_url(rule.rule_set_url.clone())
+            .sort_order(rule.sort_order)
+            .exec(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
     match result {
         Ok(()) => state.log_trace("info", "tui::ops::settings", "Routing rule saved"),
         Err(e) => state.log_trace(
@@ -662,18 +705,48 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
             Some(v.to_owned())
         }
     };
-    let dns = DnsSetting {
+    let split = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let query_strategy = match get_str("query_strategy") {
+        "UseIP" => Some(xray_tui_db::models::QueryStrategy::UseIp),
+        "UseIPv4" => Some(xray_tui_db::models::QueryStrategy::UseIpv4),
+        "UseIPv6" => Some(xray_tui_db::models::QueryStrategy::UseIpv6),
+        _ => None,
+    };
+    let dns = xray_tui_db::models::DnsSetting {
         id,
         name: None,
-        servers: get_opt("servers"),
-        hosts: get_opt("hosts"),
-        query_strategy: get_opt("query_strategy"),
-        disable_cache: Some(i32::from(get_str("disable_cache") == "true")),
-        disable_fallback: Some(i32::from(get_str("disable_fallback") == "true")),
+        servers: split(get_str("servers")),
+        hosts: split(get_str("hosts")),
+        query_strategy,
+        disable_cache: get_str("disable_cache") == "true",
+        disable_fallback: get_str("disable_fallback") == "true",
         client_ip: get_opt("client_ip"),
         cache_ttl_secs: get_opt("cache_ttl_secs").and_then(|s| s.parse().ok()),
     };
-    match state.db.upsert_dns_settings(&dns).await {
+    let result: Result<(), String> = async {
+        let mut conn = state.db.connection().await.map_err(|e| e.to_string())?;
+        xray_tui_db::models::DnsSetting::upsert_by_id(dns.id.clone())
+            .name(dns.name.clone())
+            .servers(dns.servers.clone())
+            .hosts(dns.hosts.clone())
+            .query_strategy(dns.query_strategy)
+            .disable_cache(dns.disable_cache)
+            .disable_fallback(dns.disable_fallback)
+            .client_ip(dns.client_ip.clone())
+            .cache_ttl_secs(dns.cache_ttl_secs)
+            .exec(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+    match result {
         Ok(()) => {
             // Apply immediately: TTL gate reads this on the next resolve.
             if let Some(ttl) = dns.cache_ttl_secs {
