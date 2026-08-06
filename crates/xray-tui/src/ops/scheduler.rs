@@ -298,6 +298,25 @@ impl TaskScheduler {
         .await;
     }
 
+    /// Kind of a registered task id. `None` for unregistered / orphan ids.
+    ///
+    /// The batch pipeline uses this to dispatch a promoted task after
+    /// [`Self::complete`] advanced the gate: the fire-handshake contract says
+    /// the caller re-reads the link and fires the new `task_id`, and it must
+    /// know which kind of probe to run.
+    #[must_use]
+    pub fn kind_of(&self, id: u16) -> Option<TaskKind> {
+        self.tasks.get(&id).map(|k| *k)
+    }
+
+    /// The DNS-deferral window (seconds) this scheduler was constructed with.
+    /// The batch pipeline sleeps this long before re-scheduling a
+    /// `DnsDeferred` link.
+    #[must_use]
+    pub const fn dns_defer_secs(&self) -> i64 {
+        self.dns_defer_secs
+    }
+
     /// Sibling cancel: drop every queued id whose registry entry is `kind`
     /// (other kinds are preserved). Persists the filtered queue against the
     /// CURRENT gate state; skips the write when nothing matched.

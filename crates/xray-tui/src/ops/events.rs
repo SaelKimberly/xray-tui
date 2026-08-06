@@ -1,5 +1,6 @@
 use std::net::IpAddr;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
@@ -364,10 +365,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     TestType::UdpTest => {} // no tracking for UDP
                 }
 
-                // Auto-reset stop flag when all tests complete
-                if state.testing_profiles.is_empty() {
+                // Auto-reset stop flag when all tests complete. While a batch
+                // is active (`batch_progress` set) the flag must survive the
+                // phase-1 → phase-2 transition even if every fast result
+                // drained `testing_profiles` — the batch task clears the
+                // progress itself and re-arms the flag when it ends.
+                if state.testing_profiles.is_empty() && state.batch_progress.is_none() {
                     state.speed_test_stop.store(false, Ordering::Relaxed);
-                    state.batch_progress = None;
                 }
 
                 // Real ping happened — record the exit IP + country on the
@@ -512,12 +516,22 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .unwrap_or_default();
                 }
             }
-            CoreEvent::BatchProgress {
-                total,
-                completed: _,
-            } => {
+            CoreEvent::BatchProgress { total, completed } => {
                 if total == 0 {
+                    // Batch finished: clear the shared progress and re-arm the
+                    // stop flag (the batch pipeline retired everything; a
+                    // stopped batch must not leave the status bar stuck).
                     state.batch_progress = None;
+                    state.speed_test_stop.store(false, Ordering::Relaxed);
+                } else {
+                    // Keep the shared pair in sync with the event stream (the
+                    // status bar reads the atomics directly; the batch task
+                    // also updates them in place).
+                    let entry = state.batch_progress.get_or_insert_with(|| {
+                        Arc::new((AtomicU16::new(total), AtomicU16::new(0)))
+                    });
+                    entry.0.store(total, Ordering::Relaxed);
+                    entry.1.store(completed, Ordering::Relaxed);
                 }
             }
             CoreEvent::HostFeaturesLoaded(checker) => {
@@ -661,6 +675,7 @@ pub(crate) fn merge_host_features(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
 
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{EndpointRow, HostType, Latency};
@@ -1032,5 +1047,95 @@ mod tests {
             .map(|l| l.protocol_id.get())
             .collect();
         assert_eq!(ids, vec![8, 7]);
+    }
+
+    #[tokio::test]
+    async fn batch_progress_event_updates_shared_pair_and_clears_on_zero() {
+        let (mut state, tx) = event_state().await;
+
+        tx.send(CoreEvent::BatchProgress {
+            total: 5,
+            completed: 2,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        let p = state.batch_progress.as_ref().expect("batch progress set");
+        assert_eq!(p.0.load(Ordering::Relaxed), 5);
+        assert_eq!(p.1.load(Ordering::Relaxed), 2);
+
+        // A later event with the same total refreshes the shared pair.
+        tx.send(CoreEvent::BatchProgress {
+            total: 5,
+            completed: 4,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert_eq!(
+            state
+                .batch_progress
+                .as_ref()
+                .unwrap()
+                .1
+                .load(Ordering::Relaxed),
+            4
+        );
+
+        // total == 0 ends the batch: progress cleared, stop flag re-armed.
+        state.speed_test_stop.store(true, Ordering::Relaxed);
+        tx.send(CoreEvent::BatchProgress {
+            total: 0,
+            completed: 0,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert!(state.batch_progress.is_none());
+        assert!(!state.speed_test_stop.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn stop_flag_survives_last_result_while_batch_active() {
+        // T19: the auto-reset must NOT clear the stop flag during a batch
+        // (the phase-1 → phase-2 transition would otherwise lose a stop
+        // pressed mid-batch). Only after the batch's progress is gone does a
+        // drained result re-arm the flag.
+        let (mut state, tx) = event_state().await;
+        state.batch_progress = Some(Arc::new((AtomicU16::new(2), AtomicU16::new(0))));
+        state.speed_test_stop.store(true, Ordering::Relaxed);
+        state.testing_profiles.insert(8);
+
+        tx.send(CoreEvent::SpeedTestResult {
+            protocol_id: 8,
+            test_type: TestType::TcpPing,
+            latency_ms: Some(1),
+            speed_bps: None,
+            ip_info: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert!(
+            state.speed_test_stop.load(Ordering::Relaxed),
+            "stop flag survives while a batch is active"
+        );
+
+        // Batch ends (progress cleared) → the next drained result resets it.
+        state.batch_progress = None;
+        state.testing_profiles.insert(9);
+        tx.send(CoreEvent::SpeedTestResult {
+            protocol_id: 9,
+            test_type: TestType::RealPing,
+            latency_ms: Some(20),
+            speed_bps: None,
+            ip_info: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert!(!state.speed_test_stop.load(Ordering::Relaxed));
     }
 }

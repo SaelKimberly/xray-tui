@@ -38,8 +38,9 @@ pub struct AppState {
     pub config: AppConfig,
     /// Per-(protocol, endpoint) task gate (design §6.2): one live task per
     /// link, FIFO queue, orphan sweep, DNS-deferral. Defaults `(3, 5)` for
-    /// now — T21 wires the config's queue_limit/dns_defer_secs.
-    pub scheduler: scheduler::TaskScheduler,
+    /// now — T21 wires the config's queue_limit/dns_defer_secs. Wrapped in
+    /// `Arc` so the T19 batch pipeline can clone it into its spawned task.
+    pub scheduler: Arc<scheduler::TaskScheduler>,
     /// Currently selected theme name from config or UI selection.
     pub theme_name: ratatui_themes::ThemeName,
     pub current_tab: Tab,
@@ -365,7 +366,7 @@ impl AppState {
         let mut state = Self {
             db,
             config,
-            scheduler: scheduler::TaskScheduler::new(3, 5), // T21: config queue_limit/dns_defer_secs
+            scheduler: Arc::new(scheduler::TaskScheduler::new(3, 5)), // T21: config queue_limit/dns_defer_secs
             theme_name,
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),
@@ -709,6 +710,23 @@ impl AppState {
     }
     pub fn start_udp_test(&mut self, protocol_id: i64) {
         ping::start_udp_test(self, protocol_id);
+    }
+    /// Batch fast-ping every link of every visible endpoint (T19 rebuild on
+    /// the TaskScheduler).
+    pub fn start_batch_ping(&mut self) {
+        ping::start_batch_ping(self);
+    }
+    /// Batch fast-ping every visible link, then real-ping each (T19).
+    pub fn start_batch_then_real_ping(&mut self) {
+        ping::start_batch_then_real_ping(self);
+    }
+    /// Fast-ping every link of the selected endpoint (collapsed multi-protocol rows).
+    pub fn start_endpoint_batch_ping(&mut self) {
+        ping::start_endpoint_batch_ping(self);
+    }
+    /// Fast-ping then real-ping every link of the selected endpoint (no dedup).
+    pub fn start_endpoint_batch_real_ping(&mut self) {
+        ping::start_endpoint_batch_real_ping(self);
     }
     pub fn stop_speed_test(&mut self) {
         ping::stop_speed_test(self);

@@ -353,31 +353,39 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     _ => 0,
                 };
                 state.mode = crate::AppMode::List;
-                // Resolve the target protocol id before dispatch. Sub-rows
-                // ping the exact protocol; full rows ping the active link.
-                // (The batch menu items were removed in T17 — the batch
-                // pipeline is rebuilt in T19; until then every test here is
-                // single-protocol.)
+                // Resolve the target protocol id + row shape before dispatch.
+                // Collapsed endpoint rows with >1 protocols run an
+                // endpoint-scoped batch; sub-rows ping the exact protocol.
                 let on_sub = state.is_on_sub_row();
-                let proto_id = {
+                let (proto_id, multi) = {
                     let ep_id = state.selected_profile_id();
                     let row = ep_id
                         .and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id.get() == id));
-                    if on_sub {
+                    let multi = row.is_some_and(|r| r.protocols.len() > 1);
+                    let pid = if on_sub {
                         state.selected_sub_protocol_id()
                     } else {
                         row.and_then(|r| r.active_protocol().map(|(_, p)| p.id.get()))
-                    }
+                    };
+                    (pid, multi)
                 };
                 match selected {
                     0 => {
-                        if let Some(id) = proto_id {
-                            state.start_tcp_ping(id);
+                        if on_sub || !multi {
+                            if let Some(id) = proto_id {
+                                state.start_tcp_ping(id);
+                            }
+                        } else {
+                            state.start_endpoint_batch_ping();
                         }
                     }
                     1 => {
-                        if let Some(id) = proto_id {
-                            state.start_real_ping(id);
+                        if on_sub || !multi {
+                            if let Some(id) = proto_id {
+                                state.start_real_ping(id);
+                            }
+                        } else {
+                            state.start_endpoint_batch_real_ping();
                         }
                     }
                     2 => {
@@ -391,17 +399,23 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         }
                     }
                     5 => {
+                        state.start_batch_ping();
+                    }
+                    6 => {
+                        state.start_batch_then_real_ping();
+                    }
+                    7 => {
                         state.sort_column = SortColumn::Test;
                         state.sort_ascending = true;
                         state.filter_cache_valid.set(false);
                     }
-                    6 => {
+                    8 => {
                         state.remove_failed_servers().await;
                     }
-                    8 => {
+                    10 => {
                         state.stop_speed_test();
                     }
-                    10 => {
+                    12 => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
@@ -1024,6 +1038,8 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Speed Test (Selected)"),
     SpeedTestMenuItem::Item("UDP Test (Selected)"),
     SpeedTestMenuItem::Separator,
+    SpeedTestMenuItem::Item("Fast Ping (All Visible)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (All Visible)"),
     SpeedTestMenuItem::Item("Sort by Test"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,
