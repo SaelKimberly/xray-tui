@@ -19,6 +19,7 @@ mod error;
 mod http_client;
 mod hysteria1;
 mod hysteria2;
+mod inject_stub;
 mod kinds;
 mod naive;
 pub mod security_rank;
@@ -581,6 +582,29 @@ pub trait ProtoSpec: ProtoIdentity {
     }
 }
 
+/// A protocol config injects its outbound block + stream settings into a core
+/// JSON config. `endpoint` supplies host/port for transport/sni fields left
+/// unset by the host-free parse mandate (Task 4/5) — impls apply
+/// transport.with_host(endpoint.host) / sni defaults at build time, NEVER at
+/// parse time.
+///
+/// Standalone by design: deliberately NOT a supertrait of [`ProtoSpec`] (no
+/// coupling). Task 6 adds the trait plus the [`ProtocolConfig`] dispatch; the
+/// per-config implementations land in Tasks 14/15 (stubs in `inject_stub.rs`
+/// error with [`SupportError::UnsupportedProtocol`] until then).
+pub trait InjectToCoreConf {
+    /// # Errors
+    ///
+    /// If this protocol cannot be injected into the requested core (or, today,
+    /// until Tasks 14/15 land the real impls — always).
+    fn inject_to(
+        &self,
+        core_conf: &mut serde_json::Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+    ) -> Result<(), SupportError>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(tag = "schema")]
@@ -717,6 +741,19 @@ impl ProtoSpec for ProtocolConfig {
             Ok(ParseResult::Direct(c) | ParseResult::Fallback(c, _)) => Ok(c),
             Err(e) => Err(e),
         }
+    }
+}
+
+impl InjectToCoreConf for ProtocolConfig {
+    fn inject_to(
+        &self,
+        core_conf: &mut serde_json::Value,
+        core_type: CoreType,
+        endpoint: Option<&EndpointEssentials>,
+    ) -> Result<(), SupportError> {
+        // Reuses the existing `dispatch!` macro — it already forwards extra
+        // arguments (`core_conf`, `core_type`, `endpoint`) to each variant.
+        dispatch!(self, inject_to, core_conf, core_type, endpoint)
     }
 }
 
@@ -1180,5 +1217,229 @@ mod tests {
         // Unknown strings must error.
         assert!("auto".parse::<CoreType>().is_err());
         assert!("".parse::<CoreType>().is_err());
+    }
+
+    // ── InjectToCoreConf dispatch (Task 6) ────────────────────────────────
+    // NOTE: these stub-behavior tests are replaced in T14/T15 when the real
+    // per-config `inject_to` impls land.
+
+    fn vless_config() -> VlessConfig {
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws";
+        let parsed = VlessConfig::try_parse_proto(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"));
+        match parsed.protocol.config {
+            ProtocolConfig::Vless(c) => c,
+            other => panic!("expected VlessConfig, got {other:?}"),
+        }
+    }
+
+    /// Parse a share URL into its `ProtocolConfig` (endpoints discarded).
+    fn config_from_url(url: &str) -> ProtocolConfig {
+        ProtocolConfig::try_parse(&RawUrlX::from(url))
+            .unwrap_or_else(|e| panic!("parse failed for {url}: {e}"))
+    }
+
+    /// One `ProtocolConfig` per dispatch variant, paired with the kind string
+    /// its dispatch arm must route to.
+    fn all_variants_with_kinds() -> Vec<(ProtocolConfig, &'static str)> {
+        use crate::clash::{ClashProxy, ClashSsh, ClashTailscale, ClashTor};
+
+        let placeholder = |name: &str| {
+            ProtocolConfig::from_legacy_parse(name, serde_json::to_vec(&json!({})).unwrap())
+        };
+        let tor = TorConfig::try_from_clash_proto(&ClashProxy::Tor(ClashTor {
+            name: "tor-node".into(),
+            server: "127.0.0.1".into(),
+            port: 9050,
+        }))
+        .expect("tor clash parse")
+        .protocol
+        .config;
+        let ssh = SshConfig::try_from_clash_proto(&ClashProxy::Ssh(ClashSsh {
+            name: "ssh-box".into(),
+            server: "example.com".into(),
+            port: 22,
+            user: "root".into(),
+            password: Some("sekrit".into()),
+            private_key: None,
+            private_key_path: Some("/home/user/.ssh/id_ed25519".into()),
+            host_key: Some(vec!["ssh-ed25519 AAA".into()]),
+            host_key_algorithms: Some(vec!["ssh-ed25519".into()]),
+            client_version: Some("SSH-2.0-myclient".into()),
+        }))
+        .expect("ssh clash parse")
+        .protocol
+        .config;
+        let tailscale =
+            TailscaleConfig::try_from_clash_proto(&ClashProxy::Tailscale(ClashTailscale {
+                name: "ts-node".into(),
+                server: "100.64.0.1".into(),
+                port: 100,
+                hostname: "node1".into(),
+                auth_key: Some("tskey-auth-abc".into()),
+                control_url: Some("https://control.example.com".into()),
+                state_dir: Some("/var/lib/tailscale".into()),
+                ephemeral: true,
+                accept_routes: true,
+                exit_node: Some("100.64.0.2".into()),
+                exit_node_allow_lan_access: Some(true),
+            }))
+            .expect("tailscale clash parse")
+            .protocol
+            .config;
+
+        vec![
+            (
+                config_from_url(
+                    "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@159.223.24.65:443?path=/?ed=2560&security=tls&encryption=none&sni=test.ir&type=ws",
+                ),
+                "vless",
+            ),
+            (
+                config_from_url(
+                    "vmess://eyJhZGQiOiIxOTIuMjAwLjE2MC4xNiIsImFpZCI6IjAiLCJhbHBuIjoiIiwiZnAiOiIiLCJob3N0IjoiIiwiaWQiOiI5YjRjMmVkYS0zNDFlLTQ4OGYtYTNiMi0xZGM3MTZiOWYzNmEiLCJpbnNlY3VyZSI6IjEiLCJuZXQiOiJ3cyIsInBhdGgiOiIvIiwicG9ydCI6Ijg0NDMiLCJwcyI6IkBDbG91ZENpdHl5Iiwic2N5IjoiYXV0byIsInNuaSI6InN0ZWFtLmF2YWFhYWwuaXIiLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoiLS0tIiwidiI6IjIifQ==",
+                ),
+                "vmess",
+            ),
+            (
+                config_from_url(
+                    "trojan://humanity@172.64.152.23:443?security=tls&type=ws&path=/assignment&sni=www.creationlong.org",
+                ),
+                "trojan",
+            ),
+            (
+                config_from_url(
+                    "hy2://linux.do@[2a01:4f9:4b:f378::1]:13599?security=tls&insecure=1&sni=www.bing.com",
+                ),
+                "hy2",
+            ),
+            (
+                config_from_url("ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080"),
+                "ss",
+            ),
+            (
+                config_from_url(
+                    "ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9ncm91cD1WR1Z6ZEVkeWIzVncmcmVtYXJrcz1WR1Z6ZEZObGNuWmxjZw",
+                ),
+                "ssr",
+            ),
+            (
+                config_from_url(
+                    "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
+                ),
+                "tuic",
+            ),
+            (
+                config_from_url(
+                    "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280",
+                ),
+                "wireguard",
+            ),
+            (config_from_url("socks://user:pass@1.2.3.4:1080"), "socks"),
+            (config_from_url("http://user:pass@1.2.3.4:8080"), "http"),
+            (
+                config_from_url("naive+https://user:pass@example.com:443"),
+                "naive",
+            ),
+            (
+                config_from_url("anytls://1.2.3.4:8080?password=secret"),
+                "any-tls",
+            ),
+            (
+                config_from_url(
+                    "shadowtls://1.2.3.4:443?password=pass123&version=1&sni=example.com",
+                ),
+                "shadow-tls",
+            ),
+            (tor, "tor"),
+            (ssh, "ssh"),
+            (tailscale, "tailscale"),
+            (
+                config_from_url(
+                    "hysteria://example.com:443?protocol=udp&obfs=xplus&up_mbps=200&down_mbps=200&insecure=1&sni=real.example.com",
+                ),
+                "hy",
+            ),
+            (placeholder("redirect"), "redirect"),
+            (placeholder("tproxy"), "tproxy"),
+            (placeholder("mixed"), "mixed"),
+        ]
+    }
+
+    #[test]
+    fn dispatch_routes_to_variant() {
+        let vless = ProtocolConfig::Vless(vless_config());
+        match vless.inject_to(&mut json!({}), CoreType::Xray, None) {
+            Err(SupportError::UnsupportedProtocol(kind, core)) => {
+                assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
+                assert_eq!(core, CoreType::Xray, "error reports the requested core");
+            }
+            other => panic!("expected UnsupportedProtocol, got {other:?}"),
+        }
+
+        let tuic = config_from_url(
+            "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
+        );
+        match tuic.inject_to(&mut json!({}), CoreType::SingBox, None) {
+            Err(SupportError::UnsupportedProtocol(kind, core)) => {
+                assert!(kind.contains("tuic"), "kind {kind:?} must mention tuic");
+                assert_eq!(core, CoreType::SingBox, "error reports the requested core");
+            }
+            other => panic!("expected UnsupportedProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xray_and_singbox_both_error_today() {
+        // NOTE: replaced in T14/T15 when real per-config `inject_to` impls land.
+        let vless = ProtocolConfig::Vless(vless_config());
+        for core in [CoreType::Xray, CoreType::SingBox] {
+            match vless.inject_to(&mut json!({}), core, None) {
+                Err(SupportError::UnsupportedProtocol(kind, got)) => {
+                    assert!(kind.contains("vless"), "kind {kind:?} must mention vless");
+                    assert_eq!(got, core, "error reports the requested core");
+                }
+                other => panic!("expected UnsupportedProtocol for {core:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_param_accepted() {
+        let vless = ProtocolConfig::Vless(vless_config());
+        let endpoint = EndpointEssentials::new("1.2.3.4", 443);
+        for endpoint in [None, Some(&endpoint)] {
+            match vless.inject_to(&mut json!({}), CoreType::Xray, endpoint) {
+                Err(SupportError::UnsupportedProtocol(..)) => {}
+                other => panic!("expected UnsupportedProtocol, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn all_variants_route_to_their_kind_string() {
+        let variants = all_variants_with_kinds();
+        assert_eq!(variants.len(), 20, "all 20 dispatch arms must be covered");
+        let mut kinds = Vec::new();
+        for (config, expected) in &variants {
+            match config.inject_to(&mut json!({}), CoreType::Xray, None) {
+                Err(SupportError::UnsupportedProtocol(kind, _)) => {
+                    assert_eq!(
+                        kind.as_str(),
+                        *expected,
+                        "dispatch arm for {config:?} must report kind {expected:?}"
+                    );
+                    kinds.push(kind);
+                }
+                other => panic!("expected UnsupportedProtocol for {config:?}, got {other:?}"),
+            }
+        }
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(
+            kinds.len(),
+            20,
+            "every variant must report a distinct kind string"
+        );
     }
 }
