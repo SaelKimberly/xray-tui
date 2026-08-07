@@ -224,13 +224,12 @@ pub async fn build_settings_fields(
                 state.config.statistics.enabled.to_string(),
             )]
         }
-        ProtocolCore => state
-            .config
-            .core
-            .protocol_core_overrides
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        // All 22 protocols, defaulting to "Auto": the form must render every
+        // PROTOCOL_CORE_DEFS entry even when no overrides are saved, or the
+        // Select Left/Right handler indexes `fields[focus_index]` against an
+        // empty vec (panic "index out of bounds: the len is 0 but the index
+        // is 0").
+        ProtocolCore => protocol_core_form_fields(&state.config.core.protocol_core_overrides),
         SpeedTest => {
             vec![
                 ("ping_url".into(), state.config.speed_test.ping_url.clone()),
@@ -790,5 +789,57 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
             "tui::ops::settings",
             &format!("Failed to save DNS settings: {e}"),
         ),
+    }
+}
+
+/// One form field per protocol in `PROTOCOL_CORE_DEFS`, in def order.
+/// Missing overrides default to "Auto" so the form field list always matches
+/// the field definitions — a mismatch lets the Select Left/Right handler
+/// index `fields[focus_index]` past an empty vec (panic, see build arm).
+fn protocol_core_form_fields(
+    overrides: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    crate::ui::settings::PROTOCOL_CORE_DEFS
+        .iter()
+        .map(|(key, _, _)| {
+            (
+                (*key).to_string(),
+                overrides
+                    .get(*key)
+                    .cloned()
+                    .unwrap_or_else(|| "Auto".to_string()),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protocol_core_form_fields;
+    use crate::ui::settings::PROTOCOL_CORE_DEFS;
+    use std::collections::HashMap;
+
+    /// Regression: pressing Right on the Protocol Core form panicked
+    /// ("index out of bounds: the len is 0 but the index is 0") because the
+    /// fields vec was empty when no overrides were saved, while the field
+    /// defs (22 protocols) were not.
+    #[test]
+    fn protocol_core_fields_cover_all_defs_with_auto_default() {
+        let overrides = HashMap::from([("vless".to_string(), "Xray".to_string())]);
+        let fields = protocol_core_form_fields(&overrides);
+
+        assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
+        for ((key, val), (def_key, _, _)) in fields.iter().zip(PROTOCOL_CORE_DEFS) {
+            assert_eq!(key, def_key, "field order/keys must match the defs");
+            let expected = if key == "vless" { "Xray" } else { "Auto" };
+            assert_eq!(val, expected, "unsaved protocols must default to Auto");
+        }
+    }
+
+    #[test]
+    fn protocol_core_fields_empty_overrides_all_auto() {
+        let fields = protocol_core_form_fields(&HashMap::new());
+        assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
+        assert!(fields.iter().all(|(_, v)| v == "Auto"));
     }
 }

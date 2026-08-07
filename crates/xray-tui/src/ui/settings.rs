@@ -820,7 +820,14 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
             }
             // If errors, stay on form with errors displayed
         }
-        KeyCode::Left | KeyCode::Right if *focus_index < field_defs.len() => {
+        // Guard both lengths: the Char handler already does
+        // `if *focus_index >= fields.len() { return; }`; without the fields
+        // check here, a form whose stored fields are shorter than its defs
+        // (e.g. Protocol Core with no saved overrides) panics on
+        // `fields[*focus_index]`.
+        KeyCode::Left | KeyCode::Right
+            if *focus_index < field_defs.len() && *focus_index < fields.len() =>
+        {
             let def = field_defs[*focus_index];
             let field_type = def.2;
             if let Some(options_csv) = field_type.strip_prefix("Select:") {
@@ -2087,4 +2094,54 @@ fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static
         }
     );
     Line::from(Span::styled(format!("{bar}{pct}{sizes}"), *style))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_form_key;
+    use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
+    use crate::AppState;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_cheese::tree::TreeState;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// Regression: pressing Right on the Protocol Core form panicked
+    /// ("index out of bounds: the len is 0 but the index is 0" at
+    /// settings.rs, the Select Left/Right arm) because the stored form fields
+    /// were empty when no overrides were saved, while the field defs (22
+    /// protocols) were not. The handler must no-op instead of indexing.
+    #[tokio::test]
+    async fn form_left_right_no_panic_with_empty_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, xray_tui_config::AppConfig::default()).await;
+        // Pre-fix failure state: Protocol Core form with empty stored fields.
+        state.mode = AppMode::Settings {
+            mode: SettingsMode::Split {
+                tree: RefCell::new(TreeState::all_expanded(5)),
+                focus: SplitFocus::Right,
+                right: SplitRightPane::Form {
+                    section: SettingsSection::ProtocolCore,
+                    fields: Vec::new(),
+                    focus_index: 0,
+                    form_errors: HashMap::new(),
+                },
+            },
+        };
+
+        // Must not panic; fields stay empty (no field to cycle).
+        handle_form_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        handle_form_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+    }
 }
