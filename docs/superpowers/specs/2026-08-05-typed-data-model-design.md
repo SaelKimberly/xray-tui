@@ -381,10 +381,13 @@ replaced by per-pair tasks:
 
 ### 6.4 Labels and persistence
 
-- Labels render from the persisted per-link `error.kind` markers: `[real]`
-  when any link carries a Real marker, `[fast]` when any carries Fast (real
-  over fast precedence), `[name]` when the endpoint is DNS-unresolved
-  (`resolved_as` empty). Tier/sort logic reads
+- Labels render from the persisted per-link `error.kind` markers of the
+  endpoint's ACTIVE (preferred) link — not any link: `[real]` when the active
+  link carries a Real/Name marker, `[fast]` when it carries Fast (real over
+  fast precedence), `[name]` when the endpoint is DNS-unresolved
+  (`resolved_as` empty). A failed sibling must not paint the row red when the
+  best protocol succeeded; the expanded panel still shows per-link markers.
+  Tier/sort logic reads
   persisted rows (`latency`, `error.kind`, `resolved_as`) instead of
   session-only round sets. Note: the tier fn checks the endpoint-level
   `resolved_as`-empty flag FIRST (tier 5); `error.kind == ProfileErr::Name` on

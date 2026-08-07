@@ -294,25 +294,24 @@ const TEST_BAD_MS: i32 = 1000;
 /// link's last measured delay, colored by magnitude, or the red problem
 /// labels — `[name]` when the DNS name could not be resolved, `[real]`/`[fast]`
 /// when any of the endpoint's links carries a persisted failure marker of
-/// that class (`link.error.kind`, round maps removed in T17). Precedence
-/// follows the tier model (decision 16): real-err (3) ranks above fast-err
-/// (4) — when both marker classes are present the deeper real check wins —
-/// and DNS-unresolved (5) is the deepest, so `[name]` beats both.
+/// Failure label for the single-row Test cell, from the ACTIVE (preferred)
+/// link only — the row represents the endpoint's chosen protocol, so a
+/// failed sibling must not paint it red when the best protocol succeeded
+/// (the expanded panel still shows per-link markers). Precedence follows the
+/// tier model (decision 16): real-err (3) ranks above fast-err (4) — when
+/// both marker classes are present the deeper real check wins — and
+/// DNS-unresolved (5) is the deepest, so `[name]` beats both.
 fn compute_test_cell(
     row: &EndpointRow,
     resolved: bool,
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
     use xray_tui_db::models::ProfileErr;
-    let mut fast_failed = false;
-    let mut real_failed = false;
-    for link in &row.links {
-        match link.error.as_ref().map(|e| e.kind) {
-            Some(ProfileErr::Fast) => fast_failed = true,
-            Some(ProfileErr::Real | ProfileErr::Name) => real_failed = true,
-            None => {}
-        }
-    }
+    let failure = match row.active_link().and_then(|l| l.error.as_ref()).map(|e| e.kind) {
+        Some(ProfileErr::Real | ProfileErr::Name) => Some(TestFailure::Real),
+        Some(ProfileErr::Fast) => Some(TestFailure::Fast),
+        None => None,
+    };
     let active_delay = row.active_link().and_then(|l| match l.latency {
         Some(
             xray_tui_db::models::Latency::Real { delay, .. }
@@ -323,13 +322,7 @@ fn compute_test_cell(
     test_cell_content(
         row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
         resolved,
-        if real_failed {
-            Some(TestFailure::Real)
-        } else if fast_failed {
-            Some(TestFailure::Fast)
-        } else {
-            None
-        },
+        failure,
         active_delay,
         palette,
     )
@@ -939,9 +932,38 @@ mod tests {
         }
     }
 
+    /// Regression: multi-protocol endpoint — first protocol fails real ping,
+    /// second succeeds. The single-row Test cell must reflect the ACTIVE
+    /// (preferred) link: no red `[real]` when the best protocol succeeded,
+    /// and its delay shown. Pre-fix the label scanned ANY link, so a failed
+    /// sibling painted the row red despite the endpoint working.
     #[test]
-    fn expanded_row_height_includes_gap() {
-        let row = sample_row(
+    fn test_cell_label_follows_active_link_not_any_link() {
+        use crate::ops::profiles::test_support::fake_row;
+        use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut row = fake_row(1, "1.2.3.4", 3); // p100, p101, p102
+        row.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout".into(),
+        });
+        row.links[1].latency = Some(Latency::Real { delay: 40, ip: None });
+
+        // Active = p101 (success): no failure label, delay shown.
+        row.selected_protocol = 1;
+        let (text, _style) = compute_test_cell(&row, true, &palette);
+        assert!(!text.contains("real"), "active success must not paint red: {text:?}");
+        assert!(text.contains("40"), "active delay must be shown: {text:?}");
+
+        // Active = p100 (failed): [real] red, as expected.
+        row.selected_protocol = 0;
+        let (text, _style) = compute_test_cell(&row, true, &palette);
+        assert!(text.contains("real"), "active failure must label: {text:?}");
+    }
+
+    #[test]
+    fn expanded_row_height_includes_gap() {        let row = sample_row(
             true,
             vec![sample_panel_row("●"), sample_panel_row("○")],
             "00",

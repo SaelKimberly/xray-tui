@@ -33,7 +33,7 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | `]=>{`       | 4     | Bracket decoration                          |
 | (config)     | 12    | `transport/security`, center-aligned        |
 | `}=>`        | 3     | Bracket decoration                          |
-| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (any protocol of the endpoint carries that persisted failure marker; real over fast precedence). Labels come from the persisted per-link failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
+| `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (the endpoint's ACTIVE/preferred link carries that persisted failure marker; real over fast precedence). After a successful real ping the lowest-latency real-ok protocol is auto-promoted to preferred, so the row shows its delay instead of a failed sibling's. Labels come from the persisted per-link failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
 | `[`          | 1     | Bracket decoration (Outbound opener)        |
 | `Outbound`   | 16    | Exit IP from the last real ping (`—` none)  |
 | `Country`    | 7     | Exit country flag + ISO (`—` none)          |
@@ -267,9 +267,13 @@ warning. Profiles whose DNS failed recently are deferred and retried after
 Test and apply immediately.
 
 **Error labels:** failed tests mark the profile (`[fast]`/`[real]`/`[name]`
-in the Test column). Markers persist across restarts; `error_ttl_hours`
-(empty = never) clears them automatically on profile reload and at batch
-finish.
+in the Test column). The label reflects the endpoint's ACTIVE (preferred)
+protocol — a failed sibling doesn't paint the row red when the best protocol
+succeeded (the expanded panel still shows per-link markers). Markers persist
+across restarts; `error_ttl_hours` (empty = never) clears them automatically
+on profile reload and at batch finish. After a real ping, the successful
+protocol with the lowest latency is automatically preferred, so the
+single-row view carries the working protocol's delay and exit IP.
 
 ---
 

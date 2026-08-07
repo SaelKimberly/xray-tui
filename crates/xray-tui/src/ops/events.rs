@@ -386,6 +386,31 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                             state.selected_sub =
                                 row.links.iter().position(|l| l.protocol_id == pid);
                         }
+                        // Auto-preferred: after a successful real ping, the
+                        // lowest-latency real-ok link becomes the endpoint's
+                        // active protocol (single-row view shows its delay,
+                        // and the failure label follows the active link).
+                        // Skipped when the user pinned an override (Enter on
+                        // a sub-row) — an explicit choice wins. The sort's
+                        // implicit best-first order can be perturbed by a
+                        // transient DNS-unresolved tier, so promote by real
+                        // latency explicitly rather than trusting links[0].
+                        if error.is_none()
+                            && test_type == TestType::RealPing
+                            && row.endpoint.manual_protocol_override.is_none()
+                            && row.links.len() > 1
+                            && let Some((best_idx, _)) = row
+                                .links
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, l)| match l.latency {
+                                    Some(Latency::Real { delay, .. }) => Some((i, delay)),
+                                    _ => None,
+                                })
+                                .min_by_key(|&(_, d)| d)
+                        {
+                            row.selected_protocol = best_idx;
+                        }
                     }
                     state.filter_cache_valid.set(false);
                 }
@@ -1255,6 +1280,53 @@ mod tests {
             .find(|l| l.protocol_id.get() == 9)
             .unwrap();
         assert_eq!(p9.traffic.total_up, 0, "foreign-session delta rejected");
+    }
+
+    #[tokio::test]
+    async fn real_ping_success_promotes_lowest_latency_link() {
+        // User scenario: first protocol fails real ping, second succeeds.
+        // The single-row view must follow the successful (best) protocol, not
+        // the failed one. Regression: sort keeps the failed link first under
+        // a transient DNS-unresolved tier, so promotion must be explicit.
+        let (mut state, tx) = event_state().await;
+        let mut row = fake_row(1, "h1.example", 2); // p100, p101
+        row.endpoint.host_type = HostType::Dns; // unresolved -> all tier 5
+        row.links[0].error = Some(xray_tui_db::models::ErrorInfo {
+            kind: xray_tui_db::models::ProfileErr::Real,
+            text: "timeout".into(),
+        });
+        row.links[0].last_seen_at = crate::ops::profiles::test_support::ts(200);
+        row.links[1].latency = Some(Latency::Real { delay: 90, ip: None });
+        row.links[1].last_seen_at = crate::ops::profiles::test_support::ts(100);
+        state.endpoints = vec![row];
+        state.selected_index = 0;
+        state.testing_profiles.insert(101);
+
+        tx.send(CoreEvent::SpeedTestResult {
+            protocol_id: 101,
+            test_type: TestType::RealPing,
+            latency_ms: Some(40),
+            speed_bps: None,
+            ip_info: Some("5.6.7.8|US".to_string()),
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        let row = &state.endpoints[0];
+        // Pre-fix: active stayed p100 (failed) — tier-5 recency sort kept it
+        // first, so the row showed [real] + no delay. Post-fix: promotion.
+        let active = row.active_link().expect("active link");
+        assert_eq!(
+            active.protocol_id,
+            xray_tui_db::models::ProtocolId::new(101),
+            "best real-ok link must become the preferred protocol"
+        );
+        assert!(matches!(
+            active.latency,
+            Some(Latency::Real { delay: 40, .. })
+        ));
     }
 
     #[tokio::test]
