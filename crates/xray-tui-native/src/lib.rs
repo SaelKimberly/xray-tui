@@ -22,6 +22,7 @@
 //! ([`ProtocolConfig`], [`EndpointEssentials`]). No config model is defined
 //! here.
 
+pub mod addr;
 pub mod error;
 
 pub use error::NativeError;
