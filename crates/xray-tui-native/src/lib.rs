@@ -31,6 +31,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for 
 pub type BoxStream = Box<dyn Stream>;
 
 pub mod addr;
+pub mod chain;
 pub mod context;
 pub mod error;
 pub mod protocol;
@@ -38,8 +39,15 @@ pub mod security;
 pub mod shape;
 pub mod transport;
 
+pub use chain::connect_chain;
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
+
+/// Connect through a single proxy to `params.target`.
+pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, NativeError> {
+    let target = params.target.clone();
+    connect_chain(&[params], target).await
+}
 
 /// A completed native tunnel: the byte stream after the full layer stack.
 ///

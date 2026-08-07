@@ -30,6 +30,12 @@ impl Host {
     }
 }
 
+impl From<&str> for Host {
+    fn from(host: &str) -> Self {
+        Self::new(host)
+    }
+}
+
 /// A destination address on the wire: host + port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetAddr {
