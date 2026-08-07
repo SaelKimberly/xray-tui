@@ -138,18 +138,29 @@ pub fn generate_certs() -> Certs {
 }
 
 /// Write a GET through the tunnel, return (status code, body).
+///
+/// Fully bounded: the write fails fast on a broken tunnel instead of
+/// blocking. Returns `(0, String::new())` on a timeout or short read — the
+/// e2e tests retry the whole connection on such outcomes.
 pub async fn probe(tunnel: &mut xray_tui_native::NativeTunnel) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tunnel
-        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
+    const STEP: Duration = Duration::from_secs(5);
+    let write = tokio::time::timeout(STEP, tunnel.write_all(&GET)).await;
+    if write.is_err() {
+        return (0, String::new());
+    }
+    if let Err(e) = write.unwrap() {
+        eprintln!("probe write error: {e}");
+        return (0, String::new());
+    }
     let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(10), tunnel.read_to_end(&mut buf))
-        .await
-        .expect("probe timeout")
-        .unwrap();
-    assert!(read > 0, "empty tunnel response");
+    let read = tokio::time::timeout(STEP, tunnel.read_to_end(&mut buf)).await;
+    let Ok(Ok(read)) = read else {
+        return (0, String::new());
+    };
+    if read == 0 {
+        return (0, String::new());
+    }
     let text = String::from_utf8_lossy(&buf);
     let status_line = text.lines().next().unwrap_or_default().to_string();
     let status = status_line
@@ -165,6 +176,8 @@ pub async fn probe(tunnel: &mut xray_tui_native::NativeTunnel) -> (u16, String) 
         .to_string();
     (status, body)
 }
+
+const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
 /// Build the native connect params for the e2e VLESS case (sni=localhost).
 ///
