@@ -50,7 +50,10 @@ fn default_config() -> Arc<rustls::ClientConfig> {
 }
 
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    #[cfg(any(test, feature = "native-e2e"))]
     let mut config = TEST_CFG.get().cloned().unwrap_or_else(default_config);
+    #[cfg(not(any(test, feature = "native-e2e")))]
+    let mut config = default_config();
     let alpn = ctx.alpn_vec();
     if !alpn.is_empty() {
         Arc::make_mut(&mut config).alpn_protocols = alpn;

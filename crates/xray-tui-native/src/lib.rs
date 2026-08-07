@@ -40,3 +40,52 @@ pub mod transport;
 
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
+
+/// A completed native tunnel: the byte stream after the full layer stack.
+///
+/// Dropping the tunnel closes the underlying connection.
+pub struct NativeTunnel {
+    inner: BoxStream,
+}
+
+impl NativeTunnel {
+    /// Wrap a completed layer stack (crate-internal; external users get
+    /// tunnels from `connect`/`connect_chain`).
+    pub(crate) fn from_stream(inner: BoxStream) -> Self {
+        Self { inner }
+    }
+}
+
+impl tokio::io::AsyncRead for NativeTunnel {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for NativeTunnel {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
