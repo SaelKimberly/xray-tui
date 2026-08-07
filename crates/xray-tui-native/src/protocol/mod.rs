@@ -5,7 +5,7 @@
 //! pipeline applies to the TCP-stream family. Device tunnels
 //! (WireGuard/Tailscale), own-handshake protocols (SSH/Tor), and the
 //! outbound-only kinds (Redirect/TProxy/Mixed) take divergent paths at their
-//! own connect() and return NotImplemented here until those paths exist.
+//! own `connect()` and return `NotImplemented` here until those paths exist.
 
 use xray_tui_proto::proto_spec::ProtocolConfig;
 

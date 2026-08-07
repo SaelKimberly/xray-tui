@@ -1,12 +1,12 @@
 //! JA3 fingerprint encoder (offline).
 //!
-//! JA3 is the md5 of a canonical string over ClientHello fields:
+//! JA3 is the md5 of a canonical string over `ClientHello` fields:
 //! `version,ciphers,extensions,curves,point_formats` with decimal version,
 //! lowercase-hex extension/cipher/curve ids and decimal point formats.
-//! Computing JA3 from raw hello bytes requires a ClientHello parser (M2,
+//! Computing JA3 from raw hello bytes requires a `ClientHello` parser (M2,
 //! with the fingerprint engine); this codec encodes from structured fields.
 
-/// JA3 field set extracted (later) from a ClientHello.
+/// JA3 field set extracted (later) from a `ClientHello`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Ja3Fields {
     /// TLS record/layout version, e.g. 0x0303 → 771.

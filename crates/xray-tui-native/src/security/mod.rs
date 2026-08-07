@@ -43,26 +43,28 @@ mod tests {
     use crate::addr::{Host, TargetAddr};
     use crate::context::NativeConnectParams;
 
-    fn vless_with_security(security: serde_json::Value) -> ProtocolConfig {
-        serde_json::from_value(serde_json::json!({
+    fn vless_with_security(security: Option<&serde_json::Value>) -> ProtocolConfig {
+        let mut obj = serde_json::json!({
             "schema": "Vless",
             "uuid": "00000000-0000-0000-0000-000000000000",
-            "security": security,
             "transport": { "type": "tcp" }
-        }))
-        .expect("vless config parses")
+        });
+        if let Some(sec) = security {
+            obj["security"] = sec.clone();
+        }
+        serde_json::from_value(obj).expect("vless config parses")
     }
 
     fn vless_with_tls(sni: &str) -> ProtocolConfig {
-        vless_with_security(serde_json::json!({
+        vless_with_security(Some(&serde_json::json!({
             "type": "tls", "sni": sni, "alpn": "http/1.1"
-        }))
+        })))
     }
 
     fn vless_with_reality() -> ProtocolConfig {
-        vless_with_security(serde_json::json!({
+        vless_with_security(Some(&serde_json::json!({
             "type": "reality", "sni": "example.com", "pbk": "Zm9vYmFy"
-        }))
+        })))
     }
 
     fn ctx_for(protocol: ProtocolConfig) -> LinkContext {

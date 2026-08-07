@@ -14,10 +14,8 @@ impl Host {
     /// Parse a host string: `IpAddr` when it parses, else `Domain`.
     #[must_use]
     pub fn new(host: &str) -> Self {
-        match host.parse::<IpAddr>() {
-            Ok(ip) => Self::Ip(ip),
-            Err(_) => Self::Domain(host.to_string()),
-        }
+        host.parse::<IpAddr>()
+            .map_or_else(|_| Self::Domain(host.to_string()), Self::Ip)
     }
 
     #[must_use]
@@ -92,6 +90,7 @@ pub fn encode_addr(target: &TargetAddr) -> Vec<u8> {
 }
 
 /// Decode one wire address; returns the address plus the unconsumed tail.
+#[must_use]
 pub fn decode_addr(bytes: &[u8]) -> Option<(TargetAddr, &[u8])> {
     if bytes.len() < 3 {
         return None;

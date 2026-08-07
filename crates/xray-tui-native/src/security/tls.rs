@@ -1,7 +1,7 @@
 //! Standard TLS: rustls 0.23 (ring backend) via tokio-rustls.
 //!
 //! This is the `TlsProvider::Standard` path. It cannot emit a mimicked
-//! ClientHello (rustls has no modification API); a fingerprinted hello comes
+//! `ClientHello` (rustls has no modification API); a fingerprinted hello comes
 //! from a `TlsProvider::Custom` engine (M2). Certificate validation is always
 //! on — no skip-verify anywhere in the native core.
 
@@ -22,6 +22,7 @@ static TEST_CFG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::Onc
 /// Build a client config trusting exactly `ca_der` (test/e2e harness only).
 #[doc(hidden)]
 #[cfg(any(test, feature = "native-e2e"))]
+#[must_use]
 pub fn test_client_config(ca_der: &[u8]) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots

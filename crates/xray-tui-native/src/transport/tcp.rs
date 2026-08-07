@@ -8,20 +8,19 @@ pub async fn connect(
     ctx: &crate::context::LinkContext,
     base: Option<BoxStream>,
 ) -> Result<BoxStream, NativeError> {
-    match base {
-        Some(stream) => Ok(stream),
-        None => {
-            let socket = ctx.server_socket().await?;
-            let timeout = timeouts::TRANSPORT;
-            let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(socket))
-                .await
-                .map_err(|_| NativeError::Timeout {
-                    step: "tcp dial",
-                    limit: timeout,
-                })?
-                .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
-            Ok(Box::new(stream))
-        }
+    if let Some(stream) = base {
+        Ok(stream)
+    } else {
+        let socket = ctx.server_socket().await?;
+        let timeout = timeouts::TRANSPORT;
+        let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(socket))
+            .await
+            .map_err(|_| NativeError::Timeout {
+                step: "tcp dial",
+                limit: timeout,
+            })?
+            .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
+        Ok(Box::new(stream))
     }
 }
 

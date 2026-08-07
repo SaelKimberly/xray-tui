@@ -9,22 +9,19 @@ rust-version.workspace = true
 xray-tui-proto.workspace = true
 
 # async runtime
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
-futures-util.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
 
 # TLS (workspace standard: ring backend)
 rustls = { workspace = true, features = ["ring"] }
 tokio-rustls = "0.26"
 webpki-roots = "1"
 
-# errors / observability
+# errors
 thiserror.workspace = true
-tracing.workspace = true
 
 # misc
 uuid.workspace = true
 md-5 = "0.10"
-serde_json.workspace = true
 
 [lints]
 workspace = true
@@ -33,6 +30,7 @@ workspace = true
 native-e2e = []
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3"
 rcgen = "0.13"
 tiny_http = "0.12"

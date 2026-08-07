@@ -1,2 +1,2 @@
-//! TProxy — placeholder (ConnectShape::NoStream, outbound-only form kind).
+//! `TProxy` — placeholder (`ConnectShape::NoStream`, outbound-only form kind).
 //! No client connect path exists.

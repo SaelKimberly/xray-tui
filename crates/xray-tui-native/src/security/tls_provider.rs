@@ -1,6 +1,6 @@
 //! TLS provider plug: standard rustls vs a fingerprint-capable engine.
 //!
-//! Stock rustls (0.23) exposes no ClientHello modification API, so browser
+//! Stock rustls (0.23) exposes no `ClientHello` modification API, so browser
 //! fingerprint mimicry (the DPI/CDN bypass requirement) lives behind the
 //! [`TlsConnector`] trait. `Custom` engines serve BOTH plain TLS (with
 //! certificate validation) and REALITY. M1 ships only `Standard`.
@@ -41,7 +41,7 @@ pub struct TlsParams {
     pub fingerprint: Option<FingerprintId>,
 }
 
-/// A TLS connector that can emit arbitrary ClientHellos (fingerprint mimicry).
+/// A TLS connector that can emit arbitrary `ClientHellos` (fingerprint mimicry).
 pub trait TlsConnector: Send + Sync {
     fn connect(
         &self,

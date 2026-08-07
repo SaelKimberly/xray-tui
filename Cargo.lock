@@ -7440,7 +7440,6 @@ dependencies = [
 name = "xray-tui-native"
 version = "0.1.0"
 dependencies = [
- "futures-util",
  "md-5 0.10.6",
  "rcgen",
  "rustls",
@@ -7450,7 +7449,6 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tokio-rustls",
- "tracing",
  "uuid",
  "webpki-roots",
  "xray-tui-proto",

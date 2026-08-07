@@ -21,7 +21,7 @@ pub struct NativeConnectParams {
 
 impl NativeConnectParams {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         protocol: ProtocolConfig,
         server: EndpointEssentials,
         target: crate::addr::TargetAddr,
@@ -44,7 +44,7 @@ pub struct LinkContext {
 
 impl LinkContext {
     #[must_use]
-    pub fn new(params: NativeConnectParams, target: crate::addr::TargetAddr) -> Self {
+    pub const fn new(params: NativeConnectParams, target: crate::addr::TargetAddr) -> Self {
         Self { params, target }
     }
 
@@ -83,7 +83,10 @@ impl LinkContext {
             .ok()
             .flatten()
             .and_then(|o| o.sni.as_ref())
-            .map_or_else(|| self.params.server.host.clone(), |s| s.to_string())
+            .map_or_else(
+                || self.params.server.host.clone(),
+                std::string::ToString::to_string,
+            )
     }
 
     /// TLS ALPN list: comma-separated `alpn` option, else empty (no ALPN).

@@ -19,10 +19,10 @@ use crate::{BoxStream, NativeTunnel};
 /// The destination of link `i`: the next link's server, or `target` for the
 /// last link. Pure function — unit-tested independently of the fold.
 fn next_target(links: &[NativeConnectParams], i: usize, target: &TargetAddr) -> TargetAddr {
-    links
-        .get(i + 1)
-        .map(|next| TargetAddr::new(next.server.host.as_str(), next.server.port))
-        .unwrap_or_else(|| target.clone())
+    links.get(i + 1).map_or_else(
+        || target.clone(),
+        |next| TargetAddr::new(next.server.host.as_str(), next.server.port),
+    )
 }
 
 /// Connect through a chain of proxies to the final `target`.
