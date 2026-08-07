@@ -342,7 +342,26 @@ Ring coverage verified: X25519 agreement, HKDF-SHA256, AES-128/256-GCM,
 ChaCha20-Poly1305, SHA-256/384/512 + HMAC, Ed25519 verify. The port needs no
 aws-lc-rs.
 
-### HelloProvisioner seam
+### rustls ClientHello limitation (hard constraint)
+
+Stock rustls 0.23 (our workspace pin) exposes **no ClientHello modification
+API**: no custom extension injection, no extension order/values control, no
+fingerprint emission. The `dangerous()` verifier hook affects certificate
+validation only. Consequences, adopted into the design:
+
+1. **Standard TLS cannot do fingerprint mimicry.** A profile with `fp`
+   set (e.g. `vless://…&fp=chrome`) on the `Standard` provider connects
+   undisguised (functional — most servers do not require a specific
+   fingerprint; only DPI/CDN inspection cares), and the `fp` parameter stays a
+   documented no-op until the engine milestone.
+2. **The `Custom` provider is the ONLY fingerprint-capable path** — for both
+   REALITY and fingerprinted standard TLS. Its engines therefore need
+   certificate validation + full cipher-suite coverage before they may serve
+   standard-TLS traffic (REALITY path needs neither, per §11).
+3. **No rustls fork in this project.** Forking rustls would diverge the
+   workspace-wide pin and add permanent maintenance; the hand-rolled engine
+   (tls-fingerprint refactor) already shares the REALITY path's machinery, so
+   it is the chosen vehicle.
 
 ```rust
 pub trait HelloProvisioner: Send + Sync {
