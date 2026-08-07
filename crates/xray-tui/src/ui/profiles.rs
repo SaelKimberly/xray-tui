@@ -484,7 +484,9 @@ fn build_display_rows(
             (None, None) => "-".to_string(),
             (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
         };
-        let config_type_str = center_pad(&config_type, 12);
+        // Column is 14 wide (config widened to fit `xhttp/reality`); the cell
+        // must center inside the same width or the value drifts left.
+        let config_type_str = center_pad(&config_type, 14);
 
         // Exit IP: the ACTIVE link's persisted real-ping IP wins (survives
         // reruns); endpoint_info is the live-enrich fallback. Country comes
