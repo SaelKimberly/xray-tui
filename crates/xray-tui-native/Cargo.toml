@@ -1,0 +1,38 @@
+[package]
+name = "xray-tui-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# source of truth for all protocol/transport/security configs (MIT, workspace)
+xray-tui-proto.workspace = true
+
+# async runtime
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
+futures-util.workspace = true
+
+# TLS (workspace standard: ring backend)
+rustls = { workspace = true, features = ["ring"] }
+tokio-rustls = "0.26"
+webpki-roots = "1"
+
+# errors / observability
+thiserror.workspace = true
+tracing.workspace = true
+
+# misc
+uuid.workspace = true
+md-5 = "0.10"
+
+[lints]
+workspace = true
+
+[features]
+native-e2e = []
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.13"
+tiny_http = "0.12"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
