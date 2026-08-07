@@ -1,5 +1,5 @@
-use crate::error::{NativeError, timeouts};
 use crate::BoxStream;
+use crate::error::{NativeError, timeouts};
 
 /// Dial the server's TCP socket directly (`base` is None) or pass through an
 /// existing tunnel (`base` is Some — a TCP "transport" over a tunnel is raw
@@ -15,7 +15,10 @@ pub async fn connect(
             let timeout = timeouts::TRANSPORT;
             let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(socket))
                 .await
-                .map_err(|_| NativeError::Timeout { step: "tcp dial", limit: timeout })?
+                .map_err(|_| NativeError::Timeout {
+                    step: "tcp dial",
+                    limit: timeout,
+                })?
                 .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
             Ok(Box::new(stream))
         }
@@ -27,8 +30,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
     use xray_tui_proto::proto_spec::ProtocolConfig;
+    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
     use crate::addr::{Host, TargetAddr};
     use crate::context::{LinkContext, NativeConnectParams};

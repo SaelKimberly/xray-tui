@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
-use xray_tui_proto::proto_spec::{ProtocolConfig, ProtoSpec, SecurityConfig, TlsConfig, TlsOpts};
+use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
 
 use crate::addr::Host;
 use crate::error::{NativeError, timeouts};
@@ -61,16 +61,17 @@ impl LinkContext {
             Host::Domain(domain) => {
                 let (host, port) = (domain.as_str(), self.params.server.port);
                 let timeout = timeouts::DIAL;
-                let mut addrs = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
-                    .await
-                    .map_err(|_| NativeError::Timeout {
-                        step: "dns lookup",
-                        limit: timeout,
-                    })?
-                    .map_err(|e| NativeError::Dial(format!("{host}: {e}")))?;
-                addrs.next().ok_or_else(|| {
-                    NativeError::Dial(format!("{host}: no addresses found"))
-                })
+                let mut addrs =
+                    tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+                        .await
+                        .map_err(|_| NativeError::Timeout {
+                            step: "dns lookup",
+                            limit: timeout,
+                        })?
+                        .map_err(|e| NativeError::Dial(format!("{host}: {e}")))?;
+                addrs
+                    .next()
+                    .ok_or_else(|| NativeError::Dial(format!("{host}: no addresses found")))
             }
         }
     }
@@ -113,9 +114,7 @@ impl LinkContext {
             Some(SecurityConfig {
                 tls: Some(TlsConfig::Reality(_)),
                 ..
-            }) => Err(NativeError::Reality(
-                "reality not implemented yet".into(),
-            )),
+            }) => Err(NativeError::Reality("reality not implemented yet".into())),
             _ => Ok(None),
         }
     }

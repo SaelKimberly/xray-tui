@@ -8,7 +8,7 @@
 
 use xray_tui_proto::proto_spec::ProtocolKind;
 
-use crate::addr::{encode_addr, TargetAddr};
+use crate::addr::{TargetAddr, encode_addr};
 use crate::error::NativeError;
 
 pub const VERSION: u8 = 0;

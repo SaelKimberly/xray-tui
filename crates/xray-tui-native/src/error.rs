@@ -18,10 +18,7 @@ pub enum NativeError {
     #[error("REALITY error: {0}")]
     Reality(String),
     #[error("protocol {kind} error: {detail}")]
-    Protocol {
-        kind: ProtocolKind,
-        detail: String,
-    },
+    Protocol { kind: ProtocolKind, detail: String },
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
     #[error("I/O error: {0}")]

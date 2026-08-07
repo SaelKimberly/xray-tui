@@ -9,22 +9,22 @@
 
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::NativeError;
-use crate::BoxStream;
 
 pub mod anytls;
+pub mod http;
 pub mod hysteria1;
 pub mod hysteria2;
-pub mod http;
 pub mod mixed;
 pub mod naive;
 pub mod redirect;
 pub mod shadowtls;
 pub mod socks;
 pub mod ss;
-pub mod ssr;
 pub mod ssh;
+pub mod ssr;
 pub mod tailscale;
 pub mod tor;
 pub mod tproxy;

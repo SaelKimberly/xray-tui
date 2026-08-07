@@ -44,8 +44,8 @@ pub async fn connect_chain(
 
 #[cfg(test)]
 mod tests {
-    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
     use xray_tui_proto::proto_spec::ProtocolConfig;
+    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
     use super::*;
     use crate::addr::Host;

@@ -77,7 +77,11 @@ mod tests {
 
     #[test]
     fn quic_family() {
-        for k in [ProtocolKind::Hysteria2, ProtocolKind::Hysteria, ProtocolKind::Tuic] {
+        for k in [
+            ProtocolKind::Hysteria2,
+            ProtocolKind::Hysteria,
+            ProtocolKind::Tuic,
+        ] {
             assert_eq!(connect_shape(k), ConnectShape::Quic, "{k:?}");
         }
     }

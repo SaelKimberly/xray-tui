@@ -70,10 +70,7 @@ mod tests {
             curves: vec![0x001d, 0x0017],
             point_formats: vec![0],
         };
-        assert_eq!(
-            f.canonical_string(),
-            "771,1301,1302,1303,0,1a,a0a,1d,17,0"
-        );
+        assert_eq!(f.canonical_string(), "771,1301,1302,1303,0,1a,a0a,1d,17,0");
     }
 
     #[test]
@@ -86,10 +83,7 @@ mod tests {
             curves: vec![0x001d],
             point_formats: vec![0],
         };
-        assert_eq!(
-            f.hash(),
-            format!("{:x}", Md5::digest(b"771,1301,,1d,0"))
-        );
+        assert_eq!(f.hash(), format!("{:x}", Md5::digest(b"771,1301,,1d,0")));
     }
 
     #[test]

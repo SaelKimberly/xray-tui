@@ -6,18 +6,15 @@
 //! None`) and "upgrade an existing tunnel in place" (`base: Some`, e.g. a
 //! WebSocket handshake on a later chain hop).
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::NativeError;
-use crate::BoxStream;
 
 pub mod tcp;
 
 /// Run the transport step. `base` is the stream from the previous chain hop
 /// (or `None` for the first hop, which dials the server directly).
-pub async fn connect(
-    ctx: &LinkContext,
-    base: Option<BoxStream>,
-) -> Result<BoxStream, NativeError> {
+pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
         None | Some("tcp") => tcp::connect(ctx, base).await,
         Some(t) => Err(NativeError::NotImplemented {

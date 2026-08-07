@@ -10,8 +10,8 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 pub use xray_tui_proto::proto_spec::CoreType;
-use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use xray_tui_proto::proto_spec::ProtocolConfig;
+use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
 pub struct EchoServer {
     pub addr: SocketAddr,
@@ -38,7 +38,10 @@ pub fn spawn_echo() -> EchoServer {
             let _ = request.respond(response);
         }
     });
-    EchoServer { addr, handle: Some(handle) }
+    EchoServer {
+        addr,
+        handle: Some(handle),
+    }
 }
 
 /// Return a port that was free at bind time.
@@ -123,7 +126,9 @@ pub fn generate_certs() -> Certs {
     let server_params =
         CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
     let server_key = KeyPair::generate().unwrap();
-    let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
 
     Certs {
         cert_pem: server_cert.pem(),

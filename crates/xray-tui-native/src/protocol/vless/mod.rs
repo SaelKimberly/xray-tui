@@ -4,9 +4,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use xray_tui_proto::proto_spec::VlessConfig;
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::BoxStream;
 
 pub mod header;
 

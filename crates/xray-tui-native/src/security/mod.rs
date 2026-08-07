@@ -9,9 +9,9 @@ pub mod tls_provider;
 
 use xray_tui_proto::proto_spec::TlsConfig;
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::NativeError;
-use crate::BoxStream;
 
 /// Wrap the transport stream according to the profile's security config.
 pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
@@ -36,8 +36,8 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls;
-    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
     use xray_tui_proto::proto_spec::ProtocolConfig;
+    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
     use super::*;
     use crate::addr::{Host, TargetAddr};
@@ -85,10 +85,12 @@ mod tests {
         let ca_key = KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
-        let server_params = CertificateParams::new(vec![sni.to_string(), "127.0.0.1".to_string()])
-            .unwrap();
+        let server_params =
+            CertificateParams::new(vec![sni.to_string(), "127.0.0.1".to_string()]).unwrap();
         let server_key = KeyPair::generate().unwrap();
-        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
 
         (
             server_cert.pem(),
@@ -142,10 +144,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config(
-                &cert_pem,
-                &key_pem,
-            )));
+            let acceptor =
+                tokio_rustls::TlsAcceptor::from(Arc::new(server_config(&cert_pem, &key_pem)));
             let mut tls = acceptor.accept(sock).await.unwrap();
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).await.unwrap();

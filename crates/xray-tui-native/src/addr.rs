@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use xray_tui_proto::proto_spec::HostKind;
+use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
 /// Remote host: parsed IP or DNS name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,10 +103,7 @@ pub fn decode_addr(bytes: &[u8]) -> Option<(TargetAddr, &[u8])> {
                 return None;
             }
             let ip = Ipv4Addr::new(bytes[3], bytes[4], bytes[5], bytes[6]);
-            Some((
-                TargetAddr::new(Host::Ip(IpAddr::V4(ip)), port),
-                &bytes[7..],
-            ))
+            Some((TargetAddr::new(Host::Ip(IpAddr::V4(ip)), port), &bytes[7..]))
         }
         ADDR_TYPE_DOMAIN => {
             let len = usize::from(bytes[3]);

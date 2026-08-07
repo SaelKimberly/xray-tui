@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use crate::error::NativeError;
 use crate::BoxStream;
+use crate::error::NativeError;
 
 /// Browser fingerprint id, mirrored from the URL `fp` parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

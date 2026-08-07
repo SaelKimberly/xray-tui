@@ -25,8 +25,7 @@ use crate::error::NativeError;
 pub trait HelloProvisioner: Send + Sync {
     /// Returns the bare ClientHello plus the SessionId byte range.
     /// The returned range is computed by the builder — never hardcoded.
-    fn provision(&self, params: &HelloProvisionParams)
-        -> Result<ProvisionedHello, NativeError>;
+    fn provision(&self, params: &HelloProvisionParams) -> Result<ProvisionedHello, NativeError>;
 }
 
 /// Inputs the reality connector hands to a provisioner.

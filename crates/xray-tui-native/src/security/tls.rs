@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use tokio_rustls::rustls;
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::BoxStream;
 
 /// Test/e2e override: a client config trusting exactly one CA (the harness
 /// CA). Production builds use webpki-roots and carry no test state.
