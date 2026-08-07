@@ -20,8 +20,8 @@ use crate::try_send_or_warn;
 use crate::types::CoreEvent;
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
-pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
-    if state.testing_profiles.contains(&protocol_id) {
+pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
+    if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         state.log_trace(
             "warn",
             "tui::ops::ping",
@@ -29,16 +29,19 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
         );
         return;
     }
-    // Find the profile and extract address:port. Lookup is by REAL protocol
-    // id so sub-row pings target the exact protocol (not the endpoint).
+    // Find the profile and extract address:port. Lookup is by the
+    // (endpoint, protocol) pair, never by protocol alone: a `Protocol` row is
+    // shared across endpoints (identity dedup excludes host/port), so
+    // first-owner resolution would probe and update the wrong server when two
+    // endpoints share the same config.
     let row = if let Some(r) = state
         .endpoints
         .iter()
-        .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id))
+        .find(|r| r.endpoint.id.get() == endpoint_id)
     {
         r
     } else {
-        state.log_trace("error", "tui::ops::ping", "Profile not found for TCP ping");
+        state.log_trace("error", "tui::ops::ping", "Endpoint not found for TCP ping");
         return;
     };
     let Some(link) = row
@@ -80,8 +83,10 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
         return;
     };
 
-    state.testing_details.insert(protocol_id, TestType::TcpPing);
-    state.testing_profiles.insert(protocol_id);
+    state
+        .testing_details
+        .insert((endpoint_id, protocol_id), TestType::TcpPing);
+    state.testing_profiles.insert((endpoint_id, protocol_id));
     // The fast-ping adapters dispatch on the protocol kind.
     let config_type = proto.proto_kind.to_i32();
     let timeout_dur = *state.config.speed_test.tcp_timeout_secs;
@@ -96,6 +101,7 @@ pub fn start_tcp_ping(state: &mut AppState, protocol_id: i64) {
         try_send_or_warn(
             &tx,
             CoreEvent::SpeedTestResult {
+                endpoint_id,
                 protocol_id,
                 test_type: TestType::TcpPing,
                 latency_ms,
@@ -140,29 +146,19 @@ fn get_or_create_pool(state: &mut AppState) -> Arc<CorePool> {
 /// same core: sing-box via SIGHUP reload, xray-core via stop+restart. The
 /// `Protocol` row is re-loaded WITH its deferred `config` included inside the
 /// spawned task — the pool's `ConfigBuilder::build` refuses unloaded configs.
-pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
-    if state.testing_profiles.contains(&protocol_id) {
+pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
+    if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         return;
     }
 
-    // Find profile row by REAL protocol id (sub-row pings target the exact
-    // protocol; different credentials → different exits).
+    // Resolve by the (endpoint, protocol) pair — see `start_tcp_ping` for why
+    // protocol-only lookup is wrong for shared `Protocol` rows.
     let endpoint;
     let link;
     let protocol_id_typed;
-    if let Some(r) = state
-        .endpoints
-        .iter()
-        .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id))
+    if let Some(r) = state.endpoints.iter().find(|r| r.endpoint.id.get() == endpoint_id)
+        && let Some(l) = r.links.iter().find(|l| l.protocol_id.get() == protocol_id)
     {
-        let Some(l) = r.links.iter().find(|l| l.protocol_id.get() == protocol_id) else {
-            state.log_trace(
-                "error",
-                "tui::ops::ping",
-                "Protocol not found for real ping",
-            );
-            return;
-        };
         endpoint = r.endpoint.clone();
         link = l.clone();
         protocol_id_typed = l.protocol_id;
@@ -177,8 +173,8 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
     };
     state
         .testing_details
-        .insert(protocol_id, TestType::RealPing);
-    state.testing_profiles.insert(protocol_id);
+        .insert((endpoint_id, protocol_id), TestType::RealPing);
+    state.testing_profiles.insert((endpoint_id, protocol_id));
 
     // Lazily create the core pool on first use
     let pool = get_or_create_pool(state);
@@ -191,6 +187,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
 
     tokio::spawn(async move {
         let _ = tx.try_send(CoreEvent::TestTypeUpdate {
+            endpoint_id,
             protocol_id,
             test_type: TestType::RealPing,
         });
@@ -203,6 +200,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
                 try_send_or_warn(
                     &tx,
                     CoreEvent::SpeedTestResult {
+                        endpoint_id,
                         protocol_id,
                         test_type: TestType::RealPing,
                         latency_ms: None,
@@ -218,6 +216,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
                 try_send_or_warn(
                     &tx,
                     CoreEvent::SpeedTestResult {
+                        endpoint_id,
                         protocol_id,
                         test_type: TestType::RealPing,
                         latency_ms: None,
@@ -248,6 +247,7 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
         try_send_or_warn(
             &tx,
             CoreEvent::SpeedTestResult {
+                endpoint_id,
                 protocol_id,
                 test_type: TestType::RealPing,
                 latency_ms: result.latency_ms,
@@ -261,8 +261,8 @@ pub fn start_real_ping(state: &mut AppState, protocol_id: i64) {
 }
 
 /// Start speed test (download through proxy) on the given profile.
-pub fn start_speed_test(state: &mut AppState, protocol_id: i64) {
-    if state.testing_profiles.contains(&protocol_id) {
+pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
+    if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         return;
     }
     if state.connected_core.is_none() {
@@ -279,8 +279,8 @@ pub fn start_speed_test(state: &mut AppState, protocol_id: i64) {
     };
     state
         .testing_details
-        .insert(protocol_id, TestType::SpeedTest);
-    state.testing_profiles.insert(protocol_id);
+        .insert((endpoint_id, protocol_id), TestType::SpeedTest);
+    state.testing_profiles.insert((endpoint_id, protocol_id));
     let proxy_addr = state.config.inbound.listen.clone();
     let proxy_port = state.config.inbound.socks_port;
     let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
@@ -303,6 +303,7 @@ pub fn start_speed_test(state: &mut AppState, protocol_id: i64) {
         try_send_or_warn(
             &tx,
             CoreEvent::SpeedTestResult {
+                endpoint_id,
                 protocol_id,
                 test_type: TestType::SpeedTest,
                 latency_ms: None,
@@ -316,8 +317,8 @@ pub fn start_speed_test(state: &mut AppState, protocol_id: i64) {
 }
 
 /// Start UDP test through the connected proxy.
-pub fn start_udp_test(state: &mut AppState, protocol_id: i64) {
-    if state.testing_profiles.contains(&protocol_id) {
+pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
+    if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         return;
     }
     if state.connected_core.is_none() {
@@ -332,8 +333,10 @@ pub fn start_udp_test(state: &mut AppState, protocol_id: i64) {
         Some(tx) => tx.clone(),
         None => return,
     };
-    state.testing_details.insert(protocol_id, TestType::UdpTest);
-    state.testing_profiles.insert(protocol_id);
+    state
+        .testing_details
+        .insert((endpoint_id, protocol_id), TestType::UdpTest);
+    state.testing_profiles.insert((endpoint_id, protocol_id));
     let proxy_addr = state.config.inbound.listen.clone();
     let proxy_port = state.config.inbound.socks_port;
 
@@ -351,6 +354,7 @@ pub fn start_udp_test(state: &mut AppState, protocol_id: i64) {
         try_send_or_warn(
             &tx,
             CoreEvent::SpeedTestResult {
+                endpoint_id,
                 protocol_id,
                 test_type: TestType::UdpTest,
                 latency_ms,
@@ -1068,13 +1072,16 @@ impl BatchShared {
             } => (*latency_ms, ip_info.clone(), None),
             ProbeOutcome::Failed(e) => (None, None, Some(e.clone())),
         };
+        let endpoint_id = link.endpoint_id.get();
         let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
+            endpoint_id,
             protocol_id: link.protocol_id.get(),
             test_type,
         });
         try_send_or_warn(
             &self.tx,
             CoreEvent::SpeedTestResult {
+                endpoint_id,
                 protocol_id: link.protocol_id.get(),
                 test_type,
                 latency_ms,

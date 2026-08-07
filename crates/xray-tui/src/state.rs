@@ -95,9 +95,15 @@ pub struct AppState {
     pub confirmation: Option<ConfirmAction>,
     pub updating_groups: HashSet<String>,
     /// Profile IDs currently being tested
-    pub testing_profiles: HashSet<i64>,
-    /// Which test type is currently running per profile (for display).
-    pub testing_details: HashMap<i64, TestType>,
+    /// Test sessions in flight, keyed by `(endpoint_id, protocol_id)` — the
+    /// unique `ProfileStats` pair. Protocol-only keys collide across
+    /// endpoints that share a `Protocol` row (identity dedup excludes
+    /// host/port), which is exactly how results used to land on the wrong
+    /// endpoint's row.
+    pub testing_profiles: HashSet<(i64, i64)>,
+    /// Which test type is currently running per link (for display), keyed by
+    /// `(endpoint_id, protocol_id)` like `testing_profiles`.
+    pub testing_details: HashMap<(i64, i64), TestType>,
     /// Cached update status for both backends.
     pub update_status: HashMap<CoreType, BackendUpdateStatus>,
     pub actions_compact: bool,
@@ -724,17 +730,17 @@ impl AppState {
     pub fn disconnect(&mut self) {
         connect::disconnect(self);
     }
-    pub fn start_tcp_ping(&mut self, protocol_id: i64) {
-        ping::start_tcp_ping(self, protocol_id);
+    pub fn start_tcp_ping(&mut self, endpoint_id: i64, protocol_id: i64) {
+        ping::start_tcp_ping(self, endpoint_id, protocol_id);
     }
-    pub fn start_real_ping(&mut self, protocol_id: i64) {
-        ping::start_real_ping(self, protocol_id);
+    pub fn start_real_ping(&mut self, endpoint_id: i64, protocol_id: i64) {
+        ping::start_real_ping(self, endpoint_id, protocol_id);
     }
-    pub fn start_speed_test(&mut self, protocol_id: i64) {
-        ping::start_speed_test(self, protocol_id);
+    pub fn start_speed_test(&mut self, endpoint_id: i64, protocol_id: i64) {
+        ping::start_speed_test(self, endpoint_id, protocol_id);
     }
-    pub fn start_udp_test(&mut self, protocol_id: i64) {
-        ping::start_udp_test(self, protocol_id);
+    pub fn start_udp_test(&mut self, endpoint_id: i64, protocol_id: i64) {
+        ping::start_udp_test(self, endpoint_id, protocol_id);
     }
     /// Batch fast-ping every link of every visible endpoint (T19 rebuild on
     /// the `TaskScheduler`).

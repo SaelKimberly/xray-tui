@@ -408,12 +408,18 @@ fn build_display_rows(
         } else {
             let active_id = row.active_link().map(|l| l.protocol_id.get());
             let glyph = active_id
-                .and_then(|id| state.testing_details.get(&id).copied().map(test_glyph))
+                .and_then(|id| {
+                    state
+                        .testing_details
+                        .get(&(row.endpoint.id.get(), id))
+                        .copied()
+                        .map(test_glyph)
+                })
                 .or_else(|| {
                     row.links.iter().find_map(|l| {
                         state
                             .testing_details
-                            .get(&l.protocol_id.get())
+                            .get(&(row.endpoint.id.get(), l.protocol_id.get()))
                             .copied()
                             .map(test_glyph)
                     })

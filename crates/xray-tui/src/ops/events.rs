@@ -228,13 +228,17 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.reload_groups().await;
             }
             CoreEvent::TestTypeUpdate {
+                endpoint_id,
                 protocol_id,
                 test_type,
             } => {
-                state.testing_details.insert(protocol_id, test_type);
-                state.testing_profiles.insert(protocol_id);
+                state
+                    .testing_details
+                    .insert((endpoint_id, protocol_id), test_type);
+                state.testing_profiles.insert((endpoint_id, protocol_id));
             }
             CoreEvent::SpeedTestResult {
+                endpoint_id,
                 protocol_id,
                 test_type,
                 latency_ms,
@@ -242,18 +246,24 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 ip_info,
                 error,
             } => {
-                // Guard against duplicate events for the same protocol_id
-                if !state.testing_profiles.remove(&protocol_id) {
+                // Guard against duplicate events for the same (endpoint,
+                // protocol) pair — the unique ProfileStats row. Protocol-only
+                // keys dropped the second result when two endpoints shared a
+                // `Protocol` row (identity dedup excludes host/port), leaving
+                // the probed endpoint's link empty.
+                if !state.testing_profiles.remove(&(endpoint_id, protocol_id)) {
                     // Already processed — skip
                     continue;
                 }
-                state.testing_details.remove(&protocol_id);
+                state.testing_details.remove(&(endpoint_id, protocol_id));
 
                 // Capture endpoint context before the mutable row borrow below.
+                // Resolution is by the event's endpoint id — the row that
+                // actually ran the probe — never by first protocol owner.
                 let (ep_id, ep_host_is_dns) = state
                     .endpoints
                     .iter()
-                    .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id))
+                    .find(|r| r.endpoint.id.get() == endpoint_id)
                     .map_or((0, false), |r| {
                         use xray_tui_db::models::HostType;
                         (r.endpoint.id.get(), r.endpoint.host_type == HostType::Dns)
@@ -264,7 +274,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     let row = state
                         .endpoints
                         .iter_mut()
-                        .find(|r| r.links.iter().any(|l| l.protocol_id.get() == protocol_id));
+                        .find(|r| r.endpoint.id.get() == endpoint_id);
                     match row {
                         Some(row) => {
                             if let Some(link) = row
@@ -421,7 +431,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // endpoint; DNS-host endpoints get their inbound resolved too
                 // (deferred-resolution trigger: real networking occurred).
                 if ip_info_clone.is_some() {
-                    crate::ops::enrich::spawn_outbound_enrich(state, protocol_id, ip_info_clone);
+                    crate::ops::enrich::spawn_outbound_enrich(state, ep_id, ip_info_clone);
                 }
                 if ep_host_is_dns {
                     crate::ops::enrich::spawn_dns_resolve(state, ep_id, false);
@@ -1268,6 +1278,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_protocol_result_writes_to_probing_endpoint_only() {
+        // Two endpoints share the same `Protocol` row (identity dedup
+        // excludes host/port): a ping on endpoint 2's link used to land on
+        // endpoint 1's row — the handler resolved by protocol id with
+        // `.find()` (first owner) and the per-protocol dedupe guard dropped
+        // the second endpoint's result as a "duplicate". Both must work per
+        // (endpoint, protocol) pair.
+        let (mut state, tx) = event_state().await;
+        let mut ep1 = fake_row(1, "1.1.1.1", 2); // p100, p101
+        let mut ep2 = fake_row(2, "2.2.2.2", 2); // p200, p201 — rewrite to share
+        // Two endpoints pointing at the SAME `Protocol` rows: the identity
+        // dedup collision (protocol config equal, only host/port differs).
+        for (l, pid) in ep2.links.iter_mut().zip([100_i64, 101]) {
+            l.protocol_id = xray_tui_db::models::ProtocolId::new(pid);
+        }
+        ep2.protocols = ep1.protocols.clone();
+        ep1.endpoint.host_type = HostType::Ipv4;
+        ep2.endpoint.host_type = HostType::Ipv4;
+        state.endpoints = vec![ep1, ep2];
+        state.selected_index = 1;
+
+        // Ping ep2's p101 link.
+        state.testing_profiles.insert((2, 101));
+        tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 2,
+            protocol_id: 101,
+            test_type: TestType::TcpPing,
+            latency_ms: Some(45),
+            speed_bps: None,
+            ip_info: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+
+        // Result lands on ep2's p101 row; ep1's p101 row untouched. (The live
+        // re-sort moves the now-measured p101 to the top of ep2's sub-table,
+        // so look up by protocol id, not index.)
+        let ep2_p101 = state.endpoints[1]
+            .links
+            .iter()
+            .find(|l| l.protocol_id.get() == 101)
+            .expect("ep2 p101 link");
+        assert_eq!(
+            ep2_p101.latency,
+            Some(Latency::Fast { delay: 45 }),
+            "probing endpoint's own row must carry the result"
+        );
+        assert_eq!(
+            state.endpoints[0]
+                .links
+                .iter()
+                .find(|l| l.protocol_id.get() == 101)
+                .unwrap()
+                .latency,
+            None,
+            "sibling endpoint must stay untouched"
+        );
+
+        // The same protocol on ep1 is a DIFFERENT link: its own result must
+        // NOT be dropped by a per-protocol dedupe guard, and must write ep1's
+        // row.
+        state.testing_profiles.insert((1, 101));
+        tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 1,
+            protocol_id: 101,
+            test_type: TestType::TcpPing,
+            latency_ms: Some(60),
+            speed_bps: None,
+            ip_info: None,
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert_eq!(
+            state.endpoints[0]
+                .links
+                .iter()
+                .find(|l| l.protocol_id.get() == 101)
+                .unwrap()
+                .latency,
+            Some(Latency::Fast { delay: 60 }),
+            "second endpoint's result processed, not dropped"
+        );
+        // ep2's earlier result survives the second event (no cross-write).
+        assert_eq!(
+            state.endpoints[1]
+                .links
+                .iter()
+                .find(|l| l.protocol_id.get() == 101)
+                .unwrap()
+                .latency,
+            Some(Latency::Fast { delay: 45 })
+        );
+    }
+
+    #[tokio::test]
     async fn real_ping_success_promotes_lowest_latency_link() {
         // User scenario: first protocol fails real ping, second succeeds.
         // The single-row view must follow the successful (best) protocol, not
@@ -1285,9 +1394,10 @@ mod tests {
         row.links[1].last_seen_at = crate::ops::profiles::test_support::ts(100);
         state.endpoints = vec![row];
         state.selected_index = 0;
-        state.testing_profiles.insert(101);
+        state.testing_profiles.insert((1, 101));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 1,
             protocol_id: 101,
             test_type: TestType::RealPing,
             latency_ms: Some(40),
@@ -1326,9 +1436,10 @@ mod tests {
         state.filter_cache_valid.set(false);
         // The SpeedTestResult dedupe guard drops events for protocols not in
         // `testing_profiles`; production seeds it when a ping starts.
-        state.testing_profiles.insert(8);
+        state.testing_profiles.insert((100, 8));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::RealPing,
             latency_ms: Some(120),
@@ -1365,9 +1476,10 @@ mod tests {
         state.selected_index = 0;
         state.selected_sub = None;
         state.filter_cache_valid.set(false);
-        state.testing_profiles.insert(7);
+        state.testing_profiles.insert((100, 7));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 100,
             protocol_id: 7,
             test_type: TestType::RealPing,
             latency_ms: None,
@@ -1401,9 +1513,10 @@ mod tests {
         state.selected_index = 0;
         state.selected_sub = None;
         state.filter_cache_valid.set(false);
-        state.testing_profiles.insert(8);
+        state.testing_profiles.insert((100, 8));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::TcpPing,
             latency_ms: Some(15),
@@ -1436,9 +1549,10 @@ mod tests {
         state.selected_index = 0;
         state.selected_sub = None;
         state.filter_cache_valid.set(false);
-        state.testing_profiles.insert(8);
+        state.testing_profiles.insert((100, 8));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::UdpTest,
             latency_ms: Some(50),
@@ -1475,9 +1589,10 @@ mod tests {
         state.selected_index = 0;
         state.selected_sub = None;
         state.filter_cache_valid.set(false);
-        state.testing_profiles.insert(8);
+        state.testing_profiles.insert((100, 8));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::RealPing,
             latency_ms: Some(10),
@@ -1508,9 +1623,10 @@ mod tests {
         state.selected_index = 0;
         state.selected_sub = None;
         state.filter_cache_valid.set(false);
-        state.testing_profiles.insert(8);
+        state.testing_profiles.insert((100, 8));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 100,
             protocol_id: 8,
             test_type: TestType::RealPing,
             latency_ms: None,
@@ -1627,9 +1743,10 @@ mod tests {
         let (mut state, tx) = event_state().await;
         state.batch_progress = Some(Arc::new((AtomicU16::new(2), AtomicU16::new(0))));
         state.speed_test_stop.store(true, Ordering::Relaxed);
-        state.testing_profiles.insert(8);
+        state.testing_profiles.insert((0, 8));
 
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 0,
             protocol_id: 8,
             test_type: TestType::TcpPing,
             latency_ms: Some(1),
@@ -1647,8 +1764,9 @@ mod tests {
 
         // Batch ends (progress cleared) → the next drained result resets it.
         state.batch_progress = None;
-        state.testing_profiles.insert(9);
+        state.testing_profiles.insert((0, 9));
         tx.send(CoreEvent::SpeedTestResult {
+            endpoint_id: 0,
             protocol_id: 9,
             test_type: TestType::RealPing,
             latency_ms: Some(20),

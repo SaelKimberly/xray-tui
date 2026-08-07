@@ -311,8 +311,13 @@ pub enum CoreEvent {
         error: Option<String>,
         summary: ValidationSummary,
     },
-    /// Result from a speed test operation
+    /// Result from a speed test operation. `endpoint_id` + `protocol_id`
+    /// together address exactly one `ProfileStats` row: protocol rows are
+    /// shared across endpoints (identity dedup excludes host/port), so a
+    /// protocol-only key would write the result onto the first endpoint that
+    /// happens to own the protocol.
     SpeedTestResult {
+        endpoint_id: i64,
         protocol_id: i64,
         test_type: TestType,
         latency_ms: Option<u64>,
@@ -342,8 +347,11 @@ pub enum CoreEvent {
         error: Option<String>,
     },
     /// Update the displayed test type for a profile without triggering cleanup.
-    /// Used by `batch_then_real_ping` to switch from TcpPing→RealPing emoji
+    /// Used by `batch_then_real_ping` to switch from TcpPing→RealPing emoji.
+    /// Endpoint-scoped for the same reason as `SpeedTestResult`: the protocol
+    /// row is shared, the (endpoint, protocol) pair is the unique link.
     TestTypeUpdate {
+        endpoint_id: i64,
         protocol_id: i64,
         test_type: TestType,
     },

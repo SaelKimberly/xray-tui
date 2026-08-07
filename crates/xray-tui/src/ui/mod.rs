@@ -357,8 +357,8 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 // Collapsed endpoint rows with >1 protocols run an
                 // endpoint-scoped batch; sub-rows ping the exact protocol.
                 let on_sub = state.is_on_sub_row();
+                let ep_id = state.selected_profile_id();
                 let (proto_id, multi) = {
-                    let ep_id = state.selected_profile_id();
                     let row = ep_id
                         .and_then(|id| state.endpoints.iter().find(|r| r.endpoint.id.get() == id));
                     let multi = row.is_some_and(|r| r.protocols.len() > 1);
@@ -373,7 +373,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     0 => {
                         if on_sub || !multi {
                             if let Some(id) = proto_id {
-                                state.start_tcp_ping(id);
+                                state.start_tcp_ping(ep_id.unwrap_or_default(), id);
                             }
                         } else {
                             state.start_endpoint_batch_ping();
@@ -382,7 +382,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     1 => {
                         if on_sub || !multi {
                             if let Some(id) = proto_id {
-                                state.start_real_ping(id);
+                                state.start_real_ping(ep_id.unwrap_or_default(), id);
                             }
                         } else {
                             state.start_endpoint_batch_real_ping();
@@ -390,12 +390,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     }
                     2 => {
                         if let Some(id) = proto_id {
-                            state.start_speed_test(id);
+                            state.start_speed_test(ep_id.unwrap_or_default(), id);
                         }
                     }
                     3 => {
                         if let Some(id) = proto_id {
-                            state.start_udp_test(id);
+                            state.start_udp_test(ep_id.unwrap_or_default(), id);
                         }
                     }
                     5 => {

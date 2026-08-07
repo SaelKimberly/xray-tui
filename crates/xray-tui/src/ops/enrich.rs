@@ -441,25 +441,23 @@ pub fn spawn_outbound_countries(state: &mut AppState) {
 /// owns `protocol_id`. The IP is parsed from real-ping `ip_info`
 /// (`"{ip} | {country}"`); the country hint string is replaced by the mmdb ISO
 /// code. Sends a full copy of the entry with outbound fields set.
-pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Option<String>) {
+pub fn spawn_outbound_enrich(state: &mut AppState, endpoint_id: i64, ip_info: Option<String>) {
     let Some(ip_info) = ip_info else {
         return;
     };
     let Some((outbound_ip, _hint)) = parse_ip_info(&ip_info) else {
         return;
     };
-    let Some(endpoint_id) = state
+    // The caller knows the endpoint that ran the probe (the SpeedTestResult
+    // event carries it). Never resolve by protocol: shared `Protocol` rows
+    // would point the exit IP at the first owner's endpoint.
+    if !state
         .endpoints
         .iter()
-        .find(|r| {
-            r.links
-                .iter()
-                .any(|l| l.protocol_id == xray_tui_db::models::ProtocolId::new(protocol_id))
-        })
-        .map(|r| r.endpoint.id.get())
-    else {
+        .any(|r| r.endpoint.id.get() == endpoint_id)
+    {
         return;
-    };
+    }
 
     let geo = state.geo_ip.clone();
     let mut info = state
