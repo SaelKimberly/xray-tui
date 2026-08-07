@@ -22,10 +22,19 @@
 //! ([`ProtocolConfig`], [`EndpointEssentials`]). No config model is defined
 //! here.
 
+/// Byte-stream capability: readable, writable, `Unpin`, `Send` — the seam
+/// between layers.
+pub trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+/// The boxed byte-stream seam between layers.
+pub type BoxStream = Box<dyn Stream>;
+
 pub mod addr;
 pub mod context;
 pub mod error;
 pub mod shape;
+pub mod transport;
 
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
