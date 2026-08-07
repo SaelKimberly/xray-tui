@@ -342,6 +342,26 @@ Ring coverage verified: X25519 agreement, HKDF-SHA256, AES-128/256-GCM,
 ChaCha20-Poly1305, SHA-256/384/512 + HMAC, Ed25519 verify. The port needs no
 aws-lc-rs.
 
+### Driving requirement: DPI/CDN bypass via fingerprint mimicry
+
+Real-world proxy servers sit behind CDN/DPI (Cloudflare and friends) that
+fingerprint ClientHellos and throttle or block non-browser shapes. A stock
+rustls hello is detectable, so the native core is only useful against real
+servers when its TLS layer can mimic a browser fingerprint. **Fingerprint
+mimicry is a core requirement of the crate, not an optional enhancement.**
+Consequences:
+
+- The `Custom` (fingerprint-capable) provider is the primary TLS path;
+  `Standard` without mimicry is a temporary fallback for local/trusted paths
+  (tests, loops) only, and is always the last resort when no engine is
+  installed.
+- The fingerprint engine must serve **both** standard TLS (with certificate
+  validation) and REALITY (authKey auth, no PKI). That makes cert validation
+  + full suite coverage mandatory engine requirements, per the limitation
+  section below.
+- DPI bypass is verified empirically: the engine's acceptance is the tier-2
+  grader pass (§12), not just byte-shape conformance.
+
 ### rustls ClientHello limitation (hard constraint)
 
 Stock rustls 0.23 (our workspace pin) exposes **no ClientHello modification
@@ -504,13 +524,16 @@ wrapped in `tokio::time::timeout`; timeouts map to `NativeError::Timeout`.
 - M0 (this doc): design approved, spec committed.
 - M1 (this session): skeleton + ConnectShape + addr/error + VLESS real +
   unit vectors + e2e harness + xray/sing-box e2e + chain unit tests.
-- M2: crypto codecs (aead/kdf/salamander), VMess/SS bodies, legacy stubs.
-- M3: REALITY ring port + `FixedChrome133` provisioner + reality e2e against
-  core reality inbounds.
-- M4: fingerprint engine (tls-fingerprint refactor: ring, provisioner
-  integration, tier-2 grader).
-- M5: chaining e2e, TUI wiring (`RealPingManager`/`CorePool` swap, instant
-  availability checks), SSH/WireGuard connect paths.
+- M2: **fingerprint engine** (DPI/CDN priority): tls-fingerprint refactor —
+  ring migration, certificate validation, full suite coverage, integration as
+  the `Custom` TlsConnector for standard TLS; tier-2 grader acceptance
+  (§12/§10 driving requirement). First-class deliverable, not deferrable.
+- M3: REALITY ring port + engine-backed provisioner (`FixedChrome133` first)
+  + reality e2e against core reality inbounds.
+- M4: crypto codecs (aead/kdf/salamander), VMess/SS bodies, legacy stubs.
+- M5: chaining e2e (needs real SS client from M4), TUI wiring
+  (`RealPingManager`/`CorePool` swap, instant availability checks),
+  SSH/WireGuard connect paths.
 
 ## 17. Risks
 
