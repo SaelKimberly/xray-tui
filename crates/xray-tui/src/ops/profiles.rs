@@ -105,6 +105,8 @@ pub async fn reload_profiles(state: &mut AppState) {
     // Enrich new endpoints in the background (IP hosts + persisted DNS cache;
     // no network for fresh entries).
     crate::ops::enrich::spawn_enrich_ip_hosts(state);
+    // mmdb countries for persisted outbound (exit) IPs — survives reruns.
+    crate::ops::enrich::spawn_outbound_countries(state);
 }
 
 /// Clamp a selection index into `[0, len)`, returning 0 for an empty list.

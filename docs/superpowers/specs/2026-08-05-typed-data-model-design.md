@@ -387,6 +387,16 @@ replaced by per-pair tasks:
   fast precedence), `[name]` when the endpoint is DNS-unresolved
   (`resolved_as` empty). A failed sibling must not paint the row red when the
   best protocol succeeded; the expanded panel still shows per-link markers.
+  A label shows only when the active link has NO measured delay — a link
+  carrying both a successful measurement and a later failure marker still
+  shows its delay. The preferred link is the best MEASURED one
+  (`EndpointRow::select_best_measured_link`: real-ok lowest delay, else
+  fast-ok lowest; error markers don't disqualify a measurement), re-selected
+  after every fast/real result and at load — the sub-table keeps full
+  test-priority tiers (fresh failures dominate) while the single-row cell
+  reflects the measured state. Outbound IP/country follow the active link's
+  persisted `Latency::Real.ip`; country is an mmdb cache per exit IP, seeded
+  at load + on ping, so it survives reruns.
   Tier/sort logic reads
   persisted rows (`latency`, `error.kind`, `resolved_as`) instead of
   session-only round sets. Note: the tier fn checks the endpoint-level

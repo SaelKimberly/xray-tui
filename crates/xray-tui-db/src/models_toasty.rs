@@ -433,6 +433,36 @@ impl EndpointRow {
             .sort_by_key(|l| Self::link_test_key(l, dns_unresolved));
     }
 
+    /// Set `selected_protocol` (the single-row display preference) to the
+    /// endpoint's best MEASURED link: a real success with the lowest delay,
+    /// else a fast success with the lowest delay. Error markers do NOT
+    /// disqualify a measured link — a link that has both a successful
+    /// measurement and a later failure marker still carries the result the
+    /// row should show (decision: display preference follows measurements;
+    /// the sub-table order keeps full test-priority tiers, where fresh
+    /// failures dominate). Untested links rank last; when nothing is
+    /// measured the current selection is kept. A pinned manual override is
+    /// unaffected — `active_link()` checks it first.
+    pub fn select_best_measured_link(&mut self) {
+        let Some((best, _)) = self
+            .links
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let (rank, delay) = match l.latency {
+                    Some(Latency::Real { delay, .. }) => (0u8, delay),
+                    Some(Latency::Fast { delay }) => (1u8, delay),
+                    None => return None,
+                };
+                Some((i, (rank, delay)))
+            })
+            .min_by_key(|&(_, (rank, delay))| (rank, delay))
+        else {
+            return;
+        };
+        self.selected_protocol = best;
+    }
+
     /// The endpoint's representative sort key = its best (minimum) link key —
     /// used by the main-table Test column sort. `None` when the endpoint has
     /// no links.
@@ -528,6 +558,51 @@ mod tests {
             kind,
             text: "boom".to_string(),
         }
+    }
+
+    #[test]
+    fn select_best_measured_link_prefers_real_ok_lowest_delay() {
+        // fast-ok 44 + error marker, real-ok 50, untested — the measured
+        // real-ok wins despite the error-carrying fast sibling (sub-table
+        // tiers still rank the error low; the display preference follows
+        // measurements).
+        let mut r = row(&[
+            (10, 1, Some(fast(44)), Some(err(ProfileErr::Fast))),
+            (11, 2, Some(real(50)), None),
+            (12, 3, None, None),
+        ]);
+        r.select_best_measured_link();
+        assert_eq!(r.selected_protocol, 1, "real-ok lowest delay wins");
+        assert_eq!(r.active_link().map(|l| l.protocol_id.get()), Some(11));
+    }
+
+    #[test]
+    fn select_best_measured_link_fast_ok_when_no_real() {
+        let mut r = row(&[
+            (10, 1, Some(fast(90)), None),
+            (11, 2, Some(fast(44)), None),
+        ]);
+        r.select_best_measured_link();
+        assert_eq!(r.selected_protocol, 1, "fast-ok lowest delay wins");
+    }
+
+    #[test]
+    fn select_best_measured_link_keeps_selection_when_unmeasured() {
+        let mut r = row(&[(10, 1, None, None), (11, 2, None, Some(err(ProfileErr::Real)))]);
+        r.select_best_measured_link();
+        assert_eq!(r.selected_protocol, 0, "no measurement -> keep selection");
+    }
+
+    #[test]
+    fn select_best_measured_link_error_with_latency_still_measured() {
+        // A link that carries both a success and a later failure marker is
+        // still the best measured link (user-facing: the row shows 44ms).
+        let mut r = row(&[
+            (10, 1, Some(fast(44)), Some(err(ProfileErr::Fast))),
+            (11, 2, None, None),
+        ]);
+        r.select_best_measured_link();
+        assert_eq!(r.selected_protocol, 0);
     }
 
     #[test]

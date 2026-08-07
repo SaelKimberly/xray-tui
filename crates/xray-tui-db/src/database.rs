@@ -490,6 +490,10 @@ impl Database {
                 expanded: false,
             };
             row.sort_links_by_test_priority(dns_unresolved);
+            // Single-row display follows the best measured link (survives
+            // restarts via the persisted latency columns); the sub-table
+            // keeps test-priority order.
+            row.select_best_measured_link();
             rows.push(row);
         }
         // Deterministic page order (the newtype id path cannot be ordered in SQL).

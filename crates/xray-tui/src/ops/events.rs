@@ -386,31 +386,16 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                             state.selected_sub =
                                 row.links.iter().position(|l| l.protocol_id == pid);
                         }
-                        // Auto-preferred: after a successful real ping, the
-                        // lowest-latency real-ok link becomes the endpoint's
-                        // active protocol (single-row view shows its delay,
-                        // and the failure label follows the active link).
-                        // Skipped when the user pinned an override (Enter on
-                        // a sub-row) — an explicit choice wins. The sort's
-                        // implicit best-first order can be perturbed by a
-                        // transient DNS-unresolved tier, so promote by real
-                        // latency explicitly rather than trusting links[0].
-                        if error.is_none()
-                            && test_type == TestType::RealPing
-                            && row.endpoint.manual_protocol_override.is_none()
-                            && row.links.len() > 1
-                            && let Some((best_idx, _)) = row
-                                .links
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(i, l)| match l.latency {
-                                    Some(Latency::Real { delay, .. }) => Some((i, delay)),
-                                    _ => None,
-                                })
-                                .min_by_key(|&(_, d)| d)
-                        {
-                            row.selected_protocol = best_idx;
-                        }
+                        // Single-row display follows the best MEASURED link
+                        // (real-ok lowest delay, else fast-ok lowest) after
+                        // every fast/real result, success or failure — the
+                        // sort's implicit best-first order is test-priority
+                        // (fresh failures dominate, untested above errors),
+                        // which is the right sub-table order but the wrong
+                        // display choice: a link with a measured success must
+                        // drive the row. A pinned manual override wins via
+                        // `active_link()` (checked first).
+                        row.select_best_measured_link();
                     }
                     state.filter_cache_valid.set(false);
                 }

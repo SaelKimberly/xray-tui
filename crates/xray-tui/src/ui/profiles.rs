@@ -13,7 +13,7 @@ use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
     Column, ColumnWidth, DataTable, DataTableRow, DataTableState, SortDirection,
 };
-use crate::{AppState, ConfirmAction, EndpointRow, format_ts, iso_to_flag};
+use crate::{AppState, ConfirmAction, EndpointRow, format_relative_ts, format_ts, iso_to_flag};
 
 /// One row of the expanded per-protocol sub-table inside an endpoint panel.
 struct PanelRow {
@@ -182,18 +182,20 @@ impl DisplayRowData {
             buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
         }
 
-        // Sub-table rows
+        // Sub-table rows. last_used is relative ("2d ago"/"never"); config
+        // is 14 wide with a 1-space gap before delay so "xhttp/reality"
+        // never blends into the latency column.
         let cols: [(usize, usize); 10] = [
             (0, 3),   // marker
             (3, 10),  // id
             (13, 20), // last_seen
-            (33, 20), // last_used
-            (53, 12), // config
-            (65, 8),  // delay
-            (73, 8),  // speed
-            (81, 11), // traffic
-            (92, 16), // outbound
-            (108, 7), // country
+            (33, 12), // last_used (relative)
+            (45, 14), // config
+            (60, 8),  // delay
+            (68, 8),  // speed
+            (76, 11), // traffic
+            (87, 16), // outbound
+            (103, 7), // country
         ];
         for (n, pr) in self.panel_rows.iter().enumerate() {
             let y = y0 + 3 + n as u16;
@@ -350,14 +352,12 @@ fn test_cell_content(
     if host_is_dns && !resolved {
         return (format!("[{}]", center_cell("name", 4)), bad);
     }
-    // Tier ordering (decision 16): real-err ranks above fast-err — the real
-    // check is the deeper probe, so when both classes failed `[real]` wins.
-    if failure == Some(TestFailure::Real) {
-        return (format!("[{}]", center_cell("real", 4)), bad);
-    }
-    if failure == Some(TestFailure::Fast) {
-        return (format!("[{}]", center_cell("fast", 4)), bad);
-    }
+    // A measured delay wins over a failure marker: a link that carries both a
+    // successful measurement and a later failure (e.g. a batch probe that
+    // succeeded, then a transient retry failed) still has a result the row
+    // should show. The failure label appears only when the active link has no
+    // measurement — decision 16 keeps fresh failures dominating the sub-table
+    // order, but the single-row cell reflects the measured state.
     match active_delay {
         Some(d) if d >= 0 => {
             let style = if d >= TEST_BAD_MS {
@@ -369,7 +369,18 @@ fn test_cell_content(
             };
             (format!("[{}]", center_cell(&d.to_string(), 4)), style)
         }
-        _ => (" ".repeat(6), Style::default()),
+        _ => {
+            // Tier ordering (decision 16): real-err ranks above fast-err —
+            // the real check is the deeper probe, so when both classes
+            // failed `[real]` wins.
+            if failure == Some(TestFailure::Real) {
+                (format!("[{}]", center_cell("real", 4)), bad)
+            } else if failure == Some(TestFailure::Fast) {
+                (format!("[{}]", center_cell("fast", 4)), bad)
+            } else {
+                (" ".repeat(6), Style::default())
+            }
+        }
     }
 }
 
@@ -432,7 +443,7 @@ fn build_display_rows(
             .and_then(|i| i.country.as_deref())
             .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
         let address_port_str =
-            truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 36);
+            truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 34);
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
         // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
         let ip_feature =
@@ -469,14 +480,24 @@ fn build_display_rows(
         };
         let config_type_str = center_pad(&config_type, 12);
 
-        let outbound_addr = info
-            .and_then(|i| i.outbound_ip.map(|ip| ip.to_string()))
+        // Exit IP: the ACTIVE link's persisted real-ping IP wins (survives
+        // reruns); endpoint_info is the live-enrich fallback. Country comes
+        // from the per-IP mmdb cache (seeded at load + on ping).
+        let active_outbound_ip = row.active_link().and_then(|l| match &l.latency {
+            Some(xray_tui_db::models::Latency::Real { ip: Some(ip), .. }) => Some(ip.clone()),
+            _ => None,
+        });
+        let outbound_addr = active_outbound_ip
+            .clone()
+            .or_else(|| info.and_then(|i| i.outbound_ip.map(|ip| ip.to_string())))
             .unwrap_or_else(|| "—".to_string());
-        let outbound_country = info
-            .and_then(|i| i.outbound_country.as_deref())
+        let outbound_country = active_outbound_ip
+            .as_deref()
+            .and_then(|ip| state.outbound_country_for(ip))
+            .or_else(|| info.and_then(|i| i.outbound_country.clone()))
             .map_or_else(
                 || "—".to_string(),
-                |iso| truncate_pad(&format!("{} {iso}", iso_to_flag(iso)), 7),
+                |iso| truncate_pad(&format!("{} {iso}", iso_to_flag(&iso)), 7),
             );
 
         // Panel content
@@ -527,16 +548,21 @@ fn build_display_rows(
                         .latency
                         .as_ref()
                         .and_then(|l| match l {
-                            // Latency::Real.ip is the bare IP prefix now
-                            // (events.rs strips any "|"-joined suffix) — no
-                            // split here; country needs parsed fields, which
-                            // T20 refines.
+                            // Latency::Real.ip is the persisted exit IP
+                            // (events.rs stores the bare IP; country comes
+                            // from the mmdb cache seeded at load + on ping).
                             xray_tui_db::models::Latency::Real { ip, .. } => ip.clone(),
                             xray_tui_db::models::Latency::Fast { .. } => None,
                         })
                         .map_or_else(
                             || ("—".to_string(), "—".to_string()),
-                            |ip| (ip, "—".to_string()),
+                            |ip| {
+                                let country = state.outbound_country_for(&ip).map_or_else(
+                                    || "—".to_string(),
+                                    |iso| format!("{} {iso}", iso_to_flag(&iso)),
+                                );
+                                (ip, country)
+                            },
                         );
                     let (t, s) = proto.map_or((None, None), |p| {
                         (
@@ -558,7 +584,7 @@ fn build_display_rows(
                         last_seen: format_ts(&link.last_seen_at),
                         last_used: link
                             .last_used_at
-                            .map_or_else(|| "—".to_string(), |ts| format_ts(&ts)),
+                            .map_or_else(|| "never".to_string(), |ts| format_relative_ts(&ts)),
                         config_type,
                         delay,
                         speed,
@@ -638,11 +664,11 @@ fn render_data_grid(
         Column::new("Type", ColumnWidth::Fixed(12)), // 3
         Column::new("", ColumnWidth::Fixed(1)),      // 4 — [
         Column::new("", ColumnWidth::Fixed(4)),      // 5 — country flag
-        Column::new("Address", ColumnWidth::Fixed(36)), // 6
+        Column::new("Address", ColumnWidth::Fixed(34)), // 6
         Column::new("", ColumnWidth::Fixed(2)),      // 7 — ][
         Column::new("Feat", ColumnWidth::Fixed(4)),  // 8 — IP+SNI flags
         Column::new("", ColumnWidth::Fixed(4)),      // 9 — ]=>{
-        Column::new("", ColumnWidth::Fixed(12)),     // 10 — config type
+        Column::new("", ColumnWidth::Fixed(14)),     // 10 — config type
         Column::new("", ColumnWidth::Fixed(3)),      // 11 — }=> arrow
         Column::new("Test", ColumnWidth::Fixed(6)),  // 12 — [delay]/[name]/[fast]/[real]
         Column::new("", ColumnWidth::Fixed(1)),      // 13 — [ outbound opener
@@ -962,6 +988,26 @@ mod tests {
         assert!(text.contains("real"), "active failure must label: {text:?}");
     }
 
+    /// A link that carries both a measured success and a later failure
+    /// marker must still show the delay — the single-row cell reflects the
+    /// measured state, not the stale marker.
+    #[test]
+    fn test_cell_delay_beats_failure_marker_on_active_link() {
+        use crate::ops::profiles::test_support::fake_row;
+        use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        row.links[0].latency = Some(Latency::Fast { delay: 44 });
+        row.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "timeout".into(),
+        });
+        let (text, _style) = compute_test_cell(&row, true, &palette);
+        assert!(text.contains("44"), "measured delay must win: {text:?}");
+        assert!(!text.contains("fast"), "no [fast] label over a delay: {text:?}");
+    }
+
     #[test]
     fn expanded_row_height_includes_gap() {        let row = sample_row(
             true,
@@ -1219,16 +1265,21 @@ mod tests {
     #[test]
     fn test_cell_labels_persisted_failure_markers() {
         let palette = test_palette();
-        // Both marker classes present → [real]: real-err (tier 3) ranks above
-        // fast-err (tier 4), the real check being the deeper probe (T20 flip).
-        let (t, s) = test_cell_content(false, true, Some(TestFailure::Real), Some(12), &palette);
+        // A measured delay wins over a failure marker: a link carrying both a
+        // success and a later failure still shows its result. Labels appear
+        // only when the active link has NO measurement.
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), Some(12), &palette);
+        assert_eq!(t, "[ 12 ]");
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), Some(12), &palette);
+        assert_eq!(t, "[ 12 ]");
+        // Both marker classes present with no delay → [real]: real-err
+        // (tier 3) ranks above fast-err (tier 4), the real check being the
+        // deeper probe (T20 flip).
+        let (t, s) = test_cell_content(false, true, Some(TestFailure::Real), None, &palette);
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
-        // Only a real-class failure marker → [real].
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), Some(12), &palette);
-        assert_eq!(t, "[real]");
-        // Only a fast-class failure marker → [fast].
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), Some(12), &palette);
+        // Only a fast-class failure marker with no delay → [fast].
+        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), None, &palette);
         assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
         let (t, _) = test_cell_content(false, true, None, Some(30), &palette);

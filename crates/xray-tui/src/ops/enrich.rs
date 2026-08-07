@@ -399,6 +399,43 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
     });
 }
 
+/// Seed the outbound-IP country cache at profile load.
+///
+/// Collects the distinct exit IPs persisted on links (`Latency::Real.ip`),
+/// looks each up in mmdb and fills `state.outbound_country_cache` — async, so
+/// IPs render immediately and flags a moment later. Survives reruns: the
+/// source IPs are persisted and this re-runs at every load.
+pub fn spawn_outbound_countries(state: &mut AppState) {
+    let mut ips = std::collections::HashSet::new();
+    for row in &state.endpoints {
+        for link in &row.links {
+            if let Some(xray_tui_db::models::Latency::Real { ip: Some(ip), .. }) = &link.latency {
+                ips.insert(ip.clone());
+            }
+        }
+    }
+    if ips.is_empty() {
+        return;
+    }
+    let geo = state.geo_ip.clone();
+    let cache = state.outbound_country_cache.clone();
+    tokio::spawn(async move {
+        let Some(geo) = geo else { return };
+        for ip in ips {
+            let Ok(ipaddr) = ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            let country = match geo.location_by_ip(ipaddr).await {
+                Ok(Some(loc)) => Some(loc.country),
+                _ => None,
+            };
+            if let Ok(mut c) = cache.lock() {
+                c.insert(ip, country);
+            }
+        }
+    });
+}
+
 /// Record the exit (egress) IP + country of a real ping on the endpoint that
 ///
 /// owns `protocol_id`. The IP is parsed from real-ping `ip_info`
@@ -431,6 +468,7 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
         .cloned()
         .unwrap_or_default();
     info.outbound_ip = Some(outbound_ip);
+    let cache = state.outbound_country_cache.clone();
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
@@ -444,7 +482,12 @@ pub fn spawn_outbound_enrich(state: &mut AppState, protocol_id: i64, ip_info: Op
         }
         if let Some(geo) = &geo {
             match geo.location_by_ip(outbound_ip).await {
-                Ok(Some(loc)) => info.outbound_country = Some(loc.country),
+                Ok(Some(loc)) => {
+                    info.outbound_country = Some(loc.country.clone());
+                    if let Ok(mut c) = cache.lock() {
+                        c.insert(outbound_ip.to_string(), Some(loc.country));
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(target: "tui::ops::enrich", "outbound geo lookup failed: {e}");

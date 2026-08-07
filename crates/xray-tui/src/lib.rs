@@ -134,6 +134,26 @@ pub fn format_ts(ts: &jiff::Timestamp) -> String {
         .to_string()
 }
 
+/// Compact relative time for the panel "last used" column: "2d ago", "5h
+/// ago", "3m ago", "now" for under a minute. Callers render "never" for
+/// `None`.
+#[must_use]
+pub fn format_relative_ts(ts: &jiff::Timestamp) -> String {
+    let span = jiff::Timestamp::now().since(*ts).unwrap_or_default();
+    let (n, unit) = if span.get_weeks() > 0 {
+        (span.get_weeks() as u64, "w")
+    } else if span.get_days() > 0 {
+        (span.get_days() as u64, "d")
+    } else if span.get_hours() > 0 {
+        (span.get_hours() as u64, "h")
+    } else if span.get_minutes() > 0 {
+        (span.get_minutes() as u64, "m")
+    } else {
+        return "now".to_string();
+    };
+    format!("{n}{unit} ago")
+}
+
 /// "US" → "🇺🇸"; anything not exactly 2 ASCII alpha chars → "🏴" (U+1F3F4).
 #[must_use]
 pub fn iso_to_flag(iso: &str) -> String {
