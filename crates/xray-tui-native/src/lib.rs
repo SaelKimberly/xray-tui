@@ -23,7 +23,9 @@
 //! here.
 
 pub mod addr;
+pub mod context;
 pub mod error;
 pub mod shape;
 
+pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
