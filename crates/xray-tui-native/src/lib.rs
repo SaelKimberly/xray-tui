@@ -24,5 +24,6 @@
 
 pub mod addr;
 pub mod error;
+pub mod shape;
 
 pub use error::NativeError;
