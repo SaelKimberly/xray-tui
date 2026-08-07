@@ -99,12 +99,26 @@ where
 
 // ── Application entry point ──
 
+/// Install the process-level rustls `CryptoProvider` before anything can
+/// build TLS. reqwest 0.13 is built with `rustls-no-provider` (workspace
+/// standard: ring backend) and panics at `Client::build` unless a provider is
+/// installed process-wide. Idempotent: a second call returns `Err` from
+/// `install_default` and is ignored. rustls 0.23 also auto-selects when the
+/// crate features name exactly one backend — the workspace pins ring only —
+/// but reqwest checks `get_default()` explicitly and never auto-installs.
+fn install_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[allow(
     clippy::significant_drop_tightening,
     reason = "trivial drop timing differences, adding explicit drops adds noise"
 )]
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 0. Install rustls CryptoProvider first — every later TLS consumer
+    //    (reqwest, QUIC ping adapter, hickory DoH) needs it.
+    install_tls_provider();
     // 1. Load app config (~/.config/xray-tui/config.json) — returns Default on missing
     let config = AppConfig::load()?;
 
@@ -300,4 +314,26 @@ async fn main() -> Result<()> {
     xray_tui::ui::run(&mut state).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_tls_provider;
+
+    /// Regression: release panic "Could not automatically determine the
+    /// process-level `CryptoProvider` from Rustls crate" on Fast+Real ping.
+    /// rustls is single-backend ring, but reqwest 0.13 `rustls-no-provider`
+    /// requires an installed default before `Client::build`.
+    #[test]
+    fn tls_provider_installed_before_any_use() {
+        install_tls_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "startup install_tls_provider() must leave a default CryptoProvider installed"
+        );
+        // The exact panic site from the report must no longer fire.
+        let _builder = rustls::ClientConfig::builder();
+        // Idempotent: a second install returns Err, never panics.
+        install_tls_provider();
+    }
 }

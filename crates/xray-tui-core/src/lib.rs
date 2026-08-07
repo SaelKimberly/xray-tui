@@ -40,6 +40,18 @@ pub use process::{CoreManager, MockCoreManager, ProcessError, RealCoreManager};
 pub use speed_test::{
     SpeedTestError, TestType, real_ping, speed_test, tcp_ping, udp_ping, udp_test, wait_for_socks5,
 };
+
+/// Ensure the process-level rustls `CryptoProvider` is installed (idempotent).
+///
+/// reqwest 0.13 is built with `rustls-no-provider` (workspace standard: ring
+/// backend) and panics at `Client::build` unless a provider is installed
+/// process-wide — reqwest checks `CryptoProvider::get_default()` explicitly
+/// and never auto-selects. Every reqwest `Client` construction in this crate
+/// calls this first; the binary also installs it at startup (main.rs
+/// `install_tls_provider`) before any subsystem runs.
+pub fn ensure_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 pub use xray_tui_proto::proto_spec::core_mapping::{
     SINGBOX_ONLY_KINDS, SINGBOX_SS_METHODS, XRAY_SS_METHODS, resolve_core,
     singbox_supports_ss_method, ss_method_supported, xray_supports_ss_method,

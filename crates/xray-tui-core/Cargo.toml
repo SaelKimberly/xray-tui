@@ -34,7 +34,16 @@ semver = { version = "1.0", features = ["std"] }
 async-trait = "0.1"
 prost = "0.14"
 quinn = { version = "0.11", optional = true }
-rustls = { workspace = true, optional = true, features = ["tls12", "logging", "aws_lc_rs"] }
+# Transitive feature override (user-directed): tokio-rustls 0.26 defaults to
+# the aws_lc_rs backend (`default = ["logging", "tls12", "aws_lc_rs"]`).
+# Disable defaults and pin ring explicitly so rustls keeps exactly one
+# backend in the whole graph — `ClientConfig::builder()` auto-selects it and
+# never hits the dual-backend "Could not automatically determine the
+# process-level CryptoProvider" panic. All other edges (reqwest
+# rustls-no-provider, quinn, hyper-rustls) already opt out of tokio-rustls
+# defaults.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { workspace = true, optional = true, features = ["tls12", "logging", "ring"] }
 tonic-prost = "0.14"
 
 # ============ Build & Archiving ============

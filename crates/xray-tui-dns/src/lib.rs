@@ -123,9 +123,17 @@ async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<Vec<NameServerConfig>
     (Some(parsed), stale)
 }
 
+/// Idempotent install of the process-level rustls `CryptoProvider` (ring).
+/// Required before any reqwest `Client::build` — reqwest 0.13 is built with
+/// `rustls-no-provider` and panics otherwise.
+fn ensure_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Downloads the `DNSCrypt` public resolver list under a hard 10s deadline;
 /// without the timeout a blocked network hangs every lookup forever.
 async fn download_dnscrypt_resolvers(resolvers_url: &str) -> anyhow::Result<String> {
+    ensure_tls_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;

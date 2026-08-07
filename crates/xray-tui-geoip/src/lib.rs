@@ -146,7 +146,15 @@ impl GeoIp {
     }
 }
 
+/// Idempotent install of the process-level rustls `CryptoProvider` (ring).
+/// Required before any reqwest `Client::build` — reqwest 0.13 is built with
+/// `rustls-no-provider` and panics otherwise.
+fn ensure_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 async fn fetch_geolite_bytes() -> anyhow::Result<Vec<u8>> {
+    ensure_tls_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_mins(2))
         .build()?;

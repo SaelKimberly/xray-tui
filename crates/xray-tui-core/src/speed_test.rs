@@ -132,6 +132,7 @@ async fn create_socks5_client(
     socks5h: bool,
     timeout: Duration,
 ) -> Result<reqwest::Client, SpeedTestError> {
+    crate::ensure_tls_provider();
     let key = (proxy.to_string(), port, socks5h);
     if let Some(client) = client_cache().lock().unwrap().get(&key) {
         return Ok(client.clone()); // Client::clone() is cheap (Arc)
@@ -166,6 +167,7 @@ pub async fn real_ping(
     test_timeout: Duration,
     retries: u32,
 ) -> Result<RealPingResult, SpeedTestError> {
+    crate::ensure_tls_provider();
     let scheme = "socks5";
     let proxy_url = format!("{scheme}://{proxy}:{port}");
     let client = reqwest::Client::builder()

@@ -252,6 +252,13 @@ impl HostFeaturesChecker {
     }
 }
 
+/// Idempotent install of the process-level rustls `CryptoProvider` (ring).
+/// Required before any reqwest `Client::build` — reqwest 0.13 is built with
+/// `rustls-no-provider` and panics otherwise.
+fn ensure_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Fetch `url` to `path` only if the file is not already present. Download is
 /// bounded (30s) and written atomically (tmp + rename); empty downloads are
 /// rejected so a rate-limit HTML page can never become a permanent tombstone.
@@ -259,6 +266,7 @@ async fn ensure_file(path: &Path, url: &str) -> anyhow::Result<()> {
     if path.is_file() {
         return Ok(());
     }
+    ensure_tls_provider();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;

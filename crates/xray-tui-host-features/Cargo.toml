@@ -11,7 +11,7 @@ rust-version.workspace = true
 fastbloom = "0.17"
 
 # ============ TLS ============
-rustls.workspace = true   # only for rustls::pki_types::ServerName
+rustls = { workspace = true, features = ["ring"] }   # pki_types::ServerName + provider install before reqwest Client::build (rustls-no-provider)
 
 # ============ Networking ============
 reqwest.workspace = true  # download-if-missing of whitelist files

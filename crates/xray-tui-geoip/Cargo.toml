@@ -13,6 +13,8 @@ tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt"] }
 
 # ============ Networking ============
 reqwest.workspace = true
+# ring provider install before reqwest Client::build (rustls-no-provider)
+rustls = { workspace = true, features = ["ring"] }
 
 # ============ Error Handling ============
 anyhow.workspace = true

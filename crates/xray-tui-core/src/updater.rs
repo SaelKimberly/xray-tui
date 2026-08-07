@@ -95,6 +95,7 @@ pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
 
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
 
+    crate::ensure_tls_provider();
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)

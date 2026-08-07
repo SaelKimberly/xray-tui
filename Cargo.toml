@@ -36,7 +36,16 @@ yaml-rust2 = "0.11.0"
 anyhow = "1.0"
 
 # ============ Networking ============
-reqwest = { version = "^0.13.4", default-features = false, features = ["rustls"] }
+# reqwest 0.13 (latest minor) has no ring feature: `rustls` = aws-lc-rs only,
+# `rustls-no-provider` defers to the process default. Workspace standard is
+# ring (quinn quic-ping, hickory-resolver) — see rustls pins below — so we use
+# rustls-no-provider and install the ring CryptoProvider in code: the binary
+# at startup (main.rs install_tls_provider) and every reqwest Client::build
+# site (crate-local ensure_tls_provider). Without the install, Client::build
+# panics ("No rustls crypto provider is configured", verified live). rustls
+# itself stays single-backend ring, so ClientConfig::builder() auto-selects
+# (quic ping adapter, hickory DoH).
+reqwest = { version = "^0.13.4", default-features = false, features = ["rustls-no-provider"] }
 
 # ============ Config & Filesystem ============
 dirs = { version = "^6.0.0" }
