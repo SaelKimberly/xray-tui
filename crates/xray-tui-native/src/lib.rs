@@ -33,6 +33,7 @@ pub type BoxStream = Box<dyn Stream>;
 pub mod addr;
 pub mod context;
 pub mod error;
+pub mod protocol;
 pub mod security;
 pub mod shape;
 pub mod transport;
