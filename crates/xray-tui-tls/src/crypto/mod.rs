@@ -8,6 +8,8 @@
 //! every derived value is directly observable and testable against the
 //! RFC 8448 vectors.
 
+pub mod fingerprint;
+
 use core::cell::Cell;
 
 use ring::{
