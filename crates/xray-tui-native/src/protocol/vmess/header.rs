@@ -307,20 +307,56 @@ mod tests {
         session.request_body_iv = [0x11; 16];
         session.request_body_key = [0x22; 16];
         session.security = SECURITY_CHACHA20_POLY1305;
-        let mut entropy_calls = 0;
-        let mut entropy = |out: &mut [u8]| {
-            entropy_calls += 1;
-            out.fill(0x77);
-        };
+        let mut entropy = |out: &mut [u8]| out.fill(0x77);
         let target = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 8080);
         let wire =
             encode_request(&ck, &session, &target, 0x6000_0000_0000_0000, &mut entropy).unwrap();
-        // The plaintext body is inside the sealed payload; the security byte is
-        // not directly visible on the wire. Instead assert the constant exists
-        // and encode_request accepts security 4 without error, and that the
-        // existing security-3 golden wire test still passes unchanged.
-        assert_eq!(SECURITY_CHACHA20_POLY1305, 4);
         assert_eq!(wire.len(), peek_seal_len(49));
+
+        // This test pins the task's central contract: `encode_request` must
+        // write `session.security` (4 = chacha20-poly1305) at plaintext body
+        // index 35 — NOT a hardcoded default. The security byte is inside the
+        // sealed payload, so decrypt the body AEAD reusing the sibling
+        // `request_plaintext_body_layout_is_port_first` pattern; the key/nonce
+        // derivation depends only on ck, auth_id, and nonce (all on the wire).
+        let auth_id = &wire[..16];
+        let len_cipher = &wire[16..34];
+        let nonce = &wire[34..42];
+        let body_cipher = &wire[42..];
+
+        let len_key =
+            keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key_Length", auth_id, nonce]);
+        let len_nonce =
+            keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce_Length", auth_id, nonce]);
+        let len_aead = Aes128Gcm::new_from_slice(&len_key).unwrap();
+        let len_plain = len_aead
+            .decrypt(
+                Nonce::from_slice(&len_nonce[..12]),
+                Payload {
+                    msg: len_cipher,
+                    aad: auth_id,
+                },
+            )
+            .unwrap();
+        assert_eq!(len_plain, 49u16.to_be_bytes());
+
+        let body_key = keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key", auth_id, nonce]);
+        let body_nonce = keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce", auth_id, nonce]);
+        let body_aead = Aes128Gcm::new_from_slice(&body_key).unwrap();
+        let body = body_aead
+            .decrypt(
+                Nonce::from_slice(&body_nonce[..12]),
+                Payload {
+                    msg: body_cipher,
+                    aad: auth_id,
+                },
+            )
+            .unwrap();
+
+        // 35 = version(1) IV(16) key(16) respHdr(1) option(1).
+        assert_eq!(body[35], SECURITY_CHACHA20_POLY1305);
+        // chacha20-poly1305 security byte = 4 (RFC 7905 / xray common).
+        assert_eq!(SECURITY_CHACHA20_POLY1305, 4);
     }
 
     fn hex_encode(b: &[u8]) -> String {
