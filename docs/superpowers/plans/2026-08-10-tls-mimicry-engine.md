@@ -221,11 +221,21 @@ git commit -m "feat(tls): ClientHello spec model + extension wire encoding"
 - Produces:
 
 ```rust
+// NOTE (plan correction, verified against ring 0.17.14): ring's
+// `SecureRandom` trait is SEALED — a fixed-seed test double cannot
+// implement it. Define a crate-local seam in `hello/mod.rs` (or `lib.rs`):
+pub trait SecureRandom: Send + Sync {
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified>;
+}
+impl<T: ring::rand::SecureRandom> SecureRandom for T {} // blanket: SystemRandom works
+// Tests implement the LOCAL trait directly. All later tasks (crypto
+// keypairs, handshake, REALITY) take `&dyn crate::SecureRandom`.
+
 pub struct BuildParams<'a> {
     pub server_name: &'a str,
     pub alpn: Option<&'a [&'a str]>,   // None → use spec's Alpn
     pub x25519_pub: &'a [u8; 32],
-    pub rng: &'a dyn ring::rand::SecureRandom,
+    pub rng: &'a dyn SecureRandom,
 }
 pub struct BuiltHello {
     pub handshake_bytes: Vec<u8>,        // type 0x01 + 3-byte len + body
@@ -236,43 +246,44 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
 pub fn to_record(handshake_bytes: &[u8]) -> Vec<u8>;
 ```
 
+Padding (reference `thirdparty/tls-fingerprint/src/profiles/chrome.rs:125-139`): target **512 bytes of the RECORD** (not 517). Compute `current = to_record(handshake_without_padding).len()`; if `current < 512`, the padding extension's DATA length = `512 - (current + 4)` (4 = type+len overhead of the padding ext); else no padding. `ExtensionSpec::Padding` uses `RuntimeValues.padding_len` for its data length.
+
 GREASE pairing rule (Chrome family): the FIRST `GREASE_PLACEHOLDER` occurrence in each of {cipher_suites, supported_groups, supported_versions, key_share groups} is replaced with the SAME value `grease_a`; a standalone `ExtensionSpec::Grease` uses `grease_b`. Any additional placeholder gets a fresh value. Firefox-family specs contain no placeholders.
 
-- [ ] **Step 1: Write the failing test** — golden bytes captured from the reference implementation (`/tmp/tf`, the `tls-fingerprint` crate, same profile + fixed seed):
+- [ ] **Step 1: Write the failing test** — golden bytes captured from the reference implementation (`/tmp/tf`, the `tls-fingerprint` crate, same profile + fixed seed), plus a padding-size test:
 
 ```rust
 // hello/mod.rs tests
 struct FixedRandom { bytes: Vec<u8>, pos: usize }
-impl ring::rand::SecureRandom for FixedRandom {
-    fn fill(&mut self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
-        for b in dest.iter_mut() {
-            *b = *self.bytes.get(self.pos).ok_or(ring::error::Unspecified)?;
-            self.pos += 1;
-        }
-        Ok(())
-    }
-}
+impl crate::hello::SecureRandom for FixedRandom { /* sequential bytes, error when exhausted */ }
 
 #[test]
 fn chrome130_golden_hello_with_fixed_seed() {
-    // Reference capture (run the CURRENT tls-fingerprint example with the
-    // same fixed seed and record the ClientHello bytes; lock them here):
-    //   spec = profiles::chrome::v130::spec() (Task 10 adds the real data —
-    //   until then use a placeholder spec assembled from the chrome.rs
-    //   constants in thirdparty/tls-fingerprint/src/profiles/chrome.rs)
-    let spec = test_spec(); // CIPHER_SUITES etc. copied from tls-fingerprint chrome.rs
-    let rng = FixedRandom { bytes: vec![0x42; 64], pos: 0 };
+    // Reference capture: run the CURRENT tls-fingerprint crate with
+    // aws_lc_rs::test::rand::FixedSliceSequenceRandom (all 0x42), fixed
+    // x25519 pub [0xAB; 32], NO padding, print hex of ch.build() and
+    // ch.to_record(); lock the bytes here.
+    let spec = test_spec(); // chrome.rs constants as ClientHelloSpec (incl. Padding arm if the capture included it)
+    let rng = FixedRandom { bytes: vec![0x42; 128], pos: 0 };
     let hello = build_hello(&spec, &BuildParams {
         server_name: "tls.peet.ws",
         alpn: Some(&["h2", "http/1.1"]),
         x25519_pub: &[0xAB; 32],
         rng: &rng,
     }).unwrap();
-    assert_eq!(hello.handshake_bytes, EXPECTED_HELLO); // captured from reference
+    assert_eq!(hex::encode(&hello.handshake_bytes), EXPECTED_HELLO_HEX);
+    assert_eq!(hex::encode(&hello.record_bytes), EXPECTED_RECORD_HEX);
+}
+
+#[test]
+fn padding_reaches_512_byte_record() {
+    // Spec with a small extension set + Padding. Build.
+    // Assert: hello.record_bytes.len() == 512 when the unpadded record < 512;
+    // and no Padding data when the unpadded record is already >= 512.
 }
 ```
 
-Capture procedure for `EXPECTED_HELLO`: in `/tmp/tf` (the standalone tls-fingerprint copy), add a temporary example that builds the Chrome130 hello with a fixed-seed RNG and prints `hex::encode(handshake_bytes)`; copy the output into this test. The ported builder must produce byte-identical output.
+Capture procedure for `EXPECTED_HELLO_HEX`: in `/tmp/tf` (the standalone tls-fingerprint copy), add a temporary example that builds the Chrome130 hello with a fixed-seed RNG (aws-lc-rs `FixedSliceSequenceRandom`) and prints `hex::encode(ch.build())` + `hex::encode(ch.to_record())`; copy the output into this test. The ported builder must produce byte-identical output. If the capture includes padding, `test_spec()` must include the `Padding` arm and the builder must reproduce the reference's 512-record-target computation.
 
 - [ ] **Step 2: Run test to verify it fails**
 
