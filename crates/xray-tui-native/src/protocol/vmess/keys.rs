@@ -17,6 +17,20 @@ pub fn cmd_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
     m.finalize().into()
 }
 
+/// 32-byte chacha20poly1305 key for a 16-byte VMess session body key.
+/// Mirrors Go `GenerateChacha20Poly1305Key` (xray
+/// `proxy/vmess/encoding/auth.go`, sing-vmess `protocol.go`):
+/// `md5(k) ‖ md5(md5(k))` — chained double md5, never zeros.
+#[must_use]
+pub fn chacha20_key_32(body_key: &[u8; 16]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let first: [u8; 16] = Md5::digest(body_key).into();
+    key[..16].copy_from_slice(&first);
+    let second: [u8; 16] = Md5::digest(&key[..16]).into();
+    key[16..].copy_from_slice(&second);
+    key
+}
+
 /// `VMess` AEAD KDF — Go `aead.KDF`.
 ///
 /// Go builds a chain of HMAC-SHA256 objects
@@ -219,6 +233,16 @@ mod tests {
         let bytes_path: [&[u8]; 3] = [b"AES Auth ID Encryption", b"aead", b"salt"];
         assert_eq!(kdf_bytes_path(&ck, &bytes_path), kdf(&ck, &str_path));
         assert_eq!(kdf16_bytes_path(&ck, &bytes_path), kdf16(&ck, &str_path));
+    }
+
+    #[test]
+    fn chacha20_key_is_double_md5_of_body_key() {
+        let k = [0x22u8; 16];
+        let key = chacha20_key_32(&k);
+        assert_eq!(
+            hex(&key),
+            "fbc3cf71d993ca7bec2664357ccdac2bb270c6d264a3bfeab7ceea80762a13cc"
+        );
     }
 
     fn hex(b: &[u8]) -> String {
