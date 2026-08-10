@@ -109,54 +109,63 @@ impl ExtensionSpec {
                 (0x0000, body)
             }
             Self::SupportedGroups(groups) => {
-                let count = u16::try_from(groups.len())
+                // RFC 8446 NamedGroupList: u16 byte-length + groups, no count field.
+                let byte_len = u16::try_from(groups.len() * 2)
                     .map_err(|_| TlsError::Spec("supported_groups exceeds u16 length".to_string()))?;
                 let mut body = Vec::with_capacity(2 + groups.len() * 2);
-                body.extend_from_slice(&count.to_be_bytes());
+                body.extend_from_slice(&byte_len.to_be_bytes());
                 for group in groups {
                     body.extend_from_slice(&group.to_be_bytes());
                 }
                 (0x000a, body)
             }
             Self::KeyShare(groups) => {
-                let mut body = Vec::with_capacity(4 + groups.len() * 36);
+                // RFC 8446 KeyShareClientHello: u16 list-length + entries.
+                let mut entries = Vec::with_capacity(groups.len() * 36);
                 for group in groups {
                     match group {
                         KeyShareGroup::Grease => {
-                            // Entry on the wire: group (grease_a), key_exchange_length 00 01, key_exchange 00.
-                            body.extend_from_slice(&rt.grease_a.to_be_bytes());
-                            body.extend_from_slice(&[0x00, 0x01, 0x00]);
+                            // Entry: group (grease_a), key_exchange_length 00 01, key_exchange 00.
+                            entries.extend_from_slice(&rt.grease_a.to_be_bytes());
+                            entries.extend_from_slice(&[0x00, 0x01, 0x00]);
                         }
                         KeyShareGroup::X25519 => {
                             // Entry: group 00 1d (x25519), key_exchange_length 00 20, raw public key.
-                            body.extend_from_slice(&[0x00, 0x1d, 0x00, 0x20]);
-                            body.extend_from_slice(&rt.x25519_pub);
+                            entries.extend_from_slice(&[0x00, 0x1d, 0x00, 0x20]);
+                            entries.extend_from_slice(&rt.x25519_pub);
                         }
                     }
                 }
+                let list_len = u16::try_from(entries.len())
+                    .map_err(|_| TlsError::Spec("key_share entries exceed u16 length".to_string()))?;
+                let mut body = Vec::with_capacity(2 + entries.len());
+                body.extend_from_slice(&list_len.to_be_bytes());
+                body.extend_from_slice(&entries);
                 (0x0033, body)
             }
             Self::SupportedVersions(versions) => {
-                let count = u8::try_from(versions.len())
-                    .map_err(|_| TlsError::Spec("supported_versions exceeds 255 entries".to_string()))?;
+                // RFC 8446: 1-byte length counts BYTES (n*2), not versions.
+                let byte_len = u8::try_from(versions.len() * 2)
+                    .map_err(|_| TlsError::Spec("supported_versions exceeds 255 bytes".to_string()))?;
                 let mut body = Vec::with_capacity(1 + versions.len() * 2);
-                body.push(count);
+                body.push(byte_len);
                 for version in versions {
                     body.extend_from_slice(&version.to_be_bytes());
                 }
                 (0x002b, body)
             }
             Self::SignatureAlgorithms(schemes) => {
-                let count = u16::try_from(schemes.len())
+                // RFC 8446 SignatureSchemeList: u16 byte-length + schemes, no count field.
+                let byte_len = u16::try_from(schemes.len() * 2)
                     .map_err(|_| TlsError::Spec("signature_algorithms exceeds u16 length".to_string()))?;
                 let mut body = Vec::with_capacity(2 + schemes.len() * 2);
-                body.extend_from_slice(&count.to_be_bytes());
+                body.extend_from_slice(&byte_len.to_be_bytes());
                 for scheme in schemes {
                     body.extend_from_slice(&scheme.to_be_bytes());
                 }
                 (0x000d, body)
             }
-            Self::Alpn(protos) => (0x0010, encode_alpn_list(protos)?),
+            Self::Alpn(protos) => (0x0010, prepend_list_len(&encode_alpn_list(protos)?)?),
             Self::EcPointFormats => (0x000b, vec![0x01, 0x00]),
             Self::SessionTicket => (0x0023, Vec::new()),
             Self::PskKeyExchangeModes => (0x002d, vec![0x01, 0x01]),
@@ -164,16 +173,21 @@ impl ExtensionSpec {
             Self::SignedCertificateTimestamp => (0x0012, Vec::new()),
             Self::RenegotiationInfo => (0xff01, vec![0x00]),
             Self::CompressCertificate(algos) => {
-                let count = u16::try_from(algos.len())
-                    .map_err(|_| TlsError::Spec("compress_certificate exceeds u16 length".to_string()))?;
-                let mut body = Vec::with_capacity(2 + algos.len() * 2);
-                body.extend_from_slice(&count.to_be_bytes());
+                // RFC 8871: 1-byte length counts BYTES + algos, no count field.
+                let byte_len = u8::try_from(algos.len() * 2)
+                    .map_err(|_| TlsError::Spec("compress_certificate exceeds 255 bytes".to_string()))?;
+                let mut body = Vec::with_capacity(1 + algos.len() * 2);
+                body.push(byte_len);
                 for algo in algos {
                     body.extend_from_slice(&algo.to_be_bytes());
                 }
                 (0x001b, body)
             }
-            Self::ApplicationSettings(protos) => (0x4469, encode_alpn_list(protos)?),
+            Self::ApplicationSettings(protos) => {
+                // ALPS (draft-ietf-tls-alps): 2-byte per-entry lengths (differs
+                // from ALPN), u16 list-length prefix.
+                (0x4469, prepend_list_len(&encode_alps_list(protos)?)?)
+            }
             Self::RecordSizeLimit(limit) => (0x001c, limit.to_be_bytes().to_vec()),
             Self::Padding => (0x0015, vec![0u8; rt.padding_len]),
             Self::Grease => (rt.grease_b, vec![0x00]),
@@ -189,13 +203,38 @@ impl ExtensionSpec {
     }
 }
 
-/// Encodes an ALPN-style protocol list: per entry, a u16 BE length
-/// followed by the raw protocol bytes.
+/// Prefixes a protocol list with its u16 BE byte-length (the RFC vector
+/// shape shared by ALPN and ALPS).
+fn prepend_list_len(list: &[u8]) -> Result<Vec<u8>, TlsError> {
+    let list_len = u16::try_from(list.len())
+        .map_err(|_| TlsError::Spec("protocol list exceeds u16 length".to_string()))?;
+    let mut out = Vec::with_capacity(2 + list.len());
+    out.extend_from_slice(&list_len.to_be_bytes());
+    out.extend_from_slice(list);
+    Ok(out)
+}
+
+/// Encodes an ALPN protocol list (RFC 7301): per entry, a u8 BE length
+/// followed by the raw protocol bytes. Returns just the entries; the caller
+/// prepends the list-length field.
 fn encode_alpn_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
     let mut out = Vec::new();
     for proto in protos {
+        let len = u8::try_from(proto.len())
+            .map_err(|_| TlsError::Spec("alpn protocol exceeds 255 bytes".to_string()))?;
+        out.push(len);
+        out.extend_from_slice(proto.as_bytes());
+    }
+    Ok(out)
+}
+
+/// Encodes an ALPS protocol list (draft-ietf-tls-alps): per entry, a u16 BE
+/// length followed by the raw protocol bytes — 2-byte entries, unlike ALPN.
+fn encode_alps_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
+    let mut out = Vec::new();
+    for proto in protos {
         let len = u16::try_from(proto.len())
-            .map_err(|_| TlsError::Spec("alpn protocol exceeds u16 length".to_string()))?;
+            .map_err(|_| TlsError::Spec("application_settings protocol exceeds u16 length".to_string()))?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(proto.as_bytes());
     }
@@ -229,16 +268,19 @@ mod tests {
     fn supported_groups_encodes_count_and_groups() {
         let ext = ExtensionSpec::SupportedGroups(vec![0x1301, 0x1302, 0x1303]);
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
-        // type 00 0a | len 00 08 (2+6) | count 00 03 | groups
-        assert_eq!(body, vec![0x00, 0x0a, 0x00, 0x08, 0x00, 0x03, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03]);
+        // RFC 8446 NamedGroupList: u16 byte-length + groups, NO count field.
+        // type 00 0a | len 00 08 (2+6) | byte_len 00 06 | groups
+        assert_eq!(body, vec![0x00, 0x0a, 0x00, 0x08, 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03]);
     }
 
     #[test]
     fn key_share_encodes_grease_and_x25519() {
         let ext = ExtensionSpec::KeyShare(vec![KeyShareGroup::Grease, KeyShareGroup::X25519]);
         let body = ext.encode_body(&RuntimeValues { grease_a: 0x1A1A, x25519_pub: [0xAB; 32], ..RuntimeValues::default() }).unwrap();
-        // type 00 33 | len 00 29 (5+36=41) | grease: 1a 1a 00 01 00 | x25519: 00 1d 00 20 <pub>
-        let mut expected = vec![0x00, 0x33, 0x00, 0x29, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x20];
+        // RFC 8446 KeyShare: u16 list-length + entries.
+        // entries: grease 5 bytes (1a 1a 00 01 00), x25519 36 bytes → list 41 bytes.
+        // type 00 33 | len 00 2b (2+41) | list_len 00 29 | grease | x25519
+        let mut expected = vec![0x00, 0x33, 0x00, 0x2b, 0x00, 0x29, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x20];
         expected.extend_from_slice(&[0xAB; 32]);
         assert_eq!(body, expected);
     }
@@ -247,25 +289,29 @@ mod tests {
     fn supported_versions_encodes_count8_and_versions() {
         let ext = ExtensionSpec::SupportedVersions(vec![0x0A0A, 0x0304, 0x0303]);
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
-        // type 00 2b | len 00 07 (1+6) | count 03 | versions
-        assert_eq!(body, vec![0x00, 0x2b, 0x00, 0x07, 0x03, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03]);
+        // RFC 8446: 1-byte length counts BYTES (n*2), not versions. 3 versions → len 6.
+        // type 00 2b | len 00 07 | len8 06 | versions
+        assert_eq!(body, vec![0x00, 0x2b, 0x00, 0x07, 0x06, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03]);
     }
 
     #[test]
     fn signature_algorithms_encodes_count_and_schemes() {
         let ext = ExtensionSpec::SignatureAlgorithms(vec![0x0403, 0x0804]);
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
-        // type 00 0d | len 00 06 (2+4) | count 00 02 | schemes
-        assert_eq!(body, vec![0x00, 0x0d, 0x00, 0x06, 0x00, 0x02, 0x04, 0x03, 0x08, 0x04]);
+        // RFC 8446 SignatureSchemeList: u16 byte-length + schemes, NO count field.
+        // type 00 0d | len 00 06 (2+4) | byte_len 00 04 | schemes
+        assert_eq!(body, vec![0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x04]);
     }
 
     #[test]
     fn alpn_encodes_list() {
         let ext = ExtensionSpec::Alpn(vec!["h2".into(), "http/1.1".into()]);
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
-        // type 00 10 | len 00 0e (14) | list: 00 02 h2 00 08 http/1.1
+        // RFC 7301: per-entry 1-byte length; u16 list-length counts bytes.
+        // list = 02 h2 08 http/1.1 (12 bytes).
+        // type 00 10 | len 00 0e (2+12) | list_len 00 0c | entries
         assert_eq!(body, vec![
-            0x00, 0x10, 0x00, 0x0e, 0x00, 0x02, b'h', b'2', 0x00, 0x08,
+            0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, b'h', b'2', 0x08,
             b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
         ]);
     }
@@ -312,16 +358,18 @@ mod tests {
     fn compress_certificate_encodes_count_and_algos() {
         let ext = ExtensionSpec::CompressCertificate(vec![0x0002, 0x0001]);
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
-        // type 00 1b | len 00 06 (2+4) | count 00 02 | algos
-        assert_eq!(body, vec![0x00, 0x1b, 0x00, 0x06, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01]);
+        // RFC 8871: 1-byte length counts BYTES + algos, NO count field.
+        // type 00 1b | len 00 05 | len8 04 | algos
+        assert_eq!(body, vec![0x00, 0x1b, 0x00, 0x05, 0x04, 0x00, 0x02, 0x00, 0x01]);
     }
 
     #[test]
     fn application_settings_encodes_list() {
         let ext = ExtensionSpec::ApplicationSettings(vec!["h2".into()]);
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
-        // type 44 69 | len 00 04 | list: 00 02 h2
-        assert_eq!(body, vec![0x44, 0x69, 0x00, 0x04, 0x00, 0x02, b'h', b'2']);
+        // ALPS (draft-ietf-tls-alps): 2-byte per-entry lengths, u16 list-length.
+        // type 44 69 | len 00 06 | list_len 00 04 | entry 00 02 h2
+        assert_eq!(body, vec![0x44, 0x69, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, b'h', b'2']);
     }
 
     #[test]
