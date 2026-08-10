@@ -66,10 +66,14 @@ impl AsyncRead for VlessClientStream {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, msg)));
                 }
                 Peel::Head => {
-                    // Fill the 2 header bytes through a local buffer (a read
-                    // sized to the remainder can never overshoot).
+                    // Bound the staging read to the header remainder — an
+                    // unbounded read can swallow the first payload byte when
+                    // the header arrives fragmented across write boundaries
+                    // (mirror the Addons state below).
+                    let start = self.head_filled;
+                    let need = 2 - start;
                     let mut tmp = [0u8; 2];
-                    let mut rb = ReadBuf::new(&mut tmp);
+                    let mut rb = ReadBuf::new(&mut tmp[..need]);
                     ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
                     let got = rb.filled().len();
                     if got == 0 {
@@ -78,8 +82,7 @@ impl AsyncRead for VlessClientStream {
                             "vless response header truncated (EOF)",
                         )));
                     }
-                    let start = self.head_filled;
-                    self.head[..got].copy_from_slice(&tmp[..got]);
+                    self.head[start..start + got].copy_from_slice(&tmp[..got]);
                     self.head_filled = start + got;
                     if self.head_filled < 2 {
                         continue;
@@ -175,6 +178,27 @@ mod tests {
         server.write_all(&[0x00, 0x00]).await.unwrap();
         server.write_all(b"hello native core").await.unwrap();
         assert_eq!(&read_n(stream, 5).await, b"hello");
+    }
+
+    #[tokio::test]
+    async fn peels_fragmented_header_across_writes() {
+        // The 2-byte response header arrives byte-by-byte: the first header
+        // byte lands alone, the second is bundled with the first payload byte
+        // (e.g. two TCP segments). A peel state that reads without bounding
+        // to the header remainder swallows that payload byte or mis-parses
+        // the header — this used to corrupt the stream.
+        let (client, server) = pair();
+        let stream = VlessClientStream::new(Box::new(client));
+        let writer = tokio::spawn(async move {
+            let mut server = server;
+            server.write_all(&[0x00]).await.unwrap();
+            tokio::task::yield_now().await;
+            server.write_all(&[0x00, b'h']).await.unwrap();
+            tokio::task::yield_now().await;
+            server.write_all(b"ello native core").await.unwrap();
+        });
+        assert_eq!(&read_n(stream, 5).await, b"hello");
+        writer.await.unwrap();
     }
 
     #[tokio::test]

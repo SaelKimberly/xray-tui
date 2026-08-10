@@ -6,6 +6,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 
 use crate::addr::{TargetAddr, encode_addr};
+use crate::error::NativeError;
 use crate::protocol::vmess::keys;
 
 pub const VERSION: u8 = 1;
@@ -67,14 +68,13 @@ fn rand_bytes(out: &mut [u8]) {
 /// VLESS in both Xray-core and v2ray-core (proxy/vmess/encoding/encoding.go),
 /// mihomo, and sing-vmess — the port comes FIRST, then the address type byte
 /// and bytes. The crate's [`encode_addr`] already emits exactly that order.
-#[must_use]
 pub fn encode_request(
     cmd_key: &[u8; 16],
     session: &Session,
     target: &TargetAddr,
     auth_ts: i64,
     entropy: &mut impl FnMut(&mut [u8]),
-) -> Vec<u8> {
+) -> Result<Vec<u8>, NativeError> {
     // --- plaintext header body (49 bytes for the minimal TCP/IPv4 form) ---
     let mut body = Vec::with_capacity(49);
     body.push(VERSION);
@@ -85,7 +85,7 @@ pub fn encode_request(
     body.push(SECURITY_AES128_GCM); // padding nibble 0 | security 3
     body.push(0); // reserved
     body.push(COMMAND_TCP);
-    encode_address_port(&mut body, target);
+    encode_address_port(&mut body, target)?;
     // padding: length 0 (we send the minimal body)
     let fnv = keys::fnv1a32(&body);
     body.extend_from_slice(&fnv.to_be_bytes());
@@ -146,7 +146,7 @@ pub fn encode_request(
     out.extend_from_slice(&len_cipher);
     out.extend_from_slice(&conn_nonce);
     out.extend_from_slice(&body_cipher);
-    out
+    Ok(out)
 }
 
 /// Wire length of a sealed request given the plaintext header body length:
@@ -160,8 +160,9 @@ pub const fn peek_seal_len(body_len: usize) -> usize {
 /// address (type byte + payload). `VMess` uses the same port-first
 /// `PortThenAddress()` order as VLESS — Go `encoding.go` address parser —
 /// which is exactly what [`encode_addr`] emits.
-fn encode_address_port(body: &mut Vec<u8>, target: &TargetAddr) {
-    body.extend_from_slice(&encode_addr(target));
+fn encode_address_port(body: &mut Vec<u8>, target: &TargetAddr) -> Result<(), NativeError> {
+    body.extend_from_slice(&encode_addr(target)?);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,7 +196,8 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 0x6000_0000_0000_0000, &mut fixed_entropy);
+        let wire =
+            encode_request(&ck, &s, &tgt, 0x6000_0000_0000_0000, &mut fixed_entropy).unwrap();
         // body = 38 fixed + port 2 + addr(1+4) + fnv 4 = 49; payloadAEAD = 49+16; lenAEAD 18; authID 16; nonce 8
         assert_eq!(wire.len(), 16 + 18 + 8 + 49 + 16);
         // authID golden (ts=0x6000000000000000, rand=aabbccdd, fixed cmdKey) —
@@ -210,7 +212,7 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy);
+        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy).unwrap();
         assert!(!wire[..16].iter().any(|b| *b == 0x11 || *b == 0x22)); // authID is ciphertext
         assert_eq!(wire.len(), 16 + 18 + 8 + 49 + 16);
     }
@@ -226,7 +228,7 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy);
+        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy).unwrap();
 
         let auth_id = &wire[..16];
         let len_cipher = &wire[16..34];
@@ -284,7 +286,7 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy);
+        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy).unwrap();
         assert_eq!(
             hex_encode(&wire),
             "79d348cf6b4707cf6acbb494bf257f1de2d3f7fed70400fdc38997b98856e876eea6abababababababab988161deb14ca4eb23a17a1a8bef86e406b8fd0192d050514be96e66e75ebc4ac82dbbbe0fa3ef08d80e26f393f4dea4c96aee6878ba3a7d22cceba18a67028d7e"

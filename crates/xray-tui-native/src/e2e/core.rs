@@ -54,16 +54,6 @@ impl CoreUnderTest {
             version: actual,
         })
     }
-
-    /// argv for spawning with the given config file.
-    #[must_use]
-    pub fn spawn_args(&self, config_path: &std::path::Path) -> Vec<String> {
-        let p = config_path.to_string_lossy().into_owned();
-        match self.kind {
-            CoreKind::Xray => vec!["-c".into(), p],
-            CoreKind::SingBox => vec!["run".into(), "-c".into(), p],
-        }
-    }
 }
 
 /// Probe the version string: exact probe per kind, bounded to 5s.

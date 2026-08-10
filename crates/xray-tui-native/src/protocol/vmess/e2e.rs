@@ -20,9 +20,7 @@ impl E2eCase for VmessCase {
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
-        let cert = env.certs.cert_pem.as_bytes();
-        let key = env.certs.key_pem.as_bytes();
-        let _ = (cert, key); // configs below reference PEM FILES on disk
+        // Configs reference the PEM FILES on disk, not the in-memory bytes.
         let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
         let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
         let json = match core {

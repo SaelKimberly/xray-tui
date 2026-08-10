@@ -24,8 +24,11 @@ pub fn uuid_bytes(uuid_str: &str) -> Result<[u8; 16], NativeError> {
 }
 
 /// Encode a VLESS request header (no addons, version 0).
-#[must_use]
-pub fn encode_request(uuid: &[u8; 16], target: &TargetAddr, command: u8) -> Vec<u8> {
+pub fn encode_request(
+    uuid: &[u8; 16],
+    target: &TargetAddr,
+    command: u8,
+) -> Result<Vec<u8>, NativeError> {
     let mut out = Vec::with_capacity(32);
     out.push(VERSION);
     out.extend_from_slice(uuid);
@@ -33,18 +36,18 @@ pub fn encode_request(uuid: &[u8; 16], target: &TargetAddr, command: u8) -> Vec<
     out.push(command);
     match command {
         CMD_TCP | CMD_UDP => {
-            out.extend_from_slice(&encode_addr(target));
+            out.extend_from_slice(&encode_addr(target)?);
         }
         CMD_MUX => {
             // Mux uses a fixed v1.mux.cool:0 target on the wire.
             out.extend_from_slice(&encode_addr(&TargetAddr::new(
                 crate::addr::Host::Domain("v1.mux.cool".into()),
                 0,
-            )));
+            ))?);
         }
         _ => {}
     }
-    out
+    Ok(out)
 }
 
 /// Validate the first bytes of the response header; returns the addon length.
@@ -81,7 +84,7 @@ mod tests {
     #[test]
     fn tcp_request_header_bytes_exact() {
         let target = TargetAddr::new(Host::new("127.0.0.1"), 8080);
-        let got = encode_request(&uuid(), &target, CMD_TCP);
+        let got = encode_request(&uuid(), &target, CMD_TCP).unwrap();
         // version, uuid, addon_len=0, cmd=1, port 0x1f90, type=1, 127.0.0.1
         let mut expected = vec![0x00];
         expected.extend_from_slice(&uuid());

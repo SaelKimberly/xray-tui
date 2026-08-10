@@ -36,7 +36,7 @@ pub async fn connect(
     }
 
     let uuid = header::uuid_bytes(&cfg.uuid)?;
-    let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP);
+    let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP)?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;
     tokio::time::timeout(timeout, stream.write_all(&request))

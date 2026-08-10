@@ -51,7 +51,7 @@ pub async fn connect(
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0);
-    let request = encode_request(&ck, &session, &ctx.target, ts, &mut entropy);
+    let request = encode_request(&ck, &session, &ctx.target, ts, &mut entropy)?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;
     tokio::time::timeout(timeout, stream.write_all(&request))
