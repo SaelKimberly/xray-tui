@@ -93,9 +93,7 @@ pub struct ClientHelloSpec {
 impl ExtensionSpec {
     /// Encodes the COMPLETE extension: type (u16 BE) + length (u16 BE) + body.
     ///
-    /// The length field counts the bytes after itself, except for the
-    /// fixed-format arms whose authoritative Task 2 vectors carry a distinct
-    /// length (see [`ExtensionSpec::declared_len`]).
+    /// The length field counts the bytes after itself.
     pub fn encode_body(&self, rt: &RuntimeValues) -> Result<Vec<u8>, TlsError> {
         let (ty, body) = match self {
             Self::ServerName => {
@@ -181,32 +179,13 @@ impl ExtensionSpec {
             Self::Grease => (rt.grease_b, vec![0x00]),
             Self::Raw { ty, data } => (*ty, data.clone()),
         };
-        let len = self.declared_len(&body)?;
+        let len = u16::try_from(body.len())
+            .map_err(|_| TlsError::Spec("extension body exceeds u16 length".to_string()))?;
         let mut out = Vec::with_capacity(4 + body.len());
         out.extend_from_slice(&ty.to_be_bytes());
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&body);
         Ok(out)
-    }
-
-    /// The length-field value for the extension body.
-    ///
-    /// Equal to the body byte count for every arm except the two fixed-format
-    /// extensions whose authoritative test vectors carry a distinct length:
-    /// `ec_point_formats` (`00 0b 00 01 01 00`) and `key_share`
-    /// (`00 33 00 28 ...`), where the vector's length is the sum of the
-    /// per-entry sizes declared in the brief (Grease = 4, X25519 = 36).
-    fn declared_len(&self, body: &[u8]) -> Result<u16, TlsError> {
-        let len = match self {
-            Self::EcPointFormats => 1,
-            Self::KeyShare(groups) => groups.iter().map(|g| match g {
-                KeyShareGroup::Grease => 4,
-                KeyShareGroup::X25519 => 36,
-            }).sum::<usize>(),
-            _ => body.len(),
-        };
-        u16::try_from(len)
-            .map_err(|_| TlsError::Spec("extension body exceeds u16 length".to_string()))
     }
 }
 
@@ -258,8 +237,8 @@ mod tests {
     fn key_share_encodes_grease_and_x25519() {
         let ext = ExtensionSpec::KeyShare(vec![KeyShareGroup::Grease, KeyShareGroup::X25519]);
         let body = ext.encode_body(&RuntimeValues { grease_a: 0x1A1A, x25519_pub: [0xAB; 32], ..RuntimeValues::default() }).unwrap();
-        // type 00 33 | len 00 28 (4+36=40) | grease: 1a 1a 00 01 00 | x25519: 00 1d 00 20 <pub>
-        let mut expected = vec![0x00, 0x33, 0x00, 0x28, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x20];
+        // type 00 33 | len 00 29 (5+36=41) | grease: 1a 1a 00 01 00 | x25519: 00 1d 00 20 <pub>
+        let mut expected = vec![0x00, 0x33, 0x00, 0x29, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x20];
         expected.extend_from_slice(&[0xAB; 32]);
         assert_eq!(body, expected);
     }
@@ -294,8 +273,8 @@ mod tests {
     #[test]
     fn ec_point_formats_encodes_one_format() {
         let body = ExtensionSpec::EcPointFormats.encode_body(&RuntimeValues::default()).unwrap();
-        // type 00 0b | len 00 01 | count 01 | format 00
-        assert_eq!(body, vec![0x00, 0x0b, 0x00, 0x01, 0x01, 0x00]);
+        // type 00 0b | len 00 02 | count 01 | format 00
+        assert_eq!(body, vec![0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
     }
 
     #[test]
