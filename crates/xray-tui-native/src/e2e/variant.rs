@@ -2,7 +2,16 @@
 //! gates which cores support it, and supplies the security strings for the
 //! server config and client params.
 
-use super::{CoreKind, SecurityVariant};
+use super::CoreKind;
+
+/// Payload-security variant: names itself, gates which cores support it, and
+/// supplies the security strings for the server config and client params.
+pub trait SecurityVariant: Sync {
+    fn name(&self) -> &'static str;
+    fn cores(&self) -> &'static [CoreKind];
+    fn server_security(&self, core: CoreKind) -> Option<&'static str>;
+    fn client_security(&self) -> &'static str;
+}
 
 /// `VMess` payload security: AES-128-GCM (xray header security byte 3).
 pub struct Aes128GcmVariant;

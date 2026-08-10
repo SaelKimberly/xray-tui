@@ -17,9 +17,12 @@ pub enum ProtocolKind {
 }
 
 /// One e2e scenario described as data.
+///
+/// Construct via [`CaseSpec::vless`] / [`CaseSpec::vmess`]; `protocol` and
+/// `security` are private invariants (a vmess case always carries a variant).
 pub struct CaseSpec {
-    pub protocol: ProtocolKind,
-    pub security: Option<Box<dyn SecurityVariant>>,
+    protocol: ProtocolKind,
+    security: Option<Box<dyn SecurityVariant>>,
 }
 
 impl CaseSpec {

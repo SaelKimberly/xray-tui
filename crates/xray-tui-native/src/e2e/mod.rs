@@ -16,7 +16,7 @@ use std::path::Path;
 pub use case::{CaseSpec, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{Certs, EchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo};
-pub use variant::{Aes128GcmVariant, Chacha20Poly1305Variant};
+pub use variant::{Aes128GcmVariant, Chacha20Poly1305Variant, SecurityVariant};
 
 use crate::NativeConnectParams;
 
@@ -36,15 +36,6 @@ pub struct ServerEnv<'a> {
 pub struct E2eExpect {
     pub status: u16,
     pub body: String,
-}
-
-/// Payload-security variant: names itself, gates which cores support it, and
-/// supplies the security strings for the server config and client params.
-pub trait SecurityVariant: Sync {
-    fn name(&self) -> &'static str;
-    fn cores(&self) -> &'static [CoreKind];
-    fn server_security(&self, core: CoreKind) -> Option<&'static str>;
-    fn client_security(&self) -> &'static str;
 }
 
 /// One end-to-end scenario: a core's server config, the native client params

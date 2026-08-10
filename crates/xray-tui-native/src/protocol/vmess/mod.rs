@@ -1,8 +1,9 @@
 //! `VMess` — native client (modern AEAD, xtls dialect).
 //!
 //! Wire contract: `thirdparty/Xray-core/proxy/vmess/encoding/{client,encoding,server}.go`
-//! and `proxy/vmess/aead/` (MIT). Only TCP + AES-128-GCM payload security;
-//! xray-core 26.x refuses `none`/`zero`/`auto` body streams server-side.
+//! and `proxy/vmess/aead/` (MIT). Payload security: AES-128-GCM or
+//! chacha20-poly1305; xray-core 26.x refuses `none`/`zero`/`auto` body
+//! streams server-side.
 
 use tokio::io::AsyncWriteExt;
 
@@ -11,7 +12,9 @@ use xray_tui_proto::proto_spec::VmessConfig;
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::protocol::vmess::header::{Session, encode_request};
+use crate::protocol::vmess::header::{
+    SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session, encode_request,
+};
 use crate::protocol::vmess::keys::cmd_key;
 use crate::protocol::vmess::stream::VmessClientStream;
 
@@ -27,8 +30,8 @@ pub fn check_security(cfg: &VmessConfig) -> Result<(), NativeError> {
 /// Map the requested `security.enc` to the header security byte.
 pub fn security_byte(cfg: &VmessConfig) -> Result<u8, NativeError> {
     match cfg.security.enc.as_deref() {
-        None | Some("" | "auto" | "aes-128-gcm") => Ok(3),
-        Some("chacha20-poly1305") => Ok(4),
+        None | Some("" | "auto" | "aes-128-gcm") => Ok(SECURITY_AES128_GCM),
+        Some("chacha20-poly1305") => Ok(SECURITY_CHACHA20_POLY1305),
         Some(other) => Err(NativeError::Config(format!(
             "vmess payload security {other:?} not supported (native core: aes-128-gcm, chacha20-poly1305)"
         ))),
@@ -117,13 +120,13 @@ mod tests {
     fn chacha20_security_accepted() {
         let cfg = vcfg("chacha20-poly1305");
         assert!(check_security(&cfg).is_ok());
-        assert_eq!(security_byte(&cfg).unwrap(), 4);
+        assert_eq!(security_byte(&cfg).unwrap(), SECURITY_CHACHA20_POLY1305);
     }
 
     #[test]
     fn aes128_security_still_default() {
         let cfg = vcfg("aes-128-gcm");
-        assert_eq!(security_byte(&cfg).unwrap(), 3);
+        assert_eq!(security_byte(&cfg).unwrap(), SECURITY_AES128_GCM);
         // absent/auto still map to the AES default
         let auto: VmessConfig = serde_json::from_value(serde_json::json!({
             "schema": "Vmess", "uuid": "00000000-0000-0000-0000-000000000000",
@@ -131,6 +134,6 @@ mod tests {
             "transport": { "type": "tcp" }
         }))
         .unwrap();
-        assert_eq!(security_byte(&auto).unwrap(), 3);
+        assert_eq!(security_byte(&auto).unwrap(), SECURITY_AES128_GCM);
     }
 }
