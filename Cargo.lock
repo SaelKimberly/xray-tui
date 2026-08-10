@@ -7537,6 +7537,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-tui-tls"
+version = "0.1.0"
+dependencies = [
+ "md-5 0.10.6",
+ "rcgen",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.19",
+ "tokio",
+ "webpki-roots",
+]
+
+[[package]]
 name = "yaml-rust2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
