@@ -332,42 +332,56 @@ impl KeySchedule {
 
 // ── AEAD record keys ───────────────────────────────────────────────────────
 
-/// An AEAD record key, nonce = sequence number (12-byte big-endian).
+/// An AEAD record key; the per-record nonce is
+/// `write_iv XOR sequence number` (RFC 8446 §5.3).
 pub struct AeadKey {
     key: LessSafeKey,
+    iv: [u8; 12],
 }
 
 impl AeadKey {
-    /// Derives a record key from a traffic secret:
-    /// `HKDF-Expand-Label(secret, "key", "", key_len)`.
+    /// Derives a record key and write IV from a traffic secret:
+    /// `HKDF-Expand-Label(secret, "key", "", key_len)` and
+    /// `HKDF-Expand-Label(secret, "iv", "", 12)`.
     pub fn new(suite: CipherSuiteId, secret: &[u8]) -> Result<Self> {
         let ks = KeySchedule::new(suite);
         let key_bytes = ks.hkdf_expand_label(secret, "key", &[], suite.key_len())?;
-        Self::from_key_bytes(suite, &key_bytes)
+        let iv_vec = ks.hkdf_expand_label(secret, "iv", &[], 12)?;
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&iv_vec);
+        Self::from_key_iv(suite, &key_bytes, iv)
     }
 
-    /// Builds a record key directly from raw key bytes (same material →
-    /// identical keys, for tests and TLS 1.3 export paths).
+    /// Builds a record key directly from raw key bytes with a zero IV
+    /// (same material → identical keys; for tests and raw-material paths).
     pub fn from_key_bytes(suite: CipherSuiteId, key_bytes: &[u8]) -> Result<Self> {
+        Self::from_key_iv(suite, key_bytes, [0u8; 12])
+    }
+
+    /// Builds a record key from raw key bytes and an explicit write IV.
+    pub fn from_key_iv(suite: CipherSuiteId, key_bytes: &[u8], iv: [u8; 12]) -> Result<Self> {
         let unbound = UnboundKey::new(suite.aead(), key_bytes)
             .map_err(|_| TlsError::Crypto("failed to create AEAD key".into()))?;
         Ok(Self {
             key: LessSafeKey::new(unbound),
+            iv,
         })
     }
 
-    /// TLS 1.3 record nonce: the sequence number as a 12-byte big-endian
-    /// value (RFC 8446 §5.3; the per-connection write IV is folded into the
-    /// caller's sequencing, so this engine's nonce starts from zero).
-    fn nonce(seq: u64) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[4..].copy_from_slice(&seq.to_be_bytes());
+    /// TLS 1.3 record nonce = `write_iv` XOR the sequence number encoded as
+    /// a right-aligned 12-byte big-endian value (RFC 8446 §5.3).
+    fn make_nonce(&self, seq: u64) -> [u8; 12] {
+        let mut n = self.iv;
+        let seq_bytes = seq.to_be_bytes();
+        for i in 0..8 {
+            n[4 + i] ^= seq_bytes[i];
+        }
         n
     }
 
     /// Encrypts `plaintext` under `(seq, aad)`, appending the AEAD tag.
     pub fn seal(&self, seq: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = Nonce::assume_unique_for_key(Self::nonce(seq));
+        let nonce = Nonce::assume_unique_for_key(self.make_nonce(seq));
         let mut in_out = plaintext.to_vec();
         self.key
             .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
@@ -377,7 +391,7 @@ impl AeadKey {
 
     /// Decrypts and authenticates `ciphertext` under `(seq, aad)`.
     pub fn open(&self, seq: u64, aad: &[u8], ciphertext: &mut [u8]) -> Result<Vec<u8>> {
-        let nonce = Nonce::assume_unique_for_key(Self::nonce(seq));
+        let nonce = Nonce::assume_unique_for_key(self.make_nonce(seq));
         let plaintext = self
             .key
             .open_in_place(nonce, Aad::from(aad), ciphertext)
@@ -577,6 +591,9 @@ mod tests {
         let c_hs = decode_hex(CLIENT_HS_TRAFFIC);
         let key = ks.hkdf_expand_label(&c_hs, "key", &[], 16).unwrap();
         assert_eq!(hex(&key), CLIENT_HS_KEY);
+        // client handshake write IV = HKDF-Expand-Label(c_hs_traffic, "iv", "", 12).
+        let iv = ks.hkdf_expand_label(&c_hs, "iv", &[], 12).unwrap();
+        assert_eq!(hex(&iv), "5bd3c71b836e0b76bb73265f");
     }
 
     /// Server `Finished` `verify_data` = `HMAC(finished_key, Hash(CH..CV))`.
@@ -623,6 +640,47 @@ mod tests {
         let d = AeadKey::from_key_bytes(suite, &[0x11; 16]).unwrap();
         let mut ct_c = c.seal(3, b"aad", b"payload").unwrap();
         assert_eq!(d.open(3, b"aad", &mut ct_c).unwrap(), b"payload");
+    }
+
+    /// `new` (traffic-secret derivation) and `from_key_iv` (explicit key +
+    /// IV from the same expansions) build interoperable keys.
+    #[test]
+    fn new_matches_from_key_iv() {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let secret = [0x42; 32];
+        let ks = KeySchedule::new(suite);
+        let key_bytes = ks.hkdf_expand_label(&secret, "key", &[], 16).unwrap();
+        let iv_vec = ks.hkdf_expand_label(&secret, "iv", &[], 12).unwrap();
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&iv_vec);
+
+        let a = AeadKey::new(suite, &secret).unwrap();
+        let b = AeadKey::from_key_iv(suite, &key_bytes, iv).unwrap();
+        let mut ct = a.seal(5, b"aad", b"payload").unwrap();
+        assert_eq!(b.open(5, b"aad", &mut ct).unwrap(), b"payload");
+    }
+
+    /// Nonce = `write_iv` XOR right-aligned 12-byte big-endian seq (RFC 8446
+    /// §5.3, reference `make_nonce` formula).
+    #[test]
+    fn nonce_is_iv_xor_seq() {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let iv = [0x5d, 0x31, 0x3e, 0xb2, 0x67, 0x12, 0x76, 0xee, 0x13, 0x00, 0x0b, 0x30];
+        let key = AeadKey::from_key_iv(suite, &[0x11; 16], iv).unwrap();
+
+        assert_eq!(key.make_nonce(0), iv);
+        let mut expected = iv;
+        for i in 0..8 {
+            expected[4 + i] ^= (1u64).to_be_bytes()[i];
+        }
+        assert_eq!(key.make_nonce(1), expected);
+        // seq 2^32 must flip the first nonce octet of the 8-byte field.
+        let mut expected = iv;
+        let seq = 1u64 << 32;
+        for i in 0..8 {
+            expected[4 + i] ^= seq.to_be_bytes()[i];
+        }
+        assert_eq!(key.make_nonce(seq), expected);
     }
 
     /// A different key or sequence number fails authentication.
