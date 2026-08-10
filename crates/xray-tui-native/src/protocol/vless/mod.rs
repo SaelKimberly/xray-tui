@@ -9,8 +9,6 @@ use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::protocol::vless::stream::VlessClientStream;
 
-#[cfg(feature = "native-e2e")]
-pub mod e2e;
 pub mod header;
 pub mod stream;
 

@@ -17,7 +17,8 @@ pub fn cmd_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
     m.finalize().into()
 }
 
-/// 32-byte chacha20poly1305 key for a 16-byte VMess session body key.
+/// 32-byte `chacha20poly1305` key for a 16-byte `VMess` session body key.
+///
 /// Mirrors Go `GenerateChacha20Poly1305Key` (xray
 /// `proxy/vmess/encoding/auth.go`, sing-vmess `protocol.go`):
 /// `md5(k) ‖ md5(md5(k))` — chained double md5, never zeros.

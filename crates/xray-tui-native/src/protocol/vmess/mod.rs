@@ -15,8 +15,6 @@ use crate::protocol::vmess::header::{Session, encode_request};
 use crate::protocol::vmess::keys::cmd_key;
 use crate::protocol::vmess::stream::VmessClientStream;
 
-#[cfg(feature = "native-e2e")]
-pub mod e2e;
 pub mod header;
 pub mod keys;
 pub mod stream;
