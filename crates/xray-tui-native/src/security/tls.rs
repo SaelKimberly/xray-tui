@@ -13,11 +13,16 @@ use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 
-/// Test/e2e override: a client config trusting exactly one CA (the harness
-/// CA). Production builds use webpki-roots and carry no test state.
+// Test/e2e override: a client config trusting exactly one CA (the harness
+// CA). Thread-local: each `#[tokio::test]` runs on its own OS thread with its
+// own harness CA, so parallel e2e cases can't clobber each other's trust
+// store. Production builds use webpki-roots and carry no test state.
 #[doc(hidden)]
 #[cfg(any(test, feature = "native-e2e"))]
-static TEST_CFG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+std::thread_local! {
+    static TEST_CFG: std::cell::RefCell<Option<Arc<rustls::ClientConfig>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Build a client config trusting exactly `ca_der` (test/e2e harness only).
 #[doc(hidden)]
@@ -33,11 +38,12 @@ pub fn test_client_config(ca_der: &[u8]) -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-/// Install a test-only TLS client config (root store = harness CA).
+/// Install a test-only TLS client config (root store = harness CA). Stored
+/// per-thread so parallel e2e cases with distinct CAs don't interfere.
 #[doc(hidden)]
 #[cfg(any(test, feature = "native-e2e"))]
 pub fn set_test_config(cfg: rustls::ClientConfig) {
-    let _ = TEST_CFG.set(Arc::new(cfg));
+    TEST_CFG.with(|c| *c.borrow_mut() = Some(Arc::new(cfg)));
 }
 
 fn default_config() -> Arc<rustls::ClientConfig> {
@@ -52,7 +58,7 @@ fn default_config() -> Arc<rustls::ClientConfig> {
 
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     #[cfg(any(test, feature = "native-e2e"))]
-    let mut config = TEST_CFG.get().cloned().unwrap_or_else(default_config);
+    let mut config = TEST_CFG.with(|c| c.borrow().clone()).unwrap_or_else(default_config);
     #[cfg(not(any(test, feature = "native-e2e")))]
     let mut config = default_config();
     let alpn = ctx.alpn_vec();

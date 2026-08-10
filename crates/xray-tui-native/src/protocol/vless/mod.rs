@@ -11,6 +11,8 @@ use crate::protocol::vless::stream::VlessClientStream;
 
 pub mod header;
 pub mod stream;
+#[cfg(feature = "native-e2e")]
+pub mod e2e;
 
 /// Connect through a VLESS outbound over an already-secured stream.
 ///

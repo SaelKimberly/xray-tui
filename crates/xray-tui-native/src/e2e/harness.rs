@@ -7,6 +7,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::core::CoreKind;
@@ -14,10 +15,14 @@ use super::core::CoreKind;
 pub struct EchoServer {
     pub addr: SocketAddr,
     handle: Option<std::thread::JoinHandle<()>>,
+    server: Arc<tiny_http::Server>,
 }
 
 impl Drop for EchoServer {
     fn drop(&mut self) {
+        // Unblock the accept loop (it blocks forever on incoming_requests)
+        // so the thread can exit and join returns instead of hanging.
+        self.server.unblock();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -27,10 +32,11 @@ impl Drop for EchoServer {
 /// Spawn a tiny_http responder on 127.0.0.1:ephemeral serving a fixed body.
 /// tiny_http is synchronous — dedicated thread, requests drained until drop.
 pub fn spawn_echo() -> EchoServer {
-    let server = tiny_http::Server::http("127.0.0.1:0").expect("bind echo");
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind echo"));
     let addr = server.server_addr().to_ip().expect("ip addr");
+    let srv = server.clone();
     let handle = std::thread::spawn(move || {
-        for request in server.incoming_requests() {
+        for request in srv.incoming_requests() {
             let response =
                 tiny_http::Response::from_string("hello native core").with_status_code(200);
             let _ = request.respond(response);
@@ -39,6 +45,7 @@ pub fn spawn_echo() -> EchoServer {
     EchoServer {
         addr,
         handle: Some(handle),
+        server,
     }
 }
 
