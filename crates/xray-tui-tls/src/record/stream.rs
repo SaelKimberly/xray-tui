@@ -46,6 +46,15 @@ pub struct AppKeys {
 
 /// A TLS 1.3 application-data stream: decrypts records on read, encrypts and
 /// frames plaintext on write.
+///
+/// # EOF semantics (deliberate deviation from RFC 8446 §6.1)
+///
+/// Transport EOF *without* `close_notify` is surfaced as a clean EOF
+/// (`Ready(Ok(()))` with zero bytes), deliberately: this stream is a proxy
+/// tunnel whose servers close with TCP FIN and do not guarantee `close_notify`
+/// (RST arrives as an `io::Error` before the record layer observes EOF).
+/// Truncation attacks per RFC 8446 §6.1 are out of scope for this tunnel
+/// semantic; a `close_notify` is still honored as EOF when present.
 pub struct TlsStream<S> {
     inner: S,
     keys: AppKeys,
@@ -275,8 +284,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(None)) => {
-                    // Clean inner EOF without close_notify: teardown is TCP
-                    // close in this codebase.
+                    // Transport EOF without close_notify: clean EOF by design
+                    // (tunnel semantics — see the type-level docs).
                     this.closed = true;
                     return Poll::Ready(Ok(()));
                 }
