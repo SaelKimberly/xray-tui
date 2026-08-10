@@ -6,7 +6,7 @@ Scope: `crates/xray-tui-native`
 
 ## Goal
 
-1. Implement a second native protocol: **VMess over TCP, modern AEAD header, `none` payload security** — the simplest correct VMess slice, interoperable with xray-core and sing-box.
+1. Implement a second native protocol: **VMess over TCP, modern AEAD header, AES-128-GCM payload security** — the smallest VMess slice both cores accept, interoperable with xray-core and sing-box.
 2. Replace the ad-hoc per-protocol e2e tests with a **unified, declarative testing pipeline**: one driver executing the same 7 steps for any protocol/core pair, with each protocol providing a testing-enablement trait impl behind `feature = "native-e2e"`.
 3. VMess is the proof-of-concept: it and the existing VLESS implementation both implement the trait, and both e2e suites run through the pipeline.
 
@@ -96,7 +96,10 @@ src/protocol/vmess/e2e.rs   #[cfg(feature = "native-e2e")] impl E2eCase for Vmes
 
 - `VlessCase` / `VmessCase` — `Default` unit structs; hardcoded shared UUID
   `00000000-0000-0000-0000-000000000000`, sni `localhost`, alpn `http/1.1`,
-  TLS + TCP transport, security payload `none` (VMess).
+  TLS + TCP transport, payload security `aes-128-gcm` (VMess — see the
+  security-scope decision: xray-core 26.x validates only AES-128-GCM=3 /
+  CHACHA20=4 in the body stream; `none`/`zero`/`auto` are refused server-side,
+  verified in `thirdparty/Xray-core/proxy/vmess/encoding/server.go`).
 - `client_trust` installs the harness CA: `security::tls::set_test_config(test_client_config(&certs.ca_der))` (existing pattern).
 - `server_config(xray | sing-box)` hand-rolls flat inbound JSON: xray `inbounds/outbounds` shape, sing-box `inbounds/outbounds` shape. **Deliberately not** the proto `inject_to` builders — those emit outbound blocks for profile configs, wrong shape for inbound test servers.
 
@@ -109,19 +112,23 @@ src/protocol/vmess/
   stream.rs — VMessStream: peel response header on first read
 ```
 
-Wire contract implemented **verbatim from `thirdparty/Xray-core/proxy/vmess/encoding/`** (read the Go source at implementation time, not memory):
+Wire contract implemented **verbatim from `thirdparty/Xray-core/proxy/vmess/encoding/`** — Go source is the authority; `thirdparty/shoes/src/vmess/` (complete Rust VMess, aws-lc-rs AEAD) and sing-box's vendored `sing-vmess` (`~/go/pkg/mod/github.com/sagernet/sing-vmess@v0.2.8-*/`) are cross-checks.
 
-- cmdKey = HMAC-MD5 KDF over md5(uuid·bytes), salted with the standard VMess constant `c48619fe-8f02-49e0-b9e9-edf763e17e21` (the milestone-M4 note already names it).
-- Request: `version(1)=1` | `requestBodyIV(16)` | `requestBodyKey(16)` | AES-128-GCM encrypted header body — command 0x01 (TCP), port (BE), addr type, addr, random(4), timestamp(4).
-- Payload: security `none` → raw bytes after the header (AEAD header mandatory on modern cores regardless).
-- Response: the server's response header (`version(1)=0` + length + V(4)/IV(16)/Key(16), exact framing from Go) is **peeled on first read** — same pattern as VLESS, which proved robust against both cores' send-timing variants.
-- `protocol/mod.rs`: replace `ProtocolConfig::Vmess(_) => not_impl("vmess")` with `vmess::connect(...)`. `ConnectShape` already routes VMess to `TcpStream` (exhaustive match — confirm at implementation time).
+- `cmdKey = md5(uuid_bytes ‖ "c48619fe-8f02-49e0-b9e9-edf763e17e21")` — confirmed in `common/protocol/id.go` `NewID` (`uuid.Bytes()` = the 16 raw UUID bytes).
+- Session (client, per connection): random `requestBodyIV(16)` + `requestBodyKey(16)` + random `responseHeader(1)` byte. `responseBodyKey = sha256(requestBodyKey)[:16]`, `responseBodyIV = sha256(requestBodyIV)[:16]`.
+- AuthID (per request): AES-128-ECB(key = `KDF16(cmdKey, "AES Auth ID Encryption")`, block = `[unix_ts: 8B BE][random: 4B][crc32-ieee of the 12 bytes: 4B BE]`) — 16 bytes out.
+- `KDF(key, path...)` = nested HMAC-SHA256: `msg = HMAC-SHA256("VMess AEAD KDF", key)`, then for each path string `v`: `msg = HMAC-SHA256(v, msg)`; `KDF16` = first 16 bytes. (Verified against Go `aead/kdf.go`.)
+- **Request header body** (pre-seal, command TCP): `version(1)=1 | requestBodyIV(16) | requestBodyKey(16) | responseHeader(1) | option(1)=0 | [padding_len(4 bits)|security(4 bits)=0x03](1) | 0(1) | command(1)=0x01 | addr(type|addr) | port(2 BE) | [padding] | FNV-1a32(4 BE over all preceding bytes)`. Addr types: 1=IPv4, 2=domain, 3=IPv6 (`payload.go`).
+- **Seal** (`aead/encrypt.go`): `nonce(8B random)`; `lenAEAD = AES-128-GCM(KDF16(cmdKey,"VMess Header AEAD Key_Length",authID,nonce), KDF(cmdKey,"VMess Header AEAD Nonce_Length",authID,nonce)[:12], 2B BE header length, aad=authID)` (18B); `payloadAEAD = AES-128-GCM(KDF16(cmdKey,"VMess Header AEAD Key",authID,nonce), KDF(...,[:12]), body, aad=authID)`. Wire: `authID(16) | lenAEAD(18) | nonce(8) | payloadAEAD`.
+- **Payload records** (both directions, `aes-128-gcm`): each record = `2B BE length | AES-128-GCM(key=sessionKey, nonce)` where request-side session = `requestBodyKey`/`requestBodyIV`, response-side = `responseBody*`; nonce = session IV with the FIRST TWO bytes overwritten by a BE chunk counter starting at 0 (`GenerateChunkNonce`), used 12 bytes. No authenticated length, no chunk masking (option=0).
+- **Response header**: after the request header, the server replies `lenAEAD(18) | payloadAEAD` where `lenAEAD = AES-128-GCM(KDF16(respKey,"AEAD Resp Header Len Key"), KDF(respIV,"AEAD Resp Header Len IV")[:12], 2B len, aad=nil)` and the payload (4B: `responseHeader | option | 0 | 0`) is `AES-128-GCM(KDF16(respKey,"AEAD Resp Header Key"), KDF(respIV,"AEAD Resp Header IV")[:12], ..., aad=nil)`. Client verifies byte 0 == its random `responseHeader` (echo check), then body is the response-side record stream (handled by the tunnel).
+- `vmess::connect` (in `protocol/mod.rs`, replacing `not_impl`): write request body+seal, **read + verify the response header eagerly** (bounded by `timeouts::PROTOCOL`), return `VmessClientStream` (decrypts response records on read, encrypts request records on write). `ConnectShape` already routes VMess to `TcpStream`.
 
 ### Dependencies
 
-- **Runtime (unconditional, production paths):** `aes-gcm`, `hmac` (VMess header is mandatory for any VMess client → not test-gated). `md-5` already present.
+- **Runtime (unconditional, production paths):** `aes` (ECB for AuthID + block ops), `aes-gcm` (header + record AEAD), `hmac` (KDF + md5-HMAC chains), `sha2` (responseBodyKey/IV), `crc32fast` (AuthID checksum), `md-5` (cmdKey — already present). VMess's AEAD header + records are mandatory for any VMess client → not test-gated.
 - **Feature-gated (`native-e2e`):** `serde_json`, `tempfile`, `rcgen`, `tiny_http` move from dev-deps to `[dependencies]` with `optional = true`, enabled by the `native-e2e` feature (the e2e module lives in the crate, so dev-deps are unavailable to it).
-- `aes`/`cfb-mode` deferred until a CFB security mode is added; `chacha20-poly1305` likewise.
+- `chacha20-poly1305` (body security) and legacy CFB modes deferred.
 - `examples/native_connect_check.rs` deleted; `tiny_http`/`rcgen`/`tempfile` disappear from dev-deps.
 
 ## Data Flow (one attempt)
@@ -152,13 +159,13 @@ test ── run() ── steps 1-4 ── connect() ── transport tcp → sec
 
 ## Out of Scope
 
-- VMess payload securities beyond `none` (aes-128-gcm / chacha20-poly1305 / auto / zero) and legacy alterId/AEAD-less clients (modern cores reject them).
+- VMess payload securities beyond `aes-128-gcm` (chacha20-poly1305, legacy alterId/AEAD-less clients — modern cores reject or never accept them). Config values `none`/`zero`/`auto` on the native client error loudly (xray-core 26.x cannot serve them).
 - Non-TCP transports for either protocol; VMess over mKCP/WS/QUIC.
 - Version-conditioned server configs.
 - Making the sandbox cargo-test-harness stall go away (environmental; bounded retries contain it).
 
 ## Risks
 
-- **Wire details from Go source are authoritative but dense** (option flags, KDF chain). Mitigation: implement header-by-header with the encoding.go file open; e2e against real cores is the final arbiter.
-- **Response-header peel timing** differs between xray/sing-box VMess servers — the VLESS pattern already handles this; the parse must not consume relayed bytes (peel = exact header length only).
-- **sing-box VMess `none` security acceptance** — verify server-side config field during implementation; if sing-box rejects explicit `none`, fall back to omitting security where the server default matches (document the choice in the spec's risks section if it happens).
+- **Wire details from Go source are authoritative but dense** (option flags, KDF chain). Mitigation: implement header-by-header with the encoding.go file open; every KDF step has a committed golden vector (python-computed from the Go semantics); e2e against real cores is the final arbiter.
+- **xtls header-body dialect vs sing-vmess**: the xtls request-body layout (responseHeader/option/padding/FNV-1a) must be accepted by sing-box's server too. sing-vmess is a reimplementation; if it rejects the xtls layout, the body generator adapts to the dialect sing-vmess parses (fields are additive — expected to accept; both cores' e2e prove it).
+- **Echo-back mismatch attack surface**: response-header byte 0 must match the client's random byte; verify and fail loudly (catches stream misalignment early).
