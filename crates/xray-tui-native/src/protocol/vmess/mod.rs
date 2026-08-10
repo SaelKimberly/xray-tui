@@ -23,10 +23,16 @@ pub mod stream;
 
 /// Validate the `VMess` payload security the config requests.
 pub fn check_security(cfg: &VmessConfig) -> Result<(), NativeError> {
+    security_byte(cfg).map(|_| ())
+}
+
+/// Map the requested `security.enc` to the header security byte.
+pub fn security_byte(cfg: &VmessConfig) -> Result<u8, NativeError> {
     match cfg.security.enc.as_deref() {
-        None | Some("" | "auto" | "aes-128-gcm") => Ok(()),
+        None | Some("" | "auto" | "aes-128-gcm") => Ok(3),
+        Some("chacha20-poly1305") => Ok(4),
         Some(other) => Err(NativeError::Config(format!(
-            "vmess payload security {other:?} not supported (native core: aes-128-gcm only)"
+            "vmess payload security {other:?} not supported (native core: aes-128-gcm, chacha20-poly1305)"
         ))),
     }
 }
@@ -40,7 +46,8 @@ pub async fn connect(
     check_security(cfg)?;
     let uuid = crate::protocol::vless::header::uuid_bytes(&cfg.uuid)?;
     let ck = cmd_key(&uuid);
-    let session = Session::new();
+    let mut session = Session::new();
+    session.security = security_byte(cfg)?;
 
     let mut entropy = |out: &mut [u8]| {
         use ring::rand::{SecureRandom, SystemRandom};
@@ -79,8 +86,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_payload_securities() {
-        for enc in ["none", "zero", "chacha20-poly1305"] {
+    fn rejects_none_zero_payload_security() {
+        for enc in ["none", "zero"] {
             let cfg = vcfg(enc);
             assert!(
                 matches!(check_security(&cfg), Err(NativeError::Config(_))),
@@ -106,5 +113,26 @@ mod tests {
         .expect("vmess config without security key parses");
         assert!(cfg.security.enc.is_none());
         assert!(check_security(&cfg).is_ok());
+    }
+
+    #[test]
+    fn chacha20_security_accepted() {
+        let cfg = vcfg("chacha20-poly1305");
+        assert!(check_security(&cfg).is_ok());
+        assert_eq!(security_byte(&cfg).unwrap(), 4);
+    }
+
+    #[test]
+    fn aes128_security_still_default() {
+        let cfg = vcfg("aes-128-gcm");
+        assert_eq!(security_byte(&cfg).unwrap(), 3);
+        // absent/auto still map to the AES default
+        let auto: VmessConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vmess", "uuid": "00000000-0000-0000-0000-000000000000",
+            "security": { "enc": "auto", "type": "tls", "sni": "localhost", "alpn": "http/1.1" },
+            "transport": { "type": "tcp" }
+        }))
+        .unwrap();
+        assert_eq!(security_byte(&auto).unwrap(), 3);
     }
 }
