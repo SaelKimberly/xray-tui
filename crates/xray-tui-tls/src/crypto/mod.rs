@@ -1,1 +1,3 @@
-//! Crypto primitives module (stub).
+//! Crypto primitives and offline fingerprint encoders.
+
+pub mod fingerprint;

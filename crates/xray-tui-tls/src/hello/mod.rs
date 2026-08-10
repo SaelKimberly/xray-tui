@@ -12,6 +12,7 @@ use crate::error::TlsError;
 use crate::spec::grease::GREASE_PLACEHOLDER;
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec};
 
+pub mod parse;
 pub use crate::SecureRandom;
 
 /// Runtime inputs for a single `ClientHello` build.
@@ -293,6 +294,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{build_hello, to_record, BuildParams, SecureRandom};
+    use crate::hello::parse::parse_hello;
     use crate::spec::grease::GREASE_PLACEHOLDER;
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
 
@@ -454,7 +456,7 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_hello(&hello.handshake_bytes);
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
         // cipher_suites[0] is the first slot-A placeholder.
         assert_eq!(parsed.cipher_suites[0], 0x0A0A);
         assert_eq!(parsed.cipher_suites[1], 0x1301);
@@ -505,7 +507,7 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_hello(&hello.handshake_bytes);
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
         assert_eq!(parsed.cipher_suites[0], 0x0A0A);
         assert_eq!(parsed.cipher_suites[1], 0x2A2A);
         assert_eq!(parsed.cipher_suites[2], 0x1301);
@@ -532,7 +534,7 @@ mod tests {
 
         assert_eq!(hello.record_bytes.len(), 512);
         assert_eq!(hello.handshake_bytes.len(), 507);
-        let parsed = parse_hello(&hello.handshake_bytes);
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
         let padding = parsed.extension(0x0015).expect("padding extension");
         assert_eq!(padding.len(), 200);
         assert!(padding.iter().all(|&b| b == 0));
@@ -560,7 +562,7 @@ mod tests {
         )
         .unwrap();
         assert!(hello.record_bytes.len() > 512);
-        let parsed = parse_hello(&hello.handshake_bytes);
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
         assert!(parsed.extension(0x0015).is_none(), "no padding when already >= 512");
     }
 
@@ -619,14 +621,14 @@ mod tests {
 
         // Some(...) replaces the spec's ALPN list.
         let overridden = build(Some(&["h2"]));
-        let parsed = parse_hello(&overridden.handshake_bytes);
+        let parsed = parse_hello(&overridden.handshake_bytes).unwrap();
         let alpn = parsed.extension(0x0010).expect("alpn");
         assert!(alpn.windows(2).any(|w| w == b"h2".as_slice()));
         assert!(!alpn.windows(2).any(|w| w == b"sp".as_slice()));
 
         // None keeps the spec's list.
         let spec_alpn = build(None);
-        let parsed = parse_hello(&spec_alpn.handshake_bytes);
+        let parsed = parse_hello(&spec_alpn.handshake_bytes).unwrap();
         let alpn = parsed.extension(0x0010).expect("alpn");
         assert!(alpn.windows(9).any(|w| w == b"spec-only".as_slice()));
     }
@@ -657,52 +659,26 @@ mod tests {
         assert!(hello.session_id_range.is_none());
     }
 
-    /// Parsed view of a `ClientHello` handshake message (test helper).
-    struct ParsedHello {
-        cipher_suites: Vec<u16>,
-        extensions: Vec<(u16, Vec<u8>)>,
-    }
-
-    impl ParsedHello {
-        /// Returns the body of the extension with the given type.
-        fn extension(&self, ty: u16) -> Option<&[u8]> {
-            self.extensions
-                .iter()
-                .find(|(t, _)| *t == ty)
-                .map(|(_, data)| data.as_slice())
+    /// Fixed `BuildParams` for the round-trip test (Chrome 130 profile
+    /// inputs, deterministic RNG).
+    fn params_fixed(rng: &FixedRandom) -> BuildParams<'_> {
+        BuildParams {
+            server_name: "tls.peet.ws",
+            alpn: Some(&["h2", "http/1.1"]),
+            x25519_pub: &[0xAB; 32],
+            rng,
         }
     }
 
-    /// Parses a `ClientHello` handshake message into its top-level fields.
-    fn parse_hello(hs: &[u8]) -> ParsedHello {
-        assert_eq!(hs[0], 0x01, "handshake type");
-        let body_len = (usize::from(hs[1]) << 16) | (usize::from(hs[2]) << 8) | usize::from(hs[3]);
-        assert_eq!(body_len, hs.len() - 4, "handshake body length");
-        let mut off = 4;
-        off += 2; // legacy_version
-        off += 32; // random
-        let sid_len = usize::from(hs[off]);
-        off += 1 + sid_len; // session id
-        let cs_len = usize::from(u16::from_be_bytes([hs[off], hs[off + 1]]));
-        off += 2;
-        let mut cipher_suites = Vec::with_capacity(cs_len / 2);
-        for _ in 0..cs_len / 2 {
-            cipher_suites.push(u16::from_be_bytes([hs[off], hs[off + 1]]));
-            off += 2;
-        }
-        let comp_len = usize::from(hs[off]);
-        off += 1 + comp_len; // compression methods
-        let ext_total = usize::from(u16::from_be_bytes([hs[off], hs[off + 1]]));
-        off += 2;
-        let ext_end = off + ext_total;
-        let mut extensions = Vec::new();
-        while off < ext_end {
-            let ty = u16::from_be_bytes([hs[off], hs[off + 1]]);
-            let len = usize::from(u16::from_be_bytes([hs[off + 2], hs[off + 3]]));
-            extensions.push((ty, hs[off + 4..off + 4 + len].to_vec()));
-            off += 4 + len;
-        }
-        assert_eq!(off, ext_end, "extensions consumed exactly");
-        ParsedHello { cipher_suites, extensions }
+    #[test]
+    fn parse_roundtrip_of_built_hello() {
+        let spec = test_spec();
+        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+        let hello = build_hello(&spec, &params_fixed(&rng)).unwrap();
+        let parsed = parse_hello(&hello.handshake_bytes).unwrap();
+        assert_eq!(parsed.legacy_version, 0x0303);
+        assert_eq!(parsed.cipher_suites.len(), spec.cipher_suites.len());
+        assert!(parsed.extensions.iter().any(|(t, _)| *t == 0x0000)); // SNI present
+        assert!(parsed.extension(0x0010).is_some(), "ALPN present");
     }
 }
