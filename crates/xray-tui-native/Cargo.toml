@@ -16,22 +16,31 @@ rustls = { workspace = true, features = ["ring"] }
 tokio-rustls = "0.26"
 webpki-roots = "1"
 
+# VMess wire crypto (mandatory for any VMess client — not feature-gated)
+aes = "0.8"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+crc32fast = "1"
+md-5 = "0.10"
+
 # errors
 thiserror.workspace = true
 
 # misc
 uuid.workspace = true
-md-5 = "0.10"
+
+# e2e pipeline (crate-side module -> real deps, optional behind the feature)
+serde_json = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
+rcgen = { version = "0.13", optional = true }
+tiny_http = { version = "0.12", optional = true }
 
 [lints]
 workspace = true
 
 [features]
-native-e2e = []
+native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http"]
 
 [dev-dependencies]
-serde_json.workspace = true
-tempfile = "3"
-rcgen = "0.13"
-tiny_http = "0.12"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
