@@ -2,17 +2,18 @@
 //!
 //! RFC 8701 defines GREASE values with equal high and low bytes
 //! (`0x0A0A`, `0x1A1A`, ..., `0xFAFA`). Browsers sprinkle them into
-//! ClientHellos to keep the ecosystem extensible; we mirror that.
+//! `ClientHello`s to keep the ecosystem extensible; we mirror that.
 
 use crate::error::TlsError;
 
 /// The placeholder value specs write for a GREASE slot.
 pub const GREASE_PLACEHOLDER: u16 = 0xCACA;
 
-/// Returns `true` if `v` is one of the 16 GREASE values (RFC 8701):
-/// equal high and low bytes whose shared low nibble is `0xA`
-/// (`0x0A0A`, `0x1A1A`, ..., `0xFAFA`). Values like `0x0000` have equal
-/// bytes but are NOT in the GREASE range.
+/// Returns `true` if `v` is one of the 16 RFC 8701 GREASE values.
+///
+/// The valid range is `0x0A0A` to `0xFAFA`; equal-byte values like `0x0000`
+/// are not in it.
+#[must_use]
 pub const fn is_grease(v: u16) -> bool {
     (v >> 8) == (v & 0xFF) && (v & 0x0F) == 0x0A
 }

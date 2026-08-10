@@ -1,1 +1,1 @@
-//! ClientHello module (stub).
+//! `ClientHello` module (stub).

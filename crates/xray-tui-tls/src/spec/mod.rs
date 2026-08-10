@@ -1,6 +1,6 @@
-//! ClientHello specification model and extension wire encoding.
+//! `ClientHello` specification model and extension wire encoding.
 //!
-//! [`ClientHelloSpec`] describes a ClientHello at the semantic level; the
+//! [`ClientHelloSpec`] describes a `ClientHello` at the semantic level; the
 //! extension arms here encode to the exact RFC 6066/8446 wire format.
 //! Browser fingerprint profiles (built by later tasks) are expressed in
 //! terms of these types.
@@ -13,7 +13,7 @@ use crate::error::TlsError;
 ///
 /// Task 3 fills this from real connection state; `Default` values are used
 /// by the encoding tests below.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeValues {
     pub server_name: String,
     pub alpn: Vec<String>,
@@ -36,8 +36,8 @@ impl Default for RuntimeValues {
     }
 }
 
-/// How the ClientHello session id is produced.
-#[derive(Debug, PartialEq)]
+/// How the `ClientHello` session id is produced.
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionIdSpec {
     /// 32 random bytes, the TLS 1.3 default.
     Random32,
@@ -46,8 +46,8 @@ pub enum SessionIdSpec {
     AuthPayload { len: usize },
 }
 
-/// A single TLS extension in the ClientHello.
-#[derive(Debug, PartialEq)]
+/// A single TLS extension in the `ClientHello`.
+#[derive(Debug, PartialEq, Eq)]
 pub enum ExtensionSpec {
     ServerName,
     SupportedGroups(Vec<u16>),
@@ -70,15 +70,15 @@ pub enum ExtensionSpec {
 }
 
 /// One key-share entry in the `key_share` extension.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum KeyShareGroup {
     /// A GREASE group; the wire value comes from `RuntimeValues::grease_a`.
     Grease,
     X25519,
 }
 
-/// The semantic ClientHello description.
-#[derive(Debug, PartialEq)]
+/// The semantic `ClientHello` description.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ClientHelloSpec {
     /// TLS legacy record version, always `0x0303` for TLS 1.3.
     pub legacy_version: u16,
