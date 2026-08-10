@@ -6,7 +6,10 @@
 //! the same decryption (`strip_padding`) and framing (`make_app_data_record`)
 //! logic is implemented as a poll-based stream: buffered plaintext on read
 //! (handles TLS record fragmentation), 16 KiB plaintext split and
-//! partial-write buffering on write.
+//! partial-write buffering on write. Post-handshake `NewSessionTicket`
+//! records (encrypted handshake content, message type 0x04) are consumed and
+//! dropped;
+//! any other inner handshake message is a protocol error (no renegotiation).
 
 use std::io;
 use std::pin::Pin;
@@ -20,7 +23,8 @@ use crate::error::{Result, TlsError};
 /// TLS record content types (RFC 8446 §5.1).
 use super::{
     aead_aad, make_app_data_record, TlsRecord, CONTENT_ALERT,
-    CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, MAX_RECORD_PAYLOAD,
+    CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET,
+    MAX_RECORD_PAYLOAD,
 };
 
 /// Maximum plaintext bytes per TLS 1.3 record: 2^14 (RFC 8446 §5.2).
@@ -171,10 +175,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
 
     /// Decrypt one record and dispatch on its inner content type.
     ///
-    /// Returns the plaintext for `CONTENT_APPLICATION_DATA`, `Ok(None)` for
-    /// `close_notify`, and an error for alerts other than `close_notify`,
-    /// handshake records (no renegotiation) and unknown content types.
-    fn process_record(&mut self, mut rec: TlsRecord) -> io::Result<Option<Vec<u8>>> {
+    /// Returns the plaintext for `CONTENT_APPLICATION_DATA`, `CloseNotify`
+    /// for `close_notify`, `Skip` for `NewSessionTicket` records, and an
+    /// error for alerts other than `close_notify`, other handshake records
+    /// (no renegotiation) and unknown content types.
+    fn process_record(&mut self, mut rec: TlsRecord) -> io::Result<DecryptedRecord> {
         let plaintext = self
             .keys
             .read_key
@@ -187,11 +192,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
         self.keys.read_seq += 1;
         let (inner_type, content) = strip_padding(&plaintext).map_err(to_io_error)?;
         match inner_type {
-            CONTENT_APPLICATION_DATA => Ok(Some(content.to_vec())),
+            CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(content.to_vec())),
             CONTENT_ALERT => {
                 if content.len() >= 2 && content[1] == 0 {
                     // close_notify: clean EOF.
-                    Ok(None)
+                    Ok(DecryptedRecord::CloseNotify)
                 } else {
                     let level = content.first().copied().unwrap_or(2);
                     let desc = content.get(1).copied().unwrap_or(0);
@@ -201,10 +206,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                     ))
                 }
             }
-            CONTENT_HANDSHAKE => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected TLS handshake record during application data (no renegotiation)",
-            )),
+            CONTENT_HANDSHAKE => {
+                // NewSessionTicket (0x04) legitimately follows the server
+                // Finished as an encrypted handshake record; drop it. Any
+                // other handshake message post-handshake is a protocol
+                // violation — TLS 1.3 has no renegotiation.
+                match content.first() {
+                    Some(&HS_NEW_SESSION_TICKET) => Ok(DecryptedRecord::Skip),
+                    Some(&msg_type) => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected handshake message type {msg_type} after handshake"
+                        ),
+                    )),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty handshake record during application data",
+                    )),
+                }
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected inner TLS content type {other:#04x}"),
@@ -275,14 +295,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
                 continue;
             }
             match this.process_record(rec) {
-                Ok(Some(plaintext)) => {
+                Ok(DecryptedRecord::Data(plaintext)) => {
                     this.read_buf.extend_from_slice(&plaintext);
                     this.read_pos = 0;
                 }
-                Ok(None) => {
+                Ok(DecryptedRecord::CloseNotify) => {
                     this.closed = true;
                     return Poll::Ready(Ok(()));
                 }
+                // NewSessionTicket: consumed, nothing to deliver — read on.
+                Ok(DecryptedRecord::Skip) => {}
                 Err(e) => return Poll::Ready(Err(e)),
             }
         }
@@ -358,6 +380,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
 enum Step {
     HeaderComplete { content_type: u8, len: usize },
     RecordReady { content_type: u8, payload: Vec<u8> },
+}
+
+/// What a decrypted record contributes to the application byte stream.
+enum DecryptedRecord {
+    /// Plaintext to buffer and serve.
+    Data(Vec<u8>),
+    /// `close_notify` — subsequent reads are EOF.
+    CloseNotify,
+    /// Record consumed with nothing to deliver (`NewSessionTicket`).
+    Skip,
 }
 
 /// Remove TLS 1.3 record padding and extract the inner content type (port of
@@ -533,17 +565,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_inner_content_is_rejected() {
-        // Post-handshake handshake records (e.g. renegotiation) are refused.
+    async fn new_session_ticket_records_are_skipped() {
+        // TLS 1.3 servers send NewSessionTicket as encrypted handshake
+        // records right after the handshake; they must be consumed and
+        // dropped so the following application data is delivered.
         let (a, mut b) = duplex(4096);
         let keys = test_keys();
-        let rec = raw_record(&keys, 0, CONTENT_HANDSHAKE, &[0x04, 0, 0, 0]);
+        let nst = raw_record(&keys, 0, CONTENT_HANDSHAKE, &[HS_NEW_SESSION_TICKET, 0, 0, 0]);
+        let data = raw_record(&keys, 1, CONTENT_APPLICATION_DATA, b"ticket?");
+        tokio::spawn(async move {
+            b.write_all(&nst).await.unwrap();
+            b.write_all(&data).await.unwrap();
+        });
+        let mut reader = TlsStream::new(a, keys);
+        let mut buf = [0u8; 7];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ticket?");
+    }
+
+    #[tokio::test]
+    async fn non_ticket_handshake_inner_content_is_rejected() {
+        // Post-handshake handshake records other than NewSessionTicket (e.g.
+        // a ServerHello — renegotiation) are refused.
+        let (a, mut b) = duplex(4096);
+        let keys = test_keys();
+        let rec = raw_record(&keys, 0, CONTENT_HANDSHAKE, &[0x02, 0, 0, 0]);
         tokio::spawn(async move {
             b.write_all(&rec).await.unwrap();
         });
         let mut reader = TlsStream::new(a, keys);
         let mut buf = [0u8; 8];
-        assert!(reader.read(&mut buf).await.is_err());
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("after handshake"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ pub const CONTENT_APPLICATION_DATA: u8 = 0x17;
 /// TLS Handshake message types (RFC 8446 §4).
 pub const HS_CLIENT_HELLO: u8 = 0x01;
 pub const HS_SERVER_HELLO: u8 = 0x02;
+pub const HS_NEW_SESSION_TICKET: u8 = 0x04;
 pub const HS_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 pub const HS_CERTIFICATE: u8 = 0x0B;
 pub const HS_CERTIFICATE_VERIFY: u8 = 0x0F;
