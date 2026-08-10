@@ -32,6 +32,8 @@ pub type BoxStream = Box<dyn Stream>;
 
 pub mod addr;
 pub mod chain;
+#[cfg(feature = "native-e2e")]
+pub mod e2e;
 pub mod context;
 pub mod crypto;
 pub mod error;
