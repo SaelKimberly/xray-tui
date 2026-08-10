@@ -25,10 +25,11 @@ use std::task::{Context, Poll, ready};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::BoxStream;
-use crate::protocol::vmess::header::Session;
+use crate::protocol::vmess::header::{SECURITY_AES128_GCM, SECURITY_CHACHA20_POLY1305, Session};
 use crate::protocol::vmess::keys;
 
 /// Peel salt paths (Go `aead.KDFSaltConstAEADRespHeader*`), as byte slices for
@@ -54,6 +55,55 @@ enum ReadState {
     Dead(&'static str),
 }
 
+/// Record cipher selected by the payload security byte. The response-header
+/// peel is ALWAYS AES-128-GCM; only the body records dispatch here.
+#[allow(clippy::large_enum_variant)]
+enum Cipher {
+    Aes128Gcm(Aes128Gcm),
+    Chacha20Poly1305(ChaCha20Poly1305),
+}
+
+impl Cipher {
+    /// Build from the header security byte; the 16-byte `VMess` session key is
+    /// expanded to 32 bytes for chacha (md5 chain) inside.
+    fn new(security: u8, key16: &[u8; 16]) -> Self {
+        match security {
+            SECURITY_AES128_GCM => {
+                Self::Aes128Gcm(Aes128Gcm::new_from_slice(key16).expect("16-byte key"))
+            }
+            SECURITY_CHACHA20_POLY1305 => {
+                let key32 = keys::chacha20_key_32(key16);
+                Self::Chacha20Poly1305(
+                    ChaCha20Poly1305::new_from_slice(&key32).expect("32-byte key"),
+                )
+            }
+            other => panic!("vmess payload security {other} not validated"),
+        }
+    }
+
+    fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, ()> {
+        match self {
+            Self::Aes128Gcm(c) => c
+                .encrypt(Nonce::from_slice(nonce), plaintext)
+                .map_err(|_| ()),
+            Self::Chacha20Poly1305(c) => c
+                .encrypt(ChaChaNonce::from_slice(nonce), plaintext)
+                .map_err(|_| ()),
+        }
+    }
+
+    fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
+        match self {
+            Self::Aes128Gcm(c) => c
+                .decrypt(Nonce::from_slice(nonce), ciphertext)
+                .map_err(|_| ()),
+            Self::Chacha20Poly1305(c) => c
+                .decrypt(ChaChaNonce::from_slice(nonce), ciphertext)
+                .map_err(|_| ()),
+        }
+    }
+}
+
 /// `VMess` client tunnel stream: response-header peel + record codec over the
 /// secured connection.
 pub struct VmessClientStream {
@@ -77,10 +127,10 @@ pub struct VmessClientStream {
     /// Original caller length the pending record was sealed from — returned
     /// once the record is fully flushed.
     write_len: usize,
-    /// Expanded AES keys (per-direction) so record codec never re-derives a
-    /// key schedule.
-    req_cipher: Aes128Gcm,
-    resp_cipher: Aes128Gcm,
+    /// Expanded per-direction record ciphers (selected by the payload
+    /// security byte) so the record codec never re-derives a key schedule.
+    req_cipher: Cipher,
+    resp_cipher: Cipher,
     req_nonce: [u8; 12],
     req_counter: u16,
     resp_nonce: [u8; 12],
@@ -96,10 +146,8 @@ impl VmessClientStream {
         req_nonce.copy_from_slice(&session.request_body_iv[..12]);
         let mut resp_nonce = [0u8; 12];
         resp_nonce.copy_from_slice(&session.response_body_iv[..12]);
-        let req_cipher =
-            Aes128Gcm::new_from_slice(&session.request_body_key).expect("16-byte request key");
-        let resp_cipher =
-            Aes128Gcm::new_from_slice(&session.response_body_key).expect("16-byte response key");
+        let req_cipher = Cipher::new(session.security, &session.request_body_key);
+        let resp_cipher = Cipher::new(session.security, &session.response_body_key);
         Self {
             inner,
             session,
@@ -347,10 +395,7 @@ impl AsyncRead for VmessClientStream {
                     }
                     let nonce = Self::record_nonce(&this.resp_nonce, this.resp_counter);
                     this.resp_counter = this.resp_counter.wrapping_add(1);
-                    if let Ok(pt) = this
-                        .resp_cipher
-                        .decrypt(Nonce::from_slice(&nonce), &this.pending[..total])
-                    {
+                    if let Ok(pt) = this.resp_cipher.decrypt(&nonce, &this.pending[..total]) {
                         this.pending = pt;
                         this.pending_pos = 0;
                         this.read_state = ReadState::RecordLen { filled: 0 };
@@ -391,7 +436,7 @@ impl AsyncWrite for VmessClientStream {
         // (tokio poll contract) — the pending record was built from it.
         if this.write_pending.is_none() {
             let nonce = Self::record_nonce(&this.req_nonce, this.req_counter);
-            let Ok(ct) = this.req_cipher.encrypt(Nonce::from_slice(&nonce), buf) else {
+            let Ok(ct) = this.req_cipher.encrypt(&nonce, buf) else {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "vmess request record seal failed",
@@ -441,7 +486,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::protocol::vmess::header::Session;
+    use crate::protocol::vmess::header::{SECURITY_CHACHA20_POLY1305, Session};
     use crate::protocol::vmess::keys::{kdf16_bytes_path, sha256_first16};
 
     /// Server-side response header seal (mirrors Go `EncodeResponseHeader`):
@@ -490,6 +535,25 @@ mod tests {
             .collect()
     }
 
+    /// Server-side chacha20-poly1305 response record (Go `EncodeResponseBody`
+    /// with security 4): 2B BE ciphertext length + chacha20poly1305 data.
+    fn seal_record_chacha(key16: &[u8; 16], iv: &[u8; 16], counter: u16, data: &[u8]) -> Vec<u8> {
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+        let mut nonce = *iv;
+        nonce[..2].copy_from_slice(&counter.to_be_bytes());
+        let key32 = keys::chacha20_key_32(key16);
+        let ct = ChaCha20Poly1305::new_from_slice(&key32)
+            .unwrap()
+            .encrypt(Nonce::from_slice(&nonce[..12]), data)
+            .unwrap();
+        u16::try_from(data.len() + 16)
+            .unwrap()
+            .to_be_bytes()
+            .into_iter()
+            .chain(ct)
+            .collect()
+    }
+
     #[test]
     fn records_roundtrip_with_peel() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -525,6 +589,45 @@ mod tests {
             let mut got = Vec::new();
             tunnel.read_to_end(&mut got).await.unwrap();
             assert_eq!(got, b"hello");
+        });
+    }
+
+    #[test]
+    fn chacha20_records_roundtrip_with_peel() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client_side, mut server_side) = tokio::io::duplex(8192);
+            let mut session = Session::new();
+            session.security = SECURITY_CHACHA20_POLY1305;
+            session.request_body_iv = [0x11; 16];
+            session.request_body_key = [0x22; 16];
+            session.response_header = 0x99;
+            session.response_body_key = sha256_first16(&session.request_body_key);
+            session.response_body_iv = sha256_first16(&session.request_body_iv);
+
+            // Response HEADER seal is always AES-128-GCM (Go OpenVMessAEADHeader);
+            // only the body record uses the chacha cipher.
+            let mut wire = seal_response_header(
+                &session.response_body_key,
+                &session.response_body_iv,
+                &[0x99, 0, 0, 0],
+            );
+            wire.extend_from_slice(&seal_record_chacha(
+                &session.response_body_key,
+                &session.response_body_iv,
+                0,
+                b"chacha body",
+            ));
+            server_side.write_all(&wire).await.unwrap();
+            drop(server_side);
+
+            let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
+            let mut got = Vec::new();
+            tunnel.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"chacha body");
         });
     }
 

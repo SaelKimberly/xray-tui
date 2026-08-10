@@ -19,6 +19,7 @@ webpki-roots = "1"
 # VMess wire crypto (mandatory for any VMess client — not feature-gated)
 aes = "0.8"
 aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 crc32fast = "1"
