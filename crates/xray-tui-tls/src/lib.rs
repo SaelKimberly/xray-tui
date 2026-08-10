@@ -19,3 +19,25 @@ pub mod error;
 /// Byte-stream seam: everything the engine touches is generic over this.
 pub trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+/// Random-byte source for the engine.
+///
+/// ring's `SecureRandom` is a sealed trait (ring 0.17.13+), so a
+/// deterministic test double cannot implement it. This crate-local seam
+/// mirrors ring's shape and is blanket-implemented for everything ring's
+/// `SecureRandom` accepts: production passes `ring::rand::SystemRandom`,
+/// tests pass fixed-seed RNGs. All engine code that draws randomness takes
+/// `&dyn SecureRandom`.
+pub trait SecureRandom: Send + Sync {
+    /// Fills `dest` with random bytes.
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified>;
+}
+
+impl<T> SecureRandom for T
+where
+    T: ring::rand::SecureRandom + Send + Sync,
+{
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
+        ring::rand::SecureRandom::fill(self, dest)
+    }
+}

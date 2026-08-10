@@ -12,26 +12,7 @@ use crate::error::TlsError;
 use crate::spec::grease::GREASE_PLACEHOLDER;
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec};
 
-/// Random-byte source for the builder.
-///
-/// ring's `SecureRandom` is a sealed trait (ring 0.17.13+), so a
-/// deterministic test double cannot implement it. This crate-local seam
-/// mirrors ring's shape and is blanket-implemented for everything ring's
-/// `SecureRandom` accepts: production passes `ring::rand::SystemRandom`,
-/// tests pass fixed-seed RNGs.
-pub trait SecureRandom {
-    /// Fills `dest` with random bytes.
-    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified>;
-}
-
-impl<T> SecureRandom for T
-where
-    T: ring::rand::SecureRandom,
-{
-    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
-        ring::rand::SecureRandom::fill(self, dest)
-    }
-}
+pub use crate::SecureRandom;
 
 /// Runtime inputs for a single `ClientHello` build.
 pub struct BuildParams<'a> {
@@ -53,10 +34,12 @@ pub struct BuiltHello {
     pub session_id_range: Option<Range<usize>>,
 }
 
-/// Target total record size for the padding extension. Chrome pads the
-/// `ClientHello` handshake message to 512 bytes, i.e. a 517-byte record
-/// (`5` record header + `512` handshake).
-const PADDING_TARGET: usize = 517;
+/// Target total record size for the padding extension, matching the
+/// reference (`tls-fingerprint` `profiles/chrome.rs`): the padding data
+/// length is `512 - (unpadded record + 4)`, so the final record is exactly
+/// 512 bytes; no padding is added when the unpadded record already reaches
+/// the target.
+const PADDING_TARGET: usize = 512;
 
 /// Builds a `ClientHello` handshake message and record from a spec.
 pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<BuiltHello, TlsError> {
@@ -182,9 +165,10 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 // record header (5) + handshake header (4) + version (2) +
                 // random (32) + sid (1 + len) + cipher suites (2 + bytes) +
                 // compression (1 + len) + extension total length field (2)
-                // + already-encoded extensions. Chrome pads so the final
-                // record reaches PADDING_TARGET; a zero result omits the
-                // extension (matches the reference implementation).
+                // + already-encoded extensions. Padding data length =
+                // PADDING_TARGET − (accumulated + 4) with the 4 bytes being
+                // the padding extension's type+length overhead; a zero
+                // result omits the extension (matches the reference).
                 let acc_record = 5 + 4 + 2 + 32 + 1 + usize::from(sid_len) + 2
                     + spec.cipher_suites.len() * 2 + 1 + usize::from(comp_len) + 2
                     + ext_bytes.len();
@@ -306,7 +290,7 @@ fn effective_alpn(spec: &ClientHelloSpec, override_alpn: Option<&[&str]>) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use core::cell::Cell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{build_hello, to_record, BuildParams, SecureRandom};
     use crate::spec::grease::GREASE_PLACEHOLDER;
@@ -315,17 +299,17 @@ mod tests {
     /// Deterministic RNG feeding back a fixed byte sequence.
     struct FixedRandom {
         bytes: Vec<u8>,
-        pos: Cell<usize>,
+        pos: AtomicUsize,
     }
 
     impl SecureRandom for FixedRandom {
         fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
-            let mut pos = self.pos.get();
+            let mut pos = self.pos.load(Ordering::Relaxed);
             for b in dest.iter_mut() {
                 *b = *self.bytes.get(pos).ok_or(ring::error::Unspecified)?;
                 pos += 1;
             }
-            self.pos.set(pos);
+            self.pos.store(pos, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -419,7 +403,7 @@ mod tests {
         let spec = test_spec();
         // 2 GREASE bytes + 32 random + 32 session id = 66 bytes needed; give
         // the fixed RNG headroom so exhaustion is never the failure mode.
-        let rng = FixedRandom { bytes: vec![0x42; 128], pos: Cell::new(0) };
+        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -436,7 +420,7 @@ mod tests {
         assert_eq!(hello.record_bytes, to_record(&hello.handshake_bytes));
         assert!(hello.session_id_range.is_none());
         // grease_a + grease_b + random + session id all came from the RNG.
-        assert_eq!(rng.pos.get(), 66);
+        assert_eq!(rng.pos.load(Ordering::Relaxed), 66);
     }
 
     #[test]
@@ -458,7 +442,7 @@ mod tests {
         };
         let mut bytes = vec![0x00, 0x01];
         bytes.extend_from_slice(&[0x42; 64]);
-        let rng = FixedRandom { bytes, pos: Cell::new(0) };
+        let rng = FixedRandom { bytes, pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -509,7 +493,7 @@ mod tests {
         };
         let mut bytes = vec![0x00, 0x01];
         bytes.extend_from_slice(&[0x42; 66]);
-        let rng = FixedRandom { bytes, pos: Cell::new(0) };
+        let rng = FixedRandom { bytes, pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -528,12 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn padding_extension_pads_record_to_517_bytes() {
-        // Full Chrome 130 layout + padding: Chrome pads the ClientHello
-        // handshake to 512 bytes (record 517 total).
+    fn padding_reaches_512_byte_record() {
+        // Full Chrome 130 layout + padding, per the reference
+        // (`chrome.rs:125-139`): the padding data length is
+        // `512 - (unpadded record + 4)`, so the record is exactly 512 bytes.
         let mut spec = test_spec();
         spec.extensions.push(ExtensionSpec::Padding);
-        let rng = FixedRandom { bytes: vec![0x42; 128], pos: Cell::new(0) };
+        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -545,12 +530,38 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(hello.handshake_bytes.len(), 512);
-        assert_eq!(hello.record_bytes.len(), 517);
+        assert_eq!(hello.record_bytes.len(), 512);
+        assert_eq!(hello.handshake_bytes.len(), 507);
         let parsed = parse_hello(&hello.handshake_bytes);
         let padding = parsed.extension(0x0015).expect("padding extension");
-        assert_eq!(padding.len(), 205);
+        assert_eq!(padding.len(), 200);
         assert!(padding.iter().all(|&b| b == 0));
+
+        // An unpadded record already >= 512 bytes → no padding extension.
+        let big = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![
+                ExtensionSpec::Raw { ty: 0x1234, data: vec![0xEE; 600] },
+                ExtensionSpec::Padding,
+            ],
+        };
+        let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
+        let hello = build_hello(
+            &big,
+            &BuildParams {
+                server_name: "example.com",
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        assert!(hello.record_bytes.len() > 512);
+        let parsed = parse_hello(&hello.handshake_bytes);
+        assert!(parsed.extension(0x0015).is_none(), "no padding when already >= 512");
     }
 
     #[test]
@@ -562,7 +573,7 @@ mod tests {
             session_id: SessionIdSpec::AuthPayload { len: 42 },
             extensions: vec![],
         };
-        let rng = FixedRandom { bytes: vec![0x42; 64], pos: Cell::new(0) };
+        let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -580,7 +591,7 @@ mod tests {
         assert_eq!(sid.len(), 42);
         assert!(sid.iter().all(|&b| b == 0));
         // No GREASE in this spec → the RNG only fed the 32-byte random.
-        assert_eq!(rng.pos.get(), 32);
+        assert_eq!(rng.pos.load(Ordering::Relaxed), 32);
     }
 
     #[test]
@@ -593,7 +604,7 @@ mod tests {
             extensions: vec![ExtensionSpec::Alpn(vec!["spec-only".into()])],
         };
         let build = |alpn: Option<&[&str]>| {
-            let rng = FixedRandom { bytes: vec![0x42; 64], pos: Cell::new(0) };
+            let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
             build_hello(
                 &spec,
                 &BuildParams {
@@ -631,7 +642,7 @@ mod tests {
             session_id: SessionIdSpec::Random32,
             extensions: vec![ExtensionSpec::SupportedGroups(vec![0x001D])],
         };
-        let rng = FixedRandom { bytes: vec![0x42; 64], pos: Cell::new(0) };
+        let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -642,7 +653,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(rng.pos.get(), 64);
+        assert_eq!(rng.pos.load(Ordering::Relaxed), 64);
         assert!(hello.session_id_range.is_none());
     }
 
