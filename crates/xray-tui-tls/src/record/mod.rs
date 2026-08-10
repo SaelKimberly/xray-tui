@@ -1,1 +1,202 @@
-//! TLS record layer module (stub).
+//! TLS record layer primitives.
+//!
+//! Port of `thirdparty/tls-fingerprint/src/record.rs`, generalized from
+//! `&mut TcpStream` to any `AsyncRead + Unpin` stream so the engine can run
+//! over the crate's generic `Stream` seam.
+
+use tokio::io::AsyncReadExt;
+
+use crate::error::{Result, TlsError};
+
+/// TLS `ContentType` values (RFC 8446 §5.1).
+pub const CONTENT_CHANGE_CIPHER_SPEC: u8 = 0x14;
+pub const CONTENT_ALERT: u8 = 0x15;
+pub const CONTENT_HANDSHAKE: u8 = 0x16;
+pub const CONTENT_APPLICATION_DATA: u8 = 0x17;
+
+/// TLS Handshake message types (RFC 8446 §4).
+pub const HS_CLIENT_HELLO: u8 = 0x01;
+pub const HS_SERVER_HELLO: u8 = 0x02;
+pub const HS_ENCRYPTED_EXTENSIONS: u8 = 0x08;
+pub const HS_CERTIFICATE: u8 = 0x0B;
+pub const HS_CERTIFICATE_VERIFY: u8 = 0x0F;
+pub const HS_FINISHED: u8 = 0x14;
+
+/// Maximum acceptable record payload: 2^14 plaintext plus 256 slack for the
+/// TLS 1.3 AEAD overhead and padding (RFC 8446 §5.2).
+const MAX_RECORD_PAYLOAD: usize = 16_384 + 256;
+
+/// A raw TLS record off the wire.
+#[derive(Debug)]
+pub struct TlsRecord {
+    pub content_type: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Read a single TLS record (5-byte header, then payload) from the stream.
+///
+/// Alert records are rejected with a [`TlsError::Handshake`] carrying the
+/// alert's `level` and `description`; oversized records are rejected too.
+pub async fn read_record<S>(stream: &mut S) -> Result<TlsRecord>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await?;
+
+    let content_type = header[0];
+    let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+
+    if length > MAX_RECORD_PAYLOAD {
+        return Err(TlsError::Handshake(format!(
+            "record too large: {length} bytes"
+        )));
+    }
+
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).await?;
+
+    if content_type == CONTENT_ALERT && payload.len() >= 2 {
+        return Err(TlsError::Handshake(format!(
+            "alert: {} {}",
+            payload[0], payload[1]
+        )));
+    }
+
+    Ok(TlsRecord {
+        content_type,
+        payload,
+    })
+}
+
+/// Read records, skipping any Change-Cipher-Spec records (TLS 1.3 middlebox
+/// compatibility, RFC 8446 §5). Returns the first non-CCS record.
+pub async fn skip_ccs<S>(stream: &mut S) -> Result<TlsRecord>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        let rec = read_record(stream).await?;
+        if rec.content_type == CONTENT_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        return Ok(rec);
+    }
+}
+
+/// Parse one or more handshake messages from a raw record payload.
+///
+/// Each message is `type(1) || length(3) || body` (RFC 8446 §4); returns a
+/// `Vec` of `(msg_type, body)` pairs.
+pub fn parse_handshake_messages(payload: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
+    let mut msgs = Vec::new();
+    let mut pos = 0;
+    while pos < payload.len() {
+        if payload.len() - pos < 4 {
+            return Err(TlsError::Handshake(
+                "truncated handshake message".into(),
+            ));
+        }
+        let msg_type = payload[pos];
+        let length = (usize::from(payload[pos + 1]) << 16)
+            | (usize::from(payload[pos + 2]) << 8)
+            | usize::from(payload[pos + 3]);
+        pos += 4;
+        if pos + length > payload.len() {
+            return Err(TlsError::Handshake(format!(
+                "handshake message body truncated: need {length} have {}",
+                payload.len() - pos
+            )));
+        }
+        msgs.push((msg_type, payload[pos..pos + length].to_vec()));
+        pos += length;
+    }
+    Ok(msgs)
+}
+
+/// Build a TLS Handshake record: `0x16 0x0303 <len16> <msg_type len24 body>`.
+#[must_use]
+pub fn make_handshake_record(msg_type: u8, body: &[u8]) -> Vec<u8> {
+    let mut hs_msg = Vec::with_capacity(4 + body.len());
+    hs_msg.push(msg_type);
+    let hs_len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+    hs_msg.extend_from_slice(&hs_len.to_be_bytes()[1..]);
+    hs_msg.extend_from_slice(body);
+
+    let mut rec = Vec::with_capacity(5 + hs_msg.len());
+    rec.push(CONTENT_HANDSHAKE);
+    rec.extend_from_slice(&0x0303u16.to_be_bytes());
+    let rec_len = u16::try_from(hs_msg.len()).unwrap_or(u16::MAX);
+    rec.extend_from_slice(&rec_len.to_be_bytes());
+    rec.extend_from_slice(&hs_msg);
+    rec
+}
+
+/// Frame ciphertext as a TLS 1.3 Application Data record: `0x17 0x0303 <len16>`.
+#[must_use]
+pub fn make_app_data_record(ciphertext: &[u8]) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(5 + ciphertext.len());
+    rec.push(CONTENT_APPLICATION_DATA);
+    rec.extend_from_slice(&0x0303u16.to_be_bytes());
+    let len = u16::try_from(ciphertext.len()).unwrap_or(u16::MAX);
+    rec.extend_from_slice(&len.to_be_bytes());
+    rec.extend_from_slice(ciphertext);
+    rec
+}
+
+/// Build the AEAD additional data for a TLS 1.3 record (RFC 8446 §5.2):
+/// `opaque_type || legacy_record_version || length` of the ciphertext.
+#[must_use]
+pub fn aead_aad(ciphertext_len: usize) -> [u8; 5] {
+    let len = u16::try_from(ciphertext_len).unwrap_or(u16::MAX);
+    let bytes = len.to_be_bytes();
+    [CONTENT_APPLICATION_DATA, 0x03, 0x03, bytes[0], bytes[1]]
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn read_record_parses_header_and_payload() {
+        let (mut stream, mut w) = tokio::io::duplex(1024);
+        // Build: 16 03 03 00 05 01 02 03 04 05
+        w.write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05])
+            .await
+            .unwrap();
+
+        let rec = read_record(&mut stream).await.unwrap();
+        assert_eq!(rec.content_type, CONTENT_HANDSHAKE);
+        assert_eq!(rec.payload, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[test]
+    fn parse_multi_handshake_messages() {
+        let payload = [0x02, 0x00, 0x00, 0x02, 0xaa, 0xbb, 0x08, 0x00, 0x00, 0x00]; // SH + EE
+        let msgs = parse_handshake_messages(&payload).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], (0x02, vec![0xaa, 0xbb]));
+    }
+
+    #[test]
+    fn aad_matches_tls13_rule() {
+        assert_eq!(aead_aad(0x0010), [0x17, 0x03, 0x03, 0x00, 0x10]);
+    }
+
+    #[tokio::test]
+    async fn alert_record_is_rejected_with_level_and_description() {
+        let (mut stream, mut w) = tokio::io::duplex(1024);
+        // level 2 (fatal), description 40 (handshake_failure)
+        w.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28])
+            .await
+            .unwrap();
+
+        let err = read_record(&mut stream).await.unwrap_err();
+        assert!(
+            matches!(&err, TlsError::Handshake(msg) if msg.as_str() == "alert: 2 40"),
+            "expected alert Handshake error, got {err:?}"
+        );
+    }
+}
