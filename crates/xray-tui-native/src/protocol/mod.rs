@@ -45,7 +45,7 @@ fn not_impl(feature: &str) -> Result<BoxStream, NativeError> {
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match &ctx.params.protocol {
         ProtocolConfig::Vless(cfg) => vless::connect(ctx, stream, cfg).await,
-        ProtocolConfig::Vmess(_) => not_impl("vmess"),
+        ProtocolConfig::Vmess(cfg) => vmess::connect(ctx, stream, cfg).await,
         ProtocolConfig::Trojan(_) => not_impl("trojan"),
         ProtocolConfig::Hysteria2(_) => not_impl("hysteria2"),
         ProtocolConfig::Ss(_) => not_impl("shadowsocks"),
