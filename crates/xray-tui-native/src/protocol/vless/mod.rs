@@ -9,10 +9,10 @@ use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::protocol::vless::stream::VlessClientStream;
 
-pub mod header;
-pub mod stream;
 #[cfg(feature = "native-e2e")]
 pub mod e2e;
+pub mod header;
+pub mod stream;
 
 /// Connect through a VLESS outbound over an already-secured stream.
 ///

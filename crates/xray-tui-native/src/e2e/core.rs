@@ -4,12 +4,19 @@ use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoreKind { Xray, SingBox }
+pub enum CoreKind {
+    Xray,
+    SingBox,
+}
 
 impl CoreKind {
-    /// Binary file name inside `XRAY_TUI_CORE_BIN_DIR}.
-    pub fn bin_name(self) -> &'static str {
-        match self { Self::Xray => "xray", Self::SingBox => "sing-box" }
+    /// Binary file name inside `XRAY_TUI_CORE_BIN_DIR`.
+    #[must_use]
+    pub const fn bin_name(self) -> &'static str {
+        match self {
+            Self::Xray => "xray",
+            Self::SingBox => "sing-box",
+        }
     }
 }
 
@@ -29,7 +36,11 @@ impl CoreUnderTest {
             .map_err(|_| "XRAY_TUI_CORE_BIN_DIR is not set".to_string())?;
         let bin = PathBuf::from(dir).join(kind.bin_name());
         if !bin.is_file() {
-            return Err(format!("no '{}' binary at {}", kind.bin_name(), bin.display()));
+            return Err(format!(
+                "no '{}' binary at {}",
+                kind.bin_name(),
+                bin.display()
+            ));
         }
         let actual = probe_version(&bin, kind)?;
         if !check_version(&actual, expected_version) {
@@ -37,10 +48,15 @@ impl CoreUnderTest {
                 "core version mismatch: want {expected_version:?}, got {actual:?}"
             ));
         }
-        Ok(Self { kind, bin, version: actual })
+        Ok(Self {
+            kind,
+            bin,
+            version: actual,
+        })
     }
 
     /// argv for spawning with the given config file.
+    #[must_use]
     pub fn spawn_args(&self, config_path: &std::path::Path) -> Vec<String> {
         let p = config_path.to_string_lossy().into_owned();
         match self.kind {
@@ -76,6 +92,7 @@ fn probe_version(bin: &std::path::Path, kind: CoreKind) -> Result<String, String
 }
 
 /// Loose sanity: the reported version contains the expected one.
+#[must_use]
 pub fn check_version(actual: &str, want: &str) -> bool {
     actual.contains(want)
 }

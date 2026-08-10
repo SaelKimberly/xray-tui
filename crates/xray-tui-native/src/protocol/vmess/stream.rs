@@ -1,6 +1,8 @@
-//! VMess record tunnel stream: peels the AEAD response header on the first
+//! `VMess` record tunnel stream: peels the AEAD response header on the first
 //! read, then transparently decodes response records (read side) and encodes
-//! request records (write side). Mirrors Xray-core
+//! request records (write side).
+//!
+//! Mirrors Xray-core
 //! `proxy/vmess/encoding/client.go` (`DecodeResponseHeader`,
 //! `DecodeResponseBody`, `EncodeRequestBody`) with the request option byte 0
 //! — the server chunk-decodes AEAD bodies regardless
@@ -52,7 +54,7 @@ enum ReadState {
     Dead(&'static str),
 }
 
-/// VMess client tunnel stream: response-header peel + record codec over the
+/// `VMess` client tunnel stream: response-header peel + record codec over the
 /// secured connection.
 pub struct VmessClientStream {
     inner: BoxStream,
@@ -86,8 +88,9 @@ pub struct VmessClientStream {
 }
 
 impl VmessClientStream {
-    /// Wrap `inner` with a VMess session: peels the response header on the
+    /// Wrap `inner` with a `VMess` session: peels the response header on the
     /// first read, then codes AEAD records.
+    #[must_use]
     pub fn new(inner: BoxStream, session: Session) -> Self {
         let mut req_nonce = [0u8; 12];
         req_nonce.copy_from_slice(&session.request_body_iv[..12]);
@@ -135,9 +138,8 @@ impl VmessClientStream {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            let r = match rec.as_ref() {
-                Some(r) => r,
-                None => return Poll::Ready(Ok(())),
+            let Some(r) = rec.as_ref() else {
+                return Poll::Ready(Ok(()));
             };
             if *pos >= r.len() {
                 *rec = None;
@@ -172,9 +174,7 @@ impl AsyncRead for VmessClientStream {
             if matches!(this.read_state, ReadState::RecordLen { filled: 0 })
                 && this.pending_pos < this.pending.len()
             {
-                let n = buf
-                    .remaining()
-                    .min(this.pending.len() - this.pending_pos);
+                let n = buf.remaining().min(this.pending.len() - this.pending_pos);
                 buf.put_slice(&this.pending[this.pending_pos..this.pending_pos + n]);
                 this.pending_pos += n;
                 if this.pending_pos == this.pending.len() {
@@ -187,18 +187,14 @@ impl AsyncRead for VmessClientStream {
             let state = this.read_state; // Copy — no borrow held across awaits
             match state {
                 ReadState::Dead(msg) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        msg,
-                    )));
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, msg)));
                 }
                 ReadState::PeelLen { filled } => {
                     let mut rb = ReadBuf::new(&mut this.peel_len[filled..]);
                     ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
                     let got = rb.filled().len();
                     if got == 0 {
-                        this.read_state =
-                            ReadState::Dead("vmess response header truncated (EOF)");
+                        this.read_state = ReadState::Dead("vmess response header truncated (EOF)");
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "vmess response header truncated (EOF)",
@@ -214,27 +210,21 @@ impl AsyncRead for VmessClientStream {
                         &this.session.response_body_key,
                         &[RESP_LEN_KEY_SALT],
                     );
-                    let len_iv = keys::kdf16_bytes_path(
-                        &this.session.response_body_iv,
-                        &[RESP_LEN_IV_SALT],
-                    );
-                    let pt = match Aes128Gcm::new_from_slice(&len_key)
+                    let len_iv =
+                        keys::kdf16_bytes_path(&this.session.response_body_iv, &[RESP_LEN_IV_SALT]);
+                    let Ok(pt) = Aes128Gcm::new_from_slice(&len_key)
                         .expect("16-byte KDF output")
                         .decrypt(Nonce::from_slice(&len_iv[..12]), &this.peel_len[..])
-                    {
-                        Ok(pt) => pt,
-                        Err(_) => {
-                            this.read_state =
-                                ReadState::Dead("vmess response header length decrypt failed");
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "vmess response header length decrypt failed",
-                            )));
-                        }
+                    else {
+                        this.read_state =
+                            ReadState::Dead("vmess response header length decrypt failed");
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vmess response header length decrypt failed",
+                        )));
                     };
                     if pt.len() != 2 {
-                        this.read_state =
-                            ReadState::Dead("vmess response header length corrupt");
+                        this.read_state = ReadState::Dead("vmess response header length corrupt");
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "vmess response header length corrupt",
@@ -243,7 +233,6 @@ impl AsyncRead for VmessClientStream {
                     let total = u16::from_be_bytes([pt[0], pt[1]]) as usize + 16;
                     this.peel_buf.resize(total, 0);
                     this.read_state = ReadState::PeelPayload { total, filled: 0 };
-                    continue;
                 }
                 ReadState::PeelPayload { total, filled } => {
                     let mut rb = ReadBuf::new(&mut this.peel_buf[filled..total]);
@@ -270,20 +259,19 @@ impl AsyncRead for VmessClientStream {
                         &this.session.response_body_iv,
                         &[RESP_PAYLOAD_IV_SALT],
                     );
-                    let pt = match Aes128Gcm::new_from_slice(&payload_key)
+                    let Ok(pt) = Aes128Gcm::new_from_slice(&payload_key)
                         .expect("16-byte KDF output")
-                        .decrypt(Nonce::from_slice(&payload_iv[..12]), &this.peel_buf[..total])
-                    {
-                        Ok(pt) => pt,
-                        Err(_) => {
-                            this.peel_buf = Vec::new();
-                            this.read_state =
-                                ReadState::Dead("vmess response header decrypt failed");
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "vmess response header decrypt failed",
-                            )));
-                        }
+                        .decrypt(
+                            Nonce::from_slice(&payload_iv[..12]),
+                            &this.peel_buf[..total],
+                        )
+                    else {
+                        this.peel_buf = Vec::new();
+                        this.read_state = ReadState::Dead("vmess response header decrypt failed");
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vmess response header decrypt failed",
+                        )));
                     };
                     this.peel_buf = Vec::new(); // one-shot peel; drop staging
                     if pt.is_empty() {
@@ -297,15 +285,13 @@ impl AsyncRead for VmessClientStream {
                     // Echo check: payload[0] must equal the request's random
                     // response header byte.
                     if pt[0] != this.session.response_header {
-                        this.read_state =
-                            ReadState::Dead("vmess response header echo mismatch");
+                        this.read_state = ReadState::Dead("vmess response header echo mismatch");
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "vmess response header echo mismatch",
                         )));
                     }
                     this.read_state = ReadState::RecordLen { filled: 0 };
-                    continue;
                 }
                 ReadState::RecordLen { filled } => {
                     let mut rb = ReadBuf::new(&mut this.len_buf[filled..]);
@@ -342,15 +328,13 @@ impl AsyncRead for VmessClientStream {
                     this.pending.resize(total, 0);
                     this.pending_pos = 0;
                     this.read_state = ReadState::RecordData { total, filled: 0 };
-                    continue;
                 }
                 ReadState::RecordData { total, filled } => {
                     let mut rb = ReadBuf::new(&mut this.pending[filled..total]);
                     ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
                     let got = rb.filled().len();
                     if got == 0 {
-                        this.read_state =
-                            ReadState::Dead("vmess response record truncated (EOF)");
+                        this.read_state = ReadState::Dead("vmess response record truncated (EOF)");
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "vmess response record truncated (EOF)",
@@ -363,25 +347,20 @@ impl AsyncRead for VmessClientStream {
                     }
                     let nonce = Self::record_nonce(&this.resp_nonce, this.resp_counter);
                     this.resp_counter = this.resp_counter.wrapping_add(1);
-                    match this
+                    if let Ok(pt) = this
                         .resp_cipher
                         .decrypt(Nonce::from_slice(&nonce), &this.pending[..total])
                     {
-                        Ok(pt) => {
-                            this.pending = pt;
-                            this.pending_pos = 0;
-                            this.read_state = ReadState::RecordLen { filled: 0 };
-                            continue;
-                        }
-                        Err(_) => {
-                            this.read_state =
-                                ReadState::Dead("vmess response record decrypt failed");
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "vmess response record decrypt failed",
-                            )));
-                        }
+                        this.pending = pt;
+                        this.pending_pos = 0;
+                        this.read_state = ReadState::RecordLen { filled: 0 };
+                        continue;
                     }
+                    this.read_state = ReadState::Dead("vmess response record decrypt failed");
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vmess response record decrypt failed",
+                    )));
                 }
             }
         }
@@ -412,17 +391,16 @@ impl AsyncWrite for VmessClientStream {
         // (tokio poll contract) — the pending record was built from it.
         if this.write_pending.is_none() {
             let nonce = Self::record_nonce(&this.req_nonce, this.req_counter);
-            let ct = match this.req_cipher.encrypt(Nonce::from_slice(&nonce), buf) {
-                Ok(ct) => ct,
-                Err(_) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "vmess request record seal failed",
-                    )));
-                }
+            let Ok(ct) = this.req_cipher.encrypt(Nonce::from_slice(&nonce), buf) else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vmess request record seal failed",
+                )));
             };
             let mut rec = Vec::with_capacity(2 + ct.len());
-            rec.extend_from_slice(&(buf.len() as u16 + 16).to_be_bytes());
+            let field =
+                u16::try_from(buf.len() + 16).expect("record size bounded by the u16 guard above");
+            rec.extend_from_slice(&field.to_be_bytes());
             rec.extend_from_slice(&ct);
             this.write_pending = Some(rec);
             this.write_pos = 0;
@@ -482,9 +460,15 @@ mod tests {
             iv,
             "AEAD Resp Header Len Key",
             "AEAD Resp Header Len IV",
-            &(payload.len() as u16).to_be_bytes(),
+            &u16::try_from(payload.len()).unwrap().to_be_bytes(),
         );
-        wire.extend_from_slice(&ae(key, iv, "AEAD Resp Header Key", "AEAD Resp Header IV", payload));
+        wire.extend_from_slice(&ae(
+            key,
+            iv,
+            "AEAD Resp Header Key",
+            "AEAD Resp Header IV",
+            payload,
+        ));
         wire
     }
 
@@ -498,12 +482,20 @@ mod tests {
             .unwrap()
             .encrypt(Nonce::from_slice(&nonce[..12]), data)
             .unwrap();
-        (data.len() as u16 + 16).to_be_bytes().into_iter().chain(ct).collect()
+        u16::try_from(data.len() + 16)
+            .unwrap()
+            .to_be_bytes()
+            .into_iter()
+            .chain(ct)
+            .collect()
     }
 
     #[test]
     fn records_roundtrip_with_peel() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let (client_side, mut server_side) = tokio::io::duplex(8192);
             let mut session = Session::new();
@@ -538,7 +530,10 @@ mod tests {
 
     #[test]
     fn response_eof_marker_ends_stream() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let (client_side, mut server_side) = tokio::io::duplex(8192);
             let mut session = Session::new();
@@ -573,7 +568,10 @@ mod tests {
 
     #[test]
     fn peel_rejects_wrong_echo_byte() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let (client_side, mut server_side) = tokio::io::duplex(8192);
             let mut session = Session::new();
@@ -599,7 +597,10 @@ mod tests {
                 tunnel.read_to_end(&mut got),
             )
             .await;
-            assert!(res.is_err() || matches!(res.unwrap(), Err(_)), "must fail, got {got:?}");
+            assert!(
+                res.is_err() || res.unwrap().is_err(),
+                "must fail, got {got:?}"
+            );
         });
     }
 
@@ -628,7 +629,10 @@ mod tests {
 
     #[test]
     fn write_seals_request_records_with_counters() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let (client_side, mut server_side) = tokio::io::duplex(8192);
             let mut session = Session::new();
@@ -645,7 +649,10 @@ mod tests {
             tunnel.flush().await.unwrap();
 
             // Each write_all produced exactly one record with its own counter.
-            assert_eq!(read_record(&mut server_side, &req_key, &req_iv, 0).await, b"first");
+            assert_eq!(
+                read_record(&mut server_side, &req_key, &req_iv, 0).await,
+                b"first"
+            );
             assert_eq!(
                 read_record(&mut server_side, &req_key, &req_iv, 1).await,
                 b"second-payload"
@@ -655,7 +662,10 @@ mod tests {
 
     #[test]
     fn write_resumes_partial_record_flush() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             // 1-byte duplex: the inner write accepts a byte per poll, so the
             // record flush must resume across polls and still report the
@@ -671,12 +681,16 @@ mod tests {
 
             // Drain the wire concurrently so the writer never blocks on the
             // full 1-byte buffer.
-            let reader = tokio::spawn(async move {
-                read_record(&mut server_side, &req_key, &req_iv, 0).await
-            });
+            let reader =
+                tokio::spawn(
+                    async move { read_record(&mut server_side, &req_key, &req_iv, 0).await },
+                );
 
             let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
-            tunnel.write_all(b"payload-larger-than-one-byte").await.unwrap();
+            tunnel
+                .write_all(b"payload-larger-than-one-byte")
+                .await
+                .unwrap();
             tunnel.flush().await.unwrap();
             drop(tunnel);
 

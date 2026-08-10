@@ -1,13 +1,13 @@
-//! E2E case for VMess (TLS + TCP, AES-128-GCM) — declarative input to the e2e pipeline.
+//! E2E case for `VMess` (TLS + TCP, AES-128-GCM) — declarative input to the e2e pipeline.
 #![cfg(feature = "native-e2e")]
 
 use std::net::SocketAddr;
 
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
+use crate::NativeConnectParams;
 use crate::e2e::{Certs, CoreKind, E2eCase, E2eExpect, ServerEnv};
 use crate::security;
-use crate::NativeConnectParams;
 
 pub struct VmessCase;
 
@@ -67,7 +67,10 @@ impl E2eCase for VmessCase {
     }
 
     fn expected(&self) -> E2eExpect {
-        E2eExpect { status: 200, body: BODY.into() }
+        E2eExpect {
+            status: 200,
+            body: BODY.into(),
+        }
     }
 
     fn client_trust(&self, certs: &Certs) {

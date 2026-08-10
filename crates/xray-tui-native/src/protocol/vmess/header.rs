@@ -1,4 +1,4 @@
-//! VMess AEAD request header codec (v2ray `proxy/vmess/encoding/client.go`
+//! `VMess` AEAD request header codec (v2ray `proxy/vmess/encoding/client.go`
 //! + `proxy/vmess/aead/encrypt.go`).
 
 use aes::cipher::KeyInit;
@@ -12,7 +12,7 @@ pub const VERSION: u8 = 1;
 pub const SECURITY_AES128_GCM: u8 = 3;
 pub const COMMAND_TCP: u8 = 1;
 
-/// Per-connection VMess session material (mirrors Go `ClientSession`).
+/// Per-connection `VMess` session material (mirrors Go `ClientSession`).
 pub struct Session {
     pub request_body_iv: [u8; 16],
     pub request_body_key: [u8; 16],
@@ -24,6 +24,7 @@ pub struct Session {
 impl Session {
     /// CSPRNG request IV/key/response header; response keys are the first 16
     /// bytes of sha256(request key/iv) — Go `NewClientSession`.
+    #[must_use]
     pub fn new() -> Self {
         let mut iv = [0u8; 16];
         let mut key = [0u8; 16];
@@ -38,6 +39,12 @@ impl Session {
             response_body_key: keys::sha256_first16(&key),
             response_body_iv: keys::sha256_first16(&iv),
         }
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -56,7 +63,7 @@ fn rand_bytes(out: &mut [u8]) {
 /// port BE2 | addrType | addr | fnv1a32. Wire (Go `SealVMessAEADHeader`):
 /// authID(16) | lenAEAD(18) | nonce(8) | payloadAEAD.
 ///
-/// NOTE on address order: VMess uses the same `PortThenAddress()` parser as
+/// NOTE on address order: `VMess` uses the same `PortThenAddress()` parser as
 /// VLESS in both Xray-core and v2ray-core (proxy/vmess/encoding/encoding.go),
 /// mihomo, and sing-vmess — the port comes FIRST, then the address type byte
 /// and bytes. The crate's [`encode_addr`] already emits exactly that order.
@@ -114,10 +121,8 @@ pub fn encode_request(
     };
 
     // --- payload AEAD (seals the header body) ---
-    let body_key = keys::kdf16_bytes_path(
-        cmd_key,
-        &[b"VMess Header AEAD Key", &auth_id, &conn_nonce],
-    );
+    let body_key =
+        keys::kdf16_bytes_path(cmd_key, &[b"VMess Header AEAD Key", &auth_id, &conn_nonce]);
     let body_nonce = keys::kdf_bytes_path(
         cmd_key,
         &[b"VMess Header AEAD Nonce", &auth_id, &conn_nonce],
@@ -151,8 +156,8 @@ pub const fn peek_seal_len(body_len: usize) -> usize {
     16 + 18 + 8 + body_len + 16
 }
 
-/// Append the VMess target address to `body`: port BE2 first, then the
-/// address (type byte + payload). VMess uses the same port-first
+/// Append the `VMess` target address to `body`: port BE2 first, then the
+/// address (type byte + payload). `VMess` uses the same port-first
 /// `PortThenAddress()` order as VLESS — Go `encoding.go` address parser —
 /// which is exactly what [`encode_addr`] emits.
 fn encode_address_port(body: &mut Vec<u8>, target: &TargetAddr) {
@@ -229,8 +234,10 @@ mod tests {
         let body_cipher = &wire[42..];
 
         // lenAEAD plaintext is the BE body length (49 = 38 fixed + 2 port + 5 addr + 4 fnv).
-        let len_key = keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key_Length", auth_id, nonce]);
-        let len_nonce = keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce_Length", auth_id, nonce]);
+        let len_key =
+            keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key_Length", auth_id, nonce]);
+        let len_nonce =
+            keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce_Length", auth_id, nonce]);
         let len_aead = Aes128Gcm::new_from_slice(&len_key).unwrap();
         let len_plain = len_aead
             .decrypt(
@@ -262,7 +269,7 @@ mod tests {
         expect.extend_from_slice(&[0x33, 0x00, 0x03, 0x00, COMMAND_TCP]);
         expect.extend_from_slice(&80u16.to_be_bytes()); // port FIRST
         expect.extend_from_slice(&[0x01, 127, 0, 0, 1]); // addrType IPv4 + 127.0.0.1
-        expect.extend_from_slice(&0x273bd20au32.to_be_bytes()); // fnv1a32(port-first body)
+        expect.extend_from_slice(&0x273b_d20a_u32.to_be_bytes()); // fnv1a32(port-first body)
         assert_eq!(body, expect);
     }
 
@@ -285,7 +292,12 @@ mod tests {
     }
 
     fn hex_encode(b: &[u8]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect()
+        use std::fmt::Write;
+        let mut s = String::with_capacity(b.len() * 2);
+        for x in b {
+            let _ = write!(s, "{x:02x}");
+        }
+        s
     }
 
     fn hex_decode(h: &str) -> Vec<u8> {

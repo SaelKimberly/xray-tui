@@ -29,8 +29,9 @@ impl Drop for EchoServer {
     }
 }
 
-/// Spawn a tiny_http responder on 127.0.0.1:ephemeral serving a fixed body.
-/// tiny_http is synchronous — dedicated thread, requests drained until drop.
+/// Spawn a `tiny_http` responder on 127.0.0.1:ephemeral serving a fixed body.
+/// `tiny_http` is synchronous — dedicated thread, requests drained until drop.
+#[must_use]
 pub fn spawn_echo() -> EchoServer {
     let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind echo"));
     let addr = server.server_addr().to_ip().expect("ip addr");
@@ -50,6 +51,7 @@ pub fn spawn_echo() -> EchoServer {
 }
 
 /// Return a port that was free at bind time.
+#[must_use]
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -70,6 +72,7 @@ impl Drop for CoreGuard {
 }
 
 /// Spawn a core with the given on-disk config; wait until `port` accepts TCP.
+#[must_use]
 pub fn spawn_core(bin: &Path, kind: CoreKind, config_path: &Path, port: u16) -> CoreGuard {
     let p = config_path.to_str().expect("config path utf8");
     let mut cmd = match kind {
@@ -107,6 +110,7 @@ pub struct Certs {
     pub ca_der: Vec<u8>,
 }
 
+#[must_use]
 pub fn generate_certs() -> Certs {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
@@ -137,7 +141,7 @@ pub fn generate_certs() -> Certs {
 pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const STEP: Duration = Duration::from_secs(5);
-    let write = tokio::time::timeout(STEP, tunnel.write_all(&GET)).await;
+    let write = tokio::time::timeout(STEP, tunnel.write_all(GET)).await;
     if write.is_err() {
         return (0, String::new());
     }

@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 pub use core::{CoreKind, CoreUnderTest};
-pub use harness::{Certs, EchoServer, probe, spawn_core, spawn_echo, generate_certs, free_port};
+pub use harness::{Certs, EchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo};
 
 use crate::NativeConnectParams;
 
@@ -49,7 +49,7 @@ const ATTEMPTS: u32 = 3;
 ///
 /// The flaky segment (core spawn + connect + probe) is retried with fresh
 /// resources; echo/certs/tempdir are created once.
-pub async fn run<C: E2eCase>(case: &C, core: &CoreUnderTest) -> Result<(), String> {
+pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<(), String> {
     let expect = case.expected();
     let echo = spawn_echo();
     let certs = generate_certs();
@@ -62,7 +62,11 @@ pub async fn run<C: E2eCase>(case: &C, core: &CoreUnderTest) -> Result<(), Strin
 
     for attempt in 1..=ATTEMPTS {
         let port = free_port();
-        let env = ServerEnv { port, certs: &certs, tmp: dir.path() };
+        let env = ServerEnv {
+            port,
+            certs: &certs,
+            tmp: dir.path(),
+        };
         let config_json = case.server_config(core.kind, &env);
         if std::fs::write(&config_path, &config_json).is_err() {
             return Err(format!("attempt {attempt}: config write failed"));
@@ -74,7 +78,10 @@ pub async fn run<C: E2eCase>(case: &C, core: &CoreUnderTest) -> Result<(), Strin
         let mut tunnel = match crate::connect(params).await {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[e2e] {}: attempt {attempt}/{ATTEMPTS} connect: {e}", case.label());
+                eprintln!(
+                    "[e2e] {}: attempt {attempt}/{ATTEMPTS} connect: {e}",
+                    case.label()
+                );
                 continue;
             }
         };
@@ -87,5 +94,8 @@ pub async fn run<C: E2eCase>(case: &C, core: &CoreUnderTest) -> Result<(), Strin
             case.label()
         );
     }
-    Err(format!("{}: failed after {ATTEMPTS} attempts", case.label()))
+    Err(format!(
+        "{}: failed after {ATTEMPTS} attempts",
+        case.label()
+    ))
 }

@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
+use crate::NativeConnectParams;
 use crate::e2e::{Certs, CoreKind, E2eCase, E2eExpect, ServerEnv};
 use crate::security;
-use crate::NativeConnectParams;
 
 pub struct VlessCase;
 
@@ -20,9 +20,7 @@ impl E2eCase for VlessCase {
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
-        let cert = env.certs.cert_pem.as_bytes();
-        let key = env.certs.key_pem.as_bytes();
-        let _ = (cert, key); // configs below reference PEM FILES on disk
+        // Configs below reference the PEM FILES on disk, not the byte buffers.
         let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
         let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
         let json = match core {
@@ -67,7 +65,10 @@ impl E2eCase for VlessCase {
     }
 
     fn expected(&self) -> E2eExpect {
-        E2eExpect { status: 200, body: BODY.into() }
+        E2eExpect {
+            status: 200,
+            body: BODY.into(),
+        }
     }
 
     fn client_trust(&self, certs: &Certs) {
