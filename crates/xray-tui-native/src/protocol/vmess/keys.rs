@@ -109,8 +109,8 @@ mod tests {
         body.extend_from_slice(&[0x22; 16]);
         body.extend_from_slice(&[0x33, 0x00, 0x00, 0x00, 0x01]);
         body.extend_from_slice(&[0x01, 127, 0, 0, 1]);
-        body.extend_from_slice(&0u16.to_be_bytes());
-        assert_eq!(fnv1a32(&body), 0x01e79ab9);
+        body.extend_from_slice(&80u16.to_be_bytes()); // port 80 (0x0050), per golden
+        assert_eq!(fnv1a32(&body), 0x51e818a9);
     }
 
     #[test]
