@@ -7456,6 +7456,7 @@ dependencies = [
  "hmac 0.12.1",
  "md-5 0.10.6",
  "rcgen",
+ "ring",
  "rustls",
  "serde_json",
  "sha2 0.10.9",

@@ -5,6 +5,8 @@ use sha2::Sha256;
 
 pub const VMESS_SALT: &str = "c48619fe-8f02-49e0-b9e9-edf763e17e21";
 const KDF_ROOT: &str = "VMess AEAD KDF";
+const IPAD: u8 = 0x36;
+const OPAD: u8 = 0x5c;
 
 /// cmdKey = md5(uuid_bytes ‖ VMESS_SALT) — Go `protocol.NewID`.
 pub fn cmd_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
@@ -14,20 +16,74 @@ pub fn cmd_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
     m.finalize().into()
 }
 
-/// Nested HMAC-SHA256: `HMAC(p[n], … HMAC(p[1], HMAC(KDF_ROOT, key)))`.
-/// Go `aead.KDF` — message chains root → key at the innermost position.
-pub fn kdf(key: &[u8], path: &[&str]) -> [u8; 32] {
-    let mut msg: [u8; 32] = hmac_sha256(KDF_ROOT.as_bytes(), key);
-    for v in path {
-        msg = hmac_sha256(v.as_bytes(), &msg);
+/// VMess AEAD KDF — Go `aead.KDF`. Go builds a chain of HMAC-SHA256 objects
+/// where each path element keys the next HMAC whose *underlying hash* is the
+/// previous HMAC (`hmac.New(parent.Create, v)`), then writes the original key
+/// as the innermost message. Unrolled, one path element is:
+///
+/// ```text
+/// kdf(key, [p]) = HMAC(root, opad(p) ‖ HMAC(root, ipad(p) ‖ key))
+/// ```
+///
+/// and each additional element wraps the previous result the same way
+/// (`kdf(key, p..) = kdf'(opad(pn) ‖ kdf'(ipad(pn) ‖ key, p..n-1), p..n-1)`).
+/// All VMess keys and path entries are ≤ 64 bytes, so the long-key hashing
+/// branch never applies. Path entries are RAW BYTES — Go passes the 16-byte
+/// authID / 8-byte nonce through `string(...)`.
+///
+/// Verified byte-for-byte against Xray-core (hash2 form), v2ray-core v5 and
+/// mihomo and sing-vmess (`hMacCreator` form), and the leaf/shoes Rust ports.
+pub fn kdf_bytes_path(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
+    fn go(id: &[u8], path: &[&[u8]]) -> [u8; 32] {
+        match path {
+            [] => hmac_sha256(KDF_ROOT.as_bytes(), id),
+            [rest @ .., p] => {
+                let inner = {
+                    let mut msg = Vec::with_capacity(64 + id.len());
+                    msg.extend_from_slice(&pad_key(p, IPAD));
+                    msg.extend_from_slice(id);
+                    go(&msg, rest)
+                };
+                let mut msg = Vec::with_capacity(64 + inner.len());
+                msg.extend_from_slice(&pad_key(p, OPAD));
+                msg.extend_from_slice(&inner);
+                go(&msg, rest)
+            }
+        }
     }
-    msg
+    go(key, path)
 }
 
+/// String-path form of [`kdf_bytes_path`] (ASCII salts — e.g. the authID
+/// encryption key salt and the response-header salts).
+pub fn kdf(key: &[u8], path: &[&str]) -> [u8; 32] {
+    let bytes: Vec<&[u8]> = path.iter().map(|s| s.as_bytes()).collect();
+    kdf_bytes_path(key, &bytes)
+}
+
+/// 16-byte prefix of [`kdf`].
 pub fn kdf16(key: &[u8], path: &[&str]) -> [u8; 16] {
     let full = kdf(key, path);
     let mut out = [0u8; 16];
     out.copy_from_slice(&full[..16]);
+    out
+}
+
+/// 16-byte prefix of [`kdf_bytes_path`].
+pub fn kdf16_bytes_path(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
+    let full = kdf_bytes_path(key, path);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+/// 64-byte ipad/opad padding of an HMAC key (VMess keys are ≤ 64 bytes, so no
+/// long-key pre-hashing is needed — matches Go's `hmac.New` for short keys).
+fn pad_key(key: &[u8], xor: u8) -> [u8; 64] {
+    let mut out = [xor; 64];
+    for (o, &b) in out.iter_mut().zip(key) {
+        *o ^= b;
+    }
     out
 }
 
@@ -93,36 +149,82 @@ mod tests {
     }
 
     #[test]
-    fn kdf_matches_go_nested_hmac() {
+    fn kdf_matches_go_hmac_chain() {
         let ck = cmd_key(&ZERO_UUID);
-        // Go aead.KDF16(ck, "AES Auth ID Encryption")
-        assert_eq!(hex(&kdf16(&ck, &["AES Auth ID Encryption"])), "e4e63970ccc1e39dd4a315d51b66abf7");
+        // Go aead.KDF16(ck, "AES Auth ID Encryption") — verified against the
+        // vendored Xray-core proxy/vmess/aead package.
+        assert_eq!(hex(&kdf16(&ck, &["AES Auth ID Encryption"])), "b39f4051224a1a3ce8aa8b1a2ab9f5ca");
         // Go aead.KDF16(ck, "AEAD Resp Header Len Key")
-        assert_eq!(hex(&kdf16(&ck, &["AEAD Resp Header Len Key"])), "2e2b7503835a5934f683a5f84910e211");
+        assert_eq!(hex(&kdf16(&ck, &["AEAD Resp Header Len Key"])), "e784d53ee0d812cd04762ebe91cab8d4");
+    }
+
+    #[test]
+    fn kdf_bytes_path_three_level_matches_go_seal_key() {
+        // 3-level byte-path KDF, exactly as used to seal the request header:
+        // Go KDF16(ck, "VMess Header AEAD Key_Length", authID(ts=42), nonce=0xABx8).
+        // authID/ts=42 from the vendored Go run (fixed rand aabbccdd).
+        let ck = cmd_key(&ZERO_UUID);
+        let auth_id = hex_decode("79d348cf6b4707cf6acbb494bf257f1d");
+        let nonce = [0xab; 8];
+        let got = kdf16_bytes_path(
+            &ck,
+            &[b"VMess Header AEAD Key_Length", &auth_id, &nonce],
+        );
+        assert_eq!(hex(&got), "f6ce8d31a534f597ab191a35a335f27e");
     }
 
     #[test]
     fn fnv1a32_matches_go() {
-        // sample request-body prefix used for the golden: version|iv|key|resp|opt|sec|0|cmd|addr
+        // Real request-body prefix (wire layout, Go-verified): version | iv | key |
+        // resp | opt | security 3 | reserved | cmd | PORT FIRST | addrType | addr.
+        // fnv = 0x273bd20a (computed by the vendored Xray-core seal for this body).
         let mut body = vec![1u8];
         body.extend_from_slice(&[0x11; 16]);
         body.extend_from_slice(&[0x22; 16]);
-        body.extend_from_slice(&[0x33, 0x00, 0x00, 0x00, 0x01]);
-        body.extend_from_slice(&[0x01, 127, 0, 0, 1]);
-        body.extend_from_slice(&80u16.to_be_bytes()); // port 80 (0x0050), per golden
-        assert_eq!(fnv1a32(&body), 0x51e818a9);
+        body.extend_from_slice(&[0x33, 0x00, 0x03, 0x00, 0x01]);
+        body.extend_from_slice(&80u16.to_be_bytes()); // port 80 (0x0050), FIRST
+        body.extend_from_slice(&[0x01, 127, 0, 0, 1]); // addrType IPv4 + 127.0.0.1
+        assert_eq!(fnv1a32(&body), 0x273bd20a);
     }
 
     #[test]
     fn auth_id_encrypts_ecb_golden() {
         let ck = cmd_key(&ZERO_UUID);
-        // ts=0x6000000000000000, rand=0xaabbccdd -> crc32 0x277774dc; key = KDF16(ck, salt)
-        // golden ciphertext (openssl aes-128-ecb): 5659b5bba7891c58aad644346470c210
+        // ts=0x6000000000000000, rand=0xaabbccdd -> crc32 0x277774dc; key =
+        // KDF16(ck, "AES Auth ID Encryption") = b39f4051224a1a3ce8aa8b1a2ab9f5ca.
+        // Golden ciphertext (openssl aes-128-ecb + vendored Xray-core aead):
+        // 9becfee74d1a702389bc60e9f200e6de
         let id = auth_id(&ck, 0x6000_0000_0000_0000, &[0xaa, 0xbb, 0xcc, 0xdd]);
-        assert_eq!(hex(&id), "5659b5bba7891c58aad644346470c210");
+        assert_eq!(hex(&id), "9becfee74d1a702389bc60e9f200e6de");
+    }
+
+    #[test]
+    fn kdf_bytes_path_matches_string_path_for_ascii() {
+        let ck = cmd_key(&ZERO_UUID);
+        let str_path = ["AES Auth ID Encryption", "aead", "salt"];
+        let bytes_path: [&[u8]; 3] = [
+            b"AES Auth ID Encryption",
+            b"aead",
+            b"salt",
+        ];
+        assert_eq!(
+            kdf_bytes_path(&ck, &bytes_path),
+            kdf(&ck, &str_path)
+        );
+        assert_eq!(
+            kdf16_bytes_path(&ck, &bytes_path),
+            kdf16(&ck, &str_path)
+        );
     }
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn hex_decode(h: &str) -> Vec<u8> {
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+            .collect()
     }
 }

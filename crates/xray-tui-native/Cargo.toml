@@ -24,6 +24,9 @@ sha2 = "0.10"
 crc32fast = "1"
 md-5 = "0.10"
 
+# CSPRNG for per-connection VMess session material (same provider rustls uses)
+ring = "0.17"
+
 # errors
 thiserror.workspace = true
 
