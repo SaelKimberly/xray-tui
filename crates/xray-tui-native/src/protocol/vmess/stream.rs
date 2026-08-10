@@ -7,12 +7,15 @@
 //! (`crypto.PlainChunkSizeParser`), so no ChunkStream/ChunkMasking option bit
 //! is ever set.
 //!
-//! Record framing (both directions): `2B BE length | AES-128-GCM(key =
-//! session.{request,response}_body_key, nonce = IV-with-first-2-bytes-
-//! overwritten-by-BE-counter)` — counter starts 0 and increments per record
-//! (Go `GenerateChunkNonce`); the nonce is the first 12 bytes of the modified
-//! IV. The request direction uses the request keys + its own counter, the
-//! response direction the response keys + its own counter.
+//! Record framing (both directions): `2B BE ciphertext-length | AES-128-GCM(
+//! key = session.{request,response}_body_key, nonce = IV-with-first-2-bytes-
+//! overwritten-by-BE-counter)` — the length field is the FULL wire size
+//! (plaintext + 16-byte GCM tag, Go `AuthenticationWriter.seal`); a record
+//! carrying only the tag (field == 16) or a zero field marks end of stream.
+//! The counter starts 0 and increments per record (Go `GenerateChunkNonce`);
+//! the nonce is the first 12 bytes of the modified IV. The request direction
+//! uses the request keys + its own counter, the response direction the
+//! response keys + its own counter.
 
 use std::io;
 use std::pin::Pin;
@@ -41,9 +44,9 @@ enum ReadState {
     PeelLen { filled: usize },
     /// Filling the (len+16)-byte AEAD response-header payload ciphertext.
     PeelPayload { total: usize, filled: usize },
-    /// Filling the 2-byte BE record length.
+    /// Filling the 2-byte BE record field (ciphertext size, plaintext+tag).
     RecordLen { filled: usize },
-    /// Filling the (len+16)-byte record ciphertext.
+    /// Filling the `field`-byte record ciphertext.
     RecordData { total: usize, filled: usize },
     /// Terminal error: every subsequent poll returns the same error.
     Dead(&'static str),
@@ -327,13 +330,15 @@ impl AsyncRead for VmessClientStream {
                         this.read_state = ReadState::RecordLen { filled };
                         continue;
                     }
-                    let len = u16::from_be_bytes(this.len_buf);
-                    if len == 0 {
-                        // Zero-length record: skip, read the next one.
-                        this.read_state = ReadState::RecordLen { filled: 0 };
-                        continue;
+                    let field = u16::from_be_bytes(this.len_buf);
+                    // End-of-stream markers: a record carrying only the GCM
+                    // tag (field == 16) or a zero field (Go: `size ==
+                    // auth.Overhead()` -> io.EOF).
+                    if field == 0 || field == 16 {
+                        return Poll::Ready(Ok(()));
                     }
-                    let total = len as usize + 16;
+                    // The field is the full wire size (plaintext + tag).
+                    let total = field as usize;
                     this.pending.resize(total, 0);
                     this.pending_pos = 0;
                     this.read_state = ReadState::RecordData { total, filled: 0 };
@@ -394,6 +399,14 @@ impl AsyncWrite for VmessClientStream {
             // Empty writes are skipped (mirror xray: no zero-length record).
             return Poll::Ready(Ok(0));
         }
+        // One record holds the whole buffer; the 2B field is the full wire
+        // size (plaintext + 16-byte GCM tag) and must fit in u16.
+        if buf.len() > u16::MAX as usize - 16 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vmess record too large (max 65519 bytes per write)",
+            )));
+        }
         // Seal the caller's buffer into a single record. If a previous record
         // is still being flushed, the caller is retrying with the same buffer
         // (tokio poll contract) — the pending record was built from it.
@@ -409,7 +422,7 @@ impl AsyncWrite for VmessClientStream {
                 }
             };
             let mut rec = Vec::with_capacity(2 + ct.len());
-            rec.extend_from_slice(&(buf.len() as u16).to_be_bytes());
+            rec.extend_from_slice(&(buf.len() as u16 + 16).to_be_bytes());
             rec.extend_from_slice(&ct);
             this.write_pending = Some(rec);
             this.write_pos = 0;
@@ -476,7 +489,8 @@ mod tests {
     }
 
     /// Server-side response record (mirrors Go `EncodeResponseBody` chunk):
-    /// 2B BE length + AES-128-GCM data, counter nonce from the response IV.
+    /// 2B BE ciphertext length (plaintext + GCM tag) + AES-128-GCM data,
+    /// counter nonce from the response IV.
     fn seal_record(key: &[u8; 16], iv: &[u8; 16], counter: u16, data: &[u8]) -> Vec<u8> {
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
@@ -484,7 +498,7 @@ mod tests {
             .unwrap()
             .encrypt(Nonce::from_slice(&nonce[..12]), data)
             .unwrap();
-        (data.len() as u16).to_be_bytes().into_iter().chain(ct).collect()
+        (data.len() as u16 + 16).to_be_bytes().into_iter().chain(ct).collect()
     }
 
     #[test]
@@ -523,6 +537,41 @@ mod tests {
     }
 
     #[test]
+    fn response_eof_marker_ends_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (client_side, mut server_side) = tokio::io::duplex(8192);
+            let mut session = Session::new();
+            session.request_body_iv = [0x11; 16];
+            session.request_body_key = [0x22; 16];
+            session.response_header = 0x99;
+            session.response_body_key = sha256_first16(&session.request_body_key);
+            session.response_body_iv = sha256_first16(&session.request_body_iv);
+
+            // A record carrying only the GCM tag (field == 16) terminates the
+            // stream cleanly (Go: `size == auth.Overhead()` -> io.EOF).
+            let mut wire = seal_response_header(
+                &session.response_body_key,
+                &session.response_body_iv,
+                &[0x99, 0, 0, 0],
+            );
+            wire.extend_from_slice(&seal_record(
+                &session.response_body_key,
+                &session.response_body_iv,
+                0,
+                b"",
+            ));
+            server_side.write_all(&wire).await.unwrap();
+            drop(server_side);
+
+            let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
+            let mut got = Vec::new();
+            tunnel.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"");
+        });
+    }
+
+    #[test]
     fn peel_rejects_wrong_echo_byte() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
@@ -555,7 +604,8 @@ mod tests {
     }
 
     /// Client-side inverse of [`seal_record`]: reads one record off `stream`
-    /// and returns its plaintext (2B BE length, then len+16 ciphertext).
+    /// and returns its plaintext (2B BE ciphertext length, then that many
+    /// bytes).
     async fn read_record(
         stream: &mut tokio::io::DuplexStream,
         key: &[u8; 16],
@@ -565,8 +615,8 @@ mod tests {
         use aes_gcm::aead::Aead;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await.unwrap();
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut ct = vec![0u8; len + 16];
+        let field = u16::from_be_bytes(len_buf) as usize;
+        let mut ct = vec![0u8; field];
         stream.read_exact(&mut ct).await.unwrap();
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
