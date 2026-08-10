@@ -15,8 +15,8 @@ const UUID: &str = "00000000-0000-0000-0000-000000000000";
 const BODY: &str = "hello native core";
 
 impl E2eCase for VlessCase {
-    fn label(&self) -> &'static str {
-        "vless/tcp/tls"
+    fn label(&self) -> String {
+        "vless/tcp/tls".to_string()
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {

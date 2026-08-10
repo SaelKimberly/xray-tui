@@ -4,16 +4,26 @@
 //! config, client params, expectations); a driver (Task 3) runs them against
 //! resolved core binaries. Gated behind feature `native-e2e`.
 
+pub mod case;
+pub mod config;
 pub mod core;
 pub mod harness;
+pub mod variant;
 
 use std::net::SocketAddr;
 use std::path::Path;
 
+pub use case::{CaseSpec, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{Certs, EchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo};
+pub use variant::{Aes128GcmVariant, Chacha20Poly1305Variant};
 
 use crate::NativeConnectParams;
+
+/// Core version strings for the e2e sweep (single source of truth; tests
+/// import these instead of duplicating constants).
+pub const SINGBOX_VERSION: &str = "1.13.16";
+pub const XRAY_VERSION: &str = "26.3.27";
 
 /// Environment handed to an [`E2eCase`]'s `server_config` builder.
 pub struct ServerEnv<'a> {
@@ -28,11 +38,20 @@ pub struct E2eExpect {
     pub body: String,
 }
 
+/// Payload-security variant: names itself, gates which cores support it, and
+/// supplies the security strings for the server config and client params.
+pub trait SecurityVariant: Sync {
+    fn name(&self) -> &'static str;
+    fn cores(&self) -> &'static [CoreKind];
+    fn server_security(&self, core: CoreKind) -> Option<&'static str>;
+    fn client_security(&self) -> &'static str;
+}
+
 /// One end-to-end scenario: a core's server config, the native client params
 /// that dial it, and the expected probe result.
 pub trait E2eCase {
     /// Human-readable scenario name (test label).
-    fn label(&self) -> &'static str;
+    fn label(&self) -> String;
     /// JSON config to write for `core` and spawn on `env.port`.
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String;
     /// Native client params dialing the core listener on `port` toward `target`.
@@ -98,4 +117,19 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
         "{}: failed after {ATTEMPTS} attempts",
         case.label()
     ))
+}
+
+/// Run `case` against every core in its gate; the first failure short-circuits.
+pub async fn run_against_cores(case: &CaseSpec) -> Result<(), String> {
+    for kind in case.cores() {
+        let version = match kind {
+            CoreKind::Xray => XRAY_VERSION,
+            CoreKind::SingBox => SINGBOX_VERSION,
+        };
+        let core = CoreUnderTest::resolve(*kind, version)?;
+        run(case, &core)
+            .await
+            .map_err(|e| format!("{}/{}: {e}", case.label(), core.bin.display()))?;
+    }
+    Ok(())
 }
