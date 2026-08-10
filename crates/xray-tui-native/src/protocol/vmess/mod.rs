@@ -18,6 +18,8 @@ use crate::protocol::vmess::stream::VmessClientStream;
 pub mod keys;
 pub mod header;
 pub mod stream;
+#[cfg(feature = "native-e2e")]
+pub mod e2e;
 
 /// Validate the VMess payload security the config requests.
 pub fn check_security(cfg: &VmessConfig) -> Result<(), NativeError> {
