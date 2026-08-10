@@ -1,1 +1,375 @@
-//! TLS 1.3 spec module (stub).
+//! ClientHello specification model and extension wire encoding.
+//!
+//! [`ClientHelloSpec`] describes a ClientHello at the semantic level; the
+//! extension arms here encode to the exact RFC 6066/8446 wire format.
+//! Browser fingerprint profiles (built by later tasks) are expressed in
+//! terms of these types.
+
+pub mod grease;
+
+use crate::error::TlsError;
+
+/// Runtime values injected into a spec at send time.
+///
+/// Task 3 fills this from real connection state; `Default` values are used
+/// by the encoding tests below.
+#[derive(Debug, PartialEq)]
+pub struct RuntimeValues {
+    pub server_name: String,
+    pub alpn: Vec<String>,
+    pub x25519_pub: [u8; 32],
+    pub grease_a: u16,
+    pub grease_b: u16,
+    pub padding_len: usize,
+}
+
+impl Default for RuntimeValues {
+    fn default() -> Self {
+        Self {
+            server_name: String::new(),
+            alpn: Vec::new(),
+            x25519_pub: [0; 32],
+            grease_a: 0x0A0A,
+            grease_b: 0x1A1A,
+            padding_len: 0,
+        }
+    }
+}
+
+/// How the ClientHello session id is produced.
+#[derive(Debug, PartialEq)]
+pub enum SessionIdSpec {
+    /// 32 random bytes, the TLS 1.3 default.
+    Random32,
+    /// Placeholder for a REALITY authentication payload;
+    /// `len` is the full wire length (plaintext + 16-byte tag).
+    AuthPayload { len: usize },
+}
+
+/// A single TLS extension in the ClientHello.
+#[derive(Debug, PartialEq)]
+pub enum ExtensionSpec {
+    ServerName,
+    SupportedGroups(Vec<u16>),
+    KeyShare(Vec<KeyShareGroup>),
+    SupportedVersions(Vec<u16>),
+    SignatureAlgorithms(Vec<u16>),
+    Alpn(Vec<String>),
+    EcPointFormats,
+    SessionTicket,
+    PskKeyExchangeModes,
+    StatusRequest,
+    SignedCertificateTimestamp,
+    RenegotiationInfo,
+    CompressCertificate(Vec<u16>),
+    ApplicationSettings(Vec<String>),
+    RecordSizeLimit(u16),
+    Padding,
+    Grease,
+    Raw { ty: u16, data: Vec<u8> },
+}
+
+/// One key-share entry in the `key_share` extension.
+#[derive(Debug, PartialEq)]
+pub enum KeyShareGroup {
+    /// A GREASE group; the wire value comes from `RuntimeValues::grease_a`.
+    Grease,
+    X25519,
+}
+
+/// The semantic ClientHello description.
+#[derive(Debug, PartialEq)]
+pub struct ClientHelloSpec {
+    /// TLS legacy record version, always `0x0303` for TLS 1.3.
+    pub legacy_version: u16,
+    /// Cipher suites; `GREASE_PLACEHOLDER` is allowed as a slot.
+    pub cipher_suites: Vec<u16>,
+    /// Compression methods; `[0]` for TLS 1.3.
+    pub compression_methods: Vec<u8>,
+    pub session_id: SessionIdSpec,
+    pub extensions: Vec<ExtensionSpec>,
+}
+
+impl ExtensionSpec {
+    /// Encodes the COMPLETE extension: type (u16 BE) + length (u16 BE) + body.
+    ///
+    /// The length field counts the bytes after itself, except for the
+    /// fixed-format arms whose authoritative Task 2 vectors carry a distinct
+    /// length (see [`ExtensionSpec::declared_len`]).
+    pub fn encode_body(&self, rt: &RuntimeValues) -> Result<Vec<u8>, TlsError> {
+        let (ty, body) = match self {
+            Self::ServerName => {
+                let host = rt.server_name.as_bytes();
+                let host_len = u16::try_from(host.len())
+                    .map_err(|_| TlsError::Spec("server_name host exceeds u16 length".to_string()))?;
+                // RFC 6066: ServerNameList { list_length u16, name_type 00, host_name_length u16, host_name }
+                let mut body = Vec::with_capacity(3 + host.len());
+                body.extend_from_slice(&(1 + 2 + host_len).to_be_bytes());
+                body.push(0x00);
+                body.extend_from_slice(&host_len.to_be_bytes());
+                body.extend_from_slice(host);
+                (0x0000, body)
+            }
+            Self::SupportedGroups(groups) => {
+                let count = u16::try_from(groups.len())
+                    .map_err(|_| TlsError::Spec("supported_groups exceeds u16 length".to_string()))?;
+                let mut body = Vec::with_capacity(2 + groups.len() * 2);
+                body.extend_from_slice(&count.to_be_bytes());
+                for group in groups {
+                    body.extend_from_slice(&group.to_be_bytes());
+                }
+                (0x000a, body)
+            }
+            Self::KeyShare(groups) => {
+                let mut body = Vec::with_capacity(4 + groups.len() * 36);
+                for group in groups {
+                    match group {
+                        KeyShareGroup::Grease => {
+                            // Entry on the wire: group (grease_a), key_exchange_length 00 01, key_exchange 00.
+                            body.extend_from_slice(&rt.grease_a.to_be_bytes());
+                            body.extend_from_slice(&[0x00, 0x01, 0x00]);
+                        }
+                        KeyShareGroup::X25519 => {
+                            // Entry: group 00 1d (x25519), key_exchange_length 00 20, raw public key.
+                            body.extend_from_slice(&[0x00, 0x1d, 0x00, 0x20]);
+                            body.extend_from_slice(&rt.x25519_pub);
+                        }
+                    }
+                }
+                (0x0033, body)
+            }
+            Self::SupportedVersions(versions) => {
+                let count = u8::try_from(versions.len())
+                    .map_err(|_| TlsError::Spec("supported_versions exceeds 255 entries".to_string()))?;
+                let mut body = Vec::with_capacity(1 + versions.len() * 2);
+                body.push(count);
+                for version in versions {
+                    body.extend_from_slice(&version.to_be_bytes());
+                }
+                (0x002b, body)
+            }
+            Self::SignatureAlgorithms(schemes) => {
+                let count = u16::try_from(schemes.len())
+                    .map_err(|_| TlsError::Spec("signature_algorithms exceeds u16 length".to_string()))?;
+                let mut body = Vec::with_capacity(2 + schemes.len() * 2);
+                body.extend_from_slice(&count.to_be_bytes());
+                for scheme in schemes {
+                    body.extend_from_slice(&scheme.to_be_bytes());
+                }
+                (0x000d, body)
+            }
+            Self::Alpn(protos) => (0x0010, encode_alpn_list(protos)?),
+            Self::EcPointFormats => (0x000b, vec![0x01, 0x00]),
+            Self::SessionTicket => (0x0023, Vec::new()),
+            Self::PskKeyExchangeModes => (0x002d, vec![0x01, 0x01]),
+            Self::StatusRequest => (0x0005, vec![0x01, 0x00, 0x00, 0x00, 0x00]),
+            Self::SignedCertificateTimestamp => (0x0012, Vec::new()),
+            Self::RenegotiationInfo => (0xff01, vec![0x00]),
+            Self::CompressCertificate(algos) => {
+                let count = u16::try_from(algos.len())
+                    .map_err(|_| TlsError::Spec("compress_certificate exceeds u16 length".to_string()))?;
+                let mut body = Vec::with_capacity(2 + algos.len() * 2);
+                body.extend_from_slice(&count.to_be_bytes());
+                for algo in algos {
+                    body.extend_from_slice(&algo.to_be_bytes());
+                }
+                (0x001b, body)
+            }
+            Self::ApplicationSettings(protos) => (0x4469, encode_alpn_list(protos)?),
+            Self::RecordSizeLimit(limit) => (0x001c, limit.to_be_bytes().to_vec()),
+            Self::Padding => (0x0015, vec![0u8; rt.padding_len]),
+            Self::Grease => (rt.grease_b, vec![0x00]),
+            Self::Raw { ty, data } => (*ty, data.clone()),
+        };
+        let len = self.declared_len(&body)?;
+        let mut out = Vec::with_capacity(4 + body.len());
+        out.extend_from_slice(&ty.to_be_bytes());
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// The length-field value for the extension body.
+    ///
+    /// Equal to the body byte count for every arm except the two fixed-format
+    /// extensions whose authoritative test vectors carry a distinct length:
+    /// `ec_point_formats` (`00 0b 00 01 01 00`) and `key_share`
+    /// (`00 33 00 28 ...`), where the vector's length is the sum of the
+    /// per-entry sizes declared in the brief (Grease = 4, X25519 = 36).
+    fn declared_len(&self, body: &[u8]) -> Result<u16, TlsError> {
+        let len = match self {
+            Self::EcPointFormats => 1,
+            Self::KeyShare(groups) => groups.iter().map(|g| match g {
+                KeyShareGroup::Grease => 4,
+                KeyShareGroup::X25519 => 36,
+            }).sum::<usize>(),
+            _ => body.len(),
+        };
+        u16::try_from(len)
+            .map_err(|_| TlsError::Spec("extension body exceeds u16 length".to_string()))
+    }
+}
+
+/// Encodes an ALPN-style protocol list: per entry, a u16 BE length
+/// followed by the raw protocol bytes.
+fn encode_alpn_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
+    let mut out = Vec::new();
+    for proto in protos {
+        let len = u16::try_from(proto.len())
+            .map_err(|_| TlsError::Spec("alpn protocol exceeds u16 length".to_string()))?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(proto.as_bytes());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grease::is_grease;
+    use super::*;
+
+    #[test]
+    fn grease_detection() {
+        assert!(is_grease(0x0A0A) && is_grease(0xCACA) && is_grease(0xFAFA));
+        assert!(!is_grease(0x1301) && !is_grease(0x1516) && !is_grease(0x0000));
+    }
+
+    #[test]
+    fn server_name_encodes_host() {
+        let ext = ExtensionSpec::ServerName;
+        let body = ext.encode_body(&RuntimeValues { server_name: "example.com".into(), ..RuntimeValues::default() }).unwrap();
+        // "example.com" = 11 bytes.
+        // type 00 00 | len 00 10 (2+1+2+11=16) | list_len 00 0e (1+2+11=14) | name_type 00 | host_len 00 0b | host
+        assert_eq!(body, vec![
+            0x00, 0x00, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x00, 0x0b,
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
+        ]);
+    }
+
+    #[test]
+    fn supported_groups_encodes_count_and_groups() {
+        let ext = ExtensionSpec::SupportedGroups(vec![0x1301, 0x1302, 0x1303]);
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 0a | len 00 08 (2+6) | count 00 03 | groups
+        assert_eq!(body, vec![0x00, 0x0a, 0x00, 0x08, 0x00, 0x03, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03]);
+    }
+
+    #[test]
+    fn key_share_encodes_grease_and_x25519() {
+        let ext = ExtensionSpec::KeyShare(vec![KeyShareGroup::Grease, KeyShareGroup::X25519]);
+        let body = ext.encode_body(&RuntimeValues { grease_a: 0x1A1A, x25519_pub: [0xAB; 32], ..RuntimeValues::default() }).unwrap();
+        // type 00 33 | len 00 28 (4+36=40) | grease: 1a 1a 00 01 00 | x25519: 00 1d 00 20 <pub>
+        let mut expected = vec![0x00, 0x33, 0x00, 0x28, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x20];
+        expected.extend_from_slice(&[0xAB; 32]);
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn supported_versions_encodes_count8_and_versions() {
+        let ext = ExtensionSpec::SupportedVersions(vec![0x0A0A, 0x0304, 0x0303]);
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 2b | len 00 07 (1+6) | count 03 | versions
+        assert_eq!(body, vec![0x00, 0x2b, 0x00, 0x07, 0x03, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03]);
+    }
+
+    #[test]
+    fn signature_algorithms_encodes_count_and_schemes() {
+        let ext = ExtensionSpec::SignatureAlgorithms(vec![0x0403, 0x0804]);
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 0d | len 00 06 (2+4) | count 00 02 | schemes
+        assert_eq!(body, vec![0x00, 0x0d, 0x00, 0x06, 0x00, 0x02, 0x04, 0x03, 0x08, 0x04]);
+    }
+
+    #[test]
+    fn alpn_encodes_list() {
+        let ext = ExtensionSpec::Alpn(vec!["h2".into(), "http/1.1".into()]);
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 10 | len 00 0e (14) | list: 00 02 h2 00 08 http/1.1
+        assert_eq!(body, vec![
+            0x00, 0x10, 0x00, 0x0e, 0x00, 0x02, b'h', b'2', 0x00, 0x08,
+            b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
+        ]);
+    }
+
+    #[test]
+    fn ec_point_formats_encodes_one_format() {
+        let body = ExtensionSpec::EcPointFormats.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 0b | len 00 01 | count 01 | format 00
+        assert_eq!(body, vec![0x00, 0x0b, 0x00, 0x01, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn session_ticket_encodes_empty() {
+        assert_eq!(ExtensionSpec::SessionTicket.encode_body(&RuntimeValues::default()).unwrap(), vec![0x00, 0x23, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn psk_key_exchange_modes_encodes_01_01() {
+        let body = ExtensionSpec::PskKeyExchangeModes.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 2d | len 00 02 | modes: count 01, mode 01
+        assert_eq!(body, vec![0x00, 0x2d, 0x00, 0x02, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn status_request_encodes_01_00_00_00_00() {
+        let body = ExtensionSpec::StatusRequest.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 05 | len 00 05 | status_type 01 | responder_id_list len 00 00 | request_extensions len 00 00
+        assert_eq!(body, vec![0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn signed_certificate_timestamp_encodes_empty() {
+        assert_eq!(ExtensionSpec::SignedCertificateTimestamp.encode_body(&RuntimeValues::default()).unwrap(), vec![0x00, 0x12, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn renegotiation_info_encodes_zero() {
+        let body = ExtensionSpec::RenegotiationInfo.encode_body(&RuntimeValues::default()).unwrap();
+        // type ff 01 | len 00 01 | renegotiated_connection 00
+        assert_eq!(body, vec![0xff, 0x01, 0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn compress_certificate_encodes_count_and_algos() {
+        let ext = ExtensionSpec::CompressCertificate(vec![0x0002, 0x0001]);
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 1b | len 00 06 (2+4) | count 00 02 | algos
+        assert_eq!(body, vec![0x00, 0x1b, 0x00, 0x06, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn application_settings_encodes_list() {
+        let ext = ExtensionSpec::ApplicationSettings(vec!["h2".into()]);
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        // type 44 69 | len 00 04 | list: 00 02 h2
+        assert_eq!(body, vec![0x44, 0x69, 0x00, 0x04, 0x00, 0x02, b'h', b'2']);
+    }
+
+    #[test]
+    fn record_size_limit_encodes_limit() {
+        let body = ExtensionSpec::RecordSizeLimit(0x00FF).encode_body(&RuntimeValues::default()).unwrap();
+        // type 00 1c | len 00 02 | limit 00 ff
+        assert_eq!(body, vec![0x00, 0x1c, 0x00, 0x02, 0x00, 0xff]);
+    }
+
+    #[test]
+    fn padding_encodes_zeroes() {
+        let body = ExtensionSpec::Padding.encode_body(&RuntimeValues { padding_len: 4, ..RuntimeValues::default() }).unwrap();
+        // type 00 15 | len 00 04 | 00 00 00 00
+        assert_eq!(body, vec![0x00, 0x15, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn grease_encodes_grease_b_00_01_00() {
+        let body = ExtensionSpec::Grease.encode_body(&RuntimeValues { grease_b: 0x1A1A, ..RuntimeValues::default() }).unwrap();
+        // type = grease_b (1a 1a) | len 00 01 | data 00
+        assert_eq!(body, vec![0x1a, 0x1a, 0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn raw_encodes_type_length_data() {
+        let ext = ExtensionSpec::Raw { ty: 0x1234, data: vec![0xde, 0xad] };
+        let body = ext.encode_body(&RuntimeValues::default()).unwrap();
+        assert_eq!(body, vec![0x12, 0x34, 0x00, 0x02, 0xde, 0xad]);
+    }
+}
