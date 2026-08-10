@@ -4,6 +4,8 @@
 //! `&mut TcpStream` to any `AsyncRead + Unpin` stream so the engine can run
 //! over the crate's generic `Stream` seam.
 
+pub mod stream;
+
 use tokio::io::AsyncReadExt;
 
 use crate::error::{Result, TlsError};
@@ -24,7 +26,7 @@ pub const HS_FINISHED: u8 = 0x14;
 
 /// Maximum acceptable record payload: 2^14 plaintext plus 256 slack for the
 /// TLS 1.3 AEAD overhead and padding (RFC 8446 §5.2).
-const MAX_RECORD_PAYLOAD: usize = 16_384 + 256;
+pub(crate) const MAX_RECORD_PAYLOAD: usize = 16_384 + 256;
 
 /// A raw TLS record off the wire.
 #[derive(Debug)]

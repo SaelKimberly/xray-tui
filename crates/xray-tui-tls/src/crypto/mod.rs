@@ -336,6 +336,7 @@ impl KeySchedule {
 
 /// An AEAD record key; the per-record nonce is
 /// `write_iv XOR sequence number` (RFC 8446 §5.3).
+#[derive(Clone)]
 pub struct AeadKey {
     key: LessSafeKey,
     iv: [u8; 12],
@@ -358,6 +359,16 @@ impl AeadKey {
     /// (same material → identical keys; for tests and raw-material paths).
     pub fn from_key_bytes(suite: CipherSuiteId, key_bytes: &[u8]) -> Result<Self> {
         Self::from_key_iv(suite, key_bytes, [0u8; 12])
+    }
+
+    /// Returns a key with identical key material (same key bytes, same IV);
+    /// used when both directions of a stream share one key, e.g. tests.
+    #[must_use]
+    pub fn clone_key(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            iv: self.iv,
+        }
     }
 
     /// Builds a record key from raw key bytes and an explicit write IV.
