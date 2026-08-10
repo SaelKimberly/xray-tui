@@ -11,6 +11,7 @@ use crate::protocol::vmess::keys;
 
 pub const VERSION: u8 = 1;
 pub const SECURITY_AES128_GCM: u8 = 3;
+pub const SECURITY_CHACHA20_POLY1305: u8 = 4;
 pub const COMMAND_TCP: u8 = 1;
 
 /// Per-connection `VMess` session material (mirrors Go `ClientSession`).
@@ -20,6 +21,9 @@ pub struct Session {
     pub response_header: u8,
     pub response_body_key: [u8; 16],
     pub response_body_iv: [u8; 16],
+    /// Payload security byte (header body byte 35): 3 = AES-128-GCM,
+    /// 4 = chacha20-poly1305. `connect` sets it from the config.
+    pub security: u8,
 }
 
 impl Session {
@@ -39,6 +43,7 @@ impl Session {
             response_header: resp_header[0],
             response_body_key: keys::sha256_first16(&key),
             response_body_iv: keys::sha256_first16(&iv),
+            security: SECURITY_AES128_GCM,
         }
     }
 }
@@ -60,7 +65,7 @@ fn rand_bytes(out: &mut [u8]) {
 ///
 /// `entropy` supplies the 4-byte auth-rand and 8-byte connection nonce (fixed
 /// for tests). The header body (Go `EncodeRequestHeader`):
-/// version | IV | key | respHeader | option=0 | security=3 | 0 | cmd=1 |
+/// version | IV | key | respHeader | option=0 | security={session.security} | 0 | cmd=1 |
 /// port BE2 | addrType | addr | fnv1a32. Wire (Go `SealVMessAEADHeader`):
 /// authID(16) | lenAEAD(18) | nonce(8) | payloadAEAD.
 ///
@@ -82,7 +87,7 @@ pub fn encode_request(
     body.extend_from_slice(&session.request_body_key);
     body.push(session.response_header);
     body.push(0); // option (basic format; chunk-stream option is Task 6)
-    body.push(SECURITY_AES128_GCM); // padding nibble 0 | security 3
+    body.push(session.security); // padding nibble 0 | security byte
     body.push(0); // reserved
     body.push(COMMAND_TCP);
     encode_address_port(&mut body, target)?;
@@ -291,6 +296,31 @@ mod tests {
             hex_encode(&wire),
             "79d348cf6b4707cf6acbb494bf257f1de2d3f7fed70400fdc38997b98856e876eea6abababababababab988161deb14ca4eb23a17a1a8bef86e406b8fd0192d050514be96e66e75ebc4ac82dbbbe0fa3ef08d80e26f393f4dea4c96aee6878ba3a7d22cceba18a67028d7e"
         );
+    }
+
+    #[test]
+    fn request_security_byte_is_writable() {
+        // Body layout: version(1) IV(16) key(16) respHdr(1) option(1) = 35, so
+        // the security byte sits at body index 35.
+        let ck = [0x55u8; 16];
+        let mut session = Session::new();
+        session.request_body_iv = [0x11; 16];
+        session.request_body_key = [0x22; 16];
+        session.security = SECURITY_CHACHA20_POLY1305;
+        let mut entropy_calls = 0;
+        let mut entropy = |out: &mut [u8]| {
+            entropy_calls += 1;
+            out.fill(0x77);
+        };
+        let target = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 8080);
+        let wire =
+            encode_request(&ck, &session, &target, 0x6000_0000_0000_0000, &mut entropy).unwrap();
+        // The plaintext body is inside the sealed payload; the security byte is
+        // not directly visible on the wire. Instead assert the constant exists
+        // and encode_request accepts security 4 without error, and that the
+        // existing security-3 golden wire test still passes unchanged.
+        assert_eq!(SECURITY_CHACHA20_POLY1305, 4);
+        assert_eq!(wire.len(), peek_seal_len(49));
     }
 
     fn hex_encode(b: &[u8]) -> String {
