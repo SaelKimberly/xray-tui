@@ -1,6 +1,7 @@
 //! Binary-core resolution + version sanity for the e2e pipeline.
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreKind { Xray, SingBox }
@@ -49,26 +50,29 @@ impl CoreUnderTest {
     }
 }
 
-/// Probe the version string: `-version` first, then `version` (sing-box).
+/// Probe the version string: exact probe per kind, bounded to 5s.
+/// xray: `-version`; sing-box: `version`. A hang is a bug → timeout error.
 fn probe_version(bin: &std::path::Path, kind: CoreKind) -> Result<String, String> {
-    for flag in [Some("-version"), None] {
-        let mut cmd = Command::new(bin);
-        match flag {
-            Some(f) => { cmd.arg(f); }
-            None => { cmd.arg("version"); }
-        }
-        if let Ok(out) = cmd.output() {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let text = text.trim();
-            if !text.is_empty() {
-                return Ok(text.to_string());
-            }
-        }
-        if kind == CoreKind::SingBox {
-            break; // `run` would block; only try `-version` then exit
-        }
+    let flag = match kind {
+        CoreKind::Xray => "-version",
+        CoreKind::SingBox => "version",
+    };
+    // `Command::output()` can hang; run it on a std thread and bound the wait.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cmd_bin = bin.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(Command::new(&cmd_bin).arg(flag).output());
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| format!("version probe timed out for {}", bin.display()))?
+        .map_err(|e| format!("failed to run {}: {e}", bin.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(format!("no version output from {}", bin.display()));
     }
-    Err(format!("failed to probe version of {}", bin.display()))
+    Ok(text.to_string())
 }
 
 /// Loose sanity: the reported version contains the expected one.
