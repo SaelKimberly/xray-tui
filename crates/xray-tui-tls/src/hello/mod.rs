@@ -35,6 +35,18 @@ pub struct BuiltHello {
     pub session_id_range: Option<Range<usize>>,
 }
 
+impl BuiltHello {
+    /// The legacy session id carried by the hello, read from the wire
+    /// layout: handshake header (4) + `legacy_version` (2) + random (32) +
+    /// `sid_len(1) + sid` (RFC 8446 §4.1.2). The server's `ServerHello` must
+    /// echo these exact bytes (RFC 8446 §4.1.3).
+    #[must_use]
+    pub fn session_id(&self) -> &[u8] {
+        let sid_len = usize::from(self.handshake_bytes[38]);
+        &self.handshake_bytes[39..39 + sid_len]
+    }
+}
+
 /// Target total record size for the padding extension, matching the
 /// reference (`tls-fingerprint` `profiles/chrome.rs`): the padding data
 /// length is `512 - (unpadded record + 4)`, so the final record is exactly
@@ -238,6 +250,16 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
     handshake_bytes.push(0x01);
     handshake_bytes.extend_from_slice(&body_len.to_be_bytes()[1..]);
     handshake_bytes.extend_from_slice(&body);
+
+    // A TLS record's length field is uint16 (RFC 8446 §5.1): a handshake
+    // message larger than 64 KiB cannot be framed in a single record, so
+    // reject it here — `to_record`'s defensive saturation of the u16 length
+    // stays unreachable for every hello this builder emits.
+    if handshake_bytes.len() > usize::from(u16::MAX) {
+        return Err(TlsError::Spec(
+            "client hello handshake exceeds 64 KiB record limit".to_string(),
+        ));
+    }
 
     let record_bytes = to_record(&handshake_bytes);
     Ok(BuiltHello {

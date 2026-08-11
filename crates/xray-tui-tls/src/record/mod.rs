@@ -25,9 +25,11 @@ pub const HS_CERTIFICATE: u8 = 0x0B;
 pub const HS_CERTIFICATE_VERIFY: u8 = 0x0F;
 pub const HS_FINISHED: u8 = 0x14;
 
-/// Maximum acceptable record payload: 2^14 plaintext plus 256 slack for the
-/// TLS 1.3 AEAD overhead and padding (RFC 8446 §5.2).
-pub(crate) const MAX_RECORD_PAYLOAD: usize = 16_384 + 256;
+/// Maximum acceptable record payload: 2^14 plaintext plus 272 slack — the
+/// TLS 1.3 `TLSInnerPlaintext` type byte (1), the maximum record padding
+/// (255), and the 16-byte AEAD tag (RFC 8446 §5.2, §5.4). 16,384 + 272 =
+/// 16,656 is the largest legal ciphertext for a full-size record.
+pub(crate) const MAX_RECORD_PAYLOAD: usize = 16_384 + 272;
 
 /// A raw TLS record off the wire.
 #[derive(Debug)]

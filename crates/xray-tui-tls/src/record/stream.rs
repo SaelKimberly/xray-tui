@@ -301,11 +301,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
             };
             // Raw records other than application data are invalid post
             // handshake (TLS 1.3 §5.4) — but mirror `read_record`'s
-            // leniency for CCS middlebox-compat records: skip them.
-            if rec.content_type == CONTENT_ALERT && rec.payload.len() >= 2 {
+            // leniency for CCS middlebox-compat records: skip them. Alerts
+            // are exactly 2 bytes (`level || description`, RFC 8446 §6); a
+            // truncated raw alert is a protocol error, never silently
+            // skipped.
+            if rec.content_type == CONTENT_ALERT {
+                if rec.payload.len() >= 2 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("TLS alert: {} {}", rec.payload[0], rec.payload[1]),
+                    )));
+                }
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("TLS alert: {} {}", rec.payload[0], rec.payload[1]),
+                    format!(
+                        "truncated TLS alert record ({} payload byte(s))",
+                        rec.payload.len()
+                    ),
                 )));
             }
             if rec.content_type != CONTENT_APPLICATION_DATA {

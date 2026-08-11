@@ -77,6 +77,15 @@ pub struct ProvisionedHello {
     pub session_id_range: Range<usize>,
 }
 
+impl ProvisionedHello {
+    /// The `SessionId` bytes (the REALITY auth payload slot). The server's
+    /// `ServerHello` must echo them exactly (RFC 8446 §4.1.3).
+    #[must_use]
+    pub fn session_id(&self) -> &[u8] {
+        &self.handshake_bytes[self.session_id_range.clone()]
+    }
+}
+
 /// Fixed Chrome-133-shaped provisioner (first engine; ported from shoes).
 pub struct FixedChrome133;
 
@@ -172,8 +181,9 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     // 7. ServerHello (middlebox CCS skipped; HRR rejected by the parser).
     //    Its keyshare is the server's *ephemeral* TLS key (not the static
-    //    `pbk`), so no static-key comparison is performed.
-    let server_hello = read_server_hello(&mut stream).await?;
+    //    `pbk`), so no static-key comparison is performed. The server must
+    //    echo the sealed session id (the REALITY auth payload).
+    let server_hello = read_server_hello(&mut stream, hello.session_id()).await?;
 
     // 8. TLS 1.3 ECDHE with the server's keyshare: the same ephemeral
     //    scalar drives both the auth key (step 4) and this shared secret.
