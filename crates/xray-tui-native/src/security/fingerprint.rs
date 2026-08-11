@@ -35,7 +35,7 @@ pub fn parse_fingerprint_id(s: &str) -> Result<tls_provider::FingerprintId, Nati
         "firefox" => Ok(FingerprintId::Firefox),
         "safari" => Ok(FingerprintId::Safari),
         "random" => Ok(FingerprintId::Random),
-        other => Err(NativeError::Tls(format!(
+        other => Err(NativeError::Config(format!(
             "unknown fingerprint id {other:?} (expected chrome, chrome-randomized, \
              firefox, safari or random)"
         ))),
