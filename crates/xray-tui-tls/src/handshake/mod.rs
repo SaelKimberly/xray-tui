@@ -240,13 +240,13 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
 // ── ServerHello ────────────────────────────────────────────────────────────
 
 /// A parsed `ServerHello`.
-struct ServerHelloData {
+pub(crate) struct ServerHelloData {
     /// The raw handshake message (type + length + body), for the transcript.
-    raw: Vec<u8>,
+    pub(crate) raw: Vec<u8>,
     /// The server's X25519 public key from `key_share`.
-    peer_key: [u8; 32],
+    pub(crate) peer_key: [u8; 32],
     /// The cipher suite the server selected.
-    suite: CipherSuiteId,
+    pub(crate) suite: CipherSuiteId,
 }
 
 /// The `ServerHello` body fields the engine needs.
@@ -257,7 +257,7 @@ struct ParsedServerHello {
 }
 
 /// Read and parse the `ServerHello` record, skipping CCS records.
-async fn read_server_hello<S>(stream: &mut S) -> Result<ServerHelloData>
+pub(crate) async fn read_server_hello<S>(stream: &mut S) -> Result<ServerHelloData>
 where
     S: AsyncRead + Unpin,
 {
@@ -363,13 +363,13 @@ fn parse_server_hello(body: &[u8]) -> Result<ParsedServerHello> {
 
 /// The parsed server flight: raw messages for the transcript plus the values
 /// the verifier seam and client `Finished` need.
-struct ServerFlight {
-    ee_raw: Vec<u8>,
-    cert_raw: Vec<u8>,
-    cv_raw: Vec<u8>,
-    sf_verify_data: Vec<u8>,
+pub(crate) struct ServerFlight {
+    pub(crate) ee_raw: Vec<u8>,
+    pub(crate) cert_raw: Vec<u8>,
+    pub(crate) cv_raw: Vec<u8>,
+    pub(crate) sf_verify_data: Vec<u8>,
     /// DER certificates, leaf first.
-    chain: Vec<Vec<u8>>,
+    pub(crate) chain: Vec<Vec<u8>>,
     /// The `signature_scheme` from `CertificateVerify`.
     signature_scheme: u16,
     /// The raw `CertificateVerify` body (scheme + signature).
@@ -379,7 +379,10 @@ struct ServerFlight {
 /// Read and decrypt the encrypted server handshake records
 /// (`EncryptedExtensions` … `Finished`) with `server_hs_key`, sequencing
 /// from zero.
-async fn read_server_hs_messages<S>(stream: &mut S, server_hs_key: &AeadKey) -> Result<ServerFlight>
+pub(crate) async fn read_server_hs_messages<S>(
+    stream: &mut S,
+    server_hs_key: &AeadKey,
+) -> Result<ServerFlight>
 where
     S: AsyncRead + Unpin,
 {
@@ -583,7 +586,7 @@ fn parse_certificate_verify(body: &[u8]) -> Result<u16> {
 
 /// Wrap a handshake body as a raw handshake message: `type(1) || len(3) ||
 /// body` (RFC 8446 §4).
-fn make_hs_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn make_hs_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(4 + body.len());
     msg.push(msg_type);
     let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
@@ -616,7 +619,7 @@ fn strip_padding(plaintext: &[u8]) -> Result<(u8, &[u8])> {
 /// [`build_hello`] consumes. ring's trait is sealed with only thread-safe
 /// implementors, so the `Send + Sync` bounds carried on the trait object
 /// are always satisfiable.
-struct RingRng<'a>(&'a (dyn ring::rand::SecureRandom + Send + Sync));
+pub(crate) struct RingRng<'a>(pub(crate) &'a (dyn ring::rand::SecureRandom + Send + Sync));
 
 impl SecureRandom for RingRng<'_> {
     fn fill(&self, dest: &mut [u8]) -> std::result::Result<(), ring::error::Unspecified> {
