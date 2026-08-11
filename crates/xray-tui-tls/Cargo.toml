@@ -25,6 +25,11 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
 rcgen = "0.13"
+# Interop proof: our client handshakes against a real rustls server. The
+# workspace dep pins default-features = false (ring is the workspace's
+# single crypto provider); we enable exactly ring + std so rustls's
+# process-level provider selection is unambiguous.
+rustls = { workspace = true, features = ["ring", "std"] }
 
 [[example]]
 name = "grader"
