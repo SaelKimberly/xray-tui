@@ -13,6 +13,8 @@ pub enum TlsError {
     Crypto(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
     #[error("server sent HelloRetryRequest; retry is not supported")]
