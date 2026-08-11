@@ -9,13 +9,18 @@
 //! `webpki::EndEntityCert::verify_signature`.
 //!
 //! Trust modes, in priority order:
-//! 1. A configured `pin_sha256` — only the `SHA-256` of the leaf's
-//!    `SubjectPublicKeyInfo` is compared; the chain and SAN are skipped
-//!    (v2rayN pin semantics).
+//! 1. A configured `pin_sha256` — the chain walk (and SAN) are skipped
+//!    (v2rayN pin semantics); the leaf SPKI must hash to the pin and the
+//!    `CertificateVerify` signature must still verify against the leaf's
+//!    public key.
 //! 2. `insecure` — every server is accepted.
 //! 3. Full `WebPKI` — the chain must build to a configured root, the leaf must
 //!    be valid for the offered SNI, and the `CertificateVerify` signature
 //!    must verify against the leaf's public key.
+//!
+//! The `CertificateVerify` signature is verified over
+//! `Hash(ClientHello .. Certificate)` per RFC 8446 §4.4.3 (the
+//! `CertificateVerify` message itself is excluded from the transcript hash).
 
 use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime};
 use webpki::{EndEntityCert, KeyUsage};
@@ -77,8 +82,10 @@ impl WebPkiVerifier {
 
     /// Pins the expected SHA-256 of the leaf's `SubjectPublicKeyInfo` (DER).
     ///
-    /// When set, chain and SAN verification are skipped (v2rayN semantics);
-    /// only the SPKI hash is compared.
+    /// When set, the trust-chain walk is replaced by the SPKI hash comparison
+    /// (v2rayN semantics); SAN is also skipped. The `CertificateVerify`
+    /// signature check is *not* skipped: it proves the server holds the
+    /// private key of the presented leaf.
     #[must_use]
     pub const fn with_pin(mut self, pin: [u8; 32]) -> Self {
         self.pin_sha256 = Some(pin);
@@ -95,8 +102,14 @@ impl ServerVerifier for WebPkiVerifier {
         let end_entity = EndEntityCert::try_from(&leaf_der)
             .map_err(|e| TlsError::Verify(format!("invalid leaf certificate DER: {e}")))?;
 
-        // Pin mode first: v2rayN semantics — only the leaf SPKI hash matters
-        // (the chain and SAN are deliberately skipped).
+        if self.insecure {
+            return Ok(());
+        }
+
+        // Pin mode: the pin replaces the chain walk (which CA signed the
+        // cert) but NOT the CertificateVerify signature verification, which
+        // authenticates the handshake by proving the server holds the leaf's
+        // private key.
         if let Some(pin) = self.pin_sha256 {
             let digest = ring::digest::digest(
                 &ring::digest::SHA256,
@@ -107,11 +120,7 @@ impl ServerVerifier for WebPkiVerifier {
                     "server certificate SPKI does not match the configured pin".to_string(),
                 ));
             }
-            return Ok(());
-        }
-
-        if self.insecure {
-            return Ok(());
+            return verify_certificate_verify(&end_entity, ctx);
         }
 
         // Full WebPKI: chain + SAN + CertificateVerify signature.
