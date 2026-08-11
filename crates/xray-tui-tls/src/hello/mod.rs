@@ -82,6 +82,7 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 .map_err(|_| TlsError::Crypto("session id random failed".to_string()))?;
             (sid.to_vec(), None)
         }
+        SessionIdSpec::Empty => (Vec::new(), None),
         SessionIdSpec::AuthPayload { len } => {
             // handshake header (4) + legacy_version (2) + random (32) +
             // session id length byte (1).
@@ -338,71 +339,24 @@ mod tests {
     /// Golden Chrome 130 `ClientHello` captured from the reference
     /// implementation (`tls-fingerprint` crate, same profile + fixed seed):
     /// RNG bytes all `0x42` (so every GREASE value is `0x2A2A`), X25519
-    /// public key `[0xAB; 32]`, no padding extension (kept zero for this
-    /// test).
-    const EXPECTED_HELLO_HEX: &str = "0100012b0303424242424242424242424242424242424242424242424242424242424242424220424242424242424242424242424242424242424242424242424242424242424200202a2a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f0035010000c22a2a00010000000010000e00000b746c732e706565742e777300170000ff01000100000a000a00082a2a001d00170018000b00020100002300000010000e000c02683208687474702f312e31000500050100000000001200000033002b00292a2a000100001d0020abababababababababababababababababababababababababababababababab002d00020101002b0007062a2a03040303001b0005040002000344690006000400026832000d0012001004030804040105030805050108060601";
+    /// public key `[0xAB; 32]`, and the real `chrome::spec()` — which ends
+    /// with a Padding extension the builder uses to hit a 512-byte record
+    /// (the reference `profiles/chrome.rs` computes the same target).
+    const EXPECTED_HELLO_HEX: &str = "010001f70303424242424242424242424242424242424242424242424242424242424242424220424242424242424242424242424242424242424242424242424242424242424200202a2a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f00350100018e2a2a00010000000010000e00000b746c732e706565742e777300170000ff01000100000a000a00082a2a001d00170018000b00020100002300000010000e000c02683208687474702f312e31000500050100000000001200000033002b00292a2a000100001d0020abababababababababababababababababababababababababababababababab002d00020101002b0007062a2a03040303001b0005040002000344690006000400026832000d0012001004030804040105030805050108060601001500c80000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
     /// Same hello wrapped in a handshake record (`0x16 0x0301` + length).
-    const EXPECTED_RECORD_HEX: &str = "160301012f0100012b0303424242424242424242424242424242424242424242424242424242424242424220424242424242424242424242424242424242424242424242424242424242424200202a2a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f0035010000c22a2a00010000000010000e00000b746c732e706565742e777300170000ff01000100000a000a00082a2a001d00170018000b00020100002300000010000e000c02683208687474702f312e31000500050100000000001200000033002b00292a2a000100001d0020abababababababababababababababababababababababababababababababab002d00020101002b0007062a2a03040303001b0005040002000344690006000400026832000d0012001004030804040105030805050108060601";
-
-    /// Chrome 130 spec assembled from the constants in
-    /// `thirdparty/tls-fingerprint/src/profiles/chrome.rs`. Placeholder for
-    /// the real `profiles::chrome::v130::spec()` (Task 10).
-    fn test_spec() -> ClientHelloSpec {
-        ClientHelloSpec {
-            legacy_version: 0x0303,
-            cipher_suites: vec![
-                GREASE_PLACEHOLDER,
-                0x1301,
-                0x1302,
-                0x1303,
-                0xC02B,
-                0xC02F,
-                0xC02C,
-                0xC030,
-                0xCCA9,
-                0xCCA8,
-                0xC013,
-                0xC014,
-                0x009C,
-                0x009D,
-                0x002F,
-                0x0035,
-            ],
-            compression_methods: vec![0x00],
-            session_id: SessionIdSpec::Random32,
-            extensions: vec![
-                ExtensionSpec::Grease,
-                ExtensionSpec::ServerName,
-                // extended_master_secret (no dedicated variant).
-                ExtensionSpec::Raw { ty: 0x0017, data: Vec::new() },
-                ExtensionSpec::RenegotiationInfo,
-                ExtensionSpec::SupportedGroups(vec![GREASE_PLACEHOLDER, 0x001D, 0x0017, 0x0018]),
-                ExtensionSpec::EcPointFormats,
-                ExtensionSpec::SessionTicket,
-                ExtensionSpec::Alpn(vec!["h2".into(), "http/1.1".into()]),
-                ExtensionSpec::StatusRequest,
-                ExtensionSpec::SignedCertificateTimestamp,
-                ExtensionSpec::KeyShare(vec![KeyShareGroup::Grease, KeyShareGroup::X25519]),
-                ExtensionSpec::PskKeyExchangeModes,
-                ExtensionSpec::SupportedVersions(vec![GREASE_PLACEHOLDER, 0x0304, 0x0303]),
-                ExtensionSpec::CompressCertificate(vec![0x0002, 0x0003]),
-                ExtensionSpec::ApplicationSettings(vec!["h2".into()]),
-                ExtensionSpec::SignatureAlgorithms(vec![
-                    0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
-                ]),
-                // No Padding — the golden test keeps padding zero.
-            ],
-        }
-    }
+    const EXPECTED_RECORD_HEX: &str = "16030101fb010001f70303424242424242424242424242424242424242424242424242424242424242424220424242424242424242424242424242424242424242424242424242424242424200202a2a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f00350100018e2a2a00010000000010000e00000b746c732e706565742e777300170000ff01000100000a000a00082a2a001d00170018000b00020100002300000010000e000c02683208687474702f312e31000500050100000000001200000033002b00292a2a000100001d0020abababababababababababababababababababababababababababababababab002d00020101002b0007062a2a03040303001b0005040002000344690006000400026832000d0012001004030804040105030805050108060601001500c80000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
     #[test]
     fn chrome130_golden_hello_with_fixed_seed() {
         // Reference capture (run the CURRENT tls-fingerprint example with
         // the same fixed seed): RNG all 0x42 → every GREASE value 0x2A2A,
-        // random and session id all 0x42, X25519 public key [0xAB; 32], no
-        // padding. The ported builder must produce byte-identical output.
-        let spec = test_spec();
+        // random and session id all 0x42, X25519 public key [0xAB; 32].
+        // The real chrome::spec() ends with a Padding extension, so the
+        // record is padded to exactly 512 bytes (same target as the
+        // reference `profiles/chrome.rs`). The ported builder must produce
+        // byte-identical output.
+        let spec = crate::profiles::chrome::spec();
         // 2 GREASE bytes + 32 random + 32 session id = 66 bytes needed; give
         // the fixed RNG headroom so exhaustion is never the failure mode.
         let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
@@ -518,8 +472,7 @@ mod tests {
         // Full Chrome 130 layout + padding, per the reference
         // (`chrome.rs:125-139`): the padding data length is
         // `512 - (unpadded record + 4)`, so the record is exactly 512 bytes.
-        let mut spec = test_spec();
-        spec.extensions.push(ExtensionSpec::Padding);
+        let spec = crate::profiles::chrome::spec();
         let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
         let hello = build_hello(
             &spec,
@@ -672,7 +625,7 @@ mod tests {
 
     #[test]
     fn parse_roundtrip_of_built_hello() {
-        let spec = test_spec();
+        let spec = crate::profiles::chrome::spec();
         let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
         let hello = build_hello(&spec, &params_fixed(&rng)).unwrap();
         let parsed = parse_hello(&hello.handshake_bytes).unwrap();

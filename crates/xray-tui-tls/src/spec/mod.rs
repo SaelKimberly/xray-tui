@@ -41,6 +41,8 @@ impl Default for RuntimeValues {
 pub enum SessionIdSpec {
     /// 32 random bytes, the TLS 1.3 default.
     Random32,
+    /// No legacy session id (0 bytes) — the Safari family.
+    Empty,
     /// Placeholder for a REALITY authentication payload;
     /// `len` is the full wire length (plaintext + 16-byte tag).
     AuthPayload { len: usize },
