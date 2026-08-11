@@ -55,7 +55,10 @@ pub fn spec() -> ClientHelloSpec {
             ExtensionSpec::Grease,
             ExtensionSpec::ServerName,
             // extended_master_secret.
-            ExtensionSpec::Raw { ty: 0x0017, data: Vec::new() },
+            ExtensionSpec::Raw {
+                ty: 0x0017,
+                data: Vec::new(),
+            },
             ExtensionSpec::RenegotiationInfo,
             ExtensionSpec::SupportedGroups(vec![
                 GREASE_PLACEHOLDER,

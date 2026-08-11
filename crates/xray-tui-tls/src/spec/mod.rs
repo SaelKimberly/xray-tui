@@ -100,8 +100,9 @@ impl ExtensionSpec {
         let (ty, body) = match self {
             Self::ServerName => {
                 let host = rt.server_name.as_bytes();
-                let host_len = u16::try_from(host.len())
-                    .map_err(|_| TlsError::Spec("server_name host exceeds u16 length".to_string()))?;
+                let host_len = u16::try_from(host.len()).map_err(|_| {
+                    TlsError::Spec("server_name host exceeds u16 length".to_string())
+                })?;
                 // RFC 6066: ServerNameList { list_length u16, name_type 00, host_name_length u16, host_name }
                 let mut body = Vec::with_capacity(3 + host.len());
                 body.extend_from_slice(&(1 + 2 + host_len).to_be_bytes());
@@ -112,8 +113,9 @@ impl ExtensionSpec {
             }
             Self::SupportedGroups(groups) => {
                 // RFC 8446 NamedGroupList: u16 byte-length + groups, no count field.
-                let byte_len = u16::try_from(groups.len() * 2)
-                    .map_err(|_| TlsError::Spec("supported_groups exceeds u16 length".to_string()))?;
+                let byte_len = u16::try_from(groups.len() * 2).map_err(|_| {
+                    TlsError::Spec("supported_groups exceeds u16 length".to_string())
+                })?;
                 let mut body = Vec::with_capacity(2 + groups.len() * 2);
                 body.extend_from_slice(&byte_len.to_be_bytes());
                 for group in groups {
@@ -138,8 +140,9 @@ impl ExtensionSpec {
                         }
                     }
                 }
-                let list_len = u16::try_from(entries.len())
-                    .map_err(|_| TlsError::Spec("key_share entries exceed u16 length".to_string()))?;
+                let list_len = u16::try_from(entries.len()).map_err(|_| {
+                    TlsError::Spec("key_share entries exceed u16 length".to_string())
+                })?;
                 let mut body = Vec::with_capacity(2 + entries.len());
                 body.extend_from_slice(&list_len.to_be_bytes());
                 body.extend_from_slice(&entries);
@@ -147,8 +150,9 @@ impl ExtensionSpec {
             }
             Self::SupportedVersions(versions) => {
                 // RFC 8446: 1-byte length counts BYTES (n*2), not versions.
-                let byte_len = u8::try_from(versions.len() * 2)
-                    .map_err(|_| TlsError::Spec("supported_versions exceeds 255 bytes".to_string()))?;
+                let byte_len = u8::try_from(versions.len() * 2).map_err(|_| {
+                    TlsError::Spec("supported_versions exceeds 255 bytes".to_string())
+                })?;
                 let mut body = Vec::with_capacity(1 + versions.len() * 2);
                 body.push(byte_len);
                 for version in versions {
@@ -158,8 +162,9 @@ impl ExtensionSpec {
             }
             Self::SignatureAlgorithms(schemes) => {
                 // RFC 8446 SignatureSchemeList: u16 byte-length + schemes, no count field.
-                let byte_len = u16::try_from(schemes.len() * 2)
-                    .map_err(|_| TlsError::Spec("signature_algorithms exceeds u16 length".to_string()))?;
+                let byte_len = u16::try_from(schemes.len() * 2).map_err(|_| {
+                    TlsError::Spec("signature_algorithms exceeds u16 length".to_string())
+                })?;
                 let mut body = Vec::with_capacity(2 + schemes.len() * 2);
                 body.extend_from_slice(&byte_len.to_be_bytes());
                 for scheme in schemes {
@@ -176,8 +181,9 @@ impl ExtensionSpec {
             Self::RenegotiationInfo => (0xff01, vec![0x00]),
             Self::CompressCertificate(algos) => {
                 // RFC 8871: 1-byte length counts BYTES + algos, no count field.
-                let byte_len = u8::try_from(algos.len() * 2)
-                    .map_err(|_| TlsError::Spec("compress_certificate exceeds 255 bytes".to_string()))?;
+                let byte_len = u8::try_from(algos.len() * 2).map_err(|_| {
+                    TlsError::Spec("compress_certificate exceeds 255 bytes".to_string())
+                })?;
                 let mut body = Vec::with_capacity(1 + algos.len() * 2);
                 body.push(byte_len);
                 for algo in algos {
@@ -235,8 +241,9 @@ fn encode_alpn_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
 fn encode_alps_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
     let mut out = Vec::new();
     for proto in protos {
-        let len = u16::try_from(proto.len())
-            .map_err(|_| TlsError::Spec("application_settings protocol exceeds u16 length".to_string()))?;
+        let len = u16::try_from(proto.len()).map_err(|_| {
+            TlsError::Spec("application_settings protocol exceeds u16 length".to_string())
+        })?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(proto.as_bytes());
     }
@@ -257,13 +264,21 @@ mod tests {
     #[test]
     fn server_name_encodes_host() {
         let ext = ExtensionSpec::ServerName;
-        let body = ext.encode_body(&RuntimeValues { server_name: "example.com".into(), ..RuntimeValues::default() }).unwrap();
+        let body = ext
+            .encode_body(&RuntimeValues {
+                server_name: "example.com".into(),
+                ..RuntimeValues::default()
+            })
+            .unwrap();
         // "example.com" = 11 bytes.
         // type 00 00 | len 00 10 (2+1+2+11=16) | list_len 00 0e (1+2+11=14) | name_type 00 | host_len 00 0b | host
-        assert_eq!(body, vec![
-            0x00, 0x00, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x00, 0x0b,
-            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
-        ]);
+        assert_eq!(
+            body,
+            vec![
+                0x00, 0x00, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x00, 0x0b, b'e', b'x', b'a', b'm', b'p',
+                b'l', b'e', b'.', b'c', b'o', b'm',
+            ]
+        );
     }
 
     #[test]
@@ -272,17 +287,31 @@ mod tests {
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
         // RFC 8446 NamedGroupList: u16 byte-length + groups, NO count field.
         // type 00 0a | len 00 08 (2+6) | byte_len 00 06 | groups
-        assert_eq!(body, vec![0x00, 0x0a, 0x00, 0x08, 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03]);
+        assert_eq!(
+            body,
+            vec![
+                0x00, 0x0a, 0x00, 0x08, 0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03
+            ]
+        );
     }
 
     #[test]
     fn key_share_encodes_grease_and_x25519() {
         let ext = ExtensionSpec::KeyShare(vec![KeyShareGroup::Grease, KeyShareGroup::X25519]);
-        let body = ext.encode_body(&RuntimeValues { grease_a: 0x1A1A, x25519_pub: [0xAB; 32], ..RuntimeValues::default() }).unwrap();
+        let body = ext
+            .encode_body(&RuntimeValues {
+                grease_a: 0x1A1A,
+                x25519_pub: [0xAB; 32],
+                ..RuntimeValues::default()
+            })
+            .unwrap();
         // RFC 8446 KeyShare: u16 list-length + entries.
         // entries: grease 5 bytes (1a 1a 00 01 00), x25519 36 bytes → list 41 bytes.
         // type 00 33 | len 00 2b (2+41) | list_len 00 29 | grease | x25519
-        let mut expected = vec![0x00, 0x33, 0x00, 0x2b, 0x00, 0x29, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x20];
+        let mut expected = vec![
+            0x00, 0x33, 0x00, 0x2b, 0x00, 0x29, 0x1a, 0x1a, 0x00, 0x01, 0x00, 0x00, 0x1d, 0x00,
+            0x20,
+        ];
         expected.extend_from_slice(&[0xAB; 32]);
         assert_eq!(body, expected);
     }
@@ -293,7 +322,12 @@ mod tests {
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
         // RFC 8446: 1-byte length counts BYTES (n*2), not versions. 3 versions → len 6.
         // type 00 2b | len 00 07 | len8 06 | versions
-        assert_eq!(body, vec![0x00, 0x2b, 0x00, 0x07, 0x06, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03]);
+        assert_eq!(
+            body,
+            vec![
+                0x00, 0x2b, 0x00, 0x07, 0x06, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03
+            ]
+        );
     }
 
     #[test]
@@ -302,7 +336,10 @@ mod tests {
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
         // RFC 8446 SignatureSchemeList: u16 byte-length + schemes, NO count field.
         // type 00 0d | len 00 06 (2+4) | byte_len 00 04 | schemes
-        assert_eq!(body, vec![0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x04]);
+        assert_eq!(
+            body,
+            vec![0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x04]
+        );
     }
 
     #[test]
@@ -312,46 +349,70 @@ mod tests {
         // RFC 7301: per-entry 1-byte length; u16 list-length counts bytes.
         // list = 02 h2 08 http/1.1 (12 bytes).
         // type 00 10 | len 00 0e (2+12) | list_len 00 0c | entries
-        assert_eq!(body, vec![
-            0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, b'h', b'2', 0x08,
-            b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
-        ]);
+        assert_eq!(
+            body,
+            vec![
+                0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p',
+                b'/', b'1', b'.', b'1',
+            ]
+        );
     }
 
     #[test]
     fn ec_point_formats_encodes_one_format() {
-        let body = ExtensionSpec::EcPointFormats.encode_body(&RuntimeValues::default()).unwrap();
+        let body = ExtensionSpec::EcPointFormats
+            .encode_body(&RuntimeValues::default())
+            .unwrap();
         // type 00 0b | len 00 02 | count 01 | format 00
         assert_eq!(body, vec![0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
     }
 
     #[test]
     fn session_ticket_encodes_empty() {
-        assert_eq!(ExtensionSpec::SessionTicket.encode_body(&RuntimeValues::default()).unwrap(), vec![0x00, 0x23, 0x00, 0x00]);
+        assert_eq!(
+            ExtensionSpec::SessionTicket
+                .encode_body(&RuntimeValues::default())
+                .unwrap(),
+            vec![0x00, 0x23, 0x00, 0x00]
+        );
     }
 
     #[test]
     fn psk_key_exchange_modes_encodes_01_01() {
-        let body = ExtensionSpec::PskKeyExchangeModes.encode_body(&RuntimeValues::default()).unwrap();
+        let body = ExtensionSpec::PskKeyExchangeModes
+            .encode_body(&RuntimeValues::default())
+            .unwrap();
         // type 00 2d | len 00 02 | modes: count 01, mode 01
         assert_eq!(body, vec![0x00, 0x2d, 0x00, 0x02, 0x01, 0x01]);
     }
 
     #[test]
     fn status_request_encodes_01_00_00_00_00() {
-        let body = ExtensionSpec::StatusRequest.encode_body(&RuntimeValues::default()).unwrap();
+        let body = ExtensionSpec::StatusRequest
+            .encode_body(&RuntimeValues::default())
+            .unwrap();
         // type 00 05 | len 00 05 | status_type 01 | responder_id_list len 00 00 | request_extensions len 00 00
-        assert_eq!(body, vec![0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            body,
+            vec![0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
     fn signed_certificate_timestamp_encodes_empty() {
-        assert_eq!(ExtensionSpec::SignedCertificateTimestamp.encode_body(&RuntimeValues::default()).unwrap(), vec![0x00, 0x12, 0x00, 0x00]);
+        assert_eq!(
+            ExtensionSpec::SignedCertificateTimestamp
+                .encode_body(&RuntimeValues::default())
+                .unwrap(),
+            vec![0x00, 0x12, 0x00, 0x00]
+        );
     }
 
     #[test]
     fn renegotiation_info_encodes_zero() {
-        let body = ExtensionSpec::RenegotiationInfo.encode_body(&RuntimeValues::default()).unwrap();
+        let body = ExtensionSpec::RenegotiationInfo
+            .encode_body(&RuntimeValues::default())
+            .unwrap();
         // type ff 01 | len 00 01 | renegotiated_connection 00
         assert_eq!(body, vec![0xff, 0x01, 0x00, 0x01, 0x00]);
     }
@@ -362,7 +423,10 @@ mod tests {
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
         // RFC 8871: 1-byte length counts BYTES + algos, NO count field.
         // type 00 1b | len 00 05 | len8 04 | algos
-        assert_eq!(body, vec![0x00, 0x1b, 0x00, 0x05, 0x04, 0x00, 0x02, 0x00, 0x01]);
+        assert_eq!(
+            body,
+            vec![0x00, 0x1b, 0x00, 0x05, 0x04, 0x00, 0x02, 0x00, 0x01]
+        );
     }
 
     #[test]
@@ -371,33 +435,51 @@ mod tests {
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
         // ALPS (draft-ietf-tls-alps): 2-byte per-entry lengths, u16 list-length.
         // type 44 69 | len 00 06 | list_len 00 04 | entry 00 02 h2
-        assert_eq!(body, vec![0x44, 0x69, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, b'h', b'2']);
+        assert_eq!(
+            body,
+            vec![0x44, 0x69, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, b'h', b'2']
+        );
     }
 
     #[test]
     fn record_size_limit_encodes_limit() {
-        let body = ExtensionSpec::RecordSizeLimit(0x00FF).encode_body(&RuntimeValues::default()).unwrap();
+        let body = ExtensionSpec::RecordSizeLimit(0x00FF)
+            .encode_body(&RuntimeValues::default())
+            .unwrap();
         // type 00 1c | len 00 02 | limit 00 ff
         assert_eq!(body, vec![0x00, 0x1c, 0x00, 0x02, 0x00, 0xff]);
     }
 
     #[test]
     fn padding_encodes_zeroes() {
-        let body = ExtensionSpec::Padding.encode_body(&RuntimeValues { padding_len: 4, ..RuntimeValues::default() }).unwrap();
+        let body = ExtensionSpec::Padding
+            .encode_body(&RuntimeValues {
+                padding_len: 4,
+                ..RuntimeValues::default()
+            })
+            .unwrap();
         // type 00 15 | len 00 04 | 00 00 00 00
         assert_eq!(body, vec![0x00, 0x15, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]
     fn grease_encodes_grease_b_00_01_00() {
-        let body = ExtensionSpec::Grease.encode_body(&RuntimeValues { grease_b: 0x1A1A, ..RuntimeValues::default() }).unwrap();
+        let body = ExtensionSpec::Grease
+            .encode_body(&RuntimeValues {
+                grease_b: 0x1A1A,
+                ..RuntimeValues::default()
+            })
+            .unwrap();
         // type = grease_b (1a 1a) | len 00 01 | data 00
         assert_eq!(body, vec![0x1a, 0x1a, 0x00, 0x01, 0x00]);
     }
 
     #[test]
     fn raw_encodes_type_length_data() {
-        let ext = ExtensionSpec::Raw { ty: 0x1234, data: vec![0xde, 0xad] };
+        let ext = ExtensionSpec::Raw {
+            ty: 0x1234,
+            data: vec![0xde, 0xad],
+        };
         let body = ext.encode_body(&RuntimeValues::default()).unwrap();
         assert_eq!(body, vec![0x12, 0x34, 0x00, 0x02, 0xde, 0xad]);
     }

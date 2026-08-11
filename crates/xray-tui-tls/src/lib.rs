@@ -4,16 +4,16 @@
 //! including JA3 fingerprinting, TLS record and handshake handling, certificate
 //! verification, and REALITY protocol integration.
 
-pub mod spec;
 pub mod profiles;
+pub mod spec;
 pub use profiles::BrowserProfile;
-pub mod hello;
 pub mod crypto;
-pub mod record;
 pub mod handshake;
-pub mod verify;
-pub mod reality;
+pub mod hello;
 pub mod http2;
+pub mod reality;
+pub mod record;
+pub mod verify;
 
 pub mod error;
 

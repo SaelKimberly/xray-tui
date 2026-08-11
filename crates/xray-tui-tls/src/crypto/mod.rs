@@ -285,7 +285,8 @@ impl KeySchedule {
         let hash_len = self.suite.hash_len();
         let zeros = vec![0u8; hash_len];
         let early = self.hkdf_extract(&zeros, &zeros)?;
-        let derived = self.hkdf_expand_label(&early, "derived", &empty_hash(self.suite), hash_len)?;
+        let derived =
+            self.hkdf_expand_label(&early, "derived", &empty_hash(self.suite), hash_len)?;
         self.hkdf_extract(&derived, shared_secret)
     }
 
@@ -301,7 +302,8 @@ impl KeySchedule {
     /// ""), 0^hash_len)`.
     pub fn master_secret(&self, hs_secret: &[u8]) -> Result<Vec<u8>> {
         let hash_len = self.suite.hash_len();
-        let derived = self.hkdf_expand_label(hs_secret, "derived", &empty_hash(self.suite), hash_len)?;
+        let derived =
+            self.hkdf_expand_label(hs_secret, "derived", &empty_hash(self.suite), hash_len)?;
         let zeros = vec![0u8; hash_len];
         self.hkdf_extract(&derived, &zeros)
     }
@@ -415,7 +417,7 @@ impl AeadKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_hash, AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair};
+    use super::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair, empty_hash};
 
     /// Decodes a hex string into bytes (test helper).
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -506,8 +508,7 @@ mod tests {
         "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718";
     const DERIVED_FROM_HS: &str =
         "43de77e0c77713859a944db9db2590b53190a65b3ee2e4f12dd7a0bb7ce254b4";
-    const MASTER_SECRET: &str =
-        "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919";
+    const MASTER_SECRET: &str = "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919";
     const TRANSCRIPT_CH_FINISHED: &str =
         "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13";
     const CLIENT_AP_TRAFFIC: &str =
@@ -676,7 +677,9 @@ mod tests {
     #[test]
     fn nonce_is_iv_xor_seq() {
         let suite = CipherSuiteId::Aes128GcmSha256;
-        let iv = [0x5d, 0x31, 0x3e, 0xb2, 0x67, 0x12, 0x76, 0xee, 0x13, 0x00, 0x0b, 0x30];
+        let iv = [
+            0x5d, 0x31, 0x3e, 0xb2, 0x67, 0x12, 0x76, 0xee, 0x13, 0x00, 0x0b, 0x30,
+        ];
         let key = AeadKey::from_key_iv(suite, &[0x11; 16], iv).unwrap();
 
         assert_eq!(key.make_nonce(0), iv);
@@ -756,18 +759,18 @@ mod tests {
         assert_eq!(
             alice.public_key().to_vec(),
             vec![
-                0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54, 0x74, 0x8b, 0x7d, 0xdc, 0xb4,
-                0x3e, 0xf7, 0x5a, 0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4, 0xeb, 0xa4,
-                0xa9, 0x8e, 0xaa, 0x9b, 0x4e, 0x6a,
+                0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54, 0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e,
+                0xf7, 0x5a, 0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4, 0xeb, 0xa4, 0xa9, 0x8e,
+                0xaa, 0x9b, 0x4e, 0x6a,
             ]
         );
         let shared = alice.agree(&bob_pub).unwrap();
         assert_eq!(
             shared.to_vec(),
             vec![
-                0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80,
-                0x35, 0x0f, 0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0,
-                0x9b, 0x3c, 0x1e, 0x16, 0x17, 0x42,
+                0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35,
+                0x0f, 0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0, 0x9b, 0x3c,
+                0x1e, 0x16, 0x17, 0x42,
             ]
         );
     }

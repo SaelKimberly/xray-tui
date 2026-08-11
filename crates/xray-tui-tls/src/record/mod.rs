@@ -96,9 +96,7 @@ pub fn parse_handshake_messages(payload: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
     let mut pos = 0;
     while pos < payload.len() {
         if payload.len() - pos < 4 {
-            return Err(TlsError::Handshake(
-                "truncated handshake message".into(),
-            ));
+            return Err(TlsError::Handshake("truncated handshake message".into()));
         }
         let msg_type = payload[pos];
         let length = (usize::from(payload[pos + 1]) << 16)

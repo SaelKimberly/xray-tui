@@ -128,11 +128,15 @@ pub fn extract_certificate_signature(cert_der: &[u8]) -> Result<&[u8]> {
     }
     let (tag, _sigalg) = read_tlv(cert, &mut inner)?;
     if tag != 0x30 {
-        return Err(TlsError::Verify("certificate signatureAlgorithm is not a SEQUENCE".into()));
+        return Err(TlsError::Verify(
+            "certificate signatureAlgorithm is not a SEQUENCE".into(),
+        ));
     }
     let (tag, sig) = read_tlv(cert, &mut inner)?;
     if tag != 0x03 {
-        return Err(TlsError::Verify("certificate signatureValue is not a BIT STRING".into()));
+        return Err(TlsError::Verify(
+            "certificate signatureValue is not a BIT STRING".into(),
+        ));
     }
     split_bit_string(sig)
 }
@@ -163,8 +167,10 @@ pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> Resul
             "unsupported signature algorithm 0x{sig_alg:04x}, expected Ed25519 (0x0807)"
         )));
     }
-    let sig_len =
-        usize::from(u16::from_be_bytes([cert_verify_message[pos + 2], cert_verify_message[pos + 3]]));
+    let sig_len = usize::from(u16::from_be_bytes([
+        cert_verify_message[pos + 2],
+        cert_verify_message[pos + 3],
+    ]));
     if sig_len != 64 {
         return Err(TlsError::Handshake(format!(
             "invalid Ed25519 signature length {sig_len}, expected 64"
@@ -172,7 +178,9 @@ pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> Resul
     }
     let sig_start = pos + 4;
     if sig_start + sig_len > cert_verify_message.len() {
-        return Err(TlsError::Handshake("CertificateVerify message truncated".into()));
+        return Err(TlsError::Handshake(
+            "CertificateVerify message truncated".into(),
+        ));
     }
     Ok(cert_verify_message[sig_start..sig_start + sig_len].to_vec())
 }
@@ -355,8 +363,8 @@ mod tests {
         let cert = params
             .self_signed(&key_pair)
             .expect("Failed to create self-signed certificate");
-        let signing_key = Ed25519KeyPair::from_pkcs8(key_pair.serialized_der())
-            .expect("Failed to parse key");
+        let signing_key =
+            Ed25519KeyPair::from_pkcs8(key_pair.serialized_der()).expect("Failed to parse key");
         (cert.der().to_vec(), signing_key)
     }
 
@@ -387,9 +395,7 @@ mod tests {
         let (mut cert_der, signing_key) = ed25519_cert();
         let auth_key = [0x42; 32];
 
-        let sig_offset = extract_certificate_signature(&cert_der)
-            .unwrap()
-            .as_ptr() as usize
+        let sig_offset = extract_certificate_signature(&cert_der).unwrap().as_ptr() as usize
             - cert_der.as_ptr() as usize;
         let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, &auth_key);
         let hmac_tag = hmac::sign(&hmac_key, signing_key.public_key().as_ref());
@@ -501,19 +507,17 @@ mod tests {
         let signature = key_pair.sign(&signed_content);
 
         assert!(
-            verify_certificate_verify_signature(
-                &public_key,
-                signature.as_ref(),
-                &[0x43; 32]
-            )
-            .is_err()
+            verify_certificate_verify_signature(&public_key, signature.as_ref(), &[0x43; 32])
+                .is_err()
         );
     }
 
     #[test]
     fn verify_certificate_verify_signature_invalid_length() {
         let public_key = [0x00; 32];
-        assert!(verify_certificate_verify_signature(&public_key, &[0x00; 32], &[0x42; 32]).is_err());
+        assert!(
+            verify_certificate_verify_signature(&public_key, &[0x00; 32], &[0x42; 32]).is_err()
+        );
     }
 
     /// End to end: HMAC-stamped certificate + a `CertificateVerify` signed
@@ -524,9 +528,7 @@ mod tests {
         let auth_key = [0x42; 32];
 
         // Stamp the certificate with the REALITY HMAC.
-        let sig_offset = extract_certificate_signature(&cert_der)
-            .unwrap()
-            .as_ptr() as usize
+        let sig_offset = extract_certificate_signature(&cert_der).unwrap().as_ptr() as usize
             - cert_der.as_ptr() as usize;
         let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, &auth_key);
         let hmac_tag = hmac::sign(&hmac_key, signing_key.public_key().as_ref());
@@ -544,14 +546,7 @@ mod tests {
         let mut cv = vec![0x0f, 0x00, 0x00, 0x44, 0x08, 0x07, 0x00, 0x40];
         cv.extend_from_slice(signature.as_ref());
 
-        verify_server(
-            &cert_der,
-            &cv,
-            &auth_key,
-            transcript,
-            &digest::SHA256,
-        )
-        .unwrap();
+        verify_server(&cert_der, &cv, &auth_key, transcript, &digest::SHA256).unwrap();
 
         // A wrong auth_key fails the whole chain.
         assert!(verify_server(&cert_der, &cv, &[0x43; 32], transcript, &digest::SHA256).is_err());

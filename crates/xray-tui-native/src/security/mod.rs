@@ -42,7 +42,11 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 let params = TlsParams {
                     sni: ctx.sni(),
                     alpn: ctx.alpn_vec(),
-                    fingerprint: opts.fp.as_deref().map(fingerprint::parse_fingerprint_id).transpose()?,
+                    fingerprint: opts
+                        .fp
+                        .as_deref()
+                        .map(fingerprint::parse_fingerprint_id)
+                        .transpose()?,
                     insecure: opts.insecure.unwrap_or(false),
                     pin_sha256: fingerprint::decode_pin_sha256(opts.pin_sha256.as_deref())?,
                 };

@@ -45,9 +45,9 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
-use xray_tui_tls::handshake::{connect, HandshakeParams};
+use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
-use xray_tui_tls::hello::{build_hello, BuildParams};
+use xray_tui_tls::hello::{BuildParams, build_hello};
 use xray_tui_tls::http2;
 use xray_tui_tls::profiles::BrowserProfile;
 use xray_tui_tls::verify::WebPkiVerifier;
@@ -111,17 +111,21 @@ fn parse_args() -> Vec<BrowserProfile> {
             eprintln!("--profile requires a value");
             std::process::exit(2);
         });
-        let profile = GRADED_PROFILES.iter().copied().find(|p| p.name() == name).unwrap_or_else(|| {
-            eprintln!(
-                "unknown or unsupported profile {name:?}; grader supports: {}",
-                GRADED_PROFILES
-                    .iter()
-                    .map(|p| p.name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            std::process::exit(2);
-        });
+        let profile = GRADED_PROFILES
+            .iter()
+            .copied()
+            .find(|p| p.name() == name)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "unknown or unsupported profile {name:?}; grader supports: {}",
+                    GRADED_PROFILES
+                        .iter()
+                        .map(|p| p.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(2);
+            });
         selected.push(profile);
     }
     if selected.is_empty() {
@@ -135,7 +139,10 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
     // Local fingerprint of the profile (fixed seed → deterministic GREASE;
     // JA4 is GREASE-normalized anyway; JA3 is compared GREASE-stripped).
     let spec = profile.spec();
-    let fixed = local::FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+    let fixed = local::FixedRandom {
+        bytes: vec![0x42; 128],
+        pos: AtomicUsize::new(0),
+    };
     let local_hello = build_hello(
         &spec,
         &BuildParams {
@@ -185,7 +192,9 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
     let server_ja3_hash = tls["ja3_hash"].as_str().unwrap_or("<missing>");
     let server_ja4 = tls["ja4"].as_str().unwrap_or("<missing>");
     let server_ja4_r = tls["ja4_r"].as_str().unwrap_or("");
-    let akamai = json["http2"]["akamai_fingerprint_hash"].as_str().unwrap_or("");
+    let akamai = json["http2"]["akamai_fingerprint_hash"]
+        .as_str()
+        .unwrap_or("");
 
     println!("TLS version : {tls_version}");
     // `tls.ciphers` is the server's echo of the *offered* cipher list, so
@@ -233,7 +242,10 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
         "server JA3 hash must be the md5 of its own GREASE-stripped string"
     );
     if profile == BrowserProfile::Firefox128Esr {
-        assert_eq!(server_ja3_hash, FIREFOX128ESR_JA3, "Firefox JA3 is stable and locked");
+        assert_eq!(
+            server_ja3_hash, FIREFOX128ESR_JA3,
+            "Firefox JA3 is stable and locked"
+        );
     }
 
     Ok(())
@@ -251,9 +263,9 @@ mod local {
     use md5::{Digest, Md5};
     use ring::digest;
 
+    use xray_tui_tls::SecureRandom;
     use xray_tui_tls::hello::parse::ParsedClientHello;
     use xray_tui_tls::spec::grease::is_grease;
-    use xray_tui_tls::SecureRandom;
 
     /// Deterministic RNG (all `0x42`) mirroring the crate's test double.
     pub struct FixedRandom {
@@ -282,7 +294,11 @@ mod local {
     fn sha256_hex12(data: &[u8]) -> String {
         use std::fmt::Write;
         let mut out = String::with_capacity(12);
-        for b in digest::digest(&digest::SHA256, data).as_ref().iter().take(6) {
+        for b in digest::digest(&digest::SHA256, data)
+            .as_ref()
+            .iter()
+            .take(6)
+        {
             let _ = write!(out, "{b:02x}");
         }
         out
@@ -398,17 +414,27 @@ mod local {
     /// deviation from the `FoxIO` `python` implementation which includes it.
     /// The extension *count* in the `_a_` section still includes padding.
     pub fn ja4_v2(hello: &ParsedClientHello) -> String {
-        let ciphers: Vec<u16> =
-            hello.cipher_suites.iter().copied().filter(|&c| !is_grease(c)).collect();
-        let exts: Vec<u16> =
-            hello.extensions.iter().map(|(t, _)| *t).filter(|&t| !is_grease(t)).collect();
-        let sigs: Vec<u16> = sigalgs(hello).into_iter().filter(|&s| !is_grease(s)).collect();
+        let ciphers: Vec<u16> = hello
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|&c| !is_grease(c))
+            .collect();
+        let exts: Vec<u16> = hello
+            .extensions
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|&t| !is_grease(t))
+            .collect();
+        let sigs: Vec<u16> = sigalgs(hello)
+            .into_iter()
+            .filter(|&s| !is_grease(s))
+            .collect();
 
         let cipher_count = ciphers.len().min(99);
         let ext_count = exts.len().min(99);
 
-        let mut sorted_ciphers: Vec<String> =
-            ciphers.iter().map(|c| format!("{c:04x}")).collect();
+        let mut sorted_ciphers: Vec<String> = ciphers.iter().map(|c| format!("{c:04x}")).collect();
         sorted_ciphers.sort_unstable();
         let cipher_sha = sha256_hex12(sorted_ciphers.join(",").as_bytes());
 
@@ -418,7 +444,11 @@ mod local {
             .filter(|e| e != "0000" && e != "0010" && e != "0015")
             .collect();
         sorted_exts.sort_unstable();
-        let sig_str = sigs.iter().map(|s| format!("{s:04x}")).collect::<Vec<_>>().join(",");
+        let sig_str = sigs
+            .iter()
+            .map(|s| format!("{s:04x}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let ext_sha = sha256_hex12(format!("{}_{}", sorted_exts.join(","), sig_str).as_bytes());
 
         let alpn_token = alpn(hello).map_or_else(

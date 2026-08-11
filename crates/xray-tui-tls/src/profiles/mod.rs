@@ -106,12 +106,12 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::BrowserProfile;
-    use crate::crypto::fingerprint::ja3::{ja3_hash, Ja3Fields};
+    use crate::SecureRandom;
+    use crate::crypto::fingerprint::ja3::{Ja3Fields, ja3_hash};
     use crate::crypto::fingerprint::ja4::ja4_a;
     use crate::hello::parse::parse_hello;
-    use crate::hello::{build_hello, BuildParams};
+    use crate::hello::{BuildParams, build_hello};
     use crate::spec::grease::is_grease;
-    use crate::SecureRandom;
 
     /// Deterministic RNG feeding back a fixed byte sequence (mirrors the
     /// `hello` test double; `AtomicUsize` keeps it `Sync` for the
@@ -156,7 +156,10 @@ mod tests {
     fn all_profiles_build_and_parse() {
         for profile in BrowserProfile::all() {
             let spec = profile.spec();
-            let rng = FixedRandom { bytes: vec![0x5A; 256], pos: AtomicUsize::new(0) };
+            let rng = FixedRandom {
+                bytes: vec![0x5A; 256],
+                pos: AtomicUsize::new(0),
+            };
             let hello = build_hello(
                 &spec,
                 &BuildParams {
@@ -185,7 +188,10 @@ mod tests {
                 );
             }
             assert!(!ja3_hash(&fields).is_empty(), "{profile:?} JA3");
-            assert!(ja4_a(&fields).starts_with("t13d"), "{profile:?} JA4-A prefix");
+            assert!(
+                ja4_a(&fields).starts_with("t13d"),
+                "{profile:?} JA4-A prefix"
+            );
         }
     }
 
@@ -201,7 +207,10 @@ mod tests {
     #[test]
     fn firefox128esr_golden_hello_with_fixed_seed() {
         let spec = BrowserProfile::Firefox128Esr.spec();
-        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -221,7 +230,10 @@ mod tests {
         assert_eq!(BrowserProfile::Chrome130.name(), "chrome_130");
         assert_eq!(BrowserProfile::Chrome.name(), "chrome");
         assert_eq!(BrowserProfile::Chrome133.name(), "chrome_133");
-        assert_eq!(BrowserProfile::ChromeAndroid130.name(), "chrome_android_130");
+        assert_eq!(
+            BrowserProfile::ChromeAndroid130.name(),
+            "chrome_android_130"
+        );
         assert_eq!(BrowserProfile::Edge130.name(), "edge_130");
         assert_eq!(BrowserProfile::Brave167.name(), "brave_167");
         assert_eq!(BrowserProfile::Opera114.name(), "opera_114");
@@ -231,4 +243,3 @@ mod tests {
         assert_eq!(BrowserProfile::SafariIos17.name(), "safari_ios_17");
     }
 }
-

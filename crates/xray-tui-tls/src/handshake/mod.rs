@@ -23,17 +23,17 @@
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::SecureRandom;
 use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair};
 use crate::error::{Result, TlsError};
-use crate::hello::{build_hello, BuildParams};
+use crate::hello::{BuildParams, build_hello};
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{
-    aead_aad, make_app_data_record, parse_handshake_messages, skip_ccs,
-    CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE,
-    HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
+    CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
+    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, aead_aad, make_app_data_record,
+    parse_handshake_messages, skip_ccs,
 };
 use crate::spec::ClientHelloSpec;
-use crate::SecureRandom;
 
 // ── Verifier seam ──────────────────────────────────────────────────────────
 
@@ -96,9 +96,8 @@ pub struct HandshakeParams<'a> {
 /// RFC 8446 §4.1.4: the `ServerHello.random` that marks a
 /// `HelloRetryRequest`.
 const HRR_RANDOM: [u8; 32] = [
-    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
-    0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
-    0x33, 0x9C,
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
 /// `key_share` extension type (RFC 8446 §4.2.8).
@@ -171,13 +170,12 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let flight = read_server_hs_messages(&mut stream, &server_hs_key).await?;
 
     // Transcript up to (excluding) CertificateVerify — the verifier seam.
-    let mut transcript =
-        Vec::with_capacity(
-            hello.handshake_bytes.len()
-                + server_hello.raw.len()
-                + flight.ee_raw.len()
-                + flight.cert_raw.len(),
-        );
+    let mut transcript = Vec::with_capacity(
+        hello.handshake_bytes.len()
+            + server_hello.raw.len()
+            + flight.ee_raw.len()
+            + flight.cert_raw.len(),
+    );
     transcript.extend_from_slice(&hello.handshake_bytes);
     transcript.extend_from_slice(&server_hello.raw);
     transcript.extend_from_slice(&flight.ee_raw);
@@ -214,8 +212,11 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let cf_hs_msg = make_hs_msg(HS_FINISHED, &client_finished_mac);
     let mut cf_inner = cf_hs_msg.clone();
     cf_inner.push(CONTENT_HANDSHAKE);
-    let cf_ciphertext = client_hs_key.seal(0, &aead_aad(cf_inner.len() + AEAD_TAG_LEN), &cf_inner)?;
-    stream.write_all(&make_app_data_record(&cf_ciphertext)).await?;
+    let cf_ciphertext =
+        client_hs_key.seal(0, &aead_aad(cf_inner.len() + AEAD_TAG_LEN), &cf_inner)?;
+    stream
+        .write_all(&make_app_data_record(&cf_ciphertext))
+        .await?;
 
     // 6. Application traffic secrets over ClientHello..server Finished
     //    (the client Finished is added to the transcript afterwards, for a
@@ -305,7 +306,9 @@ fn parse_server_hello(body: &[u8]) -> Result<ParsedServerHello> {
     let session_id_len = usize::from(body[34]);
     let mut pos = 35 + session_id_len;
     if pos + 5 > body.len() {
-        return Err(TlsError::Handshake("ServerHello truncated at cipher suite".into()));
+        return Err(TlsError::Handshake(
+            "ServerHello truncated at cipher suite".into(),
+        ));
     }
 
     // RFC 8446 §4.1.4: a HelloRetryRequest is a ServerHello whose random is
@@ -330,7 +333,9 @@ fn parse_server_hello(body: &[u8]) -> Result<ParsedServerHello> {
     pos += 2;
     let ext_end = pos + ext_list_len;
     if ext_end > body.len() {
-        return Err(TlsError::Handshake("ServerHello extensions truncated".into()));
+        return Err(TlsError::Handshake(
+            "ServerHello extensions truncated".into(),
+        ));
     }
 
     let mut peer_key = None;
@@ -339,7 +344,9 @@ fn parse_server_hello(body: &[u8]) -> Result<ParsedServerHello> {
         let ext_len = usize::from(u16::from_be_bytes([body[pos + 2], body[pos + 3]]));
         pos += 4;
         if pos + ext_len > ext_end {
-            return Err(TlsError::Handshake("ServerHello extension overruns list".into()));
+            return Err(TlsError::Handshake(
+                "ServerHello extension overruns list".into(),
+            ));
         }
         let ext_data = &body[pos..pos + ext_len];
         pos += ext_len;
@@ -442,10 +449,8 @@ where
 
     Ok(ServerFlight {
         ee_raw: ee_raw.ok_or_else(|| TlsError::Handshake("missing EncryptedExtensions".into()))?,
-        cert_raw: cert_raw
-            .unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE, &[])),
-        cv_raw: cv_raw
-            .unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE_VERIFY, &[])),
+        cert_raw: cert_raw.unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE, &[])),
+        cv_raw: cv_raw.unwrap_or_else(|| make_hs_msg(HS_CERTIFICATE_VERIFY, &[])),
         sf_verify_data: finished_data
             .ok_or_else(|| TlsError::Handshake("missing server Finished".into()))?,
         chain: chain.unwrap_or_default(),
@@ -475,7 +480,9 @@ fn parse_encrypted_extensions(body: &[u8]) -> Result<()> {
         let ext_len = usize::from(u16::from_be_bytes([body[pos + 2], body[pos + 3]]));
         pos += 4;
         if pos + ext_len > ext_end {
-            return Err(TlsError::Handshake("EncryptedExtensions extension overruns list".into()));
+            return Err(TlsError::Handshake(
+                "EncryptedExtensions extension overruns list".into(),
+            ));
         }
         let ext_data = &body[pos..pos + ext_len];
         pos += ext_len;
@@ -497,7 +504,9 @@ fn parse_encrypted_extensions(body: &[u8]) -> Result<()> {
             EXT_ALPN => {
                 // uint16 list length || (uint8 len || protocol)*.
                 if ext_data.len() < 2 {
-                    return Err(TlsError::Handshake("malformed ALPN in EncryptedExtensions".into()));
+                    return Err(TlsError::Handshake(
+                        "malformed ALPN in EncryptedExtensions".into(),
+                    ));
                 }
                 let list_len = usize::from(u16::from_be_bytes([ext_data[0], ext_data[1]]));
                 if ext_data.len() != 2 + list_len {
@@ -535,7 +544,9 @@ fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     let ctx_len = usize::from(body[0]);
     let mut pos = 1 + ctx_len;
     if pos + 3 > body.len() {
-        return Err(TlsError::Handshake("Certificate list length truncated".into()));
+        return Err(TlsError::Handshake(
+            "Certificate list length truncated".into(),
+        ));
     }
     let list_len = u24(&body[pos..pos + 3]);
     pos += 3;
@@ -547,7 +558,9 @@ fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut chain = Vec::new();
     while pos < list_end {
         if pos + 3 > list_end {
-            return Err(TlsError::Handshake("certificate entry length truncated".into()));
+            return Err(TlsError::Handshake(
+                "certificate entry length truncated".into(),
+            ));
         }
         let cert_len = u24(&body[pos..pos + 3]);
         pos += 3;
@@ -557,12 +570,16 @@ fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         chain.push(body[pos..pos + cert_len].to_vec());
         pos += cert_len;
         if pos + 2 > list_end {
-            return Err(TlsError::Handshake("certificate extensions length truncated".into()));
+            return Err(TlsError::Handshake(
+                "certificate extensions length truncated".into(),
+            ));
         }
         let ext_len = usize::from(u16::from_be_bytes([body[pos], body[pos + 1]]));
         pos += 2 + ext_len;
         if pos > list_end {
-            return Err(TlsError::Handshake("certificate extensions overrun list".into()));
+            return Err(TlsError::Handshake(
+                "certificate extensions overrun list".into(),
+            ));
         }
     }
     Ok(chain)
@@ -577,7 +594,9 @@ fn parse_certificate_verify(body: &[u8]) -> Result<u16> {
     let scheme = u16::from_be_bytes([body[0], body[1]]);
     let sig_len = usize::from(u16::from_be_bytes([body[2], body[3]]));
     if body.len() != 4 + sig_len {
-        return Err(TlsError::Handshake("CertificateVerify signature length mismatch".into()));
+        return Err(TlsError::Handshake(
+            "CertificateVerify signature length mismatch".into(),
+        ));
     }
     Ok(scheme)
 }
@@ -635,9 +654,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        connect, parse_certificate_message, parse_certificate_verify,
-        parse_encrypted_extensions, parse_server_hello, AcceptAll, HandshakeParams,
-        HRR_RANDOM, HS_SERVER_HELLO,
+        AcceptAll, HRR_RANDOM, HS_SERVER_HELLO, HandshakeParams, connect,
+        parse_certificate_message, parse_certificate_verify, parse_encrypted_extensions,
+        parse_server_hello,
     };
     use crate::error::TlsError;
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -693,6 +712,12 @@ mod tests {
 
     fn server_config(cert: &rcgen::Certificate, key: &rcgen::KeyPair) -> rustls::ServerConfig {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        // Workspace feature unification compiles rustls with BOTH backends
+        // (ring via our crates, aws-lc-rs via reqwest/hickory/quinn), so
+        // rustls cannot auto-select a provider here — install ring
+        // explicitly, matching `install_tls_provider()` in the binary.
+        // Idempotent: a concurrent/earlier install returns `Err`, ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(

@@ -3,7 +3,7 @@
 //! Stock rustls (0.23) exposes no `ClientHello` modification API, so browser
 //! fingerprint mimicry (the DPI/CDN bypass requirement) lives behind the
 //! [`TlsConnector`] trait. `Custom` engines serve BOTH plain TLS (with
-//! certificate validation) and REALITY. The M2 fingerprint engine
+//! certificate validation) and REALITY. The fingerprint engine
 //! ([`crate::security::fingerprint`]) is the default `Custom` connector;
 //! `Standard` remains the no-fingerprint rustls path.
 
@@ -59,9 +59,9 @@ pub trait TlsConnector: Send + Sync {
 /// Provider selection for a connect.
 ///
 /// `Standard` ignores `fingerprint` (stock rustls cannot emit a mimicked
-/// `ClientHello`); a fingerprinted hello comes from `Custom` — the M2 engine
-/// is [`crate::security::fingerprint::FingerprintConnector`], wired by
-/// `wrap()` when `fp` is set or a `Custom` provider is selected.
+/// `ClientHello`); a fingerprinted hello comes from `Custom` — the engine is
+/// [`crate::security::fingerprint::FingerprintConnector`], wired by `wrap()`
+/// when `fp` is set or a `Custom` provider is selected.
 #[derive(Clone, Default)]
 pub enum TlsProvider {
     #[default]

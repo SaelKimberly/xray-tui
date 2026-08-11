@@ -54,7 +54,10 @@ pub fn spec() -> ClientHelloSpec {
             ExtensionSpec::Grease,
             ExtensionSpec::ServerName,
             // extended_master_secret.
-            ExtensionSpec::Raw { ty: 0x0017, data: Vec::new() },
+            ExtensionSpec::Raw {
+                ty: 0x0017,
+                data: Vec::new(),
+            },
             ExtensionSpec::RenegotiationInfo,
             // Supported curves: GREASE, X25519MLKEM768, X25519, P256, P384.
             ExtensionSpec::SupportedGroups(vec![
@@ -81,7 +84,10 @@ pub fn spec() -> ClientHelloSpec {
             ExtensionSpec::CompressCertificate(vec![0x0003]),
             // ALPS "new" (0x446D): ALPN-style u8 per-entry lengths, unlike
             // the 0x4469 draft form. Static body: list_len 0003, "h2".
-            ExtensionSpec::Raw { ty: 0x446D, data: vec![0x00, 0x03, 0x02, 0x68, 0x32] },
+            ExtensionSpec::Raw {
+                ty: 0x446D,
+                data: vec![0x00, 0x03, 0x02, 0x68, 0x32],
+            },
             // Note: uTLS's Chrome 133 also carries a GREASE ECH (0xFE0D)
             // outer extension. This crate cannot emit a *valid* ECH outer
             // (no HPKE key agreement), and rustls 0.23 rejects even a

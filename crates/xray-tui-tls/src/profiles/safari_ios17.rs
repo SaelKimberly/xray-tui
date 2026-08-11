@@ -74,7 +74,10 @@ pub fn spec() -> ClientHelloSpec {
         extensions: vec![
             ExtensionSpec::ServerName,
             // extended_master_secret.
-            ExtensionSpec::Raw { ty: 0x0017, data: Vec::new() },
+            ExtensionSpec::Raw {
+                ty: 0x0017,
+                data: Vec::new(),
+            },
             ExtensionSpec::RenegotiationInfo,
             ExtensionSpec::SupportedGroups(NAMED_GROUPS.to_vec()),
             // No ec_point_formats (iOS Safari dropped this).

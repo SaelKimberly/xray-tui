@@ -105,9 +105,10 @@ impl ServerVerifier for WebPkiVerifier {
             return Ok(());
         }
 
-        let leaf = ctx.chain.first().ok_or_else(|| {
-            TlsError::Verify("server presented no certificate".to_string())
-        })?;
+        let leaf = ctx
+            .chain
+            .first()
+            .ok_or_else(|| TlsError::Verify("server presented no certificate".to_string()))?;
         let leaf_der = CertificateDer::from(leaf.as_slice());
         let end_entity = EndEntityCert::try_from(&leaf_der)
             .map_err(|e| TlsError::Verify(format!("invalid leaf certificate DER: {e}")))?;
@@ -215,7 +216,9 @@ fn verify_certificate_verify(
     end_entity
         .verify_signature(algorithm, &signed, signature)
         .map_err(|e| {
-            TlsError::Verify(format!("CertificateVerify signature verification failed: {e}"))
+            TlsError::Verify(format!(
+                "CertificateVerify signature verification failed: {e}"
+            ))
         })
 }
 
@@ -228,10 +231,10 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{verify_certificate_verify, WebPkiVerifier};
+    use super::{WebPkiVerifier, verify_certificate_verify};
     use crate::crypto::CipherSuiteId;
     use crate::error::{Result, TlsError};
-    use crate::handshake::{connect, HandshakeParams, ServerVerifier, VerifyContext};
+    use crate::handshake::{HandshakeParams, ServerVerifier, VerifyContext, connect};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -263,6 +266,12 @@ mod tests {
 
     fn server_config(cert: &rcgen::Certificate, key: &rcgen::KeyPair) -> rustls::ServerConfig {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        // Workspace feature unification compiles rustls with BOTH backends
+        // (ring via our crates, aws-lc-rs via reqwest/hickory/quinn), so
+        // rustls cannot auto-select a provider here — install ring
+        // explicitly, matching `install_tls_provider()` in the binary.
+        // Idempotent: a concurrent/earlier install returns `Err`, ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
@@ -297,9 +306,7 @@ mod tests {
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
         (ca_cert, ca_key, leaf_cert, leaf_key)
     }
 
@@ -414,14 +421,9 @@ mod tests {
         // A self-signed server cert is not in the trust store (webpki-roots),
         // so the chain cannot build to any root.
         let verifier = WebPkiVerifier::webpki_roots();
-        let err = connect_server(
-            &verifier,
-            "localhost",
-            &certified.cert,
-            &certified.key_pair,
-        )
-        .await
-        .unwrap_err();
+        let err = connect_server(&verifier, "localhost", &certified.cert, &certified.key_pair)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TlsError::Verify(_)), "got: {err}");
     }
 
@@ -489,8 +491,9 @@ mod tests {
         // The transcript is arbitrary here; the signature covers the padded
         // RFC 8446 §4.4.3 message built from it.
         let transcript = b"ClientHello..Certificate";
-        let transcript_hash =
-            ring::digest::digest(&ring::digest::SHA256, &transcript[..]).as_ref().to_vec();
+        let transcript_hash = ring::digest::digest(&ring::digest::SHA256, &transcript[..])
+            .as_ref()
+            .to_vec();
         let mut message = Vec::with_capacity(64 + super::SERVER_CV_CONTEXT.len() + 32);
         message.resize(64, 0x20);
         message.extend_from_slice(super::SERVER_CV_CONTEXT);
@@ -499,7 +502,11 @@ mod tests {
 
         let mut body = Vec::with_capacity(4 + forged_sig.as_ref().len());
         body.extend_from_slice(&0x0403u16.to_be_bytes());
-        body.extend_from_slice(&u16::try_from(forged_sig.as_ref().len()).unwrap().to_be_bytes());
+        body.extend_from_slice(
+            &u16::try_from(forged_sig.as_ref().len())
+                .unwrap()
+                .to_be_bytes(),
+        );
         body.extend_from_slice(forged_sig.as_ref());
 
         let ctx = VerifyContext {
@@ -523,12 +530,11 @@ mod tests {
         let (_, _, leaf_cert, leaf_key) = ca_and_leaf();
         let der = rustls_pki_types::CertificateDer::from(leaf_cert.der().to_vec());
         let ee = webpki::EndEntityCert::try_from(&der).unwrap();
-        assert_eq!(ee.subject_public_key_info().as_ref(), leaf_key.public_key_der());
+        assert_eq!(
+            ee.subject_public_key_info().as_ref(),
+            leaf_key.public_key_der()
+        );
     }
-
-
-
-
 
     #[test]
     fn rejects_unknown_signature_scheme() {

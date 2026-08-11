@@ -13,9 +13,9 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
-use xray_tui_tls::handshake::{connect, HandshakeParams};
+use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
-use xray_tui_tls::hello::{build_hello, BuildParams};
+use xray_tui_tls::hello::{BuildParams, build_hello};
 use xray_tui_tls::http2;
 use xray_tui_tls::profiles::BrowserProfile;
 use xray_tui_tls::verify::WebPkiVerifier;
@@ -43,11 +43,22 @@ const CHROME130_JA3_STRIPPED_MD5: &str = "2b916ec56aedf4a5ecbeb5804f60c242";
 #[test]
 fn local_fingerprints_match_locked_constants() {
     for (profile, expected_ja4, expected_ja3) in [
-        (BrowserProfile::Chrome130, CHROME130_JA4, CHROME130_JA3_STRIPPED_MD5),
-        (BrowserProfile::Firefox128Esr, FIREFOX128ESR_JA4, FIREFOX128ESR_JA3),
+        (
+            BrowserProfile::Chrome130,
+            CHROME130_JA4,
+            CHROME130_JA3_STRIPPED_MD5,
+        ),
+        (
+            BrowserProfile::Firefox128Esr,
+            FIREFOX128ESR_JA4,
+            FIREFOX128ESR_JA3,
+        ),
     ] {
         let spec = profile.spec();
-        let fixed = local::FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+        let fixed = local::FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -82,7 +93,10 @@ async fn chrome_130_matches_expected_fingerprints() {
 
     // GREASE-normalized JA4 is deterministic: strict equality against both
     // the locked constant and the local FoxIO-v2 computation.
-    assert_eq!(report.ja4, CHROME130_JA4, "Chrome 130 JA4 must match the locked constant");
+    assert_eq!(
+        report.ja4, CHROME130_JA4,
+        "Chrome 130 JA4 must match the locked constant"
+    );
     assert_eq!(
         report.local_ja4, report.ja4,
         "local JA4 v2 must match the server-reported JA4 (wire fidelity)"
@@ -103,8 +117,14 @@ async fn firefox_128_esr_matches_expected_fingerprints() {
     let report = report.expect("live tls.peet.ws fetch for Firefox 128 ESR");
 
     // Firefox 128 ESR is GREASE-free: JA3 and JA4 are both stable.
-    assert_eq!(report.ja3_hash, FIREFOX128ESR_JA3, "Firefox JA3 must match the locked constant");
-    assert_eq!(report.ja4, FIREFOX128ESR_JA4, "Firefox JA4 must match the locked constant");
+    assert_eq!(
+        report.ja3_hash, FIREFOX128ESR_JA3,
+        "Firefox JA3 must match the locked constant"
+    );
+    assert_eq!(
+        report.ja4, FIREFOX128ESR_JA4,
+        "Firefox JA4 must match the locked constant"
+    );
     assert_eq!(
         report.local_ja4, report.ja4,
         "local JA4 v2 must match the server-reported JA4 (wire fidelity)"
@@ -118,9 +138,14 @@ async fn firefox_128_esr_matches_expected_fingerprints() {
 /// One live round-trip: build the profile hello (fixed seed), connect,
 /// HTTP/2 GET `/api/all`, and compute both the server's report and the
 /// local reconciliation fingerprints.
-async fn fetch_peet_report(profile: BrowserProfile) -> Result<PeetReport, Box<dyn std::error::Error>> {
+async fn fetch_peet_report(
+    profile: BrowserProfile,
+) -> Result<PeetReport, Box<dyn std::error::Error>> {
     let spec = profile.spec();
-    let fixed = local::FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+    let fixed = local::FixedRandom {
+        bytes: vec![0x42; 128],
+        pos: AtomicUsize::new(0),
+    };
     let local_hello = build_hello(
         &spec,
         &BuildParams {
@@ -179,9 +204,9 @@ mod local {
     use md5::{Digest, Md5};
     use ring::digest;
 
+    use xray_tui_tls::SecureRandom;
     use xray_tui_tls::hello::parse::ParsedClientHello;
     use xray_tui_tls::spec::grease::is_grease;
-    use xray_tui_tls::SecureRandom;
 
     pub struct FixedRandom {
         pub bytes: Vec<u8>,
@@ -209,7 +234,11 @@ mod local {
     fn sha256_hex12(data: &[u8]) -> String {
         use std::fmt::Write;
         let mut out = String::with_capacity(12);
-        for b in digest::digest(&digest::SHA256, data).as_ref().iter().take(6) {
+        for b in digest::digest(&digest::SHA256, data)
+            .as_ref()
+            .iter()
+            .take(6)
+        {
             let _ = write!(out, "{b:02x}");
         }
         out
@@ -306,10 +335,18 @@ mod local {
     /// deviation from the `FoxIO` `python` implementation which includes it.
     /// The extension *count* in the `_a_` section still includes padding.
     pub fn ja4_v2(hello: &ParsedClientHello) -> String {
-        let ciphers: Vec<u16> =
-            hello.cipher_suites.iter().copied().filter(|&c| !is_grease(c)).collect();
-        let exts: Vec<u16> =
-            hello.extensions.iter().map(|(t, _)| *t).filter(|&t| !is_grease(t)).collect();
+        let ciphers: Vec<u16> = hello
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|&c| !is_grease(c))
+            .collect();
+        let exts: Vec<u16> = hello
+            .extensions
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|&t| !is_grease(t))
+            .collect();
         let sigs: Vec<u16> = u16_list(hello.extension(0x000d))
             .into_iter()
             .filter(|&s| !is_grease(s))
@@ -318,8 +355,7 @@ mod local {
         let cipher_count = ciphers.len().min(99);
         let ext_count = exts.len().min(99);
 
-        let mut sorted_ciphers: Vec<String> =
-            ciphers.iter().map(|c| format!("{c:04x}")).collect();
+        let mut sorted_ciphers: Vec<String> = ciphers.iter().map(|c| format!("{c:04x}")).collect();
         sorted_ciphers.sort_unstable();
         let cipher_sha = sha256_hex12(sorted_ciphers.join(",").as_bytes());
 
@@ -329,7 +365,11 @@ mod local {
             .filter(|e| e != "0000" && e != "0010" && e != "0015")
             .collect();
         sorted_exts.sort_unstable();
-        let sig_str = sigs.iter().map(|s| format!("{s:04x}")).collect::<Vec<_>>().join(",");
+        let sig_str = sigs
+            .iter()
+            .map(|s| format!("{s:04x}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let ext_sha = sha256_hex12(format!("{}_{}", sorted_exts.join(","), sig_str).as_bytes());
 
         let alpn_token = alpn(hello).map_or_else(

@@ -22,9 +22,8 @@ use crate::error::{Result, TlsError};
 
 /// TLS record content types (RFC 8446 §5.1).
 use super::{
-    aead_aad, make_app_data_record, TlsRecord, CONTENT_ALERT,
-    CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET,
-    MAX_RECORD_PAYLOAD,
+    CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET,
+    MAX_RECORD_PAYLOAD, TlsRecord, aead_aad, make_app_data_record,
 };
 
 /// Maximum plaintext bytes per TLS 1.3 record: 2^14 (RFC 8446 §5.2).
@@ -71,8 +70,16 @@ pub struct TlsStream<S> {
 
 /// Incremental state of reading one TLS record off the wire.
 enum RecordState {
-    Header { buf: [u8; 5], filled: usize },
-    Payload { content_type: u8, len: usize, buf: Vec<u8>, filled: usize },
+    Header {
+        buf: [u8; 5],
+        filled: usize,
+    },
+    Payload {
+        content_type: u8,
+        len: usize,
+        buf: Vec<u8>,
+        filled: usize,
+    },
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
@@ -168,7 +175,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                         filled: 0,
                     };
                 }
-                Step::RecordReady { content_type, payload } => {
+                Step::RecordReady {
+                    content_type,
+                    payload,
+                } => {
                     self.rec = RecordState::Header {
                         buf: [0; 5],
                         filled: 0,
@@ -224,9 +234,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                     Some(&HS_NEW_SESSION_TICKET) => Ok(DecryptedRecord::Skip),
                     Some(&msg_type) => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "unexpected handshake message type {msg_type} after handshake"
-                        ),
+                        format!("unexpected handshake message type {msg_type} after handshake"),
                     )),
                     None => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -429,7 +437,7 @@ fn to_io_error(e: TlsError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     use super::*;
     use crate::crypto::CipherSuiteId;
@@ -485,8 +493,8 @@ mod tests {
         // from_key_iv keys: non-zero write IV must round-trip through the
         // record stream (nonce = IV XOR seq).
         let (a, b) = duplex(4096);
-        let key = AeadKey::from_key_iv(CipherSuiteId::Aes128GcmSha256, &[0x22; 16], [0x01; 12])
-            .unwrap();
+        let key =
+            AeadKey::from_key_iv(CipherSuiteId::Aes128GcmSha256, &[0x22; 16], [0x01; 12]).unwrap();
         let keys = AppKeys {
             read_key: key.clone_key(),
             write_key: key.clone_key(),
@@ -580,7 +588,12 @@ mod tests {
         // dropped so the following application data is delivered.
         let (a, mut b) = duplex(4096);
         let keys = test_keys();
-        let nst = raw_record(&keys, 0, CONTENT_HANDSHAKE, &[HS_NEW_SESSION_TICKET, 0, 0, 0]);
+        let nst = raw_record(
+            &keys,
+            0,
+            CONTENT_HANDSHAKE,
+            &[HS_NEW_SESSION_TICKET, 0, 0, 0],
+        );
         let data = raw_record(&keys, 1, CONTENT_APPLICATION_DATA, b"ticket?");
         tokio::spawn(async move {
             b.write_all(&nst).await.unwrap();
@@ -640,7 +653,10 @@ mod tests {
             lens.push(content.len());
             got.extend_from_slice(content);
         }
-        assert_eq!(lens, vec![MAX_RECORD_PLAINTEXT, 20_000 - MAX_RECORD_PLAINTEXT]);
+        assert_eq!(
+            lens,
+            vec![MAX_RECORD_PLAINTEXT, 20_000 - MAX_RECORD_PLAINTEXT]
+        );
         assert_eq!(got, payload);
     }
 }

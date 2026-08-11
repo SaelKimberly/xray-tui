@@ -9,7 +9,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Result, TlsError};
-use crate::reality::{auth, ProvisionedHello};
+use crate::reality::{ProvisionedHello, auth};
 
 /// REALITY protocol version carried in the `SessionId` plaintext.
 pub const REALITY_VERSION: [u8; 3] = [1, 8, 0];
@@ -90,10 +90,10 @@ pub fn seal_and_splice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::X25519KeyPair;
     use crate::hello::parse::parse_hello;
     use crate::reality::auth::{decrypt_session_id, derive_auth_key};
     use crate::reality::{FixedChrome133, HelloProvisionParams, HelloProvisioner};
-    use crate::crypto::X25519KeyPair;
 
     /// Decodes a hex string into bytes (test helper).
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -149,11 +149,10 @@ mod tests {
     #[test]
     fn session_id_seal_roundtrip() {
         // Server public key: RFC 7748 §6.1 Bob's public key B.
-        let server_pub: [u8; 32] = decode_hex(
-            "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
-        )
-        .try_into()
-        .unwrap();
+        let server_pub: [u8; 32] =
+            decode_hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+                .try_into()
+                .unwrap();
         let rng = ring::rand::SystemRandom::new();
         let keypair = X25519KeyPair::generate(&rng).unwrap();
         let shared = keypair.agree(&server_pub).unwrap();

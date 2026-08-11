@@ -116,9 +116,10 @@ impl<'a> Reader<'a> {
     /// Takes the next `n` bytes, failing with [`TlsError::Handshake`] when
     /// fewer remain.
     fn take(&mut self, n: usize) -> Result<&'a [u8], TlsError> {
-        let end = self.pos.checked_add(n).ok_or_else(|| {
-            TlsError::Handshake("message length overflows usize".to_string())
-        })?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| TlsError::Handshake("message length overflows usize".to_string()))?;
         let out = self
             .buf
             .get(self.pos..end)
@@ -252,17 +253,11 @@ mod tests {
     fn rejects_wrong_handshake_type() {
         let mut bytes = minimal_hello();
         bytes[0] = 0x02; // ServerHello, not ClientHello
-        assert!(matches!(
-            parse_hello(&bytes),
-            Err(TlsError::Handshake(_))
-        ));
+        assert!(matches!(parse_hello(&bytes), Err(TlsError::Handshake(_))));
     }
 
     #[test]
     fn rejects_empty_input() {
-        assert!(matches!(
-            parse_hello(&[]),
-            Err(TlsError::Handshake(_))
-        ));
+        assert!(matches!(parse_hello(&[]), Err(TlsError::Handshake(_))));
     }
 }

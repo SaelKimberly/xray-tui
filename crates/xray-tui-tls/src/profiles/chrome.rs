@@ -59,7 +59,10 @@ pub fn spec() -> ClientHelloSpec {
             // SNI.
             ExtensionSpec::ServerName,
             // extended_master_secret (no dedicated variant).
-            ExtensionSpec::Raw { ty: 0x0017, data: Vec::new() },
+            ExtensionSpec::Raw {
+                ty: 0x0017,
+                data: Vec::new(),
+            },
             // renegotiation_info.
             ExtensionSpec::RenegotiationInfo,
             // supported_groups: GREASE first (the reference prepends a

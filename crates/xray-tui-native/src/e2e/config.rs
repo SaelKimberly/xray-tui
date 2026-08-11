@@ -69,7 +69,9 @@ pub fn vmess_inbound(
     tls: &dyn TlsVariant,
 ) -> String {
     if let Some(private_key) = tls.reality_private_key() {
-        let sid = tls.reality_sid().expect("reality variant carries a short id");
+        let sid = tls
+            .reality_sid()
+            .expect("reality variant carries a short id");
         return vmess_reality_inbound(core, env, security, tls.sni(), private_key, sid);
     }
     // Configs reference the PEM FILES on disk, not the in-memory bytes.
@@ -107,7 +109,9 @@ pub fn vmess_inbound(
 #[must_use]
 pub fn vless_inbound(core: CoreKind, env: &ServerEnv, tls: &dyn TlsVariant) -> String {
     if let Some(private_key) = tls.reality_private_key() {
-        let sid = tls.reality_sid().expect("reality variant carries a short id");
+        let sid = tls
+            .reality_sid()
+            .expect("reality variant carries a short id");
         return vless_reality_inbound(core, env, tls.sni(), private_key, sid);
     }
     // Configs below reference the PEM FILES on disk, not the byte buffers.
@@ -263,7 +267,9 @@ fn plain_client_security(tls: &dyn TlsVariant) -> serde_json::Value {
 
 /// The REALITY client `security` object: pbk/sid with the Chrome provisioner.
 fn reality_client_security(tls: &dyn TlsVariant, pbk: &str) -> serde_json::Value {
-    let sid = tls.reality_sid().expect("reality variant carries a short id");
+    let sid = tls
+        .reality_sid()
+        .expect("reality variant carries a short id");
     serde_json::json!({
         "type": "reality",
         "sni": tls.sni(),
@@ -341,16 +347,18 @@ mod tests {
     #[test]
     fn reality_keypair_round_trips() {
         let (private, pbk) = reality_keypair();
-        let priv_bytes =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&private).unwrap();
-        let pbk_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&pbk).unwrap();
+        let priv_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&private)
+            .unwrap();
+        let pbk_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&pbk)
+            .unwrap();
         assert_eq!(priv_bytes.len(), 32);
         assert_eq!(pbk_bytes.len(), 32);
         // The public key must be the X25519 of the private key (base point).
-        let expected =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
-                <[u8; 32]>::try_from(priv_bytes.as_slice()).unwrap(),
-            ));
+        let expected = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
+            <[u8; 32]>::try_from(priv_bytes.as_slice()).unwrap(),
+        ));
         assert_eq!(expected.as_bytes().as_slice(), pbk_bytes.as_slice());
     }
 

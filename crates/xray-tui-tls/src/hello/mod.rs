@@ -68,7 +68,8 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
 
     // Client random (RFC 8446 §4.1.2).
     let mut random = [0u8; 32];
-    params.rng
+    params
+        .rng
         .fill(&mut random)
         .map_err(|_| TlsError::Crypto("client random failed".to_string()))?;
 
@@ -98,7 +99,12 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
         .map_err(|_| TlsError::Spec("compression methods exceed 255 bytes".to_string()))?;
 
     let mut body = Vec::with_capacity(
-        2 + 32 + 1 + session_id.len() + 2 + spec.cipher_suites.len() * 2 + 1
+        2 + 32
+            + 1
+            + session_id.len()
+            + 2
+            + spec.cipher_suites.len() * 2
+            + 1
             + spec.compression_methods.len()
             + 2
             + spec.extensions.len() * 8,
@@ -138,7 +144,8 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
             ExtensionSpec::Alpn(_) => {
                 let encoded = match params.alpn {
                     Some(protos) => {
-                        let list: Vec<String> = protos.iter().copied().map(str::to_string).collect();
+                        let list: Vec<String> =
+                            protos.iter().copied().map(str::to_string).collect();
                         ExtensionSpec::Alpn(list).encode_body(&rt)?
                     }
                     None => ext.encode_body(&rt)?,
@@ -167,7 +174,8 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 if groups.contains(&GREASE_PLACEHOLDER) {
                     let mut g = groups.clone();
                     fill_grease(&mut g, grease_a, params.rng)?;
-                    ext_bytes.extend_from_slice(&ExtensionSpec::SupportedGroups(g).encode_body(&rt)?);
+                    ext_bytes
+                        .extend_from_slice(&ExtensionSpec::SupportedGroups(g).encode_body(&rt)?);
                 } else {
                     ext_bytes.extend_from_slice(&ext.encode_body(&rt)?);
                 }
@@ -176,9 +184,8 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 if versions.contains(&GREASE_PLACEHOLDER) {
                     let mut v = versions.clone();
                     fill_grease(&mut v, grease_a, params.rng)?;
-                    ext_bytes.extend_from_slice(
-                        &ExtensionSpec::SupportedVersions(v).encode_body(&rt)?,
-                    );
+                    ext_bytes
+                        .extend_from_slice(&ExtensionSpec::SupportedVersions(v).encode_body(&rt)?);
                 } else {
                     ext_bytes.extend_from_slice(&ext.encode_body(&rt)?);
                 }
@@ -192,8 +199,17 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 // PADDING_TARGET − (accumulated + 4) with the 4 bytes being
                 // the padding extension's type+length overhead; a zero
                 // result omits the extension (matches the reference).
-                let acc_record = 5 + 4 + 2 + 32 + 1 + usize::from(sid_len) + 2
-                    + spec.cipher_suites.len() * 2 + 1 + usize::from(comp_len) + 2
+                let acc_record = 5
+                    + 4
+                    + 2
+                    + 32
+                    + 1
+                    + usize::from(sid_len)
+                    + 2
+                    + spec.cipher_suites.len() * 2
+                    + 1
+                    + usize::from(comp_len)
+                    + 2
                     + ext_bytes.len();
                 let padding_len = PADDING_TARGET.saturating_sub(acc_record + 4);
                 if padding_len > 0 {
@@ -262,11 +278,7 @@ fn spec_has_grease(spec: &ClientHelloSpec) -> bool {
 
 /// Replaces `GREASE_PLACEHOLDER` slots in `values`: the first becomes
 /// `grease_a`, later ones get freshly drawn GREASE values.
-fn fill_grease(
-    values: &mut [u16],
-    grease_a: u16,
-    rng: &dyn SecureRandom,
-) -> Result<(), TlsError> {
+fn fill_grease(values: &mut [u16], grease_a: u16, rng: &dyn SecureRandom) -> Result<(), TlsError> {
     let mut first = true;
     for v in values.iter_mut() {
         if *v == GREASE_PLACEHOLDER {
@@ -315,7 +327,7 @@ fn effective_alpn(spec: &ClientHelloSpec, override_alpn: Option<&[&str]>) -> Vec
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{build_hello, to_record, BuildParams, SecureRandom};
+    use super::{BuildParams, SecureRandom, build_hello, to_record};
     use crate::hello::parse::parse_hello;
     use crate::spec::grease::GREASE_PLACEHOLDER;
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -380,7 +392,10 @@ mod tests {
         let spec = crate::profiles::chrome::spec();
         // 2 GREASE bytes + 32 random + 32 session id = 66 bytes needed; give
         // the fixed RNG headroom so exhaustion is never the failure mode.
-        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -419,7 +434,10 @@ mod tests {
         };
         let mut bytes = vec![0x00, 0x01];
         bytes.extend_from_slice(&[0x42; 64]);
-        let rng = FixedRandom { bytes, pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes,
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -470,7 +488,10 @@ mod tests {
         };
         let mut bytes = vec![0x00, 0x01];
         bytes.extend_from_slice(&[0x42; 66]);
-        let rng = FixedRandom { bytes, pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes,
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -494,7 +515,10 @@ mod tests {
         // (`chrome.rs:125-139`): the padding data length is
         // `512 - (unpadded record + 4)`, so the record is exactly 512 bytes.
         let spec = crate::profiles::chrome::spec();
-        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -520,11 +544,17 @@ mod tests {
             compression_methods: vec![0x00],
             session_id: SessionIdSpec::Random32,
             extensions: vec![
-                ExtensionSpec::Raw { ty: 0x1234, data: vec![0xEE; 600] },
+                ExtensionSpec::Raw {
+                    ty: 0x1234,
+                    data: vec![0xEE; 600],
+                },
                 ExtensionSpec::Padding,
             ],
         };
-        let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 64],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &big,
             &BuildParams {
@@ -537,7 +567,10 @@ mod tests {
         .unwrap();
         assert!(hello.record_bytes.len() > 512);
         let parsed = parse_hello(&hello.handshake_bytes).unwrap();
-        assert!(parsed.extension(0x0015).is_none(), "no padding when already >= 512");
+        assert!(
+            parsed.extension(0x0015).is_none(),
+            "no padding when already >= 512"
+        );
     }
 
     #[test]
@@ -549,7 +582,10 @@ mod tests {
             session_id: SessionIdSpec::AuthPayload { len: 42 },
             extensions: vec![],
         };
-        let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 64],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -580,7 +616,10 @@ mod tests {
             extensions: vec![ExtensionSpec::Alpn(vec!["spec-only".into()])],
         };
         let build = |alpn: Option<&[&str]>| {
-            let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
+            let rng = FixedRandom {
+                bytes: vec![0x42; 64],
+                pos: AtomicUsize::new(0),
+            };
             build_hello(
                 &spec,
                 &BuildParams {
@@ -618,7 +657,10 @@ mod tests {
             session_id: SessionIdSpec::Random32,
             extensions: vec![ExtensionSpec::SupportedGroups(vec![0x001D])],
         };
-        let rng = FixedRandom { bytes: vec![0x42; 64], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 64],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -647,7 +689,10 @@ mod tests {
     #[test]
     fn parse_roundtrip_of_built_hello() {
         let spec = crate::profiles::chrome::spec();
-        let rng = FixedRandom { bytes: vec![0x42; 128], pos: AtomicUsize::new(0) };
+        let rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
         let hello = build_hello(&spec, &params_fixed(&rng)).unwrap();
         let parsed = parse_hello(&hello.handshake_bytes).unwrap();
         assert_eq!(parsed.legacy_version, 0x0303);

@@ -84,7 +84,10 @@ pub fn make_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> 
 /// prefix. The `assert!` mirrors the reference: our headers are all short.
 fn hpack_string(buf: &mut Vec<u8>, s: &[u8]) {
     // H=0 (no Huffman), length as 7-bit integer (sufficient for our short strings)
-    assert!(s.len() < 128, "hpack_string: value too long for single-byte length");
+    assert!(
+        s.len() < 128,
+        "hpack_string: value too long for single-byte length"
+    );
     buf.push(u8::try_from(s.len()).expect("hpack length < 128 per the assert above"));
     buf.extend_from_slice(s);
 }
@@ -201,12 +204,14 @@ where
                 // The server's SETTINGS must be ACKed (RFC 7540 §6.5.3);
                 // an ACK of our own SETTINGS needs no reply.
                 if flags & FLAG_ACK == 0 {
-                    conn.write_all(&make_frame(FRAME_SETTINGS, FLAG_ACK, 0, &[])).await?;
+                    conn.write_all(&make_frame(FRAME_SETTINGS, FLAG_ACK, 0, &[]))
+                        .await?;
                 }
             }
             FRAME_PING if flags & FLAG_ACK == 0 => {
                 // Ping must be ACKed with identical payload (RFC 7540 §6.7)
-                conn.write_all(&make_frame(FRAME_PING, FLAG_ACK, 0, &payload)).await?;
+                conn.write_all(&make_frame(FRAME_PING, FLAG_ACK, 0, &payload))
+                    .await?;
             }
             FRAME_DATA if stream_id == 1 => {
                 // Handle optional PADDED flag (RFC 7540 §6.1): the pad
@@ -241,7 +246,9 @@ where
             }
             FRAME_RST_STREAM if stream_id == 1 => {
                 let code = u32::from_be_bytes(payload.try_into().unwrap_or([0; 4]));
-                return Err(TlsError::Protocol(format!("HTTP/2 RST_STREAM error_code={code}")));
+                return Err(TlsError::Protocol(format!(
+                    "HTTP/2 RST_STREAM error_code={code}"
+                )));
             }
             FRAME_GOAWAY => {
                 let code = if payload.len() >= 8 {
@@ -249,7 +256,9 @@ where
                 } else {
                     0
                 };
-                return Err(TlsError::Protocol(format!("HTTP/2 GOAWAY error_code={code}")));
+                return Err(TlsError::Protocol(format!(
+                    "HTTP/2 GOAWAY error_code={code}"
+                )));
             }
             _ => {
                 // WINDOW_UPDATE, PRIORITY, CONTINUATION, unknown — ignore

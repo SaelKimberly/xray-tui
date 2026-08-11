@@ -6,7 +6,10 @@
 
 use std::net::SocketAddr;
 
-use super::{Certs, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, StandardTls, TlsVariant, config};
+use super::{
+    Certs, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, StandardTls, TlsVariant,
+    config,
+};
 use crate::NativeConnectParams;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +122,9 @@ impl E2eCase for CaseSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::super::variant::{Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, RealityTls, StandardTls};
+    use super::super::variant::{
+        Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, RealityTls, StandardTls,
+    };
     use super::*;
 
     #[test]
@@ -134,9 +139,7 @@ mod tests {
             "vmess/tcp/tls/chacha20-poly1305"
         );
         assert_eq!(
-            CaseSpec::vless()
-                .with_tls(Box::new(StandardTls))
-                .label(),
+            CaseSpec::vless().with_tls(Box::new(StandardTls)).label(),
             "vless/tcp/tls-standard"
         );
         assert_eq!(

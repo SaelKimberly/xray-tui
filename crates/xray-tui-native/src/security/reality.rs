@@ -79,7 +79,7 @@ fn decode_sid(s: &str) -> Result<Vec<u8>, NativeError> {
         .collect()
 }
 
-/// The REALITY client handshake — the real `Task 14` implementation.
+/// The REALITY client handshake.
 ///
 /// Reads the REALITY opts from the link's security config; the SNI defaults
 /// to the endpoint host when the config carries none. The provisioner comes

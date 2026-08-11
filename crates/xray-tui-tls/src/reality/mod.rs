@@ -31,14 +31,14 @@ use std::ops::Range;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::SecureRandom;
 use crate::crypto::{AeadKey, KeySchedule, X25519KeyPair};
 use crate::error::{Result, TlsError};
-use crate::handshake::{make_hs_msg, read_server_hello, read_server_hs_messages, RingRng};
-use crate::hello::{build_hello, to_record, BuildParams};
+use crate::handshake::{RingRng, make_hs_msg, read_server_hello, read_server_hs_messages};
+use crate::hello::{BuildParams, build_hello, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
-use crate::record::{aead_aad, make_app_data_record, CONTENT_HANDSHAKE, HS_FINISHED};
+use crate::record::{CONTENT_HANDSHAKE, HS_FINISHED, aead_aad, make_app_data_record};
 use crate::spec::SessionIdSpec;
-use crate::SecureRandom;
 
 /// AEAD tag length for the TLS 1.3 AEADs in this engine (all 16 bytes).
 const AEAD_TAG_LEN: usize = 16;
@@ -199,13 +199,12 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .chain
         .first()
         .ok_or_else(|| TlsError::Verify("REALITY server sent no certificate".into()))?;
-    let mut transcript =
-        Vec::with_capacity(
-            hello.handshake_bytes.len()
-                + server_hello.raw.len()
-                + flight.ee_raw.len()
-                + flight.cert_raw.len(),
-        );
+    let mut transcript = Vec::with_capacity(
+        hello.handshake_bytes.len()
+            + server_hello.raw.len()
+            + flight.ee_raw.len()
+            + flight.cert_raw.len(),
+    );
     transcript.extend_from_slice(&hello.handshake_bytes);
     transcript.extend_from_slice(&server_hello.raw);
     transcript.extend_from_slice(&flight.ee_raw);
@@ -240,7 +239,9 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
     cf_inner.push(CONTENT_HANDSHAKE);
     let cf_ciphertext =
         client_hs_key.seal(0, &aead_aad(cf_inner.len() + AEAD_TAG_LEN), &cf_inner)?;
-    stream.write_all(&make_app_data_record(&cf_ciphertext)).await?;
+    stream
+        .write_all(&make_app_data_record(&cf_ciphertext))
+        .await?;
 
     // 13. Application traffic secrets over ClientHello..server Finished
     //     (the client Finished joins the transcript afterwards, matching
@@ -287,7 +288,10 @@ mod tests {
         let parsed = parse_hello(&hello.handshake_bytes).unwrap();
 
         // The AuthPayload slot is in the legacy session id, currently zeroed.
-        assert_eq!(&hello.handshake_bytes[hello.session_id_range.clone()], &[0u8; 32]);
+        assert_eq!(
+            &hello.handshake_bytes[hello.session_id_range.clone()],
+            &[0u8; 32]
+        );
         assert_eq!(parsed.session_id, vec![0u8; 32]);
 
         // Chrome-133 surface: TLS 1.3 suites, X25519 keyshare carrying the

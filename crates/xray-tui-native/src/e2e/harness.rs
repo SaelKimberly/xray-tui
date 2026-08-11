@@ -65,7 +65,9 @@ pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
     let server_cfg = Arc::new(tls_server_config(certs));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tls echo");
     let addr = listener.local_addr().expect("tls echo ip addr");
-    listener.set_nonblocking(true).expect("tls echo nonblocking");
+    listener
+        .set_nonblocking(true)
+        .expect("tls echo nonblocking");
     let listener = tokio::net::TcpListener::from_std(listener).expect("tls echo tokio");
     let handle = tokio::spawn(async move {
         loop {
@@ -115,7 +117,8 @@ fn tls_server_config(certs: &Certs) -> rustls::ServerConfig {
         .expect("tls echo server config builds")
 }
 
-const TLS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nhello native core";
+const TLS_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nhello native core";
 
 /// Return a port that was free at bind time.
 #[must_use]

@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn from_parsed_hello_extracts_fields() {
-        use crate::hello::parse::{parse_hello, ParsedClientHello};
+        use crate::hello::parse::{ParsedClientHello, parse_hello};
 
         // Hand-build a hello with supported_groups, ec_point_formats,
         // signature_algorithms and ALPN extensions so the From impl has
@@ -205,7 +205,9 @@ mod tests {
         // ALPN: ["h2", "http/1.1"]
         let mut alpn = Vec::new();
         alpn.extend_from_slice(&0x0010u16.to_be_bytes());
-        let entries = [2u8, b'h', b'2', 8u8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'];
+        let entries = [
+            2u8, b'h', b'2', 8u8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
+        ];
         let list_len = u16::try_from(entries.len()).expect("tiny list");
         alpn.extend_from_slice(&(2 + list_len).to_be_bytes());
         alpn.extend_from_slice(&list_len.to_be_bytes());

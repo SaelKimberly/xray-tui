@@ -21,11 +21,7 @@ impl hkdf::KeyType for ExpandLen {
 ///
 /// The protocol fixes `salt` = `ClientHello.Random[0..20]` and `info` =
 /// `b"REALITY"`; HKDF itself accepts any salt length.
-pub fn derive_auth_key(
-    shared_secret: &[u8; 32],
-    salt: &[u8],
-    info: &[u8],
-) -> Result<[u8; 32]> {
+pub fn derive_auth_key(shared_secret: &[u8; 32], salt: &[u8], info: &[u8]) -> Result<[u8; 32]> {
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt);
     let prk = salt.extract(shared_secret);
     let info_pieces = [info];
@@ -82,8 +78,9 @@ pub fn decrypt_session_id(
     let plaintext = key
         .open_in_place(nonce, Aad::from(aad), &mut in_out)
         .map_err(|_| {
-            TlsError::Crypto("REALITY session-id open failed — wrong auth_key or tampered hello"
-                .into())
+            TlsError::Crypto(
+                "REALITY session-id open failed — wrong auth_key or tampered hello".into(),
+            )
         })?;
     let mut result = [0u8; 16];
     result
@@ -141,11 +138,10 @@ mod tests {
     #[test]
     fn auth_key_derivation_matches_rfc7748_known_answer() {
         // RFC 7748 §6.1: Alice a → A, Bob b → B, shared K.
-        let shared: [u8; 32] = decode_hex(
-            "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
-        )
-        .try_into()
-        .unwrap();
+        let shared: [u8; 32] =
+            decode_hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+                .try_into()
+                .unwrap();
         let salt: [u8; 20] = (0..20u8).collect::<Vec<_>>().try_into().unwrap();
 
         let auth_key = derive_auth_key(&shared, &salt, b"REALITY").unwrap();
@@ -155,7 +151,10 @@ mod tests {
         );
 
         // Deterministic for identical inputs.
-        assert_eq!(derive_auth_key(&shared, &salt, b"REALITY").unwrap(), auth_key);
+        assert_eq!(
+            derive_auth_key(&shared, &salt, b"REALITY").unwrap(),
+            auth_key
+        );
         // A different salt (i.e. client random) must produce a different key.
         let other_salt = [0xAA; 20];
         assert_ne!(
