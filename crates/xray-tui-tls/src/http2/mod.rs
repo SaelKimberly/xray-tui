@@ -37,6 +37,15 @@ pub const FLAG_ACK: u8 = 0x01;
 // ── HTTP/2 client connection preface (RFC 7540 §3.5) ───────────────────────
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// Default maximum frame payload size (RFC 7540 §6.5.2). Frames larger than
+/// this must be rejected with a `FRAME_SIZE_ERROR`; we treat them as a
+/// protocol error (also bounds the per-frame allocation).
+const MAX_FRAME_SIZE: usize = 16_384;
+
+/// Cap on waiting for the response frames, so a stalling server fails the
+/// tier-2 gate instead of hanging forever.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 // ── Frame builder ───────────────────────────────────────────────────────────
 
 /// Serialize an HTTP/2 frame (9-byte header + payload, RFC 7540 §4.1).
@@ -121,6 +130,11 @@ where
     let mut hdr = [0u8; 9];
     conn.read_exact(&mut hdr).await?;
     let len = (usize::from(hdr[0]) << 16) | (usize::from(hdr[1]) << 8) | usize::from(hdr[2]);
+    if len > MAX_FRAME_SIZE {
+        return Err(TlsError::Protocol(format!(
+            "HTTP/2 frame length {len} exceeds default max frame size {MAX_FRAME_SIZE}"
+        )));
+    }
     let frame_type = hdr[3];
     let flags = hdr[4];
     let stream_id = u32::from_be_bytes([hdr[5] & 0x7F, hdr[6], hdr[7], hdr[8]]);
@@ -162,7 +176,22 @@ where
     ))
     .await?;
 
-    // 3. Receive frames until END_STREAM on stream 1
+    // 3. Receive frames until END_STREAM on stream 1, bounded so a
+    //    stalling server fails the gate instead of hanging forever.
+    let body = tokio::time::timeout(RESPONSE_TIMEOUT, receive_response(conn))
+        .await
+        .map_err(|_| TlsError::Protocol("HTTP/2 response timed out".to_string()))??;
+
+    String::from_utf8(body)
+        .map_err(|e| TlsError::Protocol(format!("HTTP/2 response body not UTF-8: {e}")))
+}
+
+/// Reads frames until `END_STREAM` on stream 1, acknowledging the server's
+/// `SETTINGS` and PINGs, and returns the accumulated response body.
+async fn receive_response<S>(conn: &mut TlsStream<S>) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut body: Vec<u8> = Vec::new();
     loop {
         let (ftype, flags, stream_id, payload) = read_frame(conn).await?;
@@ -180,11 +209,22 @@ where
                 conn.write_all(&make_frame(FRAME_PING, FLAG_ACK, 0, &payload)).await?;
             }
             FRAME_DATA if stream_id == 1 => {
-                // Handle optional PADDED flag
-                let data = if flags & 0x08 != 0 && !payload.is_empty() {
-                    let pad_len = usize::from(payload[0]);
-                    let end = payload.len().saturating_sub(pad_len);
-                    &payload[1..end]
+                // Handle optional PADDED flag (RFC 7540 §6.1): the pad
+                // length byte must not exceed the payload.
+                let data = if flags & 0x08 != 0 {
+                    let Some((&pad_len, rest)) = payload.split_first() else {
+                        return Err(TlsError::Protocol(
+                            "HTTP/2 PADDED DATA frame missing pad length".into(),
+                        ));
+                    };
+                    let pad_len = usize::from(pad_len);
+                    let Some(end) = rest.len().checked_sub(pad_len) else {
+                        return Err(TlsError::Protocol(format!(
+                            "HTTP/2 PADDED DATA pad length {pad_len} exceeds payload length {}",
+                            rest.len()
+                        )));
+                    };
+                    &rest[..end]
                 } else {
                     &payload[..]
                 };
@@ -216,7 +256,5 @@ where
             }
         }
     }
-
-    String::from_utf8(body)
-        .map_err(|e| TlsError::Protocol(format!("HTTP/2 response body not UTF-8: {e}")))
+    Ok(body)
 }

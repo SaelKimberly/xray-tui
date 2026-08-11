@@ -92,7 +92,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Parses `--profile <name>` (repeatable); defaults to both profiles.
+/// Profiles the grader can grade (all others are rejected at the CLI).
+const GRADED_PROFILES: &[BrowserProfile] =
+    &[BrowserProfile::Chrome130, BrowserProfile::Firefox128Esr];
+
+/// Parses `--profile <name>` (repeatable); defaults to both graded
+/// profiles. Only [`GRADED_PROFILES`] are accepted — any other profile
+/// name is a CLI error (`grade()` cannot handle it).
 fn parse_args() -> Vec<BrowserProfile> {
     let mut args = std::env::args().skip(1);
     let mut selected = Vec::new();
@@ -105,25 +111,21 @@ fn parse_args() -> Vec<BrowserProfile> {
             eprintln!("--profile requires a value");
             std::process::exit(2);
         });
-        let profile = BrowserProfile::all()
-            .iter()
-            .copied()
-            .find(|p| p.name() == name)
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "unknown profile {name:?}; known: {}",
-                    BrowserProfile::all()
-                        .iter()
-                        .map(|p| p.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                std::process::exit(2);
-            });
+        let profile = GRADED_PROFILES.iter().copied().find(|p| p.name() == name).unwrap_or_else(|| {
+            eprintln!(
+                "unknown or unsupported profile {name:?}; grader supports: {}",
+                GRADED_PROFILES
+                    .iter()
+                    .map(|p| p.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            std::process::exit(2);
+        });
         selected.push(profile);
     }
     if selected.is_empty() {
-        vec![BrowserProfile::Chrome130, BrowserProfile::Firefox128Esr]
+        GRADED_PROFILES.to_vec()
     } else {
         selected
     }
@@ -186,7 +188,10 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
     let akamai = json["http2"]["akamai_fingerprint_hash"].as_str().unwrap_or("");
 
     println!("TLS version : {tls_version}");
-    println!("Negotiated  : {cipher}");
+    // `tls.ciphers` is the server's echo of the *offered* cipher list, so
+    // the first entry is the first offered cipher (GREASE for Chrome), not
+    // the negotiated suite.
+    println!("First cipher: {cipher}");
     println!("JA3 hash    : {server_ja3_hash}");
     println!("JA3 string  : {server_ja3}");
     println!("JA4         : {server_ja4}");
