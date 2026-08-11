@@ -849,7 +849,7 @@ impl BrowserProfile {
 
 The macro (adapted from `wreq-util/src/emulate.rs` `define_enum!`): variant list, then `Variant => ("name", path::spec)` pairs; generates the enum, `name()`, `spec()`, `all()`.
 
-- [ ] **Step 1: Write the failing test** — every profile builds + parses; JA3/JA4 stable under fixed seed; macro dispatch names:
+- [ ] **Step 1: Write the failing test** — every profile builds + parses; Firefox128ESR fidelity via byte-identity golden against the reference crate (NOT a JA3-hash comparison — the offline JA3 formula diverges from tls.peet.ws's; JA3-vs-tls.peet.ws is Task 12's job):
 
 ```rust
 #[test]
@@ -875,11 +875,19 @@ fn all_profiles_build_and_parse() {
 }
 
 #[test]
-fn firefox128esr_ja3_matches_reference() {
+fn firefox128esr_golden_hello_with_fixed_seed() {
+    // Capture the reference crate's Firefox128ESR build with a fixed-seed
+    // RNG (all 0x42) + fixed x25519 pub [0xAB; 32] in /tmp/tf and lock the
+    // hex of ch.build() here. The ported spec must reproduce it byte-for-byte.
     let spec = BrowserProfile::Firefox128Esr.spec();
-    let hello = build_hello(&spec, &BuildParams { /* fixed seed */ }).unwrap();
-    let fields = Ja3Fields::from(&parse_hello(&hello.handshake_bytes).unwrap());
-    assert_eq!(ja3_hash(&fields), "361e0ca6ef1ca4dbe3a1d987722a1980");
+    let rng = FixedRandom { bytes: vec![0x42; 128], pos: 0 };
+    let hello = build_hello(&spec, &BuildParams {
+        server_name: "tls.peet.ws",
+        alpn: None,
+        x25519_pub: &[0xAB; 32],
+        rng: &rng,
+    }).unwrap();
+    assert_eq!(hex::encode(&hello.handshake_bytes), EXPECTED_FF128_HELLO_HEX);
 }
 ```
 
