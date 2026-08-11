@@ -50,6 +50,73 @@ pub fn spawn_echo() -> EchoServer {
     }
 }
 
+/// A TLS HTTP responder on 127.0.0.1:ephemeral serving the fixed body.
+///
+/// REALITY inbounds need this as their `dest`/`handshake` fallback: the
+/// xtls/reality server borrows the dest's TLS 1.3 `ServerHello` flight for its
+/// own handshake, so a plain-HTTP echo cannot satisfy it (the server's
+/// fallback detection waits for `recordTypeHandshake | typeServerHello` from
+/// the dest). Uses the harness certs so the borrowed handshake completes.
+#[must_use]
+pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
+    // Workspace convention: ring is the single crypto provider (the app
+    // installs it at startup; tests install here, idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server_cfg = Arc::new(tls_server_config(certs));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tls echo");
+    let addr = listener.local_addr().expect("tls echo ip addr");
+    listener.set_nonblocking(true).expect("tls echo nonblocking");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("tls echo tokio");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            let cfg = server_cfg.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                let Ok(mut tls) = acceptor.accept(sock).await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
+                let _ = tls.write_all(TLS_RESPONSE).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    TlsEchoServer { addr, handle }
+}
+
+pub struct TlsEchoServer {
+    pub addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TlsEchoServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Build a rustls server config from the harness cert/key PEMs (TLS 1.3).
+fn tls_server_config(certs: &Certs) -> rustls::ServerConfig {
+    use rustls::pki_types::pem::PemObject;
+    let cert_der: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(certs.cert_pem.as_bytes())
+            .map(|c| c.expect("cert pem parses"))
+            .collect();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(certs.key_pem.as_bytes())
+        .expect("key pem parses");
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_der, key)
+        .expect("tls echo server config builds")
+}
+
+const TLS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nhello native core";
+
 /// Return a port that was free at bind time.
 #[must_use]
 pub fn free_port() -> u16 {
@@ -140,7 +207,10 @@ pub fn generate_certs() -> Certs {
 /// e2e tests retry the whole connection on such outcomes.
 pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    const STEP: Duration = Duration::from_secs(5);
+    // REALITY inbounds delay the first app-data exchange ~5s while the
+    // server's post-handshake record detector completes — the window must
+    // cover that plus a slow echo.
+    const STEP: Duration = Duration::from_secs(15);
     let write = tokio::time::timeout(STEP, tunnel.write_all(GET)).await;
     if write.is_err() {
         return (0, String::new());

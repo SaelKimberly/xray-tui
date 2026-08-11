@@ -82,23 +82,15 @@ pub fn spec() -> ClientHelloSpec {
             // ALPS "new" (0x446D): ALPN-style u8 per-entry lengths, unlike
             // the 0x4469 draft form. Static body: list_len 0003, "h2".
             ExtensionSpec::Raw { ty: 0x446D, data: vec![0x00, 0x03, 0x02, 0x68, 0x32] },
-            // GREASE ECH (BoringSSL default scheme): uTLS randomizes the
-            // ECH-outer body per connection; this pins a minimal valid
-            // ECH-outer (type 0, HKDF-SHA256/AES-128-GCM, empty encap and
-            // payload). The extension TYPE is what JA3/JA4 observe.
-            ExtensionSpec::Raw {
-                ty: 0xFE0D,
-                data: vec![
-                    0x00, // OuterClientHello
-                    0x00, 0x01, // kdf_id: HKDF-SHA256
-                    0x00, 0x01, // aead_id: AES-128-GCM
-                    0x00, // config_id
-                    0x00, 0x00, // encap_key_len: 0
-                    0x00, 0x00, // payload_len: 0
-                ],
-            },
+            // Note: uTLS's Chrome 133 also carries a GREASE ECH (0xFE0D)
+            // outer extension. This crate cannot emit a *valid* ECH outer
+            // (no HPKE key agreement), and rustls 0.23 rejects even a
+            // well-shaped empty ECH outer with alert decode_error — which
+            // breaks the REALITY dest handshake (xtls/reality borrows the
+            // dest's ServerHello flight). The extension type is not part of
+            // JA3, so it is omitted here.
             // Second standalone GREASE extension (Chrome 133 sends two; the
-            // builder renders both with the same GREASE value).
+            // builder renders each with a distinct GREASE value).
             ExtensionSpec::Grease,
         ],
     }

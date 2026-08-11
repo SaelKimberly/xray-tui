@@ -46,9 +46,11 @@ const PADDING_TARGET: usize = 512;
 pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<BuiltHello, TlsError> {
     // GREASE pairing (Chrome family): the first placeholder in each of
     // {cipher_suites, supported_groups, supported_versions, key_share} is
-    // replaced with `grease_a`; the standalone GREASE extension uses
-    // `grease_b`. Additional placeholders get fresh values. Specs without
-    // placeholders (Firefox family) skip the draws entirely.
+    // replaced with `grease_a`; the first standalone GREASE extension uses
+    // `grease_b`, and each further GREASE extension slot draws a fresh
+    // value (distinct per slot — Go's TLS parser rejects duplicate
+    // extension types). Additional placeholders get fresh values. Specs
+    // without placeholders (Firefox family) skip the draws entirely.
     let (grease_a, grease_b) = if spec_has_grease(spec) {
         (draw_grease(params.rng)?, draw_grease(params.rng)?)
     } else {
@@ -130,6 +132,7 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
 
     // Extensions in spec order.
     let mut ext_bytes = Vec::with_capacity(spec.extensions.len() * 8);
+    let mut first_grease_ext = true;
     for ext in &spec.extensions {
         match ext {
             ExtensionSpec::Alpn(_) => {
@@ -140,6 +143,24 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                     }
                     None => ext.encode_body(&rt)?,
                 };
+                ext_bytes.extend_from_slice(&encoded);
+            }
+            ExtensionSpec::Grease => {
+                // Standalone GREASE extensions must carry DISTINCT values:
+                // real browsers draw each slot independently, and Go's TLS
+                // parser rejects a ClientHello with duplicate extension
+                // types (Chrome 133 carries two — see
+                // `profiles/chrome133.rs`). The first slot uses `grease_b`;
+                // later slots draw fresh values.
+                let value = if first_grease_ext {
+                    first_grease_ext = false;
+                    rt.grease_b
+                } else {
+                    draw_grease(params.rng)?
+                };
+                let mut encoded = Vec::with_capacity(5);
+                encoded.extend_from_slice(&value.to_be_bytes());
+                encoded.extend_from_slice(&[0x00, 0x01, 0x00]); // len 1, body [0x00]
                 ext_bytes.extend_from_slice(&encoded);
             }
             ExtensionSpec::SupportedGroups(groups) => {

@@ -93,7 +93,16 @@ mod tests {
         })))
     }
 
+    /// A 32-byte static public key (0xAA×32) so configs reach the handshake.
+    const VALID_PBK: &str = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo";
+
     fn vless_with_reality() -> ProtocolConfig {
+        vless_with_security(Some(&serde_json::json!({
+            "type": "reality", "sni": "example.com", "pbk": VALID_PBK, "sid": "0011223344556677"
+        })))
+    }
+
+    fn vless_with_reality_short_pbk() -> ProtocolConfig {
         vless_with_security(Some(&serde_json::json!({
             "type": "reality", "sni": "example.com", "pbk": "Zm9vYmFy"
         })))
@@ -241,10 +250,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reality_security_is_not_implemented() {
+    async fn reality_connect_rejects_short_pbk() {
+        // A `pbk` that decodes to ≠32 bytes is a config error, not a hang.
+        let ctx = ctx_for(vless_with_reality_short_pbk());
+        let (a, _) = tokio::io::duplex(64);
+        let out = wrap(&ctx, Box::new(a)).await;
+        assert!(matches!(out, Err(NativeError::Reality(_))));
+    }
+
+    #[tokio::test]
+    async fn reality_handshake_errors_are_reality_errors_not_not_implemented() {
+        // The arm is real: a valid config over a stream that yields EOF
+        // surfaces a handshake error — the `NotImplemented` stub is gone.
         let ctx = ctx_for(vless_with_reality());
         let (a, _) = tokio::io::duplex(64);
         let out = wrap(&ctx, Box::new(a)).await;
-        assert!(matches!(out, Err(NativeError::NotImplemented { .. })));
+        assert!(out.is_err(), "duplex EOF must fail the handshake");
+        assert!(
+            !matches!(out, Err(NativeError::NotImplemented { .. })),
+            "reality must not be NotImplemented"
+        );
     }
 }

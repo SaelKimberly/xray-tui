@@ -6,9 +6,8 @@
 
 use std::net::SocketAddr;
 
-use super::{Certs, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, config};
+use super::{Certs, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, StandardTls, TlsVariant, config};
 use crate::NativeConnectParams;
-use crate::security;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
@@ -20,9 +19,12 @@ pub enum ProtocolKind {
 ///
 /// Construct via [`CaseSpec::vless`] / [`CaseSpec::vmess`]; `protocol` and
 /// `security` are private invariants (a vmess case always carries a variant).
+/// `tls` defaults to [`StandardTls`]; add fingerprint/REALITY variants with
+/// [`CaseSpec::with_tls`].
 pub struct CaseSpec {
     protocol: ProtocolKind,
     security: Option<Box<dyn SecurityVariant>>,
+    tls: Option<Box<dyn TlsVariant>>,
 }
 
 impl CaseSpec {
@@ -31,6 +33,7 @@ impl CaseSpec {
         Self {
             protocol: ProtocolKind::Vless,
             security: None,
+            tls: None,
         }
     }
 
@@ -39,7 +42,20 @@ impl CaseSpec {
         Self {
             protocol: ProtocolKind::Vmess,
             security: Some(Box::new(variant)),
+            tls: None,
         }
+    }
+
+    /// Select the TLS transport variant (fingerprint engine or REALITY).
+    #[must_use]
+    pub fn with_tls(mut self, tls: Box<dyn TlsVariant>) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// The TLS variant, defaulting to stock rustls.
+    fn tls(&self) -> &dyn TlsVariant {
+        self.tls.as_deref().unwrap_or(&StandardTls)
     }
 
     /// Cores this case runs against (variant gate; no security → both).
@@ -53,33 +69,38 @@ impl CaseSpec {
 
 impl E2eCase for CaseSpec {
     fn label(&self) -> String {
-        match (self.protocol, self.security.as_deref()) {
-            (ProtocolKind::Vless, _) => "vless/tcp/tls".to_string(),
-            (ProtocolKind::Vmess, Some(s)) => format!("vmess/tcp/tls/{}", s.name()),
-            (ProtocolKind::Vmess, None) => "vmess/tcp/tls".to_string(),
-        }
+        let proto = match self.protocol {
+            ProtocolKind::Vless => "vless",
+            ProtocolKind::Vmess => "vmess",
+        };
+        let tls = self.tls.as_deref().map_or("tls", TlsVariant::name);
+        let sec = self
+            .security
+            .as_ref()
+            .map_or(String::new(), |s| format!("/{}", s.name()));
+        format!("{proto}/tcp/{tls}{sec}")
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
         match self.protocol {
-            ProtocolKind::Vless => config::vless_inbound(core, env),
+            ProtocolKind::Vless => config::vless_inbound(core, env, self.tls()),
             ProtocolKind::Vmess => {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
-                config::vmess_inbound(core, env, security)
+                config::vmess_inbound(core, env, security, self.tls())
             }
         }
     }
 
     fn client_params(&self, port: u16, target: SocketAddr) -> NativeConnectParams {
         match self.protocol {
-            ProtocolKind::Vless => config::client_params_vless(port, target),
+            ProtocolKind::Vless => config::client_params_vless(port, target, self.tls()),
             ProtocolKind::Vmess => {
                 let enc = self
                     .security
                     .as_ref()
                     .expect("vmess case requires a security variant")
                     .client_security();
-                config::client_params_vmess(enc, port, target)
+                config::client_params_vmess(enc, port, target, self.tls())
             }
         }
     }
@@ -92,14 +113,13 @@ impl E2eCase for CaseSpec {
     }
 
     fn client_trust(&self, certs: &Certs) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        security::tls::set_test_config(security::tls::test_client_config(&certs.ca_der));
+        self.tls().client_trust(certs);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::variant::{Aes128GcmVariant, Chacha20Poly1305Variant};
+    use super::super::variant::{Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, RealityTls, StandardTls};
     use super::*;
 
     #[test]
@@ -112,6 +132,24 @@ mod tests {
         assert_eq!(
             CaseSpec::vmess(Chacha20Poly1305Variant).label(),
             "vmess/tcp/tls/chacha20-poly1305"
+        );
+        assert_eq!(
+            CaseSpec::vless()
+                .with_tls(Box::new(StandardTls))
+                .label(),
+            "vless/tcp/tls-standard"
+        );
+        assert_eq!(
+            CaseSpec::vless()
+                .with_tls(Box::new(FingerprintTls("chrome")))
+                .label(),
+            "vless/tcp/tls-chrome"
+        );
+        assert_eq!(
+            CaseSpec::vmess(Aes128GcmVariant)
+                .with_tls(Box::new(RealityTls::fresh()))
+                .label(),
+            "vmess/tcp/reality/aes-128-gcm"
         );
     }
 

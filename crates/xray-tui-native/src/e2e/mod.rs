@@ -15,8 +15,14 @@ use std::path::Path;
 
 pub use case::{CaseSpec, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
-pub use harness::{Certs, EchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo};
-pub use variant::{Aes128GcmVariant, Chacha20Poly1305Variant, SecurityVariant};
+pub use harness::{
+    Certs, EchoServer, TlsEchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo,
+    spawn_tls_echo,
+};
+pub use variant::{
+    Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, RealityTls, SecurityVariant,
+    StandardTls, TlsVariant,
+};
 
 use crate::NativeConnectParams;
 
@@ -30,6 +36,13 @@ pub struct ServerEnv<'a> {
     pub port: u16,
     pub certs: &'a Certs,
     pub tmp: &'a Path,
+    /// The local echo HTTP server (the probe's destination through the
+    /// tunnel).
+    pub echo: SocketAddr,
+    /// The local TLS HTTP server: REALITY inbounds point their
+    /// `dest`/`handshake` fallback here (xtls/reality borrows the dest's
+    /// TLS `ServerHello` flight, so the fallback must be a real TLS server).
+    pub tls_echo: SocketAddr,
 }
 
 /// Expected probe outcome for an [`E2eCase`].
@@ -63,6 +76,7 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
     let expect = case.expected();
     let echo = spawn_echo();
     let certs = generate_certs();
+    let tls_echo = spawn_tls_echo(&certs);
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let cert_path = dir.path().join("server.crt");
     let key_path = dir.path().join("server.key");
@@ -76,6 +90,8 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
             port,
             certs: &certs,
             tmp: dir.path(),
+            echo: echo.addr,
+            tls_echo: tls_echo.addr,
         };
         let config_json = case.server_config(core.kind, &env);
         if std::fs::write(&config_path, &config_json).is_err() {

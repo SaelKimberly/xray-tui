@@ -10,15 +10,13 @@
 
 pub mod fingerprint;
 
-use core::cell::Cell;
-
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey},
-    agreement::{self, EphemeralPrivateKey, UnparsedPublicKey},
     digest,
     hkdf::{self, Prk},
     hmac,
 };
+use x25519_dalek::StaticSecret;
 
 use crate::error::{Result, TlsError};
 
@@ -115,28 +113,39 @@ impl CipherSuiteId {
 
 /// An ephemeral X25519 key pair.
 ///
-/// The private half is consumed by [`agree`](Self::agree) — like
-/// aws-lc-rs's, ring's `EphemeralPrivateKey` is not `Clone`, so agreement is
-/// single-use; the interior `Cell` keeps the public methods on `&self`.
+/// The private half lives in `x25519-dalek` (`StaticSecret`): ring 0.17's
+/// `EphemeralPrivateKey` is single-use (agreement consumes it) and cannot be
+/// serialized, but REALITY must agree **twice** with the same scalar — once
+/// with the server's static `pbk` for the auth key, once with the server's
+/// ephemeral keyshare for the TLS 1.3 key schedule (xtls/reality 2025-10+
+/// no longer uses the static key as the TLS keyshare). Agreement is
+/// therefore repeatable.
 pub struct X25519KeyPair {
-    private: Cell<Option<EphemeralPrivateKey>>,
+    private: StaticSecret,
     public_key: [u8; 32],
 }
 
 impl X25519KeyPair {
     /// Generates a fresh key pair using `rng`.
     pub fn generate(rng: &dyn ring::rand::SecureRandom) -> Result<Self> {
-        let private = EphemeralPrivateKey::generate(&agreement::X25519, rng)
-            .map_err(|_| TlsError::Crypto("X25519 key generation failed".into()))?;
-        let public = private
-            .compute_public_key()
-            .map_err(|_| TlsError::Crypto("X25519 public key computation failed".into()))?;
+        let mut seed = [0u8; 32];
+        rng.fill(&mut seed)
+            .map_err(|_| TlsError::Crypto("X25519 seed generation failed".into()))?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// Builds a key pair from a raw 32-byte private seed (RFC 7748 vectors,
+    /// deterministic tests). The seed is clamped at use, like both cores.
+    #[must_use]
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let private = StaticSecret::from(seed);
+        let public = x25519_dalek::PublicKey::from(&private);
         let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(public.as_ref());
-        Ok(Self {
-            private: Cell::new(Some(private)),
+        public_key.copy_from_slice(public.as_bytes());
+        Self {
+            private,
             public_key,
-        })
+        }
     }
 
     /// The 32-byte X25519 public key.
@@ -145,25 +154,14 @@ impl X25519KeyPair {
         self.public_key
     }
 
-    /// Computes the 32-byte ECDHE shared secret with `peer`.
-    ///
-    /// Consumes the private half; a second call returns an error.
+    /// Computes the 32-byte ECDHE shared secret with `peer`. Repeatable —
+    /// REALITY agrees with the static `pbk` and the server keyshare.
     pub fn agree(&self, peer: &[u8; 32]) -> Result<[u8; 32]> {
-        let private = self
-            .private
-            .take()
-            .ok_or_else(|| TlsError::Crypto("X25519KeyPair already consumed".into()))?;
-        let peer = UnparsedPublicKey::new(&agreement::X25519, peer);
-        let shared = agreement::agree_ephemeral(private, &peer, |s: &[u8]| {
-            if s.len() != 32 {
-                return Err(TlsError::Crypto("X25519 shared secret is not 32 bytes".into()));
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(s);
-            Ok(out)
-        })
-        .map_err(|_| TlsError::Crypto("X25519 key agreement failed".into()))??;
-        Ok(shared)
+        let peer = x25519_dalek::PublicKey::from(*peer);
+        let shared = self.private.diffie_hellman(&peer);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(shared.as_bytes());
+        Ok(out)
     }
 }
 
@@ -727,13 +725,51 @@ mod tests {
         assert_eq!(a.public_key().len(), 32);
     }
 
-    /// Agreement consumes the private half exactly once.
+    /// Agreement is repeatable: REALITY agrees with the static pbk AND the
+    /// server's ephemeral keyshare from the same pair.
     #[test]
-    fn x25519_agree_is_single_use() {
+    fn x25519_agree_is_repeatable() {
         let a = X25519KeyPair::generate(&ring::rand::SystemRandom::new()).unwrap();
         let b = X25519KeyPair::generate(&ring::rand::SystemRandom::new()).unwrap();
-        let _ = a.agree(&b.public_key()).unwrap();
-        assert!(a.agree(&b.public_key()).is_err());
+        let c = X25519KeyPair::generate(&ring::rand::SystemRandom::new()).unwrap();
+        let ab = a.agree(&b.public_key()).unwrap();
+        let ac = a.agree(&c.public_key()).unwrap();
+        assert_eq!(a.agree(&b.public_key()).unwrap(), ab);
+        assert_ne!(ab, ac);
+    }
+
+    /// RFC 7748 §6.1: the fixed Alice scalar derives Bob's known shared
+    /// secret (ring cannot push raw scalars; x25519-dalek can).
+    #[test]
+    fn x25519_rfc7748_alice_vector() {
+        let alice_seed: [u8; 32] = [
+            0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+            0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+            0x1d, 0xb9, 0x2c, 0x2a,
+        ];
+        let bob_pub: [u8; 32] = [
+            0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4,
+            0x35, 0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14,
+            0x6f, 0x88, 0x2b, 0x4f,
+        ];
+        let alice = X25519KeyPair::from_seed(alice_seed);
+        assert_eq!(
+            alice.public_key().to_vec(),
+            vec![
+                0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54, 0x74, 0x8b, 0x7d, 0xdc, 0xb4,
+                0x3e, 0xf7, 0x5a, 0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4, 0xeb, 0xa4,
+                0xa9, 0x8e, 0xaa, 0x9b, 0x4e, 0x6a,
+            ]
+        );
+        let shared = alice.agree(&bob_pub).unwrap();
+        assert_eq!(
+            shared.to_vec(),
+            vec![
+                0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80,
+                0x35, 0x0f, 0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0,
+                0x9b, 0x3c, 0x1e, 0x16, 0x17, 0x42,
+            ]
+        );
     }
 
     /// Cipher-suite wire mapping and lengths.

@@ -1,13 +1,15 @@
 //! REALITY protocol module: fingerprint-shaped `ClientHello` provisioning,
 //! the ring port of the shoes REALITY client, and the 9-step wire contract.
 //!
-//! Wire contract (modeled on `shoes/src/reality/`, MIT):
+//! Wire contract (modeled on `shoes/src/reality/`, MIT; adapted to
+//! xtls/reality 2025-10+ keyshare semantics):
 //! 1. X25519 keypair; the `ClientHello.random` (32 B) is the protocol
 //!    random — `[0..20]` is the HKDF salt, `[20..32]` the AES-GCM nonce.
-//! 2. `shared` = `ECDH(client_priv`, `server_pub` from `pbk`); the REALITY
-//!    server's `ServerHello` keyshare *is* its static key, so this one
-//!    shared secret drives both the `auth_key` and the TLS 1.3 key schedule.
-//! 3. `auth_key` = HKDF-SHA256(shared, salt = random[0..20], info b"REALITY").
+//! 2. `auth_shared` = `ECDH(client_priv`, `server_pub` from `pbk`) — the
+//!    REALITY auth key. Since 2025-10 the server's TLS keyshare is a fresh
+//!    *ephemeral* key (the static key authenticates only), so the TLS 1.3
+//!    key schedule uses `ECDH(client_priv`, `server_keyshare`) instead.
+//! 3. `auth_key` = HKDF-SHA256(auth_shared, salt = random[0..20], info b"REALITY").
 //! 4. `SessionId` plaintext 16 B = version(1,8,0) + pad(1) + timestamp u32
 //!    BE + `short_id` (≤8 bytes, zero-padded).
 //! 5. `ClientHello`: Chrome-133 fingerprint, SNI steal target, X25519
@@ -154,12 +156,12 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let timestamp = messages::now_timestamp()?;
     let plaintext = messages::build_session_id_plaintext(timestamp, params.short_id)?;
 
-    // 4. ECDH with the server's static public key. The REALITY server's
-    //    ServerHello keyshare is its static key (sing-box sets the TLS
-    //    private key to the REALITY key), so this one shared secret drives
-    //    both the auth_key and the TLS 1.3 key schedule.
-    let shared = keypair.agree(params.public_key)?;
-    let auth_key = auth::derive_auth_key(&shared, &client_random[..20], b"REALITY")?;
+    // 4. ECDH with the server's static public key → the REALITY auth key.
+    //    (The TLS 1.3 key schedule below uses the server's *ephemeral*
+    //    keyshare instead — xtls/reality 2025-10+ no longer reuses the
+    //    static key as the TLS keyshare.)
+    let auth_shared = keypair.agree(params.public_key)?;
+    let auth_key = auth::derive_auth_key(&auth_shared, &client_random[..20], b"REALITY")?;
 
     // 5. Seal the SessionId (AAD = the hello with the slot zeroed, i.e. the
     //    provisioned bytes) and splice it into the builder-returned range.
@@ -169,19 +171,20 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream.write_all(&to_record(&hello.handshake_bytes)).await?;
 
     // 7. ServerHello (middlebox CCS skipped; HRR rejected by the parser).
+    //    Its keyshare is the server's *ephemeral* TLS key (not the static
+    //    `pbk`), so no static-key comparison is performed.
     let server_hello = read_server_hello(&mut stream).await?;
-    if server_hello.peer_key != *params.public_key {
-        return Err(TlsError::Handshake(
-            "REALITY server key_share does not match the configured public key".into(),
-        ));
-    }
 
-    // 8. Handshake traffic secrets under the selected suite; the transcript
+    // 8. TLS 1.3 ECDHE with the server's keyshare: the same ephemeral
+    //    scalar drives both the auth key (step 4) and this shared secret.
+    let tls_shared = keypair.agree(&server_hello.peer_key)?;
+
+    // 9. Handshake traffic secrets under the selected suite; the transcript
     //    is the wire ClientHello (sealed session id) || ServerHello.
     let mut ks = KeySchedule::new(server_hello.suite);
     ks.add_transcript(&hello.handshake_bytes);
     ks.add_transcript(&server_hello.raw);
-    let hs_secret = ks.handshake_secret(&shared)?;
+    let hs_secret = ks.handshake_secret(&tls_shared)?;
     let (client_hs_ts, server_hs_ts) = ks.handshake_traffic_secrets(&hs_secret)?;
     let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts)?;
     let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts)?;

@@ -2,7 +2,8 @@
 #![cfg(feature = "native-e2e")]
 
 use xray_tui_native::e2e::{
-    Aes128GcmVariant, CaseSpec, Chacha20Poly1305Variant, run_against_cores,
+    Aes128GcmVariant, CaseSpec, Chacha20Poly1305Variant, FingerprintTls, RealityTls,
+    run_against_cores,
 };
 
 #[tokio::test]
@@ -17,4 +18,20 @@ async fn vmess_tcp_tls_chacha20poly1305_against_cores() {
     run_against_cores(&CaseSpec::vmess(Chacha20Poly1305Variant))
         .await
         .expect("vmess/chacha20-poly1305 e2e failed");
+}
+
+#[tokio::test]
+async fn vmess_tls_firefox_against_cores() {
+    run_against_cores(
+        &CaseSpec::vmess(Aes128GcmVariant).with_tls(Box::new(FingerprintTls("firefox"))),
+    )
+    .await
+    .expect("vmess tls firefox e2e failed");
+}
+
+#[tokio::test]
+async fn vmess_reality_against_cores() {
+    run_against_cores(&CaseSpec::vmess(Aes128GcmVariant).with_tls(Box::new(RealityTls::fresh())))
+        .await
+        .expect("vmess reality e2e failed");
 }

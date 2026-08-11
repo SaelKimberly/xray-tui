@@ -5,6 +5,7 @@ use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsC
 
 use crate::addr::Host;
 use crate::error::{NativeError, timeouts};
+use crate::security::reality::HelloProvisionerChoice;
 use crate::security::tls_provider::TlsProvider;
 
 /// Per-connect parameters: the typed proto config plus the dial address.
@@ -23,6 +24,10 @@ pub struct NativeConnectParams {
     /// (rustls); `wrap()` still routes to the fingerprint engine when the
     /// config carries an `fp` value.
     pub tls_provider: TlsProvider,
+    /// REALITY provisioner for the security phase: which fingerprint shapes
+    /// the `ClientHello`. Defaults to
+    /// [`HelloProvisionerChoice::FixedChrome133`].
+    pub reality_provisioner: HelloProvisionerChoice,
 }
 
 impl NativeConnectParams {
@@ -38,6 +43,7 @@ impl NativeConnectParams {
             target,
             resolved_ip: None,
             tls_provider: TlsProvider::Standard,
+            reality_provisioner: HelloProvisionerChoice::FixedChrome133,
         }
     }
 }
@@ -124,7 +130,9 @@ impl LinkContext {
             Some(SecurityConfig {
                 tls: Some(TlsConfig::Reality(_)),
                 ..
-            }) => Err(NativeError::Reality("reality not implemented yet".into())),
+            }) => Err(NativeError::Reality(
+                "plain-TLS opts requested for a REALITY config".into(),
+            )),
             _ => Ok(None),
         }
     }

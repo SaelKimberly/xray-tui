@@ -31,6 +31,14 @@ md-5 = "0.10"
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
 ring = "0.17"
 
+# X25519 keypair generation for REALITY e2e configs (feature `native-e2e`
+# only): ring 0.17 cannot serialize the private half of a generated
+# `EphemeralPrivateKey` (its `bytes()` is test-gated), and the server inbound
+# needs the raw private key — x25519-dalek derives the public half from
+# arbitrary 32-byte seeds. The runtime tunnel never needs keygen: the client
+# only ECDHs with the server's `pbk`.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
+
 # errors
 thiserror.workspace = true
 
@@ -50,7 +58,7 @@ tiny_http = { version = "0.12", optional = true }
 workspace = true
 
 [features]
-native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http"]
+native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
