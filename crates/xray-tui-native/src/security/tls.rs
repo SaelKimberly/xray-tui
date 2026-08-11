@@ -1,9 +1,17 @@
 //! Standard TLS: rustls 0.23 (ring backend) via tokio-rustls.
 //!
 //! This is the `TlsProvider::Standard` path. It cannot emit a mimicked
-//! `ClientHello` (rustls has no modification API); a fingerprinted hello comes
-//! from a `TlsProvider::Custom` engine (M2). Certificate validation is always
-//! on — no skip-verify anywhere in the native core.
+//! `ClientHello` (rustls has no modification API); a fingerprinted hello
+//! comes from the `TlsProvider::Custom` engine in
+//! [`crate::security::fingerprint`], dispatched by `wrap()`. Certificate
+//! validation is always on in the standard path — no skip-verify anywhere in
+//! the native core (the fingerprint engine reads `allowInsecure`/`pinSHA256`
+//! from the TLS opts instead).
+//!
+//! The `TEST_CFG` thread-local below is the model for the fingerprint
+//! engine's own harness override (`fingerprint::TEST_CA`): each
+//! `#[tokio::test]` runs on its own OS thread with its own harness CA, so
+//! parallel e2e cases can't clobber each other's trust store.
 
 use std::sync::Arc;
 

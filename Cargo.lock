@@ -7488,6 +7488,7 @@ version = "0.1.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
+ "base64",
  "chacha20poly1305",
  "crc32fast",
  "hmac 0.12.1",
@@ -7505,6 +7506,7 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "xray-tui-proto",
+ "xray-tui-tls",
 ]
 
 [[package]]

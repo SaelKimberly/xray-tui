@@ -5,12 +5,10 @@
 //! Salamander) is implemented here but consumed inside the QUIC transport's
 //! packet handling — it is never forced into the byte-stream seam.
 //!
-//! Current state: JA3/JA4 fingerprint encoders are implemented (tier-1
-//! fingerprint tripwire). Everything else is a documented skeleton waiting
-//! for its protocol milestone (M2+).
+//! JA3/JA4 fingerprint codecs moved to `xray-tui-tls::crypto::fingerprint`
+//! with the fingerprint engine milestone; the `VMess` wire crypto lives here.
 
 pub mod aead;
-pub mod fingerprint;
 pub mod kdf;
 pub mod legacy_stream;
 pub mod salamander;

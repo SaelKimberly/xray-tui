@@ -5,6 +5,7 @@ use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsC
 
 use crate::addr::Host;
 use crate::error::{NativeError, timeouts};
+use crate::security::tls_provider::TlsProvider;
 
 /// Per-connect parameters: the typed proto config plus the dial address.
 ///
@@ -17,6 +18,11 @@ pub struct NativeConnectParams {
     pub server: EndpointEssentials,
     pub target: crate::addr::TargetAddr,
     pub resolved_ip: Option<SocketAddr>,
+    /// TLS provider for the security phase: standard rustls or a custom
+    /// fingerprint-capable engine. Defaults to [`TlsProvider::Standard`]
+    /// (rustls); `wrap()` still routes to the fingerprint engine when the
+    /// config carries an `fp` value.
+    pub tls_provider: TlsProvider,
 }
 
 impl NativeConnectParams {
@@ -31,6 +37,7 @@ impl NativeConnectParams {
             server,
             target,
             resolved_ip: None,
+            tls_provider: TlsProvider::Standard,
         }
     }
 }
@@ -120,6 +127,12 @@ impl LinkContext {
             }) => Err(NativeError::Reality("reality not implemented yet".into())),
             _ => Ok(None),
         }
+    }
+
+    /// The TLS provider selected for this connect (default: `Standard`).
+    #[must_use]
+    pub const fn tls_provider(&self) -> &TlsProvider {
+        &self.params.tls_provider
     }
 
     /// Security config from the protocol payload (typed, via the proto trait).

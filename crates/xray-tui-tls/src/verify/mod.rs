@@ -37,6 +37,7 @@ const SERVER_CV_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify\x00";
 // ── Verifier ───────────────────────────────────────────────────────────────
 
 /// Real certificate verification via `rustls-webpki` + `ring`.
+#[derive(Clone)]
 pub struct WebPkiVerifier {
     /// Trust anchors the chain is built against (full-verification mode).
     roots: Vec<TrustAnchor<'static>>,
