@@ -8,12 +8,13 @@
 //! verified with the leaf's public key via
 //! `webpki::EndEntityCert::verify_signature`.
 //!
-//! Trust modes, in priority order:
-//! 1. A configured `pin_sha256` — the chain walk (and SAN) are skipped
+//! Trust modes, in priority order (`insecure` wins when both it and a pin
+//! are set):
+//! 1. `insecure` — every server is accepted, with no verification at all.
+//! 2. A configured `pin_sha256` — the chain walk (and SAN) are skipped
 //!    (v2rayN pin semantics); the leaf SPKI must hash to the pin and the
 //!    `CertificateVerify` signature must still verify against the leaf's
 //!    public key.
-//! 2. `insecure` — every server is accepted.
 //! 3. Full `WebPKI` — the chain must build to a configured root, the leaf must
 //!    be valid for the offered SNI, and the `CertificateVerify` signature
 //!    must verify against the leaf's public key.
@@ -28,7 +29,9 @@ use webpki::{EndEntityCert, KeyUsage};
 use crate::error::{Result, TlsError};
 use crate::handshake::{ServerVerifier, VerifyContext};
 
-/// RFC 8446 §4.4.3 server context string (with its leading length byte).
+/// RFC 8446 §4.4.3 server context label, NUL-terminated. The signed message
+/// is `64*0x20 || SERVER_CV_CONTEXT || transcript_hash` — the literal 64
+/// space bytes are the leading padding, not part of this constant.
 const SERVER_CV_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify\x00";
 
 // ── Verifier ───────────────────────────────────────────────────────────────
@@ -95,16 +98,18 @@ impl WebPkiVerifier {
 
 impl ServerVerifier for WebPkiVerifier {
     fn verify(&self, ctx: &VerifyContext<'_>) -> Result<()> {
+        // `insecure` takes precedence over everything, including the pin:
+        // no verification at all, not even a leaf-certificate parse.
+        if self.insecure {
+            return Ok(());
+        }
+
         let leaf = ctx.chain.first().ok_or_else(|| {
             TlsError::Verify("server presented no certificate".to_string())
         })?;
         let leaf_der = CertificateDer::from(leaf.as_slice());
         let end_entity = EndEntityCert::try_from(&leaf_der)
             .map_err(|e| TlsError::Verify(format!("invalid leaf certificate DER: {e}")))?;
-
-        if self.insecure {
-            return Ok(());
-        }
 
         // Pin mode: the pin replaces the chain walk (which CA signed the
         // cert) but NOT the CertificateVerify signature verification, which
@@ -225,7 +230,7 @@ mod tests {
     use super::{verify_certificate_verify, WebPkiVerifier};
     use crate::crypto::CipherSuiteId;
     use crate::error::{Result, TlsError};
-    use crate::handshake::{connect, HandshakeParams, VerifyContext};
+    use crate::handshake::{connect, HandshakeParams, ServerVerifier, VerifyContext};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -454,6 +459,60 @@ mod tests {
         connect_server(&verifier, "localhost", &certified.cert, &certified.key_pair)
             .await
             .unwrap();
+    }
+
+    /// Regression guard (review P2): pin mode must still reject a forged
+    /// `CertificateVerify`. The leaf SPKI hashes to the pin, but the
+    /// signature was made by a *different* key, so verification must fail.
+    /// This test fails if `verify_certificate_verify` is dropped from the
+    /// pin branch.
+    #[test]
+    fn pin_mode_rejects_forged_certificate_verify() {
+        let (_, _, leaf_cert, leaf_key) = ca_and_leaf();
+        let pin = spki_pin(&leaf_key);
+
+        // Forge the signature with a second, unrelated ECDSA P-256 key.
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let forger = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+
+        // The transcript is arbitrary here; the signature covers the padded
+        // RFC 8446 §4.4.3 message built from it.
+        let transcript = b"ClientHello..Certificate";
+        let transcript_hash =
+            ring::digest::digest(&ring::digest::SHA256, &transcript[..]).as_ref().to_vec();
+        let mut message = Vec::with_capacity(64 + super::SERVER_CV_CONTEXT.len() + 32);
+        message.resize(64, 0x20);
+        message.extend_from_slice(super::SERVER_CV_CONTEXT);
+        message.extend_from_slice(&transcript_hash);
+        let forged_sig = forger.sign(&rng, &message).unwrap();
+
+        let mut body = Vec::with_capacity(4 + forged_sig.as_ref().len());
+        body.extend_from_slice(&0x0403u16.to_be_bytes());
+        body.extend_from_slice(&u16::try_from(forged_sig.as_ref().len()).unwrap().to_be_bytes());
+        body.extend_from_slice(forged_sig.as_ref());
+
+        let ctx = VerifyContext {
+            chain: &[leaf_cert.der().to_vec()],
+            sni: "localhost",
+            signature_scheme: 0x0403,
+            cert_verify_body: &body,
+            transcript,
+            suite: CipherSuiteId::Aes128GcmSha256,
+        };
+
+        let verifier = WebPkiVerifier::from_roots(Vec::new()).with_pin(pin);
+        let err = verifier.verify(&ctx).unwrap_err();
+        assert!(matches!(err, TlsError::Verify(_)), "got: {err}");
     }
 
     #[test]
