@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - **ring only** in `xray-tui-tls`: no aws-lc-rs, no `rand` crate, no `unsafe`. RNG via `ring::rand::SecureRandom` trait (`SystemRandom` prod; fixed-seed impl in tests).
+  - **Amended (T14)**: the REALITY client uses `x25519-dalek` (default-features=false, static_secrets) as a runtime dep for its client ephemeral — ring 0.17's single-use `EphemeralPrivateKey` cannot drive the Reality auth-ECDH + TLS-ECDHE from the same scalar (xtls/reality 2025-10+ requirement). Non-reality paths (plain TLS fingerprint handshake) keep ring agreement. Validated by 7/7 live e2e + RFC 7748 §6.1 KAT. In xray-tui-native, x25519-dalek is optional behind the `native-e2e` feature (harness keygen only).
 - Workspace conventions: edition 2024, `[lints] workspace = true` (clippy pedantic+nursery warn), rustfmt, thiserror for errors.
 - **No implicit network in usual tests.** Tier-2 grader = example binary + `#[ignore]`d tests. Tier-3 e2e = feature `native-e2e` AND env `XRAY_TUI_CORE_BIN_DIR` (existing harness gate).
 - Every network step in the native crate stays wrapped in `timeouts::SECURITY` (10 s).
