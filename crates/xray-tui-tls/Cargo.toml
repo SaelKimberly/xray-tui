@@ -31,6 +31,8 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+# Inf. locks for the recording http2 test server (workspace already uses 0.12).
+parking_lot = "0.12"
 rcgen = "0.14"
 # Interop proof: our client handshakes against a real rustls server. The
 # workspace dep pins default-features = false (ring is the workspace's

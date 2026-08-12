@@ -7677,6 +7677,7 @@ name = "xray-tui-tls"
 version = "0.1.0"
 dependencies = [
  "md-5",
+ "parking_lot",
  "rcgen",
  "ring",
  "rustls",

@@ -6,7 +6,8 @@
 //! stream): `read_exact`/`write_all` come from the tokio IO traits instead
 //! of hand-rolled buffer helpers.
 //!
-//! Scope: one GET request on a fresh connection, h2 ALPN negotiated.
+//! Scope: several GET requests on one connection (stream ids 1, 3, 5, …),
+//! h2 ALPN negotiated.
 //! Implements: client preface, SETTINGS exchange, HPACK-encoded HEADERS,
 //! DATA frame accumulation, PING/GOAWAY handling.
 //! Deliberately excludes: dynamic HPACK table, `PUSH_PROMISE`, flow-control
@@ -148,56 +149,110 @@ where
 
 // ── High-level GET ──────────────────────────────────────────────────────────
 
-/// Perform an HTTP/2 GET request and return the response body as a String.
+/// A minimal HTTP/2 client capable of several GETs on one connection.
 ///
-/// Flow (RFC 7540):
-///   1. Send client preface (24-byte magic + empty SETTINGS)
-///   2. Send HEADERS frame (stream 1, `END_STREAM` | `END_HEADERS`)
-///   3. Process incoming frames:
-///      - SETTINGS (not ACK) → send SETTINGS ACK
-///      - PING (not ACK)     → send PING ACK
-///      - DATA on stream 1   → accumulate body; stop on `END_STREAM`
-///      - HEADERS on stream 1 → check `END_STREAM` (response has no body)
-///      - GOAWAY             → error
-///      - everything else    → ignore
+/// The connection preface + SETTINGS exchange run once (first `get`);
+/// subsequent GETs reuse the connection on stream ids 1, 3, 5, … (RFC 7540
+/// §5.1.1 — client-initiated streams are odd and monotonically increasing).
+pub struct Client {
+    next_stream: u32,
+}
+
+impl Client {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { next_stream: 1 }
+    }
+
+    /// Send a GET request and return the response body as a String.
+    ///
+    /// Flow (RFC 7540):
+    ///   1. First request only: client preface + empty SETTINGS; later
+    ///      GETs reuse the connection.
+    ///   2. HEADERS frame on the next odd stream id (`END_STREAM` |
+    ///      `END_HEADERS`); extra headers append after the static-table
+    ///      pseudo-headers.
+    ///   3. Process incoming frames:
+    ///      - SETTINGS (not ACK) → send SETTINGS ACK
+    ///      - PING (not ACK)     → send PING ACK
+    ///      - DATA on the stream → accumulate body; stop on `END_STREAM`
+    ///      - HEADERS on the stream → check `END_STREAM` (no body)
+    ///      - GOAWAY             → error
+    ///      - everything else    → ignore
+    pub async fn get<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        &mut self,
+        conn: &mut TlsStream<S>,
+        path: &str,
+        host: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<String> {
+        if self.next_stream == 1 {
+            // First request: client preface + empty SETTINGS (RFC 7540 §3.5).
+            conn.write_all(PREFACE).await?;
+            conn.write_all(&make_frame(FRAME_SETTINGS, 0, 0, &[]))
+                .await?;
+        }
+        let mut hpack = encode_get_headers(path, host);
+        for (name, value) in extra_headers {
+            encode_literal_header(&mut hpack, name, value.as_bytes());
+        }
+        let stream_id = self.next_stream;
+        self.next_stream += 2;
+        conn.write_all(&make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            stream_id,
+            &hpack,
+        ))
+        .await?;
+
+        // Receive frames until END_STREAM on this stream, bounded so a
+        // stalling server fails the gate instead of hanging forever.
+        let body = tokio::time::timeout(RESPONSE_TIMEOUT, receive_response(conn, stream_id))
+            .await
+            .map_err(|_| TlsError::Protocol("HTTP/2 response timed out".to_string()))??;
+
+        String::from_utf8(body)
+            .map_err(|e| TlsError::Protocol(format!("HTTP/2 response body not UTF-8: {e}")))
+    }
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Encodes a literal header field *without indexing, new name* (RFC 7541
+/// §6.2.2): `0x00` prefix, then name and value as raw length-prefixed
+/// strings. Used for `cookie` and `referer` in the spider's extra headers.
+fn encode_literal_header(buf: &mut Vec<u8>, name: &str, value: &[u8]) {
+    buf.push(0x00);
+    hpack_string(buf, name.as_bytes());
+    hpack_string(buf, value);
+}
+
+/// Perform an HTTP/2 GET request on a fresh connection and return the
+/// response body as a String.
+///
+/// Convenience wrapper around [`Client::get`] with no extra headers, kept
+/// for the tls.peet.ws grader (preface + stream 1 per call).
 pub async fn get<S>(conn: &mut TlsStream<S>, path: &str, host: &str) -> Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // 1. Client connection preface + empty SETTINGS
-    let mut preface = PREFACE.to_vec();
-    preface.extend(make_frame(FRAME_SETTINGS, 0, 0, &[]));
-    conn.write_all(&preface).await?;
-
-    // 2. HEADERS (stream 1): GET request, no body → END_STREAM
-    let headers_block = encode_get_headers(path, host);
-    conn.write_all(&make_frame(
-        FRAME_HEADERS,
-        FLAG_END_STREAM | FLAG_END_HEADERS,
-        1,
-        &headers_block,
-    ))
-    .await?;
-
-    // 3. Receive frames until END_STREAM on stream 1, bounded so a
-    //    stalling server fails the gate instead of hanging forever.
-    let body = tokio::time::timeout(RESPONSE_TIMEOUT, receive_response(conn))
-        .await
-        .map_err(|_| TlsError::Protocol("HTTP/2 response timed out".to_string()))??;
-
-    String::from_utf8(body)
-        .map_err(|e| TlsError::Protocol(format!("HTTP/2 response body not UTF-8: {e}")))
+    Client::new().get(conn, path, host, &[]).await
 }
 
-/// Reads frames until `END_STREAM` on stream 1, acknowledging the server's
-/// `SETTINGS` and PINGs, and returns the accumulated response body.
-async fn receive_response<S>(conn: &mut TlsStream<S>) -> Result<Vec<u8>>
+/// Reads frames until `END_STREAM` on `stream_id`, acknowledging the
+/// server's `SETTINGS` and PINGs, and returns the accumulated response body.
+async fn receive_response<S>(conn: &mut TlsStream<S>, stream_id: u32) -> Result<Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut body: Vec<u8> = Vec::new();
     loop {
-        let (ftype, flags, stream_id, payload) = read_frame(conn).await?;
+        let (ftype, flags, frame_stream, payload) = read_frame(conn).await?;
 
         match ftype {
             FRAME_SETTINGS => {
@@ -213,7 +268,7 @@ where
                 conn.write_all(&make_frame(FRAME_PING, FLAG_ACK, 0, &payload))
                     .await?;
             }
-            FRAME_DATA if stream_id == 1 => {
+            FRAME_DATA if frame_stream == stream_id => {
                 // Handle optional PADDED flag (RFC 7540 §6.1): the pad
                 // length byte must not exceed the payload.
                 let data = if flags & 0x08 != 0 {
@@ -238,13 +293,13 @@ where
                     break;
                 }
             }
-            FRAME_HEADERS if stream_id == 1 => {
+            FRAME_HEADERS if frame_stream == stream_id => {
                 // Response headers (we don't need to parse them)
                 if flags & FLAG_END_STREAM != 0 {
                     break; // response has no body (e.g. 204 No Content)
                 }
             }
-            FRAME_RST_STREAM if stream_id == 1 => {
+            FRAME_RST_STREAM if frame_stream == stream_id => {
                 let code = u32::from_be_bytes(payload.try_into().unwrap_or([0; 4]));
                 return Err(TlsError::Protocol(format!(
                     "HTTP/2 RST_STREAM error_code={code}"
@@ -266,4 +321,219 @@ where
         }
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Client, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_HEADERS, FRAME_SETTINGS,
+        PREFACE, make_frame,
+    };
+    use crate::handshake::{AcceptAll, HandshakeParams, connect};
+    use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
+    use parking_lot::Mutex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    /// A Chrome-flavoured spec with only TLS 1.3 suites/groups/versions,
+    /// the minimal surface a rustls server needs to complete a 1-RTT
+    /// handshake (identical to the handshake interop test's helper).
+    fn test_spec() -> ClientHelloSpec {
+        ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301, 0x1302, 0x1303],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![
+                ExtensionSpec::ServerName,
+                ExtensionSpec::SupportedGroups(vec![0x001D]),
+                ExtensionSpec::KeyShare(vec![KeyShareGroup::X25519]),
+                ExtensionSpec::SupportedVersions(vec![0x0304, 0x0303]),
+                ExtensionSpec::SignatureAlgorithms(vec![
+                    0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+                ]),
+                ExtensionSpec::Alpn(vec!["h2".into(), "http/1.1".into()]),
+                ExtensionSpec::EcPointFormats,
+                ExtensionSpec::SessionTicket,
+                ExtensionSpec::PskKeyExchangeModes,
+            ],
+        }
+    }
+
+    fn server_config(cert: &rcgen::Certificate, key: &rcgen::KeyPair) -> rustls::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        // Workspace feature unification compiles rustls with BOTH backends
+        // (ring via our crates, aws-lc-rs via other workspace members), so
+        // rustls cannot auto-select a provider here — install ring
+        // explicitly. Idempotent: a concurrent/earlier install returns
+        // `Err`, ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Spawns a recording rustls TLS server on a blocking thread.
+    ///
+    /// After the handshake it sends its own empty SETTINGS, then loops
+    /// reading TLS records and appends the decrypted HTTP/2 plaintext
+    /// (preface + frames) to `recorded` — bounded to the first 512 bytes,
+    /// then keeps draining reads so the client's writes never wedge on TCP
+    /// backpressure. Every `END_STREAM` HEADERS is answered with an empty
+    /// HEADERS + `END_STREAM` on the same stream (a 204-style reply) so
+    /// the client's GETs complete promptly.
+    fn spawn_recording_tls_server(recorded: Arc<Mutex<Vec<u8>>>) -> std::net::SocketAddr {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = server_config(&certified.cert, &certified.signing_key);
+
+        tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let timeout = std::time::Duration::from_secs(15);
+            sock.set_read_timeout(Some(timeout)).unwrap();
+            sock.set_write_timeout(Some(timeout)).unwrap();
+            let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).unwrap();
+            }
+            // Server connection preface: our own empty SETTINGS (RFC 7540 §3.5).
+            conn.writer()
+                .write_all(&make_frame(FRAME_SETTINGS, 0, 0, &[]))
+                .unwrap();
+            conn.write_tls(&mut sock).unwrap();
+
+            // Decrypted HTTP/2 plaintext: 24-byte preface, then 9-byte
+            // frame header + payload; `off` is the parse cursor.
+            let mut plain = Vec::new();
+            let mut off = 0usize;
+            loop {
+                if conn.read_tls(&mut sock).unwrap() == 0 {
+                    break; // client closed the connection
+                }
+                let state = conn.process_new_packets().unwrap();
+                if state.plaintext_bytes_to_read() > 0 {
+                    let mut buf = vec![0u8; state.plaintext_bytes_to_read()];
+                    // The buffer is exactly the available plaintext, so a
+                    // blocking read_exact cannot stall.
+                    conn.reader().read_exact(&mut buf).unwrap();
+                    plain.extend_from_slice(&buf);
+                }
+
+                // Record everything new since the last parse pass, bounded.
+                {
+                    let mut rec = recorded.lock();
+                    let take = (plain.len() - off).min(512usize.saturating_sub(rec.len()));
+                    rec.extend_from_slice(&plain[off..off + take]);
+                }
+
+                // Skip the client preface (may span several reads).
+                if off < PREFACE.len() {
+                    if plain.len() < PREFACE.len() {
+                        continue;
+                    }
+                    off = PREFACE.len();
+                }
+
+                // Parse complete frames and reply per RFC 7540.
+                loop {
+                    if plain.len() - off < 9 {
+                        break; // incomplete frame header
+                    }
+                    let len = (usize::from(plain[off]) << 16)
+                        | (usize::from(plain[off + 1]) << 8)
+                        | usize::from(plain[off + 2]);
+                    let frame_len = 9usize + len;
+                    if plain.len() - off < frame_len {
+                        break; // incomplete frame payload
+                    }
+                    let ftype = plain[off + 3];
+                    let flags = plain[off + 4];
+                    let stream_id = u32::from_be_bytes([
+                        plain[off + 5] & 0x7F,
+                        plain[off + 6],
+                        plain[off + 7],
+                        plain[off + 8],
+                    ]);
+                    off += frame_len;
+                    match ftype {
+                        FRAME_SETTINGS if flags & FLAG_ACK == 0 => {
+                            conn.writer()
+                                .write_all(&make_frame(FRAME_SETTINGS, FLAG_ACK, 0, &[]))
+                                .unwrap();
+                            conn.write_tls(&mut sock).unwrap();
+                        }
+                        FRAME_HEADERS if flags & FLAG_END_STREAM != 0 => {
+                            conn.writer()
+                                .write_all(&make_frame(
+                                    FRAME_HEADERS,
+                                    FLAG_END_STREAM | FLAG_END_HEADERS,
+                                    stream_id,
+                                    &[],
+                                ))
+                                .unwrap();
+                            conn.write_tls(&mut sock).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn client_reuses_connection_across_gets() {
+        let recorded: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_recording_tls_server(recorded.clone());
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let mut conn = connect(
+            stream,
+            HandshakeParams {
+                spec: &test_spec(),
+                server_name: "localhost",
+                alpn: None, // the spec already offers h2/http/1.1
+                verifier: &AcceptAll,
+                rng: &rng,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut client = Client::new();
+        client
+            .get(&mut conn, "/a", "localhost", &[("cookie", "padding=0")])
+            .await
+            .expect("first GET must complete");
+        client
+            .get(&mut conn, "/b", "localhost", &[])
+            .await
+            .expect("second GET must complete");
+
+        let bytes = recorded.lock().clone();
+        let preface_count = bytes
+            .windows(PREFACE.len())
+            .filter(|w| *w == PREFACE)
+            .count();
+        assert_eq!(preface_count, 1, "preface must be sent exactly once");
+        // Frame header layout (RFC 7540 §4.1): length(3), type(1) at
+        // offset 3, flags(1), stream id(4) at offsets 5..9.
+        let headers_on = |stream: u32| {
+            bytes.windows(9).any(|w| {
+                w[3] == FRAME_HEADERS && u32::from_be_bytes(w[5..9].try_into().unwrap()) == stream
+            })
+        };
+        assert!(headers_on(1), "HEADERS frame on stream 1 expected");
+        assert!(headers_on(3), "HEADERS frame on stream 3 expected");
+    }
 }
