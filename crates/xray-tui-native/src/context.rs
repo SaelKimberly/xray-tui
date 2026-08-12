@@ -99,7 +99,8 @@ impl LinkContext {
     /// TLS ALPN list: comma-separated `alpn` option, else empty (no ALPN).
     #[must_use]
     pub fn alpn_vec(&self) -> Vec<Vec<u8>> {
-        self.tls_opts()
+        let explicit: Vec<Vec<u8>> = self
+            .tls_opts()
             .ok()
             .flatten()
             .and_then(|o| o.alpn.as_ref())
@@ -111,7 +112,18 @@ impl LinkContext {
                     .map(<[u8]>::to_vec)
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        // Transport-implied ALPN: the grpc transport is HTTP/2, the ws
+        // upgrade is an HTTP/1.1 exchange. (Reality forces h2+http/1.1
+        // server-side; an explicit `alpn` option wins above.)
+        match self.transport_type() {
+            Some("grpc") => vec![b"h2".to_vec()],
+            Some("ws") => vec![b"http/1.1".to_vec()],
+            _ => vec![],
+        }
     }
 
     /// The typed TLS options when security is plain TLS (not Reality).
@@ -250,6 +262,52 @@ mod tests {
         );
         let ctx = LinkContext::new(params, target("example.com"));
         assert!(ctx.alpn_vec().is_empty());
+    }
+
+    #[test]
+    fn alpn_defaults_per_transport() {
+        let grpc: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "grpc", "service_name": "gun" }
+        }))
+        .expect("vless grpc config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(grpc, EndpointEssentials::new("127.0.0.1", 4430), target("x")),
+            target("x"),
+        );
+        assert_eq!(ctx.alpn_vec(), vec![b"h2".to_vec()]);
+
+        let ws: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "ws", "path": "/ws" }
+        }))
+        .expect("vless ws config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(ws, EndpointEssentials::new("127.0.0.1", 4430), target("x")),
+            target("x"),
+        );
+        assert_eq!(ctx.alpn_vec(), vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn explicit_alpn_wins_over_transport() {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "security": { "type": "tls", "sni": "sni.example", "alpn": "h2,http/1.1" },
+            "transport": { "type": "grpc", "service_name": "gun" }
+        }))
+        .expect("vless grpc+tls config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(protocol, EndpointEssentials::new("127.0.0.1", 4430), target("x")),
+            target("x"),
+        );
+        assert_eq!(
+            ctx.alpn_vec(),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]

@@ -16,18 +16,16 @@ use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::BoxStream;
 
-/// The gRPC service name: explicit config value, else `"gun"` (the xray-core
-/// default; sing-box maps an empty `service_name` to `"gun"` too).
+/// gRPC service name: config value verbatim (no default). Stream path is
+/// `/{service}/Tun`; empty service yields `//Tun` (xray `getServiceName`,
+/// sing-box `TunCustomName`).
 #[must_use]
 pub fn grpc_service_name(cfg: &GrpcConfig) -> String {
-    cfg.service_name
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("gun")
-        .to_string()
+    cfg.service_name.as_deref().unwrap_or("").to_string()
 }
 
-/// Request path: explicit config path, else `/<service>/Tun`.
+/// Request path: explicit config path, else `/{service}/Tun` (empty service
+/// → `//Tun`, matching both cores).
 fn grpc_path(cfg: &GrpcConfig, service: &str) -> String {
     cfg.path
         .as_deref()
@@ -253,17 +251,19 @@ mod tests {
     }
 
     #[test]
-    fn service_name_defaults_to_gun() {
-        assert_eq!(grpc_service_name(&GrpcConfig::default()), "gun");
+    fn service_name_is_verbatim_no_default() {
+        assert_eq!(grpc_service_name(&GrpcConfig::default()), "");
         let cfg = GrpcConfig {
-            service_name: Some("custom".into()),
+            service_name: Some("gun".into()),
             ..Default::default()
         };
-        assert_eq!(grpc_service_name(&cfg), "custom");
+        assert_eq!(grpc_service_name(&cfg), "gun");
     }
 
     #[test]
-    fn path_defaults_to_service_tun() {
+    fn path_builds_slash_service_tun() {
+        // Empty service → "//Tun", matching xray + sing-box path derivation.
+        assert_eq!(grpc_path(&GrpcConfig::default(), ""), "//Tun");
         assert_eq!(grpc_path(&GrpcConfig::default(), "gun"), "/gun/Tun");
         let cfg = GrpcConfig {
             path: Some("/custom/path".into()),
