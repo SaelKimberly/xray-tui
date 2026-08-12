@@ -16,7 +16,10 @@ tokio = { workspace = true, features = ["net", "io-util", "time"] }
 
 # TLS (workspace standard: ring backend)
 rustls = { workspace = true, features = ["ring"] }
-tokio-rustls = "0.26"
+# TLS (workspace standard: ring backend). tokio-rustls 0.26's DEFAULT
+# features include `aws_lc_rs` (rustls/aws_lc_rs) — the only aws-lc-rs
+# enabler in the tree — so default-features = false + ring/tls12.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 
 # VMess wire crypto (mandatory for any VMess client — not feature-gated)
