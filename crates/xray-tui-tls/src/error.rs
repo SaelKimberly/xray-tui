@@ -19,6 +19,10 @@ pub enum TlsError {
     NotImplemented { feature: String },
     #[error("server sent HelloRetryRequest; retry is not supported")]
     HelloRetryRequest,
+    /// REALITY was expected but the server flight was not REALITY-authenticated
+    /// — a real certificate (transparent proxy / possible MITM or redirection).
+    #[error("REALITY: received real certificate (potential MITM or redirection)")]
+    RealityFallback,
 }
 
 pub type Result<T> = std::result::Result<T, TlsError>;

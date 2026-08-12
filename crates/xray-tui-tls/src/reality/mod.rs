@@ -36,6 +36,7 @@ use crate::crypto::{AeadKey, KeySchedule, X25519KeyPair};
 use crate::error::{Result, TlsError};
 use crate::handshake::{RingRng, make_hs_msg, read_server_hello, read_server_hs_messages};
 use crate::hello::{BuildParams, build_hello, to_record};
+use crate::profiles::BrowserProfile;
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{CONTENT_HANDSHAKE, HS_FINISHED, aead_aad, make_app_data_record};
 use crate::spec::SessionIdSpec;
@@ -89,11 +90,13 @@ impl ProvisionedHello {
 /// Fixed Chrome-133-shaped provisioner (first engine; ported from shoes).
 pub struct FixedChrome133;
 
-impl HelloProvisioner for FixedChrome133 {
+/// A `HelloProvisioner` shaped by any browser profile: the profile's
+/// `ClientHello` spec with the REALITY `AuthPayload` session id slot.
+pub struct ProfileProvisioner(pub BrowserProfile);
+
+impl HelloProvisioner for ProfileProvisioner {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
-        // Chrome-133 fingerprint with the REALITY AuthPayload session id
-        // (16 B plaintext + 16 B GCM tag, zeroed for the connector to seal).
-        let mut spec = crate::profiles::chrome133::spec();
+        let mut spec = self.0.spec();
         spec.session_id = SessionIdSpec::AuthPayload { len: 32 };
         let built = build_hello(
             &spec,
@@ -105,12 +108,18 @@ impl HelloProvisioner for FixedChrome133 {
             },
         )?;
         let session_id_range = built.session_id_range.ok_or_else(|| {
-            TlsError::Spec("Chrome133 spec must use SessionIdSpec::AuthPayload".into())
+            TlsError::Spec("profile spec must use SessionIdSpec::AuthPayload".into())
         })?;
         Ok(ProvisionedHello {
             handshake_bytes: built.handshake_bytes,
             session_id_range,
         })
+    }
+}
+
+impl HelloProvisioner for FixedChrome133 {
+    fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
+        ProfileProvisioner(BrowserProfile::Chrome133).provision(params)
     }
 }
 
@@ -275,6 +284,8 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::hello::parse::parse_hello;
 
@@ -329,5 +340,59 @@ mod tests {
             alpn.windows(8).any(|w| w == b"http/1.1"),
             "ALPN must offer http/1.1"
         );
+    }
+
+    /// Deterministic RNG feeding back a fixed byte sequence (same shape as
+    /// `hello::tests::FixedRandom`), so two provision calls draw identical
+    /// bytes and the golden-equality assertion is meaningful.
+    struct FixedRandom {
+        bytes: Vec<u8>,
+        pos: AtomicUsize,
+    }
+
+    impl SecureRandom for FixedRandom {
+        fn fill(&self, dest: &mut [u8]) -> std::result::Result<(), ring::error::Unspecified> {
+            let mut pos = self.pos.load(Ordering::Relaxed);
+            for b in dest.iter_mut() {
+                *b = *self.bytes.get(pos).ok_or(ring::error::Unspecified)?;
+                pos += 1;
+            }
+            self.pos.store(pos, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn profile_provisioner_chrome133_matches_fixed_chrome133() {
+        // A fresh fixed-seed RNG per call: both provisioners must consume
+        // the identical byte stream (0x42 → every GREASE value 0x2A2A), so
+        // byte equality proves `ProfileProvisioner(BrowserProfile::Chrome133)`
+        // produces exactly what the fixed Chrome-133 provisioner produces.
+        let fixed_rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
+        let fixed = FixedChrome133
+            .provision(&HelloProvisionParams {
+                server_name: "www.microsoft.com",
+                alpn: Some(REALITY_ALPN),
+                x25519_pub: &[0xAB; 32],
+                rng: &fixed_rng,
+            })
+            .unwrap();
+        let profile_rng = FixedRandom {
+            bytes: vec![0x42; 128],
+            pos: AtomicUsize::new(0),
+        };
+        let profile = ProfileProvisioner(BrowserProfile::Chrome133)
+            .provision(&HelloProvisionParams {
+                server_name: "www.microsoft.com",
+                alpn: Some(REALITY_ALPN),
+                x25519_pub: &[0xAB; 32],
+                rng: &profile_rng,
+            })
+            .unwrap();
+        assert_eq!(fixed.handshake_bytes, profile.handshake_bytes);
+        assert_eq!(fixed.session_id_range, profile.session_id_range);
     }
 }
