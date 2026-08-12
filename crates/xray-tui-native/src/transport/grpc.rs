@@ -33,20 +33,47 @@ fn grpc_path(cfg: &GrpcConfig, service: &str) -> String {
         .map_or_else(|| format!("/{service}/Tun"), ToString::to_string)
 }
 
-/// gRPC message framing: `0x00` flag + 4-byte big-endian payload length +
-/// payload. Pure, unit-tested.
+/// The xray/sing-box grpc transport carries VLESS bytes inside a protobuf
+/// `Hunk` message (`message Hunk { bytes data = 1; }`), which rides inside
+/// the standard gRPC 5-byte framing. Wire layout per message:
+/// `0x00 | BE32(hunk_len) | 0x0A | varint(data_len) | data`.
+/// (Verified: xray-core's `HunkConn.Recv` unmarshals the payload as Hunk —
+/// raw bytes fail with "cannot parse invalid wire-format data".
+fn varint_len(mut n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2);
+    loop {
+        let mut b = u8::try_from(n & 0x7f).unwrap_or(0x7f);
+        n >>= 7;
+        if n != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if n == 0 {
+            return out;
+        }
+    }
+}
+
+/// Encode one VLESS byte chunk as a gRPC Hunk message. Pure, unit-tested.
 #[must_use]
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + payload.len());
+    let hunk = {
+        let mut h = Vec::with_capacity(1 + 2 + payload.len());
+        h.push(0x0A); // field 1, wire type 2 (length-delimited)
+        h.extend_from_slice(&varint_len(payload.len()));
+        h.extend_from_slice(payload);
+        h
+    };
+    let mut out = Vec::with_capacity(5 + hunk.len());
     out.push(0);
-    out.extend_from_slice(&u32::try_from(payload.len()).unwrap_or(u32::MAX).to_be_bytes());
-    out.extend_from_slice(payload);
+    out.extend_from_slice(&u32::try_from(hunk.len()).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(&hunk);
     out
 }
 
-/// Decode ONE gRPC message from the front of `buf`, consuming only complete
-/// messages. Returns `None` when fewer than a full message is available
-/// (partial prefix or payload stays in `buf`).
+/// Decode ONE gRPC Hunk message from the front of `buf`, consuming only
+/// complete messages. Returns `None` when fewer than a full message is
+/// available (partial prefix/payload stays in `buf`).
 pub fn decode_frame(buf: &mut BytesMut) -> Option<Vec<u8>> {
     if buf.len() < 5 {
         return None;
@@ -56,11 +83,38 @@ pub fn decode_frame(buf: &mut BytesMut) -> Option<Vec<u8>> {
         return None;
     }
     let msg = buf.split_to(5 + len);
-    Some(msg[5..].to_vec())
+    let hunk = &msg[5..];
+    // Hunk: 0x0A tag, then varint data length, then data.
+    let tag = *hunk.first()?;
+    if tag != 0x0A {
+        return None;
+    }
+    let (dlen, dstart) = varint_decode(hunk, 1)?;
+    if 1 + dstart + dlen > hunk.len() {
+        return None;
+    }
+    Some(hunk[1 + dstart..1 + dstart + dlen].to_vec())
+}
+
+/// Decode a base-128 varint starting at `start`; returns (value, bytes).
+fn varint_decode(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut val = 0usize;
+    let mut shift = 0;
+    for (i, &b) in buf.iter().enumerate().skip(start) {
+        val |= usize::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some((val, i + 1 - start));
+        }
+        shift += 7;
+        if shift >= usize::BITS {
+            return None;
+        }
+    }
+    None
 }
 
 /// Run the gRPC transport: h2 handshake over the (secured) stream, open the
-/// single `/<service>/Tun` stream, return the bidirectional byte stream.
+/// single `/{service}/Tun` stream, return the bidirectional byte stream.
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let cfg = ctx.transport_grpc().ok_or_else(|| {
         NativeError::Config("grpc transport requested but config has no grpc settings".into())
@@ -81,6 +135,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
             limit: timeouts::TRANSPORT,
         })?
         .map_err(|e| NativeError::Transport(format!("grpc h2 handshake: {e}")))?;
+    // Drive the h2 connection in the background for the stream's lifetime.
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -103,40 +158,52 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     let (resp, send_stream) = send_req
         .send_request(req, false)
         .map_err(|e| NativeError::Transport(format!("grpc stream open: {e}")))?;
-    let resp = tokio::time::timeout(timeouts::TRANSPORT, resp)
-        .await
-        .map_err(|_| NativeError::Timeout {
-            step: "grpc response headers",
-            limit: timeouts::TRANSPORT,
-        })?
-        .map_err(|e| NativeError::Transport(format!("grpc response: {e}")))?;
-    if resp.status() != http::StatusCode::OK {
-        return Err(NativeError::Transport(format!(
-            "grpc stream rejected: {}",
-            resp.status()
-        )));
-    }
-    let recv_stream = resp.into_body();
-    Ok(Box::new(GrpcStream::new(send_stream, recv_stream)))
+    // Do NOT block on the response headers here: xray's grpc `Tun` handler
+    // defers its 200 until the first client DATA message (verified with
+    // curl — no body hangs, body → 200). The protocol writes the VLESS
+    // request as the first message; a background task hands the `RecvStream`
+    // over once the server responds.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let out = match tokio::time::timeout(timeouts::TRANSPORT, resp).await {
+            Ok(Ok(r)) if r.status() == http::StatusCode::OK => Ok(r.into_body()),
+            Ok(Ok(r)) => Err(NativeError::Transport(format!(
+                "grpc stream rejected: {}",
+                r.status()
+            ))),
+            Ok(Err(e)) => Err(NativeError::Transport(format!("grpc response: {e}"))),
+            Err(_) => Err(NativeError::Timeout {
+                step: "grpc response headers",
+                limit: timeouts::TRANSPORT,
+            }),
+        };
+        let _ = tx.send(out);
+    });
+    Ok(Box::new(GrpcStream::new(send_stream, rx)))
 }
 
 /// Single bidirectional gRPC stream: `AsyncWrite` prefixes + sends DATA
 /// frames; `AsyncRead` parses the 5-byte prefix and yields payloads.
 pub struct GrpcStream {
     send: SendStream<Bytes>,
-    recv: RecvStream,
-    write_buf: Vec<u8>,
+    recv: Option<RecvStream>,
+    response: Option<tokio::sync::oneshot::Receiver<Result<RecvStream, NativeError>>>,
     read_buf: BytesMut,
     payload: BytesMut,
 }
 
 impl GrpcStream {
+    /// `response` resolves once the server replies to the first message;
+    /// the read side starts pulling from it (the write side works at once).
     #[must_use]
-    pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
+    pub fn new(
+        send: SendStream<Bytes>,
+        response: tokio::sync::oneshot::Receiver<Result<RecvStream, NativeError>>,
+    ) -> Self {
         Self {
             send,
-            recv,
-            write_buf: Vec::new(),
+            recv: None,
+            response: Some(response),
             read_buf: BytesMut::new(),
             payload: BytesMut::new(),
         }
@@ -159,16 +226,42 @@ impl AsyncRead for GrpcStream {
                 self.payload.extend_from_slice(&msg);
                 continue;
             }
-            match Pin::new(&mut self.recv).poll_data(cx) {
+            if self.recv.is_none() {
+                let rx = self.response.as_mut().expect("response channel present while recv unset");
+                match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok(Ok(recv))) => {
+                        self.recv = Some(recv);
+                        self.response = None;
+                        continue;
+                    }
+                    Poll::Ready(Ok(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::other(e)));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "grpc response task dropped",
+                        )));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            let recv = self.recv.as_mut().expect("recv set above");
+            match Pin::new(recv).poll_data(cx) {
                 Poll::Ready(Some(Ok(chunk))) => self.read_buf.extend_from_slice(&chunk),
                 Poll::Ready(Some(Err(e))) => {
+                    // A reset with NO_ERROR (grpc-go closes streams that
+                    // way) is a clean end: report EOF so `read_to_end`
+                    // completes. Any other reset is a real error.
+                    if e.reason() == Some(h2::Reason::NO_ERROR) {
+                        return Poll::Ready(Ok(()));
+                    }
                     return Poll::Ready(Err(io::Error::other(e)));
                 }
                 Poll::Ready(None) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "grpc stream closed",
-                    )));
+                    // Clean end-of-stream (trailers): report EOF so
+                    // `read_to_end` completes instead of erroring.
+                    return Poll::Ready(Ok(()));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -179,20 +272,34 @@ impl AsyncRead for GrpcStream {
 impl AsyncWrite for GrpcStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut TaskCx<'_>,
+        cx: &mut TaskCx<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.write_buf.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
+        // Write-through: one gRPC message per write, chunked at 16 KiB so a
+        // single message never exceeds the h2 flow window. `reserve` +
+        // `poll_capacity` before consuming keeps the AsyncWrite contract
+        // (Pending = nothing consumed).
+        let take = buf.len().min(16384);
+        let framed = encode_frame(&buf[..take]);
+        self.send.reserve_capacity(framed.len());
+        match Pin::new(&mut self.send).poll_capacity(cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(io::Error::other(e))),
+            Poll::Ready(None) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "grpc send stream closed",
+                )));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+        if let Err(e) = self.send.send_data(Bytes::from(framed), false) {
+            return Poll::Ready(Err(io::Error::other(e)));
+        }
+        Poll::Ready(Ok(take))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
-        if !self.write_buf.is_empty() {
-            let framed = encode_frame(&std::mem::take(&mut self.write_buf));
-            if let Err(e) = self.send.send_data(Bytes::from(framed), false) {
-                return Poll::Ready(Err(io::Error::other(e)));
-            }
-        }
         match Pin::new(&mut self.send).poll_capacity(cx) {
             Poll::Ready(Some(Ok(_))) => Poll::Ready(Ok(())),
             Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
@@ -223,11 +330,23 @@ mod tests {
     fn frame_roundtrip() {
         let payload = b"hello vless";
         let framed = encode_frame(payload);
-        assert_eq!(&framed[..5], &[0, 0, 0, 0, 11]); // flag 0 + BE len 11
-        assert_eq!(&framed[5..], payload);
+        // gRPC prefix (flag 0 + BE hunk len 13) + Hunk protobuf wrapper.
+        assert_eq!(&framed[..5], &[0, 0, 0, 0, 13]);
+        assert_eq!(&framed[5..7], &[0x0A, 11]);
+        assert_eq!(&framed[7..], payload);
         let mut buf = BytesMut::from(&framed[..]);
         assert_eq!(decode_frame(&mut buf), Some(payload.to_vec()));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn frame_hunk_wraps_long_payloads_with_varint() {
+        let payload = vec![0x42u8; 200]; // varint length needs 2 bytes
+        let framed = encode_frame(&payload);
+        assert_eq!(&framed[..5], &[0, 0, 0, 0, 1 + 2 + 200]);
+        assert_eq!(&framed[5..8], &[0x0A, 0xC8, 0x01]);
+        let mut buf = BytesMut::from(&framed[..]);
+        assert_eq!(decode_frame(&mut buf), Some(payload));
     }
 
     #[test]

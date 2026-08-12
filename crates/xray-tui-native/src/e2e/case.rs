@@ -28,6 +28,7 @@ pub struct CaseSpec {
     protocol: ProtocolKind,
     security: Option<Box<dyn SecurityVariant>>,
     tls: Option<Box<dyn TlsVariant>>,
+    network: &'static str,
 }
 
 impl CaseSpec {
@@ -37,6 +38,7 @@ impl CaseSpec {
             protocol: ProtocolKind::Vless,
             security: None,
             tls: None,
+            network: "tcp",
         }
     }
 
@@ -46,7 +48,15 @@ impl CaseSpec {
             protocol: ProtocolKind::Vmess,
             security: Some(Box::new(variant)),
             tls: None,
+            network: "tcp",
         }
+    }
+
+    /// Select the transport ("tcp", "ws", "grpc").
+    #[must_use]
+    pub fn with_network(mut self, network: &'static str) -> Self {
+        self.network = network;
+        self
     }
 
     /// Select the TLS transport variant (fingerprint engine or REALITY).
@@ -81,12 +91,12 @@ impl E2eCase for CaseSpec {
             .security
             .as_ref()
             .map_or(String::new(), |s| format!("/{}", s.name()));
-        format!("{proto}/tcp/{tls}{sec}")
+        format!("{proto}/{}/{tls}{sec}", self.network)
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
         match self.protocol {
-            ProtocolKind::Vless => config::vless_inbound(core, env, self.tls()),
+            ProtocolKind::Vless => config::vless_inbound(core, env, self.tls(), self.network),
             ProtocolKind::Vmess => {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
                 config::vmess_inbound(core, env, security, self.tls())
@@ -96,7 +106,9 @@ impl E2eCase for CaseSpec {
 
     fn client_params(&self, port: u16, target: SocketAddr) -> NativeConnectParams {
         match self.protocol {
-            ProtocolKind::Vless => config::client_params_vless(port, target, self.tls()),
+            ProtocolKind::Vless => {
+                config::client_params_vless(port, target, self.tls(), self.network)
+            }
             ProtocolKind::Vmess => {
                 let enc = self
                     .security

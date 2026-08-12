@@ -102,9 +102,15 @@ pub fn vmess_inbound(
 }
 
 /// VLESS inbound JSON for `core` (no payload security dimension). `tls`
-/// selects certificate TLS vs REALITY.
+/// selects certificate TLS vs REALITY; `network` selects the transport
+/// (tcp/ws/grpc). REALITY is tcp-only on both cores.
 #[must_use]
-pub fn vless_inbound(core: CoreKind, env: &ServerEnv, tls: &dyn TlsVariant) -> String {
+pub fn vless_inbound(
+    core: CoreKind,
+    env: &ServerEnv,
+    tls: &dyn TlsVariant,
+    network: &str,
+) -> String {
     if let Some(private_key) = tls.reality_private_key() {
         let sid = tls
             .reality_sid()
@@ -114,26 +120,64 @@ pub fn vless_inbound(core: CoreKind, env: &ServerEnv, tls: &dyn TlsVariant) -> S
     // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    // grpc rides HTTP/2 (needs h2 ALPN); ws upgrade is HTTP/1.1.
+    let alpn = match network {
+        "grpc" => serde_json::json!(["h2"]),
+        _ => serde_json::json!(["http/1.1"]),
+    };
     let json = match core {
-        CoreKind::Xray => serde_json::json!({
-            "inbounds": [{
-                "listen": "127.0.0.1", "port": env.port, "protocol": "vless",
-                "settings": { "clients": [{ "id": UUID }], "decryption": "none" },
-                "streamSettings": { "network": "tcp", "security": "tls",
-                    "tlsSettings": { "certificates": [
+        CoreKind::Xray => {
+            let mut stream = serde_json::json!({
+                "network": network,
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [
                         { "certificateFile": cert_path, "keyFile": key_path }
-                    ], "alpn": ["http/1.1"] } }
-            }],
-            "outbounds": [{ "protocol": "freedom" }]
-        }),
-        CoreKind::SingBox => serde_json::json!({
-            "log": { "level": "warn" },
-            "inbounds": [{ "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
+                    ],
+                    "alpn": alpn
+                }
+            });
+            match network {
+                "ws" => {
+                    stream["wsSettings"] = serde_json::json!({ "path": "/ws" });
+                }
+                "grpc" => {
+                    stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
+                }
+                _ => {}
+            }
+            serde_json::json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1", "port": env.port, "protocol": "vless",
+                    "settings": { "clients": [{ "id": UUID }], "decryption": "none" },
+                    "streamSettings": stream
+                }],
+                "outbounds": [{ "protocol": "freedom" }]
+            })
+        }
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
                 "users": [{ "uuid": UUID }],
                 "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path,
-                    "alpn": ["http/1.1"] } }],
-            "outbounds": [{ "type": "direct" }]
-        }),
+                    "alpn": alpn }
+            });
+            match network {
+                "ws" => {
+                    inbound["transport"] = serde_json::json!({ "type": "ws", "path": "/ws" });
+                }
+                "grpc" => {
+                    inbound["transport"] =
+                        serde_json::json!({ "type": "grpc", "service_name": "gun" });
+                }
+                _ => {}
+            }
+            serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            })
+        }
     };
     serde_json::to_string(&json).expect("vless server config serializes")
 }
@@ -244,17 +288,22 @@ fn vmess_reality_inbound(
 
 /// The `security` object for `tls`: `reality` (with pbk/sid) when the
 /// variant is REALITY, else plain `tls` with an optional `fp`.
-fn client_security(tls: &dyn TlsVariant) -> serde_json::Value {
+fn client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
     tls.reality_pbk().map_or_else(
-        || plain_client_security(tls),
+        || plain_client_security(tls, network),
         |pbk| reality_client_security(tls, pbk),
     )
 }
 
-/// The plain-TLS client `security` object, with an optional `fp`.
-fn plain_client_security(tls: &dyn TlsVariant) -> serde_json::Value {
+/// The plain-TLS client `security` object, with an optional `fp`. ALPN is
+/// transport-aware: grpc rides h2, everything else upgrades with http/1.1.
+fn plain_client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
+    let alpn = match network {
+        "grpc" => "h2",
+        _ => "http/1.1",
+    };
     let mut security = serde_json::json!({
-        "type": "tls", "sni": tls.sni(), "alpn": "http/1.1"
+        "type": "tls", "sni": tls.sni(), "alpn": alpn
     });
     if let Some(fp) = tls.fingerprint() {
         security["fp"] = serde_json::json!(fp);
@@ -287,7 +336,7 @@ pub fn client_params_vmess(
     target: SocketAddr,
     tls: &dyn TlsVariant,
 ) -> NativeConnectParams {
-    let mut security = client_security(tls);
+    let mut security = client_security(tls, "tcp");
     security["enc"] = serde_json::json!(enc);
     let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
         "schema": "Vmess",
@@ -310,12 +359,18 @@ pub fn client_params_vless(
     port: u16,
     target: SocketAddr,
     tls: &dyn TlsVariant,
+    network: &str,
 ) -> NativeConnectParams {
+    let transport = match network {
+        "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
+        "grpc" => serde_json::json!({ "type": "grpc", "service_name": "gun" }),
+        _ => serde_json::json!({ "type": "tcp" }),
+    };
     let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
         "schema": "Vless",
         "uuid": UUID,
-        "security": client_security(tls),
-        "transport": { "type": "tcp" }
+        "security": client_security(tls, network),
+        "transport": transport
     }))
     .expect("vless client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);
@@ -369,7 +424,7 @@ mod tests {
             tls_echo: "127.0.0.1:9443".parse().unwrap(),
         };
         let xray: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, &tls)).unwrap();
+            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, &tls, "tcp")).unwrap();
         let settings = &xray["inbounds"][0]["streamSettings"]["realitySettings"];
         assert_eq!(settings["show"], false);
         assert_eq!(settings["dest"], "127.0.0.1:9443");
@@ -378,7 +433,7 @@ mod tests {
         assert_eq!(settings["shortIds"][0], tls.reality_sid().unwrap());
 
         let sing: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, &tls)).unwrap();
+            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, &tls, "tcp")).unwrap();
         let tls_block = &sing["inbounds"][0]["tls"];
         let reality = &tls_block["reality"];
         assert_eq!(tls_block["server_name"], "localhost");
@@ -393,7 +448,7 @@ mod tests {
     fn client_params_reality_carry_pbk_and_sid() {
         let tls = RealityTls::fresh();
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &tls);
+        let params = client_params_vless(12345, target, &tls, "tcp");
         let sec = params.protocol.security().unwrap();
         assert_eq!(sec.type_str(), Some("reality"));
         assert_eq!(sec.pbk(), Some(tls.reality_pbk().unwrap()));

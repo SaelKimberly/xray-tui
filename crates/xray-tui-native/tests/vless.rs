@@ -54,3 +54,31 @@ async fn vless_reality_client_into_plain_server_is_fallback() {
         .await
         .expect("vless reality-into-plain e2e failed");
 }
+
+#[tokio::test]
+async fn vless_ws_against_cores() {
+    run_against_cores(&CaseSpec::vless().with_network("ws"))
+        .await
+        .expect("vless ws e2e failed");
+}
+
+#[tokio::test]
+async fn vless_ws_chrome_against_cores() {
+    run_against_cores(&CaseSpec::vless().with_network("ws").with_tls(Box::new(FingerprintTls("chrome"))))
+        .await
+        .expect("vless ws chrome e2e failed");
+}
+
+#[tokio::test]
+async fn vless_grpc_against_cores() {
+    run_against_cores(&CaseSpec::vless().with_network("grpc"))
+        .await
+        .expect("vless grpc e2e failed");
+}
+
+#[tokio::test]
+async fn vless_grpc_chrome_against_cores() {
+    run_against_cores(&CaseSpec::vless().with_network("grpc").with_tls(Box::new(FingerprintTls("chrome"))))
+        .await
+        .expect("vless grpc chrome e2e failed");
+}

@@ -82,7 +82,6 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
 pub struct WsStream {
     inner: WebSocketStream<BoxStream>,
     read_buf: BytesMut,
-    write_buf: Vec<u8>,
 }
 
 impl WsStream {
@@ -91,7 +90,6 @@ impl WsStream {
         Self {
             inner,
             read_buf: BytesMut::new(),
-            write_buf: Vec::new(),
         }
     }
 }
@@ -113,10 +111,8 @@ impl AsyncRead for WsStream {
                     self.read_buf.extend_from_slice(&b);
                 }
                 Poll::Ready(Some(Ok(Message::Close(_))) | None) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "ws peer closed",
-                    )));
+                    // Clean WS close: report EOF so `read_to_end` completes.
+                    return Poll::Ready(Ok(()));
                 }
                 // Ping (pong auto-sent by tungstenite), Pong, Text, Frame: ignored.
                 Poll::Ready(Some(Ok(_))) => {}
@@ -132,20 +128,25 @@ impl AsyncRead for WsStream {
 impl AsyncWrite for WsStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut TaskCx<'_>,
+        cx: &mut TaskCx<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.write_buf.extend_from_slice(buf);
+        // Write-through (leaf's pattern): one Binary frame per write, best
+        // effort flush so flush-less consumers (`write_all`-only) deliver.
+        match Pin::new(&mut self.inner).poll_ready(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+            Poll::Ready(Ok(())) => {}
+        }
+        let msg = Message::Binary(buf.to_vec().into());
+        if let Err(e) = Pin::new(&mut self.inner).start_send(msg) {
+            return Poll::Ready(Err(io::Error::other(e)));
+        }
+        let _ = Pin::new(&mut self.inner).poll_flush(cx);
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
-        if !self.write_buf.is_empty() {
-            let msg = Message::Binary(std::mem::take(&mut self.write_buf).into());
-            if let Err(e) = Pin::new(&mut self.inner).start_send(msg) {
-                return Poll::Ready(Err(io::Error::other(e)));
-            }
-        }
         Pin::new(&mut self.inner)
             .poll_flush(cx)
             .map_err(io::Error::other)

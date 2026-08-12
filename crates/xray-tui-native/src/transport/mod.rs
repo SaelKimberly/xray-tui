@@ -15,11 +15,12 @@ pub mod grpc;
 pub mod tcp;
 pub mod ws;
 
-/// Run the transport step. `base` is the stream from the previous chain hop
-/// (or `None` for the first hop, which dials the server directly).
+/// Run the transport step: dial the server (`base: None`) or reuse the
+/// previous tunnel (`base: Some`). The dial is ALWAYS TCP — ws/grpc framing
+/// is an upgrade over the secured stream (see [`upgrade`]).
 pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
-        None | Some("tcp") => tcp::connect(ctx, base).await,
+        None | Some("tcp" | "ws" | "grpc") => tcp::connect(ctx, base).await,
         Some(t) => Err(NativeError::NotImplemented {
             feature: format!("transport {t}"),
         }),
