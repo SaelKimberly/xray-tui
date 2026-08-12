@@ -286,9 +286,15 @@ mod local {
     }
 
     pub fn md5_hex(data: &[u8]) -> String {
+        use std::fmt::Write;
         let mut hasher = Md5::new();
         hasher.update(data);
-        format!("{:x}", hasher.finalize())
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(32);
+        for b in digest {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
     }
 
     fn sha256_hex12(data: &[u8]) -> String {

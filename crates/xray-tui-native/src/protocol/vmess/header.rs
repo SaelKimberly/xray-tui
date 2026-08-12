@@ -2,8 +2,8 @@
 //! + `proxy/vmess/aead/encrypt.go`).
 
 use aes::cipher::KeyInit;
+use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes128Gcm, Nonce};
 
 use crate::addr::{TargetAddr, encode_addr};
 use crate::error::NativeError;
@@ -116,7 +116,7 @@ pub fn encode_request(
         let plain = u16::try_from(body.len()).expect("vmess body length fits u16");
         len_aead
             .encrypt(
-                Nonce::from_slice(&len_nonce[..12]),
+                (&len_nonce[..12]).try_into().unwrap(),
                 Payload {
                     msg: &plain.to_be_bytes(),
                     aad: &auth_id,
@@ -136,7 +136,7 @@ pub fn encode_request(
         let body_aead = Aes128Gcm::new_from_slice(&body_key).expect("16-byte key");
         body_aead
             .encrypt(
-                Nonce::from_slice(&body_nonce[..12]),
+                (&body_nonce[..12]).try_into().unwrap(),
                 Payload {
                     msg: &body,
                     aad: &auth_id,
@@ -248,7 +248,7 @@ mod tests {
         let len_aead = Aes128Gcm::new_from_slice(&len_key).unwrap();
         let len_plain = len_aead
             .decrypt(
-                Nonce::from_slice(&len_nonce[..12]),
+                (&len_nonce[..12]).try_into().unwrap(),
                 Payload {
                     msg: len_cipher,
                     aad: auth_id,
@@ -262,7 +262,7 @@ mod tests {
         let body_aead = Aes128Gcm::new_from_slice(&body_key).unwrap();
         let body = body_aead
             .decrypt(
-                Nonce::from_slice(&body_nonce[..12]),
+                (&body_nonce[..12]).try_into().unwrap(),
                 Payload {
                     msg: body_cipher,
                     aad: auth_id,
@@ -331,7 +331,7 @@ mod tests {
         let len_aead = Aes128Gcm::new_from_slice(&len_key).unwrap();
         let len_plain = len_aead
             .decrypt(
-                Nonce::from_slice(&len_nonce[..12]),
+                (&len_nonce[..12]).try_into().unwrap(),
                 Payload {
                     msg: len_cipher,
                     aad: auth_id,
@@ -345,7 +345,7 @@ mod tests {
         let body_aead = Aes128Gcm::new_from_slice(&body_key).unwrap();
         let body = body_aead
             .decrypt(
-                Nonce::from_slice(&body_nonce[..12]),
+                (&body_nonce[..12]).try_into().unwrap(),
                 Payload {
                     msg: body_cipher,
                     aad: auth_id,

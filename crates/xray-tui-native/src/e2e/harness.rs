@@ -192,9 +192,8 @@ pub fn generate_certs() -> Certs {
     let server_params =
         CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
     let server_key = KeyPair::generate().unwrap();
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
+    let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+    let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
     Certs {
         cert_pem: server_cert.pem(),

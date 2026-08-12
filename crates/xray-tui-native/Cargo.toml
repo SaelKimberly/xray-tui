@@ -20,13 +20,13 @@ tokio-rustls = "0.26"
 webpki-roots = "1"
 
 # VMess wire crypto (mandatory for any VMess client — not feature-gated)
-aes = "0.8"
-aes-gcm = "0.10"
-chacha20poly1305 = "0.10"
-hmac = "0.12"
-sha2 = "0.10"
+aes = "0.9"
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+hmac = "0.13"
+sha2 = "0.11"
 crc32fast = "1"
-md-5 = "0.10"
+md-5 = "0.11"
 
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
 ring = "0.17"
@@ -37,13 +37,13 @@ ring = "0.17"
 # needs the raw private key — x25519-dalek derives the public half from
 # arbitrary 32-byte seeds. The runtime tunnel never needs keygen: the client
 # only ECDHs with the server's `pbk`.
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"], optional = true }
 
 # errors
 thiserror.workspace = true
 
 # pinSHA256 (base64) decode for the fingerprint connector's SPKI pin
-base64 = { version = "^0.22.1" }
+base64 = { version = "0.23" }
 
 # misc
 uuid.workspace = true
@@ -51,7 +51,7 @@ uuid.workspace = true
 # e2e pipeline (crate-side module -> real deps, optional behind the feature)
 serde_json = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
-rcgen = { version = "0.13", optional = true }
+rcgen = { version = "0.14", optional = true }
 tiny_http = { version = "0.12", optional = true }
 
 [lints]
@@ -67,4 +67,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # to lib unit tests regardless of feature selection (normal optional deps stay
 # for the feature-gated e2e module).
 serde_json.workspace = true
-rcgen = "0.13"
+rcgen = "0.14"

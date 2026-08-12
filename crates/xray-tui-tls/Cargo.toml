@@ -12,7 +12,7 @@ ring = "0.17"
 # TLS with the server's ephemeral keyshare) — ring 0.17's
 # EphemeralPrivateKey is single-use and cannot be serialized, so the
 # multi-agreement pair lives in x25519-dalek (same X25519 math as both cores).
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
 # async I/O seam
 tokio = { workspace = true, features = ["io-util", "time"] }
 # cert verification
@@ -20,7 +20,7 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 rustls-pki-types = "1"
 webpki-roots = "1"
 # JA3 hash
-md-5 = "0.10"
+md-5 = "0.11"
 # JSON parsing for the tls.peet.ws grader (example + ignored network test)
 serde_json.workspace = true
 # errors
@@ -31,7 +31,7 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
-rcgen = "0.13"
+rcgen = "0.14"
 # Interop proof: our client handshakes against a real rustls server. The
 # workspace dep pins default-features = false (ring is the workspace's
 # single crypto provider); we enable exactly ring + std so rustls's

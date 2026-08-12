@@ -820,7 +820,7 @@ mod tests {
                 .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let cfg = server_config(&certified.cert, &certified.key_pair);
+        let cfg = server_config(&certified.cert, &certified.signing_key);
 
         let server = tokio::task::spawn_blocking(move || {
             let (mut sock, _) = listener.accept().unwrap();

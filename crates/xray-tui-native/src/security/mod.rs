@@ -135,9 +135,8 @@ mod tests {
         let server_params =
             CertificateParams::new(vec![sni.to_string(), "127.0.0.1".to_string()]).unwrap();
         let server_key = KeyPair::generate().unwrap();
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
         (
             server_cert.pem(),

@@ -24,8 +24,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use aes_gcm::aead::Aead;
-use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
+use aes_gcm::{Aes128Gcm, KeyInit};
+use chacha20poly1305::ChaCha20Poly1305;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::BoxStream;
@@ -83,23 +83,15 @@ impl Cipher {
 
     fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, ()> {
         match self {
-            Self::Aes128Gcm(c) => c
-                .encrypt(Nonce::from_slice(nonce), plaintext)
-                .map_err(|_| ()),
-            Self::Chacha20Poly1305(c) => c
-                .encrypt(ChaChaNonce::from_slice(nonce), plaintext)
-                .map_err(|_| ()),
+            Self::Aes128Gcm(c) => c.encrypt(nonce.into(), plaintext).map_err(|_| ()),
+            Self::Chacha20Poly1305(c) => c.encrypt(nonce.into(), plaintext).map_err(|_| ()),
         }
     }
 
     fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
         match self {
-            Self::Aes128Gcm(c) => c
-                .decrypt(Nonce::from_slice(nonce), ciphertext)
-                .map_err(|_| ()),
-            Self::Chacha20Poly1305(c) => c
-                .decrypt(ChaChaNonce::from_slice(nonce), ciphertext)
-                .map_err(|_| ()),
+            Self::Aes128Gcm(c) => c.decrypt(nonce.into(), ciphertext).map_err(|_| ()),
+            Self::Chacha20Poly1305(c) => c.decrypt(nonce.into(), ciphertext).map_err(|_| ()),
         }
     }
 }
@@ -262,7 +254,7 @@ impl AsyncRead for VmessClientStream {
                         keys::kdf16_bytes_path(&this.session.response_body_iv, &[RESP_LEN_IV_SALT]);
                     let Ok(pt) = Aes128Gcm::new_from_slice(&len_key)
                         .expect("16-byte KDF output")
-                        .decrypt(Nonce::from_slice(&len_iv[..12]), &this.peel_len[..])
+                        .decrypt((&len_iv[..12]).try_into().unwrap(), &this.peel_len[..])
                     else {
                         this.read_state =
                             ReadState::Dead("vmess response header length decrypt failed");
@@ -310,7 +302,7 @@ impl AsyncRead for VmessClientStream {
                     let Ok(pt) = Aes128Gcm::new_from_slice(&payload_key)
                         .expect("16-byte KDF output")
                         .decrypt(
-                            Nonce::from_slice(&payload_iv[..12]),
+                            (&payload_iv[..12]).try_into().unwrap(),
                             &this.peel_buf[..total],
                         )
                     else {
@@ -482,7 +474,7 @@ impl AsyncWrite for VmessClientStream {
 #[cfg(test)]
 mod tests {
     use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
+    use aes_gcm::{Aes128Gcm, KeyInit};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -497,7 +489,7 @@ mod tests {
             let v = kdf16_bytes_path(iv, &[iv_salt.as_bytes()]);
             Aes128Gcm::new_from_slice(&k)
                 .unwrap()
-                .encrypt(Nonce::from_slice(&v[..12]), msg)
+                .encrypt((&v[..12]).try_into().unwrap(), msg)
                 .unwrap()
         }
         let mut wire = ae(
@@ -525,7 +517,7 @@ mod tests {
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         let ct = Aes128Gcm::new_from_slice(key)
             .unwrap()
-            .encrypt(Nonce::from_slice(&nonce[..12]), data)
+            .encrypt((&nonce[..12]).try_into().unwrap(), data)
             .unwrap();
         u16::try_from(data.len() + 16)
             .unwrap()
@@ -538,13 +530,13 @@ mod tests {
     /// Server-side chacha20-poly1305 response record (Go `EncodeResponseBody`
     /// with security 4): 2B BE ciphertext length + chacha20poly1305 data.
     fn seal_record_chacha(key16: &[u8; 16], iv: &[u8; 16], counter: u16, data: &[u8]) -> Vec<u8> {
-        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         let key32 = keys::chacha20_key_32(key16);
         let ct = ChaCha20Poly1305::new_from_slice(&key32)
             .unwrap()
-            .encrypt(Nonce::from_slice(&nonce[..12]), data)
+            .encrypt((&nonce[..12]).try_into().unwrap(), data)
             .unwrap();
         u16::try_from(data.len() + 16)
             .unwrap()
@@ -726,7 +718,7 @@ mod tests {
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         Aes128Gcm::new_from_slice(key)
             .unwrap()
-            .decrypt(Nonce::from_slice(&nonce[..12]), &ct[..])
+            .decrypt((&nonce[..12]).try_into().unwrap(), &ct[..])
             .unwrap()
     }
 

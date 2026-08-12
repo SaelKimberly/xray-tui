@@ -110,8 +110,8 @@ fn pad_key(key: &[u8], xor: u8) -> [u8; 64] {
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("hmac key any size");
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("hmac key any size");
     mac.update(msg);
     mac.finalize().into_bytes().into()
 }
@@ -137,7 +137,7 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
 /// block = [`ts_be`] [rand4] [`crc32(ts_be ‖ rand4)`]). Go `aead.CreateAuthID`.
 #[must_use]
 pub fn auth_id(cmd_key: &[u8; 16], ts_secs: i64, rand4: &[u8; 4]) -> [u8; 16] {
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
     let key = kdf16(cmd_key, &["AES Auth ID Encryption"]);
     let mut block = [0u8; 16];
     block[..8].copy_from_slice(&ts_secs.to_be_bytes());

@@ -236,6 +236,7 @@ mod tests {
     use crate::error::{Result, TlsError};
     use crate::handshake::{HandshakeParams, ServerVerifier, VerifyContext, connect};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
+    use rcgen::PublicKeyData;
 
     // ── helpers ────────────────────────────────────────────────────────────
 
@@ -306,14 +307,15 @@ mod tests {
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
         (ca_cert, ca_key, leaf_cert, leaf_key)
     }
 
     /// SHA-256 of a key's SPKI DER (the pin format), computed from the key
     /// itself — independent of [`leaf_spki`].
     fn spki_pin(key: &rcgen::KeyPair) -> [u8; 32] {
-        ring::digest::digest(&ring::digest::SHA256, &key.public_key_der())
+        ring::digest::digest(&ring::digest::SHA256, &key.subject_public_key_info())
             .as_ref()
             .try_into()
             .unwrap()
@@ -421,9 +423,14 @@ mod tests {
         // A self-signed server cert is not in the trust store (webpki-roots),
         // so the chain cannot build to any root.
         let verifier = WebPkiVerifier::webpki_roots();
-        let err = connect_server(&verifier, "localhost", &certified.cert, &certified.key_pair)
-            .await
-            .unwrap_err();
+        let err = connect_server(
+            &verifier,
+            "localhost",
+            &certified.cert,
+            &certified.signing_key,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TlsError::Verify(_)), "got: {err}");
     }
 
@@ -457,11 +464,16 @@ mod tests {
         let certified =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                 .unwrap();
-        let pin = spki_pin(&certified.key_pair);
+        let pin = spki_pin(&certified.signing_key);
         let verifier = WebPkiVerifier::webpki_roots().with_pin(pin);
-        connect_server(&verifier, "localhost", &certified.cert, &certified.key_pair)
-            .await
-            .unwrap();
+        connect_server(
+            &verifier,
+            "localhost",
+            &certified.cert,
+            &certified.signing_key,
+        )
+        .await
+        .unwrap();
     }
 
     /// Regression guard (review P2): pin mode must still reject a forged
@@ -532,7 +544,7 @@ mod tests {
         let ee = webpki::EndEntityCert::try_from(&der).unwrap();
         assert_eq!(
             ee.subject_public_key_info().as_ref(),
-            leaf_key.public_key_der()
+            leaf_key.subject_public_key_info()
         );
     }
 
