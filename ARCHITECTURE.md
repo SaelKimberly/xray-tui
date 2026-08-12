@@ -14,6 +14,15 @@ xray-tui (bin)
   └── xray-tui-host-features  (SNI/IP/CIDR whitelist membership — enrichment pipeline)
 ```
 
+Native stack (in-process tunnel alternative to the subprocess path; not yet
+wired into the binary — verified standalone via its e2e harness):
+
+```
+xray-tui-native     (in-process proxy core — VLESS + VMess tunnels, security phase)
+  ├── xray-tui-tls   (ring TLS 1.3 client, browser fingerprints, REALITY client)
+  └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
+```
+
 ## Crate Responsibilities
 
 ### xray-tui (binary crate)
@@ -486,6 +495,68 @@ pub fn export_client_config(profile: &Profile) -> Result<String>;
 Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI formats.
 
 ---
+
+### xray-tui-native (library crate)
+
+`crates/xray-tui-native/src/lib.rs` — in-process proxy core: client-side protocol
+implementations that replace spawning xray-core / sing-box for the tunnel. Built
+on the same `xray-tui-proto` typed configs (`NativeConnectParams` wraps
+`ProtocolConfig` + `EndpointEssentials`); no config model is defined here.
+
+Layering follows Xray composition order, folded by `connect_chain`:
+`dial → transport → security → protocol → tunnel`. Each phase consumes the
+previous phase's `BoxStream` (the `Stream` seam: AsyncRead+AsyncWrite+Unpin+Send)
+and returns the next.
+
+- `transport/` — TCP dial (the only implemented transport).
+- `security/` — `wrap()` dispatch on the profile's `TlsConfig`: `Tls` with no
+  `fp` + `TlsProvider::Standard` → standard rustls (`tls.rs`); `Tls` with any
+  `fp` value or `TlsProvider::Custom` → fingerprint engine (`fingerprint.rs`
+  `FingerprintConnector` over `xray-tui-tls`); `Reality` →
+  `security/reality.rs` (`RealityConnector`). Trust: `insecure` / `pin_sha256`
+  (pin replaces chain walk + SAN but never the CertificateVerify signature).
+- `protocol/` — 20 protocol modules; only `vless` + `vmess` are implemented.
+  Every other kind returns `NativeError::NotImplemented` naming the feature.
+  `shape.rs` `ConnectShape` marks the divergent paths (device tunnels:
+  WireGuard/Tailscale; own-handshake: SSH; outbound-only kinds: Redirect/TProxy/
+  Mixed).
+- `e2e/` (feature `native-e2e`) — real-core scenarios: spawns xray-core
+  26.3.27 / sing-box 1.13.16 server inbounds, dials with the native client,
+  probes HTTP through the tunnel. 7 cases (VLESS tls-standard/tls-chrome/reality,
+  VMess aes-128-gcm/chacha20-poly1305/tls-firefox/reality) × both cores.
+  Version-pinned: a core binary version mismatch is a hard fail, not a skip.
+
+Per-protocol roadmap and capability tables: `NATIVE_CORE.md`.
+
+### xray-tui-tls (library crate)
+
+`crates/xray-tui-tls/src/lib.rs` — ring-based TLS 1.3 client with browser
+fingerprint mimicry + a REALITY client. ring-only (no aws-lc-rs/rand/unsafe);
+CSPRNG via the crate-local `SecureRandom` seam (blanket impl for
+`ring::rand::SecureRandom`). One documented exception: x25519-dalek for the
+REALITY keypair, because ring's `EphemeralPrivateKey` is single-use and cannot
+serialize — REALITY must agree twice with the same scalar.
+
+- `spec/` — declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec` +
+  exact RFC 6066/8446 wire encodings; GREASE per RFC 8701.
+- `profiles/` — 12 browser profiles (`define_profiles!` macro): Chrome119/130/
+  133, ChromeAndroid130, Edge130, Brave167, Opera114, Firefox, Firefox128Esr,
+  Safari17, SafariIos17 (+ `Chrome` = Chrome130 alias).
+- `hello/` — `build_hello`/`to_record` (GREASE pairing, 512-byte record
+  padding), `parse_hello`.
+- `crypto/` — TLS 1.3 key schedule (RFC 8448-verified), AEAD record keys
+  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs.
+- `record/` — record framing, `read_record`, `TlsStream<S>`.
+- `handshake/` — client handshake (HRR detection, `ServerVerifier` seam,
+  multi-record flight reassembly).
+- `verify/` — `WebPkiVerifier` (roots / CA DER / `insecure` / `pin_sha256`).
+- `reality/` — `HelloProvisioner` + 9-step wire contract, `FixedChrome133`,
+  auth-key/session-seal/server-auth.
+- `http2/` — minimal h2 layer for the tls.peet.ws grader (not a client).
+
+Tier-2 verification: `examples/grader.rs` + ignored `tests/tls_peet_ws.rs`
+(tls.peet.ws). Interop proof: unit tests handshake against a real rustls server
+(dev-dep).
 
 ### xray-tui-db (library crate)
 

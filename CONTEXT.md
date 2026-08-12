@@ -16,6 +16,8 @@ crates/
 ├── xray-tui-dns/      # Library: secure DNS resolution via DNSCrypt stamps (DOH/DOT/DOQ)
 ├── xray-tui-geoip/    # Library: country/city lookup by IP (GeoLite2-City mmdb)
 ├── xray-tui-host-features/ # Library: SNI/exact-IP/CIDR whitelist membership checks (fastbloom)
+├── xray-tui-native/   # Library: in-process proxy core (subprocess-free tunnels; VLESS+VMess, TLS engine-backed)
+├── xray-tui-tls/      # Library: ring-based TLS 1.3 client, browser fingerprint mimicry, REALITY client
 thirdparty/
 ├── Xray-core/         # Source of truth for protocols and behavior
 ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
@@ -26,6 +28,7 @@ thirdparty/
 ROADMAP.md
 CONTEXT.md
 ARCHITECTURE.md
+NATIVE_CORE.md
 TUI_MANUAL.md
 AGENTS.md
 ```
@@ -89,6 +92,9 @@ AGENTS.md
 - **Log storage**: `TuiLogLayer` sends tracing events to log channel (non-blocking, `std::sync::mpsc::Sender`), consumed by background `spawn_blocking` batched writer. Uses `heed` (embedded LMDB) in `xray-tui-core::log_heed` with two databases: `logs` (u64 BE → postcard-encoded `LogMessage`) and `targets` (seen target string set). MapFull triggers automatic resize (1 GB default, doubles up to 8 GB) with backoff retry (50ms*(attempt+1), max 5) — the batch is retried after a successful resize, never dropped. Async wrappers (`read_recent_async`, `read_newer_than_async`, `read_older_than_async`, `get_targets_async`) wrap LMDB reads in `spawn_blocking` for non-blocking async calls from TUI event loop. Initial log loading is lazy (deferred to first Logs tab access).
 - **Theme system**: `ThemeStyles` (in `theme.rs`) replaces hardcoded `Style` constants with static methods taking `&Palette`. `Palette` comes from `ratatui_themes::ThemeName` → `Theme` → `palette_bridge::current_palette()`. Every screen uses `state.current_palette()` and `ThemeStyles::*` instead of bare `Color` values. New dependencies: `ratatui-cheese` (form widgets, `Palette`), `ratatui-themes` (theme definitions), `tui-popup` (overlays), `tui-scrollbar`. New modules: `palette_bridge`, `widgets/` (reusable `DataTable`).
 - **Protocols in scope**: Everything supported natively by either Xray-core or Sing-box. No third binary backends.
+- **Native in-process core** (`xray-tui-native`): client-side protocol implementations that remove the subprocess dependency for the tunnel itself. Xray composition order (`dial → transport → security → protocol → tunnel`); config source of truth is `xray-tui-proto` typed models (`NativeConnectParams`). Only VLESS + VMess implemented; every other kind has a dispatch arm returning `NativeError::NotImplemented` — no silent fallback. Feature `native-e2e` runs 7 cases against real xray-core 26.3.27 + sing-box 1.13.16 servers (version-pinned, hard-fail on mismatch). See `NATIVE_CORE.md`.
+- **TLS fingerprint engine** (`xray-tui-tls`): ring-only TLS 1.3 client (no aws-lc-rs/rand/unsafe) with browser ClientHello mimicry (12 profiles as declarative spec data, GREASE pairing, 512-byte record padding) + a REALITY client (x25519-dalek for the dual agreement — the one documented crypto exception). JA3/JA4 encoders; `WebPkiVerifier` with `insecure`/`pin_sha256` trust modes (pin replaces chain walk but never the CertificateVerify signature). Consumed by native's security phase: `fp` value or `TlsProvider::Custom` routes to the fingerprint engine, `reality` config to the RealityConnector.
+- **Verification tiers**: tier 1 offline unit/integration (RFC 8448 vectors, JA3/JA4 goldens, Go VMess vectors, rustls-server interop, multi-record reassembly); tier 2 live tls.peet.ws grader (`examples/grader.rs` + `#[ignore]`d test); tier 3 real-core e2e (feature + `XRAY_TUI_CORE_BIN_DIR`). No implicit network in the usual test run.
 
 ## Key source files
 
@@ -110,6 +116,8 @@ AGENTS.md
 - `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing → hickory-resolver 0.26 config, cached resolver list, panic-free async init
 - `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup
 - `crates/xray-tui-host-features/src/lib.rs` — HostFeaturesChecker: SNI/exact-IP/CIDR whitelist checks, download-if-missing from hxehex/russia-mobile-internet-whitelist
+- `crates/xray-tui-native/src/` — in-process proxy core: `chain.rs` (connect_chain), `context.rs` (LinkContext/NativeConnectParams), `security/` (tls.rs, fingerprint.rs, reality.rs, tls_provider.rs), `protocol/` (vless.rs + vmess.rs implemented; 18 kinds NotImplemented), `e2e/` (feature-gated real-core harness). Roadmap: `NATIVE_CORE.md`
+- `crates/xray-tui-tls/src/` — ring TLS 1.3 client: `spec/` + `profiles/` (12 browser fingerprints), `hello/` (builder + parser), `crypto/` (key schedule + JA3/JA4), `record/` (TlsStream), `handshake/` + `verify/` (WebPkiVerifier), `reality/` (HelloProvisioner + 9-step wire contract), `http2/` (grader-minimal)
 
 ## Key Differences from v2rayN
 
