@@ -25,6 +25,7 @@
 
 pub mod auth;
 pub mod messages;
+pub mod spider;
 pub mod verify;
 
 use std::ops::Range;
@@ -180,7 +181,7 @@ pub struct RealityParams<'a> {
 /// of the plain-TLS verifier seam. A server flight that fails REALITY auth
 /// (a real certificate) is reported as [`TlsError::RealityFallback`], not a
 /// hard error: the caller may fall back to the spider session.
-pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
+pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     params: RealityParams<'_>,
 ) -> Result<TlsStream<S>> {
@@ -237,17 +238,28 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
     .await?;
     match outcome {
         AuthOutcome::Ok => Ok(tls),
-        AuthOutcome::RealityFallback => Err(TlsError::RealityFallback),
+        AuthOutcome::RealityFallback => {
+            // The TLS session to the real site is established and usable —
+            // hand it to the Spider-X task so the connection looks like a
+            // browsing session, then report the fallback to the caller.
+            let spider = params.spider.clone();
+            let sni = params.server_name.to_string();
+            tokio::spawn(spider::run(tls, spider, sni));
+            Err(TlsError::RealityFallback)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::{Read, Write};
     use std::sync::Arc;
 
     use super::*;
     use crate::hello::parse::parse_hello;
+    use crate::http2;
+    use parking_lot::Mutex;
 
     /// The Chrome-133 provisioner lays out a valid `ClientHello` with a
     /// 32-byte zeroed `AuthPayload` slot at the reported range.
@@ -375,13 +387,18 @@ mod tests {
             .unwrap()
     }
 
-    /// A REALITY-mode client against a plain TLS server must yield
-    /// [`TlsError::RealityFallback`], not a hard error: the server echoes
-    /// the sealed session id, so the handshake proceeds to the
-    /// `CertificateVerify`, where the REALITY HMAC check fails on the real
-    /// certificate — the fallback signal the caller needs.
-    #[tokio::test]
-    async fn reality_against_plain_tls_server_is_fallback() {
+    /// Spawns the plain rustls server on a blocking thread, recording every
+    /// decrypted post-handshake byte (the spider's HTTP/2 plaintext) into
+    /// `recorded` — bounded to the first 512 bytes, then keeps draining
+    /// reads so the spider's writes never wedge on TCP backpressure.
+    ///
+    /// After the handshake it sends its own empty SETTINGS (RFC 7540 §3.5),
+    /// ACKs the client's SETTINGS, and answers every `END_STREAM` HEADERS
+    /// with an empty HEADERS + `END_STREAM` on the same stream (a 204-style
+    /// reply) so the spider's GETs complete promptly. The handshake itself
+    /// completes because `drive()` sends the client `Finished` even on the
+    /// fallback path.
+    fn spawn_recording_plain_tls_server(recorded: Arc<Mutex<Vec<u8>>>) -> std::net::SocketAddr {
         let certified =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                 .unwrap();
@@ -389,20 +406,117 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let cfg = plain_tls_server_config(&certified.cert, &certified.signing_key);
 
-        let server = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let timeout = std::time::Duration::from_secs(15);
             sock.set_read_timeout(Some(timeout)).unwrap();
             sock.set_write_timeout(Some(timeout)).unwrap();
             let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
-            // The client tears down after the failed auth; EOF/errors are
-            // expected once the handshake side completes.
             while conn.is_handshaking() {
                 if conn.complete_io(&mut sock).is_err() {
-                    break;
+                    return;
+                }
+            }
+            // Server connection preface: our own empty SETTINGS.
+            conn.writer()
+                .write_all(&http2::make_frame(http2::FRAME_SETTINGS, 0, 0, &[]))
+                .unwrap();
+            conn.write_tls(&mut sock).unwrap();
+
+            // Decrypted HTTP/2 plaintext: 24-byte preface, then 9-byte
+            // frame header + payload; `off` is the parse cursor.
+            let mut plain = Vec::new();
+            let mut off = 0usize;
+            loop {
+                if conn.read_tls(&mut sock).unwrap() == 0 {
+                    break; // the spider task finished and closed the connection
+                }
+                let state = conn.process_new_packets().unwrap();
+                if state.plaintext_bytes_to_read() > 0 {
+                    let mut buf = vec![0u8; state.plaintext_bytes_to_read()];
+                    // The buffer is exactly the available plaintext, so a
+                    // blocking read_exact cannot stall.
+                    conn.reader().read_exact(&mut buf).unwrap();
+                    plain.extend_from_slice(&buf);
+                }
+
+                // Record everything new since the last parse pass, bounded.
+                {
+                    let mut rec = recorded.lock();
+                    let take = (plain.len() - off).min(512usize.saturating_sub(rec.len()));
+                    rec.extend_from_slice(&plain[off..off + take]);
+                }
+
+                // Skip the client preface (may span several reads).
+                if off < http2::PREFACE.len() {
+                    if plain.len() < http2::PREFACE.len() {
+                        continue;
+                    }
+                    off = http2::PREFACE.len();
+                }
+
+                // Parse complete frames and reply per RFC 7540.
+                loop {
+                    if plain.len() - off < 9 {
+                        break; // incomplete frame header
+                    }
+                    let len = (usize::from(plain[off]) << 16)
+                        | (usize::from(plain[off + 1]) << 8)
+                        | usize::from(plain[off + 2]);
+                    let frame_len = 9usize + len;
+                    if plain.len() - off < frame_len {
+                        break; // incomplete frame payload
+                    }
+                    let ftype = plain[off + 3];
+                    let flags = plain[off + 4];
+                    let stream_id = u32::from_be_bytes([
+                        plain[off + 5] & 0x7F,
+                        plain[off + 6],
+                        plain[off + 7],
+                        plain[off + 8],
+                    ]);
+                    off += frame_len;
+                    match ftype {
+                        http2::FRAME_SETTINGS if flags & http2::FLAG_ACK == 0 => {
+                            conn.writer()
+                                .write_all(&http2::make_frame(
+                                    http2::FRAME_SETTINGS,
+                                    http2::FLAG_ACK,
+                                    0,
+                                    &[],
+                                ))
+                                .unwrap();
+                            conn.write_tls(&mut sock).unwrap();
+                        }
+                        http2::FRAME_HEADERS if flags & http2::FLAG_END_STREAM != 0 => {
+                            conn.writer()
+                                .write_all(&http2::make_frame(
+                                    http2::FRAME_HEADERS,
+                                    http2::FLAG_END_STREAM | http2::FLAG_END_HEADERS,
+                                    stream_id,
+                                    &[],
+                                ))
+                                .unwrap();
+                            conn.write_tls(&mut sock).unwrap();
+                        }
+                        _ => {}
+                    }
                 }
             }
         });
+
+        addr
+    }
+
+    /// A REALITY-mode client against a plain TLS server must yield
+    /// [`TlsError::RealityFallback`], not a hard error: the server echoes
+    /// the sealed session id, so the handshake proceeds to the
+    /// `CertificateVerify`, where the REALITY HMAC check fails on the real
+    /// certificate — the fallback signal the caller needs.
+    #[tokio::test]
+    async fn reality_against_plain_tls_server_is_fallback() {
+        let recorded: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_recording_plain_tls_server(recorded.clone());
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let rng = ring::rand::SystemRandom::new();
@@ -422,6 +536,27 @@ mod tests {
             matches!(result, Err(TlsError::RealityFallback)),
             "expected RealityFallback, got an unexpected handshake result"
         );
-        drop(server);
+
+        // The spawned Spider-X session must keep the established TLS
+        // session alive: poll the recorded bytes (up to 5s) for the HTTP/2
+        // client preface, which the spider writes on its first GET. The
+        // guard is scoped to a block so it never spans the await below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let preface_seen = {
+                let bytes = recorded.lock();
+                bytes
+                    .windows(http2::PREFACE.len())
+                    .any(|w| w == http2::PREFACE)
+            };
+            if preface_seen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "spider never sent the h2 preface to the dest"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }
