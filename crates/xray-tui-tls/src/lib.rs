@@ -7,6 +7,7 @@
 pub mod profiles;
 pub mod spec;
 pub use profiles::BrowserProfile;
+pub mod client;
 pub mod crypto;
 pub mod handshake;
 pub mod hello;
