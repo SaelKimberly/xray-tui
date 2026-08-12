@@ -24,6 +24,12 @@ Both crates are client-side only. Server-side protocol behavior remains the
 job of xray-core / sing-box; the e2e harness runs real cores as servers to
 prove wire compatibility.
 
+**Roadmap: engine-only TLS.** The native client path is engine-only — every
+TLS/REALITY connect runs through `xray-tui-tls`. The rustls *client* path was
+removed; rustls remains only as the server-side test double (unit tests + the
+e2e `tls_echo` dest). The engine is TLS 1.3-only: TLS 1.2 engine support is a
+future task, so legacy (TLS 1.2-only) servers are not yet reachable.
+
 ## Principles
 
 - **Xray composition order, one layer stack**: `dial → transport → security →
@@ -55,9 +61,9 @@ prove wire compatibility.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native` | unit + integration: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly | 172 tests (62 tls + 110 native) |
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native` | unit + integration: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback | 180 tests (118 tls + 62 native) |
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
-| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers | 7 cases × 2 cores green (see e2e cases) |
+| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers | 11 cases × 2 cores green (see e2e cases) |
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
@@ -73,7 +79,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
 | `transport/` | TCP dial (only transport implemented) |
-| `security/` | `wrap()` dispatch: `tls.rs` (tokio-rustls), `fingerprint.rs` (`FingerprintConnector`), `reality.rs` (`RealityConnector`), `tls_provider.rs` (`TlsProvider` plug, `TlsParams`) |
+| `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `BrowserProfile`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented` |
 | `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
 | `shape.rs` | `ConnectShape`: uniform vs divergent connect paths |
@@ -85,41 +91,62 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 |--------|----------------|
 | `spec/` | declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec`, RFC 6066/8446 wire encodings, GREASE (RFC 8701) |
 | `profiles/` | 12 browser profiles as spec data (`define_profiles!` macro): Chrome119/130/133, ChromeAndroid130, Edge130, Brave167, Opera114, Firefox, Firefox128Esr, Safari17, SafariIos17 (+ `Chrome` = Chrome130 alias) |
+| `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
 | `crypto/` | key schedule (RFC 8448-verified), AEAD record keys (IV XOR seq), `X25519KeyPair`, `fingerprint/` JA3 + JA4 encoders |
 | `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF) |
-| `handshake/` | TLS 1.3 client handshake, `ServerVerifier` seam, multi-record flight reassembly |
+| `handshake/` | TLS 1.3 client handshake, `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY |
 | `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked) |
-| `reality/` | `HelloProvisioner` + 9-step wire contract, `FixedChrome133`, auth-key/session-seal/server-auth |
-| `http2/` | minimal h2 layer (tls.peet.ws grading only) |
+| `reality/` | `HelloProvisioner` + `ProfileProvisioner(BrowserProfile)` (any of the 12 profiles) + 9-step wire contract, `FixedChrome133`, auth-key/session-seal/server-auth, `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
+| `http2/` | minimal h2 layer (tls.peet.ws grading + Spider-X fallback GETs) |
 | `error.rs` | `TlsError`/`Result` (thiserror) |
 
 ## Security layer capabilities
 
-`security::wrap` dispatch (from the profile's `TlsConfig`):
+Every TLS/REALITY connect is engine-only: `security::wrap` builds an engine
+`TlsConfig` from the profile's proto security config and runs
+`xray_tui_tls::client::connect` (`TlsMode::Plain` | `TlsMode::Reality`). The
+rustls client path and the `TlsProvider` plug are gone.
 
 | Path | Trigger | Mechanism | Status |
 |------|---------|-----------|--------|
-| Standard TLS | `tls` config, no `fp`, provider `Standard` | tokio-rustls (workspace rustls, ring backend) | ✅ |
-| Fingerprint TLS | `tls` config with any `fp` value, or `TlsProvider::Custom` | `FingerprintConnector` → xray-tui-tls handshake + `WebPkiVerifier`; profile = `parse_fingerprint_id(fp)` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
-| REALITY | `reality` config | `RealityConnector` → xray-tui-tls REALITY client (`HelloProvisioner`); server authenticated by auth key, not PKI | ✅ |
+| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → Chrome130 default), `WebPkiVerifier` via `verifier_for(insecure, pin)`; profile = `parse_fingerprint_id(fp)` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
+| REALITY | `reality` config | engine `TlsMode::Reality`: fingerprint-shaped hello with any of the 12 profiles via `ProfileProvisioner(BrowserProfile)` (or a custom `HelloProvisioner`), sealed session id, X25519 auth key + HMAC/Ed25519 server auth (no PKI); Spider-X fallback on auth failure | ✅ |
 | Trust modes | `insecure` / `pin_sha256` | `with_insecure()` skips chain walk; `with_pin(sha256(SPKI))` replaces chain+SAN but **never** skips the CertificateVerify signature (a MITM must hold the private key) | ✅ |
 
-`TlsParams` carries sni/alpn/fingerprint/insecure/pin_sha256. `fp.is_some() ||
-Custom` is the exact routing condition — a non-empty `fp` always means the
-fingerprint engine, never stock rustls.
+The unified API: `TlsConfig { mode: TlsMode, server_name, alpn, rng }` with a
+single entry point `connect(stream, &TlsConfig)` — `TlsMode::Plain { profile,
+verifier }` and `TlsMode::Reality { provisioner, public_key, short_id,
+spider }`. REALITY is a security layer over the same TLS machinery: plain and
+REALITY handshakes share one driver (`handshake::drive`).
+
+**Spider-X fallback.** On a REALITY auth failure — the server flight is a real
+certificate (a transparent proxy / possible MITM), mirroring xray-core
+`reality.go`'s `!Verified` path — the client keeps the established TLS session
+alive instead of tearing it down: it walks the real site with bounded HTTP/2
+GETs (`SpiderConfig { paths, max_gets, request_interval }`; padding cookie +
+Referer chaining) so a DPI observer sees browsing traffic, then reports
+`TlsError::RealityFallback` → native `NativeError::Reality("REALITY: received
+real certificate (potential MITM or redirection)")`.
 
 ## E2E coverage (tier 3)
 
-7 cases, each run against both cores (xray 26.3.27, sing-box 1.13.16), each
+11 cases, each run against both cores (xray 26.3.27, sing-box 1.13.16), each
 spawning a real server inbound + dialing it with the native client and probing
-HTTP through the tunnel:
+HTTP through the tunnel. The last four are two-servers scenarios: the REALITY
+server's `dest` is a second local server (`tls_echo`), so a fallback or a
+transparently-proxied plain probe terminates there and the recording server
+observes the client's bytes (spider h2 preface / plain-TLS ClientHello).
 
 | Case | Payload security | TLS variant |
 |------|------------------|-------------|
 | VLESS | — | tls-standard |
 | VLESS | — | tls-chrome (fingerprint engine) |
 | VLESS | — | reality |
+| VLESS | — | reality-wrong-pbk (client holds a wrong pbk → server proxies → Spider-X → fallback) |
+| VLESS | — | reality-wrong-sid (client sid mismatch → server proxies → Spider-X → fallback) |
+| VLESS | — | reality-server-plain-client (plain fingerprint probe through a REALITY server → transparently proxied to dest, stealth) |
+| VLESS | — | plain-server-reality-client (REALITY client against a cert-TLS server → Spider-X → fallback) |
 | VMess | aes-128-gcm | tls-standard |
 | VMess | chacha20-poly1305 | tls-standard |
 | VMess | aes-128-gcm | tls-firefox (fingerprint engine) |
@@ -140,9 +167,11 @@ Legend (emoji = phase/decision per column):
 
 Capability columns compare what the mainstream repositories (xray-core,
 sing-box — `thirdparty/`) provide for each protocol. "Native client" is the
-xray-tui-native tunnel; "TLS engine" is the xray-tui-tls path that backs it
-(the engine is fully built — the column marks whether the protocol routes
-through it); "REALITY" marks REALITY compatibility; "e2e" is tier-3 proof.
+xray-tui-native tunnel; "TLS engine" is the xray-tui-tls path — engine-only
+now, every TLS/REALITY connect routes through `xray_tui_tls::client::connect`
+(the column marks whether the protocol routes through it); "REALITY" marks
+REALITY compatibility (any of the 12 browser profiles via
+`ProfileProvisioner`); "e2e" is tier-3 proof.
 
 ### Overview matrix
 
@@ -173,6 +202,8 @@ Notes on the matrix:
 - **TLS engine / REALITY columns** are "✅" only for the TCP-stream family
   where the security phase applies. QUIC-family protocols (Hysteria1/2, TUIC)
   carry TLS inside QUIC and need a QUIC transport first — 🔒.
+- **TLS 1.2**: the engine is TLS 1.3-only. TLS 1.2 engine support is a future
+  task — legacy (TLS 1.2-only) servers are not yet reachable.
 - **Shadowsocks** gets no TLS column (plain TCP + AEAD; obfuscation comes from
   plugins, which are 📋 transport work). `ss` method whitelists live in
   `proto_spec/core_mapping.rs`.
@@ -366,7 +397,10 @@ Notes on the matrix:
 2. **Non-TCP transports** (WS first — most common real-world flavor).
 3. **QUIC transport** unlocks Hysteria1/2 + TUIC.
 4. **Wire in the TUI**: a per-profile "native" toggle (or auto-fallback when a
-   core binary is missing) — the `TlsProvider` seam already proves the
-   integration point.
+   core binary is missing) — the unified `xray_tui_tls::client::connect` /
+   `TlsConfig` engine API already proves the integration point.
 5. **Outbound-only kinds + routing** via native (redirect dial for
    split-tunnel rules).
+6. **TLS 1.2 engine support** — the engine is TLS 1.3-only today; legacy
+   (TLS 1.2-only) servers become reachable only after the engine learns
+   TLS 1.2.
