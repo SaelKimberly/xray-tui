@@ -20,7 +20,7 @@ use xray_tui_tls::reality::{HelloProvisioner, ProfileProvisioner, SpiderConfig};
 
 use crate::BoxStream;
 use crate::context::LinkContext;
-use crate::error::NativeError;
+use crate::error::{NativeError, timeouts};
 use crate::security::reality::HelloProvisionerChoice;
 
 /// Wrap the transport stream according to the profile's security config.
@@ -28,6 +28,7 @@ use crate::security::reality::HelloProvisionerChoice;
 /// Both arms build an engine [`EngineTlsConfig`] from the proto security
 /// config and run `xray_tui_tls::client::connect`: plain TLS (fingerprint
 /// profile + verifier seam) and REALITY (provisioner + server material).
+/// Each handshake is bounded by [`timeouts::SECURITY`].
 pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let Some(sec) = ctx.security() else {
         return Ok(stream);
@@ -53,9 +54,14 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 alpn: (!ctx.alpn_vec().is_empty()).then(|| ctx.alpn_vec()),
                 rng,
             };
-            Ok(Box::new(
-                client_connect(stream, &config).await.map_err(map_tls_err)?,
-            ))
+            let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
+                .await
+                .map_err(|_| NativeError::Timeout {
+                    step: "tls handshake",
+                    limit: timeouts::SECURITY,
+                })?
+                .map_err(map_tls_err)?;
+            Ok(Box::new(tls))
         }
         Some(TlsConfig::Reality(opts)) => {
             let pbk = sec
@@ -88,9 +94,14 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 alpn: None,
                 rng,
             };
-            Ok(Box::new(
-                client_connect(stream, &config).await.map_err(map_tls_err)?,
-            ))
+            let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
+                .await
+                .map_err(|_| NativeError::Timeout {
+                    step: "reality handshake",
+                    limit: timeouts::SECURITY,
+                })?
+                .map_err(map_tls_err)?;
+            Ok(Box::new(tls))
         }
         None => Ok(stream),
     }
