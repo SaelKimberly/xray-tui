@@ -76,15 +76,51 @@ pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
             };
             let cfg = server_cfg.clone();
             tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                let Ok(mut tls) = acceptor.accept(sock).await else {
+                use std::io::{Read as _, Write as _};
+                // The REALITY inbound borrows this server's ServerHello flight
+                // over the same socket; rustls's connection API is
+                // synchronous, so each session runs on a blocking thread.
+                let Ok(mut std_sock) = sock.into_std() else {
                     return;
                 };
-                let mut buf = [0u8; 4096];
-                let _ = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
-                let _ = tls.write_all(TLS_RESPONSE).await;
-                let _ = tls.shutdown().await;
+                tokio::task::spawn_blocking(move || {
+                    let timeout = Duration::from_secs(5);
+                    let _ = std_sock.set_read_timeout(Some(timeout));
+                    let _ = std_sock.set_write_timeout(Some(timeout));
+                    let Ok(mut conn) = rustls::ServerConnection::new(cfg) else {
+                        return;
+                    };
+                    while conn.is_handshaking() && conn.complete_io(&mut std_sock).is_ok() {}
+                    if conn.is_handshaking() {
+                        return; // handshake failed or timed out
+                    }
+                    // Read the first application-data chunk (the spider's
+                    // request), then answer and close.
+                    let mut buf = [0u8; 4096];
+                    let mut got = 0;
+                    loop {
+                        if conn.read_tls(&mut std_sock).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let _ = conn.process_new_packets();
+                        while got < buf.len() {
+                            match conn.reader().read(&mut buf[got..]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got += n,
+                            }
+                            if got > 0 {
+                                break;
+                            }
+                        }
+                        if got > 0 {
+                            break;
+                        }
+                    }
+                    let _ = conn.writer().write_all(TLS_RESPONSE);
+                    let _ = conn.write_tls(&mut std_sock);
+                    conn.send_close_notify();
+                    let _ = conn.write_tls(&mut std_sock);
+                });
             });
         }
     });

@@ -34,10 +34,10 @@ pub trait TlsVariant: Sync {
     fn reality_sid(&self) -> Option<&str> {
         None
     }
-    /// Install the harness-CA trust this variant's client path needs. Stock
-    /// TLS installs the rustls test config, fingerprint the engine's test CA,
-    /// REALITY needs none (its auth key, not a PKI chain, authenticates the
-    /// server).
+    /// Install the harness-CA trust this variant's client path needs. Both
+    /// certificate-TLS variants (stock and fingerprint) install the engine's
+    /// test CA; REALITY needs none (its auth key, not a PKI chain,
+    /// authenticates the server).
     fn client_trust(&self, _certs: &Certs) {}
 }
 
@@ -53,9 +53,7 @@ impl TlsVariant for StandardTls {
     }
     fn client_trust(&self, certs: &Certs) {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        crate::security::tls::set_test_config(crate::security::tls::test_client_config(
-            &certs.ca_der,
-        ));
+        crate::security::fingerprint::set_test_ca(&certs.ca_der);
     }
 }
 

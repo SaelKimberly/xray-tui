@@ -3,7 +3,6 @@
 //! strings (see `variant.rs`).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use base64::Engine as _;
 use ring::rand::SecureRandom as _;
@@ -14,8 +13,6 @@ use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use super::{CoreKind, ServerEnv, TlsVariant};
 use crate::NativeConnectParams;
 use crate::addr::{Host, TargetAddr};
-use crate::security::fingerprint::FingerprintConnector;
-use crate::security::tls_provider::TlsProvider;
 
 pub const UUID: &str = "00000000-0000-0000-0000-000000000000";
 pub const BODY: &str = "hello native core";
@@ -279,15 +276,6 @@ fn reality_client_security(tls: &dyn TlsVariant, pbk: &str) -> serde_json::Value
     })
 }
 
-/// Apply the variant's client-side provider selection: a fingerprint id
-/// routes through the fingerprint engine.
-fn apply_provider(mut params: NativeConnectParams, tls: &dyn TlsVariant) -> NativeConnectParams {
-    if tls.fingerprint().is_some() {
-        params.tls_provider = TlsProvider::Custom(Arc::new(FingerprintConnector));
-    }
-    params
-}
-
 /// Native client params dialing a `VMess` listener with payload security `enc`.
 #[must_use]
 pub fn client_params_vmess(
@@ -306,12 +294,11 @@ pub fn client_params_vmess(
     }))
     .expect("vmess client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);
-    let params = NativeConnectParams::new(
+    NativeConnectParams::new(
         protocol,
         server,
         TargetAddr::new(Host::Ip(target.ip()), target.port()),
-    );
-    apply_provider(params, tls)
+    )
 }
 
 /// Native client params dialing a VLESS listener.
@@ -329,12 +316,11 @@ pub fn client_params_vless(
     }))
     .expect("vless client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);
-    let params = NativeConnectParams::new(
+    NativeConnectParams::new(
         protocol,
         server,
         TargetAddr::new(Host::Ip(target.ip()), target.port()),
-    );
-    apply_provider(params, tls)
+    )
 }
 
 #[cfg(test)]
@@ -412,11 +398,10 @@ mod tests {
     }
 
     #[test]
-    fn client_params_fingerprint_set_fp_and_custom_provider() {
+    fn client_params_fingerprint_set_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
         let params = client_params_vless(12345, target, &FingerprintTls("chrome"));
         assert_eq!(params.protocol.security().unwrap().fp(), Some("chrome"));
-        assert!(matches!(params.tls_provider, TlsProvider::Custom(_)));
     }
 
     #[test]
@@ -424,6 +409,5 @@ mod tests {
         let target = "1.2.3.4:80".parse().unwrap();
         let params = client_params_vless(12345, target, &StandardTls);
         assert_eq!(params.protocol.security().unwrap().fp(), None);
-        assert!(matches!(params.tls_provider, TlsProvider::Standard));
     }
 }

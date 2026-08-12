@@ -67,7 +67,7 @@ rapidhash = { version = "4.5", features = ["std", "unsafe"] }
 # Workspace TLS standard is RING ONLY — aws-lc-rs is denied. Every rustls
 # consumer must use default-features = false (rustls 0.23 defaults to
 # aws_lc_rs). Watch: tokio-rustls 0.26's DEFAULT features include
-# aws_lc_rs (xray-tui-native pins it default-features = false + ring/tls12 —
+# aws_lc_rs (xray-tui-core pins it default-features = false + ring/tls12 —
 # that pin is the reason aws-lc-rs stays out of the lockfile; check with
 # `cargo tree -i aws-lc-rs` after any dependency change).
 rustls = { version = "0.23", default-features = false }

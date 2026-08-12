@@ -1,25 +1,33 @@
 //! Security phase: wrap the transport stream (TLS, Reality — or identity).
 //!
 //! MIDDLE layer: transport → SECURITY → protocol. Security dispatches on
-//! `SecurityConfig` from the proto payload.
+//! `SecurityConfig` from the proto payload. Every TLS/REALITY connect runs
+//! through the `xray-tui-tls` engine (`xray_tui_tls::client::connect`); the
+//! rustls client path and the `TlsProvider` plug are gone.
 
 pub mod fingerprint;
 pub mod reality;
-pub mod tls;
-pub mod tls_provider;
 
 use std::sync::Arc;
 
 use xray_tui_proto::proto_spec::TlsConfig;
+use xray_tui_tls::SecureRandom;
+use xray_tui_tls::client::{TlsConfig as EngineTlsConfig, TlsMode, connect as client_connect};
+use xray_tui_tls::error::TlsError;
+use xray_tui_tls::handshake::ServerVerifier;
+use xray_tui_tls::profiles::BrowserProfile;
+use xray_tui_tls::reality::{HelloProvisioner, ProfileProvisioner, SpiderConfig};
 
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::NativeError;
-use crate::security::tls_provider::{TlsConnector, TlsParams, TlsProvider};
-
-use self::fingerprint::FingerprintConnector;
+use crate::security::reality::HelloProvisionerChoice;
 
 /// Wrap the transport stream according to the profile's security config.
+///
+/// Both arms build an engine [`EngineTlsConfig`] from the proto security
+/// config and run `xray_tui_tls::client::connect`: plain TLS (fingerprint
+/// profile + verifier seam) and REALITY (provisioner + server material).
 pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let Some(sec) = ctx.security() else {
         return Ok(stream);
@@ -27,45 +35,87 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
     if sec.is_empty() {
         return Ok(stream);
     }
+    let rng: Arc<dyn SecureRandom> = Arc::new(ring::rand::SystemRandom::new());
     match &sec.tls {
         Some(TlsConfig::Tls(opts)) => {
-            // A `Custom` provider, or any `fp` value in the config, routes
-            // through the fingerprint engine (`FingerprintConnector` unless
-            // the caller supplied its own `TlsConnector`).
-            let custom = matches!(ctx.params.tls_provider, TlsProvider::Custom(_))
-                || opts.fp.as_ref().is_some_and(|f| !f.is_empty());
-            if custom {
-                let connector: Arc<dyn TlsConnector> = match &ctx.params.tls_provider {
-                    TlsProvider::Custom(c) => c.clone(),
-                    TlsProvider::Standard => Arc::new(FingerprintConnector),
-                };
-                let params = TlsParams {
-                    sni: ctx.sni(),
-                    alpn: ctx.alpn_vec(),
-                    fingerprint: opts
-                        .fp
-                        .as_deref()
-                        .map(fingerprint::parse_fingerprint_id)
-                        .transpose()?,
-                    insecure: opts.insecure.unwrap_or(false),
-                    pin_sha256: fingerprint::decode_pin_sha256(opts.pin_sha256.as_deref())?,
-                };
-                connector.connect(stream, params).await
-            } else {
-                tls::connect(ctx, stream).await
-            }
+            let profile = opts
+                .fp
+                .as_ref()
+                .map(|fp| fingerprint::parse_fingerprint_id(fp).and_then(fingerprint::profile_for))
+                .transpose()?;
+            let verifier: Arc<dyn ServerVerifier> = Arc::new(fingerprint::verifier_for(
+                opts.insecure.unwrap_or(false),
+                fingerprint::decode_pin_sha256(opts.pin_sha256.as_deref())?,
+            ));
+            let config = EngineTlsConfig {
+                mode: TlsMode::Plain { profile, verifier },
+                server_name: ctx.sni(),
+                alpn: (!ctx.alpn_vec().is_empty()).then(|| ctx.alpn_vec()),
+                rng,
+            };
+            Ok(Box::new(
+                client_connect(stream, &config).await.map_err(map_tls_err)?,
+            ))
         }
-        Some(TlsConfig::Reality(_)) => reality::connect(ctx, stream).await,
+        Some(TlsConfig::Reality(opts)) => {
+            let pbk = sec
+                .pbk()
+                .ok_or_else(|| NativeError::Reality("reality config missing pbk".into()))?;
+            let provisioner: Arc<dyn HelloProvisioner> = match &ctx.params.reality_provisioner {
+                HelloProvisionerChoice::Custom(p) => p.clone(),
+                HelloProvisionerChoice::FixedChrome133 => match &opts.fp {
+                    Some(fp) => Arc::new(ProfileProvisioner(
+                        fingerprint::parse_fingerprint_id(fp).and_then(fingerprint::profile_for)?,
+                    )),
+                    None => Arc::new(ProfileProvisioner(BrowserProfile::Chrome133)),
+                },
+            };
+            let spider = SpiderConfig {
+                paths: opts
+                    .spx
+                    .as_ref()
+                    .map_or_else(|| vec!["/".to_string()], |s| vec![s.to_string()]),
+                ..SpiderConfig::default()
+            };
+            let config = EngineTlsConfig {
+                mode: TlsMode::Reality {
+                    provisioner,
+                    public_key: reality::decode_pbk(pbk)?,
+                    short_id: reality::decode_sid(sec.sid().unwrap_or_default())?,
+                    spider,
+                },
+                server_name: ctx.sni(),
+                alpn: None,
+                rng,
+            };
+            Ok(Box::new(
+                client_connect(stream, &config).await.map_err(map_tls_err)?,
+            ))
+        }
         None => Ok(stream),
+    }
+}
+
+/// Map an engine handshake error onto the native error surface: a REALITY
+/// fallback (the server flight was not REALITY-authenticated — a real
+/// certificate, e.g. a transparent proxy) is a `Reality` error, everything
+/// else a `Tls` error.
+fn map_tls_err(e: TlsError) -> NativeError {
+    match e {
+        TlsError::RealityFallback => NativeError::Reality(
+            "REALITY: received real certificate (potential MITM or redirection)".into(),
+        ),
+        other => NativeError::Tls(format!("TLS error: {other}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
     use std::sync::Arc;
 
+    use rustls;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_rustls::rustls;
     use xray_tui_proto::proto_spec::ProtocolConfig;
     use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
@@ -159,6 +209,43 @@ mod tests {
             .expect("server config builds")
     }
 
+    /// Spawns a blocking-thread rustls server that completes the handshake
+    /// and echoes back the first application-data bytes it reads (the client
+    /// sends 4, reads 4 back, then drops the stream).
+    fn spawn_echo_tls_server(cert_pem: &str, key_pem: &str) -> std::net::SocketAddr {
+        let cfg = server_config(cert_pem, key_pem);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let timeout = std::time::Duration::from_secs(15);
+            sock.set_read_timeout(Some(timeout)).expect("read timeout");
+            sock.set_write_timeout(Some(timeout))
+                .expect("write timeout");
+            let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).expect("server conn");
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).expect("handshake");
+            }
+            // Drain decrypted application data; echo the first chunk.
+            while let Ok(read) = conn.read_tls(&mut sock) {
+                if read == 0 {
+                    break;
+                }
+                let state = conn.process_new_packets().expect("process packets");
+                if state.plaintext_bytes_to_read() > 0 {
+                    let mut buf = vec![0u8; state.plaintext_bytes_to_read()];
+                    // The buffer is exactly the available plaintext, so a
+                    // blocking read_exact cannot stall.
+                    conn.reader().read_exact(&mut buf).expect("read plaintext");
+                    conn.writer().write_all(&buf).expect("write plaintext");
+                    conn.write_tls(&mut sock).expect("flush");
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn none_security_is_identity() {
         // No `security` key at all: `SecurityConfig` has no null representation.
@@ -184,19 +271,10 @@ mod tests {
         // here (idempotent).
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
-        tls::set_test_config(tls::test_client_config(&ca_der));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let acceptor =
-                tokio_rustls::TlsAcceptor::from(Arc::new(server_config(&cert_pem, &key_pem)));
-            let mut tls = acceptor.accept(sock).await.unwrap();
-            let mut buf = [0u8; 4];
-            tls.read_exact(&mut buf).await.unwrap();
-            tls.write_all(&buf).await.unwrap();
-        });
+        // The engine verifies through its own thread-local test CA (the
+        // harness CA), replacing the deleted rustls `set_test_config` path.
+        fingerprint::set_test_ca(&ca_der);
+        let addr = spawn_echo_tls_server(&cert_pem, &key_pem);
 
         let ctx = ctx_for(vless_with_tls("localhost"));
         // Point the context at the test listener (server host is 127.0.0.1:addr).
@@ -210,7 +288,6 @@ mod tests {
         let mut buf = [0u8; 4];
         out.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -220,27 +297,13 @@ mod tests {
         // here (idempotent).
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
-        // The fingerprint engine verifies through its own thread-local test
-        // CA (mirrors `tls::set_test_config` for the rustls path).
         fingerprint::set_test_ca(&ca_der);
+        let addr = spawn_echo_tls_server(&cert_pem, &key_pem);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let acceptor =
-                tokio_rustls::TlsAcceptor::from(Arc::new(server_config(&cert_pem, &key_pem)));
-            let mut tls = acceptor.accept(sock).await.unwrap();
-            let mut buf = [0u8; 4];
-            tls.read_exact(&mut buf).await.unwrap();
-            tls.write_all(&buf).await.unwrap();
-        });
-
-        // Fingerprint path: `fp` id in the config AND a `Custom` provider.
+        // Engine Plain arm with a fingerprint profile: `fp` id in the config.
         let ctx = ctx_for(vless_with_tls_fp("localhost", "chrome"));
         let mut params = ctx.params.clone();
         params.server = EndpointEssentials::new(addr.ip().to_string(), addr.port());
-        params.tls_provider = TlsProvider::Custom(Arc::new(fingerprint::FingerprintConnector));
         let ctx = LinkContext::new(params, ctx.target.clone());
 
         let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -249,7 +312,6 @@ mod tests {
         let mut buf = [0u8; 4];
         out.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
-        server.await.unwrap();
     }
 
     #[tokio::test]

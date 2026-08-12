@@ -14,13 +14,11 @@ xray-tui-tls.workspace = true
 # async runtime
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 
-# TLS (workspace standard: ring backend)
-rustls = { workspace = true, features = ["ring"] }
-# TLS (workspace standard: ring backend). tokio-rustls 0.26's DEFAULT
-# features include `aws_lc_rs` (rustls/aws_lc_rs) — the only aws-lc-rs
-# enabler in the tree — so default-features = false + ring/tls12.
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
+# TLS (workspace standard: ring backend). Only the server double for the
+# e2e module and unit tests needs rustls — the client path is the engine.
+# Optional: enabled by `native-e2e`, and available to unit tests via the
+# dev-dependency below (which does not require the feature).
+rustls = { workspace = true, features = ["ring"], optional = true }
 
 # VMess wire crypto (mandatory for any VMess client — not feature-gated)
 aes = "0.9"
@@ -61,7 +59,7 @@ tiny_http = { version = "0.12", optional = true }
 workspace = true
 
 [features]
-native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek"]
+native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek", "dep:rustls"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -71,3 +69,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # for the feature-gated e2e module).
 serde_json.workspace = true
 rcgen = "0.14"
+# rustls: the server double in unit tests (src/security) under `cfg(test)`,
+# without the `native-e2e` feature (which re-enables it via `dep:rustls`).
+rustls = { workspace = true, features = ["ring"] }
