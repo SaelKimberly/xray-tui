@@ -90,7 +90,11 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     short_id: reality::decode_sid(sec.sid().unwrap_or_default())?,
                     spider,
                 },
-                server_name: ctx.sni(),
+                // The REALITY steal target: `SecurityConfig::sni()` reads
+                // `RealityOpts.sni` — NOT `ctx.sni()`, whose `tls_opts()`
+                // helper rejects Reality configs and would fall back to the
+                // (often IP-literal) server host.
+                server_name: sec.sni().unwrap_or(&ctx.params.server.host).to_string(),
                 alpn: None,
                 rng,
             };
@@ -346,5 +350,30 @@ mod tests {
             !matches!(out, Err(NativeError::NotImplemented { .. })),
             "reality must not be NotImplemented"
         );
+    }
+
+    #[tokio::test]
+    async fn reality_against_plain_server_maps_to_reality_error() {
+        // A REALITY connect against a server presenting a real certificate
+        // (no REALITY auth) must surface the engine's `RealityFallback` as
+        // `NativeError::Reality` — the MITM/redirection signal — proving the
+        // `map_tls_err` mapping the brief requires.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, _ca_der) = rcgen_ca_and_server("localhost");
+        let addr = spawn_echo_tls_server(&cert_pem, &key_pem);
+
+        let ctx = ctx_for(vless_with_reality());
+        let mut params = ctx.params.clone();
+        params.server = EndpointEssentials::new(addr.ip().to_string(), addr.port());
+        let ctx = LinkContext::new(params, ctx.target.clone());
+
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        match wrap(&ctx, Box::new(sock)).await {
+            Err(NativeError::Reality(_)) => {}
+            Err(other) => {
+                panic!("expected NativeError::Reality (engine RealityFallback), got {other:?}");
+            }
+            Ok(_) => panic!("REALITY against a plain server must fail"),
+        }
     }
 }
