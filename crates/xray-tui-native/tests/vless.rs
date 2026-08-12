@@ -64,9 +64,13 @@ async fn vless_ws_against_cores() {
 
 #[tokio::test]
 async fn vless_ws_chrome_against_cores() {
-    run_against_cores(&CaseSpec::vless().with_network("ws").with_tls(Box::new(FingerprintTls("chrome"))))
-        .await
-        .expect("vless ws chrome e2e failed");
+    run_against_cores(
+        &CaseSpec::vless()
+            .with_network("ws")
+            .with_tls(Box::new(FingerprintTls("chrome"))),
+    )
+    .await
+    .expect("vless ws chrome e2e failed");
 }
 
 #[tokio::test]
@@ -78,7 +82,11 @@ async fn vless_grpc_against_cores() {
 
 #[tokio::test]
 async fn vless_grpc_chrome_against_cores() {
-    run_against_cores(&CaseSpec::vless().with_network("grpc").with_tls(Box::new(FingerprintTls("chrome"))))
-        .await
-        .expect("vless grpc chrome e2e failed");
+    run_against_cores(
+        &CaseSpec::vless()
+            .with_network("grpc")
+            .with_tls(Box::new(FingerprintTls("chrome"))),
+    )
+    .await
+    .expect("vless grpc chrome e2e failed");
 }

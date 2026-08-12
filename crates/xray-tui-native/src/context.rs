@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
-use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
+use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
 
 use crate::addr::Host;
@@ -273,7 +273,11 @@ mod tests {
         }))
         .expect("vless grpc config parses");
         let ctx = LinkContext::new(
-            NativeConnectParams::new(grpc, EndpointEssentials::new("127.0.0.1", 4430), target("x")),
+            NativeConnectParams::new(
+                grpc,
+                EndpointEssentials::new("127.0.0.1", 4430),
+                target("x"),
+            ),
             target("x"),
         );
         assert_eq!(ctx.alpn_vec(), vec![b"h2".to_vec()]);
@@ -301,13 +305,14 @@ mod tests {
         }))
         .expect("vless grpc+tls config parses");
         let ctx = LinkContext::new(
-            NativeConnectParams::new(protocol, EndpointEssentials::new("127.0.0.1", 4430), target("x")),
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("127.0.0.1", 4430),
+                target("x"),
+            ),
             target("x"),
         );
-        assert_eq!(
-            ctx.alpn_vec(),
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
+        assert_eq!(ctx.alpn_vec(), vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]

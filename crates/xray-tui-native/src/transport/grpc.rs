@@ -7,14 +7,14 @@ use std::pin::Pin;
 use std::task::{Context as TaskCx, Poll};
 
 use bytes::{Bytes, BytesMut};
-use h2::SendStream;
 use h2::RecvStream;
+use h2::SendStream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_tui_proto::proto_spec::common::GrpcConfig;
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::BoxStream;
 
 /// gRPC service name: config value verbatim (no default). Stream path is
 /// `/{service}/Tun`; empty service yields `//Tun` (xray `getServiceName`,
@@ -227,7 +227,10 @@ impl AsyncRead for GrpcStream {
                 continue;
             }
             if self.recv.is_none() {
-                let rx = self.response.as_mut().expect("response channel present while recv unset");
+                let rx = self
+                    .response
+                    .as_mut()
+                    .expect("response channel present while recv unset");
                 match Pin::new(rx).poll(cx) {
                     Poll::Ready(Ok(Ok(recv))) => {
                         self.recv = Some(recv);

@@ -32,11 +32,13 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 
 ## Principles
 
-- **Xray composition order, one layer stack**: `dial → transport → security →
-  protocol → tunnel`. Each phase consumes the previous phase's byte stream
-  (`BoxStream`) and returns the next. A protocol = the same handshake-over-
-  stream pipeline unless its `ConnectShape` says otherwise (device tunnels,
-  own-handshake protocols, outbound-only kinds).
+- **Xray composition order, one layer stack**: `dial → security → transport
+  upgrade → protocol → tunnel` — TLS is OUTERMOST (a ws/grpc transport runs
+  framing INSIDE the engine TLS session, matching xray/sing-box). Each phase
+  consumes the previous phase's byte stream (`BoxStream`) and returns the
+  next. A protocol = the same handshake-over-stream pipeline unless its
+  `ConnectShape` says otherwise (device tunnels, own-handshake protocols,
+  outbound-only kinds).
 - **Config source of truth is `xray-tui-proto`.** No config model is defined in
   native; `NativeConnectParams` wraps the typed `ProtocolConfig` +
   `EndpointEssentials`. The host/port is injected from the endpoint at connect
@@ -78,7 +80,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `chain.rs` | `connect_chain`: fold the layer stack |
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
-| `transport/` | TCP dial (only transport implemented) |
+| `transport/` | `connect` = TCP dial (any transport; framing is an upgrade step); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `BrowserProfile`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented` |
 | `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
@@ -390,7 +392,9 @@ Notes on the matrix:
 | Transport | Status | Notes |
 |-----------|:------:|-------|
 | TCP | ✅ | `transport/tcp.rs`; all e2e cases run over it |
-| WS / gRPC / h2 / HTTPUpgrade / XHTTP | 📋 | config already parses transport fields in proto; no native upgrade layer |
+| WS | ✅ | `transport/ws.rs`; tokio-tungstenite framing over the engine stream; v2ray Host/path/headers; e2e vs xray + sing-box (standard + chrome fp) |
+| gRPC | ✅ | `transport/grpc.rs`; h2 framing over the engine stream, gun mode; `Hunk` protobuf (`0x0A` + varint) inside the 5-byte gRPC prefix; e2e vs xray + sing-box (standard + chrome fp) |
+| h2 / HTTPUpgrade / XHTTP | 📋 | config already parses transport fields in proto; no native upgrade layer |
 | QUIC | 🔒 | prerequisite for Hysteria1/2 + TUIC clients |
 | KCP | 📋 | xray-core only; niche |
 | obfs plugins (SS) | 📋 | plugin URL param already parsed by proto |

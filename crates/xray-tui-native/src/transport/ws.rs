@@ -10,16 +10,16 @@ use bytes::BytesMut;
 use futures_core::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{CONNECTION, HOST, UPGRADE};
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request, StatusCode};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 use xray_tui_proto::proto_spec::common::WebSocketConfig;
 
+use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::BoxStream;
 
 /// Build the WS upgrade request. Pure, unit-testable.
 pub fn ws_request(cfg: &WebSocketConfig, server_host: &str) -> Result<Request<()>, NativeError> {
@@ -173,10 +173,7 @@ mod tests {
             ..Default::default()
         };
         let req = ws_request(&cfg, "real-server.example").unwrap();
-        assert_eq!(
-            req.uri().path_and_query().unwrap().as_str(),
-            "/ws?ed=2048"
-        );
+        assert_eq!(req.uri().path_and_query().unwrap().as_str(), "/ws?ed=2048");
         assert_eq!(req.headers().get("host").unwrap(), "cdn.example.com");
         assert_eq!(req.headers().get("x-custom").unwrap(), "v1");
         assert_eq!(req.headers().get("connection").unwrap(), "Upgrade");
