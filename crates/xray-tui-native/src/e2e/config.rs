@@ -264,8 +264,11 @@ fn plain_client_security(tls: &dyn TlsVariant) -> serde_json::Value {
 
 /// The REALITY client `security` object: pbk/sid with the Chrome provisioner.
 fn reality_client_security(tls: &dyn TlsVariant, pbk: &str) -> serde_json::Value {
+    // The client presents its own sid when the variant overrides it (the
+    // wrong-sid fallback scenario), else the server's sid.
     let sid = tls
-        .reality_sid()
+        .reality_client_sid()
+        .or_else(|| tls.reality_sid())
         .expect("reality variant carries a short id");
     serde_json::json!({
         "type": "reality",

@@ -6,8 +6,6 @@
 //! PORT-FIRST (`PortThenAddress`). Command: 0x01 TCP, 0x02 UDP, 0x03 MUX.
 //! Response header: `version(1B, echoed 0) | addon_len(1B) | addons`.
 
-use xray_tui_proto::proto_spec::ProtocolKind;
-
 use crate::addr::{TargetAddr, encode_addr};
 use crate::error::NativeError;
 
@@ -50,23 +48,6 @@ pub fn encode_request(
     Ok(out)
 }
 
-/// Validate the first bytes of the response header; returns the addon length.
-pub fn check_response_header(buf: &[u8]) -> Result<usize, NativeError> {
-    if buf.len() < 2 {
-        return Err(NativeError::Protocol {
-            kind: ProtocolKind::Vless,
-            detail: "response header truncated".into(),
-        });
-    }
-    if buf[0] != VERSION {
-        return Err(NativeError::Protocol {
-            kind: ProtocolKind::Vless,
-            detail: format!("bad response version {}", buf[0]),
-        });
-    }
-    Ok(usize::from(buf[1]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,13 +79,5 @@ mod tests {
     fn uuid_parse_match_expected_bytes() {
         assert_eq!(uuid_bytes(UUID_STR).unwrap(), uuid());
         assert!(uuid_bytes("not-a-uuid").is_err());
-    }
-
-    #[test]
-    fn response_header_ok_and_bad() {
-        assert_eq!(check_response_header(&[0x00, 0x00]).unwrap(), 0);
-        assert_eq!(check_response_header(&[0x00, 0x02]).unwrap(), 2);
-        assert!(check_response_header(&[0x01, 0x00]).is_err());
-        assert!(check_response_header(&[0x00]).is_err());
     }
 }

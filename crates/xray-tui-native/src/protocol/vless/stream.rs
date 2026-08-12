@@ -24,15 +24,15 @@ enum Peel {
     Head,
     Addons { total: usize, filled: usize },
     Done,
-    Dead(&'static str),
 }
 
 /// Tunnel stream over the secured connection; strips the VLESS response
 /// header once, then transparently streams the body.
 pub struct VlessClientStream {
     inner: BoxStream,
-    head: [u8; 2],
-    head_filled: usize,
+    /// Whether the response-header version byte has been read (persisted so
+    /// the peel is resumable across Pending polls).
+    ver_read: bool,
     addons: [u8; 255],
     addons_total: usize,
     peel: Peel,
@@ -43,8 +43,7 @@ impl VlessClientStream {
     pub fn new(inner: BoxStream) -> Self {
         Self {
             inner,
-            head: [0; 2],
-            head_filled: 0,
+            ver_read: false,
             addons: [0; 255],
             addons_total: 0,
             peel: Peel::Head,
@@ -62,18 +61,38 @@ impl AsyncRead for VlessClientStream {
             let peel = self.peel; // Peel: Copy — no borrow of `self` held across awaits
             match peel {
                 Peel::Done => break,
-                Peel::Dead(msg) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, msg)));
-                }
                 Peel::Head => {
-                    // Bound the staging read to the header remainder — an
-                    // unbounded read can swallow the first payload byte when
-                    // the header arrives fragmented across write boundaries
-                    // (mirror the Addons state below).
-                    let start = self.head_filled;
-                    let need = 2 - start;
-                    let mut tmp = [0u8; 2];
-                    let mut rb = ReadBuf::new(&mut tmp[..need]);
+                    // The response header is `version(1) | addon_len(1) |
+                    // addons`. A vless server always sends version 0x00; a
+                    // NON-vless endpoint (REALITY transparent-proxy
+                    // fallback — the client's TLS session terminates at the
+                    // dest, not at a vless server) sends no header at all,
+                    // so the first byte is plain payload. The version byte
+                    // is read first (persisted in `ver_read` so a Pending
+                    // addon-length poll does not re-consume it).
+                    if !self.ver_read {
+                        let mut tmp = [0u8; 1];
+                        let mut rb = ReadBuf::new(&mut tmp);
+                        ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
+                        let got = rb.filled().len();
+                        if got == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "vless response header truncated (EOF)",
+                            )));
+                        }
+                        self.ver_read = true;
+                        if tmp[0] != header::VERSION {
+                            // No vless response header: hand the byte back
+                            // as payload.
+                            self.peel = Peel::Done;
+                            buf.put_slice(&[tmp[0]]);
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    // Version matches: read the addon length.
+                    let mut tmp = [0u8; 1];
+                    let mut rb = ReadBuf::new(&mut tmp);
                     ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
                     let got = rb.filled().len();
                     if got == 0 {
@@ -82,28 +101,15 @@ impl AsyncRead for VlessClientStream {
                             "vless response header truncated (EOF)",
                         )));
                     }
-                    self.head[start..start + got].copy_from_slice(&tmp[..got]);
-                    self.head_filled = start + got;
-                    if self.head_filled < 2 {
-                        continue;
-                    }
-                    // Validate version and read addon length.
-                    match header::check_response_header(&self.head) {
-                        Ok(len) => {
-                            self.addons_total = len;
-                            self.peel = if len > 0 {
-                                Peel::Addons {
-                                    total: len,
-                                    filled: 0,
-                                }
-                            } else {
-                                Peel::Done
-                            };
+                    self.addons_total = usize::from(tmp[0]);
+                    self.peel = if self.addons_total > 0 {
+                        Peel::Addons {
+                            total: self.addons_total,
+                            filled: 0,
                         }
-                        Err(_) => {
-                            self.peel = Peel::Dead("vless response header rejected");
-                        }
-                    }
+                    } else {
+                        Peel::Done
+                    };
                 }
                 Peel::Addons { total, filled } => {
                     // Bound the staging read to the addons remainder — a
@@ -221,14 +227,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_bad_version() {
+    async fn passes_through_non_vless_response() {
+        // A REALITY transparent-proxy fallback terminates the client's TLS
+        // session at a non-vless endpoint: the first byte is payload, not a
+        // vless response header, and must pass through untouched.
         use tokio::io::AsyncReadExt;
         let (client, mut server) = pair();
         let mut stream = VlessClientStream::new(Box::new(client));
-        server.write_all(&[0x01, 0x00]).await.unwrap();
-        let mut out = [0u8; 4];
-        let res = stream.read(&mut out).await;
-        assert!(res.is_err());
+        let expected = b"HTTP/1.1 200 OK\r\nhello";
+        server.write_all(expected).await.unwrap();
+        let mut out = vec![0u8; expected.len()];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, expected);
     }
 
     #[tokio::test]

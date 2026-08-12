@@ -7,8 +7,8 @@
 use std::net::SocketAddr;
 
 use super::{
-    Certs, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, StandardTls, TlsVariant,
-    config,
+    Certs, ConnectExpect, CoreKind, E2eCase, E2eExpect, SecurityVariant, ServerEnv, StandardTls,
+    TlsVariant, config,
 };
 use crate::NativeConnectParams;
 
@@ -109,10 +109,30 @@ impl E2eCase for CaseSpec {
     }
 
     fn expected(&self) -> E2eExpect {
+        let connect = if self.tls().expect_fallback() {
+            ConnectExpect::ErrRealityFallback
+        } else {
+            ConnectExpect::Ok
+        };
         E2eExpect {
-            status: 200,
-            body: config::BODY.into(),
+            connect,
+            ..Default::default()
         }
+    }
+
+    fn probe_target(&self, env: &ServerEnv) -> SocketAddr {
+        // A plain client through a REALITY server is transparently proxied
+        // and terminates at the server's dest — probe that instead of the
+        // plain echo.
+        if self.tls().probe_dest() {
+            env.tls_echo
+        } else {
+            env.echo
+        }
+    }
+
+    fn spider_reaches_dest(&self) -> bool {
+        self.tls().spider_reaches_dest()
     }
 
     fn client_trust(&self, certs: &Certs) {

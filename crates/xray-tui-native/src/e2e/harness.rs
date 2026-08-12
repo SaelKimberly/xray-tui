@@ -4,13 +4,15 @@
 //! a directory containing `xray` and/or `sing-box` binaries. Absent → callers
 //! skip (eprintln + early return). Never downloads anything.
 
+use std::io::Read as _;
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::core::CoreKind;
+use xray_tui_tls::http2::PREFACE;
 
 pub struct EchoServer {
     pub addr: SocketAddr,
@@ -69,12 +71,15 @@ pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
         .set_nonblocking(true)
         .expect("tls echo nonblocking");
     let listener = tokio::net::TcpListener::from_std(listener).expect("tls echo tokio");
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let recorded_loop = recorded.clone();
     let handle = tokio::spawn(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else {
                 break;
             };
             let cfg = server_cfg.clone();
+            let recorded = recorded_loop.clone();
             tokio::spawn(async move {
                 use std::io::{Read as _, Write as _};
                 // The REALITY inbound borrows this server's ServerHello flight
@@ -83,6 +88,13 @@ pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
                 let Ok(mut std_sock) = sock.into_std() else {
                     return;
                 };
+                // The listener is nonblocking (tokio); this session runs on a
+                // blocking thread with read/write timeouts, so switch the
+                // socket to blocking mode — otherwise reads return WouldBlock
+                // instantly and the timeout never applies.
+                if std_sock.set_nonblocking(false).is_err() {
+                    return;
+                }
                 tokio::task::spawn_blocking(move || {
                     let timeout = Duration::from_secs(5);
                     let _ = std_sock.set_read_timeout(Some(timeout));
@@ -92,10 +104,21 @@ pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
                     };
                     while conn.is_handshaking() && conn.complete_io(&mut std_sock).is_ok() {}
                     if conn.is_handshaking() {
-                        return; // handshake failed or timed out
+                        // The REALITY server forwards the client's records to
+                        // this connection (MirrorConn), but they are encrypted
+                        // under the REALITY session keys — which the dest can
+                        // never derive — so rustls errors on them and the
+                        // handshake cannot complete. The connection MUST stay
+                        // open anyway: xray's post-handshake detector reads the
+                        // dest, and an early close makes it abort the client's
+                        // REALITY session (conn.Close() → client BrokenPipe).
+                        // Hold the raw socket, draining, until xray closes it
+                        // right after the auth'd handshake completes.
+                        hold_until_close(&mut std_sock);
+                        return;
                     }
                     // Read the first application-data chunk (the spider's
-                    // request), then answer and close.
+                    // request / the probe's GET), then answer and close.
                     let mut buf = [0u8; 4096];
                     let mut got = 0;
                     loop {
@@ -116,20 +139,74 @@ pub fn spawn_tls_echo(certs: &Certs) -> TlsEchoServer {
                             break;
                         }
                     }
+                    // Record the client's first app-data bytes (bounded) so
+                    // the fallback assertion can detect the spider's h2
+                    // preface on the dest.
+                    {
+                        let mut recorded = recorded.lock().unwrap();
+                        if let Some(room) = RECORD_LIMIT.checked_sub(recorded.len()) {
+                            let take = got.min(room);
+                            recorded.extend_from_slice(&buf[..take]);
+                        }
+                    }
                     let _ = conn.writer().write_all(TLS_RESPONSE);
                     let _ = conn.write_tls(&mut std_sock);
                     conn.send_close_notify();
                     let _ = conn.write_tls(&mut std_sock);
+                    // Drain anything the client races in before the close
+                    // lands, so the spider's follow-up GETs never wedge the
+                    // socket (bounded by the 5s read timeout above).
+                    let _ = conn.read_tls(&mut std_sock);
+                    let _ = conn.process_new_packets();
                 });
             });
         }
     });
-    TlsEchoServer { addr, handle }
+    TlsEchoServer {
+        addr,
+        handle,
+        recorded,
+    }
+}
+
+/// How much post-handshake app data the TLS echo records per run (the h2
+/// preface is 24 bytes; 64 covers it plus the first frames).
+const RECORD_LIMIT: usize = 64;
+
+/// Drain a socket until the peer closes or errors, keeping it open.
+///
+/// Used for the REALITY dest-borrow connection, whose rustls handshake
+/// cannot complete (see `spawn_tls_echo`): the connection must survive until
+/// xray's post-handshake detector finishes (~5s) and xray closes it.
+fn hold_until_close(std_sock: &mut std::net::TcpStream) {
+    // The borrow conn goes quiet right after the forwarded client records;
+    // outlive the detector's ~5s window so xray closes it, not us.
+    let _ = std_sock.set_read_timeout(Some(Duration::from_secs(15)));
+    let mut buf = [0u8; 4096];
+    loop {
+        match std_sock.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 pub struct TlsEchoServer {
     pub addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
+    /// Post-handshake application data received from clients (bounded to
+    /// [`RECORD_LIMIT`] bytes, across all sessions).
+    recorded: Arc<Mutex<Vec<u8>>>,
+}
+
+impl TlsEchoServer {
+    /// True if any connection received the HTTP/2 client preface
+    /// (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) as its first app data.
+    #[must_use]
+    pub fn saw_h2_preface(&self) -> bool {
+        let b = self.recorded.lock().unwrap();
+        b.windows(PREFACE.len()).any(|w| w == PREFACE)
+    }
 }
 
 impl Drop for TlsEchoServer {

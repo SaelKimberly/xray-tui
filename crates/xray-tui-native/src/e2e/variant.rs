@@ -34,6 +34,32 @@ pub trait TlsVariant: Sync {
     fn reality_sid(&self) -> Option<&str> {
         None
     }
+    /// REALITY short id the *client* presents (hex); `None` = the server's
+    /// `reality_sid()`. Overridden to a wrong value to drive the
+    /// wrong-sid fallback scenario.
+    fn reality_client_sid(&self) -> Option<&str> {
+        None
+    }
+    /// True when the case expects `connect()` to fail with the engine's
+    /// `RealityFallback` (wrong pbk/sid, or a REALITY client against a
+    /// plain-TLS server) instead of establishing a tunnel.
+    fn expect_fallback(&self) -> bool {
+        false
+    }
+    /// True when a fallback's Spider-X session terminates at the server's
+    /// dest (a REALITY server transparently proxies the fallback there, so
+    /// the spider's `h2` preface shows up in the `tls_echo` recording).
+    /// False when the fallback session terminates at the server itself (a
+    /// plain-TLS server) — the spider's bytes never reach the `tls_echo`.
+    fn spider_reaches_dest(&self) -> bool {
+        true
+    }
+    /// True when the probe must target the TLS echo (the transparent
+    /// proxy's dest) instead of the plain echo — a plain client through a
+    /// REALITY server terminates at the dest.
+    fn probe_dest(&self) -> bool {
+        false
+    }
     /// Install the harness-CA trust this variant's client path needs. Both
     /// certificate-TLS variants (stock and fingerprint) install the engine's
     /// test CA; REALITY needs none (its auth key, not a PKI chain,
@@ -123,6 +149,166 @@ impl TlsVariant for RealityTls {
         Some(&self.sid)
     }
     // `client_trust`: none — REALITY authenticates via the auth key.
+}
+
+/// REALITY server with the real keypair but the client given a *wrong*
+/// public key (valid 32-byte key, not the server's). Server transparently
+/// proxies → client's auth fails → `RealityFallback`.
+pub struct RealityWrongPbkTls(RealityTls);
+
+impl RealityWrongPbkTls {
+    /// A wrong but well-formed pbk: a fresh keypair whose private half is
+    /// kept only on the client side (never the server's private key).
+    #[must_use]
+    pub fn fresh() -> Self {
+        let inner = RealityTls::fresh();
+        let (wrong_private, wrong_pbk) = config::reality_keypair();
+        let _ = wrong_private;
+        Self(RealityTls {
+            pbk: wrong_pbk,
+            ..inner
+        })
+    }
+}
+
+impl TlsVariant for RealityWrongPbkTls {
+    fn name(&self) -> &'static str {
+        "reality-wrong-pbk"
+    }
+    fn sni(&self) -> &'static str {
+        "localhost"
+    }
+    fn reality_private_key(&self) -> Option<&str> {
+        self.0.reality_private_key()
+    }
+    fn reality_pbk(&self) -> Option<&str> {
+        Some(&self.0.pbk) // wrong pbk
+    }
+    fn reality_sid(&self) -> Option<&str> {
+        self.0.reality_sid()
+    }
+    fn expect_fallback(&self) -> bool {
+        true
+    }
+}
+
+/// REALITY with the server's short id *different* from the client's.
+/// Server decrypts the session id (right pbk) but the sid inside doesn't
+/// match its own → transparent proxy → fallback.
+pub struct RealityWrongSidTls(RealityTls, String); // (real server, wrong client sid)
+
+impl RealityWrongSidTls {
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self(RealityTls::fresh(), config::reality_sid())
+    }
+}
+
+impl TlsVariant for RealityWrongSidTls {
+    fn name(&self) -> &'static str {
+        "reality-wrong-sid"
+    }
+    fn sni(&self) -> &'static str {
+        "localhost"
+    }
+    fn reality_private_key(&self) -> Option<&str> {
+        self.0.reality_private_key()
+    }
+    fn reality_pbk(&self) -> Option<&str> {
+        Some(&self.0.pbk)
+    }
+    fn reality_sid(&self) -> Option<&str> {
+        self.0.reality_sid()
+    }
+    fn reality_client_sid(&self) -> Option<&str> {
+        Some(&self.1) // wrong client sid
+    }
+    fn expect_fallback(&self) -> bool {
+        true
+    }
+}
+
+/// REALITY server (real key) with a plain-fingerprint client — the "active
+/// probing without REALITY" case: the probe client is transparently proxied
+/// and completes standard TLS to the dest (stealth).
+///
+/// Probe target = `tls_echo`.
+pub struct RealityServerPlainClientTls(RealityTls);
+
+impl RealityServerPlainClientTls {
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self(RealityTls::fresh())
+    }
+}
+
+impl TlsVariant for RealityServerPlainClientTls {
+    fn name(&self) -> &'static str {
+        "reality-server-plain-client"
+    }
+    fn sni(&self) -> &'static str {
+        "localhost"
+    }
+    fn fingerprint(&self) -> Option<&'static str> {
+        Some("chrome")
+    }
+    fn reality_private_key(&self) -> Option<&str> {
+        self.0.reality_private_key()
+    }
+    // No `reality_pbk`: the client is a plain (fingerprint) TLS client, so
+    // its ClientHello carries no valid REALITY session id and the server
+    // transparently proxies it to the dest (stealth). A pbk here would make
+    // the client an auth'd REALITY client instead.
+    fn reality_pbk(&self) -> Option<&str> {
+        None
+    }
+    fn reality_sid(&self) -> Option<&str> {
+        self.0.reality_sid()
+    }
+    fn client_trust(&self, certs: &Certs) {
+        crate::security::fingerprint::set_test_ca(&certs.ca_der);
+    }
+    fn probe_dest(&self) -> bool {
+        true
+    }
+}
+
+/// Plain-TLS VLESS server (harness-CA cert) but a REALITY client — the
+/// client's auth fails against a non-REALITY server → `RealityFallback`.
+pub struct PlainServerRealityClientTls(RealityTls);
+
+impl PlainServerRealityClientTls {
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self(RealityTls::fresh())
+    }
+}
+
+impl TlsVariant for PlainServerRealityClientTls {
+    fn name(&self) -> &'static str {
+        "plain-server-reality-client"
+    }
+    fn sni(&self) -> &'static str {
+        "localhost"
+    }
+    fn reality_private_key(&self) -> Option<&str> {
+        None // server = cert TLS
+    }
+    fn reality_pbk(&self) -> Option<&str> {
+        Some(&self.0.pbk)
+    }
+    fn reality_sid(&self) -> Option<&str> {
+        self.0.reality_sid()
+    }
+    fn expect_fallback(&self) -> bool {
+        true
+    }
+    // The fallback session terminates at the plain server itself (the
+    // server's TLS inbound, not a transparent proxy) — the spider's bytes
+    // go there, never to the tls_echo dest.
+    fn spider_reaches_dest(&self) -> bool {
+        false
+    }
 }
 
 /// Payload-security variant: names itself, gates which cores support it, and
