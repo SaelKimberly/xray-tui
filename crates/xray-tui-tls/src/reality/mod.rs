@@ -539,22 +539,32 @@ mod tests {
 
         // The spawned Spider-X session must keep the established TLS
         // session alive: poll the recorded bytes (up to 5s) for the HTTP/2
-        // client preface, which the spider writes on its first GET. The
-        // guard is scoped to a block so it never spans the await below.
+        // client preface AND the first GET's HEADERS frame (stream 1) — a
+        // spider that dies after the preface (e.g. an HPACK encoding panic)
+        // must fail this assertion. The guard is scoped to a block so it
+        // never spans the await below.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let preface_seen = {
+            let spider_traffic = {
                 let bytes = recorded.lock();
-                bytes
+                let preface = bytes
                     .windows(http2::PREFACE.len())
-                    .any(|w| w == http2::PREFACE)
+                    .any(|w| w == http2::PREFACE);
+                // Frame header layout (RFC 7540 §4.1): type at offset 3,
+                // stream id at offsets 5..9.
+                let headers_stream1 = bytes.windows(9).any(|w| {
+                    w[3] == http2::FRAME_HEADERS
+                        && u32::from_be_bytes(w[5..9].try_into().unwrap()) == 1
+                });
+                drop(bytes);
+                preface && headers_stream1
             };
-            if preface_seen {
+            if spider_traffic {
                 break;
             }
             assert!(
                 std::time::Instant::now() <= deadline,
-                "spider never sent the h2 preface to the dest"
+                "spider never sent preface + HEADERS(stream 1) to the dest"
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

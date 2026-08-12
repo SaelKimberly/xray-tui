@@ -81,15 +81,26 @@ pub fn make_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> 
 //   4 = :path    /
 //   7 = :scheme  https
 
-/// Appends a raw (non-Huffman) HPACK string with a single-byte length
-/// prefix. The `assert!` mirrors the reference: our headers are all short.
+/// Appends a raw (non-Huffman) HPACK string. The length uses the RFC 7541
+/// §5.2 variable-length integer (7-bit prefix): values < 127 fit the prefix
+/// byte (H=0); longer values escape with `0x7F` followed by base-128
+/// continuation octets (0x80 continuation bit set on every octet but the
+/// last). The spider's padding cookie (`padding=0…0`, up to 520 bytes)
+/// requires the long form — a single-byte prefix would panic on any value
+/// >= 127.
 fn hpack_string(buf: &mut Vec<u8>, s: &[u8]) {
-    // H=0 (no Huffman), length as 7-bit integer (sufficient for our short strings)
-    assert!(
-        s.len() < 128,
-        "hpack_string: value too long for single-byte length"
-    );
-    buf.push(u8::try_from(s.len()).expect("hpack length < 128 per the assert above"));
+    let len = s.len();
+    if len < 127 {
+        buf.push(u8::try_from(len).expect("len < 127 per the check above"));
+    } else {
+        buf.push(0x7F); // 2^7 - 1 escape: the length continues in the payload
+        let mut rest = len - 127;
+        while rest >= 128 {
+            buf.push(u8::try_from((rest % 128) + 128).expect("continuation octet < 256"));
+            rest /= 128;
+        }
+        buf.push(u8::try_from(rest).expect("final octet < 128"));
+    }
     buf.extend_from_slice(s);
 }
 
@@ -327,7 +338,7 @@ where
 mod tests {
     use super::{
         Client, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_HEADERS, FRAME_SETTINGS,
-        PREFACE, make_frame,
+        PREFACE, hpack_string, make_frame,
     };
     use crate::handshake::{AcceptAll, HandshakeParams, connect};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -488,6 +499,33 @@ mod tests {
         });
 
         addr
+    }
+
+    #[test]
+    fn hpack_string_long_values_use_rfc7541_variable_length_integer() {
+        // Short values keep the single-prefix-byte form (H=0, len < 127).
+        let mut buf = Vec::new();
+        hpack_string(&mut buf, b"GET");
+        assert_eq!(buf, b"\x03GET");
+
+        // Boundary: 126 fits the 7-bit prefix; 127 must escape (0x7F 0x00).
+        let mut buf = Vec::new();
+        hpack_string(&mut buf, &[b'a'; 126]);
+        assert_eq!(buf[0], 126);
+        assert_eq!(&buf[1..], &[b'a'; 126]);
+
+        let mut buf = Vec::new();
+        hpack_string(&mut buf, &[b'b'; 127]);
+        assert_eq!(&buf[..2], &[0x7F, 0x00]);
+        assert_eq!(&buf[2..], &[b'b'; 127]);
+
+        // The spider's padding cookie: `padding=` + 512 zeros = 520 bytes →
+        // 0x7F escape, then 393 as base-128 continuation octets 0x89 0x03
+        // (RFC 7541 §5.2: 127 + 9 + 3·128 = 520).
+        let mut buf = Vec::new();
+        hpack_string(&mut buf, &[b'0'; 520]);
+        assert_eq!(&buf[..3], &[0x7F, 0x89, 0x03]);
+        assert_eq!(&buf[3..], &[b'0'; 520]);
     }
 
     #[tokio::test]

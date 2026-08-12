@@ -15,14 +15,18 @@ use crate::record::stream::TlsStream;
 const PADDING_MAX: usize = 512;
 
 /// Bounded Spider-X session: `max_gets` HTTP/2 GETs to `https://<sni><path>`
-/// with a padding cookie, Referer chaining, and jittered delays. All errors
-/// are swallowed — the caller already received its `RealityFallback` error
-/// and this task owns the connection.
+/// with a padding cookie, Referer chaining, and `request_interval` delays.
+/// All errors are swallowed — the caller already received its
+/// `RealityFallback` error and this task owns the connection. An empty
+/// `paths` list closes the session immediately (nothing to walk).
 pub(crate) async fn run<S: Stream + 'static>(
     conn: TlsStream<S>,
     spider: SpiderConfig,
     sni: String,
 ) {
+    if spider.paths.is_empty() {
+        return;
+    }
     let mut conn = conn;
     let mut client = http2::Client::new();
     let rng = ring::rand::SystemRandom::new();
