@@ -126,8 +126,11 @@ pub struct X25519KeyPair {
 }
 
 impl X25519KeyPair {
-    /// Generates a fresh key pair using `rng`.
-    pub fn generate(rng: &dyn ring::rand::SecureRandom) -> Result<Self> {
+    /// Generates a fresh key pair, drawing its 32-byte seed from the
+    /// crate's [`SecureRandom`](crate::SecureRandom) seam (ring's
+    /// `SystemRandom` coerces via the blanket impl; tests use fixed-seed
+    /// RNGs directly).
+    pub fn generate(rng: &dyn crate::SecureRandom) -> Result<Self> {
         let mut seed = [0u8; 32];
         rng.fill(&mut seed)
             .map_err(|_| TlsError::Crypto("X25519 seed generation failed".into()))?;

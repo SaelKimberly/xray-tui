@@ -20,7 +20,7 @@ use crate::error::{NativeError, timeouts};
 use crate::security::tls_provider::{TlsConnector, TlsParams};
 
 pub use xray_tui_tls::reality::{
-    FixedChrome133, HelloProvisionParams, HelloProvisioner, ProvisionedHello,
+    FixedChrome133, HelloProvisionParams, HelloProvisioner, ProvisionedHello, SpiderConfig,
 };
 
 /// Chosen provisioner for a REALITY connect.
@@ -132,6 +132,9 @@ async fn run_handshake(
                 short_id,
                 provisioner,
                 rng: &rng,
+                // Spider session wiring (spx) lands with the fallback
+                // re-wire; defaults keep the REALITY arm compiling.
+                spider: &SpiderConfig::default(),
             },
         ),
     )

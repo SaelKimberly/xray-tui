@@ -29,20 +29,16 @@ pub mod verify;
 
 use std::ops::Range;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::SecureRandom;
-use crate::crypto::{AeadKey, KeySchedule, X25519KeyPair};
+use crate::crypto::X25519KeyPair;
 use crate::error::{Result, TlsError};
-use crate::handshake::{RingRng, make_hs_msg, read_server_hello, read_server_hs_messages};
-use crate::hello::{BuildParams, build_hello, to_record};
+use crate::handshake::{AuthOutcome, ServerAuth, drive};
+use crate::hello::{BuildParams, build_hello};
 use crate::profiles::BrowserProfile;
-use crate::record::stream::{AppKeys, TlsStream};
-use crate::record::{CONTENT_HANDSHAKE, HS_FINISHED, aead_aad, make_app_data_record};
+use crate::record::stream::TlsStream;
 use crate::spec::SessionIdSpec;
-
-/// AEAD tag length for the TLS 1.3 AEADs in this engine (all 16 bytes).
-const AEAD_TAG_LEN: usize = 16;
 
 /// The `ClientHello` ALPN list REALITY always offers.
 const REALITY_ALPN: &[&str] = &["h2", "http/1.1"];
@@ -123,6 +119,37 @@ impl HelloProvisioner for FixedChrome133 {
     }
 }
 
+// ── Spider session ─────────────────────────────────────────────────────────
+
+/// Bounded spider session configuration for the REALITY fallback path.
+///
+/// When the server fails REALITY auth (a real certificate — transparent
+/// proxy / possible MITM or redirection), the engine surfaces
+/// [`TlsError::RealityFallback`] and the caller may re-connect as a plain
+/// browser to the steal target: the "spider" walks `paths` with
+/// `request_interval` between requests, `max_gets` requests per path
+/// (bounded, mirroring xray's anti-probing). The values are defaults only;
+/// the spider itself lands with the fallback re-wire.
+#[derive(Clone)]
+pub struct SpiderConfig {
+    /// Paths from the URL `spx`; default `["/"]`.
+    pub paths: Vec<String>,
+    /// Bounded spider session (GETs before close); default 4.
+    pub max_gets: usize,
+    /// Delay between GETs; default 1s.
+    pub request_interval: std::time::Duration,
+}
+
+impl Default for SpiderConfig {
+    fn default() -> Self {
+        Self {
+            paths: vec!["/".to_string()],
+            max_gets: 4,
+            request_interval: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
 // ── Connector ──────────────────────────────────────────────────────────────
 
 /// Connection-level inputs for [`connect_reality`].
@@ -135,24 +162,28 @@ pub struct RealityParams<'a> {
     pub short_id: &'a [u8],
     /// The `ClientHello` fingerprint provisioner.
     pub provisioner: &'a dyn HelloProvisioner,
-    /// Random source. ring's `SecureRandom` is sealed, so the object is
-    /// always `Send + Sync` in practice; the bounds are declared on the
-    /// trait object so `RealityParams` itself is `Send`.
-    pub rng: &'a (dyn ring::rand::SecureRandom + Send + Sync),
+    /// Random source — the crate's [`SecureRandom`] seam. ring's
+    /// `SystemRandom` coerces via the blanket impl; tests implement the
+    /// trait directly for fixed-seed vectors.
+    pub rng: &'a dyn SecureRandom,
+    /// Spider session for the fallback path (defaults are fine until the
+    /// fallback re-wire lands).
+    pub spider: &'a SpiderConfig,
 }
 
 /// Performs the full REALITY client handshake over `stream`, returning a
 /// record-framed application-data stream.
 ///
-/// Implements the 9-step wire contract above; the driver mirrors
-/// `handshake::connect` with the REALITY session-id seal and the
-/// HMAC/Ed25519 server auth in place of the verifier seam.
+/// Implements the 9-step wire contract above: the REALITY session-id seal
+/// (steps 1–5) runs here, then the shared [`drive`] takes over with a
+/// [`ServerAuth::Reality`] dispatch — the HMAC/Ed25519 server auth in place
+/// of the plain-TLS verifier seam. A server flight that fails REALITY auth
+/// (a real certificate) is reported as [`TlsError::RealityFallback`], not a
+/// hard error: the caller may fall back to the spider session.
 pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     params: RealityParams<'_>,
 ) -> Result<TlsStream<S>> {
-    let mut stream = stream;
-
     // 1. Ephemeral X25519 key pair (the ClientHello keyshare). The
     //    connector draws no randomness of its own: the client random inside
     //    the provisioned hello *is* the REALITY random.
@@ -160,12 +191,11 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     // 2. Provision the Chrome-133-shaped ClientHello with a zeroed
     //    AuthPayload slot; the connector's keyshare and rng flow through.
-    let rng = RingRng(params.rng);
     let mut hello = params.provisioner.provision(&HelloProvisionParams {
         server_name: params.server_name,
         alpn: Some(REALITY_ALPN),
         x25519_pub: &keypair.public_key(),
-        rng: &rng,
+        rng: params.rng,
     })?;
     let client_random = messages::extract_client_random(&hello.handshake_bytes)?;
 
@@ -185,106 +215,36 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send>(
     //    provisioned bytes) and splice it into the builder-returned range.
     messages::seal_and_splice(&mut hello, &plaintext, &auth_key, &client_random[20..])?;
 
-    // 6. Send the ClientHello record.
-    stream.write_all(&to_record(&hello.handshake_bytes)).await?;
-
-    // 7. ServerHello (middlebox CCS skipped; HRR rejected by the parser).
-    //    Its keyshare is the server's *ephemeral* TLS key (not the static
-    //    `pbk`), so no static-key comparison is performed. The server must
-    //    echo the sealed session id (the REALITY auth payload).
-    let server_hello = read_server_hello(&mut stream, hello.session_id()).await?;
-
-    // 8. TLS 1.3 ECDHE with the server's keyshare: the same ephemeral
-    //    scalar drives both the auth key (step 4) and this shared secret.
-    let tls_shared = keypair.agree(&server_hello.peer_key)?;
-
-    // 9. Handshake traffic secrets under the selected suite; the transcript
-    //    is the wire ClientHello (sealed session id) || ServerHello.
-    let mut ks = KeySchedule::new(server_hello.suite);
-    ks.add_transcript(&hello.handshake_bytes);
-    ks.add_transcript(&server_hello.raw);
-    let hs_secret = ks.handshake_secret(&tls_shared)?;
-    let (client_hs_ts, server_hs_ts) = ks.handshake_traffic_secrets(&hs_secret)?;
-    let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts)?;
-    let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts)?;
-
-    // 9. Decrypt the encrypted server flight (EE, Certificate,
-    //    CertificateVerify, Finished) with the server handshake key.
-    let flight = read_server_hs_messages(&mut stream, &server_hs_key).await?;
-
-    // 10. REALITY server authentication: certificate HMAC + Ed25519
-    //     CertificateVerify over the transcript (no PKI chain).
-    let cert_der = flight
-        .chain
-        .first()
-        .ok_or_else(|| TlsError::Verify("REALITY server sent no certificate".into()))?;
-    let mut transcript = Vec::with_capacity(
-        hello.handshake_bytes.len()
-            + server_hello.raw.len()
-            + flight.ee_raw.len()
-            + flight.cert_raw.len(),
-    );
-    transcript.extend_from_slice(&hello.handshake_bytes);
-    transcript.extend_from_slice(&server_hello.raw);
-    transcript.extend_from_slice(&flight.ee_raw);
-    transcript.extend_from_slice(&flight.cert_raw);
-    verify::verify_server(
-        cert_der,
-        &flight.cv_raw,
-        &auth_key,
-        &transcript,
-        server_hello.suite.digest(),
-    )?;
-
-    // 11. Authenticate the server Finished over ClientHello..CertificateVerify.
-    ks.add_transcript(&flight.ee_raw);
-    ks.add_transcript(&flight.cert_raw);
-    ks.add_transcript(&flight.cv_raw);
-    let server_finished_key = ks.finished_key(&server_hs_ts)?;
-    if ks.finished_mac(&server_finished_key) != flight.sf_verify_data {
-        return Err(TlsError::Handshake(
-            "server Finished MAC mismatch — possible MITM or wrong key".into(),
-        ));
-    }
-
-    // 12. Client Finished over ClientHello..server Finished (RFC 8446
-    //     §4.4.4), sealed with the client handshake key.
-    let sf_raw = make_hs_msg(HS_FINISHED, &flight.sf_verify_data);
-    ks.add_transcript(&sf_raw);
-    let client_finished_key = ks.finished_key(&client_hs_ts)?;
-    let client_finished_mac = ks.finished_mac(&client_finished_key);
-    let cf_hs_msg = make_hs_msg(HS_FINISHED, &client_finished_mac);
-    let mut cf_inner = cf_hs_msg.clone();
-    cf_inner.push(CONTENT_HANDSHAKE);
-    let cf_ciphertext =
-        client_hs_key.seal(0, &aead_aad(cf_inner.len() + AEAD_TAG_LEN), &cf_inner)?;
-    stream
-        .write_all(&make_app_data_record(&cf_ciphertext))
-        .await?;
-
-    // 13. Application traffic secrets over ClientHello..server Finished
-    //     (the client Finished joins the transcript afterwards, matching
-    //     handshake::connect's resumption-path accumulation).
-    let master = ks.master_secret(&hs_secret)?;
-    let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master)?;
-    let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts)?;
-    let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts)?;
-    ks.add_transcript(&cf_hs_msg);
-
-    Ok(TlsStream::new(
+    // 6. Drive the handshake: the shared `drive()` writes the ClientHello
+    //    record, reads the ServerHello (which must echo the sealed session
+    //    id — the REALITY auth payload), derives the TLS 1.3 key schedule
+    //    over the wire ClientHello, and dispatches the REALITY server auth
+    //    (certificate HMAC + Ed25519 CertificateVerify over the transcript,
+    //    no PKI chain). Any auth failure means the server is not REALITY —
+    //    a real certificate (transparent proxy / possible MITM or
+    //    redirection) — which surfaces as [`AuthOutcome::RealityFallback`]
+    //    rather than a hard error, matching xray's `!Verified` handling.
+    let (tls, outcome) = drive(
         stream,
-        AppKeys {
-            read_key: server_app_key,
-            write_key: client_app_key,
-            read_seq: 0,
-            write_seq: 0,
+        &hello.handshake_bytes,
+        hello.session_id(),
+        keypair,
+        params.server_name,
+        ServerAuth::Reality {
+            auth_key: &auth_key,
         },
-    ))
+    )
+    .await?;
+    match outcome {
+        AuthOutcome::Ok => Ok(tls),
+        AuthOutcome::RealityFallback => Err(TlsError::RealityFallback),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use super::*;
     use crate::hello::parse::parse_hello;
@@ -394,5 +354,74 @@ mod tests {
             .unwrap();
         assert_eq!(fixed.handshake_bytes, profile.handshake_bytes);
         assert_eq!(fixed.session_id_range, profile.session_id_range);
+    }
+
+    /// A plain rustls server (no REALITY on the wire): echoes the client's
+    /// legacy session id (RFC 8446 §4.1.3) and serves a real self-signed
+    /// certificate. Workspace feature unification compiles rustls with BOTH
+    /// backends, so install the ring provider explicitly (idempotent).
+    fn plain_tls_server_config(
+        cert: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+    ) -> rustls::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// A REALITY-mode client against a plain TLS server must yield
+    /// [`TlsError::RealityFallback`], not a hard error: the server echoes
+    /// the sealed session id, so the handshake proceeds to the
+    /// `CertificateVerify`, where the REALITY HMAC check fails on the real
+    /// certificate — the fallback signal the caller needs.
+    #[tokio::test]
+    async fn reality_against_plain_tls_server_is_fallback() {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = plain_tls_server_config(&certified.cert, &certified.signing_key);
+
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let timeout = std::time::Duration::from_secs(15);
+            sock.set_read_timeout(Some(timeout)).unwrap();
+            sock.set_write_timeout(Some(timeout)).unwrap();
+            let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            // The client tears down after the failed auth; EOF/errors are
+            // expected once the handshake side completes.
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut sock).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let result = connect_reality(
+            tcp,
+            RealityParams {
+                server_name: "localhost",
+                public_key: &[0xAB; 32],
+                short_id: &[],
+                provisioner: &FixedChrome133,
+                rng: &rng,
+                spider: &SpiderConfig::default(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TlsError::RealityFallback)),
+            "expected RealityFallback, got an unexpected handshake result"
+        );
+        drop(server);
     }
 }

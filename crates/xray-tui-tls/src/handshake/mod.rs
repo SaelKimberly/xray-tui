@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::SecureRandom;
 use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair};
 use crate::error::{Result, TlsError};
-use crate::hello::{BuildParams, build_hello};
+use crate::hello::{BuildParams, build_hello, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{
     CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
@@ -88,10 +88,10 @@ pub struct HandshakeParams<'a> {
     pub alpn: Option<&'a [&'a str]>,
     /// The server-authentication seam.
     pub verifier: &'a dyn ServerVerifier,
-    /// Random source. ring's `SecureRandom` is sealed, so the object is
-    /// always `Send + Sync` in practice; the bounds are declared on the
-    /// trait object so `HandshakeParams` itself is `Send`.
-    pub rng: &'a (dyn ring::rand::SecureRandom + Send + Sync),
+    /// Random source — the crate's [`SecureRandom`] seam. ring's
+    /// `SystemRandom` coerces via the blanket impl; tests implement the
+    /// trait directly for fixed-seed vectors.
+    pub rng: &'a dyn SecureRandom,
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -123,86 +123,115 @@ const MAX_FLIGHT_BUFFER: usize = 4 + 0xFF_FFFF;
 
 // ── Handshake driver ───────────────────────────────────────────────────────
 
-/// Performs the full TLS 1.3 client handshake over `stream`, returning a
-/// record-framed application-data stream.
+/// The server-authentication strategy for the shared [`drive`] handshake.
 ///
-/// # Flow
+/// [`drive`] is the common middle of `handshake::connect` and
+/// `reality::connect_reality`: both write the same shape of `ClientHello`
+/// record and derive the same TLS 1.3 key schedule; they differ only in
+/// how the server's certificate flight is authenticated.
+pub(crate) enum ServerAuth<'a> {
+    /// Plain-TLS mode: hand the flight to a [`ServerVerifier`].
+    Verifier(&'a dyn ServerVerifier),
+    /// REALITY mode: authenticate with the REALITY auth key (HMAC +
+    /// Ed25519 `CertificateVerify` over the transcript).
+    Reality { auth_key: &'a [u8; 32] },
+}
+
+/// The result of the auth dispatch inside [`drive`].
+pub(crate) enum AuthOutcome {
+    /// The server flight authenticated under the chosen strategy; the
+    /// handshake completes normally.
+    Ok,
+    /// REALITY mode: the flight failed REALITY auth, so the server is
+    /// serving a real certificate (transparent proxy / possible MITM or
+    /// redirection). The handshake still completes; the caller decides
+    /// whether to fall back (xray's `!Verified` handling).
+    RealityFallback,
+}
+
+/// Performs the shared TLS 1.3 client handshake over `stream`: writes the
+/// `ClientHello` record, reads the `ServerHello` (skipping middlebox CCS
+/// records; a `HelloRetryRequest` magic random is rejected with
+/// [`TlsError::HelloRetryRequest`]), derives the handshake traffic secrets
+/// with the *selected* suite, decrypts the server flight
+/// (`EncryptedExtensions`, `Certificate`, `CertificateVerify`, `Finished`),
+/// dispatches [`ServerAuth`], authenticates the server `Finished` MAC, sends
+/// the client `Finished` (sealed with the client handshake key), derives the
+/// application traffic secrets, and builds the [`TlsStream`].
 ///
-/// 1. Generate an ephemeral X25519 key pair and write the `ClientHello`
-///    record (fingerprint from `params.spec`).
-/// 2. Read the `ServerHello` (skipping middlebox CCS records); a
-///    `HelloRetryRequest` magic random is rejected with
-///    [`TlsError::HelloRetryRequest`].
-/// 3. Derive the handshake traffic secrets with the *selected* suite and
-///    decrypt the server flight (`EncryptedExtensions`, `Certificate`,
-///    `CertificateVerify`, `Finished`) with the server handshake key.
-/// 4. Hand the chain, `CertificateVerify` material, and the pre-`Finished`
-///    transcript to `params.verifier`, then authenticate the server
-///    `Finished` MAC.
-/// 5. Send the client `Finished` (sealed with the client handshake key),
-///    derive the application traffic secrets, and build the [`TlsStream`].
-pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
+/// The `transcript` (`ClientHello .. Certificate`) is consumed only by the
+/// auth dispatch — the key schedule carries its own transcript
+/// (`KeySchedule::add_transcript`) for the `Finished` MACs and app secrets.
+/// `offered_session_id` must be the legacy session id of `hello`; the
+/// server's `ServerHello` must echo it exactly (RFC 8446 §4.1.3).
+pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
-    params: HandshakeParams<'_>,
-) -> Result<TlsStream<S>> {
+    hello: &[u8],
+    offered_session_id: &[u8],
+    keypair: X25519KeyPair,
+    server_name: &str,
+    auth: ServerAuth<'_>,
+) -> Result<(TlsStream<S>, AuthOutcome)> {
     let mut stream = stream;
+    stream.write_all(&to_record(hello)).await?;
 
-    // 1. Ephemeral X25519 key pair and the ClientHello record.
-    let keypair = X25519KeyPair::generate(params.rng)?;
-    let x25519_pub = keypair.public_key();
-    let rng = RingRng(params.rng);
-    let hello = build_hello(
-        params.spec,
-        &BuildParams {
-            server_name: params.server_name,
-            alpn: params.alpn,
-            x25519_pub: &x25519_pub,
-            rng: &rng,
-        },
-    )?;
-    stream.write_all(&hello.record_bytes).await?;
-
-    // 2. ServerHello (the server must echo the offered legacy session id).
-    let server_hello = read_server_hello(&mut stream, hello.session_id()).await?;
+    let server_hello = read_server_hello(&mut stream, offered_session_id).await?;
     let shared = keypair.agree(&server_hello.peer_key)?;
 
-    // 3. Handshake traffic secrets under the selected suite; the transcript
-    //    is ClientHello || ServerHello.
     let mut ks = KeySchedule::new(server_hello.suite);
-    ks.add_transcript(&hello.handshake_bytes);
+    ks.add_transcript(hello);
     ks.add_transcript(&server_hello.raw);
     let hs_secret = ks.handshake_secret(&shared)?;
     let (client_hs_ts, server_hs_ts) = ks.handshake_traffic_secrets(&hs_secret)?;
     let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts)?;
     let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts)?;
 
-    // 4. Encrypted server flight: EncryptedExtensions, Certificate,
-    //    CertificateVerify, Finished.
     let flight = read_server_hs_messages(&mut stream, &server_hs_key).await?;
 
-    // Transcript up to (excluding) CertificateVerify — the verifier seam.
+    // Transcript up to (excluding) CertificateVerify — consumed only by the
+    // auth dispatch below (RFC 8446 §4.4.3).
     let mut transcript = Vec::with_capacity(
-        hello.handshake_bytes.len()
-            + server_hello.raw.len()
-            + flight.ee_raw.len()
-            + flight.cert_raw.len(),
+        hello.len() + server_hello.raw.len() + flight.ee_raw.len() + flight.cert_raw.len(),
     );
-    transcript.extend_from_slice(&hello.handshake_bytes);
+    transcript.extend_from_slice(hello);
     transcript.extend_from_slice(&server_hello.raw);
     transcript.extend_from_slice(&flight.ee_raw);
     transcript.extend_from_slice(&flight.cert_raw);
 
-    params.verifier.verify(&VerifyContext {
-        chain: &flight.chain,
-        sni: params.server_name,
-        signature_scheme: flight.signature_scheme,
-        cert_verify_body: &flight.cert_verify_body,
-        transcript: &transcript,
-        suite: server_hello.suite,
-    })?;
+    let outcome = match auth {
+        ServerAuth::Verifier(verifier) => {
+            verifier.verify(&VerifyContext {
+                chain: &flight.chain,
+                sni: server_name,
+                signature_scheme: flight.signature_scheme,
+                cert_verify_body: &flight.cert_verify_body,
+                transcript: &transcript,
+                suite: server_hello.suite,
+            })?;
+            AuthOutcome::Ok
+        }
+        ServerAuth::Reality { auth_key } => {
+            let Some(cert_der) = flight.chain.first() else {
+                return Err(TlsError::Verify(
+                    "REALITY server sent no certificate".into(),
+                ));
+            };
+            match crate::reality::verify::verify_server(
+                cert_der,
+                &flight.cv_raw,
+                auth_key,
+                &transcript,
+                server_hello.suite.digest(),
+            ) {
+                Ok(()) => AuthOutcome::Ok,
+                // Any REALITY auth failure = a real certificate (transparent
+                // proxy / possible MITM or redirection), matching xray's
+                // `!Verified` handling.
+                Err(_) => AuthOutcome::RealityFallback,
+            }
+        }
+    };
 
-    // Authenticate the server Finished over ClientHello..CertificateVerify.
-    transcript.extend_from_slice(&flight.cv_raw);
     ks.add_transcript(&flight.ee_raw);
     ks.add_transcript(&flight.cert_raw);
     ks.add_transcript(&flight.cv_raw);
@@ -213,11 +242,8 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
         ));
     }
 
-    // 5. Client Finished over ClientHello..server Finished (RFC 8446 §4.4.4).
     let sf_raw = make_hs_msg(HS_FINISHED, &flight.sf_verify_data);
-    transcript.extend_from_slice(&sf_raw);
     ks.add_transcript(&sf_raw);
-
     let client_finished_key = ks.finished_key(&client_hs_ts)?;
     let client_finished_mac = ks.finished_mac(&client_finished_key);
     let cf_hs_msg = make_hs_msg(HS_FINISHED, &client_finished_mac);
@@ -229,24 +255,57 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .write_all(&make_app_data_record(&cf_ciphertext))
         .await?;
 
-    // 6. Application traffic secrets over ClientHello..server Finished
-    //    (the client Finished is added to the transcript afterwards, for a
-    //    future resumption path — matching the reference accumulation).
     let master = ks.master_secret(&hs_secret)?;
     let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master)?;
     let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts)?;
     let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts)?;
     ks.add_transcript(&cf_hs_msg);
 
-    Ok(TlsStream::new(
-        stream,
-        AppKeys {
-            read_key: server_app_key,
-            write_key: client_app_key,
-            read_seq: 0,
-            write_seq: 0,
-        },
+    Ok((
+        TlsStream::new(
+            stream,
+            AppKeys {
+                read_key: server_app_key,
+                write_key: client_app_key,
+                read_seq: 0,
+                write_seq: 0,
+            },
+        ),
+        outcome,
     ))
+}
+
+/// Performs the full TLS 1.3 client handshake over `stream`, returning a
+/// record-framed application-data stream.
+///
+/// Generates an ephemeral X25519 key pair, builds the `ClientHello` record
+/// (fingerprint from `params.spec`), and hands both to the shared [`drive`]
+/// with a [`ServerAuth::Verifier`] dispatch.
+pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: S,
+    params: HandshakeParams<'_>,
+) -> Result<TlsStream<S>> {
+    let keypair = X25519KeyPair::generate(params.rng)?;
+    let x25519_pub = keypair.public_key();
+    let hello = build_hello(
+        params.spec,
+        &BuildParams {
+            server_name: params.server_name,
+            alpn: params.alpn,
+            x25519_pub: &x25519_pub,
+            rng: params.rng,
+        },
+    )?;
+    let (tls, _) = drive(
+        stream,
+        &hello.handshake_bytes,
+        hello.session_id(),
+        keypair,
+        params.server_name,
+        ServerAuth::Verifier(params.verifier),
+    )
+    .await?;
+    Ok(tls)
 }
 
 // ── ServerHello ────────────────────────────────────────────────────────────
@@ -712,19 +771,6 @@ fn strip_padding(plaintext: &[u8]) -> Result<(u8, &[u8])> {
     }
     let content_type = plaintext[end - 1];
     Ok((content_type, &plaintext[..end - 1]))
-}
-
-/// Adapts ring's sealed `SecureRandom` trait object (the `rng` seam of
-/// [`HandshakeParams`]) to the crate's [`SecureRandom`] trait that
-/// [`build_hello`] consumes. ring's trait is sealed with only thread-safe
-/// implementors, so the `Send + Sync` bounds carried on the trait object
-/// are always satisfiable.
-pub(crate) struct RingRng<'a>(pub(crate) &'a (dyn ring::rand::SecureRandom + Send + Sync));
-
-impl SecureRandom for RingRng<'_> {
-    fn fill(&self, dest: &mut [u8]) -> std::result::Result<(), ring::error::Unspecified> {
-        self.0.fill(dest)
-    }
 }
 
 #[cfg(test)]
