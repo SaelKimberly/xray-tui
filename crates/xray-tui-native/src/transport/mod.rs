@@ -1,10 +1,11 @@
 //! Transport phase: get a byte stream to the proxy server (or reuse an
 //! existing tunnel for the later hops of a chain).
 //!
-//! OUTERMOST layer (Xray composition order): dial → transport → security →
-//! protocol. A transport answers two questions: "dial the server" (`base:
-//! None`) and "upgrade an existing tunnel in place" (`base: Some`, e.g. a
-//! WebSocket handshake on a later chain hop).
+//! `connect` dials the server (`base: None`) or reuses an existing tunnel
+//! (`base: Some`). `upgrade` runs the transport framing (ws/grpc) over an
+//! ALREADY-established stream — the engine TLS/REALITY session (Xray
+//! composition order: dial → security → transport upgrade → protocol; TLS is
+//! OUTERMOST, transport framing runs inside it).
 
 use crate::BoxStream;
 use crate::context::LinkContext;
@@ -17,6 +18,25 @@ pub mod tcp;
 pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
         None | Some("tcp") => tcp::connect(ctx, base).await,
+        Some(t) => Err(NativeError::NotImplemented {
+            feature: format!("transport {t}"),
+        }),
+    }
+}
+
+/// Run the transport-upgrade step over an established stream (the secured
+/// engine stream). TCP = passthrough; ws/grpc = framing handshake over the
+/// stream (implemented in `ws`/`grpc`).
+#[allow(clippy::unused_async)] // ws/grpc arms become async in the transport tasks
+pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    match ctx.transport_type() {
+        Some("ws") => Err(NativeError::NotImplemented {
+            feature: "ws transport".into(),
+        }),
+        Some("grpc") => Err(NativeError::NotImplemented {
+            feature: "grpc transport".into(),
+        }),
+        None | Some("tcp") => Ok(stream),
         Some(t) => Err(NativeError::NotImplemented {
             feature: format!("transport {t}"),
         }),

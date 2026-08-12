@@ -4,9 +4,11 @@
 //! `links[0]` is dialed directly and carries `links[1]`'s traffic
 //! (links[0].target = links[1].server); the last link reaches `target`.
 //!
-//! Fold (n=1 is `connect`): for each link, run transport (dial first hop /
-//! reuse previous tunnel on later hops) → security → protocol, threading the
-//! resulting stream into the next link as its `base`.
+//! Fold (n=1 is `connect`): for each link, dial (first hop) or reuse the
+//! previous tunnel, then run security (TLS/REALITY) OUTERMOST, then the
+//! transport upgrade (ws/grpc framing inside the TLS session), then the
+//! protocol, threading the resulting stream into the next link as its
+//! `base`.
 
 use crate::addr::TargetAddr;
 use crate::context::{LinkContext, NativeConnectParams};
@@ -34,9 +36,10 @@ pub async fn connect_chain(
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
-        let transported = transport::connect(&ctx, base).await?;
-        let secured = security::wrap(&ctx, transported).await?;
-        base = Some(protocol::connect(&ctx, secured).await?);
+        let dialed = transport::connect(&ctx, base).await?;
+        let secured = security::wrap(&ctx, dialed).await?;
+        let upgraded = transport::upgrade(&ctx, secured).await?;
+        base = Some(protocol::connect(&ctx, upgraded).await?);
     }
     base.map(NativeTunnel::from_stream)
         .ok_or_else(|| NativeError::Config("empty chain".into()))
