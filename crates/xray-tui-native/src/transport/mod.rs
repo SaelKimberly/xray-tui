@@ -11,6 +11,7 @@ use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::NativeError;
 
+pub mod grpc;
 pub mod tcp;
 pub mod ws;
 
@@ -31,9 +32,7 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
 pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
         Some("ws") => ws::connect(ctx, stream).await,
-        Some("grpc") => Err(NativeError::NotImplemented {
-            feature: "grpc transport".into(),
-        }),
+        Some("grpc") => grpc::connect(ctx, stream).await,
         None | Some("tcp") => Ok(stream),
         Some(t) => Err(NativeError::NotImplemented {
             feature: format!("transport {t}"),
