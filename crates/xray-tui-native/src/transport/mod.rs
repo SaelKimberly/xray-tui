@@ -12,6 +12,7 @@ use crate::context::LinkContext;
 use crate::error::NativeError;
 
 pub mod tcp;
+pub mod ws;
 
 /// Run the transport step. `base` is the stream from the previous chain hop
 /// (or `None` for the first hop, which dials the server directly).
@@ -27,12 +28,9 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
 /// Run the transport-upgrade step over an established stream (the secured
 /// engine stream). TCP = passthrough; ws/grpc = framing handshake over the
 /// stream (implemented in `ws`/`grpc`).
-#[allow(clippy::unused_async)] // ws/grpc arms become async in the transport tasks
 pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
-        Some("ws") => Err(NativeError::NotImplemented {
-            feature: "ws transport".into(),
-        }),
+        Some("ws") => ws::connect(ctx, stream).await,
         Some("grpc") => Err(NativeError::NotImplemented {
             feature: "grpc transport".into(),
         }),

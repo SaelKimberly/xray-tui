@@ -17,6 +17,8 @@ pub enum NativeError {
     Tls(String),
     #[error("REALITY error: {0}")]
     Reality(String),
+    #[error("transport error: {0}")]
+    Transport(String),
     #[error("protocol {kind} error: {detail}")]
     Protocol { kind: ProtocolKind, detail: String },
     #[error("not implemented: {feature}")]

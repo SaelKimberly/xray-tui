@@ -28,6 +28,15 @@ impl Host {
             Self::Domain(_) => HostKind::Dns,
         }
     }
+
+    /// Raw host string (domain or IP, no IPv6 brackets).
+    #[must_use]
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Ip(ip) => ip.to_string(),
+            Self::Domain(d) => d.clone(),
+        }
+    }
 }
 
 impl From<&str> for Host {

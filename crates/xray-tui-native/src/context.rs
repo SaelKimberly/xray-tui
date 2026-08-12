@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
 use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
 
 use crate::addr::Host;
@@ -140,6 +141,36 @@ impl LinkContext {
     #[must_use]
     pub fn transport_type(&self) -> Option<&str> {
         self.params.protocol.transport_type()
+    }
+
+    /// Typed transport config (vless/vmess/trojan carry `transport`).
+    #[must_use]
+    pub const fn transport_config(&self) -> Option<&TransportConfig> {
+        use xray_tui_proto::proto_spec::ProtocolConfig as PC;
+        match &self.params.protocol {
+            PC::Vless(c) => Some(&c.transport),
+            PC::Vmess(c) => Some(&c.transport),
+            PC::Trojan(c) => Some(&c.transport),
+            _ => None,
+        }
+    }
+
+    /// WebSocket transport config, when the link uses `ws`.
+    #[must_use]
+    pub fn transport_ws(&self) -> Option<&WebSocketConfig> {
+        match self.transport_config()? {
+            TransportConfig::Ws(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// gRPC transport config, when the link uses `grpc`.
+    #[must_use]
+    pub fn transport_grpc(&self) -> Option<&GrpcConfig> {
+        match self.transport_config()? {
+            TransportConfig::Grpc(c) => Some(c),
+            _ => None,
+        }
     }
 }
 

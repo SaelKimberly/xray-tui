@@ -32,6 +32,12 @@ md-5 = "0.11"
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
 ring = "0.17"
 
+# WebSocket transport framing (RFC 6455) over the engine stream — no TLS
+tokio-tungstenite = "0.30"
+futures-core = "0.3"
+futures-sink = "0.3"
+bytes = "1"
+
 # X25519 keypair generation for REALITY e2e configs (feature `native-e2e`
 # only): ring 0.17 cannot serialize the private half of a generated
 # `EphemeralPrivateKey` (its `bytes()` is test-gated), and the server inbound
