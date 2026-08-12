@@ -130,7 +130,8 @@ impl HelloProvisioner for FixedChrome133 {
 /// browser to the steal target: the "spider" walks `paths` with
 /// `request_interval` between requests, `max_gets` requests per path
 /// (bounded, mirroring xray's anti-probing). The values are defaults only;
-/// the spider itself lands with the fallback re-wire.
+/// `connect_reality` spawns the spider task (see [`spider`]) on the
+/// fallback path.
 #[derive(Clone)]
 pub struct SpiderConfig {
     /// Paths from the URL `spx`; default `["/"]`.
@@ -167,8 +168,8 @@ pub struct RealityParams<'a> {
     /// `SystemRandom` coerces via the blanket impl; tests implement the
     /// trait directly for fixed-seed vectors.
     pub rng: &'a dyn SecureRandom,
-    /// Spider session for the fallback path (defaults are fine until the
-    /// fallback re-wire lands).
+    /// Spider session for the fallback path (defaults are fine; customize
+    /// `paths`/`max_gets`/`request_interval` for a different walk).
     pub spider: &'a SpiderConfig,
 }
 

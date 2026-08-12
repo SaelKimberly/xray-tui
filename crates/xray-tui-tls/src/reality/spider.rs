@@ -14,8 +14,33 @@ use crate::record::stream::TlsStream;
 /// Padding cookie zeros (xray `SpiderY[0..1]`).
 const PADDING_MAX: usize = 512;
 
+/// Default browser ("nav") header set applied to every spider GET — the
+/// `TryDefaultHeadersWith(…, "nav")` Chrome navigation set from xray-core
+/// (`thirdparty/Xray-core/common/utils/browser.go`). A real browser opening
+/// the steal target sends these; a bare `:authority/:method/:path/:scheme`
+/// GET plus cookie is a DPI tell. Values are kept short (<128 bytes each;
+/// the HPACK encoder handles longer values via the base-128 varint either
+/// way).
+const BROWSER_HEADERS: &[(&str, &str)] = &[
+    (
+        "user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    ),
+    (
+        "accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    ),
+    ("accept-language", "en-US,en;q=0.9"),
+    ("accept-encoding", "gzip, deflate, br"),
+    ("sec-fetch-dest", "document"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-site", "none"),
+    ("upgrade-insecure-requests", "1"),
+];
+
 /// Bounded Spider-X session: `max_gets` HTTP/2 GETs to `https://<sni><path>`
-/// with a padding cookie, Referer chaining, and `request_interval` delays.
+/// with default browser ("nav") headers, a padding cookie, Referer chaining,
+/// and jittered `request_interval` delays.
 /// All errors are swallowed — the caller already received its
 /// `RealityFallback` error and this task owns the connection. An empty
 /// `paths` list closes the session immediately (nothing to walk).
@@ -33,22 +58,33 @@ pub(crate) async fn run<S: Stream + 'static>(
     let mut prev_path: Option<String> = None;
     for idx in 0..spider.max_gets {
         let path = &spider.paths[idx % spider.paths.len()];
-        let mut extra: Vec<(&str, String)> = Vec::new();
         // Padding cookie: `padding=0…0` (xray SpiderY, 0..=512 zeros).
         let pad =
             usize::try_from(crate::crypto::fingerprint::rand_u64(&rng) % (PADDING_MAX as u64 + 1))
                 .unwrap_or(0);
-        extra.push(("cookie", format!("padding={}", "0".repeat(pad))));
+        let pad_cookie = format!("padding={}", "0".repeat(pad));
         // Referer chain: each later request refers to the previous path.
-        if let Some(prev) = &prev_path {
-            extra.push(("referer", format!("https://{sni}{prev}")));
+        let referer = prev_path
+            .as_ref()
+            .map(|prev| format!("https://{sni}{prev}"));
+        let mut extra_refs: Vec<(&str, &str)> = Vec::with_capacity(BROWSER_HEADERS.len() + 2);
+        extra_refs.extend_from_slice(BROWSER_HEADERS);
+        extra_refs.push(("cookie", pad_cookie.as_str()));
+        if let Some(referer) = referer.as_deref() {
+            extra_refs.push(("referer", referer));
         }
-        let extra_refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let result = client.get(&mut conn, path, &sni, &extra_refs).await;
         prev_path = Some(path.clone());
         if result.is_err() {
             break;
         }
-        tokio::time::sleep(spider.request_interval).await;
+        // Jittered interval: draw ×(0.5..=1.5) in tenths per request so the
+        // GET cadence is not a fixed sleep (mirrors xray's SpiderY interval
+        // randomization; a constant interval is a DPI tell). Drawn from the
+        // same `rand_u64` seam as the padding cookie.
+        let tenths = 5 + (crate::crypto::fingerprint::rand_u64(&rng) % 11); // 5..=15
+        let millis = u64::try_from(spider.request_interval.as_millis()).unwrap_or(0);
+        let jittered = std::time::Duration::from_millis(millis * tenths / 10);
+        tokio::time::sleep(jittered.max(std::time::Duration::from_millis(1))).await;
     }
 }

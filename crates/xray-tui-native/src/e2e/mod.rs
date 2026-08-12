@@ -26,7 +26,7 @@ pub use variant::{
     SecurityVariant, StandardTls, TlsVariant,
 };
 
-use crate::NativeConnectParams;
+use crate::{NativeConnectParams, NativeError};
 
 /// Core version strings for the e2e sweep (single source of truth; tests
 /// import these instead of duplicating constants).
@@ -123,6 +123,11 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
     let config_path = dir.path().join("config.json");
 
     for attempt in 1..=ATTEMPTS {
+        // Fresh recording per attempt: the tls_echo is created once before
+        // the loop, so without a reset its buffer accumulates across
+        // attempts — a preface that arrived just after attempt N's poll
+        // expiry could satisfy attempt N+1 spuriously.
+        tls_echo.reset_recording();
         let port = free_port();
         let env = ServerEnv {
             port,
@@ -141,15 +146,26 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
         let params = case.client_params(port, case.probe_target(&env));
         if matches!(expect.connect, ConnectExpect::ErrRealityFallback) {
             // REALITY fallback scenario: the client's auth must fail. Assert
-            // BOTH halves — the connect errors (RealityFallback), and the
-            // client's Spider-X session actually reached the server's dest
-            // (its h2 preface shows up in the tls_echo recording) — then
-            // skip the probe (there is no tunnel to probe).
-            if crate::connect(params).await.is_ok() {
-                return Err(format!(
-                    "{}: expected RealityFallback, got a connection",
-                    case.label()
-                ));
+            // BOTH halves — the connect errors with a REALITY error
+            // (RealityFallback), and the client's Spider-X session actually
+            // reached the server's dest (its h2 preface shows up in the
+            // tls_echo recording) — then skip the probe (there is no tunnel
+            // to probe). Accepting *any* connect error here would let an
+            // unrelated failure (server not up, timeout) pass the case.
+            match crate::connect(params).await {
+                Ok(_) => {
+                    return Err(format!(
+                        "{}: expected RealityFallback, got a connection",
+                        case.label()
+                    ));
+                }
+                Err(NativeError::Reality(_)) => {}
+                Err(other) => {
+                    return Err(format!(
+                        "{}: expected RealityFallback (NativeError::Reality), got {other:?}",
+                        case.label()
+                    ));
+                }
             }
             if !case.spider_reaches_dest() {
                 // The fallback session terminates at the server itself

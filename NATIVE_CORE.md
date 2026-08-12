@@ -132,11 +132,16 @@ real certificate (potential MITM or redirection)")`.
 ## E2E coverage (tier 3)
 
 11 cases, each run against both cores (xray 26.3.27, sing-box 1.13.16), each
-spawning a real server inbound + dialing it with the native client and probing
-HTTP through the tunnel. The last four are two-servers scenarios: the REALITY
-server's `dest` is a second local server (`tls_echo`), so a fallback or a
-transparently-proxied plain probe terminates there and the recording server
-observes the client's bytes (spider h2 preface / plain-TLS ClientHello).
+spawning a real server inbound + dialing it with the native client. The
+two-servers scenarios are rows 4-6: the REALITY server's `dest` is a second
+local server (`tls_echo`), so a fallback or a transparently-proxied plain
+probe terminates there and the recording server observes the client's bytes
+(spider h2 preface / plain-TLS ClientHello). Row 7 (`plain-server-reality-client`)
+is a single-server scenario — the fallback terminates at the plain TLS server
+itself, so the spider's bytes never reach a dest (`spider_reaches_dest()`
+false). Rows 1-3, 6 and 8-11 probe HTTP through an established tunnel; the two
+fallback cases (rows 4-5, wrong pbk / wrong sid) expect `connect()` to fail
+with the fallback error and skip the probe.
 
 | Case | Payload security | TLS variant |
 |------|------------------|-------------|

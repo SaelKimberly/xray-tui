@@ -207,6 +207,14 @@ impl TlsEchoServer {
         let b = self.recorded.lock().unwrap();
         b.windows(PREFACE.len()).any(|w| w == PREFACE)
     }
+
+    /// Clear the recorded post-handshake bytes. The echo outlives the e2e
+    /// attempt loop (it is created once before the retries), so each attempt
+    /// must reset before asserting fresh spider bytes — otherwise bytes from
+    /// attempt N could satisfy attempt N+1's fallback poll.
+    pub fn reset_recording(&self) {
+        self.recorded.lock().unwrap().clear();
+    }
 }
 
 impl Drop for TlsEchoServer {
