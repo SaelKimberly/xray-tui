@@ -327,39 +327,45 @@ impl AsyncWrite for GrpcStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use xray_tui_proto::proto_spec::common::GrpcConfig;
 
-    #[test]
-    fn frame_roundtrip() {
-        let payload = b"hello vless";
-        let framed = encode_frame(payload);
-        // gRPC prefix (flag 0 + BE hunk len 13) + Hunk protobuf wrapper.
-        assert_eq!(&framed[..5], &[0, 0, 0, 0, 13]);
-        assert_eq!(&framed[5..7], &[0x0A, 11]);
-        assert_eq!(&framed[7..], payload);
+    #[rstest]
+    #[case::short(b"hello vless".to_vec())]
+    #[case::varint_two_byte(vec![0x42; 200])]
+    #[case::empty(Vec::new())]
+    fn frame_roundtrip(#[case] payload: Vec<u8>) {
+        let framed = encode_frame(&payload);
+        // gRPC prefix (flag 0 + BE hunk byte-len) + Hunk protobuf:
+        // tag 0x0A + varint(data_len) + data.
+        // `varint_len(n)` returns the varint BYTES, so its len() is the
+        // encoded width.
+        let hunk_len = 1 + varint_len(payload.len()).len() + payload.len();
+        // Casts are deliberate: gRPC prefix bytes are u8 by spec (hunk_len ≤ 2^32).
+        // Statement-level (not fn-level): rstest's retained original fn loses fn attrs.
+        #[allow(clippy::cast_possible_truncation)]
+        let prefix = [0, 0, 0, (hunk_len >> 8) as u8, hunk_len as u8];
+        assert_eq!(&framed[..5], &prefix);
+        assert_eq!(framed[5], 0x0A);
         let mut buf = BytesMut::from(&framed[..]);
-        assert_eq!(decode_frame(&mut buf), Some(payload.to_vec()));
+        assert_eq!(decode_frame(&mut buf), Some(payload));
         assert!(buf.is_empty());
     }
 
-    #[test]
-    fn frame_hunk_wraps_long_payloads_with_varint() {
-        let payload = vec![0x42u8; 200]; // varint length needs 2 bytes
+    #[rstest]
+    #[case::short(b"abcdef".to_vec())]
+    #[case::varint_two_byte(vec![0x42; 200])]
+    #[case::empty(Vec::new())]
+    fn frame_parse_splits_across_chunks(
+        #[case] payload: Vec<u8>,
+        #[values(0, 2, 5, 6)] split: usize,
+    ) {
         let framed = encode_frame(&payload);
-        assert_eq!(&framed[..5], &[0, 0, 0, 0, 1 + 2 + 200]);
-        assert_eq!(&framed[5..8], &[0x0A, 0xC8, 0x01]);
-        let mut buf = BytesMut::from(&framed[..]);
-        assert_eq!(decode_frame(&mut buf), Some(payload));
-    }
-
-    #[test]
-    fn frame_parse_splits_across_chunks() {
-        let framed = encode_frame(b"abcdef");
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&framed[..3]);
-        assert_eq!(decode_frame(&mut buf), None); // partial prefix
-        buf.extend_from_slice(&framed[3..]);
-        assert_eq!(decode_frame(&mut buf), Some(b"abcdef".to_vec()));
+        buf.extend_from_slice(&framed[..split]);
+        assert_eq!(decode_frame(&mut buf), None); // partial frame
+        buf.extend_from_slice(&framed[split..]);
+        assert_eq!(decode_frame(&mut buf), Some(payload));
     }
 
     #[test]
