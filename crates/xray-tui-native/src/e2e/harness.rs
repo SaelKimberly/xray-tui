@@ -223,6 +223,105 @@ impl Drop for TlsEchoServer {
     }
 }
 
+/// SNI/cert CN of the inner-TLS echo target (spec §7.4): the app-side
+/// engine TLS client dials this hostname THROUGH the tunnel, so the vision
+/// server's TLS filter sees a real TLS `ClientHello` and splices the
+/// connection to the target.
+const INNER_TLS_SNI: &str = "echo.vision.test";
+
+/// The inner-TLS echo target for vision rows (spec §7.4).
+///
+/// A tokio TLS server with a self-signed cert for [`INNER_TLS_SNI`],
+/// completing a real TLS 1.3 session through the tunnel and answering the
+/// HTTP probe. Distinct from [`TlsEchoServer`] (the REALITY dest-borrow
+/// target): the inner echo must complete a NORMAL TLS handshake — the
+/// spliced tunnel forwards the app's engine-client records raw, so this
+/// server never sees the REALITY-mirrored encrypted records that the dest
+/// borrow does.
+pub struct InnerTlsEchoServer {
+    pub addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for InnerTlsEchoServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn the inner-TLS echo target on 127.0.0.1:ephemeral.
+#[must_use]
+pub fn spawn_inner_tls_echo() -> InnerTlsEchoServer {
+    // Workspace convention: ring is the single crypto provider (the app
+    // installs it at startup; tests install here, idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec![INNER_TLS_SNI.to_string()])
+        .expect("inner tls echo cert");
+    let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+        .expect("inner tls echo key der");
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("inner tls echo server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind inner tls echo");
+    let addr = listener.local_addr().expect("inner tls echo ip addr");
+    listener
+        .set_nonblocking(true)
+        .expect("inner tls echo nonblocking");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("inner tls echo tokio");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // The tunnel (vision splice + REALITY's post-handshake
+                // detector) can delay the inner ClientHello several seconds;
+                // bound the whole exchange generously.
+                let Ok(Ok(mut tls)) =
+                    tokio::time::timeout(Duration::from_secs(15), acceptor.accept(sock)).await
+                else {
+                    return;
+                };
+                // Read the request headers (bounded), then answer and close
+                // with close_notify so the client's read_to_end terminates.
+                let mut buf = [0u8; 4096];
+                let mut got = 0;
+                let _ = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        match tls.read(&mut buf[got..]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                got += n;
+                                if got >= buf.len()
+                                    || buf[..got].windows(4).any(|w| w == b"\r\n\r\n")
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+                let _ = tls.write_all(TLS_RESPONSE).await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
+                // Hold the TCP open briefly after close_notify: the server's
+                // vision downlink writes the response Direct frame in the
+                // same window as the echo's FIN. An immediate close lets the
+                // server's teardown (triggered by the echo EOF) truncate the
+                // in-flight response write; holding gives it time to flush.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            });
+        }
+    });
+    InnerTlsEchoServer { addr, handle }
+}
+
 /// Build a rustls server config from the harness cert/key PEMs (TLS 1.3).
 fn tls_server_config(certs: &Certs) -> rustls::ServerConfig {
     use rustls::pki_types::pem::PemObject;
@@ -323,18 +422,21 @@ pub fn generate_certs() -> Certs {
     }
 }
 
-/// Write a GET through the tunnel, return (status code, body).
+/// Drive one HTTP GET/response exchange over `stream`, return (status, body).
 ///
-/// Fully bounded: the write fails fast on a broken tunnel instead of
+/// Fully bounded: the write fails fast on a broken stream instead of
 /// blocking. Returns `(0, String::new())` on a timeout or short read — the
 /// e2e tests retry the whole connection on such outcomes.
-pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
+async fn http_exchange<S>(stream: &mut S) -> (u16, String)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // REALITY inbounds delay the first app-data exchange ~5s while the
     // server's post-handshake record detector completes — the window must
     // cover that plus a slow echo.
     const STEP: Duration = Duration::from_secs(15);
-    let write = tokio::time::timeout(STEP, tunnel.write_all(GET)).await;
+    let write = tokio::time::timeout(STEP, stream.write_all(GET)).await;
     if write.is_err() {
         return (0, String::new());
     }
@@ -343,7 +445,7 @@ pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
         return (0, String::new());
     }
     let mut buf = Vec::new();
-    let read = tokio::time::timeout(STEP, tunnel.read_to_end(&mut buf)).await;
+    let read = tokio::time::timeout(STEP, stream.read_to_end(&mut buf)).await;
     let Ok(Ok(read)) = read else {
         return (0, String::new());
     };
@@ -364,6 +466,50 @@ pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
         .trim_end()
         .to_string();
     (status, body)
+}
+
+/// Write a GET through the tunnel, return (status code, body).
+///
+/// Fully bounded: the write fails fast on a broken tunnel instead of
+/// blocking. Returns `(0, String::new())` on a timeout or short read — the
+/// e2e tests retry the whole connection on such outcomes.
+pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
+    http_exchange(tunnel).await
+}
+
+/// Inner-TLS probe (spec §7.4): establish a real TLS 1.3 session THROUGH
+/// the tunnel to the rustls echo target, then drive the HTTP GET over the
+/// inner stream.
+///
+/// The app side runs the engine TLS client (`xray_tui_tls::client::connect`
+/// with a Chrome profile + insecure verifier; the vision server's TLS
+/// filter detects the inner `ClientHello` and splices the connection to
+/// the target). Consumes the tunnel: the engine client takes ownership of
+/// the stream. Returns `(0, String::new())` when the inner session cannot
+/// be established (the e2e runner retries the whole connection).
+pub async fn probe_inner_tls(tunnel: crate::NativeTunnel) -> (u16, String) {
+    use xray_tui_tls::client::{TlsConfig, connect as tls_connect};
+    use xray_tui_tls::handshake::ServerVerifier;
+    use xray_tui_tls::profiles::BrowserProfile;
+    use xray_tui_tls::verify::WebPkiVerifier;
+    let verifier: Arc<dyn ServerVerifier> =
+        Arc::new(WebPkiVerifier::webpki_roots().with_insecure(true));
+    let config = TlsConfig::plain(Some(BrowserProfile::Chrome130), verifier, INNER_TLS_SNI);
+    // Bound the handshake: through the tunnel + REALITY's post-handshake
+    // detector the ServerHello flight can lag several seconds.
+    let mut inner =
+        match tokio::time::timeout(Duration::from_secs(30), tls_connect(tunnel, &config)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                eprintln!("probe inner tls connect error: {e}");
+                return (0, String::new());
+            }
+            Err(_) => {
+                eprintln!("probe inner tls connect timed out");
+                return (0, String::new());
+            }
+        };
+    http_exchange(&mut inner).await
 }
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";

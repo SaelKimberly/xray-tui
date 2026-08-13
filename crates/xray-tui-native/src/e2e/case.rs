@@ -32,6 +32,18 @@ impl Flow {
     }
 }
 
+/// The app-side probe kind: how the client's application data is carried
+/// through the tunnel (spec §7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppKind {
+    /// Plain HTTP over the raw tunnel (the End path for non-TLS traffic).
+    Plain,
+    /// A real TLS 1.3 session THROUGH the tunnel: the app wraps the tunnel
+    /// in the engine TLS client to a rustls echo target (the vision
+    /// Direct-splice path).
+    InnerTls,
+}
+
 /// One e2e scenario described as data.
 ///
 /// Construct via [`CaseSpec::vless`] / [`CaseSpec::vmess`]; `protocol` and
@@ -51,6 +63,9 @@ pub struct CaseSpec {
     /// (`xtls-rprx-vision`) exists; it is emitted in the server's
     /// clients/users and the client outbound (vmess cases never carry one).
     flow: Option<Flow>,
+    /// App-side probe kind: plain HTTP over the tunnel, or an inner TLS
+    /// session THROUGH the tunnel to a rustls echo target.
+    app: AppKind,
 }
 
 impl CaseSpec {
@@ -63,6 +78,7 @@ impl CaseSpec {
             network: "tcp",
             xhttp_mode: None,
             flow: None,
+            app: AppKind::Plain,
         }
     }
 
@@ -75,6 +91,7 @@ impl CaseSpec {
             network: "tcp",
             xhttp_mode: None,
             flow: None,
+            app: AppKind::Plain,
         }
     }
 
@@ -98,6 +115,20 @@ impl CaseSpec {
     pub const fn with_flow(mut self, flow: Flow) -> Self {
         self.flow = Some(flow);
         self
+    }
+
+    /// Select the app-side probe kind: plain HTTP over the tunnel (default)
+    /// or an inner TLS session through the tunnel to a rustls echo target.
+    #[must_use]
+    pub const fn with_app(mut self, app: AppKind) -> Self {
+        self.app = app;
+        self
+    }
+
+    /// The app-side probe kind.
+    #[must_use]
+    pub const fn app(&self) -> AppKind {
+        self.app
     }
 
     /// Select the TLS transport variant (fingerprint engine or REALITY).
@@ -135,7 +166,11 @@ impl E2eCase for CaseSpec {
             .security
             .as_ref()
             .map_or(String::new(), |s| format!("/{}", s.name()));
-        format!("{proto}/{flow}{}/{tls}{sec}", self.network)
+        let app = match self.app {
+            AppKind::Plain => String::new(),
+            AppKind::InnerTls => "/inner-tls".to_string(),
+        };
+        format!("{proto}/{flow}{}/{tls}{sec}{app}", self.network)
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
@@ -191,10 +226,14 @@ impl E2eCase for CaseSpec {
     }
 
     fn probe_target(&self, env: &ServerEnv) -> SocketAddr {
-        // A plain client through a REALITY server is transparently proxied
-        // and terminates at the server's dest — probe that instead of the
-        // plain echo.
-        if self.tls().probe_dest() {
+        // Inner-TLS rows splice to a rustls echo target (the vision
+        // Direct path); a plain client through a REALITY server is
+        // transparently proxied and terminates at the server's dest —
+        // probe that instead of the plain echo.
+        if self.app == AppKind::InnerTls {
+            env.inner_tls_echo
+                .expect("inner-tls rows spawn the inner TLS echo target")
+        } else if self.tls().probe_dest() {
             env.tls_echo
         } else {
             env.echo
@@ -254,6 +293,14 @@ mod tests {
                 .with_tls(Box::new(RealityTls::fresh()))
                 .label(),
             "vless/xtls-rprx-vision/tcp/reality"
+        );
+        assert_eq!(
+            CaseSpec::vless()
+                .with_flow(Flow::Vision)
+                .with_tls(Box::new(RealityTls::fresh()))
+                .with_app(AppKind::InnerTls)
+                .label(),
+            "vless/xtls-rprx-vision/tcp/reality/inner-tls"
         );
     }
 

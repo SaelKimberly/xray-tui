@@ -659,11 +659,25 @@ impl Unpadder {
         // equivalent for the real wire (a peer that speaks vision carries
         // the UUID on its FIRST frame, so a mismatch means no vision) and a
         // cleaner trust boundary (spec §5.4).
+        //
+        // Coalesced response header: xray's inbound buffers the [0,0]
+        // response header (EncodeResponseHeader + SetFlushNext) and the
+        // VisionWriter's first padded frame is flushed through the SAME
+        // buffered writer — so both arrive in ONE outer-TLS record,
+        // `[0,0][uuid][frame]`. Go's client peels the header from the raw
+        // conn BEFORE wrapping the VisionReader (outbound.go getResponse),
+        // so its unpadder never sees it; ours sees the coalesced chunk, so
+        // skip a leading `[0,0]` (version + addon_len 0) before the UUID
+        // gate. The peel outside then sees the first *content* byte
+        // (non-zero for every vision response) and finishes immediately.
         if self.remaining_command == -1
             && self.remaining_content == -1
             && self.remaining_padding == -1
         {
-            if chunk.len() >= 21 && chunk[..16] == self.user_uuid {
+            if chunk.len() >= 18 && chunk[..2] == [0x00, 0x00] && chunk[2..18] == self.user_uuid {
+                self.remaining_command = 5;
+                i = 18; // consume [0,0] + the UUID
+            } else if chunk.len() >= 21 && chunk[..16] == self.user_uuid {
                 self.remaining_command = 5;
                 i = 16; // consume the UUID
             } else if chunk.len() >= 21 {
@@ -1085,6 +1099,31 @@ mod tests {
         let mut out2 = Vec::new();
         unpad.feed(&frame, &mut out2);
         assert_eq!(out2, b"hi");
+    }
+
+    #[test]
+    fn unpad_coalesced_header_and_first_frame() {
+        // xray's inbound flushes the [0,0] response header and the first
+        // padded downlink frame through the SAME buffered writer, so one
+        // outer-TLS record carries `[0,0][uuid][cmd][clen][plen][content]
+        // [pad]` (Go's client peels the header from the raw conn before the
+        // VisionReader engages; our codec sees the coalesced chunk and must
+        // skip the header before the UUID gate). The gate must engage and
+        // the content must decode — the header bytes are consumed, not
+        // leaked into the stream.
+        let mut unpad = Unpadder::new(UUID);
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&[0x00, 0x00]);
+        chunk.extend_from_slice(&encode_frame(Some(&UUID), CMD_CONTINUE, b"hi", 0));
+        let mut out = Vec::new();
+        unpad.feed(&chunk, &mut out);
+        assert_eq!(out, b"hi");
+        assert!(!unpad.plain_passthrough);
+        assert!(unpad.within_padding);
+        // The frame continues seamlessly in the next chunk.
+        let mut out2 = Vec::new();
+        unpad.feed(&encode_frame(None, CMD_CONTINUE, b"there", 0), &mut out2);
+        assert_eq!(out2, b"there");
     }
 
     #[test]

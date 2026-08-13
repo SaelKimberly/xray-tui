@@ -17,7 +17,8 @@ use common::{
 };
 use rstest::rstest;
 use xray_tui_native::e2e::{
-    CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, TlsEchoServer, TlsVariant, run_against,
+    AppKind, CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, Flow, TlsEchoServer, TlsVariant,
+    run_against,
 };
 
 /// `CaseSpec::vless()` plus the network axis; these helpers keep the
@@ -39,6 +40,18 @@ fn vless_xhttp(mode: &'static str) -> CaseSpec {
 
 fn vless_xhttp_tls(mode: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
     vless_tls("xhttp", tls).with_xhttp_mode(mode)
+}
+
+/// VLESS vision rows (spec §7.4): `flow = xtls-rprx-vision`, tcp network,
+/// the default certificate TLS. `app` selects the app-side probe: plain
+/// HTTP over the tunnel, or an inner TLS session through the tunnel.
+fn vision(app: AppKind) -> CaseSpec {
+    CaseSpec::vless().with_flow(Flow::Vision).with_app(app)
+}
+
+/// VLESS vision rows with an explicit TLS variant (REALITY etc.).
+fn vision_tls(app: AppKind, tls: Box<dyn TlsVariant>) -> CaseSpec {
+    vision(app).with_tls(tls)
 }
 
 #[rstest]
@@ -66,6 +79,14 @@ fn vless_xhttp_tls(mode: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[case::grpc_reality_into_plain_server(vless_tls("grpc", plain_server_reality_client()))]
 #[case::httpupgrade_plain(vless("httpupgrade"))]
 #[case::httpupgrade_chrome(vless_tls("httpupgrade", fp("chrome")))]
+// VLESS vision flow axis (spec §7.4): `xtls-rprx-vision` × {tls, reality} ×
+// {inner-tls, plain} — the inner-tls rows drive the Direct-splice path (the
+// app establishes a real TLS 1.3 session through the tunnel to a rustls
+// echo target); the plain rows exercise the End (non-TLS) path.
+#[case::vision_tls_plain(vision(AppKind::Plain))]
+#[case::vision_tls_inner(vision(AppKind::InnerTls))]
+#[case::vision_reality_plain(vision_tls(AppKind::Plain, reality()))]
+#[case::vision_reality_inner(vision_tls(AppKind::InnerTls, reality()))]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,

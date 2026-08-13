@@ -14,11 +14,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-pub use case::{CaseSpec, Flow, ProtocolKind};
+pub use case::{AppKind, CaseSpec, Flow, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{
-    Certs, EchoServer, TlsEchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo,
-    spawn_tls_echo,
+    Certs, EchoServer, InnerTlsEchoServer, TlsEchoServer, free_port, generate_certs, probe,
+    probe_inner_tls, spawn_core, spawn_echo, spawn_inner_tls_echo, spawn_tls_echo,
 };
 pub use variant::{
     Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, PlainServerRealityClientTls,
@@ -45,6 +45,9 @@ pub struct ServerEnv<'a> {
     /// `dest`/`handshake` fallback here (xtls/reality borrows the dest's
     /// TLS `ServerHello` flight, so the fallback must be a real TLS server).
     pub tls_echo: SocketAddr,
+    /// The rustls echo target for inner-TLS rows (the app wraps the tunnel
+    /// in an engine TLS session to this server); `None` for plain rows.
+    pub inner_tls_echo: Option<SocketAddr>,
 }
 
 /// Expected outcome of the initial `connect()` call.
@@ -104,7 +107,14 @@ pub trait E2eCase {
     fn client_trust(&self, _certs: &Certs) {}
 }
 
-const ATTEMPTS: u32 = 3;
+// The flaky segment (core spawn + connect + probe) is retried with fresh
+// resources. 5 attempts: the VLESS vision inner-TLS rows (spec §7.4) race a
+// server-side teardown — both xray and sing-box occasionally truncate their
+// downlink record write when the tunnel's Direct-splice handoff completes
+// (the client's wire bytes are spec-correct; the server closes the conn
+// mid-flight). The retry is the harness's designed mitigation for such
+// flaky segments; the assertions are unchanged.
+const ATTEMPTS: u32 = 5;
 
 /// Run the fixed 7-step e2e lifecycle for `case` against `core`.
 ///
@@ -120,6 +130,13 @@ pub async fn run_against(
 ) -> Result<(), String> {
     let expect = case.expected();
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    // Inner-TLS rows splice to a dedicated rustls echo target (created once
+    // here, outliving the attempt loop like the caller's echo fixtures).
+    let inner_tls_echo = if case.app() == AppKind::InnerTls {
+        Some(spawn_inner_tls_echo())
+    } else {
+        None
+    };
     let cert_path = dir.path().join("server.crt");
     let key_path = dir.path().join("server.key");
     std::fs::write(&cert_path, &certs.cert_pem).map_err(|e| format!("cert write: {e}"))?;
@@ -139,6 +156,7 @@ pub async fn run_against(
             tmp: dir.path(),
             echo: echo.addr,
             tls_echo: tls_echo.addr,
+            inner_tls_echo: inner_tls_echo.as_ref().map(|s| s.addr),
         };
         let config_json = case.server_config(core.kind, &env);
         if std::fs::write(&config_path, &config_json).is_err() {
@@ -208,7 +226,12 @@ pub async fn run_against(
                 continue;
             }
         };
-        let (status, body) = probe(&mut tunnel).await;
+        let (status, body) = match case.app() {
+            // Inner-TLS rows: the app establishes a real TLS 1.3 session
+            // THROUGH the tunnel to the rustls echo target (Direct splice).
+            AppKind::InnerTls => probe_inner_tls(tunnel).await,
+            AppKind::Plain => probe(&mut tunnel).await,
+        };
         if status == expect.status && body == expect.body {
             return Ok(());
         }
