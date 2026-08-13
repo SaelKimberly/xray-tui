@@ -63,9 +63,9 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native` | unit + integration: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority) | 215 tests (118 tls + 97 native) |
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server | 276 lib tests (122 tls + 154 native; native incl. 37 vision-module + 2 hermetic) |
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
-| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport matrix | 100 tests = 96 green + 4 documented ignored (vless ws/grpc plain-into-reality-server semantic rows × both cores; single-core rows: xhttp/xray, v2rayhttp/sing-box, ws+httpupgrade reality/sing-box) |
+| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis | 108 tests = 104 green + 4 documented ignored (vless ws/grpc plain-into-reality-server semantic rows × both cores; single-core rows: xhttp/xray, v2rayhttp/sing-box, ws+httpupgrade reality/sing-box) |
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
@@ -82,7 +82,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
 | `transport/` | `connect` = TCP dial (any transport; framing is an upgrade step); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `BrowserProfile`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
-| `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented` |
+| `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon |
 | `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
 | `shape.rs` | `ConnectShape`: uniform vs divergent connect paths |
 | `e2e/` (feature `native-e2e`) | case/config/core/harness/variant — real-core scenarios |
@@ -96,7 +96,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
 | `crypto/` | key schedule (RFC 8448-verified), AEAD record keys (IV XOR seq), `X25519KeyPair`, `fingerprint/` JA3 + JA4 encoders |
-| `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF) |
+| `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF; per-direction direct mode `set_write_direct`/`set_read_direct` — raw record-layer bypass that hands the socket to the tunnel, backing the vision Direct splice) |
 | `handshake/` | TLS 1.3 client handshake, `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY |
 | `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked) |
 | `reality/` | `HelloProvisioner` + `ProfileProvisioner(BrowserProfile)` (any of the 12 profiles) + 9-step wire contract, `FixedChrome133`, auth-key/session-seal/server-auth, `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
@@ -134,8 +134,8 @@ real certificate (potential MITM or redirection)")`.
 ## E2E coverage (tier 3)
 
 Two axes. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
-VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 × serving core(s) — 100
-tests = 96 green + 4 documented ignored (vless ws/grpc
+VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 × serving core(s) — 108
+tests = 104 green + 4 documented ignored (vless ws/grpc
 plain-into-reality-server semantic rows × both cores; single-core rows run
 only on the serving core: xhttp on xray, v2rayhttp + ws/httpupgrade-reality
 on sing-box). **TLS-variant cases**, each run against both cores (xray
@@ -150,6 +150,15 @@ itself, so the spider's bytes never reach a dest (`spider_reaches_dest()`
 false). Rows 1-3, 6 and 8-11 probe HTTP through an established tunnel; the
 two fallback cases (rows 4-5, wrong pbk / wrong sid) expect `connect()` to fail
 with the fallback error and skip the probe.
+
+**VLESS vision flow axis** (spec §7.4): 8 rows — `flow = xtls-rprx-vision`,
+tcp network, × core {xray, sing-box} × outer {tls, reality} × app {plain,
+inner-tls}. The inner-tls rows drive the Direct-splice path (the app
+establishes a real TLS 1.3 session through the tunnel to the rustls echo
+target, then the vision filter switches both directions to a raw relay after
+the Direct frame); the plain rows exercise the End (non-TLS inner traffic —
+padding stops, outer TLS continues) path. UDP is rejected before any I/O
+(no XUDP mux, spec §2/§9).
 
 | Case | Payload security | TLS variant |
 |------|------------------|-------------|
@@ -237,8 +246,9 @@ Notes on the matrix:
 | Encryption | none (identity = UUID; optional `xtls-rprx-vision` flow control, TLS 1.3 framing) |
 | Auth | UUID (command bytes in header) |
 | Obfuscation | none at protocol level; REALITY supplies traffic camouflage |
-| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 ✅ (kcp/quic UDP stacks + XHTTP stream-one deferred) |
-| Status | Native client complete + e2e (tls-standard, tls-chrome, reality) × both cores, full TCP-stream transport matrix e2e (100-test sweep). Vision flow control 📋. Deferred: kcp/quic (UDP stacks), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set. |
+| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 ✅ (kcp/quic UDP stacks + XHTTP stream-one deferred). Vision requires raw TCP — the Direct handoff needs the socket (ws/grpc/xhttp framing is incompatible). |
+| Flow | `xtls-rprx-vision` ✅ — padded camouflage frames + inner-TLS filter + Direct splice state machine (`protocol/vless/vision.rs`, protobuf flow addon in the request header). TCP only; UDP rejected (no XUDP mux). Requires outer TLS1.3/REALITY over raw TCP (guards in `connect_vision` mirror xray's rejection). Inner TLS1.3 → `Direct` raw splice — both directions abandon the outer TLS after the Direct frame (the Direct frame is the last outer-TLS record); non-1.3 inner traffic → `End`, padding stops, outer TLS continues. Deviations (spec §9): no 500 ms camouflage timer (the empty Continue long-padding frame is emitted immediately after the header — same wire bytes, deterministic), per-direction direct flags (`TlsStream::set_write_direct`/`set_read_direct`) instead of Go's unsafe `tls.Conn` reflection, no XUDP mux. |
+| Status | Native client complete + e2e (tls-standard, tls-chrome, reality, vision-tls, vision-reality) × both cores, full TCP-stream transport matrix e2e (108-test sweep = 104 green + 4 documented ignored). Deferred: kcp/quic (UDP stacks), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set, vision UDP (`xtls-rprx-vision-udp443` — needs the UDP path). |
 
 **VMess** — ✅ native
 | Capability | Detail |
