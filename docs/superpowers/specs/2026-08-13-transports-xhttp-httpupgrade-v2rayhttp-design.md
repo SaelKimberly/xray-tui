@@ -46,18 +46,22 @@ and timeouts.
 
 ```toml
 # crates/xray-tui-native/Cargo.toml — latest minor versions (verified 2026-08-13)
-hyper = { version = "1.11", default-features = false, features = ["http1", "http2"] }
-http-body-util = "0.1.5"
+hyper = { version = "1.11", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+http-body = "1"
+http-body-util = { version = "0.1.5", features = ["channel"] }
 ```
 
 - `default-features = false`: hyper 1.x default features are empty anyway; this
-  pins it. We enable **only** `http1` + `http2` — the modules that gate
-  `hyper::client::conn::http1/http2`. No `client`, `server`, `runtime`,
-  `full`, `ffi`, `capi`.
-- No hyper-util, no connectors. We drive
-  `hyper::client::conn::http1::handshake::<T,B>(io) -> (SendRequest<B>, Connection<T,B>)`
-  and the http2 equivalent over our own `BoxStream` (AsyncRead+AsyncWrite).
-  Each `Connection` is a driver task we spawn on our runtime.
+  pins it. We enable **only** `client` (required by hyper's module layout —
+  `hyper::client::conn` is gated behind it in 1.11; adds want/pin-project-lite/
+  smallvec) + `http1` + `http2`. No `server`, `runtime`, `full`, `ffi`, `capi`.
+- hyper-util `default-features = false, features = ["tokio"]`: the standard
+  tokio bridge (`TokioIo` wraps tokio `AsyncRead`/`AsyncWrite` into hyper's
+  `rt::Read`/`rt::Write`; `TokioExecutor` drives the h2 conn task). hyper 1.x
+  implements its rt traits for no tokio types, so this bridge is mandatory —
+  hand-rolling it would own unsafe cursor/init code. No connectors, no
+  `hyper-util::client` — we keep the stream + dial + timeouts.
 - hyper **1.11.0** + http-body-util **0.1.5** (latest minor releases, verified via
   `cargo search` 2026-08-13; per workspace dep rule: minor-version bound pinned
   to the latest release). http-body-util 0.1.5 fetches on first build (0.1.4

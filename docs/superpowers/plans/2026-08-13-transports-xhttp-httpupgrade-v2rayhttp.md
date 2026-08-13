@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- hyper: `default-features = false, features = ["http1", "http2"]` — **no** `client`, `server`, `runtime`, `full`. http-body-util `"0.1.5"`, http-body `"1"`. Latest minors (verified 2026-08-13).
+- hyper: `default-features = false, features = ["client", "http1", "http2"]` — `client` is REQUIRED for `hyper::client::conn` (hyper 1.11 gates the module behind it); **no** `server`, `runtime`, `full`. hyper-util `0.1.20` `default-features = false, features = ["tokio"]` (TokioIo/TokioExecutor bridge — mandatory; hyper's rt::Read/Write have no tokio impls). http-body-util `"0.1.5"` `features = ["channel"]`, http-body `"1"`. Latest minors (verified 2026-08-13).
 - xray-tui-proto is **never modified** by these crates. `XHttpConfig`/`HttpUpgradeConfig`/`HttpConfig` already carry the fields needed; chunk size (1 MB) and post interval (30 ms) are hardcoded constants (defaults), no proto change.
 - Engine is ring-only; `xray-tui-tls` untouched. No `rand` crate — padding length uses `ring::rand::{SystemRandom, SecureRandom}` (already a dep).
 - clippy workspace `pedantic`+`nursery` **zero warnings**; `cargo fmt` clean; edition 2024; thiserror errors via existing `NativeError` (`Transport(String)`, `Timeout` — no new variant).
@@ -49,9 +49,13 @@
 # crates/xray-tui-native/Cargo.toml [dependencies]
 # HTTP/1.1 + HTTP/2 client framing (hyper) — minimal features, latest minor.
 # We own the stream + timeouts; hyper owns request/response/chunked/101 framing.
-hyper = { version = "1.11", default-features = false, features = ["http1", "http2"] }
+# NOTE (ruling): `client` is required for hyper::client::conn in 1.11; hyper-util
+# tokio bridges hyper's rt traits (TokioIo/TokioExecutor); http-body-util
+# `channel` feature gates Channel/Sender.
+hyper = { version = "1.11", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 http-body = "1"
-http-body-util = "0.1.5"
+http-body-util = { version = "0.1.5", features = ["channel"] }
 ```
 
 - [ ] **Step 2: Write the shared HTTP layer**
