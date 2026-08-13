@@ -252,9 +252,9 @@ fn encode_alps_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
     use super::grease::is_grease;
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn grease_detection() {
