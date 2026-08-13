@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-pub use case::{CaseSpec, ProtocolKind};
+pub use case::{CaseSpec, Flow, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{
     Certs, EchoServer, TlsEchoServer, free_port, generate_certs, probe, spawn_core, spawn_echo,

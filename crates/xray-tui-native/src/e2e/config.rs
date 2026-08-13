@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use xray_tui_proto::proto_spec::ProtocolConfig;
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
-use super::{CoreKind, ServerEnv, TlsVariant};
+use super::{CoreKind, Flow, ServerEnv, TlsVariant};
 use crate::NativeConnectParams;
 use crate::addr::{Host, TargetAddr};
 
@@ -51,6 +51,20 @@ pub fn reality_sid() -> String {
         write!(out, "{b:02x}").expect("writing to a String never fails");
     }
     out
+}
+
+/// Inject the VLESS flow name into an inbound server JSON: xray's
+/// `settings.clients[0].flow`, sing-box's `users[0].flow`.
+fn set_flow(json: &mut serde_json::Value, core: CoreKind, flow: Flow) {
+    match core {
+        CoreKind::Xray => {
+            json["inbounds"][0]["settings"]["clients"][0]["flow"] =
+                serde_json::json!(flow.as_str());
+        }
+        CoreKind::SingBox => {
+            json["inbounds"][0]["users"][0]["flow"] = serde_json::json!(flow.as_str());
+        }
+    }
 }
 
 // ── Server configs ────────────────────────────────────────────────────────
@@ -175,7 +189,10 @@ pub fn vmess_inbound(
 
 /// VLESS inbound JSON for `core` (no payload security dimension).
 ///
-/// `tls` selects certificate TLS vs REALITY; `network` selects the transport
+/// `flow` selects the VLESS flow control: `Flow::Vision` emits
+/// `"flow": "xtls-rprx-vision"` in xray's `settings.clients[0]` /
+/// sing-box's `users[0]`, `None` omits it. `tls` selects certificate TLS vs
+/// REALITY; `network` selects the transport
 /// (tcp/ws/grpc/httpupgrade/xhttp/h2). For REALITY the transport runs inside
 /// the reality tunnel (reality over raw/grpc/xhttp; the ws/httpupgrade
 /// reality arms are sing-box-gated).
@@ -183,6 +200,7 @@ pub fn vmess_inbound(
 pub fn vless_inbound(
     core: CoreKind,
     env: &ServerEnv,
+    flow: Option<Flow>,
     tls: &dyn TlsVariant,
     network: &str,
 ) -> String {
@@ -190,7 +208,7 @@ pub fn vless_inbound(
         let sid = tls
             .reality_sid()
             .expect("reality variant carries a short id");
-        return vless_reality_inbound(core, env, tls.sni(), private_key, sid, network);
+        return vless_reality_inbound(core, env, flow, tls.sni(), private_key, sid, network);
     }
     // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
@@ -283,6 +301,10 @@ pub fn vless_inbound(
             })
         }
     };
+    let mut json = json;
+    if let Some(flow) = flow {
+        set_flow(&mut json, core, flow);
+    }
     serde_json::to_string(&json).expect("vless server config serializes")
 }
 
@@ -326,7 +348,8 @@ fn reality_stream(
     }
 }
 
-/// VLESS REALITY inbound JSON for `core`. `network` selects the transport
+/// VLESS REALITY inbound JSON for `core`. `flow` selects the VLESS flow
+/// control (see [`vless_inbound`]). `network` selects the transport
 /// declared INSIDE the reality tunnel (tcp/ws/grpc/httpupgrade/xhttp/h2) —
 /// reality is the outermost layer, the transport framing runs beneath it.
 /// Reality serves over raw/grpc/xhttp; the ws/httpupgrade reality arms are
@@ -334,6 +357,7 @@ fn reality_stream(
 fn vless_reality_inbound(
     core: CoreKind,
     env: &ServerEnv,
+    flow: Option<Flow>,
     sni: &str,
     private_key: &str,
     sid: &str,
@@ -392,6 +416,10 @@ fn vless_reality_inbound(
             })
         }
     };
+    let mut json = json;
+    if let Some(flow) = flow {
+        set_flow(&mut json, core, flow);
+    }
     serde_json::to_string(&json).expect("vless reality server config serializes")
 }
 
@@ -568,13 +596,18 @@ pub fn client_params_vmess(
     )
 }
 
-/// Native client params dialing a VLESS listener. `xhttp_mode` selects the
-/// client-side xhttp dialect ("stream-up"; `None` → packet-up) — ignored for
-/// non-xhttp networks.
+/// Native client params dialing a VLESS listener.
+///
+/// `flow` selects the VLESS flow control: `Flow::Vision` emits
+/// `"flow": "xtls-rprx-vision"` in the outbound (the native client
+/// dispatches on `VlessConfig.flow`), `None` omits it. `xhttp_mode` selects
+/// the client-side xhttp dialect ("stream-up"; `None` → packet-up) — ignored
+/// for non-xhttp networks.
 #[must_use]
 pub fn client_params_vless(
     port: u16,
     target: SocketAddr,
+    flow: Option<Flow>,
     tls: &dyn TlsVariant,
     network: &str,
     xhttp_mode: Option<&'static str>,
@@ -604,13 +637,17 @@ pub fn client_params_vless(
         "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
         _ => serde_json::json!({ "type": "tcp" }),
     };
-    let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+    let mut protocol_value = serde_json::json!({
         "schema": "Vless",
         "uuid": UUID,
         "security": client_security(tls, network),
         "transport": transport
-    }))
-    .expect("vless client config parses");
+    });
+    if let Some(flow) = flow {
+        protocol_value["flow"] = serde_json::json!(flow.as_str());
+    }
+    let protocol: ProtocolConfig =
+        serde_json::from_value(protocol_value).expect("vless client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);
     NativeConnectParams::new(
         protocol,
@@ -662,7 +699,7 @@ mod tests {
             tls_echo: "127.0.0.1:9443".parse().unwrap(),
         };
         let xray: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, &tls, "tcp")).unwrap();
+            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, None, &tls, "tcp")).unwrap();
         let settings = &xray["inbounds"][0]["streamSettings"]["realitySettings"];
         assert_eq!(settings["show"], false);
         assert_eq!(settings["dest"], "127.0.0.1:9443");
@@ -671,7 +708,8 @@ mod tests {
         assert_eq!(settings["shortIds"][0], tls.reality_sid().unwrap());
 
         let sing: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, &tls, "tcp")).unwrap();
+            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, None, &tls, "tcp"))
+                .unwrap();
         let tls_block = &sing["inbounds"][0]["tls"];
         let reality = &tls_block["reality"];
         assert_eq!(tls_block["server_name"], "localhost");
@@ -686,7 +724,7 @@ mod tests {
     fn client_params_reality_carry_pbk_and_sid() {
         let tls = RealityTls::fresh();
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &tls, "tcp", None);
+        let params = client_params_vless(12345, target, None, &tls, "tcp", None);
         let sec = params.protocol.security().unwrap();
         assert_eq!(sec.type_str(), Some("reality"));
         assert_eq!(sec.pbk(), Some(tls.reality_pbk().unwrap()));
@@ -696,14 +734,15 @@ mod tests {
     #[test]
     fn client_params_fingerprint_set_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &FingerprintTls("chrome"), "tcp", None);
+        let params =
+            client_params_vless(12345, target, None, &FingerprintTls("chrome"), "tcp", None);
         assert_eq!(params.protocol.security().unwrap().fp(), Some("chrome"));
     }
 
     #[test]
     fn client_params_standard_has_no_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &StandardTls, "tcp", None);
+        let params = client_params_vless(12345, target, None, &StandardTls, "tcp", None);
         assert_eq!(params.protocol.security().unwrap().fp(), None);
     }
 
@@ -720,9 +759,101 @@ mod tests {
                 .map(str::to_string)
         };
         // Default (None) → packet-up; an explicit mode passes through.
-        let packet = client_params_vless(12345, target, &StandardTls, "xhttp", None);
+        let packet = client_params_vless(12345, target, None, &StandardTls, "xhttp", None);
         assert_eq!(mode_of(packet).as_deref(), Some("packet-up"));
-        let stream = client_params_vless(12345, target, &StandardTls, "xhttp", Some("stream-up"));
+        let stream = client_params_vless(
+            12345,
+            target,
+            None,
+            &StandardTls,
+            "xhttp",
+            Some("stream-up"),
+        );
         assert_eq!(mode_of(stream).as_deref(), Some("stream-up"));
+    }
+
+    #[test]
+    fn vless_flow_emitted_when_set() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+        };
+        let target = "1.2.3.4:80".parse().unwrap();
+
+        // Server JSON: flow lands in xray's clients[0] / sing-box's users[0].
+        let xray: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::Xray,
+            &env,
+            Some(Flow::Vision),
+            &StandardTls,
+            "tcp",
+        ))
+        .unwrap();
+        assert_eq!(
+            xray["inbounds"][0]["settings"]["clients"][0]["flow"],
+            "xtls-rprx-vision"
+        );
+        let sing: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::SingBox,
+            &env,
+            Some(Flow::Vision),
+            &StandardTls,
+            "tcp",
+        ))
+        .unwrap();
+        assert_eq!(sing["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision");
+
+        // The REALITY inbound carries the flow too.
+        let reality = RealityTls::fresh();
+        let xray_reality: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::Xray,
+            &env,
+            Some(Flow::Vision),
+            &reality,
+            "tcp",
+        ))
+        .unwrap();
+        assert_eq!(
+            xray_reality["inbounds"][0]["settings"]["clients"][0]["flow"],
+            "xtls-rprx-vision"
+        );
+
+        // Client JSON: flow reaches the native client's VlessConfig.
+        let params =
+            client_params_vless(12345, target, Some(Flow::Vision), &StandardTls, "tcp", None);
+        let ProtocolConfig::Vless(vless) = &params.protocol else {
+            panic!("expected a vless client config");
+        };
+        assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision"));
+    }
+
+    #[test]
+    fn vless_flow_omitted_when_none() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+        };
+        let target = "1.2.3.4:80".parse().unwrap();
+
+        // Neither xray's clients[0] nor sing-box's users[0] carry a flow key.
+        for core in [CoreKind::Xray, CoreKind::SingBox] {
+            let server: serde_json::Value =
+                serde_json::from_str(&vless_inbound(core, &env, None, &StandardTls, "tcp"))
+                    .unwrap();
+            assert!(server["inbounds"][0]["settings"]["clients"][0]["flow"].is_null());
+            assert!(server["inbounds"][0]["users"][0]["flow"].is_null());
+        }
+
+        let params = client_params_vless(12345, target, None, &StandardTls, "tcp", None);
+        let ProtocolConfig::Vless(vless) = &params.protocol else {
+            panic!("expected a vless client config");
+        };
+        assert!(vless.flow.is_none());
     }
 }

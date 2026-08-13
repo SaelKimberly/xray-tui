@@ -18,6 +18,20 @@ pub enum ProtocolKind {
     Vmess,
 }
 
+/// VLESS flow control; only `xtls-rprx-vision` is implemented (None = none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Vision,
+}
+
+impl Flow {
+    /// The wire flow name both cores and the native client emit.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        "xtls-rprx-vision"
+    }
+}
+
 /// One e2e scenario described as data.
 ///
 /// Construct via [`CaseSpec::vless`] / [`CaseSpec::vmess`]; `protocol` and
@@ -33,6 +47,10 @@ pub struct CaseSpec {
     /// client's mode selects the dialect on the wire; `None` for non-xhttp
     /// networks.
     xhttp_mode: Option<&'static str>,
+    /// VLESS flow control; `None` = no flow. Only `Flow::Vision`
+    /// (`xtls-rprx-vision`) exists; it is emitted in the server's
+    /// clients/users and the client outbound (vmess cases never carry one).
+    flow: Option<Flow>,
 }
 
 impl CaseSpec {
@@ -44,6 +62,7 @@ impl CaseSpec {
             tls: None,
             network: "tcp",
             xhttp_mode: None,
+            flow: None,
         }
     }
 
@@ -55,6 +74,7 @@ impl CaseSpec {
             tls: None,
             network: "tcp",
             xhttp_mode: None,
+            flow: None,
         }
     }
 
@@ -70,6 +90,13 @@ impl CaseSpec {
     #[must_use]
     pub const fn with_xhttp_mode(mut self, mode: &'static str) -> Self {
         self.xhttp_mode = Some(mode);
+        self
+    }
+
+    /// Select the VLESS flow control ("vision"; the default is no flow).
+    #[must_use]
+    pub const fn with_flow(mut self, flow: Flow) -> Self {
+        self.flow = Some(flow);
         self
     }
 
@@ -100,17 +127,22 @@ impl E2eCase for CaseSpec {
             ProtocolKind::Vless => "vless",
             ProtocolKind::Vmess => "vmess",
         };
+        let flow = self
+            .flow
+            .map_or_else(String::new, |flow| format!("{}/", flow.as_str()));
         let tls = self.tls.as_deref().map_or("tls", TlsVariant::name);
         let sec = self
             .security
             .as_ref()
             .map_or(String::new(), |s| format!("/{}", s.name()));
-        format!("{proto}/{}/{tls}{sec}", self.network)
+        format!("{proto}/{flow}{}/{tls}{sec}", self.network)
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
         match self.protocol {
-            ProtocolKind::Vless => config::vless_inbound(core, env, self.tls(), self.network),
+            ProtocolKind::Vless => {
+                config::vless_inbound(core, env, self.flow, self.tls(), self.network)
+            }
             ProtocolKind::Vmess => {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
                 config::vmess_inbound(core, env, security, self.tls(), self.network)
@@ -120,9 +152,14 @@ impl E2eCase for CaseSpec {
 
     fn client_params(&self, port: u16, target: SocketAddr) -> NativeConnectParams {
         match self.protocol {
-            ProtocolKind::Vless => {
-                config::client_params_vless(port, target, self.tls(), self.network, self.xhttp_mode)
-            }
+            ProtocolKind::Vless => config::client_params_vless(
+                port,
+                target,
+                self.flow,
+                self.tls(),
+                self.network,
+                self.xhttp_mode,
+            ),
             ProtocolKind::Vmess => {
                 let enc = self
                     .security
@@ -206,6 +243,17 @@ mod tests {
                 .with_tls(Box::new(RealityTls::fresh()))
                 .label(),
             "vmess/tcp/reality/aes-128-gcm"
+        );
+        assert_eq!(
+            CaseSpec::vless().with_flow(Flow::Vision).label(),
+            "vless/xtls-rprx-vision/tcp/tls"
+        );
+        assert_eq!(
+            CaseSpec::vless()
+                .with_flow(Flow::Vision)
+                .with_tls(Box::new(RealityTls::fresh()))
+                .label(),
+            "vless/xtls-rprx-vision/tcp/reality"
         );
     }
 
