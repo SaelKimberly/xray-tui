@@ -79,6 +79,14 @@ async fn vless_against_cores(
 // xray-core refuses REALITY over httpupgrade inbounds — "REALITY only
 // supports RAW, XHTTP and gRPC" — so the reality row runs on sing-box only.
 #[case::httpupgrade_reality_singbox(vless_tls("httpupgrade", reality()), CoreKind::SingBox)]
+// xhttp (splithttp) is xray-only: sing-box's own dialect is the v2rayhttp
+// transport (a different plan task). Packet-up over h1 (no TLS) is covered
+// by the hermetic unit test; these rows exercise the h2 arm (TLS) and the
+// REALITY path (xray's splithttp server accepts packet-up under REALITY —
+// the mode gate is on the client side; verified empirically below).
+#[case::xhttp_packet_plain(vless("xhttp"), CoreKind::Xray)]
+#[case::xhttp_packet_chrome(vless_tls("xhttp", fp("chrome")), CoreKind::Xray)]
+#[case::xhttp_packet_reality(vless_tls("xhttp", reality()), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,

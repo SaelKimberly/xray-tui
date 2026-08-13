@@ -122,10 +122,10 @@ pub fn vless_inbound(
     // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
-    // grpc rides HTTP/2 (needs h2 ALPN); ws/httpupgrade upgrade with
-    // http/1.1 (the default below).
+    // grpc and xhttp ride HTTP/2 (need h2 ALPN); ws/httpupgrade upgrade
+    // with http/1.1 (the default below).
     let alpn = match network {
-        "grpc" => serde_json::json!(["h2"]),
+        "grpc" | "xhttp" => serde_json::json!(["h2"]),
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
@@ -150,6 +150,14 @@ pub fn vless_inbound(
                 "httpupgrade" => {
                     stream["httpupgradeSettings"] =
                         serde_json::json!({ "path": "/hu", "host": "localhost" });
+                }
+                // xray's splithttp dialect: network "splithttp" + settings
+                // key "splithttpSettings". Server mode defaults to auto
+                // (accepts packet-up + stream-up POSTs).
+                "xhttp" => {
+                    stream["network"] = serde_json::json!("splithttp");
+                    stream["splithttpSettings"] =
+                        serde_json::json!({ "path": "/x", "host": "localhost" });
                 }
                 _ => {}
             }
@@ -235,11 +243,11 @@ fn reality_stream(
 }
 
 /// VLESS REALITY inbound JSON for `core`. `network` selects the transport
-/// declared INSIDE the reality tunnel (tcp/ws/grpc) — reality is the
+/// declared INSIDE the reality tunnel (tcp/ws/grpc/xhttp) — reality is the
 /// outermost layer, the transport framing runs beneath it. xray-core only
-/// accepts reality over raw/grpc ("REALITY only supports RAW, XHTTP and
-/// gRPC for now"), so xray's reality inbound stays tcp-only for ws; sing-box
-/// serves reality+ws.
+/// accepts reality over raw/grpc/xhttp ("REALITY only supports RAW, XHTTP
+/// and gRPC for now"), so xray's reality inbound stays tcp-only for
+/// ws/httpupgrade; sing-box serves reality+ws.
 fn vless_reality_inbound(
     core: CoreKind,
     env: &ServerEnv,
@@ -268,6 +276,11 @@ fn vless_reality_inbound(
                 stream["network"] = serde_json::json!("grpc");
                 stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
             }
+        }
+        // xray reality serves splithttp (XHTTP is in its allowlist).
+        "xhttp" if core == CoreKind::Xray => {
+            stream["network"] = serde_json::json!("splithttp");
+            stream["splithttpSettings"] = serde_json::json!({ "path": "/x", "host": "localhost" });
         }
         _ => {}
     }
@@ -347,7 +360,7 @@ fn client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
 /// transport-aware: grpc rides h2, everything else upgrades with http/1.1.
 fn plain_client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
     let alpn = match network {
-        "grpc" => "h2",
+        "grpc" | "xhttp" => "h2",
         // ws and httpupgrade both upgrade over HTTP/1.1 (the default below).
         _ => "http/1.1",
     };
@@ -418,6 +431,14 @@ pub fn client_params_vless(
         // `httpupgrade` that the dispatch arms match on.
         "httpupgrade" => {
             serde_json::json!({ "type": "http_upgrade", "path": "/hu", "host": "localhost" })
+        }
+        // Same snake_case tag for xhttp: the variant parses as `x_http`
+        // (wire/type_str name `xhttp`). The xray server dialect is
+        // `splithttp`; packet-up is forced explicitly (xray's client
+        // auto-defaults to stream-one under REALITY — we test packet-up
+        // over REALITY on purpose).
+        "xhttp" => {
+            serde_json::json!({ "type": "x_http", "path": "/x", "host": "localhost", "mode": "packet-up" })
         }
         _ => serde_json::json!({ "type": "tcp" }),
     };
