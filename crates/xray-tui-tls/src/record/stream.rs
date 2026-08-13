@@ -738,8 +738,10 @@ mod tests {
         client.write_all(b"RAW-BYTES").await.unwrap();
 
         // 4. The raw half sees the literal bytes. (A record-layer reader
-        // would reject them: 0x52 is not a valid content type and the
-        // length field 0x4259 exceeds MAX_RECORD_PAYLOAD.)
+        // would misparse them: the 5-byte header would be 0x52 0x41 0x57
+        // 0x2D 0x42 — 0x52 is not a valid content type and the length
+        // field (bytes 3-4, 0x2D42) would frame a bogus 11,586-byte
+        // payload read.)
         let mut raw = [0u8; 9];
         b.read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"RAW-BYTES");

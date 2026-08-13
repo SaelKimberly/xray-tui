@@ -158,10 +158,17 @@ stops but the outer TLS **continues** (normal relay, no splice).
 8. Both directions raw: inner TLS records relayed end-to-end; the tunnel's
    outer TLS is abandoned (no close_notify) — one TLS session on the wire.
 
-Server: response header `[0,0]` (ver + addons_len 0) is written **raw**
-(unpadded, own TLS record) before the first padded downlink frame
-(inbound.go + `NewVisionWriter` wiring). Flow must equal the account flow;
-XRV inbound rejects UDP (inbound.go).
+Server: response header `[0,0]` (ver + addons_len 0) is NOT written as its
+own TLS record — `EncodeResponseHeader` buffers it and `SetFlushNext`
+(inbound.go:619-623; common/buf/writer.go:165-167,215) flushes it TOGETHER
+with the first padded frame in ONE outer-TLS record:
+`[0,0][uuid][cmd][clen][plen][content][pad]`. The client handles this: the
+codec's Unpadder skips a leading `[0,0]` before the UUID gate
+(vision.rs:663-672), and the outer peel (stream.rs:46-78) is lenient (hands
+the first non-0x00 byte back as payload). Go peels the header from the raw
+conn BEFORE wrapping the VisionReader (outbound.go getResponse) — our peel
+sits outside the codec, hence the codec-side skip. Flow must equal the
+account flow; XRV inbound rejects UDP (inbound.go).
 
 ## 5. Architecture
 
@@ -253,9 +260,11 @@ the native crate; the engine has no vision knowledge.
     - write header + camouflage frame, then wrap the stream in the codec.
   - any other non-empty flow → `NotImplemented` (unchanged guard).
 - `stream.rs`: lazy response-header peel unchanged — the server's `[0,0]`
-  arrives as its own TLS record before the first padded frame
-  (§4.6 step 7 sequencing); the codec's UUID gate passes it through, then the
-  peel consumes it, then unpadding engages. The peel happens *outside* the
+  does NOT arrive as its own TLS record: it is coalesced with the first
+  padded frame into ONE outer-TLS record (§4.6 step 8); the codec's Unpadder
+  skips the leading `[0,0]` before its UUID gate (vision.rs:663-672), so the
+  peel never sees it — the lenient peel (stream.rs:46-78) hands the first
+  non-0x00 byte back as payload and finishes. The peel happens *outside* the
   codec (wraps the codec), preserving the existing non-vless fallback.
 - Flow value source: `VlessConfig.flow` (proto already parses/stores/hashes
   it; no proto changes).

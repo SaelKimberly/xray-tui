@@ -63,7 +63,7 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server | 276 lib tests (122 tls + 154 native; native incl. 37 vision-module + 2 hermetic) |
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server | 276 lib tests (122 tls + 154 native; native incl. 37 vision-module tests (incl. 2 hermetic fake-vision-server)) |
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
 | 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis | 108 tests = 104 green + 4 documented ignored (vless ws/grpc plain-into-reality-server semantic rows × both cores; single-core rows: xhttp/xray, v2rayhttp/sing-box, ws+httpupgrade reality/sing-box) |
 
@@ -157,8 +157,8 @@ inner-tls}. The inner-tls rows drive the Direct-splice path (the app
 establishes a real TLS 1.3 session through the tunnel to the rustls echo
 target, then the vision filter switches both directions to a raw relay after
 the Direct frame); the plain rows exercise the End (non-TLS inner traffic —
-padding stops, outer TLS continues) path. UDP is rejected before any I/O
-(no XUDP mux, spec §2/§9).
+padding stops, outer TLS continues) path. UDP unsupported
+(no UDP command path in the native client; no XUDP mux).
 
 | Case | Payload security | TLS variant |
 |------|------------------|-------------|
