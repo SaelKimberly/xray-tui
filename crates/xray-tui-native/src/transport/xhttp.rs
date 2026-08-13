@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use http::header::HOST;
+use http_body::Frame;
+use http_body_util::BodyExt;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
@@ -300,8 +302,10 @@ async fn upload_loop_h2(
 
 /// Run the XHTTP transport over the established (secured) stream.
 ///
-/// `auto`/default = packet-up. HTTP version matches xray `decideHTTPVersion`:
-/// no TLS → HTTP/1.1 (GET on the primary stream, POSTs on a second raw TCP
+/// The client-side mode (config `mode`) selects the dialect: `auto`/empty →
+/// packet-up; `stream-up` supported; `stream-one` (legacy XHTTP v1) →
+/// `NotImplemented`. HTTP version matches xray `decideHTTPVersion`: no
+/// TLS → HTTP/1.1 (GET on the primary stream, POSTs on a second raw TCP
 /// dial — Go h1 serializes responses in request order, so a long-lived GET
 /// body would block POST responses on its own conn); TLS → HTTP/2 (one conn,
 /// multiplexed streams).
@@ -311,20 +315,24 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         .and_then(|c| c.mode.as_deref())
         .unwrap_or("auto");
     match mode {
-        "auto" | "packet-up" => {
+        "stream-up" => {
+            if has_tls(ctx) {
+                stream_up_h2(ctx, stream).await
+            } else {
+                stream_up_h1(ctx, stream).await
+            }
+        }
+        "packet-up" | "auto" | "" => {
             if has_tls(ctx) {
                 packet_up_h2(ctx, stream).await
             } else {
                 packet_up_h1(ctx, stream).await
             }
         }
-        "stream-up" => Err(NativeError::NotImplemented {
-            feature: "xhttp stream-up (Task 4)".into(),
+        "stream-one" => Err(NativeError::NotImplemented {
+            feature: "xhttp stream-one mode".into(),
         }),
-        // "stream-one" (legacy XHTTP v1) is out of scope for this plan.
-        other => Err(NativeError::NotImplemented {
-            feature: format!("xhttp mode {other}"),
-        }),
+        other => Err(NativeError::Config(format!("unknown xhttp mode: {other}"))),
     }
 }
 
@@ -373,6 +381,95 @@ async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let host_owned = host.clone();
     tokio::spawn(upload_loop_h2(sender, ctx, session_owned, host_owned, rx));
     Ok(Box::new(XhttpStream::new(reader, tx)))
+}
+
+/// Drain a response body to completion in a spawned task. The stream-up
+/// server streams keepalive X-blobs into the upload response when a Referer
+/// is present (xray hub.go) — the drain keeps the h1/h2 window from
+/// stalling, so it must run concurrently with the tunnel.
+fn drain_response(resp: hyper::Response<hyper::body::Incoming>) {
+    tokio::spawn(async move {
+        let mut body = resp.into_body();
+        while let Some(Ok(_)) = body.frame().await {
+            // discard keepalive X-blobs
+        }
+    });
+}
+
+/// Forward tunnel writes into the stream-up upload pipe.
+///
+/// The pipe sender has capacity 1 (`Channel::new(1)` — see
+/// [`ReqBody::channel`]); `try_send` hands the frame back on a full pipe, so
+/// yield and retry — the hyper h1/h2 write side drains it.
+async fn forward_pipe(
+    mut pipe_tx: http_body_util::channel::Sender<Bytes>,
+    mut wrx: mpsc::Receiver<Bytes>,
+) {
+    while let Some(b) = wrx.recv().await {
+        let mut frame = Frame::data(b);
+        loop {
+            match pipe_tx.try_send(frame) {
+                Ok(()) => break,
+                Err(f) => {
+                    frame = f;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+}
+
+/// stream-up: GET (download) + one long-lived POST (upload, pipe body,
+/// `Content-Type: application/grpc`) on a second raw TCP dial. The server
+/// 200s the POST immediately and streams keepalive X-blobs into the response
+/// (drained in a spawned task).
+async fn stream_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    let session = session_id();
+    let url = path_with(ctx, &session, None);
+    let mut get_sender = h1_client(stream).await?;
+    let get_req = build_request(ctx, "GET", &url, ReqBody::Empty, &host)?;
+    let resp = send_200(&mut get_sender, get_req, "xhttp stream-up GET").await?;
+    let reader = IncomingReader::new(resp.into_body());
+
+    let post_stream = crate::transport::tcp::connect(ctx, None).await?;
+    let mut post_sender = h1_client(post_stream).await?;
+    let (tx, body) = ReqBody::channel();
+    let mut req = build_request(ctx, "POST", &url, body, &host)?;
+    req.headers_mut().insert(
+        "Content-Type",
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    let resp = send_200(&mut post_sender, req, "xhttp stream-up POST").await?;
+    drain_response(resp);
+
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    tokio::spawn(forward_pipe(tx, wrx));
+    Ok(Box::new(XhttpStream::new(reader, wt)))
+}
+
+/// stream-up over h2 (TLS): GET + POST streams on one h2 conn.
+async fn stream_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    let session = session_id();
+    let url = path_with(ctx, &session, None);
+    let mut sender = h2_client(stream).await?;
+    let get_req = build_request(ctx, "GET", &url, ReqBody::Empty, &host)?;
+    let resp = send_200(&mut sender, get_req, "xhttp stream-up GET").await?;
+    let reader = IncomingReader::new(resp.into_body());
+
+    let (tx, body) = ReqBody::channel();
+    let mut req = build_request(ctx, "POST", &url, body, &host)?;
+    req.headers_mut().insert(
+        "Content-Type",
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    let resp = send_200(&mut sender, req, "xhttp stream-up POST").await?;
+    drain_response(resp);
+
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    tokio::spawn(forward_pipe(tx, wrx));
+    Ok(Box::new(XhttpStream::new(reader, wt)))
 }
 
 /// An in-flight channel send (the channel was full when kicked) — a boxed
@@ -554,6 +651,52 @@ mod tests {
         String::from_utf8(head).unwrap()
     }
 
+    /// Decode the chunked POST body off the raw socket: parse size lines and
+    /// payloads until `want` has arrived (the stream-up tunnel POST stays
+    /// open, so the caller stops early) or the peer closes. Returns the
+    /// de-chunked payload read so far.
+    async fn read_chunked_until(sock: &mut tokio::net::TcpStream, want: &[u8]) -> Vec<u8> {
+        let mut raw: Vec<u8> = Vec::new();
+        let mut body: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut expect = 0usize; // payload bytes remaining in the current chunk
+        loop {
+            if expect == 0 {
+                if let Some(pos) = raw.windows(2).position(|w| w == b"\r\n") {
+                    let size =
+                        usize::from_str_radix(std::str::from_utf8(&raw[..pos]).unwrap().trim(), 16)
+                            .unwrap();
+                    raw.drain(..pos + 2);
+                    if size == 0 {
+                        return body; // terminating last-chunk
+                    }
+                    expect = size;
+                } else {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        return body;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                    continue;
+                }
+            }
+            if raw.len() < expect + 2 {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    return body;
+                }
+                raw.extend_from_slice(&tmp[..n]);
+                continue;
+            }
+            body.extend_from_slice(&raw[..expect]);
+            raw.drain(..expect + 2); // payload + trailing CRLF
+            expect = 0;
+            if body == want {
+                return body;
+            }
+        }
+    }
+
     /// Two connections: GET (download, session in path) + POSTs (upload, seq
     /// in path). Server responds 200 to both; GET body streams echoes.
     #[tokio::test]
@@ -611,6 +754,64 @@ mod tests {
         let mut out = [0u8; 5];
         t.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"world");
+        server.await.unwrap();
+    }
+
+    /// stream-up: GET (download, 200 + streaming body) + POST (upload, pipe
+    /// body with application/grpc). The server 200s the POST immediately
+    /// (xray hub.go) and streams echoes on the GET; the tunnel POST stays
+    /// open for the connection's lifetime, so the server echoes as soon as
+    /// the payload arrived (waiting for EOF would deadlock — xray streams
+    /// continuously).
+    #[tokio::test]
+    async fn stream_up_h1_get_and_post() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut get_sock, _) = listener.accept().await.unwrap();
+            let get_head = read_head(&mut get_sock).await;
+            assert!(get_head.starts_with("GET /x/"), "{get_head}");
+            get_sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let (mut up_sock, _) = listener.accept().await.unwrap();
+            let up_head = read_head(&mut up_sock).await;
+            assert!(up_head.starts_with("POST /x/"), "{up_head}");
+            // hyper writes header names lowercase on the wire.
+            assert!(
+                up_head
+                    .to_lowercase()
+                    .contains("content-type: application/grpc"),
+                "{up_head}"
+            );
+            // xray hub.go 200s the upload POST immediately, then streams
+            // keepalive X-blobs into the response body (drained client-side).
+            up_sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            // POST body is chunked (unknown-length pipe); the tunnel stays
+            // open — decode the framing and echo as soon as the payload
+            // arrived (waiting for EOF would deadlock; xray streams echoes
+            // continuously).
+            let body = read_chunked_until(&mut up_sock, b"hello").await;
+            assert_eq!(&body, b"hello");
+            get_sock
+                .write_all(b"6\r\nworld!\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ctx = ctx_at(addr, "stream-up");
+        let mut t = connect(&ctx, Box::new(stream)).await.unwrap();
+        t.write_all(b"hello").await.unwrap();
+        let mut out = [0u8; 6];
+        t.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"world!");
+        assert_eq!(&out, b"world!");
         server.await.unwrap();
     }
 

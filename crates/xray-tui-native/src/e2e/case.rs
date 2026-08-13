@@ -29,6 +29,10 @@ pub struct CaseSpec {
     security: Option<Box<dyn SecurityVariant>>,
     tls: Option<Box<dyn TlsVariant>>,
     network: &'static str,
+    /// Client-side xhttp dialect ("packet-up" default, "stream-up"). The
+    /// client's mode selects the dialect on the wire; `None` for non-xhttp
+    /// networks.
+    xhttp_mode: Option<&'static str>,
 }
 
 impl CaseSpec {
@@ -39,6 +43,7 @@ impl CaseSpec {
             security: None,
             tls: None,
             network: "tcp",
+            xhttp_mode: None,
         }
     }
 
@@ -49,6 +54,7 @@ impl CaseSpec {
             security: Some(Box::new(variant)),
             tls: None,
             network: "tcp",
+            xhttp_mode: None,
         }
     }
 
@@ -56,6 +62,14 @@ impl CaseSpec {
     #[must_use]
     pub const fn with_network(mut self, network: &'static str) -> Self {
         self.network = network;
+        self
+    }
+
+    /// Select the client-side xhttp dialect ("stream-up"; packet-up is the
+    /// default). Ignored for non-xhttp networks.
+    #[must_use]
+    pub const fn with_xhttp_mode(mut self, mode: &'static str) -> Self {
+        self.xhttp_mode = Some(mode);
         self
     }
 
@@ -107,7 +121,7 @@ impl E2eCase for CaseSpec {
     fn client_params(&self, port: u16, target: SocketAddr) -> NativeConnectParams {
         match self.protocol {
             ProtocolKind::Vless => {
-                config::client_params_vless(port, target, self.tls(), self.network)
+                config::client_params_vless(port, target, self.tls(), self.network, self.xhttp_mode)
             }
             ProtocolKind::Vmess => {
                 let enc = self

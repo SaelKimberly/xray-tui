@@ -415,13 +415,16 @@ pub fn client_params_vmess(
     )
 }
 
-/// Native client params dialing a VLESS listener.
+/// Native client params dialing a VLESS listener. `xhttp_mode` selects the
+/// client-side xhttp dialect ("stream-up"; `None` → packet-up) — ignored for
+/// non-xhttp networks.
 #[must_use]
 pub fn client_params_vless(
     port: u16,
     target: SocketAddr,
     tls: &dyn TlsVariant,
     network: &str,
+    xhttp_mode: Option<&'static str>,
 ) -> NativeConnectParams {
     let transport = match network {
         "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
@@ -434,12 +437,15 @@ pub fn client_params_vless(
         }
         // Same snake_case tag for xhttp: the variant parses as `x_http`
         // (wire/type_str name `xhttp`). The xray server dialect is
-        // `splithttp`; packet-up is forced explicitly (xray's client
-        // auto-defaults to stream-one under REALITY — we test packet-up
-        // over REALITY on purpose).
-        "xhttp" => {
-            serde_json::json!({ "type": "x_http", "path": "/x", "host": "localhost", "mode": "packet-up" })
-        }
+        // `splithttp`; the CLIENT mode drives the client-side dialect.
+        // Packet-up is the default (forced explicitly — xray's client
+        // auto-defaults to stream-one under REALITY; the packet-up-over-
+        // REALITY row tests that on purpose). Stream-up rows pass their
+        // mode through.
+        "xhttp" => serde_json::json!({
+            "type": "x_http", "path": "/x", "host": "localhost",
+            "mode": xhttp_mode.unwrap_or("packet-up")
+        }),
         _ => serde_json::json!({ "type": "tcp" }),
     };
     let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
@@ -524,7 +530,7 @@ mod tests {
     fn client_params_reality_carry_pbk_and_sid() {
         let tls = RealityTls::fresh();
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &tls, "tcp");
+        let params = client_params_vless(12345, target, &tls, "tcp", None);
         let sec = params.protocol.security().unwrap();
         assert_eq!(sec.type_str(), Some("reality"));
         assert_eq!(sec.pbk(), Some(tls.reality_pbk().unwrap()));
@@ -534,14 +540,33 @@ mod tests {
     #[test]
     fn client_params_fingerprint_set_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &FingerprintTls("chrome"), "tcp");
+        let params = client_params_vless(12345, target, &FingerprintTls("chrome"), "tcp", None);
         assert_eq!(params.protocol.security().unwrap().fp(), Some("chrome"));
     }
 
     #[test]
     fn client_params_standard_has_no_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &StandardTls, "tcp");
+        let params = client_params_vless(12345, target, &StandardTls, "tcp", None);
         assert_eq!(params.protocol.security().unwrap().fp(), None);
+    }
+
+    #[test]
+    fn client_params_xhttp_mode_drives_dialect() {
+        use crate::context::LinkContext;
+
+        let target = "1.2.3.4:80".parse().unwrap();
+        let dest = TargetAddr::new(Host::Domain("dest.test".into()), 80);
+        let mode_of = |params: NativeConnectParams| {
+            LinkContext::new(params, dest.clone())
+                .transport_xhttp()
+                .and_then(|c| c.mode.as_deref())
+                .map(str::to_string)
+        };
+        // Default (None) → packet-up; an explicit mode passes through.
+        let packet = client_params_vless(12345, target, &StandardTls, "xhttp", None);
+        assert_eq!(mode_of(packet).as_deref(), Some("packet-up"));
+        let stream = client_params_vless(12345, target, &StandardTls, "xhttp", Some("stream-up"));
+        assert_eq!(mode_of(stream).as_deref(), Some("stream-up"));
     }
 }

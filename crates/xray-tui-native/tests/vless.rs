@@ -1,5 +1,6 @@
 //! E2E: native VLESS matrix — network {tcp, ws, grpc, httpupgrade} × TLS
-//! variant × core {xray, sing-box}. One generated test per (case, core).
+//! variant × core {xray, sing-box}, plus xray-only xhttp (splithttp) rows.
+//! One generated test per (case, core).
 //!
 //! `clippy::future_not_send` is allowed file-wide: rstest 0.26.1 clears the
 //! source fn's attributes when embedding it beside the generated tests, so no
@@ -27,6 +28,17 @@ fn vless(net: &'static str) -> CaseSpec {
 
 fn vless_tls(net: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
     vless(net).with_tls(tls)
+}
+
+/// xhttp row with an explicit client-side mode (the client's
+/// `XHttpConfig.mode` selects the dialect on the wire; the server runs auto
+/// and accepts both).
+fn vless_xhttp(mode: &'static str) -> CaseSpec {
+    vless("xhttp").with_xhttp_mode(mode)
+}
+
+fn vless_xhttp_tls(mode: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
+    vless_tls("xhttp", tls).with_xhttp_mode(mode)
 }
 
 #[rstest]
@@ -87,6 +99,11 @@ async fn vless_against_cores(
 #[case::xhttp_packet_plain(vless("xhttp"), CoreKind::Xray)]
 #[case::xhttp_packet_chrome(vless_tls("xhttp", fp("chrome")), CoreKind::Xray)]
 #[case::xhttp_packet_reality(vless_tls("xhttp", reality()), CoreKind::Xray)]
+// stream-up: the client config carries mode "stream-up" (the client-side
+// mode drives the dialect); both rows run over h2 (TLS → h2). The h1 arm
+// is covered by the hermetic unit test.
+#[case::xhttp_stream_plain(vless_xhttp("stream-up"), CoreKind::Xray)]
+#[case::xhttp_stream_chrome(vless_xhttp_tls("stream-up", fp("chrome")), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,
