@@ -11,16 +11,15 @@
 
 mod common;
 
-use common::{certs, cores, echo, pick, tls_echo};
+use common::{certs, cores, echo, fp, pick, reality, tls_echo};
 use rstest::rstest;
 use xray_tui_native::e2e::{
     Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest,
-    EchoServer, FingerprintTls, RealityTls, SecurityVariant, TlsEchoServer, TlsVariant,
-    run_against,
+    EchoServer, SecurityVariant, TlsEchoServer, TlsVariant, run_against,
 };
 
 /// `CaseSpec::vmess` takes the security variant by value; these helpers keep
-/// the `#[case]` rows one-liners.
+/// the `#[case]` rows one-liners (mirror of the vless matrix helpers).
 fn vmess(sec: impl SecurityVariant + 'static, net: &'static str) -> CaseSpec {
     CaseSpec::vmess(sec).with_network(net)
 }
@@ -36,54 +35,22 @@ fn vmess_tls(
 #[rstest]
 #[case::tcp_aes128gcm(vmess(Aes128GcmVariant, "tcp"))]
 #[case::tcp_chacha20(vmess(Chacha20Poly1305Variant, "tcp"))]
-#[case::tcp_aes128gcm_chrome(vmess_tls(
-    Aes128GcmVariant,
-    "tcp",
-    Box::new(FingerprintTls("chrome"))
-))]
-#[case::tcp_chacha20_chrome(vmess_tls(
-    Chacha20Poly1305Variant,
-    "tcp",
-    Box::new(FingerprintTls("chrome"))
-))]
-#[case::tcp_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "tcp", Box::new(RealityTls::fresh())))]
-#[case::tcp_chacha20_reality(vmess_tls(
-    Chacha20Poly1305Variant,
-    "tcp",
-    Box::new(RealityTls::fresh())
-))]
+#[case::tcp_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "tcp", fp("chrome")))]
+#[case::tcp_chacha20_chrome(vmess_tls(Chacha20Poly1305Variant, "tcp", fp("chrome")))]
+#[case::tcp_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "tcp", reality()))]
+#[case::tcp_chacha20_reality(vmess_tls(Chacha20Poly1305Variant, "tcp", reality()))]
 #[case::ws_aes128gcm(vmess(Aes128GcmVariant, "ws"))]
 #[case::ws_chacha20(vmess(Chacha20Poly1305Variant, "ws"))]
-#[case::ws_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "ws", Box::new(FingerprintTls("chrome"))))]
-#[case::ws_chacha20_chrome(vmess_tls(
-    Chacha20Poly1305Variant,
-    "ws",
-    Box::new(FingerprintTls("chrome"))
-))]
-#[case::ws_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "ws", Box::new(RealityTls::fresh())))]
-#[case::ws_chacha20_reality(vmess_tls(
-    Chacha20Poly1305Variant,
-    "ws",
-    Box::new(RealityTls::fresh())
-))]
+#[case::ws_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "ws", fp("chrome")))]
+#[case::ws_chacha20_chrome(vmess_tls(Chacha20Poly1305Variant, "ws", fp("chrome")))]
+#[case::ws_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "ws", reality()))]
+#[case::ws_chacha20_reality(vmess_tls(Chacha20Poly1305Variant, "ws", reality()))]
 #[case::grpc_aes128gcm(vmess(Aes128GcmVariant, "grpc"))]
 #[case::grpc_chacha20(vmess(Chacha20Poly1305Variant, "grpc"))]
-#[case::grpc_aes128gcm_chrome(vmess_tls(
-    Aes128GcmVariant,
-    "grpc",
-    Box::new(FingerprintTls("chrome"))
-))]
-#[case::grpc_chacha20_chrome(vmess_tls(
-    Chacha20Poly1305Variant,
-    "grpc",
-    Box::new(FingerprintTls("chrome"))
-))]
-#[case::grpc_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "grpc", Box::new(RealityTls::fresh())))]
-#[case::grpc_chacha20_reality(vmess_tls(
-    Chacha20Poly1305Variant,
-    "grpc",
-    Box::new(RealityTls::fresh())
-))]
+#[case::grpc_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "grpc", fp("chrome")))]
+#[case::grpc_chacha20_chrome(vmess_tls(Chacha20Poly1305Variant, "grpc", fp("chrome")))]
+#[case::grpc_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "grpc", reality()))]
+#[case::grpc_chacha20_reality(vmess_tls(Chacha20Poly1305Variant, "grpc", reality()))]
 #[tokio::test]
 async fn vmess_against_cores(
     #[case] case: CaseSpec,

@@ -10,59 +10,50 @@
 
 mod common;
 
-use common::{certs, cores, echo, pick, tls_echo};
+use common::{
+    certs, cores, echo, fp, pick, plain_server_reality_client, reality,
+    reality_server_plain_client, reality_wrong_pbk, reality_wrong_sid, tls_echo,
+};
 use rstest::rstest;
 use xray_tui_native::e2e::{
-    CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls,
-    PlainServerRealityClientTls, RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls,
-    RealityWrongSidTls, TlsEchoServer, run_against,
+    CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, TlsEchoServer, TlsVariant, run_against,
 };
 
+/// `CaseSpec::vless()` plus the network axis; these helpers keep the
+/// `#[case]` rows one-liners (mirror of the vmess matrix helpers).
+fn vless(net: &'static str) -> CaseSpec {
+    CaseSpec::vless().with_network(net)
+}
+
+fn vless_tls(net: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
+    vless(net).with_tls(tls)
+}
+
 #[rstest]
-#[case::tcp_plain(CaseSpec::vless())]
-#[case::tcp_chrome(CaseSpec::vless().with_tls(Box::new(FingerprintTls("chrome"))))]
-#[case::tcp_reality(CaseSpec::vless().with_tls(Box::new(RealityTls::fresh())))]
-#[case::tcp_reality_wrong_pbk(CaseSpec::vless().with_tls(Box::new(RealityWrongPbkTls::fresh())))]
-#[case::tcp_reality_wrong_sid(CaseSpec::vless().with_tls(Box::new(RealityWrongSidTls::fresh())))]
-#[case::tcp_plain_into_reality_server(
-    CaseSpec::vless().with_tls(Box::new(RealityServerPlainClientTls::fresh()))
-)]
-#[case::tcp_reality_into_plain_server(
-    CaseSpec::vless().with_tls(Box::new(PlainServerRealityClientTls::fresh()))
-)]
-#[case::ws_plain(CaseSpec::vless().with_network("ws"))]
-#[case::ws_chrome(CaseSpec::vless().with_network("ws").with_tls(Box::new(FingerprintTls("chrome"))))]
+#[case::tcp_plain(vless("tcp"))]
+#[case::tcp_chrome(vless_tls("tcp", fp("chrome")))]
+#[case::tcp_reality(vless_tls("tcp", reality()))]
+#[case::tcp_reality_wrong_pbk(vless_tls("tcp", reality_wrong_pbk()))]
+#[case::tcp_reality_wrong_sid(vless_tls("tcp", reality_wrong_sid()))]
+#[case::tcp_plain_into_reality_server(vless_tls("tcp", reality_server_plain_client()))]
+#[case::tcp_reality_into_plain_server(vless_tls("tcp", plain_server_reality_client()))]
+#[case::ws_plain(vless("ws"))]
+#[case::ws_chrome(vless_tls("ws", fp("chrome")))]
 #[ignore = "xray-core 26.3.27 rejects reality+ws inbounds (REALITY only supports RAW, XHTTP and gRPC); sing-box serves it"]
-#[case::ws_reality(CaseSpec::vless().with_network("ws").with_tls(Box::new(RealityTls::fresh())))]
-#[case::ws_reality_wrong_pbk(
-    CaseSpec::vless().with_network("ws").with_tls(Box::new(RealityWrongPbkTls::fresh()))
-)]
-#[case::ws_reality_wrong_sid(
-    CaseSpec::vless().with_network("ws").with_tls(Box::new(RealityWrongSidTls::fresh()))
-)]
+#[case::ws_reality(vless_tls("ws", reality()))]
+#[case::ws_reality_wrong_pbk(vless_tls("ws", reality_wrong_pbk()))]
+#[case::ws_reality_wrong_sid(vless_tls("ws", reality_wrong_sid()))]
 #[ignore = "plain client into reality server: dest sees ws framing, not HTTP (transport unreachable pre-proxy)"]
-#[case::ws_plain_into_reality_server(
-    CaseSpec::vless().with_network("ws").with_tls(Box::new(RealityServerPlainClientTls::fresh()))
-)]
-#[case::ws_reality_into_plain_server(
-    CaseSpec::vless().with_network("ws").with_tls(Box::new(PlainServerRealityClientTls::fresh()))
-)]
-#[case::grpc_plain(CaseSpec::vless().with_network("grpc"))]
-#[case::grpc_chrome(CaseSpec::vless().with_network("grpc").with_tls(Box::new(FingerprintTls("chrome"))))]
-#[case::grpc_reality(CaseSpec::vless().with_network("grpc").with_tls(Box::new(RealityTls::fresh())))]
-#[case::grpc_reality_wrong_pbk(
-    CaseSpec::vless().with_network("grpc").with_tls(Box::new(RealityWrongPbkTls::fresh()))
-)]
-#[case::grpc_reality_wrong_sid(
-    CaseSpec::vless().with_network("grpc").with_tls(Box::new(RealityWrongSidTls::fresh()))
-)]
+#[case::ws_plain_into_reality_server(vless_tls("ws", reality_server_plain_client()))]
+#[case::ws_reality_into_plain_server(vless_tls("ws", plain_server_reality_client()))]
+#[case::grpc_plain(vless("grpc"))]
+#[case::grpc_chrome(vless_tls("grpc", fp("chrome")))]
+#[case::grpc_reality(vless_tls("grpc", reality()))]
+#[case::grpc_reality_wrong_pbk(vless_tls("grpc", reality_wrong_pbk()))]
+#[case::grpc_reality_wrong_sid(vless_tls("grpc", reality_wrong_sid()))]
 #[ignore = "plain client into reality server: dest sees grpc framing, not HTTP (transport unreachable pre-proxy)"]
-#[case::grpc_plain_into_reality_server(
-    CaseSpec::vless().with_network("grpc").with_tls(Box::new(RealityServerPlainClientTls::fresh()))
-)]
-#[case::grpc_reality_into_plain_server(
-    CaseSpec::vless().with_network("grpc").with_tls(Box::new(PlainServerRealityClientTls::fresh()))
-)]
+#[case::grpc_plain_into_reality_server(vless_tls("grpc", reality_server_plain_client()))]
+#[case::grpc_reality_into_plain_server(vless_tls("grpc", plain_server_reality_client()))]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,

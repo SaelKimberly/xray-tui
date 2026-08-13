@@ -3,8 +3,10 @@
 
 use rstest::fixture;
 use xray_tui_native::e2e::{
-    Certs, CoreKind, CoreUnderTest, EchoServer, SINGBOX_VERSION, TlsEchoServer, XRAY_VERSION,
-    generate_certs, spawn_echo, spawn_tls_echo,
+    Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, PlainServerRealityClientTls,
+    RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
+    SINGBOX_VERSION, TlsEchoServer, TlsVariant, XRAY_VERSION, generate_certs, spawn_echo,
+    spawn_tls_echo,
 };
 
 /// Resolved core binaries, once per test binary (hard-fails when
@@ -45,4 +47,44 @@ pub const fn pick(cores: &(CoreUnderTest, CoreUnderTest), kind: CoreKind) -> &Co
         CoreKind::Xray => &cores.0,
         CoreKind::SingBox => &cores.1,
     }
+}
+
+/// TLS-variant builders — keep the `#[case]` rows one-liners (shared by the
+/// vless + vmess matrices; `StandardTls` is `CaseSpec`'s default, no builder).
+#[must_use]
+pub fn fp(id: &'static str) -> Box<dyn TlsVariant> {
+    Box::new(FingerprintTls(id))
+}
+
+#[must_use]
+pub fn reality() -> Box<dyn TlsVariant> {
+    Box::new(RealityTls::fresh())
+}
+
+// vless-only variant (unused in the vmess test binary, which shares this module).
+#[must_use]
+#[allow(dead_code)]
+pub fn reality_wrong_pbk() -> Box<dyn TlsVariant> {
+    Box::new(RealityWrongPbkTls::fresh())
+}
+
+// vless-only variant (unused in the vmess test binary, which shares this module).
+#[must_use]
+#[allow(dead_code)]
+pub fn reality_wrong_sid() -> Box<dyn TlsVariant> {
+    Box::new(RealityWrongSidTls::fresh())
+}
+
+// vless-only variant (unused in the vmess test binary, which shares this module).
+#[must_use]
+#[allow(dead_code)]
+pub fn reality_server_plain_client() -> Box<dyn TlsVariant> {
+    Box::new(RealityServerPlainClientTls::fresh())
+}
+
+// vless-only variant (unused in the vmess test binary, which shares this module).
+#[must_use]
+#[allow(dead_code)]
+pub fn plain_server_reality_client() -> Box<dyn TlsVariant> {
+    Box::new(PlainServerRealityClientTls::fresh())
 }
