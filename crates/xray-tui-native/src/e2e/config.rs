@@ -55,48 +55,120 @@ pub fn reality_sid() -> String {
 
 // ── Server configs ────────────────────────────────────────────────────────
 
-/// `VMess` inbound JSON for `core`. `security` is the xray user security string
-/// (mirrors intent; cosmetic for AEAD); sing-box never receives it. `tls`
-/// selects certificate TLS vs REALITY.
+/// `VMess` inbound JSON for `core`.
+///
+/// `security` is the xray user security string (mirrors intent; cosmetic for
+/// AEAD); sing-box never receives it. `tls` selects certificate TLS vs
+/// REALITY; `network` selects the transport (tcp/ws/grpc/httpupgrade/xhttp/h2).
+/// For REALITY the transport runs inside the reality tunnel (xray-core serves
+/// reality over raw/grpc/xhttp only; sing-box also over ws).
 #[must_use]
 pub fn vmess_inbound(
     core: CoreKind,
     env: &ServerEnv,
     security: Option<&str>,
     tls: &dyn TlsVariant,
+    network: &str,
 ) -> String {
     if let Some(private_key) = tls.reality_private_key() {
         let sid = tls
             .reality_sid()
             .expect("reality variant carries a short id");
-        return vmess_reality_inbound(core, env, security, tls.sni(), private_key, sid);
+        return vmess_reality_inbound(core, env, security, tls.sni(), private_key, sid, network);
     }
-    // Configs reference the PEM FILES on disk, not the in-memory bytes.
+    // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    // grpc, xhttp and v2rayhttp ("h2") ride HTTP/2 (need h2 ALPN);
+    // ws/httpupgrade upgrade with http/1.1 (the default below).
+    let alpn = match network {
+        "grpc" | "xhttp" | "h2" => serde_json::json!(["h2"]),
+        _ => serde_json::json!(["http/1.1"]),
+    };
     let json = match core {
-        CoreKind::Xray => serde_json::json!({
-            "inbounds": [{
-                "listen": "127.0.0.1", "port": env.port, "protocol": "vmess",
-                "settings": { "clients": [{
-                    "id": UUID,
-                    "security": security.unwrap_or("aes-128-gcm")
-                }] },
-                "streamSettings": { "network": "tcp", "security": "tls",
-                    "tlsSettings": { "certificates": [
+        CoreKind::Xray => {
+            let mut stream = serde_json::json!({
+                "network": network,
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [
                         { "certificateFile": cert_path, "keyFile": key_path }
-                    ], "alpn": ["http/1.1"] } }
-            }],
-            "outbounds": [{ "protocol": "freedom" }]
-        }),
-        CoreKind::SingBox => serde_json::json!({
-            "log": { "level": "warn" },
-            "inbounds": [{ "type": "vmess", "listen": "127.0.0.1", "listen_port": env.port,
+                    ],
+                    "alpn": alpn
+                }
+            });
+            match network {
+                "ws" => {
+                    stream["wsSettings"] = serde_json::json!({ "path": "/ws" });
+                }
+                "grpc" => {
+                    stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
+                }
+                "httpupgrade" => {
+                    stream["httpupgradeSettings"] =
+                        serde_json::json!({ "path": "/hu", "host": "localhost" });
+                }
+                // xray's splithttp dialect: network "splithttp" + settings
+                // key "splithttpSettings". Server mode defaults to auto
+                // (accepts packet-up + stream-up POSTs).
+                "xhttp" => {
+                    stream["network"] = serde_json::json!("splithttp");
+                    stream["splithttpSettings"] =
+                        serde_json::json!({ "path": "/x", "host": "localhost" });
+                }
+                // xray-core removed the h2 transport in 26.x — these rows
+                // are sing-box single-core, so this arm is unreachable; a
+                // loud panic beats emitting a broken config.
+                "h2" => panic!("h2 (v2rayhttp) transport is sing-box only"),
+                _ => {}
+            }
+            serde_json::json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1", "port": env.port, "protocol": "vmess",
+                    "settings": { "clients": [{
+                        "id": UUID,
+                        "security": security.unwrap_or("aes-128-gcm")
+                    }] },
+                    "streamSettings": stream
+                }],
+                "outbounds": [{ "protocol": "freedom" }]
+            })
+        }
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "vmess", "listen": "127.0.0.1", "listen_port": env.port,
                 "users": [{ "uuid": UUID }],
                 "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path,
-                    "alpn": ["http/1.1"] } }],
-            "outbounds": [{ "type": "direct" }]
-        }),
+                    "alpn": alpn }
+            });
+            match network {
+                "ws" => {
+                    inbound["transport"] = serde_json::json!({ "type": "ws", "path": "/ws" });
+                }
+                "grpc" => {
+                    inbound["transport"] =
+                        serde_json::json!({ "type": "grpc", "service_name": "gun" });
+                }
+                "httpupgrade" => {
+                    inbound["transport"] = serde_json::json!({
+                        "type": "httpupgrade", "path": "/hu", "host": "localhost"
+                    });
+                }
+                // v2rayhttp: sing-box `type: http`, the h2 single-stream
+                // tunnel (xray-core dropped the h2 transport in 26.x).
+                "h2" => {
+                    inbound["transport"] = serde_json::json!({
+                        "type": "http", "path": "/h2", "host": "localhost"
+                    });
+                }
+                _ => {}
+            }
+            serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            })
+        }
     };
     serde_json::to_string(&json).expect("vmess server config serializes")
 }
@@ -323,7 +395,12 @@ fn vless_reality_inbound(
     serde_json::to_string(&json).expect("vless reality server config serializes")
 }
 
-/// `VMess` REALITY inbound JSON for `core`.
+/// `VMess` REALITY inbound JSON for `core`. `network` selects the transport
+/// declared INSIDE the reality tunnel (tcp/ws/grpc/xhttp) — reality is the
+/// outermost layer, the transport framing runs beneath it. xray-core only
+/// accepts reality over raw/grpc/xhttp ("REALITY only supports RAW, XHTTP
+/// and gRPC for now"), so xray's reality inbound stays tcp-only for
+/// ws/httpupgrade; sing-box serves reality+ws.
 fn vmess_reality_inbound(
     core: CoreKind,
     env: &ServerEnv,
@@ -331,8 +408,36 @@ fn vmess_reality_inbound(
     sni: &str,
     private_key: &str,
     sid: &str,
+    network: &str,
 ) -> String {
-    let stream = reality_stream(core, env, sni, private_key, sid);
+    let mut stream = reality_stream(core, env, sni, private_key, sid);
+    let mut transport = None;
+    match network {
+        "ws" if core == CoreKind::SingBox => {
+            transport = Some(serde_json::json!({ "type": "ws", "path": "/ws" }));
+        }
+        // xray-core refuses reality over httpupgrade ("REALITY only supports
+        // RAW, XHTTP and gRPC"), so the httpupgrade reality row runs on
+        // sing-box only.
+        "httpupgrade" if core == CoreKind::SingBox => {
+            transport = Some(serde_json::json!({
+                "type": "httpupgrade", "path": "/hu", "host": "localhost"
+            }));
+        }
+        "grpc" => {
+            transport = Some(serde_json::json!({ "type": "grpc", "service_name": "gun" }));
+            if core == CoreKind::Xray {
+                stream["network"] = serde_json::json!("grpc");
+                stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
+            }
+        }
+        // xray reality serves splithttp (XHTTP is in its allowlist).
+        "xhttp" if core == CoreKind::Xray => {
+            stream["network"] = serde_json::json!("splithttp");
+            stream["splithttpSettings"] = serde_json::json!({ "path": "/x", "host": "localhost" });
+        }
+        _ => {}
+    }
     let json = match core {
         CoreKind::Xray => serde_json::json!({
             "inbounds": [{
@@ -345,13 +450,21 @@ fn vmess_reality_inbound(
             }],
             "outbounds": [{ "protocol": "freedom" }]
         }),
-        CoreKind::SingBox => serde_json::json!({
-            "log": { "level": "warn" },
-            "inbounds": [{ "type": "vmess", "listen": "127.0.0.1", "listen_port": env.port,
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "vmess", "listen": "127.0.0.1", "listen_port": env.port,
                 "users": [{ "uuid": UUID }],
-                "tls": stream }],
-            "outbounds": [{ "type": "direct" }]
-        }),
+                "tls": stream
+            });
+            if let Some(t) = transport {
+                inbound["transport"] = t;
+            }
+            serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            })
+        }
     };
     serde_json::to_string(&json).expect("vmess reality server config serializes")
 }
@@ -402,20 +515,49 @@ fn reality_client_security(tls: &dyn TlsVariant, pbk: &str) -> serde_json::Value
 }
 
 /// Native client params dialing a `VMess` listener with payload security `enc`.
+/// `xhttp_mode` selects the client-side xhttp dialect ("stream-up"; `None` →
+/// packet-up) — ignored for non-xhttp networks.
 #[must_use]
 pub fn client_params_vmess(
     enc: &str,
     port: u16,
     target: SocketAddr,
     tls: &dyn TlsVariant,
+    network: &str,
+    xhttp_mode: Option<&'static str>,
 ) -> NativeConnectParams {
-    let mut security = client_security(tls, "tcp");
+    let transport = match network {
+        "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
+        "grpc" => serde_json::json!({ "type": "grpc", "service_name": "gun" }),
+        // The proto's `TransportConfig` serde tag is snake_case
+        // (`http_upgrade`); `transport_type()` reports the wire name
+        // `httpupgrade` that the dispatch arms match on.
+        "httpupgrade" => {
+            serde_json::json!({ "type": "http_upgrade", "path": "/hu", "host": "localhost" })
+        }
+        // Same snake_case tag for xhttp: the variant parses as `x_http`
+        // (wire/type_str name `xhttp`). The xray server dialect is
+        // `splithttp`; the CLIENT mode drives the client-side dialect.
+        // Packet-up is the default (forced explicitly — xray's client
+        // auto-defaults to stream-one under REALITY; the packet-up-over-
+        // REALITY row tests that on purpose). Stream-up rows pass their
+        // mode through.
+        "xhttp" => serde_json::json!({
+            "type": "x_http", "path": "/x", "host": "localhost",
+            "mode": xhttp_mode.unwrap_or("packet-up")
+        }),
+        // v2rayhttp: proto `type: http` (the `h2` network string is only
+        // for the test rows/dispatch; the wire name is `http`).
+        "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
+        _ => serde_json::json!({ "type": "tcp" }),
+    };
+    let mut security = client_security(tls, network);
     security["enc"] = serde_json::json!(enc);
     let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
         "schema": "Vmess",
         "uuid": UUID,
         "security": security,
-        "transport": { "type": "tcp" }
+        "transport": transport
     }))
     .expect("vmess client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);

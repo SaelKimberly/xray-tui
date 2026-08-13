@@ -1,6 +1,7 @@
 //! E2E: native `VMess` matrix — security {aes-128-gcm, chacha20-poly1305} ×
-//! network {tcp, ws, grpc} × TLS {standard, chrome, reality} × core.
-//! One generated test per (case, core).
+//! network {tcp, ws, grpc, httpupgrade} × TLS {standard, chrome, reality} ×
+//! core {xray, sing-box}, plus single-core rows (ws-reality sing-box, xhttp
+//! xray-only, v2rayhttp/h2 sing-box-only). One generated test per (case, core).
 //!
 //! `clippy::future_not_send` is allowed file-wide: rstest 0.26.1 clears the
 //! source fn's attributes when embedding it beside the generated tests, so no
@@ -32,6 +33,17 @@ fn vmess_tls(
     vmess(sec, net).with_tls(tls)
 }
 
+/// xhttp row with an explicit client-side mode (the client's
+/// `XHttpConfig.mode` selects the dialect on the wire; the server runs auto
+/// and accepts both) — mirror of the vless `vless_xhttp_tls` helper.
+fn vmess_xhttp_tls(
+    sec: impl SecurityVariant + 'static,
+    mode: &'static str,
+    tls: Box<dyn TlsVariant>,
+) -> CaseSpec {
+    vmess_tls(sec, "xhttp", tls).with_xhttp_mode(mode)
+}
+
 #[rstest]
 #[case::tcp_aes128gcm(vmess(Aes128GcmVariant, "tcp"))]
 #[case::tcp_chacha20(vmess(Chacha20Poly1305Variant, "tcp"))]
@@ -43,14 +55,20 @@ fn vmess_tls(
 #[case::ws_chacha20(vmess(Chacha20Poly1305Variant, "ws"))]
 #[case::ws_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "ws", fp("chrome")))]
 #[case::ws_chacha20_chrome(vmess_tls(Chacha20Poly1305Variant, "ws", fp("chrome")))]
-#[case::ws_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "ws", reality()))]
-#[case::ws_chacha20_reality(vmess_tls(Chacha20Poly1305Variant, "ws", reality()))]
 #[case::grpc_aes128gcm(vmess(Aes128GcmVariant, "grpc"))]
 #[case::grpc_chacha20(vmess(Chacha20Poly1305Variant, "grpc"))]
 #[case::grpc_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "grpc", fp("chrome")))]
 #[case::grpc_chacha20_chrome(vmess_tls(Chacha20Poly1305Variant, "grpc", fp("chrome")))]
 #[case::grpc_aes128gcm_reality(vmess_tls(Aes128GcmVariant, "grpc", reality()))]
 #[case::grpc_chacha20_reality(vmess_tls(Chacha20Poly1305Variant, "grpc", reality()))]
+#[case::httpupgrade_aes128gcm(vmess(Aes128GcmVariant, "httpupgrade"))]
+#[case::httpupgrade_chacha20(vmess(Chacha20Poly1305Variant, "httpupgrade"))]
+#[case::httpupgrade_aes128gcm_chrome(vmess_tls(Aes128GcmVariant, "httpupgrade", fp("chrome")))]
+#[case::httpupgrade_chacha20_chrome(vmess_tls(
+    Chacha20Poly1305Variant,
+    "httpupgrade",
+    fp("chrome")
+))]
 #[tokio::test]
 async fn vmess_against_cores(
     #[case] case: CaseSpec,
@@ -65,4 +83,56 @@ async fn vmess_against_cores(
     run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
         .await
         .expect("vmess e2e failed");
+}
+
+/// Single-core cases: the named core accepts the configuration, the other
+/// rejects it at startup. The ws-reality rows move here from the both-core
+/// matrix (xray-core 26.3.27 refuses REALITY-over-WebSocket inbounds —
+/// "REALITY only supports RAW, XHTTP and gRPC"; sing-box serves it). xhttp
+/// (splithttp) is xray-only; v2rayhttp (h2) is sing-box-only (xray-core
+/// removed the h2 transport in 26.x).
+#[rstest]
+#[case::ws_aes128gcm_reality_singbox(
+    vmess_tls(Aes128GcmVariant, "ws", reality()),
+    CoreKind::SingBox
+)]
+#[case::ws_chacha20_reality_singbox(
+    vmess_tls(Chacha20Poly1305Variant, "ws", reality()),
+    CoreKind::SingBox
+)]
+// xhttp packet-up over h2 (TLS → h2): plain + chrome fingerprint. The h1 arm
+// is covered by the hermetic unit test.
+#[case::xhttp_packet_aes128gcm(vmess(Aes128GcmVariant, "xhttp"), CoreKind::Xray)]
+#[case::xhttp_packet_chacha20(vmess(Chacha20Poly1305Variant, "xhttp"), CoreKind::Xray)]
+#[case::xhttp_packet_aes128gcm_chrome(
+    vmess_tls(Aes128GcmVariant, "xhttp", fp("chrome")),
+    CoreKind::Xray
+)]
+#[case::xhttp_packet_chacha20_chrome(
+    vmess_tls(Chacha20Poly1305Variant, "xhttp", fp("chrome")),
+    CoreKind::Xray
+)]
+// stream-up: the client config carries mode "stream-up" (the client-side
+// mode drives the dialect), over h2.
+#[case::xhttp_stream_aes128gcm_chrome(
+    vmess_xhttp_tls(Aes128GcmVariant, "stream-up", fp("chrome")),
+    CoreKind::Xray
+)]
+// v2rayhttp (sing-box `type: http`) over h2 + the chrome fingerprint.
+#[case::v2rayhttp_aes128gcm_chrome(
+    vmess_tls(Aes128GcmVariant, "h2", fp("chrome")),
+    CoreKind::SingBox
+)]
+#[tokio::test]
+async fn vmess_single_core(
+    #[case] case: CaseSpec,
+    #[case] core: CoreKind,
+    cores: &(CoreUnderTest, CoreUnderTest),
+    certs: &Certs,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
+) {
+    run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
+        .await
+        .expect("vmess single-core e2e failed");
 }

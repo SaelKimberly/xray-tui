@@ -113,7 +113,7 @@ impl E2eCase for CaseSpec {
             ProtocolKind::Vless => config::vless_inbound(core, env, self.tls(), self.network),
             ProtocolKind::Vmess => {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
-                config::vmess_inbound(core, env, security, self.tls())
+                config::vmess_inbound(core, env, security, self.tls(), self.network)
             }
         }
     }
@@ -129,7 +129,14 @@ impl E2eCase for CaseSpec {
                     .as_ref()
                     .expect("vmess case requires a security variant")
                     .client_security();
-                config::client_params_vmess(enc, port, target, self.tls())
+                config::client_params_vmess(
+                    enc,
+                    port,
+                    target,
+                    self.tls(),
+                    self.network,
+                    self.xhttp_mode,
+                )
             }
         }
     }
