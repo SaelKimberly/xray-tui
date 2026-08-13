@@ -118,12 +118,12 @@ impl LinkContext {
         if !explicit.is_empty() {
             return explicit;
         }
-        // Transport-implied ALPN: the grpc transport is HTTP/2, the ws
-        // upgrade is an HTTP/1.1 exchange. (Reality forces h2+http/1.1
-        // server-side; an explicit `alpn` option wins above.)
+        // Transport-implied ALPN: the grpc transport is HTTP/2, the ws and
+        // httpupgrade upgrades are HTTP/1.1 exchanges. (Reality forces
+        // h2+http/1.1 server-side; an explicit `alpn` option wins above.)
         match self.transport_type() {
             Some("grpc") => vec![b"h2".to_vec()],
-            Some("ws") => vec![b"http/1.1".to_vec()],
+            Some("ws" | "httpupgrade") => vec![b"http/1.1".to_vec()],
             _ => vec![],
         }
     }

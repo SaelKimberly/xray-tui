@@ -22,7 +22,13 @@ pub async fn h1_client(
         limit,
     })?
     .map_err(|e| NativeError::Transport(format!("http/1.1 handshake: {e}")))?;
-    tokio::spawn(conn);
+    // `.with_upgrades()`: the plain `Connection` future treats a 101
+    // response as "upgrade handled manually" and never fulfills the
+    // `OnUpgrade` extension (hyper: "upgrade expected but low level API in
+    // use"). The upgradeable wrapper fulfills it with the raw IO — the
+    // httpupgrade transport needs that. Non-upgrade responses behave
+    // identically.
+    tokio::spawn(conn.with_upgrades());
     Ok(sender)
 }
 

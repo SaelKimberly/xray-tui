@@ -1,5 +1,5 @@
-//! E2E: native VLESS matrix — network {tcp, ws, grpc} × TLS variant ×
-//! core {xray, sing-box}. One generated test per (case, core).
+//! E2E: native VLESS matrix — network {tcp, ws, grpc, httpupgrade} × TLS
+//! variant × core {xray, sing-box}. One generated test per (case, core).
 //!
 //! `clippy::future_not_send` is allowed file-wide: rstest 0.26.1 clears the
 //! source fn's attributes when embedding it beside the generated tests, so no
@@ -52,6 +52,8 @@ fn vless_tls(net: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[ignore = "plain client into reality server: dest sees grpc framing, not HTTP (transport unreachable pre-proxy)"]
 #[case::grpc_plain_into_reality_server(vless_tls("grpc", reality_server_plain_client()))]
 #[case::grpc_reality_into_plain_server(vless_tls("grpc", plain_server_reality_client()))]
+#[case::httpupgrade_plain(vless("httpupgrade"))]
+#[case::httpupgrade_chrome(vless_tls("httpupgrade", fp("chrome")))]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,
@@ -74,6 +76,9 @@ async fn vless_against_cores(
 /// it). Each row names its core explicitly instead of `#[values]`.
 #[rstest]
 #[case::ws_reality_singbox(vless_tls("ws", reality()), CoreKind::SingBox)]
+// xray-core refuses REALITY over httpupgrade inbounds — "REALITY only
+// supports RAW, XHTTP and gRPC" — so the reality row runs on sing-box only.
+#[case::httpupgrade_reality_singbox(vless_tls("httpupgrade", reality()), CoreKind::SingBox)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,

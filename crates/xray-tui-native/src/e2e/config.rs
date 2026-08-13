@@ -122,7 +122,8 @@ pub fn vless_inbound(
     // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
-    // grpc rides HTTP/2 (needs h2 ALPN); ws upgrade is HTTP/1.1.
+    // grpc rides HTTP/2 (needs h2 ALPN); ws/httpupgrade upgrade with
+    // http/1.1 (the default below).
     let alpn = match network {
         "grpc" => serde_json::json!(["h2"]),
         _ => serde_json::json!(["http/1.1"]),
@@ -145,6 +146,10 @@ pub fn vless_inbound(
                 }
                 "grpc" => {
                     stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
+                }
+                "httpupgrade" => {
+                    stream["httpupgradeSettings"] =
+                        serde_json::json!({ "path": "/hu", "host": "localhost" });
                 }
                 _ => {}
             }
@@ -171,6 +176,11 @@ pub fn vless_inbound(
                 "grpc" => {
                     inbound["transport"] =
                         serde_json::json!({ "type": "grpc", "service_name": "gun" });
+                }
+                "httpupgrade" => {
+                    inbound["transport"] = serde_json::json!({
+                        "type": "httpupgrade", "path": "/hu", "host": "localhost"
+                    });
                 }
                 _ => {}
             }
@@ -243,6 +253,14 @@ fn vless_reality_inbound(
     match network {
         "ws" if core == CoreKind::SingBox => {
             transport = Some(serde_json::json!({ "type": "ws", "path": "/ws" }));
+        }
+        // xray-core refuses reality over httpupgrade ("REALITY only supports
+        // RAW, XHTTP and gRPC"), so the httpupgrade reality row runs on
+        // sing-box only.
+        "httpupgrade" if core == CoreKind::SingBox => {
+            transport = Some(serde_json::json!({
+                "type": "httpupgrade", "path": "/hu", "host": "localhost"
+            }));
         }
         "grpc" => {
             transport = Some(serde_json::json!({ "type": "grpc", "service_name": "gun" }));
@@ -330,6 +348,7 @@ fn client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
 fn plain_client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
     let alpn = match network {
         "grpc" => "h2",
+        // ws and httpupgrade both upgrade over HTTP/1.1 (the default below).
         _ => "http/1.1",
     };
     let mut security = serde_json::json!({
@@ -394,6 +413,12 @@ pub fn client_params_vless(
     let transport = match network {
         "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
         "grpc" => serde_json::json!({ "type": "grpc", "service_name": "gun" }),
+        // The proto's `TransportConfig` serde tag is snake_case
+        // (`http_upgrade`); `transport_type()` reports the wire name
+        // `httpupgrade` that the dispatch arms match on.
+        "httpupgrade" => {
+            serde_json::json!({ "type": "http_upgrade", "path": "/hu", "host": "localhost" })
+        }
         _ => serde_json::json!({ "type": "tcp" }),
     };
     let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
