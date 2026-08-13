@@ -24,8 +24,16 @@
 
 /// Byte-stream capability: readable, writable, `Unpin`, `Send` — the seam
 /// between layers.
-pub trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+///
+/// `Any` (so every stream is `'static`) lets a layer recover the concrete
+/// stream behind the box: the vision codec splices the engine `TlsStream`'s
+/// per-direction direct mode through the `DirectMode` impl on [`BoxStream`]
+/// (see `protocol/vless/vision.rs`).
+pub trait Stream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::any::Any
+{
+}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> Stream for T {}
 
 /// The boxed byte-stream seam between layers.
 pub type BoxStream = Box<dyn Stream>;

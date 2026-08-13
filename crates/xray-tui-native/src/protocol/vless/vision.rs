@@ -15,12 +15,6 @@
 //! the raw stream before wrapping ([`VisionStream::camouflage_frame`] — the
 //! camouflage consumes the writer's UUID, so `VisionStream` frames never
 //! carry one).
-//!
-//! Everything here is consumed by the next plan task (the VLESS `connect`
-//! wiring): until then the module is unreferenced, so dead code is allowed
-//! crate-wide.
-
-#![allow(dead_code)]
 
 use std::io;
 use std::pin::Pin;
@@ -81,6 +75,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> DirectMode
     fn set_read_direct(&mut self) {
         Self::set_read_direct(self);
     }
+}
+
+/// The boxed seam: the protocol phase receives the stream as [`crate::BoxStream`]
+/// (`Box<dyn crate::Stream>`), with the concrete engine `TlsStream` hidden
+/// behind the trait object. Recover it through the `Any` supertrait (see
+/// `crate::Stream`) and splice via its inherent direct-mode methods.
+///
+/// Invariant: the vision guards in `connect_vision` (outer TLS/REALITY
+/// present + raw TCP transport) guarantee the box holds a `TlsStream`, so a
+/// downcast miss is a programming bug — fail loudly rather than silently
+/// corrupting the tunnel after a Direct frame.
+impl DirectMode for Box<dyn crate::Stream> {
+    fn set_write_direct(&mut self) {
+        tls_stream_mut(self)
+            .expect("vision must wrap an engine TlsStream")
+            .set_write_direct();
+    }
+    fn set_read_direct(&mut self) {
+        tls_stream_mut(self)
+            .expect("vision must wrap an engine TlsStream")
+            .set_read_direct();
+    }
+}
+
+/// Recover the concrete engine `TlsStream` behind the boxed seam (upcast
+/// `&mut dyn Stream` → `&mut dyn Any` via the supertrait, then downcast).
+fn tls_stream_mut(
+    stream: &mut Box<dyn crate::Stream>,
+) -> Option<&mut xray_tui_tls::record::stream::TlsStream<crate::BoxStream>> {
+    let inner: &mut dyn crate::Stream = &mut **stream;
+    let any: &mut dyn std::any::Any = inner;
+    any.downcast_mut::<xray_tui_tls::record::stream::TlsStream<crate::BoxStream>>()
 }
 
 /// Client-side vision stream: pads uplink writes, unpads downlink reads,
@@ -816,6 +842,7 @@ fn reshape(chunk: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BoxStream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     const UUID: [u8; 16] = [
@@ -1457,5 +1484,59 @@ mod tests {
         server.write_all(b"more raw").await.unwrap();
         let n = vs.read(&mut got).await.unwrap();
         assert_eq!(&got[..n], b"more raw");
+    }
+
+    /// A real engine `TlsStream` over a duplex, boxed through the seam —
+    /// exactly what `connect_vision` holds (the security layer boxes the
+    /// transport as `BoxStream` first, then the engine wraps THAT box, then
+    /// the protocol phase gets `Box<dyn Stream>`).
+    fn boxed_tls_stream() -> (BoxStream, tokio::io::DuplexStream) {
+        use xray_tui_tls::crypto::{AeadKey, CipherSuiteId};
+        use xray_tui_tls::record::stream::{AppKeys, TlsStream};
+        let (a, b) = tokio::io::duplex(4096);
+        let key = AeadKey::new(CipherSuiteId::Aes128GcmSha256, &[0x11; 16]).unwrap();
+        let keys = AppKeys {
+            read_key: key.clone_key(),
+            write_key: key.clone_key(),
+            read_seq: 0,
+            write_seq: 0,
+        };
+        let transport: BoxStream = Box::new(a);
+        let tls: BoxStream = Box::new(TlsStream::new(transport, keys));
+        (tls, b)
+    }
+
+    #[tokio::test]
+    async fn boxed_seam_splices_write_to_raw() {
+        // The whole composition hinges on `Box<dyn Stream>: DirectMode`
+        // reaching the concrete engine `TlsStream` inside the box. Prove it
+        // behaviorally: after the splice, a write bypasses the record layer
+        // and the peer reads the plaintext bytes.
+        let (mut tls, mut peer) = boxed_tls_stream();
+        tls.set_write_direct();
+        tls.write_all(b"raw").await.unwrap();
+        let mut got = [0u8; 3];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"raw");
+    }
+
+    #[tokio::test]
+    async fn boxed_seam_splices_read_to_raw() {
+        let (mut tls, mut peer) = boxed_tls_stream();
+        tls.set_read_direct();
+        peer.write_all(b"raw").await.unwrap();
+        let mut got = [0u8; 3];
+        tls.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"raw");
+    }
+
+    #[test]
+    #[should_panic(expected = "vision must wrap an engine TlsStream")]
+    fn boxed_non_tls_stream_panics_on_splice() {
+        // The vision guards guarantee the box holds a TlsStream; a miss is a
+        // programming bug and must fail loudly, not corrupt the tunnel.
+        let (a, _b) = tokio::io::duplex(4096);
+        let mut stream: BoxStream = Box::new(a);
+        stream.set_write_direct();
     }
 }
