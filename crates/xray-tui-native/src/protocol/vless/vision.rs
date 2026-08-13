@@ -205,7 +205,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
         let long_padding = self.filter.is_tls;
         for (i, piece) in pieces.iter().enumerate() {
             let is_last = i == pieces.len() - 1;
-            let is_app_data = piece.len() > 6 && piece.starts_with(&TLS_APP_DATA_START);
+            // Go gates on `b.Len() >= 6` (proxy.go:365): a 6-byte record is
+            // the 5-byte header plus one payload byte. The `IsCompleteRecord`
+            // check is deliberately omitted — sanctioned divergence: the
+            // inner engine writes one complete TLS record per poll (spec
+            // §9.2, sing-vmess model), so a `0x17 0x03 0x03`-prefixed piece
+            // is a record start.
+            let is_app_data = piece.len() >= 6 && piece.starts_with(&TLS_APP_DATA_START);
             if self.filter.is_tls && is_app_data {
                 // Inner TLS app data with the filter warmed: Direct (TLS 1.3,
                 // splice) or End (TLS 1.2, padding stops but the outer TLS
@@ -537,16 +543,16 @@ fn encode_frame(uuid: Option<&[u8; 16]>, cmd: u8, content: &[u8], pad_len: usize
 
 /// `XtlsPadding` port (spec §4.2): compute `pad_len` for the given content.
 ///
-/// `long_padding` mirrors xray's `longPadding` flag: `900 + rand(0..500) -
-/// content`, else `rand(0..256)`, capped so one frame never exceeds
-/// `MAX_FRAME`. The subtraction saturates — xray gates `content < 900`, so
-/// the wrap path is unreachable there; degrading to 0 padding for large
-/// content is wire-invisible (the reader skips whatever pad the header
-/// declares).
+/// Mirrors xray exactly: long padding (`900 + rand(0..500) - content`) only
+/// when `long_padding && content < 900`, else `rand(0..256)`, capped so one
+/// frame never exceeds `MAX_FRAME`. The saturating cap also guards the
+/// (unreachable) underflow path; the caller reshapes chunks >= 8171 first.
 fn padding_len(content_len: usize, long_padding: bool, rng: &ring::rand::SystemRandom) -> usize {
     let content_len = u32::try_from(content_len).expect("content fits u32");
-    let raw = if long_padding {
-        (900 + rand_u32(rng, 500)).saturating_sub(content_len)
+    let raw = if long_padding && content_len < 900 {
+        // Long padding: 900 + rand(0..500) - content; no underflow possible
+        // (content <= 899 leaves at least 900 + 0 - 899 = 1).
+        900 + rand_u32(rng, 500) - content_len
     } else {
         rand_u32(rng, 256)
     };
@@ -620,6 +626,13 @@ impl Unpadder {
         // through WITHOUT committing, so unpadding can still engage on the
         // next chunk (spec §5.4). (The brief's `uuid_gate_passed` flag is
         // subsumed by this state check.)
+        //
+        // Sanctioned divergence (latching): Go re-checks the UUID on every
+        // subsequent chunk in the initial state and never latches; here the
+        // first >=21-byte mismatch commits passthrough forever. Behaviorally
+        // equivalent for the real wire (a peer that speaks vision carries
+        // the UUID on its FIRST frame, so a mismatch means no vision) and a
+        // cleaner trust boundary (spec §5.4).
         if self.remaining_command == -1
             && self.remaining_content == -1
             && self.remaining_padding == -1
@@ -918,6 +931,19 @@ mod tests {
     }
 
     #[test]
+    fn padding_long_branch_gated_on_content_under_900() {
+        // Go: long padding only when `contentLen < 900 && longPadding`
+        // (proxy.go:502); content >= 900 always takes rand(0..256).
+        for _ in 0..64 {
+            let pad = padding_len(899, true, &rng());
+            assert!((1..=500).contains(&pad), "pad {pad}");
+            assert!(padding_len(900, true, &rng()) < 256);
+            assert!(padding_len(1000, true, &rng()) < 256);
+            assert!(padding_len(8170, true, &rng()) <= 1);
+        }
+    }
+
+    #[test]
     fn padding_plain_branch_bounds() {
         for _ in 0..64 {
             let pad = padding_len(123, false, &rng());
@@ -928,8 +954,10 @@ mod tests {
     #[test]
     fn padding_capped_at_frame_cap() {
         for _ in 0..64 {
-            // 8170 content leaves at most 1 byte of padding.
-            assert_eq!(padding_len(8170, true, &rng()), 0);
+            // 8170 content leaves at most 1 byte of padding (Go: rand(256)
+            // capped at 8192 - 21 - 8170 = 1).
+            assert!(padding_len(8170, true, &rng()) <= 1);
+            assert!(padding_len(8170, false, &rng()) <= 1);
             // 8000 content leaves at most 171 bytes.
             assert!(padding_len(8000, false, &rng()) <= 171);
             assert!(padding_len(8000, true, &rng()) <= 171);
@@ -1216,6 +1244,83 @@ mod tests {
         let mut got = [0u8; 64];
         let n = vs.read(&mut got).await.unwrap();
         assert_eq!(&got[..n], b"server-dataRAW-DOWN");
+    }
+
+    #[tokio::test]
+    async fn stream_buffered_direct_splice_on_pending() {
+        // A 64-byte duplex forces `poll_write` Pending mid-frame, driving
+        // the buffered-splice machinery: `write_buf` + `direct_boundary`,
+        // the drain/splice ordering, the buffered raw tail, and the
+        // poll_flush/poll_shutdown drain paths.
+        let (server, client) = tokio::io::duplex(64);
+        let mut raw_client = client;
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+
+        // Server task: drains everything the client sends (the small duplex
+        // blocks every write until the peer reads).
+        let server_task = tokio::spawn(async move {
+            let mut server = server;
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = server.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+            }
+            all
+        });
+
+        // Caller writes the camouflage frame through the raw stream first.
+        raw_client.write_all(&camo).await.unwrap();
+        let mut vs = test_stream(raw_client);
+
+        // Warm the shared filter directly (the downlink ServerHello would
+        // arrive over the duplex; feeding the filter is the same state).
+        vs.filter
+            .feed(&[0x16, 0x03, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00]);
+        vs.filter.feed(&server_hello(0x1301, true));
+        assert!(vs.filter.enable_xtls);
+
+        // A large app-data chunk: reshaped into [Direct frame][raw tail];
+        // the frame is far larger than the duplex, so the write must be
+        // buffered across many polls.
+        let mut app = vec![0x42u8; 9000];
+        app[0] = 0x17;
+        app[1] = 0x03;
+        app[2] = 0x03;
+        vs.write_all(&app).await.unwrap();
+        // Splice state after the full write: clean buffers, write side raw.
+        assert!(vs.writer.direct);
+        assert!(!vs.has_pending_write());
+        assert_eq!(vs.write_buf.len(), 0);
+        assert!(vs.direct_boundary.is_none());
+
+        // A flush after the splice drains and forwards, then a raw write,
+        // then shutdown (exercises poll_shutdown's drain path).
+        vs.flush().await.unwrap();
+        vs.write_all(b"RAW-AFTER").await.unwrap();
+        vs.shutdown().await.unwrap();
+        drop(vs);
+
+        let all = server_task.await.unwrap();
+
+        // Wire layout: [camouflage frame][Direct frame][raw tail][RAW-AFTER].
+        let camo_plen = usize::from(u16::from_be_bytes([all[19], all[20]]));
+        let camo_total = 21 + camo_plen;
+        assert_eq!(&all[..camo_total], &camo[..]);
+        let rest = &all[camo_total..];
+        assert_eq!(rest[0], CMD_DIRECT, "Direct frame is the last padded write");
+        let clen = usize::from(u16::from_be_bytes([rest[1], rest[2]]));
+        let plen = usize::from(u16::from_be_bytes([rest[3], rest[4]]));
+        assert_eq!(clen, 4096, "reshape fallback piece size");
+        assert!(plen < 256);
+        assert_eq!(&rest[5..5 + clen], &app[..clen]);
+        let tail = &rest[5 + clen + plen..];
+        assert_eq!(tail.len(), app.len() - clen + b"RAW-AFTER".len());
+        assert_eq!(&tail[..app.len() - clen], &app[clen..], "raw tail intact");
+        assert_eq!(&tail[app.len() - clen..], b"RAW-AFTER");
     }
 
     #[tokio::test]
