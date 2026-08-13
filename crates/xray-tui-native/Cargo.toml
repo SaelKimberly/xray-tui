@@ -42,6 +42,17 @@ bytes = "1"
 h2 = "0.4.15"
 http = "1"
 
+# HTTP/1.1 + HTTP/2 client framing (hyper) — minimal features, latest minor.
+# We own the stream + timeouts; hyper owns request/response/chunked/101 framing.
+hyper = { version = "1.11", default-features = false, features = ["client", "http1", "http2"] }
+# tokio↔hyper IO bridge: hyper's own rt::Read/Write traits take a different
+# buffer type than tokio's, so BoxStream goes through TokioIo (hyper-util's
+# standard adapter). TokioExecutor spawns hyper's h2 driver tasks.
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+http-body = "1"
+# Channel (live request-body pipe) is feature-gated in http-body-util.
+http-body-util = { version = "0.1.5", features = ["channel"] }
+
 # X25519 keypair generation for REALITY e2e configs (feature `native-e2e`
 # only): ring 0.17 cannot serialize the private half of a generated
 # `EphemeralPrivateKey` (its `bytes()` is test-gated), and the server inbound

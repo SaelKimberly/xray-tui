@@ -12,6 +12,7 @@ use crate::context::LinkContext;
 use crate::error::NativeError;
 
 pub mod grpc;
+pub mod http;
 pub mod tcp;
 pub mod ws;
 

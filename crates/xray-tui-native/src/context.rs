@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
-use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
+use xray_tui_proto::proto_spec::common::{
+    GrpcConfig, HttpConfig, HttpUpgradeConfig, TransportConfig, WebSocketConfig, XHttpConfig,
+};
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
 
@@ -181,6 +183,33 @@ impl LinkContext {
     pub fn transport_grpc(&self) -> Option<&GrpcConfig> {
         match self.transport_config()? {
             TransportConfig::Grpc(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// `HTTPUpgrade` transport config, when the link uses `httpupgrade`.
+    #[must_use]
+    pub fn transport_httpupgrade(&self) -> Option<&HttpUpgradeConfig> {
+        match self.transport_config()? {
+            TransportConfig::HttpUpgrade(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// XHTTP transport config, when the link uses `xhttp`.
+    #[must_use]
+    pub fn transport_xhttp(&self) -> Option<&XHttpConfig> {
+        match self.transport_config()? {
+            TransportConfig::XHttp(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// h2 (v2rayhttp) transport config, when the link uses `http`.
+    #[must_use]
+    pub fn transport_http(&self) -> Option<&HttpConfig> {
+        match self.transport_config()? {
+            TransportConfig::Http(c) => Some(c),
             _ => None,
         }
     }
