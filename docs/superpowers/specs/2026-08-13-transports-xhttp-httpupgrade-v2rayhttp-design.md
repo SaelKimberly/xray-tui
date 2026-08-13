@@ -1,5 +1,7 @@
 # Design: native transports — XHTTP, HTTPUpgrade, h2/v2rayhttp
 
+**Implemented 2026-08-13** — see plan `docs/superpowers/plans/2026-08-13-transports-xhttp-httpupgrade-v2rayhttp.md` and the T1-T7 commits (98bcf3c + T7 docs commit).
+
 Date: 2026-08-13. Branch: `native-core-stub`.
 
 Extends `xray-tui-native`'s transport phase from tcp/ws/grpc to the full
@@ -180,24 +182,27 @@ Single-core rows use the `*_single_core` fns (dedicated `#[case]` core arg)
 added this session for ws_reality. New rows:
 
 **vless** (+12): httpupgrade plain/chrome/reality × 2 cores (6); xhttp
-packet-up plain(h1)/tls-chrome(h2)/reality(h2) (3) + stream-up plain(h1)/tls(h2)
-(2) (xray-only single-core); v2rayhttp tls (1, sing-box-only single-core).
+packet-up plain/chrome/reality (3) + stream-up plain/chrome (2) (xray-only
+single-core; e2e rows all carry TLS → h2 arms — the h1 arms are
+hermetic-covered only); v2rayhttp chrome (1, sing-box-only single-core).
 Reality on new transports only where the core serves it (xray reality+xhttp
-is legal; verify empirically in T-tests).
+is legal; verified empirically in T-tests).
 
 **vmess** (existing 18 rows are ws/grpc-labeled but run tcp-nominal today —
 plumbing makes them real, does not add rows): plumb real ws/grpc + the new
 transports through `client_params_vmess` + `vmess_inbound`; re-gate the two
 `ws_*_reality` rows to sing-box single-core (xray rejects reality+ws, mirror
 of the vless `ws_reality` case); `grpc_*_reality` stays both-core (both cores
-serve reality+grpc, proven by the vless matrix). +8 new rows: httpupgrade
-plain/chrome × 2 cores (4); xhttp packet-up plain/tls (2, xray single-core) +
-stream-up tls (1); v2rayhttp tls (1, sing-box single-core). Net: 36 → 42 tests
-(+6: 8 new minus 2 lost to the ws-reality re-gate).
+serve reality+grpc, proven by the vless matrix). +16 new rows: httpupgrade
+plain/chrome × 2 cores (4); ws-reality ×2 sing-box single-core; xhttp
+packet-up plain/chrome ×2 sec variants + stream-up chrome (5, xray
+single-core); v2rayhttp tls chrome (1, sing-box single-core). Actual final:
+**48 vmess tests, all green** (36 baseline − 4 ws-reality re-gate + 4
+httpupgrade both-core + 8 single-core rows).
 
-Totals: **~95 tests = 91 green + 4 documented ignored** (from 73+4). The 4
-ignored (vless ws/grpc plain-into-reality-server semantic-mismatch rows)
-unchanged.
+Totals: **100 e2e tests = 96 green + 4 documented ignored** (vless 52 = 48
+green + 4 ignored; vmess 48 green). The 4 ignored (vless ws/grpc
+plain-into-reality-server semantic-mismatch rows) unchanged.
 
 ## Verification gates
 

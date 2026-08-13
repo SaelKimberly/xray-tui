@@ -63,9 +63,9 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native` | unit + integration: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback | 202 tests (118 tls + 84 native) |
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native` | unit + integration: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority) | 215 tests (118 tls + 97 native) |
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
-| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers | 77 tests = 73 green + 4 documented ignored (vless ws/grpc plain-into-reality-server; single-core ws_reality runs sing-box only) |
+| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport matrix | 100 tests = 96 green + 4 documented ignored (vless ws/grpc plain-into-reality-server semantic rows × both cores; single-core rows: xhttp/xray, v2rayhttp/sing-box, ws+httpupgrade reality/sing-box) |
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
@@ -80,7 +80,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `chain.rs` | `connect_chain`: fold the layer stack |
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
-| `transport/` | `connect` = TCP dial (any transport; framing is an upgrade step); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) |
+| `transport/` | `connect` = TCP dial (any transport; framing is an upgrade step); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `BrowserProfile`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented` |
 | `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
@@ -133,7 +133,13 @@ real certificate (potential MITM or redirection)")`.
 
 ## E2E coverage (tier 3)
 
-11 cases, each run against both cores (xray 26.3.27, sing-box 1.13.16), each
+Two axes. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
+VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 × serving core(s) — 100
+tests = 96 green + 4 documented ignored (vless ws/grpc
+plain-into-reality-server semantic rows × both cores; single-core rows run
+only on the serving core: xhttp on xray, v2rayhttp + ws/httpupgrade-reality
+on sing-box). **TLS-variant cases**, each run against both cores (xray
+26.3.27, sing-box 1.13.16), each
 spawning a real server inbound + dialing it with the native client. The
 two-servers scenarios are rows 4-6: the REALITY server's `dest` is a second
 local server (`tls_echo`), so a fallback or a transparently-proxied plain
@@ -141,8 +147,8 @@ probe terminates there and the recording server observes the client's bytes
 (spider h2 preface / plain-TLS ClientHello). Row 7 (`plain-server-reality-client`)
 is a single-server scenario — the fallback terminates at the plain TLS server
 itself, so the spider's bytes never reach a dest (`spider_reaches_dest()`
-false). Rows 1-3, 6 and 8-11 probe HTTP through an established tunnel; the two
-fallback cases (rows 4-5, wrong pbk / wrong sid) expect `connect()` to fail
+false). Rows 1-3, 6 and 8-11 probe HTTP through an established tunnel; the
+two fallback cases (rows 4-5, wrong pbk / wrong sid) expect `connect()` to fail
 with the fallback error and skip the probe.
 
 | Case | Payload security | TLS variant |
@@ -231,8 +237,8 @@ Notes on the matrix:
 | Encryption | none (identity = UUID; optional `xtls-rprx-vision` flow control, TLS 1.3 framing) |
 | Auth | UUID (command bytes in header) |
 | Obfuscation | none at protocol level; REALITY supplies traffic camouflage |
-| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP only 📋 |
-| Status | Native client complete + e2e (tls-standard, tls-chrome, reality) × both cores. Vision flow control 📋. Non-TCP transports 📋. |
+| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 ✅ (kcp/quic UDP stacks + XHTTP stream-one deferred) |
+| Status | Native client complete + e2e (tls-standard, tls-chrome, reality) × both cores, full TCP-stream transport matrix e2e (100-test sweep). Vision flow control 📋. Deferred: kcp/quic (UDP stacks), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set. |
 
 **VMess** — ✅ native
 | Capability | Detail |
@@ -240,8 +246,8 @@ Notes on the matrix:
 | Encryption | payload: `aes-128-gcm`, `chacha20-poly1305` (native ✅); legacy `aes-128-cfb` / `none` (xray-only, ⛔ legacy disabled in modern cores) |
 | Auth | AEAD request header (mandatory), MD5/HMAC-SHA256 KDF chain, FNV-1a + CRC-32 frame checks |
 | Obfuscation | none at protocol level (transport-level ws/grpc/http in xray) |
-| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2 (sing-box) — native: TCP only 📋 |
-| Status | Native client complete + e2e (aes-128-gcm, chacha20-poly1305, tls-firefox, reality) × both cores. Legacy ciphers ⛔. Non-TCP transports 📋. |
+| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2 (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 ✅ (kcp/quic UDP stacks + XHTTP stream-one deferred) |
+| Status | Native client complete + e2e (aes-128-gcm, chacha20-poly1305, tls-firefox, reality) × both cores, full TCP-stream transport matrix e2e. Legacy ciphers ⛔. Deferred: kcp/quic (UDP stacks), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set, v2rayhttp no-TLS h1 arm. |
 
 **Trojan** — 📋 native
 | Capability | Detail |
@@ -394,22 +400,44 @@ Notes on the matrix:
 | TCP | ✅ | `transport/tcp.rs`; all e2e cases run over it |
 | WS | ✅ | `transport/ws.rs`; tokio-tungstenite framing over the engine stream; v2ray Host/path/headers; e2e vs xray + sing-box (standard + chrome fp) |
 | gRPC | ✅ | `transport/grpc.rs`; h2 framing over the engine stream, gun mode; `Hunk` protobuf (`0x0A` + varint) inside the 5-byte gRPC prefix; e2e vs xray + sing-box (standard + chrome fp) |
-| h2 / HTTPUpgrade / XHTTP | 📋 | config already parses transport fields in proto; no native upgrade layer |
+| HTTPUpgrade | ✅ | `transport/httpupgrade.rs`; hyper http1 conn + RFC 7230 101 upgrade over the engine stream, `Connection: Upgrade`/`Upgrade: websocket` echo validated; ALPN `http/1.1`; e2e vs xray + sing-box |
+| XHTTP (splithttp) | ✅ | `transport/xhttp.rs`; v3 dialect (xray-only server): uuid session in path, GET-body download, raw POST uploads (seq + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks); packet-up + stream-up; h1 when no TLS, h2 over TLS; e2e vs xray (single-core) |
+| h2 (v2rayhttp) | ✅ | `transport/v2rayhttp.rs`; h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only (xray removed the h2 transport in 26.x); e2e vs sing-box (single-core) |
 | QUIC | 🔒 | prerequisite for Hysteria1/2 + TUIC clients |
-| KCP | 📋 | xray-core only; niche |
+| KCP | 📋 | xray-core only; UDP (separate UDP-transport project, deferred) |
 | obfs plugins (SS) | 📋 | plugin URL param already parsed by proto |
+
+### Transport deferrals (documented, no stub)
+
+- **kcp / quic** — UDP transports (mKCP FEC/session; QUIC stack). Separate
+  project; gates Hysteria1/2 + TUIC clients.
+- **XHTTP `stream-one`** — legacy v1 dialect (`auto` selects packet-up; only
+  reachable via the REALITY auto-default, which we override explicitly).
+- **HTTPUpgrade `ed` early-data** — xray-only client flag; server sees a
+  normal 101 exchange.
+- **h2 PING keepalive** — `idle_timeout`/`ping_timeout` in `HttpConfig` not
+  wired.
+- **xmux / connection-reuse pooling** — one session per tunnel today.
+- **Browser-masquerade default header set** — servers validate
+  Host/path/padding only; functional correctness first, masquerade is a later
+  DPI-polish step.
+- **v2rayhttp no-TLS (h1 early-data) arm** — sing-box hijacks raw bytes with
+  no Content-Length; hyper always frames request bodies, so chunked bytes
+  would pollute the hijacked stream (not reproducible with hyper). Real-world
+  use is TLS.
 
 ## Where this is headed
 
 1. **Finish the TCP-stream protocol family** (Trojan, Shadowsocks, SOCKS, HTTP,
    AnyTLS, ShadowTLS, Naïve) — the TLS engine is done, the shapes are uniform.
-2. **Non-TCP transports** (WS first — most common real-world flavor).
-3. **QUIC transport** unlocks Hysteria1/2 + TUIC.
-4. **Wire in the TUI**: a per-profile "native" toggle (or auto-fallback when a
+2. **Non-TCP transports** — the full TCP-stream transport set is done
+   (WS/gRPC/HTTPUpgrade/XHTTP/h2); next is the UDP side (QUIC/KCP), which
+   unlocks Hysteria1/2 + TUIC.
+3. **Wire in the TUI**: a per-profile "native" toggle (or auto-fallback when a
    core binary is missing) — the unified `xray_tui_tls::client::connect` /
    `TlsConfig` engine API already proves the integration point.
-5. **Outbound-only kinds + routing** via native (redirect dial for
+4. **Outbound-only kinds + routing** via native (redirect dial for
    split-tunnel rules).
-6. **TLS 1.2 engine support** — the engine is TLS 1.3-only today; legacy
+5. **TLS 1.2 engine support** — the engine is TLS 1.3-only today; legacy
    (TLS 1.2-only) servers become reachable only after the engine learns
    TLS 1.2.
