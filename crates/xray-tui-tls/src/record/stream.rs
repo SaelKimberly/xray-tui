@@ -66,6 +66,12 @@ pub struct TlsStream<S> {
     pending: Vec<u8>,
     /// Record-read state machine (header, then payload).
     rec: RecordState,
+    /// Write side switched to raw passthrough: `poll_write`/`poll_flush`/
+    /// `poll_shutdown` forward to `inner` without record framing.
+    write_direct: bool,
+    /// Read side switched to raw passthrough: `poll_read` reads from
+    /// `inner` directly (no record parsing, no decryption).
+    read_direct: bool,
 }
 
 /// Incremental state of reading one TLS record off the wire.
@@ -95,7 +101,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                 buf: [0; 5],
                 filled: 0,
             },
+            write_direct: false,
+            read_direct: false,
         }
+    }
+
+    /// Switch the write side to direct raw writes to the underlying stream.
+    ///
+    /// Caller must have fully written and flushed the last TLS record first:
+    /// once direct, `poll_write` no longer drains `pending`, so any
+    /// buffered record ciphertext would be bypassed (and reordered).
+    pub const fn set_write_direct(&mut self) {
+        self.write_direct = true;
+    }
+
+    /// Switch the read side to direct raw reads from the underlying stream.
+    ///
+    /// Caller must have consumed all decrypted bytes and be at a clean
+    /// record boundary (`read_buf` empty, `rec` back in `Header` state);
+    /// the record layer performs no read-ahead, so any bytes already in the
+    /// transport buffer are preserved for the direct reader.
+    pub const fn set_read_direct(&mut self) {
+        self.read_direct = true;
     }
 
     /// Read the next complete raw record off `inner`.
@@ -273,6 +300,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.read_direct {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
         loop {
             // Serve buffered plaintext before touching the wire.
             if this.read_pos < this.read_buf.len() {
@@ -347,6 +377,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.write_direct {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        }
         // A partial record from a previous call must drain first.
         if !this.pending.is_empty() {
             match this.flush_pending(cx) {
@@ -385,6 +418,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.write_direct {
+            return Pin::new(&mut this.inner).poll_flush(cx);
+        }
         match this.flush_pending(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -395,6 +431,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.write_direct {
+            return Pin::new(&mut this.inner).poll_shutdown(cx);
+        }
         match this.flush_pending(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -670,5 +709,144 @@ mod tests {
             vec![MAX_RECORD_PLAINTEXT, 20_000 - MAX_RECORD_PLAINTEXT]
         );
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn direct_write_bypasses_record_layer() {
+        // The server half of the duplex is kept raw so the wire bytes are
+        // directly observable.
+        let (a, mut b) = duplex(4096);
+        let keys = test_keys();
+        let mut client = TlsStream::new(a, keys.clone());
+
+        // 1. Encrypted phase: the client's write leaves the wire as a real
+        // TLS record; decrypt it manually on the raw side.
+        client.write_all(b"hello").await.unwrap();
+        let rec = read_record(&mut b).await.unwrap();
+        assert_eq!(rec.content_type, CONTENT_APPLICATION_DATA);
+        let mut ct = rec.payload;
+        let pt = keys
+            .read_key
+            .open(keys.read_seq, &aead_aad(ct.len()), &mut ct)
+            .unwrap();
+        let (inner_type, content) = strip_padding(&pt).unwrap();
+        assert_eq!(inner_type, CONTENT_APPLICATION_DATA);
+        assert_eq!(content, b"hello");
+
+        // 2+3. Direct mode: the next bytes go out unframed and unencrypted.
+        client.set_write_direct();
+        client.write_all(b"RAW-BYTES").await.unwrap();
+
+        // 4. The raw half sees the literal bytes. (A record-layer reader
+        // would reject them: 0x52 is not a valid content type and the
+        // length field 0x4259 exceeds MAX_RECORD_PAYLOAD.)
+        let mut raw = [0u8; 9];
+        b.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"RAW-BYTES");
+    }
+
+    #[tokio::test]
+    async fn direct_read_bypasses_record_layer() {
+        // The server half of the duplex is raw: it writes an encrypted
+        // record first, then, after the client switches, literal bytes.
+        let (a, mut b) = duplex(4096);
+        let keys = test_keys();
+        let mut client = TlsStream::new(a, keys.clone());
+
+        // 1. Encrypted phase: "hello" arrives as a record and the client's
+        // record layer decrypts it.
+        b.write_all(&raw_record(&keys, 0, CONTENT_APPLICATION_DATA, b"hello"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        // 2+3. Direct mode: raw bytes after the boundary are served with no
+        // record parsing or decryption.
+        client.set_read_direct();
+        b.write_all(b"RAW").await.unwrap();
+        let mut raw = [0u8; 3];
+        client.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"RAW");
+    }
+
+    #[tokio::test]
+    async fn direct_transition_at_record_boundary_loses_nothing() {
+        let (a, b) = duplex(4096);
+        let keys = test_keys();
+        let mut client = TlsStream::new(a, keys.clone());
+        let mut server = TlsStream::new(b, keys);
+
+        // Encrypted record, then a raw payload pipelined immediately behind
+        // it in one burst.
+        server.write_all(b"encrypted").await.unwrap();
+        server.set_write_direct();
+        server.write_all(b"+RAW").await.unwrap();
+
+        // The client drains the record fully, then switches to direct and
+        // still finds the pipelined raw payload in the transport buffer —
+        // no read-ahead loss at the boundary.
+        let mut buf = [0u8; 9];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"encrypted");
+        client.set_read_direct();
+        let mut raw = [0u8; 4];
+        client.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"+RAW");
+    }
+
+    #[tokio::test]
+    async fn write_direct_requires_flush_first() {
+        // A small duplex forces the partial-write path: the 20 000-byte
+        // payload cannot be written in one poll, and the final record's
+        // ciphertext can still be buffered in `pending` when `write_all`
+        // returns. `flush()` pushes it out; only then may the raw phase
+        // start, or the raw bytes would overtake the unflushed record.
+        let (a, mut b) = duplex(256);
+        let mut keys = test_keys();
+        let mut client = TlsStream::new(a, keys.clone());
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+
+        // Drain the raw server side concurrently so the client's large
+        // write can complete through the tiny duplex.
+        let server = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut lens = Vec::new();
+            for _ in 0..2 {
+                let rec = read_record(&mut b).await.unwrap();
+                assert_eq!(rec.content_type, CONTENT_APPLICATION_DATA);
+                let mut ct = rec.payload;
+                let pt = keys
+                    .read_key
+                    .open(keys.read_seq, &aead_aad(ct.len()), &mut ct)
+                    .unwrap();
+                keys.read_seq += 1;
+                let (inner_type, content) = strip_padding(&pt).unwrap();
+                assert_eq!(inner_type, CONTENT_APPLICATION_DATA);
+                lens.push(content.len());
+                got.extend_from_slice(content);
+            }
+            let mut tail = Vec::new();
+            b.read_to_end(&mut tail).await.unwrap();
+            (lens, got, tail)
+        });
+
+        client.write_all(&payload).await.unwrap();
+        // The last record may still be in `pending`; flush completes it.
+        client.flush().await.unwrap();
+        client.set_write_direct();
+        client.write_all(b"RAW-TAIL").await.unwrap();
+        drop(client);
+
+        // The server sees the two encrypted records in order, then the raw
+        // tail — nothing reordered by the mode switch.
+        let (lens, got, tail) = server.await.unwrap();
+        assert_eq!(
+            lens,
+            vec![MAX_RECORD_PLAINTEXT, 20_000 - MAX_RECORD_PLAINTEXT]
+        );
+        assert_eq!(got, payload);
+        assert_eq!(tail, b"RAW-TAIL");
     }
 }
