@@ -496,10 +496,12 @@ async fn vless_against_cores(
     #[values(CoreKind::Xray, CoreKind::SingBox)] core: CoreKind,
     cores: &(CoreUnderTest, CoreUnderTest),
     certs: &Certs,
-    echo: &EchoServer,
-    tls_echo: &TlsEchoServer,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
 ) {
-    run_against(&case, pick(cores, core), certs, echo, tls_echo)
+    // `#[once]` fixtures inject as `&T` (cores, certs); per-test fixtures
+    // inject as OWNED `T` (echo, tls_echo) — borrow them for the runner.
+    run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
         .await
         .expect("vless e2e failed");
 }
@@ -599,10 +601,12 @@ async fn vmess_against_cores(
     #[values(CoreKind::Xray, CoreKind::SingBox)] core: CoreKind,
     cores: &(CoreUnderTest, CoreUnderTest),
     certs: &Certs,
-    echo: &EchoServer,
-    tls_echo: &TlsEchoServer,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
 ) {
-    run_against(&case, pick(cores, core), certs, echo, tls_echo)
+    // `#[once]` fixtures inject as `&T` (cores, certs); per-test fixtures
+    // inject as OWNED `T` (echo, tls_echo) — borrow them for the runner.
+    run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
         .await
         .expect("vmess e2e failed");
 }
