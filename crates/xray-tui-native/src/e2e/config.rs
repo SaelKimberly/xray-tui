@@ -101,9 +101,11 @@ pub fn vmess_inbound(
     serde_json::to_string(&json).expect("vmess server config serializes")
 }
 
-/// VLESS inbound JSON for `core` (no payload security dimension). `tls`
-/// selects certificate TLS vs REALITY; `network` selects the transport
-/// (tcp/ws/grpc). REALITY is tcp-only on both cores.
+/// VLESS inbound JSON for `core` (no payload security dimension).
+///
+/// `tls` selects certificate TLS vs REALITY; `network` selects the transport
+/// (tcp/ws/grpc). For REALITY the transport runs inside the reality tunnel
+/// (xray-core serves reality over raw/grpc only; sing-box also over ws).
 #[must_use]
 pub fn vless_inbound(
     core: CoreKind,
@@ -115,7 +117,7 @@ pub fn vless_inbound(
         let sid = tls
             .reality_sid()
             .expect("reality variant carries a short id");
-        return vless_reality_inbound(core, env, tls.sni(), private_key, sid);
+        return vless_reality_inbound(core, env, tls.sni(), private_key, sid, network);
     }
     // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
@@ -222,15 +224,35 @@ fn reality_stream(
     }
 }
 
-/// VLESS REALITY inbound JSON for `core`.
+/// VLESS REALITY inbound JSON for `core`. `network` selects the transport
+/// declared INSIDE the reality tunnel (tcp/ws/grpc) — reality is the
+/// outermost layer, the transport framing runs beneath it. xray-core only
+/// accepts reality over raw/grpc ("REALITY only supports RAW, XHTTP and
+/// gRPC for now"), so xray's reality inbound stays tcp-only for ws; sing-box
+/// serves reality+ws.
 fn vless_reality_inbound(
     core: CoreKind,
     env: &ServerEnv,
     sni: &str,
     private_key: &str,
     sid: &str,
+    network: &str,
 ) -> String {
-    let stream = reality_stream(core, env, sni, private_key, sid);
+    let mut stream = reality_stream(core, env, sni, private_key, sid);
+    let mut transport = None;
+    match network {
+        "ws" if core == CoreKind::SingBox => {
+            transport = Some(serde_json::json!({ "type": "ws", "path": "/ws" }));
+        }
+        "grpc" => {
+            transport = Some(serde_json::json!({ "type": "grpc", "service_name": "gun" }));
+            if core == CoreKind::Xray {
+                stream["network"] = serde_json::json!("grpc");
+                stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
+            }
+        }
+        _ => {}
+    }
     let json = match core {
         CoreKind::Xray => serde_json::json!({
             "inbounds": [{
@@ -240,13 +262,21 @@ fn vless_reality_inbound(
             }],
             "outbounds": [{ "protocol": "freedom" }]
         }),
-        CoreKind::SingBox => serde_json::json!({
-            "log": { "level": "warn" },
-            "inbounds": [{ "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
                 "users": [{ "uuid": UUID }],
-                "tls": stream }],
-            "outbounds": [{ "type": "direct" }]
-        }),
+                "tls": stream
+            });
+            if let Some(t) = transport {
+                inbound["transport"] = t;
+            }
+            serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            })
+        }
     };
     serde_json::to_string(&json).expect("vless reality server config serializes")
 }
@@ -458,14 +488,14 @@ mod tests {
     #[test]
     fn client_params_fingerprint_set_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &FingerprintTls("chrome"));
+        let params = client_params_vless(12345, target, &FingerprintTls("chrome"), "tcp");
         assert_eq!(params.protocol.security().unwrap().fp(), Some("chrome"));
     }
 
     #[test]
     fn client_params_standard_has_no_fp() {
         let target = "1.2.3.4:80".parse().unwrap();
-        let params = client_params_vless(12345, target, &StandardTls);
+        let params = client_params_vless(12345, target, &StandardTls, "tcp");
         assert_eq!(params.protocol.security().unwrap().fp(), None);
     }
 }
