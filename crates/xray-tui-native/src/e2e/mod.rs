@@ -109,12 +109,16 @@ const ATTEMPTS: u32 = 3;
 /// Run the fixed 7-step e2e lifecycle for `case` against `core`.
 ///
 /// The flaky segment (core spawn + connect + probe) is retried with fresh
-/// resources; echo/certs/tempdir are created once.
-pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<(), String> {
+/// resources; echo/certs/tls_echo/tempdir are created once by the caller
+/// (rstest fixtures) and shared across the retries.
+pub async fn run_against(
+    case: &CaseSpec,
+    core: &CoreUnderTest,
+    certs: &Certs,
+    echo: &EchoServer,
+    tls_echo: &TlsEchoServer,
+) -> Result<(), String> {
     let expect = case.expected();
-    let echo = spawn_echo();
-    let certs = generate_certs();
-    let tls_echo = spawn_tls_echo(&certs);
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let cert_path = dir.path().join("server.crt");
     let key_path = dir.path().join("server.key");
@@ -131,7 +135,7 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
         let port = free_port();
         let env = ServerEnv {
             port,
-            certs: &certs,
+            certs,
             tmp: dir.path(),
             echo: echo.addr,
             tls_echo: tls_echo.addr,
@@ -142,7 +146,7 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
         }
         let _core = spawn_core(&core.bin, core.kind, &config_path, port);
 
-        case.client_trust(&certs);
+        case.client_trust(certs);
         let params = case.client_params(port, case.probe_target(&env));
         if matches!(expect.connect, ConnectExpect::ErrRealityFallback) {
             // REALITY fallback scenario: the client's auth must fail. Assert
@@ -217,19 +221,4 @@ pub async fn run<C: E2eCase + Sync>(case: &C, core: &CoreUnderTest) -> Result<()
         "{}: failed after {ATTEMPTS} attempts",
         case.label()
     ))
-}
-
-/// Run `case` against every core in its gate; the first failure short-circuits.
-pub async fn run_against_cores(case: &CaseSpec) -> Result<(), String> {
-    for kind in case.cores() {
-        let version = match kind {
-            CoreKind::Xray => XRAY_VERSION,
-            CoreKind::SingBox => SINGBOX_VERSION,
-        };
-        let core = CoreUnderTest::resolve(*kind, version)?;
-        run(case, &core)
-            .await
-            .map_err(|e| format!("{}/{}: {e}", case.label(), core.bin.display()))?;
-    }
-    Ok(())
 }
