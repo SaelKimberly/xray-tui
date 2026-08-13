@@ -181,11 +181,17 @@ packet-up plain(h1)/tls-chrome(h2)/reality(h2) (3) + stream-up plain(h1)/tls(h2)
 Reality on new transports only where the core serves it (xray reality+xhttp
 is legal; verify empirically in T-tests).
 
-**vmess** (+16): real ws/grpc plain/chrome × 2 cores (8); httpupgrade
+**vmess** (existing 18 rows are ws/grpc-labeled but run tcp-nominal today —
+plumbing makes them real, does not add rows): plumb real ws/grpc + the new
+transports through `client_params_vmess` + `vmess_inbound`; re-gate the two
+`ws_*_reality` rows to sing-box single-core (xray rejects reality+ws, mirror
+of the vless `ws_reality` case); `grpc_*_reality` stays both-core (both cores
+serve reality+grpc, proven by the vless matrix). +8 new rows: httpupgrade
 plain/chrome × 2 cores (4); xhttp packet-up plain/tls (2, xray single-core) +
-stream-up tls (1); v2rayhttp tls (1, sing-box single-core).
+stream-up tls (1); v2rayhttp tls (1, sing-box single-core). Net: 36 → 42 tests
+(+6: 8 new minus 2 lost to the ws-reality re-gate).
 
-Totals: **~105 tests = 101 green + 4 documented ignored** (from 73+4). The 4
+Totals: **~95 tests = 91 green + 4 documented ignored** (from 73+4). The 4
 ignored (vless ws/grpc plain-into-reality-server semantic-mismatch rows)
 unchanged.
 
@@ -197,7 +203,7 @@ unchanged.
   construction, httpupgrade header set, v2rayhttp method/authority) —
   hermetic, no cores.
 - Tier 3: `XRAY_TUI_CORE_BIN_DIR=/tmp/core-bin cargo test -p xray-tui-native
-  --features native-e2e --test vless --test vmess` → 101 green + 4 ignored.
+  --features native-e2e --test vless --test vmess` → 91 green + 4 ignored.
   Cores: xray 26.3.27, sing-box 1.13.16.
 - NATIVE_CORE.md: crate-map transport row, per-protocol Transports rows
   (native now TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2), e2e count, deferred list.
