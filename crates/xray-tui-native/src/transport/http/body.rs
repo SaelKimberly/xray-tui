@@ -114,6 +114,12 @@ impl tokio::io::AsyncRead for IncomingReader {
                 }
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Ok(data) = frame.into_data() {
+                        // An empty DATA frame carries no bytes; treat it as a
+                        // no-op, not EOF (an empty read signals end-of-stream
+                        // to AsyncRead callers).
+                        if data.is_empty() {
+                            continue;
+                        }
                         let n = data.len().min(buf.remaining());
                         buf.put_slice(&data[..n]);
                         if n < data.len() {

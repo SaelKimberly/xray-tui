@@ -176,8 +176,9 @@ pub fn vmess_inbound(
 /// VLESS inbound JSON for `core` (no payload security dimension).
 ///
 /// `tls` selects certificate TLS vs REALITY; `network` selects the transport
-/// (tcp/ws/grpc). For REALITY the transport runs inside the reality tunnel
-/// (xray-core serves reality over raw/grpc only; sing-box also over ws).
+/// (tcp/ws/grpc/httpupgrade/xhttp/h2). For REALITY the transport runs inside
+/// the reality tunnel (reality over raw/grpc/xhttp; the ws/httpupgrade
+/// reality arms are sing-box-gated).
 #[must_use]
 pub fn vless_inbound(
     core: CoreKind,
@@ -326,11 +327,10 @@ fn reality_stream(
 }
 
 /// VLESS REALITY inbound JSON for `core`. `network` selects the transport
-/// declared INSIDE the reality tunnel (tcp/ws/grpc/xhttp) — reality is the
-/// outermost layer, the transport framing runs beneath it. xray-core only
-/// accepts reality over raw/grpc/xhttp ("REALITY only supports RAW, XHTTP
-/// and gRPC for now"), so xray's reality inbound stays tcp-only for
-/// ws/httpupgrade; sing-box serves reality+ws.
+/// declared INSIDE the reality tunnel (tcp/ws/grpc/httpupgrade/xhttp/h2) —
+/// reality is the outermost layer, the transport framing runs beneath it.
+/// Reality serves over raw/grpc/xhttp; the ws/httpupgrade reality arms are
+/// sing-box-gated (xray-core: "REALITY only supports RAW, XHTTP and gRPC").
 fn vless_reality_inbound(
     core: CoreKind,
     env: &ServerEnv,

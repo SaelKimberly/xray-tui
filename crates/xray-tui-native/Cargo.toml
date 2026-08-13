@@ -64,6 +64,9 @@ x25519-dalek = { version = "3", default-features = false, features = ["static_se
 # errors
 thiserror.workspace = true
 
+# observability (debug diagnostics in transports)
+tracing.workspace = true
+
 # pinSHA256 (base64) decode for the fingerprint connector's SPKI pin
 base64 = { version = "0.23" }
 

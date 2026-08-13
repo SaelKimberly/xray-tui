@@ -1,6 +1,6 @@
 # Design: native transports — XHTTP, HTTPUpgrade, h2/v2rayhttp
 
-**Implemented 2026-08-13** — see plan `docs/superpowers/plans/2026-08-13-transports-xhttp-httpupgrade-v2rayhttp.md` and the T1-T7 commits (98bcf3c + T7 docs commit).
+**Implemented 2026-08-13** — see plan `docs/superpowers/plans/2026-08-13-transports-xhttp-httpupgrade-v2rayhttp.md`; commits b6e40ee..599e056 (T1-T7).
 
 Date: 2026-08-13. Branch: `native-core-stub`.
 
@@ -212,8 +212,8 @@ plain-into-reality-server semantic-mismatch rows) unchanged.
   construction, httpupgrade header set, v2rayhttp method/authority) —
   hermetic, no cores.
 - Tier 3: `XRAY_TUI_CORE_BIN_DIR=/tmp/core-bin cargo test -p xray-tui-native
-  --features native-e2e --test vless --test vmess` → 91 green + 4 ignored.
-  Cores: xray 26.3.27, sing-box 1.13.16.
+  --features native-e2e --test vless --test vmess` → 96 green + 4 documented
+  ignored. Cores: xray 26.3.27, sing-box 1.13.16.
 - NATIVE_CORE.md: crate-map transport row, per-protocol Transports rows
   (native now TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2), e2e count, deferred list.
   AGENTS.md transport/ + xray-tui-native lines.

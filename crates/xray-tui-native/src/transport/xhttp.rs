@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use http::header::HOST;
-use http_body::Frame;
 use http_body_util::BodyExt;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -390,31 +389,31 @@ async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
 fn drain_response(resp: hyper::Response<hyper::body::Incoming>) {
     tokio::spawn(async move {
         let mut body = resp.into_body();
-        while let Some(Ok(_)) = body.frame().await {
-            // discard keepalive X-blobs
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(_) => {} // discard keepalive X-blobs
+                Err(e) => {
+                    tracing::debug!(error = %e, "xhttp stream-up: drain failed on body read");
+                    break;
+                }
+            }
         }
     });
 }
 
 /// Forward tunnel writes into the stream-up upload pipe.
 ///
-/// The pipe sender has capacity 1 (`Channel::new(1)` — see
-/// [`ReqBody::channel`]); `try_send` hands the frame back on a full pipe, so
-/// yield and retry — the hyper h1/h2 write side drains it.
+/// `send_data` awaits pipe capacity (hyper drains it into h1/h2 DATA
+/// frames), so backpressure propagates without dropping bytes; `SendError`
+/// fires only when the body is gone (stream reset) — the upload side is
+/// then broken.
 async fn forward_pipe(
     mut pipe_tx: http_body_util::channel::Sender<Bytes>,
     mut wrx: mpsc::Receiver<Bytes>,
 ) {
     while let Some(b) = wrx.recv().await {
-        let mut frame = Frame::data(b);
-        loop {
-            match pipe_tx.try_send(frame) {
-                Ok(()) => break,
-                Err(f) => {
-                    frame = f;
-                    tokio::task::yield_now().await;
-                }
-            }
+        if pipe_tx.send_data(b).await.is_err() {
+            return;
         }
     }
 }
@@ -810,7 +809,6 @@ mod tests {
         t.write_all(b"hello").await.unwrap();
         let mut out = [0u8; 6];
         t.read_exact(&mut out).await.unwrap();
-        assert_eq!(&out, b"world!");
         assert_eq!(&out, b"world!");
         server.await.unwrap();
     }

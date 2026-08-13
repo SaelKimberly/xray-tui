@@ -7716,6 +7716,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
  "uuid",
  "x25519-dalek",
  "xray-tui-proto",

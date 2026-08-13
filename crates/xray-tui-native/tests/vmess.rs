@@ -100,8 +100,9 @@ async fn vmess_against_cores(
     vmess_tls(Chacha20Poly1305Variant, "ws", reality()),
     CoreKind::SingBox
 )]
-// xhttp packet-up over h2 (TLS → h2): plain + chrome fingerprint. The h1 arm
-// is covered by the hermetic unit test.
+// xhttp packet-up: every vmess row is TLS, so the client negotiates the h2
+// arm (h2 ALPN); the h1 arm is exercised only by the xhttp.rs hermetic unit
+// test.
 #[case::xhttp_packet_aes128gcm(vmess(Aes128GcmVariant, "xhttp"), CoreKind::Xray)]
 #[case::xhttp_packet_chacha20(vmess(Chacha20Poly1305Variant, "xhttp"), CoreKind::Xray)]
 #[case::xhttp_packet_aes128gcm_chrome(

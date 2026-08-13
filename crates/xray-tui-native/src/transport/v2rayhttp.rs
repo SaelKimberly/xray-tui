@@ -73,7 +73,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     let (tx, body) = ReqBody::channel();
 
     let uri = http::Uri::builder()
-        .scheme("http")
+        .scheme("https")
         .authority(authority.as_str())
         .path_and_query(&path)
         .build()
