@@ -841,8 +841,22 @@ fn reshape(chunk: &[u8]) -> Vec<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+    use xray_tui_proto::proto_spec::{ProtocolConfig, VlessConfig};
+
     use super::*;
     use crate::BoxStream;
+    use crate::addr::{ADDR_TYPE_DOMAIN, Host, TargetAddr};
+    use crate::context::{LinkContext, NativeConnectParams};
+    use crate::protocol::vless::connect;
+    use crate::protocol::vless::header;
+    use crate::security;
+    use crate::security::fingerprint;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     const UUID: [u8; 16] = [
@@ -1538,5 +1552,392 @@ mod tests {
         let (a, _b) = tokio::io::duplex(4096);
         let mut stream: BoxStream = Box::new(a);
         stream.set_write_direct();
+    }
+
+    // ---- Hermetic: fake vision server over a real outer TLS session ----
+    //
+    // The raw-TCP fake server pattern from the xhttp/httpupgrade hermetic
+    // tests, extended with the security phase's rustls server double (the
+    // engine's SERVER side): one `TcpListener`, the outer TLS handshake as
+    // a rustls `ServerConnection`, then the vision wire spoken exactly —
+    // read + assert the VLESS request header (flow addon), the camouflage
+    // frame, and the padded uplink frame; send the `[0,0]` response header
+    // and the padded downlink frame(s). The CLIENT drives the real path:
+    // `security::wrap` (engine TLS 1.3) + `protocol::vless::connect` (flow
+    // addon header + camouflage + VisionStream). This is the frame-level
+    // gate (brief steps 1-7) before the real-core e2e rows.
+
+    fn vless_vision_config() -> VlessConfig {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+            "transport": { "type": "tcp" },
+            "flow": "xtls-rprx-vision",
+            "security": { "type": "tls", "sni": "localhost", "alpn": "http/1.1" }
+        }))
+        .expect("vless vision config parses");
+        match protocol {
+            ProtocolConfig::Vless(cfg) => cfg,
+            _ => panic!("expected a vless config"),
+        }
+    }
+
+    /// rcgen CA + server cert/key PEM + CA DER (the security-phase fixture).
+    fn rcgen_ca_and_server(sni: &str) -> (String, String, Vec<u8>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let mut ca_params = CertificateParams::new(vec![sni.to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_params =
+            CertificateParams::new(vec![sni.to_string(), "127.0.0.1".to_string()]).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        (
+            server_cert.pem(),
+            server_key.serialize_pem(),
+            ca_cert.der().to_vec(),
+        )
+    }
+
+    fn server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
+        use rustls::pki_types::pem::PemObject;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .map(|c| c.expect("cert pem parses"))
+                .collect();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .expect("key pem parses");
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config builds")
+    }
+
+    /// Read exactly `out.len()` decrypted bytes, pulling new outer-TLS
+    /// records from the socket whenever the rustls plaintext buffer is
+    /// empty (rustls 0.23 `Reader::read` signals that with `WouldBlock`).
+    fn read_exact_decrypted(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < out.len() {
+            match conn.reader().read(&mut out[filled..]) {
+                Ok(n) if n > 0 => {
+                    filled += n;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            // No plaintext buffered. `complete_io` may have pulled the
+            // peer's first application-data records into rustls's read
+            // buffer together with the final handshake flight — process
+            // whatever is buffered before blocking on the socket.
+            let state = conn
+                .process_new_packets()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if state.plaintext_bytes_to_read() > 0 {
+                continue;
+            }
+            if conn.read_tls(sock)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "fake vision server: outer TLS peer closed",
+                ));
+            }
+            conn.process_new_packets()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }
+        Ok(())
+    }
+
+    /// Write `data` as decrypted bytes (buffered into the record layer,
+    /// then flushed until nothing is left to send).
+    fn write_all_encrypted(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        conn.writer().write_all(data)?;
+        loop {
+            if conn.write_tls(sock)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Read one complete padded frame (no UUID prefix): `[cmd][clen:2]
+    /// [plen:2][content][zeros]`. Returns `(cmd, content, plen)`.
+    fn read_frame(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+    ) -> std::io::Result<(u8, Vec<u8>, usize)> {
+        let mut fh = [0u8; 5];
+        read_exact_decrypted(conn, sock, &mut fh)?;
+        let clen = usize::from(u16::from_be_bytes([fh[1], fh[2]]));
+        let plen = usize::from(u16::from_be_bytes([fh[3], fh[4]]));
+        let mut content = vec![0u8; clen];
+        read_exact_decrypted(conn, sock, &mut content)?;
+        let mut pad = vec![0u8; plen];
+        read_exact_decrypted(conn, sock, &mut pad)?;
+        assert!(
+            pad.iter().all(|&b| b == 0),
+            "vision padding must be zero bytes"
+        );
+        Ok((fh[0], content, plen))
+    }
+
+    /// The fake vision server's wire script, run inside the completed outer
+    /// TLS connection (brief steps 3-6): the VLESS request header with the
+    /// flow addon, the camouflage frame, the `[0,0]` response header, one
+    /// padded uplink frame; then `after` drives the downlink frame(s).
+    fn vision_server_script(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        uuid: &[u8; 16],
+        expected_host: &str,
+        expected_port: u16,
+        after: impl FnOnce(
+            &mut rustls::ServerConnection,
+            &mut std::net::TcpStream,
+        ) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        // Step 3: VLESS request header — version | uuid | addons_len.
+        let mut head = [0u8; 18];
+        read_exact_decrypted(conn, sock, &mut head)?;
+        assert_eq!(head[0], header::VERSION, "vless version byte");
+        assert_eq!(&head[1..17], uuid, "vless user uuid");
+        assert_eq!(head[17], 18, "addons_len");
+        // addons: protobuf field 1 string, exact wire bytes.
+        let mut addons = [0u8; 18];
+        read_exact_decrypted(conn, sock, &mut addons)?;
+        assert_eq!(&addons[..2], &[0x0a, 0x10], "addons protobuf tag+length");
+        assert_eq!(&addons[2..], b"xtls-rprx-vision", "addons flow value");
+        // command + target (port first, then atyp + address).
+        let mut cmd = [0u8; 1];
+        read_exact_decrypted(conn, sock, &mut cmd)?;
+        assert_eq!(cmd[0], header::CMD_TCP, "vless command");
+        let mut port = [0u8; 2];
+        read_exact_decrypted(conn, sock, &mut port)?;
+        assert_eq!(u16::from_be_bytes(port), expected_port, "target port");
+        let mut atyp = [0u8; 1];
+        read_exact_decrypted(conn, sock, &mut atyp)?;
+        assert_eq!(atyp[0], ADDR_TYPE_DOMAIN, "target address type");
+        let mut alen = [0u8; 1];
+        read_exact_decrypted(conn, sock, &mut alen)?;
+        assert_eq!(
+            usize::from(alen[0]),
+            expected_host.len(),
+            "target domain length"
+        );
+        let mut host = vec![0u8; usize::from(alen[0])];
+        read_exact_decrypted(conn, sock, &mut host)?;
+        assert_eq!(&host, expected_host.as_bytes(), "target domain");
+
+        // Step 4: the camouflage frame — empty long-padding Continue frame
+        // carrying the writer's UUID.
+        let mut camo = [0u8; 21];
+        read_exact_decrypted(conn, sock, &mut camo)?;
+        assert_eq!(&camo[..16], uuid, "camouflage uuid prefix");
+        assert_eq!(camo[16], CMD_CONTINUE, "camouflage command");
+        assert_eq!(&camo[17..19], &[0x00, 0x00], "camouflage content_len == 0");
+        let camo_plen = usize::from(u16::from_be_bytes([camo[19], camo[20]]));
+        assert!(
+            (900..=1399).contains(&camo_plen),
+            "camouflage long padding {camo_plen}"
+        );
+        let mut pad = vec![0u8; camo_plen];
+        read_exact_decrypted(conn, sock, &mut pad)?;
+        assert!(pad.iter().all(|&b| b == 0), "camouflage padding zeros");
+
+        // Step 5: the `[0,0]` response header, raw (its own outer-TLS
+        // record, before the first padded downlink frame).
+        write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
+
+        // Step 6: one padded uplink frame (no UUID — the camouflage frame
+        // consumed the writer's UUID).
+        let (fcmd, content, app_plen) = read_frame(conn, sock)?;
+        assert_eq!(fcmd, CMD_CONTINUE, "app frame command");
+        assert_eq!(content, b"hello", "app frame content");
+        assert!(app_plen < 256, "plain app frame padding {app_plen}");
+
+        after(conn, sock)
+    }
+
+    /// Spawn the fake vision server: accept one connection, complete the
+    /// outer TLS handshake as the rustls server double, run the wire
+    /// script. Returns the listener address + the join handle (server-side
+    /// assertion failures surface as panics through it).
+    fn spawn_vision_server(
+        cert_pem: &str,
+        key_pem: &str,
+        uuid: [u8; 16],
+        expected_host: &str,
+        expected_port: u16,
+        after: impl FnOnce(
+            &mut rustls::ServerConnection,
+            &mut std::net::TcpStream,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let cfg = server_config(cert_pem, key_pem);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let expected_host = expected_host.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let timeout = Duration::from_secs(15);
+            sock.set_read_timeout(Some(timeout)).expect("read timeout");
+            sock.set_write_timeout(Some(timeout))
+                .expect("write timeout");
+            let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).expect("server conn");
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).expect("outer TLS handshake");
+            }
+            vision_server_script(
+                &mut conn,
+                &mut sock,
+                &uuid,
+                &expected_host,
+                expected_port,
+                after,
+            )
+            .expect("vision wire script");
+        });
+        (addr, handle)
+    }
+
+    /// A `LinkContext` pointing the client at the fake server, with the
+    /// vision flow config and a known target (asserted on the server side).
+    fn vision_ctx(addr: SocketAddr, cfg: VlessConfig, target: TargetAddr) -> LinkContext {
+        let mut params = NativeConnectParams::new(
+            ProtocolConfig::Vless(cfg),
+            EndpointEssentials::new("127.0.0.1", 1),
+            target.clone(),
+        );
+        params.server = EndpointEssentials::new(addr.ip().to_string(), addr.port());
+        LinkContext::new(params, target)
+    }
+
+    /// The hermetic frame-level gate (brief steps 1-7): the real client
+    /// path — engine TLS wrap + vless vision connect — against the fake
+    /// server. Asserts the header addon bytes, the camouflage frame, the
+    /// padded uplink frame layout, and the padded END downlink frame.
+    #[tokio::test]
+    async fn hermetic_fake_vision_server_frames() {
+        // Feature unification enables both rustls backends; the app installs
+        // the ring provider at startup (workspace convention), tests do it
+        // here (idempotent).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        // The engine verifies through its thread-local harness CA.
+        fingerprint::set_test_ca(&ca_der);
+        let target = TargetAddr::new(Host::Domain("dest.test".into()), 8080);
+        let (addr, server) = spawn_vision_server(
+            &cert_pem,
+            &key_pem,
+            UUID,
+            "dest.test",
+            8080,
+            |conn, sock| {
+                // Step 7: padded END frame with the server's UUID; the
+                // client must deliver its content.
+                let end = encode_frame(Some(&UUID), CMD_END, b"world", 0);
+                write_all_encrypted(conn, sock, &end)
+            },
+        );
+        let cfg = vless_vision_config();
+        let ctx = vision_ctx(addr, cfg.clone(), target);
+
+        let out = tokio::time::timeout(Duration::from_secs(30), async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+            let mut tunnel = connect(&ctx, wrapped, &cfg).await.unwrap();
+            tunnel.write_all(b"hello").await.unwrap();
+            let mut out = [0u8; 5];
+            tunnel.read_exact(&mut out).await.unwrap();
+            out
+        })
+        .await
+        .expect("hermetic vision flow timed out");
+        assert_eq!(&out, b"world", "client delivers the END-frame content");
+        server.await.expect("fake vision server task failed");
+    }
+
+    /// Hermetic Direct proof (brief step 8): after the padded END exchange,
+    /// the client's inner `ClientHello` is padded (Continue, long padding),
+    /// the server's crafted TLS 1.3 `ServerHello` passes through the tunnel
+    /// and flips the shared filter's `EnableXtls`, and the client's next
+    /// inner app-data write goes out as the Direct frame — the splice
+    /// point, proven over the real outer TLS session. (The raw-relay
+    /// continuation after the splice is Task 6's e2e job.)
+    #[tokio::test]
+    async fn hermetic_fake_vision_server_direct_frame() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        fingerprint::set_test_ca(&ca_der);
+        let target = TargetAddr::new(Host::Domain("dest.test".into()), 8080);
+        let client_hello = b"\x16\x03\x03\x00\x05\x01\x00\x00\x01\x00";
+        let app_data = b"\x17\x03\x03\x00\x05hello";
+        let sh = server_hello(0x1301, true);
+        let (addr, server) = spawn_vision_server(&cert_pem, &key_pem, UUID, "dest.test", 8080, {
+            let sh = sh.clone();
+            move |conn, sock| {
+                // Step 7: padded END frame with the server's UUID.
+                let end = encode_frame(Some(&UUID), CMD_END, b"world", 0);
+                write_all_encrypted(conn, sock, &end)?;
+                // The inner ClientHello arrives padded (Continue, long
+                // padding — the shared filter already marked is_tls).
+                let (cmd, content, plen) = read_frame(conn, sock)?;
+                assert_eq!(cmd, CMD_CONTINUE, "inner ClientHello frame command");
+                assert_eq!(content, client_hello, "inner ClientHello content");
+                assert!(
+                    (890..=1389).contains(&plen),
+                    "ClientHello long padding {plen}"
+                );
+                // Padded TLS 1.3 ServerHello — flips EnableXtls.
+                let sh_frame = encode_frame(Some(&UUID), CMD_CONTINUE, &sh, 0);
+                write_all_encrypted(conn, sock, &sh_frame)?;
+                // The client's inner app-data write: the Direct frame.
+                let (cmd, content, plen) = read_frame(conn, sock)?;
+                assert_eq!(cmd, CMD_DIRECT, "Direct frame command");
+                assert_eq!(content, app_data, "Direct frame content");
+                assert!(
+                    (890..=1389).contains(&plen),
+                    "Direct frame long padding {plen}"
+                );
+                Ok(())
+            }
+        });
+        let cfg = vless_vision_config();
+        let ctx = vision_ctx(addr, cfg.clone(), target);
+
+        let (world, sh_got) = tokio::time::timeout(Duration::from_secs(30), async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+            let mut tunnel = connect(&ctx, wrapped, &cfg).await.unwrap();
+            tunnel.write_all(b"hello").await.unwrap();
+            let mut out = [0u8; 5];
+            tunnel.read_exact(&mut out).await.unwrap();
+            tunnel.write_all(client_hello).await.unwrap();
+            let mut sh_out = vec![0u8; sh.len()];
+            tunnel.read_exact(&mut sh_out).await.unwrap();
+            tunnel.write_all(app_data).await.unwrap();
+            (out, sh_out)
+        })
+        .await
+        .expect("hermetic vision direct flow timed out");
+        assert_eq!(&world, b"world", "client delivers the END-frame content");
+        assert_eq!(&sh_got, &sh, "client unpads the crafted ServerHello");
+        server.await.expect("fake vision server task failed");
     }
 }
