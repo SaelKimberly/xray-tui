@@ -79,6 +79,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # for the feature-gated e2e module).
 serde_json.workspace = true
 rcgen = "0.14"
+rstest.workspace = true
 # rustls: the server double in unit tests (src/security) under `cfg(test)`,
 # without the `native-e2e` feature (which re-enables it via `dep:rustls`).
 rustls = { workspace = true, features = ["ring"] }

@@ -63,6 +63,9 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 # ============ Hashing ============
 rapidhash = { version = "4.5", features = ["std", "unsafe"] }
 
+# ============ Test ============
+rstest = "0.26.1"
+
 # ============ TLS ============
 # Workspace TLS standard is RING ONLY — aws-lc-rs is denied. Every rustls
 # consumer must use default-features = false (rustls 0.23 defaults to
