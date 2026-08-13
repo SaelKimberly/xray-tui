@@ -45,9 +45,9 @@ HTTP/1.1 + HTTP/2 framing, chunked, Content-Length, and the RFC 7230 upgrade
 and timeouts.
 
 ```toml
-# crates/xray-tui-native/Cargo.toml
-hyper = { version = "1", default-features = false, features = ["http1", "http2"] }
-http-body-util = "0.1"
+# crates/xray-tui-native/Cargo.toml — latest minor versions (verified 2026-08-13)
+hyper = { version = "1.11", default-features = false, features = ["http1", "http2"] }
+http-body-util = "0.1.5"
 ```
 
 - `default-features = false`: hyper 1.x default features are empty anyway; this
@@ -58,10 +58,14 @@ http-body-util = "0.1"
   `hyper::client::conn::http1::handshake::<T,B>(io) -> (SendRequest<B>, Connection<T,B>)`
   and the http2 equivalent over our own `BoxStream` (AsyncRead+AsyncWrite).
   Each `Connection` is a driver task we spawn on our runtime.
-- http-body-util (`Channel::new(buffer) -> (Sender, Channel)`) provides the
+- hyper **1.11.0** + http-body-util **0.1.5** (latest minor releases, verified via
+  `cargo search` 2026-08-13; per workspace dep rule: minor-version bound pinned
+  to the latest release). http-body-util 0.1.5 fetches on first build (0.1.4
+  cached). hyper 1.11 uses h2 0.4.x internally (same major as grpc's h2 dep —
+  no duplicate).
+- http-body-util `Channel::new(buffer) -> (Sender, Channel)` provides the
   upload pipe bodies (stream-up POST, v2rayhttp PUT); `Empty`/`Full` cover the
-  discrete POST bodies. bytes + http already direct deps. hyper 1.11 uses h2
-  0.4.x internally (same major as grpc's h2 dep — no duplicate).
+  discrete POST bodies. bytes + http already direct deps.
 - 101 upgrade: `hyper::upgrade::on(response) -> OnUpgrade` yields the upgraded
   stream for httpupgrade.
 - Timeouts: existing `timeouts::*` seams stay — each hyper read/write of the
