@@ -14,7 +14,7 @@
 - E2E gating unchanged: `#![cfg(feature = "native-e2e")]` on integration tests; env `XRAY_TUI_CORE_BIN_DIR` hard-fails via `CoreUnderTest::resolve` (no default).
 - NO `#[timeout]` on e2e tests (rstest abort skips `CoreGuard` Drop → orphan cores). NO `#[trace]` (CaseSpec not Debug).
 - Clippy pedantic+nursery: ZERO warnings workspace-wide (`cargo clippy --workspace --all-targets`). rustfmt clean.
-- NO non-test source changes except: `crates/xray-tui-native/src/e2e/mod.rs` (runner signature), test modules inside `src/transport/grpc.rs` + `src/spec/mod.rs`, and new `tests/common/mod.rs`. `src/e2e/core.rs`, `config.rs`, `variant.rs`, `case.rs`, `harness.rs` untouched.
+- NO non-test source changes except: `crates/xray-tui-native/src/e2e/mod.rs` (runner signature), test modules inside `src/transport/grpc.rs` + `src/spec/mod.rs`, and new `tests/common/mod.rs`. `src/e2e/core.rs`, `config.rs`, `variant.rs`, `case.rs`, `harness.rs` untouched. **Deviation note (recorded post-execution):** `case.rs` `CaseSpec::with_network` was made `pub const fn` (clippy `missing_const_for_fn`, required by the zero-warnings gate; behavior-identical) — the untouched-file list is otherwise honored.
 - No `pkill`/blanket kills of core binaries; core processes are only ever reaped by `CoreGuard` Drop (tests) or targeted `kill <pid>`.
 - Existing e2e expectations (`E2eExpect`), `ATTEMPTS=3`, 7-step lifecycle, and the fallback assertions (connect errors with `NativeError::Reality` + Spider-X preface reaches dest) are behavior-preserved.
 

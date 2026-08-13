@@ -42,9 +42,16 @@ runtime expression so it works inside `#[case]`.
 | `vless_against_cores` | network {tcp, ws, grpc} × tls {standard, chrome, reality, wrong-pbk, wrong-sid, plain→reality-server, reality→plain-server} | 21 | 42 |
 | `vmess_against_cores` | security {aes128gcm, chacha20} × network {tcp, ws, grpc} × tls {standard, chrome, reality} | 18 | 36 |
 
-Full cartesian = new coverage (reality/fallback over ws/grpc framing; vmess over
-ws/grpc). A combo that legitimately fails server-side gets a documented skip,
-not a delete.
+Full cartesian = new coverage, with an honest caveat: the vmess `ws_*`/`grpc_*`
+rows are cosmetic (labels only). `vmess_inbound`, `vmess_reality_inbound` and
+`client_params_vmess` in the harness hardcode `tcp` on both ends (server
+`streamSettings.network = "tcp"`, client `client_security(tls, "tcp")` +
+`"transport": { "type": "tcp" }`) — vmess is tcp-only end to end, so plain
+vmess-over-ws/grpc AND vmess reality-over-ws/grpc are NOT actually exercised;
+the network axis is genuinely wired only for VLESS. The genuinely new vmess
+coverage is the reality-vs-tcp rows; reality/fallback over ws/grpc framing is
+new coverage for VLESS only. A combo that legitimately fails server-side gets a
+documented skip, not a delete.
 
 `run_against_cores` is replaced by a per-(case, core) runner `run_against(case,
 core, &certs, &echo, &tls_echo)` — same 7-step lifecycle, 3 attempts, same
