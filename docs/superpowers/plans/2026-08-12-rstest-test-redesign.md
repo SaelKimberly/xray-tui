@@ -88,7 +88,9 @@ In the `#[cfg(test)] mod tests` of `crates/xray-tui-native/src/transport/grpc.rs
         let framed = encode_frame(&payload);
         // gRPC prefix (flag 0 + BE hunk byte-len) + Hunk protobuf:
         // tag 0x0A + varint(data_len) + data.
-        let hunk_len = 1 + varint_len(payload.len() as u64) + payload.len();
+        // `varint_len(n)` returns the varint BYTES, so its len() is the
+        // encoded width.
+        let hunk_len = 1 + varint_len(payload.len()).len() + payload.len();
         assert_eq!(
             &framed[..5],
             &[0, 0, 0, (hunk_len >> 8) as u8, hunk_len as u8]
@@ -116,7 +118,10 @@ In the `#[cfg(test)] mod tests` of `crates/xray-tui-native/src/transport/grpc.rs
     }
 ```
 
-Note: `varint_len` is already in scope via `use super::*;`. `BytesMut` is already imported in the tests module.
+Note: `varint_len` is already in scope via `use super::*;`. For the `empty`
+case `framed.len()` is 7 (5-byte prefix + `[0x0A, 0x00]`); split points
+0/2/5/6 all stay inside it and each partial prefix yields `None`. `BytesMut`
+is already imported in the tests module.
 
 - [ ] **Step 2: Run the unit tests**
 
