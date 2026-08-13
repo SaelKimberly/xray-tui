@@ -11,6 +11,7 @@ use crate::protocol::vless::stream::VlessClientStream;
 
 pub mod header;
 pub mod stream;
+pub(crate) mod vision;
 
 /// Connect through a VLESS outbound over an already-secured stream.
 ///
