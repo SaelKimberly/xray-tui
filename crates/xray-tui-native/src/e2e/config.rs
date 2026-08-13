@@ -122,10 +122,10 @@ pub fn vless_inbound(
     // Configs below reference the PEM FILES on disk, not the byte buffers.
     let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
     let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
-    // grpc and xhttp ride HTTP/2 (need h2 ALPN); ws/httpupgrade upgrade
-    // with http/1.1 (the default below).
+    // grpc, xhttp and v2rayhttp ("h2") ride HTTP/2 (need h2 ALPN);
+    // ws/httpupgrade upgrade with http/1.1 (the default below).
     let alpn = match network {
-        "grpc" | "xhttp" => serde_json::json!(["h2"]),
+        "grpc" | "xhttp" | "h2" => serde_json::json!(["h2"]),
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
@@ -159,6 +159,10 @@ pub fn vless_inbound(
                     stream["splithttpSettings"] =
                         serde_json::json!({ "path": "/x", "host": "localhost" });
                 }
+                // xray-core removed the h2 transport in 26.x — these rows
+                // are sing-box single-core, so this arm is unreachable; a
+                // loud panic beats emitting a broken config.
+                "h2" => panic!("h2 (v2rayhttp) transport is sing-box only"),
                 _ => {}
             }
             serde_json::json!({
@@ -188,6 +192,13 @@ pub fn vless_inbound(
                 "httpupgrade" => {
                     inbound["transport"] = serde_json::json!({
                         "type": "httpupgrade", "path": "/hu", "host": "localhost"
+                    });
+                }
+                // v2rayhttp: sing-box `type: http`, the h2 single-stream
+                // tunnel (xray-core dropped the h2 transport in 26.x).
+                "h2" => {
+                    inbound["transport"] = serde_json::json!({
+                        "type": "http", "path": "/h2", "host": "localhost"
                     });
                 }
                 _ => {}
@@ -360,7 +371,7 @@ fn client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
 /// transport-aware: grpc rides h2, everything else upgrades with http/1.1.
 fn plain_client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
     let alpn = match network {
-        "grpc" | "xhttp" => "h2",
+        "grpc" | "xhttp" | "h2" => "h2",
         // ws and httpupgrade both upgrade over HTTP/1.1 (the default below).
         _ => "http/1.1",
     };
@@ -446,6 +457,9 @@ pub fn client_params_vless(
             "type": "x_http", "path": "/x", "host": "localhost",
             "mode": xhttp_mode.unwrap_or("packet-up")
         }),
+        // v2rayhttp: proto `type: http` (the `h2` network string is only
+        // for the test rows/dispatch; the wire name is `http`).
+        "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
         _ => serde_json::json!({ "type": "tcp" }),
     };
     let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({

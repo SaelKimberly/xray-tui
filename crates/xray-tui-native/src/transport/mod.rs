@@ -15,6 +15,7 @@ pub mod grpc;
 pub mod http;
 pub mod httpupgrade;
 pub mod tcp;
+pub mod v2rayhttp;
 pub mod ws;
 pub mod xhttp;
 
@@ -23,7 +24,7 @@ pub mod xhttp;
 /// the secured stream (see [`upgrade`]).
 pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
-        None | Some("tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp") => {
+        None | Some("tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp" | "http") => {
             tcp::connect(ctx, base).await
         }
         Some(t) => Err(NativeError::NotImplemented {
@@ -33,13 +34,14 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
 }
 
 /// Run the transport-upgrade step over an established (secured) stream:
-/// TCP = passthrough; ws/grpc/httpupgrade/xhttp = framing handshake.
+/// TCP = passthrough; ws/grpc/httpupgrade/xhttp/v2rayhttp = framing handshake.
 pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
         Some("ws") => ws::connect(ctx, stream).await,
         Some("grpc") => grpc::connect(ctx, stream).await,
         Some("httpupgrade") => httpupgrade::connect(ctx, stream).await,
         Some("xhttp") => xhttp::connect(ctx, stream).await,
+        Some("http") => v2rayhttp::connect(ctx, stream).await,
         None | Some("tcp") => Ok(stream),
         Some(t) => Err(NativeError::NotImplemented {
             feature: format!("transport {t}"),

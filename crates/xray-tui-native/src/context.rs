@@ -118,13 +118,13 @@ impl LinkContext {
         if !explicit.is_empty() {
             return explicit;
         }
-        // Transport-implied ALPN: the grpc and xhttp transports are HTTP/2
-        // (xhttp falls back to HTTP/1.1 only when there is no TLS at all —
-        // no ALPN then), the ws and httpupgrade upgrades are HTTP/1.1
-        // exchanges. (Reality forces h2+http/1.1 server-side; an explicit
-        // `alpn` option wins above.)
+        // Transport-implied ALPN: the grpc, xhttp and v2rayhttp (`http`)
+        // transports are HTTP/2 (xhttp falls back to HTTP/1.1 only when
+        // there is no TLS at all — no ALPN then), the ws and httpupgrade
+        // upgrades are HTTP/1.1 exchanges. (Reality forces h2+http/1.1
+        // server-side; an explicit `alpn` option wins above.)
         match self.transport_type() {
-            Some("grpc" | "xhttp") => vec![b"h2".to_vec()],
+            Some("grpc" | "xhttp" | "http") => vec![b"h2".to_vec()],
             Some("ws" | "httpupgrade") => vec![b"http/1.1".to_vec()],
             _ => vec![],
         }
@@ -324,6 +324,23 @@ mod tests {
             target("x"),
         );
         assert_eq!(ctx.alpn_vec(), vec![b"http/1.1".to_vec()]);
+
+        // v2rayhttp rides HTTP/2 like grpc.
+        let http: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "http", "path": "/h2" }
+        }))
+        .expect("vless http config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                http,
+                EndpointEssentials::new("127.0.0.1", 4430),
+                target("x"),
+            ),
+            target("x"),
+        );
+        assert_eq!(ctx.alpn_vec(), vec![b"h2".to_vec()]);
     }
 
     #[test]

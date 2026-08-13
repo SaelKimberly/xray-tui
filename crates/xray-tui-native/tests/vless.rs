@@ -104,6 +104,11 @@ async fn vless_against_cores(
 // is covered by the hermetic unit test.
 #[case::xhttp_stream_plain(vless_xhttp("stream-up"), CoreKind::Xray)]
 #[case::xhttp_stream_chrome(vless_xhttp_tls("stream-up", fp("chrome")), CoreKind::Xray)]
+// v2rayhttp (sing-box `type: http`) is sing-box-only: xray-core removed the
+// h2 transport in 26.x. One row over h2 + the chrome fingerprint (the
+// client JSON carries the fp so the engine fingerprints; ALPN h2 comes from
+// the context's transport-implied alpn arm).
+#[case::v2rayhttp_chrome(vless_tls("h2", fp("chrome")), CoreKind::SingBox)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,
