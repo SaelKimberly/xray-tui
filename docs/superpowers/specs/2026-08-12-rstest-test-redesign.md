@@ -64,15 +64,20 @@ core, &certs, &echo, &tls_echo)` — same 7-step lifecycle, 3 attempts, same
   once: `reset_recording`/`saw_h2_preface` is fallback-case mutable state;
   sharing across parallel tests races.
 
-### Unit conversions (same assertions, table-driven)
+### Unit conversions (same assertions, table-driven — only where the SAME assertion repeats over inputs)
 
 - `transport/grpc.rs`: `frame_roundtrip(#[case] payload)` (short / varint-2-byte
-  / empty), `frame_parse_splits(#[case] payload, #[values] split)`, multi-message
-  as a case row; `service_name`/`path` stay one-offs.
-- `xray-tui-tls` `spec/mod.rs` extension-encoding tables → `#[case]` per
-  extension shape; `crypto/fingerprint` JA3/JA4 → `#[case::profile(…)]` per
-  golden.
-- `protocol/vmess/keys.rs` + `header.rs` tables → `#[case]`.
+  / empty), `frame_parse(#[case] payload, #[values] split)`, multi-message as a
+  case row; `service_name`/`path` stay one-offs.
+- `xray-tui-tls` `spec/mod.rs`: the 18 extension `encode_body` tests
+  (ServerName … Raw) are one repeating assertion (encode → exact wire bytes) →
+  ONE rstest fn with 18 named `#[case]` rows; `grease_detection` stays.
+
+Explicitly NOT converted (verified during survey — each is a distinct Go- or
+RFC-verified golden or logic test, no repeating assertion; conversion would be
+churn without clarity): `crypto/mod.rs` aead/key-schedule goldens, `ja3.rs`/
+`ja4.rs` logic tests, `profiles/mod.rs` (JA4 prefix property loop), `vmess/
+keys.rs` + `header.rs` Go-verified wire goldens, `transport/ws.rs` (2 one-offs).
 
 ## Non-goals
 
