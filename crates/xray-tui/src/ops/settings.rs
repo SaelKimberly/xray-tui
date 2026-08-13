@@ -796,9 +796,7 @@ pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]
 /// Missing overrides default to "Auto" so the form field list always matches
 /// the field definitions — a mismatch lets the Select Left/Right handler
 /// index `fields[focus_index]` past an empty vec (panic, see build arm).
-fn protocol_core_form_fields(
-    overrides: &HashMap<String, String>,
-) -> Vec<(String, String)> {
+fn protocol_core_form_fields(overrides: &HashMap<String, String>) -> Vec<(String, String)> {
     crate::ui::settings::PROTOCOL_CORE_DEFS
         .iter()
         .map(|(key, _, _)| {

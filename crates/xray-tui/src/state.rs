@@ -154,7 +154,8 @@ pub struct AppState {
     /// mmdb country per outbound (exit) IP, keyed by the IP string. Filled at
     /// profile load and on real-ping success; survives reruns because the
     /// source (`Latency::Real.ip`) is persisted and lookups rerun at load.
-    pub outbound_country_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+    pub outbound_country_cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
     /// TTL (secs) for the DNS-resolution cache; default 300.
     pub dns_cache_ttl_secs: i64,
 }
@@ -463,7 +464,9 @@ impl AppState {
             dns_resolver: None,
             host_features: None,
             endpoint_info: HashMap::new(),
-            outbound_country_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            outbound_country_cache: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             dns_cache_ttl_secs: 300,
         };
         // Cheap constructors — no I/O until first lookup.

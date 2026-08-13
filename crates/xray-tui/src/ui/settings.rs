@@ -2099,8 +2099,8 @@ fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static
 #[cfg(test)]
 mod tests {
     use super::handle_form_key;
-    use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
     use crate::AppState;
+    use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui_cheese::tree::TreeState;
     use std::cell::RefCell;

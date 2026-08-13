@@ -156,7 +156,10 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     let endpoint;
     let link;
     let protocol_id_typed;
-    if let Some(r) = state.endpoints.iter().find(|r| r.endpoint.id.get() == endpoint_id)
+    if let Some(r) = state
+        .endpoints
+        .iter()
+        .find(|r| r.endpoint.id.get() == endpoint_id)
         && let Some(l) = r.links.iter().find(|l| l.protocol_id.get() == protocol_id)
     {
         endpoint = r.endpoint.clone();

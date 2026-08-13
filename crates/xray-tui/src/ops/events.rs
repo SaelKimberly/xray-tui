@@ -1390,7 +1390,10 @@ mod tests {
             text: "timeout".into(),
         });
         row.links[0].last_seen_at = crate::ops::profiles::test_support::ts(200);
-        row.links[1].latency = Some(Latency::Real { delay: 90, ip: None });
+        row.links[1].latency = Some(Latency::Real {
+            delay: 90,
+            ip: None,
+        });
         row.links[1].last_seen_at = crate::ops::profiles::test_support::ts(100);
         state.endpoints = vec![row];
         state.selected_index = 0;

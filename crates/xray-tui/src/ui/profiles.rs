@@ -309,7 +309,11 @@ fn compute_test_cell(
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
     use xray_tui_db::models::ProfileErr;
-    let failure = match row.active_link().and_then(|l| l.error.as_ref()).map(|e| e.kind) {
+    let failure = match row
+        .active_link()
+        .and_then(|l| l.error.as_ref())
+        .map(|e| e.kind)
+    {
         Some(ProfileErr::Real | ProfileErr::Name) => Some(TestFailure::Real),
         Some(ProfileErr::Fast) => Some(TestFailure::Fast),
         None => None,
@@ -982,12 +986,18 @@ mod tests {
             kind: ProfileErr::Real,
             text: "timeout".into(),
         });
-        row.links[1].latency = Some(Latency::Real { delay: 40, ip: None });
+        row.links[1].latency = Some(Latency::Real {
+            delay: 40,
+            ip: None,
+        });
 
         // Active = p101 (success): no failure label, delay shown.
         row.selected_protocol = 1;
         let (text, _style) = compute_test_cell(&row, true, &palette);
-        assert!(!text.contains("real"), "active success must not paint red: {text:?}");
+        assert!(
+            !text.contains("real"),
+            "active success must not paint red: {text:?}"
+        );
         assert!(text.contains("40"), "active delay must be shown: {text:?}");
 
         // Active = p100 (failed): [real] red, as expected.
@@ -1013,11 +1023,15 @@ mod tests {
         });
         let (text, _style) = compute_test_cell(&row, true, &palette);
         assert!(text.contains("44"), "measured delay must win: {text:?}");
-        assert!(!text.contains("fast"), "no [fast] label over a delay: {text:?}");
+        assert!(
+            !text.contains("fast"),
+            "no [fast] label over a delay: {text:?}"
+        );
     }
 
     #[test]
-    fn expanded_row_height_includes_gap() {        let row = sample_row(
+    fn expanded_row_height_includes_gap() {
+        let row = sample_row(
             true,
             vec![sample_panel_row("●"), sample_panel_row("○")],
             "00",

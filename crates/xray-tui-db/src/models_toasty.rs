@@ -578,17 +578,17 @@ mod tests {
 
     #[test]
     fn select_best_measured_link_fast_ok_when_no_real() {
-        let mut r = row(&[
-            (10, 1, Some(fast(90)), None),
-            (11, 2, Some(fast(44)), None),
-        ]);
+        let mut r = row(&[(10, 1, Some(fast(90)), None), (11, 2, Some(fast(44)), None)]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 1, "fast-ok lowest delay wins");
     }
 
     #[test]
     fn select_best_measured_link_keeps_selection_when_unmeasured() {
-        let mut r = row(&[(10, 1, None, None), (11, 2, None, Some(err(ProfileErr::Real)))]);
+        let mut r = row(&[
+            (10, 1, None, None),
+            (11, 2, None, Some(err(ProfileErr::Real))),
+        ]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 0, "no measurement -> keep selection");
     }
