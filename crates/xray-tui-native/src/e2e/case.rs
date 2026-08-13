@@ -54,7 +54,7 @@ impl CaseSpec {
 
     /// Select the transport ("tcp", "ws", "grpc").
     #[must_use]
-    pub fn with_network(mut self, network: &'static str) -> Self {
+    pub const fn with_network(mut self, network: &'static str) -> Self {
         self.network = network;
         self
     }

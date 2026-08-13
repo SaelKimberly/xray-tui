@@ -109,7 +109,7 @@ const ATTEMPTS: u32 = 3;
 /// Run the fixed 7-step e2e lifecycle for `case` against `core`.
 ///
 /// The flaky segment (core spawn + connect + probe) is retried with fresh
-/// resources; echo/certs/tls_echo/tempdir are created once by the caller
+/// resources; `echo`/`certs`/`tls_echo`/`tempdir` are created once by the caller
 /// (rstest fixtures) and shared across the retries.
 pub async fn run_against(
     case: &CaseSpec,

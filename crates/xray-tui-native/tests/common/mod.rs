@@ -25,7 +25,7 @@ pub fn certs() -> Certs {
     generate_certs()
 }
 
-/// Plain HTTP echo; per-test (tiny_http owns a thread; Drop unblocks it).
+/// Plain HTTP echo; `per-test` (`tiny_http` owns a thread; Drop unblocks it).
 #[fixture]
 pub fn echo() -> EchoServer {
     spawn_echo()
@@ -40,7 +40,7 @@ pub fn tls_echo(certs: &Certs) -> TlsEchoServer {
 
 /// Select the resolved core for a `CoreKind` case value.
 #[must_use]
-pub fn pick<'a>(cores: &'a (CoreUnderTest, CoreUnderTest), kind: CoreKind) -> &'a CoreUnderTest {
+pub const fn pick(cores: &(CoreUnderTest, CoreUnderTest), kind: CoreKind) -> &CoreUnderTest {
     match kind {
         CoreKind::Xray => &cores.0,
         CoreKind::SingBox => &cores.1,
