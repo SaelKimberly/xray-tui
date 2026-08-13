@@ -65,7 +65,7 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 |------|------|-----------|----------|
 | 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native` | unit + integration: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback | 202 tests (118 tls + 84 native) |
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
-| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers | 39 cases × 2 cores = 72 green + 6 documented ignored (see e2e cases) |
+| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers | 77 tests = 73 green + 4 documented ignored (vless ws/grpc plain-into-reality-server; single-core ws_reality runs sing-box only) |
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.

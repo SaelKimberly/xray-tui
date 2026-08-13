@@ -39,8 +39,6 @@ fn vless_tls(net: &'static str, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[case::tcp_reality_into_plain_server(vless_tls("tcp", plain_server_reality_client()))]
 #[case::ws_plain(vless("ws"))]
 #[case::ws_chrome(vless_tls("ws", fp("chrome")))]
-#[ignore = "xray-core 26.3.27 rejects reality+ws inbounds (REALITY only supports RAW, XHTTP and gRPC); sing-box serves it"]
-#[case::ws_reality(vless_tls("ws", reality()))]
 #[case::ws_reality_wrong_pbk(vless_tls("ws", reality_wrong_pbk()))]
 #[case::ws_reality_wrong_sid(vless_tls("ws", reality_wrong_sid()))]
 #[ignore = "plain client into reality server: dest sees ws framing, not HTTP (transport unreachable pre-proxy)"]
@@ -68,4 +66,24 @@ async fn vless_against_cores(
     run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
         .await
         .expect("vless e2e failed");
+}
+
+/// Single-core cases: the named core accepts the configuration, the other
+/// rejects it at startup (xray-core 26.3.27 refuses REALITY-over-WebSocket
+/// inbounds — "REALITY only supports RAW, XHTTP and gRPC"; sing-box serves
+/// it). Each row names its core explicitly instead of `#[values]`.
+#[rstest]
+#[case::ws_reality_singbox(vless_tls("ws", reality()), CoreKind::SingBox)]
+#[tokio::test]
+async fn vless_single_core(
+    #[case] case: CaseSpec,
+    #[case] core: CoreKind,
+    cores: &(CoreUnderTest, CoreUnderTest),
+    certs: &Certs,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
+) {
+    run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
+        .await
+        .expect("vless single-core e2e failed");
 }
