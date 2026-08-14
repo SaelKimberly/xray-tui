@@ -91,7 +91,7 @@ workspace = true
 native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek", "dep:rustls", "dep:tokio-rustls"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by unit tests in security/transport/context/chain,
 # which compile without the `native-e2e` feature — dev-deps make them available
 # to lib unit tests regardless of feature selection (normal optional deps stay
