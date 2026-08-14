@@ -75,8 +75,9 @@ pub struct CaseSpec {
     app: AppKind,
     /// UDP packet mode for UDP rows: `None` = the TCP path (default);
     /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`PacketMode`]
-    /// `Raw` = header-dest, `PacketAddr` = per-packet magic-address
-    /// destinations). Ignored unless `app` is [`AppKind::Udp`]; drives
+    /// `Raw` = header-dest, `PacketAddr` = per-packet address header
+    /// (`atyp|addr|port`) — the magic fqdn is header-dest only, never in
+    /// the frame). Ignored unless `app` is [`AppKind::Udp`]; drives
     /// `NativeConnectParams.udp` for the probe's `connect_udp`.
     udp: Option<PacketMode>,
 }

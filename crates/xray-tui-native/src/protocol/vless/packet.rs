@@ -15,7 +15,10 @@ use crate::protocol::vless::udp::{read_packet, write_packet};
 const MAX_FRAME: usize = 65_535;
 
 /// Datagram mode: `Raw` (header-dest, xray-style) or `PacketAddr`
-/// (per-packet magic-address destination, sing-box-style; spec §4.3).
+/// (per-packet address header `atyp|addr|port`, sing-box-style; spec §4.3).
+///
+/// The packetaddr magic fqdn appears only in the header dest, never in the
+/// per-packet frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketMode {
     Raw,
@@ -46,7 +49,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// Sends one datagram.
     ///
     /// Raw: one `[len][payload]` frame. `PacketAddr`: prepends the
-    /// magic-address destination header (spec §4.3) — header and payload go
+    /// per-packet address header (`atyp|addr|port`, spec §4.3) — header and
+    /// payload go
     /// in ONE frame, mirroring the sing encoder which writes
     /// `AddrPortLen + payload` in a single buffer; the destination is
     /// required and the combined length must fit a u16 frame. Oversized
@@ -80,8 +84,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// The response header precedes ALL downlink frames, so the peel runs
     /// before the first frame read. Returns `Ok(None)` on a clean EOF at a
     /// frame boundary. Raw: `(None, payload)`. `PacketAddr`: `(Some(dest),
-    /// payload)` after validating the magic — a malformed destination
-    /// header is an error, never delivered as garbage.
+    /// payload)` after validating the address family (atyp) — a malformed
+    /// destination header is an error, never delivered as garbage.
     pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
         if !self.peel.is_peeled() {
             self.peel.ensure_peeled(&mut self.inner).await?;
@@ -149,7 +153,8 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(1024);
         let mut conn = PacketConn::new(client, PacketMode::PacketAddr);
 
-        // send(Some(127.0.0.1:8080), b"p") → magic + 0x01 + addr + port + 'p'.
+        // send(Some(127.0.0.1:8080), b"p") → atyp(0x01) + addr + port + 'p'
+        // (the per-packet address header; no magic in the frame).
         let target = "127.0.0.1:8080".parse::<SocketAddr>().unwrap();
         conn.send(Some(target), b"p").await.unwrap();
         let frame = read_packet(&mut server).await.unwrap().unwrap();
@@ -157,7 +162,8 @@ mod tests {
         expected.push(b'p');
         assert_eq!(frame, expected);
 
-        // Peer replies with a magic-address frame for a different dest.
+        // Peer replies with a packetaddr address-header frame for a
+        // different dest.
         let reply_dest = "[::1]:53".parse::<SocketAddr>().unwrap();
         server.write_all(&[0x00, 0x00]).await.unwrap();
         let mut reply = packetaddr::encode_dest(reply_dest);
