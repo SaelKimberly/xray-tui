@@ -63,13 +63,13 @@ pub fn encode_request(
         CMD_TCP | CMD_UDP => {
             out.extend_from_slice(&encode_addr(target)?);
         }
-        CMD_MUX => {
-            // Mux uses a fixed v1.mux.cool:0 target on the wire.
-            out.extend_from_slice(&encode_addr(&TargetAddr::new(
-                crate::addr::Host::Domain("v1.mux.cool".into()),
-                0,
-            ))?);
-        }
+        // CMD_MUX (0x03) carries NO destination on the wire: xray's
+        // `EncodeRequestHeader` skips the address for the Mux/Rvs commands
+        // (`proxy/vless/encoding/encoding.go`) and the server derives the
+        // magic `v1.mux.cool` fqdn from the command byte alone
+        // (`DecodeRequestHeader`); mihomo's sing-vmess client writes only
+        // `CommandMux` too. `target` is the tunnel's semantic destination
+        // (`v1.mux.cool:9527`, spec §4.1) and is not encoded.
         _ => {}
     }
     Ok(out)
@@ -100,6 +100,24 @@ mod tests {
         expected.push(0x01);
         expected.extend_from_slice(&[0x1f, 0x90, 0x01, 127, 0, 0, 1]);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn mux_request_header_has_no_destination() {
+        // Command 0x03 ENDS the header — no address bytes follow: xray's
+        // `EncodeRequestHeader` skips the address for Mux/Rvs and the
+        // server derives `v1.mux.cool` from the command byte alone, so any
+        // trailing bytes would be misparsed as the first mux frame's
+        // meta_len. The destination argument is the tunnel's semantic
+        // target (`v1.mux.cool:9527`) and is not encoded.
+        let mux_target = TargetAddr::new(Host::Domain("v1.mux.cool".into()), 9527);
+        let got = encode_request(&uuid(), &mux_target, CMD_MUX, None).unwrap();
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&uuid());
+        expected.push(0x00); // addon_len 0
+        expected.push(0x03); // cmd MUX
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 19);
     }
 
     #[test]

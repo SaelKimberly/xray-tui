@@ -50,10 +50,10 @@ pub mod security;
 pub mod shape;
 pub mod transport;
 
-pub use chain::{connect_chain, connect_chain_udp};
+pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
-pub use protocol::vless::{PacketConn, PacketMode};
+pub use protocol::vless::{MuxClient, MuxTarget, PacketConn, PacketMode, SessionStream};
 
 /// Connect through a single proxy to `params.target`.
 pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, NativeError> {
@@ -73,6 +73,22 @@ pub async fn connect_udp(
 ) -> Result<PacketConn<BoxStream>, NativeError> {
     let target = params.target.clone();
     connect_chain_udp(std::slice::from_ref(params), target).await
+}
+
+/// Connect through a single proxy with a VLESS v1.mux.cool multiplexed
+/// tunnel (command 0x03).
+///
+/// The same dial → security → transport chain as [`connect`] runs
+/// unchanged; only the protocol phase differs (command 0x03 + mux framing
+/// to the fixed `v1.mux.cool` destination). `params.udp` must be `None`
+/// (the mux tunnel carries TCP sessions; UDP over mux / XUDP is a later
+/// plan). The returned [`MuxClient`] opens concurrent TCP sessions via
+/// [`MuxClient::open_session`].
+pub async fn connect_mux(
+    params: &NativeConnectParams,
+) -> Result<MuxClient<BoxStream>, NativeError> {
+    let target = params.target.clone();
+    connect_chain_mux(std::slice::from_ref(params), target).await
 }
 
 /// A completed native tunnel: the byte stream after the full layer stack.

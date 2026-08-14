@@ -14,7 +14,7 @@ use crate::addr::TargetAddr;
 use crate::context::{LinkContext, NativeConnectParams};
 use crate::error::NativeError;
 use crate::protocol;
-use crate::protocol::vless::PacketConn;
+use crate::protocol::vless::{MuxClient, PacketConn};
 use crate::security;
 use crate::transport;
 use crate::{BoxStream, NativeTunnel};
@@ -68,6 +68,34 @@ pub async fn connect_chain_udp(
             // The last link speaks the UDP protocol phase: it owns the
             // stream and returns the datagram tunnel.
             return protocol::connect_udp(&ctx, upgraded).await;
+        }
+        base = Some(protocol::connect(&ctx, upgraded).await?);
+    }
+    Err(NativeError::Config("empty chain".into()))
+}
+
+/// Connect through a chain of proxies to `target` with a VLESS v1.mux.cool
+/// multiplexed tunnel (command 0x03).
+///
+/// Identical to [`connect_chain`] except the LAST link runs the mux
+/// protocol phase and the result is the [`MuxClient`] multiplexer instead
+/// of a byte tunnel. Intermediate links tunnel TCP as usual — they carry
+/// the mux tunnel as a byte stream to the next hop.
+pub async fn connect_chain_mux(
+    links: &[NativeConnectParams],
+    target: TargetAddr,
+) -> Result<MuxClient<BoxStream>, NativeError> {
+    let mut base: Option<BoxStream> = None;
+    for (i, link) in links.iter().enumerate() {
+        let to = next_target(links, i, &target);
+        let ctx = LinkContext::new(link.clone(), to);
+        let dialed = transport::connect(&ctx, base).await?;
+        let secured = security::wrap(&ctx, dialed).await?;
+        let upgraded = transport::upgrade(&ctx, secured).await?;
+        if i + 1 == links.len() {
+            // The last link speaks the mux protocol phase: it owns the
+            // stream and returns the multiplexer.
+            return protocol::connect_mux(&ctx, upgraded).await;
         }
         base = Some(protocol::connect(&ctx, upgraded).await?);
     }

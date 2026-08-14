@@ -33,7 +33,9 @@
 //! [`SessionStream`] reads its channel and writes 8 KiB-chunked `Keep`
 //! frames, ending with a meta-only `End` on close/drop.
 //!
-//! Items are `pub` inside the `pub(crate)` module (effective
+//! [`MuxClient`], [`SessionStream`] and [`MuxTarget`] are the public mux
+//! API — re-exported from `protocol::vless` and the crate root. The rest
+//! of the items are `pub` inside the `pub(crate)` module (effective
 //! `pub(crate)`), mirroring `udp.rs`.
 
 use std::collections::{HashMap, VecDeque};
@@ -59,11 +61,9 @@ use crate::addr::{ADDR_TYPE_DOMAIN, ADDR_TYPE_IPV4, ADDR_TYPE_IPV6, Host, decode
 /// (`v1.mux.cool:9527` — the VLESS Mux command target).
 ///
 /// Not consumed by the [`MuxClient`] itself (it only sees the byte stream
-/// of the already-open tunnel); the `connect_mux` path of the next SP2
-/// task writes the `command=0x03` header with this destination.
-#[allow(dead_code)] // wired by the SP2 connect_mux task
+/// of the already-open tunnel); the `connect_mux` path (this plan's Task
+/// 3) writes the `command=0x03` header with this destination.
 pub const MUX_DEST: &str = "v1.mux.cool";
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 pub const MUX_PORT: u16 = 9527;
 
 pub const STATUS_NEW: u8 = 0x01;
@@ -76,7 +76,6 @@ pub const OPT_ERROR: u8 = 0x02;
 
 /// Application data chunk size written per Keep frame (xray
 /// `SplitSize(mb, 8*1024)` for stream transfers).
-#[allow(dead_code)] // wired by the SP2 connect_mux task (SessionStream's only user)
 pub const CHUNK_SIZE: usize = 8 * 1024;
 
 /// Server-side `meta_len` rejection cap (`FrameMetadata.Unmarshal`), used
@@ -327,7 +326,6 @@ const WRITER_CHANNEL_CAPACITY: usize = 32;
 const SESSION_CHANNEL_CAPACITY: usize = 8;
 
 /// One event the demux task delivers to a session.
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 enum SessionEvent {
     /// Application payload bytes (a `Keep`+`Data` frame's payload).
     Data(Bytes),
@@ -360,15 +358,16 @@ fn lock_map(
 /// tunnel (it lives inside the spawned tasks); dropping the handle stops
 /// the keepalive, and the tunnel tears down once the last session drops.
 ///
-/// [`MuxClient`] and [`SessionStream`] are consumed by the `connect_mux`
-/// path of the next SP2 task — until then nothing outside this module
-/// (or the tests) uses them, so the file-level allow removed in this task
-/// is scoped to exactly these two types.
-#[allow(dead_code)] // wired by the SP2 connect_mux task
+/// [`MuxClient`], [`SessionStream`] and [`MuxTarget`] are the public mux
+/// API: re-exported from `protocol::vless` and the crate root (the
+/// `connect_mux` entry returns a [`MuxClient`] the app opens sessions on).
 pub struct MuxClient<S> {
     next_id: AtomicU16,
     sessions: Arc<Mutex<HashMap<u16, mpsc::Sender<SessionEvent>>>>,
     write_tx: mpsc::Sender<Frame>,
+    /// Kept alive so dropping the handle stops the keepalive task (the
+    /// loop exits when its receiver sees the channel close).
+    #[allow(dead_code)] // held for the drop-close semantics, never read
     keepalive_tx: mpsc::Sender<()>,
     /// Set when the demux task exits — `open_session` fails fast after a
     /// dead tunnel instead of waiting on a writer that is gone.
@@ -376,7 +375,6 @@ pub struct MuxClient<S> {
     tunnel: PhantomData<fn() -> S>,
 }
 
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
     /// Splits `tunnel` into read (demux) + write (writer) halves and
     /// spawns the demux/writer/keepalive tasks.
@@ -412,7 +410,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
     /// The `New` frame is sent eagerly (spec §8 deviation 1) so the server
     /// allocates the session before any app data; the first app write then
     /// goes out as `Keep`. Fails when the tunnel is dead.
-    pub(crate) async fn open_session(&self, target: MuxTarget) -> io::Result<SessionStream> {
+    pub async fn open_session(&self, target: MuxTarget) -> io::Result<SessionStream> {
         if self.dead.load(Ordering::Acquire) {
             return Err(tunnel_closed());
         }
@@ -606,7 +604,6 @@ async fn keepalive_loop(write_tx: mpsc::Sender<Frame>, mut stop: mpsc::Receiver<
 /// counted as accepted once their frame is queued, and a full writer
 /// channel parks the writer (`Pending`) rather than ever reporting `Ok(0)`
 /// for a non-empty buffer.
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 pub struct SessionStream {
     id: u16,
     rx: mpsc::Receiver<SessionEvent>,
@@ -630,14 +627,12 @@ pub struct SessionStream {
 }
 
 /// The session's terminal read outcome (peer `End` / peer `Error`).
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 enum ReadEnd {
     Eof,
     Err(io::Error),
 }
 
 /// The unit of queued write work.
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 enum WriteItem {
     /// A `Keep`-frame payload chunk; its length is the accepted count.
     Data(Bytes),
@@ -645,7 +640,6 @@ enum WriteItem {
     End,
 }
 
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 impl WriteItem {
     /// The accepted-byte count this item contributes (0 for `End`).
     const fn len(&self) -> usize {
@@ -700,13 +694,11 @@ impl WriteItem {
 /// is `'static` and storable across polls).
 type WriteFuture = Pin<Box<dyn Future<Output = Result<OwnedPermit<Frame>, SendError<()>>> + Send>>;
 
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 enum WriteState {
     Idle,
     Waiting(WriteFuture),
 }
 
-#[allow(dead_code)] // wired by the SP2 connect_mux task
 impl SessionStream {
     #[must_use]
     const fn new(
@@ -956,7 +948,6 @@ impl SessionStream {
     /// (never accepted) is replaced by the End and its reservation is
     /// handed to a spawned task that sends the End the moment the slot is
     /// acquired; with nothing parked, a one-shot task waits for capacity.
-    #[allow(dead_code)] // wired by the SP2 connect_mux task
     fn queue_end_fire_and_forget(&mut self) {
         let end = Frame {
             session_id: self.id,

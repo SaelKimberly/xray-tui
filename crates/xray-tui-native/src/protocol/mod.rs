@@ -83,3 +83,20 @@ pub async fn connect_udp(
         }),
     }
 }
+
+/// Run the mux protocol phase: VLESS command 0x03 + v1.mux.cool framing
+/// over the given stream — the last link of a `connect_mux` chain.
+///
+/// Only VLESS has a native mux path; every other protocol stays
+/// `NotImplemented` here.
+pub async fn connect_mux(
+    ctx: &LinkContext,
+    stream: BoxStream,
+) -> Result<crate::protocol::vless::MuxClient<BoxStream>, NativeError> {
+    match &ctx.params.protocol {
+        ProtocolConfig::Vless(cfg) => vless::connect_mux(ctx, stream, cfg).await,
+        _ => Err(NativeError::NotImplemented {
+            feature: "mux protocol connect (native mux path is vless-only)".into(),
+        }),
+    }
+}

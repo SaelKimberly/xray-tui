@@ -19,6 +19,7 @@ pub mod stream;
 pub(crate) mod udp;
 pub(crate) mod vision;
 
+pub use mux::{MuxClient, MuxTarget, SessionStream};
 pub use packet::{PacketConn, PacketMode};
 
 /// Connect through a VLESS outbound over an already-secured stream.
@@ -224,6 +225,135 @@ fn udp_header_target(ctx: &LinkContext, mode: PacketMode) -> Result<TargetAddr, 
             ))
         }
     }
+}
+
+/// Mux connect (protocol phase, parallel to [`connect_udp`]).
+///
+/// The chain runs dial → security → transport exactly as for TCP; this
+/// writes the request header with `command = 0x03` and the fixed
+/// `v1.mux.cool` destination (spec §4.1), then wraps the tunnel in the
+/// [`MuxClient`] multiplexer. The wire carries NO destination bytes for
+/// the mux command (xray's `EncodeRequestHeader` skips the address; the
+/// server derives the magic fqdn from the command byte) — the target
+/// built by [`mux_header_target`] is the semantic destination, not
+/// encoded bytes. `params.udp` must be `None`: the mux tunnel carries
+/// TCP sessions (UDP over mux / XUDP is SP3).
+pub async fn connect_mux(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    cfg: &VlessConfig,
+) -> Result<MuxClient<BoxStream>, NativeError> {
+    if ctx.params.udp.is_some() {
+        return Err(NativeError::Config(
+            "vless mux connect is TCP-only (UDP over mux / XUDP is not implemented; use connect_udp)"
+                .into(),
+        ));
+    }
+    let uuid = header::uuid_bytes(&cfg.uuid)?;
+    match cfg.flow.as_deref() {
+        None | Some("") => connect_mux_plain(ctx, stream, uuid).await,
+        Some(FLOW_XTLS_RPRX_VISION) => connect_mux_vision(ctx, stream, uuid).await,
+        Some(other) => Err(NativeError::NotImplemented {
+            feature: format!("vless flow {other}"),
+        }),
+    }
+}
+
+/// Plain mux connect: request header without addons (`cmd = CMD_MUX`),
+/// then the multiplexer over the peeled tunnel.
+async fn connect_mux_plain(
+    _ctx: &LinkContext,
+    stream: BoxStream,
+    uuid: [u8; 16],
+) -> Result<MuxClient<BoxStream>, NativeError> {
+    let request = header::encode_request(&uuid, &mux_header_target(), header::CMD_MUX, None)?;
+    let timeout = timeouts::PROTOCOL;
+    let mut stream = stream;
+    tokio::time::timeout(timeout, stream.write_all(&request))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "vless mux request write",
+            limit: timeout,
+        })??;
+
+    // The mux frame stream rides the peeled tunnel: the server's `[0,0]`
+    // response header is consumed on the first read, then frames flow.
+    let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
+    Ok(MuxClient::new(peeled))
+}
+
+/// Vision (`xtls-rprx-vision`) mux connect (spec §5.3): `cmd = CMD_MUX`
+/// with the flow addon, the camouflage frame, then the vision-padded
+/// multiplexer.
+///
+/// Guarded preconditions mirror [`connect_vision`], checked before any
+/// protocol-phase I/O:
+/// - outer security is TLS or REALITY (`has_tls()`) — mirroring xray's
+///   rejection of bare vision;
+/// - the transport is raw TCP — vision requires the socket for the Direct
+///   handoff (spec §5.1; ws/grpc/xhttp framing is incompatible).
+///
+/// Unlike the TCP command path there is no command guard: xray servers
+/// accept vision+mux (`inbound.go` splices `RequestCommandMux` under flow
+/// XRV with `CanSpliceCopy = 3`).
+async fn connect_mux_vision(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    uuid: [u8; 16],
+) -> Result<MuxClient<BoxStream>, NativeError> {
+    if !has_tls(ctx) {
+        return Err(NativeError::Config(
+            "XTLS only supports TLS and REALITY directly for now".into(),
+        ));
+    }
+    if ctx.transport_type() != Some("tcp") {
+        return Err(NativeError::Config(
+            "XTLS only supports the TCP transport for now".into(),
+        ));
+    }
+
+    // Step 2: request header with the flow addon (addon_len = 18).
+    let request = header::encode_request(
+        &uuid,
+        &mux_header_target(),
+        header::CMD_MUX,
+        header::encode_addons(Some(FLOW_XTLS_RPRX_VISION)).as_deref(),
+    )?;
+    let timeout = timeouts::PROTOCOL;
+    let mut stream = stream;
+    tokio::time::timeout(timeout, stream.write_all(&request))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "vless mux request write",
+            limit: timeout,
+        })??;
+
+    // Step 3: the camouflage frame — one empty long-padding Continue frame
+    // carrying the UUID, right after the header (same wire bytes as the
+    // TCP vision path, spec §4.6 step 3 deviation 1).
+    let rng = ring::rand::SystemRandom::new();
+    let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid, &rng);
+    tokio::time::timeout(timeout, stream.write_all(&camo))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "vless mux vision camouflage write",
+            limit: timeout,
+        })??;
+
+    // Vision codec, then the response-header peel, then the multiplexer —
+    // the same composition as the TCP vision path (`connect_vision`).
+    let vision = VisionStream::new(stream, uuid, rng);
+    let peeled: BoxStream = Box::new(VlessClientStream::new(Box::new(vision)));
+    Ok(MuxClient::new(peeled))
+}
+
+/// The header destination for the mux command: the fixed `v1.mux.cool`
+/// fqdn and port (spec §4.1 — xray `common/mux/client.go`
+/// `muxCoolAddress` / `muxCoolPort`). Passed to
+/// [`header::encode_request`] as the mux command's target; the `CMD_MUX`
+/// arm does not encode it on the wire.
+fn mux_header_target() -> TargetAddr {
+    TargetAddr::new(Host::Domain(mux::MUX_DEST.to_string()), mux::MUX_PORT)
 }
 
 #[cfg(test)]
@@ -463,5 +593,165 @@ mod tests {
             .err()
             .expect("packetaddr + domain target must fail");
         assert!(matches!(&err, NativeError::Config(msg) if msg.contains("packetaddr")));
+    }
+
+    #[tokio::test]
+    async fn mux_rejects_udp_params() {
+        // Mux is TCP-only: params.udp set → config error before any I/O
+        // (UDP over mux / XUDP is SP3).
+        let cfg = vless(None, "tcp", false);
+        let (stream, _peer) = stream_pair();
+        let err = connect_mux(&udp_ctx_for(&cfg, PacketMode::Raw), stream, &cfg)
+            .await
+            .err()
+            .expect("mux + udp params must fail");
+        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TCP-only")));
+    }
+
+    #[tokio::test]
+    async fn mux_plain_writes_cmd_mux_header() {
+        // Header: version, uuid, addon_len 0, cmd 0x03 — and NOTHING after
+        // (the mux command carries no destination bytes; the wire ends at
+        // the command byte). The returned MuxClient is live over the
+        // tunnel: an eager New frame + a Keep data roundtrip.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cfg = vless(None, "tcp", false);
+        let (stream, mut peer) = stream_pair();
+        let client = connect_mux(&ctx_for(&cfg), stream, &cfg)
+            .await
+            .expect("plain mux connect");
+
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&header::uuid_bytes(&cfg.uuid).unwrap());
+        expected.push(0x00); // addon_len 0
+        expected.push(0x03); // cmd MUX
+        let mut got = [0u8; 19];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, &expected[..]);
+
+        // Server response header, then a session open through the mux.
+        peer.write_all(&[0x00, 0x00]).await.unwrap();
+        let mut session = client
+            .open_session(MuxTarget::TcpDomain("example.com".into(), 80))
+            .await
+            .expect("open session");
+
+        // The eager New frame arrives at the server (spec §8 deviation 1).
+        let frame = mux::read_frame(&mut peer)
+            .await
+            .unwrap()
+            .expect("eager new frame");
+        assert_eq!(frame.session_id, 1);
+        assert_eq!(frame.status, mux::STATUS_NEW);
+        assert_eq!(
+            frame.target,
+            Some(MuxTarget::TcpDomain("example.com".into(), 80))
+        );
+
+        // App data roundtrips as a Keep frame with the payload.
+        session.write_all(b"ping").await.unwrap();
+        let frame = mux::read_frame(&mut peer)
+            .await
+            .unwrap()
+            .expect("keep frame");
+        assert_eq!(frame.session_id, 1);
+        assert_eq!(frame.status, mux::STATUS_KEEP);
+        assert_eq!(frame.payload.as_ref(), b"ping");
+
+        // The server's Keep reply reaches the session stream.
+        mux::write_frame(
+            &mut peer,
+            &mux::Frame {
+                session_id: 1,
+                status: mux::STATUS_KEEP,
+                option: mux::OPT_DATA,
+                target: None,
+                payload: bytes::Bytes::from_static(b"ok"),
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 2];
+        session.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+    }
+
+    #[tokio::test]
+    async fn mux_vision_requires_outer_tls_or_reality() {
+        let cfg = vless(Some("xtls-rprx-vision"), "tcp", false);
+        let (stream, _peer) = stream_pair();
+        let err = connect_mux(&ctx_for(&cfg), stream, &cfg)
+            .await
+            .err()
+            .expect("vision mux without TLS must fail");
+        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TLS and REALITY")));
+    }
+
+    #[tokio::test]
+    async fn mux_vision_rejects_non_tcp_transport() {
+        let cfg = vless(Some("xtls-rprx-vision"), "ws", true);
+        let (stream, _peer) = stream_pair();
+        let err = connect_mux(&ctx_for(&cfg), stream, &cfg)
+            .await
+            .err()
+            .expect("vision mux over ws must fail");
+        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TCP transport")));
+    }
+
+    #[tokio::test]
+    async fn mux_unknown_flow_stays_not_implemented() {
+        let cfg = vless(Some("xtls-rprx-splice"), "tcp", true);
+        let (stream, _peer) = stream_pair();
+        let err = connect_mux(&ctx_for(&cfg), stream, &cfg)
+            .await
+            .err()
+            .expect("unknown flow must fail");
+        assert!(matches!(
+            &err,
+            NativeError::NotImplemented { feature } if feature.contains("xtls-rprx-splice")
+        ));
+    }
+
+    #[tokio::test]
+    async fn mux_vision_writes_addon_and_camouflage() {
+        // Vision mux header: the flow addon (addon_len 18) + cmd 0x03, then
+        // the camouflage frame ([uuid][CMD_CONTINUE][clen=0][long plen][zeros])
+        // right after — the vision wire precedes the mux frames (spec §5.3).
+        use tokio::io::AsyncReadExt;
+
+        let cfg = vless(Some("xtls-rprx-vision"), "tcp", true);
+        // The camouflage frame (up to ~1.4 KiB) is written before the test
+        // starts reading, so the duplex buffer must hold header + frame.
+        let (stream, mut peer) = tokio::io::duplex(4096);
+        let stream: BoxStream = Box::new(stream);
+        let client = connect_mux(&ctx_for(&cfg), stream, &cfg)
+            .await
+            .expect("vision mux connect");
+        let uuid = header::uuid_bytes(&cfg.uuid).unwrap();
+        let addons = header::encode_addons(Some(FLOW_XTLS_RPRX_VISION)).unwrap();
+
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&uuid);
+        expected.push(18); // addon_len
+        expected.extend_from_slice(&addons);
+        expected.push(0x03); // cmd MUX
+        let mut got = vec![0u8; 1 + 16 + 1 + 18 + 1];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, &expected[..]);
+
+        let mut head = [0u8; 21];
+        peer.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..16], &uuid);
+        assert_eq!(head[16], vision::CMD_CONTINUE);
+        assert_eq!(&head[17..19], &[0x00, 0x00]); // clen 0 (empty content)
+        let plen = usize::from(u16::from_be_bytes([head[19], head[20]]));
+        // Long padding for empty content: 900 + rand(0..500).
+        assert!((900..=1399).contains(&plen), "plen {plen}");
+        let mut pad = vec![0u8; plen];
+        peer.read_exact(&mut pad).await.unwrap();
+        assert!(pad.iter().all(|&b| b == 0));
+
+        drop(client);
     }
 }
