@@ -115,6 +115,19 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 // smoke-passed 4/4 real-core in Task 5).
 #[case::mux_tls(vless("tcp").with_mux(true))]
 #[case::mux_reality(vless_tls("tcp", reality()).with_mux(true))]
+// VLESS XUDP axis (spec §7.3): UDP over the mux tunnel — the probe's
+// `connect_udp` dispatches XUDP on `params.mux`, carrying each datagram
+// as a mux UDP session packet (per-packet destination, `PacketMode::XUdp`)
+// to the UDP echo target; the runner routes the mux+UDP row to
+// `probe_udp_mux`. Over tls and reality, both cores (the probe
+// smoke-passed 5/5 real-core in Task 5).
+#[case::xudp_tls(vless("tcp").with_app(AppKind::Udp).with_udp(PacketMode::XUdp).with_mux(true))]
+#[case::xudp_reality(
+    vless_tls("tcp", reality())
+        .with_app(AppKind::Udp)
+        .with_udp(PacketMode::XUdp)
+        .with_mux(true)
+)]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,
@@ -176,6 +189,20 @@ async fn vless_against_cores(
 // connection ("we will break Mux connections that contain TCP requests").
 // Hence sing-box single-core.
 #[case::mux_vision_singbox(vless("tcp").with_flow(Flow::Vision).with_mux(true), CoreKind::SingBox)]
+// vision_udp443 (spec §7.3): the udp443 flow — the client carries the
+// full `xtls-rprx-vision-udp443` name (selects the XUDP path client-side:
+// mux-forced via `case.mux()`, guard lifted), the wire addon truncates to
+// `xtls-rprx-vision`, and the server config emits that truncated name
+// (`Flow::server_str` — both cores validate the request's addon against
+// it). xray-core rejects vision+mux TCP by design (mux under flow XRV is
+// the XUDP path: AllowedNetwork=UDP), so the row is sing-box single-core.
+#[case::vision_udp443(
+    vless("tcp")
+        .with_flow(Flow::Udp443)
+        .with_app(AppKind::Udp)
+        .with_udp(PacketMode::XUdp),
+    CoreKind::SingBox
+)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,
