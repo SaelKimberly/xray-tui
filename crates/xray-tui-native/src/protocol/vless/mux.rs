@@ -1324,7 +1324,7 @@ mod tests {
 
     use crate::addr::{ADDR_TYPE_DOMAIN, ADDR_TYPE_IPV4, ADDR_TYPE_IPV6, Host, TargetAddr};
     use crate::context::{LinkContext, NativeConnectParams};
-    use crate::protocol::vless::{connect_mux, header};
+    use crate::protocol::vless::{PacketConn, connect_mux, header};
     use crate::security;
     use crate::security::fingerprint;
 
@@ -2772,15 +2772,24 @@ mod tests {
         session_id: u16,
         status: u8,
         option: u8,
-        /// New-frame target, parsed as wire bytes: `(network, port, atyp,
-        /// addr)` — interpreted in the assertions, never by the parser.
+        /// Frame target, parsed as wire bytes: `(network, port, atyp,
+        /// addr)` — the New frame's session target (TCP or UDP) or a UDP
+        /// Keep frame's per-packet destination; interpreted in the
+        /// assertions, never by the parser.
         target: Option<(u8, u16, u8, Vec<u8>)>,
+        /// The 8-byte `GlobalID` a UDP New frame carries after the
+        /// target; `None` on every other frame (spec §4.1).
+        global_id: Option<[u8; 8]>,
         payload: Vec<u8>,
     }
 
     /// Reads one raw mux frame from the decrypted stream:
-    /// `[2B meta_len][sid 2B][status 1B][option 1B][New target][2B
-    /// data_len][payload]`, exactly as the server would (spec §4.2).
+    /// `[2B meta_len][sid 2B][status 1B][option 1B][target][2B
+    /// data_len][payload]`, exactly as the server would (spec §4.2). The
+    /// target is the New frame's session target (TCP or UDP — a UDP New
+    /// frame carries the 8-byte `GlobalID` right after the address) or a
+    /// UDP Keep frame's per-packet destination; the server's own replies
+    /// (TCP Keep / KeepAlive / End) carry no target.
     fn read_mux_frame(
         conn: &mut rustls::ServerConnection,
         sock: &mut std::net::TcpStream,
@@ -2796,8 +2805,12 @@ mod tests {
         let status = meta[2];
         let option = meta[3];
         let mut rest = &meta[4..];
-        let target = if status == STATUS_NEW {
-            assert!(rest.len() >= 4, "new frame metadata too short");
+        // New frames always carry a target; UDP Keep frames carry the
+        // per-packet destination (TCP Keep/KeepAlive/End carry none).
+        let mut target = None;
+        let mut global_id = None;
+        if status == STATUS_NEW || !rest.is_empty() {
+            assert!(rest.len() >= 4, "mux frame target metadata too short");
             let network = rest[0];
             let port = u16::from_be_bytes([rest[1], rest[2]]);
             let atyp = rest[3];
@@ -2808,7 +2821,7 @@ mod tests {
                 ADDR_TYPE_DOMAIN => {
                     let (&len, tail) = rest
                         .split_first()
-                        .expect("domain new frame missing the length byte");
+                        .expect("domain mux frame missing the length byte");
                     rest = tail;
                     usize::from(len)
                 }
@@ -2816,15 +2829,21 @@ mod tests {
             };
             assert!(
                 rest.len() >= addr_len,
-                "new frame target truncated ({} < {addr_len})",
+                "mux frame target truncated ({} < {addr_len})",
                 rest.len()
             );
             let addr = rest[..addr_len].to_vec();
             rest = &rest[addr_len..];
-            Some((network, port, atyp, addr))
-        } else {
-            None
-        };
+            // A UDP New frame carries the tunnel's 8-byte GlobalID after
+            // the address (xray `frame.go` `WriteTo`); UDP Keep frames
+            // carry nothing further.
+            if status == STATUS_NEW && network == NETWORK_UDP {
+                assert!(rest.len() >= 8, "udp new frame missing the GlobalID");
+                global_id = Some(rest[..8].try_into().expect("8-byte GlobalID"));
+                rest = &rest[8..];
+            }
+            target = Some((network, port, atyp, addr));
+        }
         assert!(rest.is_empty(), "trailing mux metadata bytes");
         let payload = if option & OPT_DATA != 0 {
             let mut dl = [0u8; 2];
@@ -2841,25 +2860,36 @@ mod tests {
             status,
             option,
             target,
+            global_id,
             payload,
         })
     }
 
-    /// Writes one raw mux frame to the decrypted stream. The fake server
-    /// only ever sends `Keep` / `KeepAlive` / `End` frames (the server-side
+    /// Writes one raw mux frame to the decrypted stream, optionally
+    /// carrying a target (`[network 1B][port 2B][atyp 1B][addr]`). The
+    /// fake server's UDP replies are Keep frames WITH the per-packet
+    /// destination (the client threads it to `recv_from`); its TCP
+    /// replies (Keep / KeepAlive / End) carry no target (the server-side
     /// response writer starts at Keep — no New target on the wire).
-    fn write_mux_frame(
+    fn write_mux_frame_full(
         conn: &mut rustls::ServerConnection,
         sock: &mut std::net::TcpStream,
         session_id: u16,
         status: u8,
         option: u8,
+        target: Option<(u8, u16, u8, Vec<u8>)>,
         payload: &[u8],
     ) -> std::io::Result<()> {
         let mut meta = Vec::with_capacity(4);
         meta.extend_from_slice(&session_id.to_be_bytes());
         meta.push(status);
         meta.push(option);
+        if let Some((network, port, atyp, addr)) = target {
+            meta.push(network);
+            meta.extend_from_slice(&port.to_be_bytes());
+            meta.push(atyp);
+            meta.extend_from_slice(&addr);
+        }
         let meta_len = u16::try_from(meta.len()).expect("metadata fits the 2-byte length");
         let mut out = Vec::with_capacity(2 + meta.len() + 2 + payload.len());
         out.extend_from_slice(&meta_len.to_be_bytes());
@@ -2870,6 +2900,19 @@ mod tests {
             out.extend_from_slice(payload);
         }
         write_all_encrypted(conn, sock, &out)
+    }
+
+    /// Writes one target-less raw mux frame (the fake server's TCP
+    /// replies).
+    fn write_mux_frame(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        session_id: u16,
+        status: u8,
+        option: u8,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        write_mux_frame_full(conn, sock, session_id, status, option, None, payload)
     }
 
     /// Spawn the fake mux server: accept one connection, complete the
@@ -3101,6 +3144,136 @@ mod tests {
             tokio::task::yield_now().await;
         }
         s1.write_all(b"still-alive").await.unwrap();
+        server.await.expect("fake mux server task failed");
+    }
+
+    /// The hermetic XUDP gate (brief): the client opens a UDP mux session
+    /// over the fake server — the first `send` writes the New frame with
+    /// network=UDP + the destination + the 8-byte `GlobalID` (spec §4.1),
+    /// subsequent `send`s are Keep frames carrying their own per-packet
+    /// destinations; the server replies per dest (Keep frames carrying
+    /// that destination back) and the client's XUdp [`PacketConn`] recv
+    /// returns the `(dest, payload)` pairs. Asserts the GlobalID bytes
+    /// (a fixed value drives the byte-exact wire check; the production
+    /// path draws one randomly per tunnel) and the per-packet dest
+    /// framing on both uplink directions.
+    #[tokio::test]
+    async fn hermetic_fake_mux_server_udp_session() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        fingerprint::set_test_ca(&ca_der);
+        let uuid = header::uuid_bytes("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap();
+        let (addr, server) = spawn_mux_server(&cert_pem, &key_pem, move |conn, sock| {
+            // Step 1: the request header — cmd 0x03, NO destination bytes.
+            let mut head = [0u8; 19];
+            read_exact_decrypted(conn, sock, &mut head)?;
+            assert_eq!(head[0], header::VERSION, "vless version byte");
+            assert_eq!(&head[1..17], &uuid, "vless user uuid");
+            assert_eq!(head[17], 0, "addons_len (no flow on the mux path)");
+            assert_eq!(head[18], header::CMD_MUX, "vless command must be MUX 0x03");
+
+            // Step 2: the `[0,0]` response header (consumed by the
+            // client's peel on the first tunnel read).
+            write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
+
+            // Step 3: the client's UDP New frame — network byte UDP, the
+            // first packet's destination, and the 8-byte GlobalID right
+            // after the address (xray `frame.go` `WriteTo`), payload 'p1'.
+            // The GlobalID sits INSIDE the metadata, so meta_len covers
+            // it: 2+1+1+1+2+1+4+8 = 20.
+            let new = read_mux_frame(conn, sock)?;
+            assert_eq!(new.session_id, 1, "first session id is 1");
+            assert_eq!(new.status, STATUS_NEW, "UDP session opens with New");
+            assert_eq!(new.option, OPT_DATA);
+            let (network, port, atyp, addr) = new.target.expect("New frame carries the dest");
+            assert_eq!(network, NETWORK_UDP, "New network byte is UDP");
+            assert_eq!(port, 8080, "session destination port");
+            assert_eq!(atyp, ADDR_TYPE_IPV4, "session destination type");
+            assert_eq!(addr, [127, 0, 0, 1], "session destination addr");
+            assert_eq!(
+                new.global_id,
+                Some([0xAA; 8]),
+                "GlobalID bytes ride the New frame only"
+            );
+            assert_eq!(&new.payload, b"p1");
+
+            // Reply per dest 1: a Keep frame carrying that destination
+            // (the server's response writer starts at Keep, spec §4.4).
+            write_mux_frame_full(
+                conn,
+                sock,
+                1,
+                STATUS_KEEP,
+                OPT_DATA,
+                Some((NETWORK_UDP, 8080, ADDR_TYPE_IPV4, vec![127, 0, 0, 1])),
+                b"r1",
+            )?;
+
+            // Step 4: the second packet — a Keep frame carrying ITS OWN
+            // destination (`[0x02 UDP][port-first addr]`, no GlobalID),
+            // payload 'p2'.
+            let keep = read_mux_frame(conn, sock)?;
+            assert_eq!(keep.session_id, 1);
+            assert_eq!(keep.status, STATUS_KEEP, "follow-up packets are Keep");
+            assert_eq!(keep.option, OPT_DATA);
+            let (network2, port2, atyp2, addr2) =
+                keep.target.expect("Keep frame carries the per-packet dest");
+            assert_eq!(network2, NETWORK_UDP, "Keep network byte is UDP");
+            assert_eq!(port2, 53, "per-packet dest port");
+            assert_eq!(atyp2, ADDR_TYPE_IPV4, "per-packet dest type");
+            assert_eq!(addr2, [192, 0, 2, 7], "per-packet dest addr");
+            assert_eq!(keep.global_id, None, "no GlobalID on Keep frames");
+            assert_eq!(&keep.payload, b"p2");
+
+            // Reply per dest 2.
+            write_mux_frame_full(
+                conn,
+                sock,
+                1,
+                STATUS_KEEP,
+                OPT_DATA,
+                Some((NETWORK_UDP, 53, ADDR_TYPE_IPV4, vec![192, 0, 2, 7])),
+                b"r2",
+            )?;
+
+            // Step 5: the server closes the session — the client's recv
+            // sees a sticky EOF.
+            write_mux_frame(conn, sock, 1, STATUS_END, 0, &[])?;
+            Ok(())
+        });
+        let cfg = vless_mux_config();
+        let ctx = mux_ctx(addr, cfg.clone());
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+            let mux = connect_mux(&ctx, wrapped, &cfg).await.unwrap();
+            // A fixed GlobalID drives the byte-exact wire assertion above.
+            let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+            // XUdp holds no stream, so S is unconstrained — pin it for
+            // the test (production pins it via connect_udp's return type).
+            let mut conn: PacketConn<crate::BoxStream> = PacketConn::xudp(session);
+
+            conn.send(Some("127.0.0.1:8080".parse().unwrap()), b"p1")
+                .await
+                .unwrap();
+            conn.send(Some("192.0.2.7:53".parse().unwrap()), b"p2")
+                .await
+                .unwrap();
+
+            // The replies come back per dest, in order.
+            let (dest, payload) = conn.recv().await.unwrap().expect("reply 1");
+            assert_eq!(dest, Some("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
+            assert_eq!(payload, b"r1");
+            let (dest, payload) = conn.recv().await.unwrap().expect("reply 2");
+            assert_eq!(dest, Some("192.0.2.7:53".parse::<SocketAddr>().unwrap()));
+            assert_eq!(payload, b"r2");
+            // The server's End: a sticky EOF on recv.
+            assert!(conn.recv().await.unwrap().is_none());
+            assert!(conn.recv().await.unwrap().is_none());
+        })
+        .await
+        .expect("hermetic xudp flow timed out");
         server.await.expect("fake mux server task failed");
     }
 }
