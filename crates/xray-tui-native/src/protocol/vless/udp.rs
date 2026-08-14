@@ -59,8 +59,21 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> i
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+    use xray_tui_proto::proto_spec::{ProtocolConfig, VlessConfig};
+
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use crate::addr::{ADDR_TYPE_DOMAIN, ADDR_TYPE_IPV4, Host, TargetAddr};
+    use crate::context::{LinkContext, NativeConnectParams};
+    use crate::protocol::vless::{PacketMode, connect_udp, header, packetaddr};
+    use crate::security;
+    use crate::security::fingerprint;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn write_then_read_roundtrip() {
@@ -132,5 +145,353 @@ mod tests {
         drop(a);
         let err = read_packet(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    // ---- Hermetic: fake UDP server over a real outer TLS session ----
+    //
+    // The raw-TCP fake server pattern from the vision-plan hermetic tests
+    // (fake server = the rustls server double + raw socket): one
+    // `TcpListener`, the outer TLS handshake as a rustls `ServerConnection`,
+    // then the VLESS UDP wire spoken exactly — read + assert the request
+    // header (cmd 0x02, port-first dest), send the `[0,0]` response header,
+    // exchange `[2B len][payload]` frames both directions. The CLIENT drives
+    // the real path: `security::wrap` (engine TLS 1.3) +
+    // `protocol::vless::connect_udp` + `PacketConn::send`/`recv`. This is
+    // the frame-level gate (brief steps 1-5) before the real-core e2e rows.
+
+    /// A VLESS config for the UDP path: no flow, plain TLS to the fake
+    /// server. The UDP mode (`Raw` / `PacketAddr`) lives in the context, not
+    /// the config (the proto has no `packet_encoding` field yet).
+    fn vless_udp_config() -> VlessConfig {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+            "transport": { "type": "tcp" },
+            "security": { "type": "tls", "sni": "localhost" }
+        }))
+        .expect("vless udp config parses");
+        match protocol {
+            ProtocolConfig::Vless(cfg) => cfg,
+            _ => panic!("expected a vless config"),
+        }
+    }
+
+    /// rcgen CA + server cert/key PEM + CA DER (the security-phase fixture).
+    fn rcgen_ca_and_server(sni: &str) -> (String, String, Vec<u8>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let mut ca_params = CertificateParams::new(vec![sni.to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_params =
+            CertificateParams::new(vec![sni.to_string(), "127.0.0.1".to_string()]).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        (
+            server_cert.pem(),
+            server_key.serialize_pem(),
+            ca_cert.der().to_vec(),
+        )
+    }
+
+    fn server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
+        use rustls::pki_types::pem::PemObject;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .map(|c| c.expect("cert pem parses"))
+                .collect();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .expect("key pem parses");
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config builds")
+    }
+
+    /// Read exactly `out.len()` decrypted bytes, pulling new outer-TLS
+    /// records from the socket whenever the rustls plaintext buffer is
+    /// empty (rustls 0.23 `Reader::read` signals that with `WouldBlock`).
+    fn read_exact_decrypted(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < out.len() {
+            match conn.reader().read(&mut out[filled..]) {
+                Ok(n) if n > 0 => {
+                    filled += n;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            // No plaintext buffered. `complete_io` may have pulled the
+            // peer's first application-data records into rustls's read
+            // buffer together with the final handshake flight — process
+            // whatever is buffered before blocking on the socket.
+            let state = conn
+                .process_new_packets()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if state.plaintext_bytes_to_read() > 0 {
+                continue;
+            }
+            if conn.read_tls(sock)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "fake udp server: outer TLS peer closed",
+                ));
+            }
+            conn.process_new_packets()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }
+        Ok(())
+    }
+
+    /// Write `data` as decrypted bytes (buffered into the record layer,
+    /// then flushed until nothing is left to send).
+    fn write_all_encrypted(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        conn.writer().write_all(data)?;
+        loop {
+            if conn.write_tls(sock)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Read the VLESS request header prefix: version, uuid, `addons_len` (0 —
+    /// the UDP path carries no flow), and the command byte. The destination
+    /// is left to the caller (raw: the UDP target; packetaddr: the magic
+    /// fqdn, spec §4.1/§4.3).
+    fn read_header_prefix(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        uuid: &[u8; 16],
+    ) -> std::io::Result<()> {
+        let mut head = [0u8; 19];
+        read_exact_decrypted(conn, sock, &mut head)?;
+        assert_eq!(head[0], header::VERSION, "vless version byte");
+        assert_eq!(&head[1..17], uuid, "vless user uuid");
+        assert_eq!(head[17], 0, "addons_len (no flow on the UDP path)");
+        assert_eq!(head[18], header::CMD_UDP, "vless command must be UDP 0x02");
+        Ok(())
+    }
+
+    /// Read one `[2B BE len][payload]` frame raw from the decrypted stream
+    /// — the server speaks the wire directly, independently of the codec
+    /// under test.
+    fn read_raw_frame(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut len = [0u8; 2];
+        read_exact_decrypted(conn, sock, &mut len)?;
+        let n = usize::from(u16::from_be_bytes(len));
+        let mut payload = vec![0u8; n];
+        read_exact_decrypted(conn, sock, &mut payload)?;
+        Ok(payload)
+    }
+
+    /// Write one `[2B BE len][payload]` frame to the decrypted stream.
+    fn write_raw_frame(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let n = u16::try_from(payload.len()).expect("frame payload fits u16");
+        let mut frame = Vec::with_capacity(2 + payload.len());
+        frame.extend_from_slice(&n.to_be_bytes());
+        frame.extend_from_slice(payload);
+        write_all_encrypted(conn, sock, &frame)
+    }
+
+    /// Spawn the fake UDP server: accept one connection, complete the outer
+    /// TLS handshake as the rustls server double, run the wire `script`.
+    /// Returns the listener address + the join handle (server-side
+    /// assertion failures surface as panics through it).
+    fn spawn_udp_server(
+        cert_pem: &str,
+        key_pem: &str,
+        script: impl FnOnce(
+            &mut rustls::ServerConnection,
+            &mut std::net::TcpStream,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let cfg = server_config(cert_pem, key_pem);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let timeout = Duration::from_secs(15);
+            sock.set_read_timeout(Some(timeout)).expect("read timeout");
+            sock.set_write_timeout(Some(timeout))
+                .expect("write timeout");
+            let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).expect("server conn");
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).expect("outer TLS handshake");
+            }
+            script(&mut conn, &mut sock).expect("fake udp server wire script");
+        });
+        (addr, handle)
+    }
+
+    /// A `LinkContext` pointing the client at the fake server, with the UDP
+    /// packet mode set and a known target (asserted on the server side).
+    fn udp_ctx(
+        addr: SocketAddr,
+        cfg: VlessConfig,
+        mode: PacketMode,
+        target: TargetAddr,
+    ) -> LinkContext {
+        let mut params = NativeConnectParams::new(
+            ProtocolConfig::Vless(cfg),
+            EndpointEssentials::new("127.0.0.1", 1),
+            target.clone(),
+        );
+        params.server = EndpointEssentials::new(addr.ip().to_string(), addr.port());
+        params.udp = Some(mode);
+        LinkContext::new(params, target)
+    }
+
+    /// The hermetic frame-level gate (brief steps 1-5), raw mode: the real
+    /// client path — engine TLS wrap + vless `connect_udp` + `PacketConn` —
+    /// against the fake server. Asserts the header's cmd 0x02 + port-first
+    /// dest, the `[0,0]` response, and the `[2B len][payload]` frames in
+    /// both directions.
+    #[tokio::test]
+    async fn hermetic_fake_udp_server_frames() {
+        // Feature unification enables both rustls backends; the app installs
+        // the ring provider at startup (workspace convention), tests do it
+        // here (idempotent).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        // The engine verifies through its thread-local harness CA.
+        fingerprint::set_test_ca(&ca_der);
+        let uuid = header::uuid_bytes("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap();
+        let target = TargetAddr::new(Host::new("1.2.3.4"), 8080);
+        let (addr, server) = spawn_udp_server(&cert_pem, &key_pem, move |conn, sock| {
+            // Step 1: the request header — cmd 0x02, port-first dest.
+            read_header_prefix(conn, sock, &uuid)?;
+            let mut port = [0u8; 2];
+            read_exact_decrypted(conn, sock, &mut port)?;
+            assert_eq!(u16::from_be_bytes(port), 8080, "target port first");
+            let mut atyp = [0u8; 1];
+            read_exact_decrypted(conn, sock, &mut atyp)?;
+            assert_eq!(atyp[0], ADDR_TYPE_IPV4, "target address type");
+            let mut got_addr = [0u8; 4];
+            read_exact_decrypted(conn, sock, &mut got_addr)?;
+            assert_eq!(&got_addr, &[1, 2, 3, 4], "target address");
+
+            // Step 2: the `[0,0]` response header.
+            write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
+
+            // Step 3: one client frame `[2B len][payload]`.
+            let frame = read_raw_frame(conn, sock)?;
+            assert_eq!(frame, b"hello", "client datagram payload");
+
+            // Step 4: one frame back; the client's recv must deliver it.
+            write_raw_frame(conn, sock, b"world")?;
+            Ok(())
+        });
+        let cfg = vless_udp_config();
+        let ctx = udp_ctx(addr, cfg.clone(), PacketMode::Raw, target);
+
+        let (dest, payload) = tokio::time::timeout(Duration::from_secs(30), async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+            let mut conn = connect_udp(&ctx, wrapped, &cfg).await.unwrap();
+            conn.send(None, b"hello").await.unwrap();
+            conn.recv().await.unwrap().unwrap()
+        })
+        .await
+        .expect("hermetic udp flow timed out");
+        assert_eq!(dest, None, "raw mode: no per-packet destination");
+        assert_eq!(payload, b"world", "client delivers the server frame");
+        server.await.expect("fake udp server task failed");
+    }
+
+    /// The packetaddr-mode variant (brief step 5, spec §4.3): the header
+    /// destination is the magic fqdn with port 0, and each datagram frame
+    /// carries the per-packet magic-address bytes — asserted in the client's
+    /// frame on the server side; the server's reply frame decodes back to a
+    /// per-packet destination on the client side.
+    #[tokio::test]
+    async fn hermetic_fake_udp_server_packetaddr_frames() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        fingerprint::set_test_ca(&ca_der);
+        let uuid = header::uuid_bytes("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap();
+        let target = TargetAddr::new(Host::new("1.2.3.4"), 8080);
+        let (addr, server) = spawn_udp_server(&cert_pem, &key_pem, move |conn, sock| {
+            // The header dest is the magic fqdn with port 0 — the UDP target
+            // stays out of the header (spec §4.3).
+            read_header_prefix(conn, sock, &uuid)?;
+            let mut port = [0u8; 2];
+            read_exact_decrypted(conn, sock, &mut port)?;
+            assert_eq!(u16::from_be_bytes(port), 0, "packetaddr header port 0");
+            let mut atyp = [0u8; 1];
+            read_exact_decrypted(conn, sock, &mut atyp)?;
+            assert_eq!(atyp[0], ADDR_TYPE_DOMAIN, "magic fqdn address type");
+            let mut alen = [0u8; 1];
+            read_exact_decrypted(conn, sock, &mut alen)?;
+            assert_eq!(
+                usize::from(alen[0]),
+                packetaddr::MAGIC.len(),
+                "magic fqdn length"
+            );
+            let mut magic = vec![0u8; packetaddr::MAGIC.len()];
+            read_exact_decrypted(conn, sock, &mut magic)?;
+            assert_eq!(&magic, packetaddr::MAGIC.as_bytes(), "magic fqdn bytes");
+
+            // The `[0,0]` response header.
+            write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
+
+            // The client's datagram frame carries the magic-address bytes:
+            // `magic | atyp 0x01 | 1.2.3.4 | port 8080 | 'p'` (spec §4.3).
+            let frame = read_raw_frame(conn, sock)?;
+            let mut expected = packetaddr::encode_dest("1.2.3.4:8080".parse().unwrap());
+            expected.push(b'p');
+            assert_eq!(frame, expected, "packetaddr magic-address frame");
+
+            // One frame back with its own per-packet destination; the
+            // client's recv must decode it.
+            let reply_dest = "[::1]:53".parse().unwrap();
+            let mut reply = packetaddr::encode_dest(reply_dest);
+            reply.extend_from_slice(b"ok");
+            write_raw_frame(conn, sock, &reply)?;
+            Ok(())
+        });
+        let cfg = vless_udp_config();
+        let ctx = udp_ctx(addr, cfg.clone(), PacketMode::PacketAddr, target);
+
+        let (dest, payload) = tokio::time::timeout(Duration::from_secs(30), async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+            let mut conn = connect_udp(&ctx, wrapped, &cfg).await.unwrap();
+            conn.send(Some("1.2.3.4:8080".parse().unwrap()), b"p")
+                .await
+                .unwrap();
+            conn.recv().await.unwrap().unwrap()
+        })
+        .await
+        .expect("hermetic packetaddr flow timed out");
+        assert_eq!(
+            dest,
+            Some("[::1]:53".parse().unwrap()),
+            "per-packet dest decoded"
+        );
+        assert_eq!(payload, b"ok", "client delivers the packetaddr frame");
+        server.await.expect("fake udp server task failed");
     }
 }
