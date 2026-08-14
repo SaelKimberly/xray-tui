@@ -4,11 +4,12 @@
 //!
 //! ```text
 //! [2B meta_len BE][2B session_id BE][1B status][1B option]
-//! [New: 1B network + port-first addr][2B data_len][payload]
+//! [New: 1B network + port-first addr (+ 8B `GlobalID` for UDP)]
+//! [2B data_len][payload]
 //! ```
 //!
 //! The 2-byte `meta_len` covers ONLY the metadata (session id, status,
-//! option, and the New-frame target); `writeMetaWithFrame` appends
+//! option, and the frame target); `writeMetaWithFrame` appends
 //! `[2B data_len][data]` after it. Status: `New` `0x01` / `Keep` `0x02` /
 //! `End` `0x03` / `KeepAlive` `0x04`. Option: `Data` `0x01` / `Error`
 //! `0x02`. Addresses are port-first (`[2B port][atyp][addr]`, atyp IPv4
@@ -17,11 +18,18 @@
 //! read); application data is chunked at 8 KiB by the client. The mux
 //! connection itself targets the fixed `v1.mux.cool:9527` destination.
 //!
-//! Scope: TCP targets only — `MuxTarget` has no UDP variant (UDP mux /
-//! XUDP is a later plan), and a New frame with a non-TCP network byte is
-//! a protocol error. The server's response writer starts at Keep
-//! (`NewResponseWriter` sets `followup: true`), so `target` is only ever
-//! `Some` on the New frames the client writes.
+//! New frames carry the session target: network byte TCP `0x01` (stream
+//! sessions) or UDP `0x02` (XUDP sessions, spec §4.1), then the
+//! port-first address. UDP New frames additionally carry the tunnel's
+//! 8-byte `GlobalID` after the address (xray `frame.go` `WriteTo`:
+//! `b.Write(f.GlobalID[:])` for user proxy requests). Data frames after
+//! the first are `Keep`; **UDP Keep frames carry that packet's own
+//! destination** (`[0x02 UDP][port-first addr]` — xray `WriteTo`'s
+//! `else if b.UDP != nil`), which the demux threads to the session so
+//! `recv_from` can return `(dest, payload)`. TCP Keep frames carry no
+//! target. The server's response writer starts at Keep
+//! (`NewResponseWriter` sets `followup: true`), so the client never sees
+//! New frames in practice.
 //!
 //! The multiplexer ([`MuxClient`] + [`SessionStream`], spec §5.2) sits on
 //! top of the codec: [`MuxClient::new`] splits the tunnel and spawns a
@@ -32,11 +40,17 @@
 //! channel, and sends an eager `New` frame (deviation 1); the returned
 //! [`SessionStream`] reads its channel and writes 8 KiB-chunked `Keep`
 //! frames, ending with a meta-only `End` on close/drop.
+//! [`MuxClient::open_udp_session`] opens an XUDP datagram session: the
+//! first [`UdpSession::send_to`] writes the `New` frame (network UDP +
+//! dest + `GlobalID` — not eager, the target is only known with the first
+//! packet, spec §8 deviation 3), subsequent sends are `Keep` frames with
+//! per-packet destinations, and [`UdpSession::recv_from`] returns each
+//! inbound packet's `(dest, payload)`.
 //!
-//! [`MuxClient`], [`SessionStream`] and [`MuxTarget`] are the public mux
-//! API — re-exported from `protocol::vless` and the crate root. The rest
-//! of the items are `pub` inside the `pub(crate)` module (effective
-//! `pub(crate)`), mirroring `udp.rs`.
+//! [`MuxClient`], [`SessionStream`], [`UdpSession`] and [`MuxTarget`] are
+//! the public mux API — re-exported from `protocol::vless` and the crate
+//! root. The rest of the items are `pub` inside the `pub(crate)` module
+//! (effective `pub(crate)`), mirroring `udp.rs`.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -82,18 +96,27 @@ pub const CHUNK_SIZE: usize = 8 * 1024;
 /// to bound the metadata read on the client too.
 pub const MAX_META: usize = 512;
 
-/// Network byte for New frames. Always TCP in this codec — `MuxTarget` is
-/// TCP-only (see the module doc).
+/// Network byte for New frames. TCP for stream sessions, UDP for XUDP
+/// sessions ([`MuxTarget::Udp`]); UDP is also the network byte on every
+/// UDP Keep frame (the per-packet destination).
 const NETWORK_TCP: u8 = 0x01;
+const NETWORK_UDP: u8 = 0x02;
 
-/// A mux session target (the New frame's `network + port-first addr`).
-/// TCP-only: UDP mux is out of scope (a later plan).
+/// A mux session target (the New frame's `network + port-first addr`;
+/// for UDP sessions also the per-packet destination on Keep frames).
+///
+/// [`MuxTarget::Udp`] is the XUDP form: `open_session` never takes it
+/// (stream sessions are TCP-only), it is the target carried by
+/// [`UdpSession`] frames — the New frame's session dest and each Keep
+/// frame's per-packet dest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuxTarget {
     /// IP target.
     Tcp(SocketAddr),
     /// Domain target: name + port.
     TcpDomain(String, u16),
+    /// UDP target — a datagram destination (XUDP sessions).
+    Udp(SocketAddr),
 }
 
 /// One decoded v1.mux.cool frame.
@@ -102,9 +125,15 @@ pub struct Frame {
     pub session_id: u16,
     pub status: u8,
     pub option: u8,
-    /// `Some` on New frames (the client's first frame per session); the
-    /// server's response writer starts at Keep, so `None` otherwise.
+    /// `Some` on New frames (the client's first frame per session) and
+    /// on UDP Keep frames (the per-packet destination); the server's
+    /// response writer starts at Keep, so `None` on TCP Keep frames.
     pub target: Option<MuxTarget>,
+    /// The tunnel `GlobalID`, written after the target on UDP New frames
+    /// only (xray `frame.go` `WriteTo`: `b.Write(f.GlobalID[:])`). Read
+    /// back from the metadata when present (defensive — the server never
+    /// sends New frames to the client).
+    pub global_id: Option<[u8; 8]>,
     /// Empty unless the Data option is set.
     pub payload: Bytes,
 }
@@ -157,8 +186,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     Ok(Some(frame))
 }
 
-/// Parses the metadata body: `[sid 2B][status 1B][option 1B]`, plus
-/// `[network 1B][port-first addr]` for New frames.
+/// Parses the metadata body: `[sid 2B][status 1B][option 1B]`, plus the
+/// target for New frames (`[network 1B][port-first addr]`, TCP or UDP —
+/// UDP New frames add the 8-byte `GlobalID` after the address) and for UDP
+/// Keep frames (the per-packet destination, `[0x02 UDP][port-first
+/// addr]`).
 fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
     if meta.len() < 4 {
         return Err(io::Error::new(
@@ -171,6 +203,7 @@ fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
     let option = meta[3];
     let mut rest = &meta[4..];
     let mut target = None;
+    let mut global_id = None;
     if status == STATUS_NEW {
         let (network, tail) = rest.split_first().ok_or_else(|| {
             io::Error::new(
@@ -178,12 +211,6 @@ fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
                 "vless mux new frame missing network byte",
             )
         })?;
-        if *network != NETWORK_TCP {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("vless mux unsupported network type {network}"),
-            ));
-        }
         // port-first: [2B port][atyp][addr] — same wire layout as the
         // VLESS request header (addr.rs `decode_addr`).
         let (addr, tail) = decode_addr(tail).ok_or_else(|| {
@@ -192,9 +219,74 @@ fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
                 "vless mux truncated target address",
             )
         })?;
+        target = Some(match (*network, addr.host) {
+            (NETWORK_TCP, Host::Ip(ip)) => MuxTarget::Tcp(SocketAddr::new(ip, addr.port)),
+            (NETWORK_TCP, Host::Domain(domain)) => MuxTarget::TcpDomain(domain, addr.port),
+            (NETWORK_UDP, Host::Ip(ip)) => MuxTarget::Udp(SocketAddr::new(ip, addr.port)),
+            (NETWORK_UDP, Host::Domain(_)) => {
+                // A UDP destination is a socket — domains cannot be
+                // represented (and never occur: the server echoes the
+                // IP dests the client sent).
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vless mux udp target with a domain address is unsupported",
+                ));
+            }
+            (other, _) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("vless mux unsupported network type {other}"),
+                ));
+            }
+        });
+        rest = tail;
+        // UDP New frames carry the 8-byte tunnel GlobalID after the
+        // target (xray `frame.go` `WriteTo`). The server never sends New
+        // frames to the client, so this is defensive: consume the 8 bytes
+        // when present, and anything beyond them (or a truncated prefix)
+        // is a format violation.
+        if matches!(target, Some(MuxTarget::Udp(_))) {
+            match rest.len() {
+                0 => {}
+                n if n >= 8 => {
+                    let mut gid = [0u8; 8];
+                    gid.copy_from_slice(&rest[..8]);
+                    global_id = Some(gid);
+                    rest = &rest[8..];
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vless mux truncated global id",
+                    ));
+                }
+            }
+        }
+    } else if status == STATUS_KEEP && !rest.is_empty() {
+        // UDP Keep frames carry the per-packet destination (xray
+        // `WriteTo`'s `else if b.UDP != nil`); TCP Keep frames carry no
+        // target, so any leading byte other than the UDP network byte is
+        // a format violation.
+        if rest[0] != NETWORK_UDP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vless mux trailing metadata bytes",
+            ));
+        }
+        let (addr, tail) = decode_addr(&rest[1..]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vless mux truncated target address",
+            )
+        })?;
         target = Some(match addr.host {
-            Host::Ip(ip) => MuxTarget::Tcp(SocketAddr::new(ip, addr.port)),
-            Host::Domain(domain) => MuxTarget::TcpDomain(domain, addr.port),
+            Host::Ip(ip) => MuxTarget::Udp(SocketAddr::new(ip, addr.port)),
+            Host::Domain(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vless mux udp target with a domain address is unsupported",
+                ));
+            }
         });
         rest = tail;
     }
@@ -211,29 +303,54 @@ fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
         status,
         option,
         target,
+        global_id,
         payload: Bytes::new(),
     })
 }
 
 /// Writes one frame in a single `write_all`: `[2B meta_len][metadata]`
 /// plus `[2B data_len][payload]` when the Data option is set. The
-/// metadata (sid, status, option, New target) is what `meta_len` covers;
-/// `writeMetaWithFrame` appends the data after it.
+/// metadata (sid, status, option, frame target) is what `meta_len`
+/// covers; `writeMetaWithFrame` appends the data after it.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Result<()> {
-    // sid(2) + status(1) + opt(1) + [net(1) + port(2) + atyp(1) + IPv6(16)]
-    let mut meta = Vec::with_capacity(2 + 1 + 1 + 1 + 2 + 1 + 16);
+    // sid(2) + status(1) + opt(1) + [net(1) + port(2) + atyp(1) + IPv6(16)
+    // + GlobalID(8)]
+    let mut meta = Vec::with_capacity(2 + 1 + 1 + 1 + 2 + 1 + 16 + 8);
     meta.extend_from_slice(&f.session_id.to_be_bytes());
     meta.push(f.status);
     meta.push(f.option);
     if f.status == STATUS_NEW {
-        meta.push(NETWORK_TCP);
         let target = f.target.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "vless mux new frame requires a target",
             )
         })?;
-        meta.extend_from_slice(&encode_new_target(target)?);
+        encode_target_meta(&mut meta, target)?;
+        // UDP New frames carry the tunnel GlobalID after the target
+        // (xray `frame.go` `WriteTo`: `b.Write(f.GlobalID[:])` for user
+        // proxy requests — the client's TCP sessions have no per-packet
+        // dest, so no GlobalID there).
+        if matches!(target, MuxTarget::Udp(_))
+            && let Some(gid) = f.global_id
+        {
+            meta.extend_from_slice(&gid);
+        }
+    } else if f.status == STATUS_KEEP {
+        // UDP Keep frames carry the per-packet destination (xray
+        // `WriteTo`'s `else if b.UDP != nil`); TCP Keep frames carry no
+        // target.
+        if let Some(target) = &f.target {
+            match target {
+                MuxTarget::Udp(_) => encode_target_meta(&mut meta, target)?,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "vless mux keep frame with a non-udp target",
+                    ));
+                }
+            }
+        }
     }
     let meta_len = u16::try_from(meta.len()).map_err(|_| {
         io::Error::new(
@@ -271,14 +388,15 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
     w.write_all(&out).await
 }
 
-/// Encodes a New-frame target as the port-first address bytes:
+/// Encodes a frame target as the port-first address bytes:
 /// `[2B port][atyp][addr]` (IPv4 4 / Domain 1+len / IPv6 16). The network
-/// byte (`NETWORK_TCP`) is written separately by [`write_frame`]. A
-/// domain longer than the wire's 255-byte length field is `InvalidInput`.
+/// byte (`NETWORK_TCP` / `NETWORK_UDP`) is written separately by
+/// [`encode_target_meta`]. A domain longer than the wire's 255-byte
+/// length field is `InvalidInput`.
 pub fn encode_new_target(t: &MuxTarget) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2 + 1 + 16);
     match t {
-        MuxTarget::Tcp(sa) => {
+        MuxTarget::Tcp(sa) | MuxTarget::Udp(sa) => {
             out.extend_from_slice(&sa.port().to_be_bytes());
             match sa.ip() {
                 IpAddr::V4(v4) => {
@@ -312,6 +430,18 @@ pub fn encode_new_target(t: &MuxTarget) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Appends a target's `[network byte][port-first addr]` to `meta` (the
+/// network byte and address both live inside the frame metadata).
+fn encode_target_meta(meta: &mut Vec<u8>, t: &MuxTarget) -> io::Result<()> {
+    let network = match t {
+        MuxTarget::Tcp(_) | MuxTarget::TcpDomain(..) => NETWORK_TCP,
+        MuxTarget::Udp(_) => NETWORK_UDP,
+    };
+    meta.push(network);
+    meta.extend_from_slice(&encode_new_target(t)?);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // MuxClient + SessionStream — the multiplexing core (spec §5.2)
 // ---------------------------------------------------------------------
@@ -333,8 +463,15 @@ const SESSION_CHANNEL_CAPACITY: usize = 8;
 
 /// One event the demux task delivers to a session.
 enum SessionEvent {
-    /// Application payload bytes (a `Keep`+`Data` frame's payload).
-    Data(Bytes),
+    /// Application payload bytes (a `Keep`+`Data` frame's payload) with
+    /// the per-packet destination for UDP sessions (`Some(addr)` — the
+    /// dest parsed from the frame's metadata; TCP streams' Keep frames
+    /// carry no target, so `None` there).
+    #[allow(dead_code)] // read by UdpSession::recv_from — wired by SP3 Task 2
+    Data {
+        dest: Option<SocketAddr>,
+        bytes: Bytes,
+    },
     /// The peer closed the session (`End` frame) — the reader sees EOF.
     End,
     /// The peer reported an error for the session (`Error` option) — the
@@ -351,7 +488,8 @@ fn lock_map(
     map.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Multiplexes app TCP streams over one v1.mux.cool tunnel (spec §5.2).
+/// Multiplexes app TCP streams and UDP datagram sessions over one
+/// v1.mux.cool tunnel (spec §5.2).
 ///
 /// `new` splits the tunnel and spawns three tasks: a **demux** task reads
 /// frames off the tunnel and routes payloads/`End`/`Error` to per-session
@@ -364,9 +502,10 @@ fn lock_map(
 /// tunnel (it lives inside the spawned tasks); dropping the handle stops
 /// the keepalive, and the tunnel tears down once the last session drops.
 ///
-/// [`MuxClient`], [`SessionStream`] and [`MuxTarget`] are the public mux
-/// API: re-exported from `protocol::vless` and the crate root (the
-/// `connect_mux` entry returns a [`MuxClient`] the app opens sessions on).
+/// [`MuxClient`], [`SessionStream`], [`UdpSession`] and [`MuxTarget`] are
+/// the public mux API: re-exported from `protocol::vless` and the crate
+/// root (the `connect_mux` entry returns a [`MuxClient`] the app opens
+/// sessions on).
 pub struct MuxClient<S> {
     next_id: AtomicU16,
     sessions: Arc<Mutex<HashMap<u16, mpsc::Sender<SessionEvent>>>>,
@@ -434,6 +573,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
             status: STATUS_NEW,
             option: 0,
             target: Some(target),
+            global_id: None,
             payload: Bytes::new(),
         };
         if self.write_tx.send(frame).await.is_err() {
@@ -457,6 +597,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
             self.write_tx.clone(),
             Arc::clone(&self.sessions),
         ))
+    }
+
+    /// Opens a new UDP (XUDP) session with the tunnel's `global_id` and
+    /// returns its datagram socket.
+    ///
+    /// Unlike [`MuxClient::open_session`] the `New` frame is NOT eager:
+    /// its target is the first packet's destination, so the first
+    /// [`UdpSession::send_to`] writes it (with the `GlobalID`, spec §4.1 —
+    /// deviation 3). Fails when the tunnel is dead.
+    // `async` per the SP3 plan interface — Task 2 awaits it; the body is
+    // sync today because no eager New frame is sent.
+    #[allow(dead_code, clippy::unused_async)] // wired by SP3 Task 2 (PacketConn XUdp mode)
+    pub(crate) async fn open_udp_session(&self, global_id: [u8; 8]) -> io::Result<UdpSession> {
+        if self.dead.load(Ordering::Acquire) {
+            return Err(tunnel_closed());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Reject id 0 — the KeepAlive frames' session id (same wrap guard
+        // as open_session).
+        if id == 0 {
+            return Err(io::Error::other("vless mux session id exhausted"));
+        }
+        let (tx, rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
+        lock_map(&self.sessions).insert(id, tx);
+        // Re-check the demux (same race as open_session): an entry
+        // inserted after its exit-clear would never be routed.
+        if self.dead.load(Ordering::Acquire) {
+            lock_map(&self.sessions).remove(&id);
+            return Err(tunnel_closed());
+        }
+        Ok(UdpSession {
+            id,
+            rx,
+            write_tx: self.write_tx.clone(),
+            sessions: Arc::clone(&self.sessions),
+            global_id,
+            first: AtomicBool::new(true),
+        })
     }
 }
 
@@ -529,7 +707,18 @@ async fn route(frame: Frame, sessions: &Mutex<HashMap<u16, mpsc::Sender<SessionE
             if frame.option & OPT_ERROR != 0 {
                 SessionEvent::Error(session_error())
             } else if frame.option & OPT_DATA != 0 {
-                SessionEvent::Data(frame.payload)
+                // The per-packet destination for UDP sessions (parsed
+                // from the frame metadata — frame.target is
+                // Some(Udp(addr)) on UDP Keep frames; TCP Keep frames
+                // carry no target).
+                let dest = match frame.target {
+                    Some(MuxTarget::Udp(addr)) => Some(addr),
+                    _ => None,
+                };
+                SessionEvent::Data {
+                    dest,
+                    bytes: frame.payload,
+                }
             } else {
                 return true; // meta-only Keep — nothing to deliver
             }
@@ -606,6 +795,7 @@ async fn keepalive_loop(write_tx: mpsc::Sender<Frame>, mut stop: mpsc::Receiver<
                     status: STATUS_KEEPALIVE,
                     option: 0,
                     target: None,
+                    global_id: None,
                     payload: Bytes::new(),
                 };
                 if write_tx.send(frame).await.is_err() {
@@ -678,6 +868,7 @@ impl WriteItem {
                 status: STATUS_KEEP,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: payload.clone(),
             },
             Self::End => Frame {
@@ -685,6 +876,7 @@ impl WriteItem {
                 status: STATUS_END,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         }
@@ -698,6 +890,7 @@ impl WriteItem {
                 status: STATUS_KEEP,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload,
             },
             Self::End => Frame {
@@ -705,6 +898,7 @@ impl WriteItem {
                 status: STATUS_END,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         }
@@ -819,14 +1013,14 @@ impl AsyncRead for SessionStream {
                 return Poll::Ready(Ok(()));
             }
             match self.rx.poll_recv(cx) {
-                Poll::Ready(Some(SessionEvent::Data(payload))) => {
-                    if payload.is_empty() {
+                Poll::Ready(Some(SessionEvent::Data { bytes, .. })) => {
+                    if bytes.is_empty() {
                         continue; // empty frames carry nothing
                     }
-                    let n = std::cmp::min(payload.len(), buf.remaining());
-                    buf.put_slice(&payload[..n]);
-                    if n < payload.len() {
-                        self.read_pending = Some(payload.slice(n..));
+                    let n = std::cmp::min(bytes.len(), buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.read_pending = Some(bytes.slice(n..));
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -975,13 +1169,14 @@ impl SessionStream {
             status: STATUS_END,
             option: 0,
             target: None,
+            global_id: None,
             payload: Bytes::new(),
         };
         match self.write_tx.try_send(end) {
             // Handed over, or the tunnel is dead — nothing to queue in
             // either case.
             Ok(()) | Err(TrySendError::Closed(_)) => {}
-            Err(TrySendError::Full(end)) => {
+            Err(TrySendError::Full(_)) => {
                 match std::mem::replace(&mut self.write_state, WriteState::Idle) {
                     WriteState::Waiting(fut) => {
                         if let Some(front) = self.write_queue.front_mut() {
@@ -996,15 +1191,122 @@ impl SessionStream {
                             }
                         });
                     }
-                    WriteState::Idle => {
-                        let tx = self.write_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(end).await;
-                        });
-                    }
+                    WriteState::Idle => queue_end_fire_and_forget(self.id, &self.write_tx),
                 }
             }
         }
+    }
+}
+
+/// The Drop-path End for a session with no in-flight writer reservation
+/// (a full writer channel): a spawned task sends the meta-only `End`
+/// (spec §4.3) the moment a slot frees. The End lands strictly behind
+/// data already accepted into the channel (a cancelled `send_to`/`write`
+/// never queued its frame, so there is nothing to overtake).
+fn queue_end_fire_and_forget(id: u16, write_tx: &mpsc::Sender<Frame>) {
+    let end = Frame {
+        session_id: id,
+        status: STATUS_END,
+        option: 0,
+        target: None,
+        global_id: None,
+        payload: Bytes::new(),
+    };
+    let tx = write_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(end).await;
+    });
+}
+
+/// The app-side datagram socket for one mux UDP session (XUDP, spec
+/// §4.5).
+///
+/// Reads pull `SessionEvent`s off the session channel (`Data` → one
+/// datagram `(dest, payload)`, `End` → `Ok(None)`, `Error` → the
+/// `io::Error`); writes queue `New`/`Keep` frames on the tunnel's writer
+/// channel. The first [`UdpSession::send_to`] writes the session's `New`
+/// frame (network byte UDP + the destination + the `GlobalID` + the first
+/// payload — spec §8 deviation 3: not eager, the target is only known
+/// with the first packet); subsequent sends write `Keep` frames carrying
+/// that packet's own destination (spec §4.1).
+#[allow(dead_code)] // constructed by MuxClient::open_udp_session — wired by SP3 Task 2
+pub struct UdpSession {
+    id: u16,
+    rx: mpsc::Receiver<SessionEvent>,
+    write_tx: mpsc::Sender<Frame>,
+    sessions: Arc<Mutex<HashMap<u16, mpsc::Sender<SessionEvent>>>>,
+    /// The tunnel's `GlobalID` (xudp, spec §4.2), written in the New frame
+    /// only.
+    global_id: [u8; 8],
+    /// The first `send_to` writes the `New` frame; afterwards `Keep`.
+    /// Atomic so `send_to` (&self) is safe to call concurrently — exactly
+    /// one caller wins the New.
+    first: AtomicBool,
+}
+
+// Methods wired by SP3 Task 2 (PacketConn XUdp mode); dead until then.
+#[allow(dead_code)]
+impl UdpSession {
+    /// Sends one datagram to `dest`. The first call writes the session's
+    /// `New` frame (network UDP + `dest` + the `GlobalID` + the payload);
+    /// later calls write `Keep` frames carrying this packet's own
+    /// destination (spec §4.1). Fails when the tunnel is dead.
+    pub(crate) async fn send_to(&self, dest: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        let is_first = self.first.swap(false, Ordering::AcqRel);
+        let frame = Frame {
+            session_id: self.id,
+            status: if is_first { STATUS_NEW } else { STATUS_KEEP },
+            option: OPT_DATA,
+            target: Some(MuxTarget::Udp(dest)),
+            global_id: is_first.then_some(self.global_id),
+            payload: Bytes::copy_from_slice(payload),
+        };
+        self.write_tx.send(frame).await.map_err(|_| tunnel_closed())
+    }
+
+    /// Reads one datagram: `(destination, payload)` — the destination the
+    /// server dispatched the packet to (the per-packet dest echoed from
+    /// the frame's metadata, spec §4.4). `Ok(None)` on a clean close
+    /// (`End` frame or the tunnel ending — spec §6). Each `recv` takes
+    /// exactly one whole datagram, so cancelling it loses nothing (tokio
+    /// `recv` is cancellation-safe).
+    pub(crate) async fn recv_from(&mut self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+        loop {
+            match self.rx.recv().await {
+                Some(SessionEvent::Data { dest, bytes }) => {
+                    // A UDP packet without a destination is a protocol
+                    // violation (xray's packet reader errors on it too) —
+                    // surface it, never deliver garbage.
+                    let dest = dest.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vless mux: udp packet without a destination",
+                        )
+                    })?;
+                    if bytes.is_empty() {
+                        continue; // empty datagrams carry nothing
+                    }
+                    return Ok(Some((dest, bytes.to_vec())));
+                }
+                Some(SessionEvent::End) | None => return Ok(None),
+                Some(SessionEvent::Error(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// Removes this session from the demux's routing map. Idempotent.
+    fn unregister(&self) {
+        lock_map(&self.sessions).remove(&self.id);
+    }
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        // Fire-and-forget End + unregister (spec §4.3), mirroring
+        // SessionStream: the peer must see the session close even when
+        // the app never sends one.
+        queue_end_fire_and_forget(self.id, &self.write_tx);
+        self.unregister();
     }
 }
 
@@ -1071,6 +1373,7 @@ mod tests {
                 status: STATUS_NEW,
                 option: 0,
                 target: Some(MuxTarget::Tcp("127.0.0.1:8080".parse().unwrap())),
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1096,6 +1399,7 @@ mod tests {
             status: STATUS_KEEP,
             option: OPT_DATA,
             target: None,
+            global_id: None,
             payload: Bytes::from_static(b"hello"),
         };
         let (mut a, mut b) = tokio::io::duplex(64);
@@ -1131,6 +1435,7 @@ mod tests {
                 status: STATUS_END,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1221,6 +1526,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: OPT_ERROR,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1244,6 +1550,7 @@ mod tests {
                 status: STATUS_NEW,
                 option: OPT_DATA,
                 target: Some(MuxTarget::Tcp("192.0.2.1:443".parse().unwrap())),
+                global_id: None,
                 payload: Bytes::from_static(b"GET /"),
             },
         )
@@ -1283,6 +1590,7 @@ mod tests {
                 status: STATUS_NEW,
                 option: 0,
                 target: Some(MuxTarget::TcpDomain("example.com".into(), 443)),
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1309,6 +1617,7 @@ mod tests {
                 status: STATUS_NEW,
                 option: 0,
                 target: Some(target.clone()),
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1332,6 +1641,7 @@ mod tests {
                 status: STATUS_KEEPALIVE,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1381,12 +1691,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_network_is_error() {
-        // New frame with network byte 0x02 (UDP): the codec is TCP-only
-        // (mirrors xray's "unknown network type" — the target cannot be
-        // represented, so the whole connection is unrecoverable).
+        // New frame with network byte 0x03: neither TCP nor UDP — the
+        // codec only knows the two v1.mux.cool networks (mirrors xray's
+        // "unknown network type"; the target cannot be represented, so
+        // the whole connection is unrecoverable).
         let mut r = PieceReader {
             data: vec![
-                0x00, 0x0C, 0x00, 0x01, 0x01, 0x00, 0x02, 0x1F, 0x90, 0x01, 127, 0, 0, 1,
+                0x00, 0x0C, 0x00, 0x01, 0x01, 0x00, 0x03, 0x1F, 0x90, 0x01, 127, 0, 0, 1,
             ],
             pos: 0,
             piece: 2,
@@ -1394,6 +1705,235 @@ mod tests {
         let err = read_frame(&mut r).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("network"));
+    }
+
+    #[tokio::test]
+    async fn udp_new_frame_parses() {
+        // A UDP New frame (network byte 0x02) now parses: target = the
+        // UDP dest, and the 8-byte GlobalID is read back from the
+        // metadata (xray `frame.go` writes it after the target).
+        let mut r = PieceReader {
+            data: vec![
+                0x00, 0x14, 0x00, 0x01, 0x01, 0x01, 0x02, 0x1F, 0x90, 0x01, 127, 0, 0, 1, 0xAA,
+                0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x00, 0x02, b'h', b'i',
+            ],
+            pos: 0,
+            piece: 3,
+        };
+        let frame = read_frame(&mut r).await.unwrap().unwrap();
+        assert_eq!(frame.session_id, 1);
+        assert_eq!(frame.status, STATUS_NEW);
+        assert_eq!(frame.option, OPT_DATA);
+        assert_eq!(
+            frame.target.as_ref(),
+            Some(&MuxTarget::Udp("127.0.0.1:8080".parse().unwrap()))
+        );
+        assert_eq!(frame.global_id, Some([0xAA; 8]));
+        assert_eq!(&frame.payload[..], b"hi");
+    }
+
+    /// Reads one raw frame's exact wire bytes from the peer (`[2B
+    /// meta_len][metadata][2B data_len][payload]`) without decoding it —
+    /// for byte-exact wire assertions on frames emitted by the
+    /// [`MuxClient`] machinery (the writer task owns the write half).
+    async fn read_raw_frame(peer: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut ml = [0u8; 2];
+        peer.read_exact(&mut ml).await.unwrap();
+        let meta_len = usize::from(u16::from_be_bytes(ml));
+        let mut meta = vec![0u8; meta_len];
+        peer.read_exact(&mut meta).await.unwrap();
+        let mut out = ml.to_vec();
+        out.extend_from_slice(&meta);
+        if meta[3] & OPT_DATA != 0 {
+            let mut dl = [0u8; 2];
+            peer.read_exact(&mut dl).await.unwrap();
+            let n = usize::from(u16::from_be_bytes(dl));
+            let mut payload = vec![0u8; n];
+            peer.read_exact(&mut payload).await.unwrap();
+            out.extend_from_slice(&dl);
+            out.extend_from_slice(&payload);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn udp_session_new_frame_bytes() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        session
+            .send_to("127.0.0.1:8080".parse().unwrap(), b"hi")
+            .await
+            .unwrap();
+
+        // The first send writes the New frame — exact bytes:
+        // [meta_len 0x14][sid 1][0x01 New][0x01 Data][0x02 UDP]
+        // [port 0x1F90][atyp 0x01][127,0,0,1][GlobalID 0xAA×8]
+        // [data_len 2]'hi'. meta_len = 2+1+1+1+2+1+4+8 = 20.
+        let raw = read_raw_frame(&mut peer).await;
+        let mut expected = vec![
+            0x00, 0x14, 0x00, 0x01, 0x01, 0x01, 0x02, 0x1F, 0x90, 0x01, 127, 0, 0, 1,
+        ];
+        expected.extend_from_slice(&[0xAA; 8]);
+        expected.extend_from_slice(&[0x00, 0x02, b'h', b'i']);
+        assert_eq!(raw, expected);
+
+        // And it decodes to the expected frame.
+        let frame = read_frame(&mut std::io::Cursor::new(raw))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.session_id, 1);
+        assert_eq!(frame.status, STATUS_NEW);
+        assert_eq!(frame.option, OPT_DATA);
+        assert_eq!(
+            frame.target.as_ref(),
+            Some(&MuxTarget::Udp("127.0.0.1:8080".parse().unwrap()))
+        );
+        assert_eq!(frame.global_id, Some([0xAA; 8]));
+        assert_eq!(&frame.payload[..], b"hi");
+    }
+
+    #[tokio::test]
+    async fn udp_session_per_packet_dests() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        session
+            .send_to("127.0.0.1:8080".parse().unwrap(), b"p1")
+            .await
+            .unwrap();
+        session
+            .send_to("192.0.2.7:53".parse().unwrap(), b"p2")
+            .await
+            .unwrap();
+
+        // First packet → New frame carrying dest1 + the GlobalID.
+        let new = read_frame(&mut peer).await.unwrap().unwrap();
+        assert_eq!(new.session_id, 1);
+        assert_eq!(new.status, STATUS_NEW);
+        assert_eq!(new.option, OPT_DATA);
+        assert_eq!(
+            new.target.as_ref(),
+            Some(&MuxTarget::Udp("127.0.0.1:8080".parse().unwrap()))
+        );
+        assert_eq!(new.global_id, Some([0xAA; 8]));
+        assert_eq!(&new.payload[..], b"p1");
+
+        // Second packet → Keep frame carrying dest2 (its own per-packet
+        // dest), no GlobalID.
+        let keep = read_frame(&mut peer).await.unwrap().unwrap();
+        assert_eq!(keep.session_id, 1);
+        assert_eq!(keep.status, STATUS_KEEP);
+        assert_eq!(keep.option, OPT_DATA);
+        assert_eq!(
+            keep.target.as_ref(),
+            Some(&MuxTarget::Udp("192.0.2.7:53".parse().unwrap()))
+        );
+        assert_eq!(keep.global_id, None);
+        assert_eq!(&keep.payload[..], b"p2");
+    }
+
+    #[tokio::test]
+    async fn udp_session_recv_returns_dest() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let mut session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        session
+            .send_to("127.0.0.1:8080".parse().unwrap(), b"hello")
+            .await
+            .unwrap();
+        let sid = read_frame(&mut peer).await.unwrap().unwrap().session_id;
+        assert_eq!(sid, 1);
+
+        // The peer answers with Keep frames, each carrying its own dest
+        // (the server's response writer starts at Keep, spec §4.4); the
+        // demux threads the per-packet dest to recv_from.
+        for (addr, payload) in [("10.0.0.1:4000", b"a1"), ("10.0.0.2:4001", b"b2")] {
+            write_frame(
+                &mut peer,
+                &Frame {
+                    session_id: sid,
+                    status: STATUS_KEEP,
+                    option: OPT_DATA,
+                    target: Some(MuxTarget::Udp(addr.parse().unwrap())),
+                    global_id: None,
+                    payload: Bytes::from_static(payload),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let (dest, payload) = session.recv_from().await.unwrap().unwrap();
+        assert_eq!(dest, "10.0.0.1:4000".parse::<SocketAddr>().unwrap());
+        assert_eq!(payload, b"a1");
+        let (dest, payload) = session.recv_from().await.unwrap().unwrap();
+        assert_eq!(dest, "10.0.0.2:4001".parse::<SocketAddr>().unwrap());
+        assert_eq!(payload, b"b2");
+    }
+
+    #[tokio::test]
+    async fn udp_session_eof_on_end() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let mut session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        session
+            .send_to("127.0.0.1:8080".parse().unwrap(), b"ping")
+            .await
+            .unwrap();
+        let sid = read_frame(&mut peer).await.unwrap().unwrap().session_id;
+
+        // The peer ends the session: recv_from sees EOF (sticky).
+        write_frame(
+            &mut peer,
+            &Frame {
+                session_id: sid,
+                status: STATUS_END,
+                option: 0,
+                target: None,
+                global_id: None,
+                payload: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(session.recv_from().await.unwrap().is_none());
+        assert!(session.recv_from().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_session_tunnel_death() {
+        let (client, peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let mut session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        session
+            .send_to("127.0.0.1:8080".parse().unwrap(), b"ping")
+            .await
+            .unwrap();
+        drop(peer);
+
+        // Tunnel EOF ends the session (spec §6): recv_from sees EOF.
+        assert!(session.recv_from().await.unwrap().is_none());
+        // The writer task's next write hits BrokenPipe (the peer half is
+        // gone) and it exits, closing the frame channel — sends then fail.
+        let mut err = None;
+        for _ in 0..64 {
+            match session
+                .send_to("127.0.0.1:8080".parse().unwrap(), b"x")
+                .await
+            {
+                Ok(()) => tokio::task::yield_now().await,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let e = err.expect("send_to fails once the tunnel is dead");
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        // The client itself is dead: no new sessions.
+        assert!(mux.open_udp_session([0xAA; 8]).await.is_err());
+        assert!(mux.open_session(echo_target()).await.is_err());
     }
 
     #[tokio::test]
@@ -1408,6 +1948,7 @@ mod tests {
                 status: STATUS_NEW,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1432,6 +1973,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::from_static(b"x"),
             },
         )
@@ -1510,6 +2052,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: Bytes::copy_from_slice(reply),
             },
         )
@@ -1568,6 +2111,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: Bytes::from_static(b"reply-A"),
             },
         )
@@ -1580,6 +2124,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: Bytes::from_static(b"reply-B"),
             },
         )
@@ -1615,6 +2160,7 @@ mod tests {
                 status: STATUS_END,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1653,6 +2199,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: OPT_ERROR,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1688,6 +2235,7 @@ mod tests {
                 status: STATUS_END,
                 option: OPT_ERROR,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1720,6 +2268,7 @@ mod tests {
                 status: STATUS_KEEPALIVE,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1732,6 +2281,7 @@ mod tests {
                 status: STATUS_KEEPALIVE,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: Bytes::from_static(b"tick"),
             },
         )
@@ -1744,6 +2294,7 @@ mod tests {
                 status: STATUS_KEEP,
                 option: OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: Bytes::from_static(b"real"),
             },
         )
@@ -1872,6 +2423,7 @@ mod tests {
                 status: STATUS_END,
                 option: 0,
                 target: None,
+                global_id: None,
                 payload: Bytes::new(),
             },
         )
@@ -1891,6 +2443,7 @@ mod tests {
                     status: STATUS_KEEP,
                     option: OPT_DATA,
                     target: None,
+                    global_id: None,
                     payload: Bytes::from_static(b"stray"),
                 },
             )
@@ -1920,6 +2473,7 @@ mod tests {
                     status: STATUS_KEEP,
                     option: OPT_DATA,
                     target: None,
+                    global_id: None,
                     payload: Bytes::from_static(b"ghost"),
                 },
             )

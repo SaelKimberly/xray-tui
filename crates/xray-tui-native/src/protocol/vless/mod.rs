@@ -672,6 +672,7 @@ mod tests {
                 status: mux::STATUS_KEEP,
                 option: mux::OPT_DATA,
                 target: None,
+                global_id: None,
                 payload: bytes::Bytes::from_static(b"ok"),
             },
         )
