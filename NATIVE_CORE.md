@@ -197,15 +197,16 @@ one UDP session (`UdpSession`, `open_udp_session`) carrying a fresh random
 `frame.go` `WriteTo`), each datagram a `Keep` frame with its own
 per-packet destination (network byte UDP + port-first addr), wrapped in
 the `PacketMode::XUdp` `PacketConn`; echoes matched by payload,
-order-independent. 4 both-cores rows: {tls, reality} × {xray, sing-box};
-1 sing-box single-core row: the `xtls-rprx-vision-udp443` flow — the
+order-independent. All 5 rows run both cores: {tls, reality} × {xray,
+sing-box} for plain XUDP, plus the `xtls-rprx-vision-udp443` flow — the
 client config carries the full name (selects the XUDP path client-side:
 mux-forced, guard lifted), the wire addon truncates to `xtls-rprx-vision`
 (`requestAddons.Flow[:16]`) and the server config emits that truncated
 name (`Flow::server_str` — both cores validate the request addon against
-it). xray-core rejects vision+mux TCP by design (mux under flow XRV is
-the XUDP path: `AllowedNetwork = UDP`), so the vision-udp443 row is
-sing-box only.
+it). xray serves vision+mux+UDP by design (mux under flow XRV is the XUDP
+path: `AllowedNetwork = UDP` — inbound.go; the SP2 vision+mux TCP
+rejection does not apply to UDP), and sing-box terminates the same XUDP
+session — the xray arm was verified in the final-review fix wave.
 
 | Case | Payload security | TLS variant |
 |------|------------------|-------------|

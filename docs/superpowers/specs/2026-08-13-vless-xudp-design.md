@@ -88,7 +88,11 @@ both.)
   skipped; the mux rewrite already applies to all UDP under vision/cone.)
 - Vision TCP semantics unchanged (SP2's mux+vision composition applies —
   peel-inside; xray servers still reject vision+mux TCP by design, so the
-  e2e for the mux+vision+udp443 row is sing-box-single-core).
+  mux+vision TCP row stays sing-box single-core). The udp443 row's UDP
+  traffic is XUDP over the mux tunnel, which BOTH cores serve: xray's
+  inbound sets `AllowedNetwork = UDP` for mux under flow XRV (inbound.go —
+  vision+mux is the XUDP path), so the SP2 TCP rejection does not apply
+  to UDP (verified in the final-review fix wave).
 
 ### 4.4 Server response
 
@@ -202,11 +206,12 @@ through the mux tunnel → assert echoes). Rows:
 |---|---|---|---|---|
 | xudp_tls | xray + sing-box | tls | none | UDP over mux (XUDP) |
 | xudp_reality | xray + sing-box | reality | none | XUDP over REALITY |
-| vision_udp443 | sing-box (single-core) | tls | vision-udp443 | udp443 flow via vision mux |
+| vision_udp443 | xray + sing-box | tls | vision-udp443 | udp443 flow via vision mux |
 
-= **5 rows** (2+2+1). Existing rows untouched (vless 66+4 → 71+4; total
-114+4 → 119+4). The vision_udp443 row: sing-box server only (xray rejects
-vision+mux TCP by design — SP2 finding).
+= **5 rows, all both-core**. Existing rows untouched (vless 66+4 → 72+4;
+total 114+4 → 120+4). The vision_udp443 row runs on both cores: xray's
+vision+mux path is the XUDP route (`AllowedNetwork = UDP` — the SP2 TCP
+rejection does not apply to UDP), verified in the final-review fix wave.
 
 ### 7.4 Gates
 
@@ -226,11 +231,16 @@ vision+mux TCP by design — SP2 finding).
 3. **First-packet dest in the New frame** (xray's PacketWriter uses the
    writer's bound dest for New, per-packet dests for Keep) — the New frame
    carries the first send's dest; per-packet dests after. Wire-compatible.
-4. **udp443 over sing-box only in e2e** — xray's server-side vision+mux TCP
-   rejection (AllowedNetwork=UDP) is upstream behavior, not our choice.
+
+(An earlier draft carried a 4th deviation — "udp443 over sing-box only in
+e2e" — citing xray's vision+mux TCP rejection. That rationale was wrong:
+the rejection applies to TCP New frames only; xray's inbound sets
+`AllowedNetwork = UDP` for mux under flow XRV (inbound.go), so
+vision+mux+UDP is the XUDP path and works on both cores. The row is
+both-core; no deviation remains.)
 
 ## 9. Verification Order
 
 1. Unit: UdpSession frames + PacketConn XUdp + flow truncation + guards.
 2. Hermetic: fake mux server UDP-session frames.
-3. e2e: vless sweep (71+4) + vmess (48) + clippy + fmt.
+3. e2e: vless sweep (72+4) + vmess (48) + clippy + fmt.

@@ -1239,7 +1239,8 @@ pub struct UdpSession {
     global_id: [u8; 8],
     /// The first `send_to` writes the `New` frame; afterwards `Keep`.
     /// Atomic so `send_to` (&self) is safe to call concurrently — exactly
-    /// one caller wins the New.
+    /// one caller wins the New (see [`UdpSession::send_to`] for the
+    /// serialization invariant that makes the race moot).
     first: AtomicBool,
 }
 
@@ -1248,7 +1249,29 @@ impl UdpSession {
     /// `New` frame (network UDP + `dest` + the `GlobalID` + the payload);
     /// later calls write `Keep` frames carrying this packet's own
     /// destination (spec §4.1). Fails when the tunnel is dead.
+    ///
+    /// `&self` (not `&mut self`) because the `XUdp` [`PacketConn`] hands
+    /// the session around behind its own `&mut` API: production callers
+    /// go through [`PacketConn::send`], which serializes — the session is
+    /// never sent to concurrently. The `AtomicBool` first-swap would make
+    /// a hypothetical concurrent first-send safe only in the weak sense
+    /// of exactly-one `New`: the mpsc channel ordering is otherwise
+    /// unconstrained, so a racer could wire its `Keep` before the `New`
+    /// and that datagram would be dropped (the server has no session
+    /// yet). The serialization invariant is what prevents it.
     pub(crate) async fn send_to(&self, dest: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        // Reject datagrams that cannot fit the 2-byte frame length
+        // (65535) upfront — queuing one would return a misleading Ok,
+        // then the writer task's `u16::try_from` in `write_frame` fails
+        // mid-write and kills the whole tunnel (the writer exits on any
+        // write error). `PacketConn::send`'s Raw/PacketAddr arms carry
+        // the same guard (`reject_oversized`); XUdp delegates here.
+        if payload.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vless mux: udp datagram exceeds the 2-byte data length (65535)",
+            ));
+        }
         let is_first = self.first.swap(false, Ordering::AcqRel);
         let frame = Frame {
             session_id: self.id,
@@ -1931,6 +1954,32 @@ mod tests {
         // The client itself is dead: no new sessions.
         assert!(mux.open_udp_session([0xAA; 8]).await.is_err());
         assert!(mux.open_session(echo_target()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_session_rejects_oversized_datagram() {
+        // A datagram larger than the 2-byte frame length (65535) is
+        // rejected upfront with InvalidInput — without the guard it would
+        // queue Ok, then the writer task's `u16::try_from` in
+        // `write_frame` would fail mid-write and kill the whole tunnel.
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let big = vec![0u8; u16::MAX as usize + 1];
+        let err = session
+            .send_to("127.0.0.1:8080".parse().unwrap(), &big)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Nothing was queued: the session's New is still pending, so the
+        // next valid send writes it and the tunnel survives.
+        session
+            .send_to("127.0.0.1:8080".parse().unwrap(), b"ok")
+            .await
+            .unwrap();
+        let frame = read_frame(&mut peer).await.unwrap().unwrap();
+        assert_eq!(frame.status, STATUS_NEW);
+        assert_eq!(&frame.payload[..], b"ok");
     }
 
     #[tokio::test]

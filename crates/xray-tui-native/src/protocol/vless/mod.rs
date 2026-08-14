@@ -307,6 +307,18 @@ pub async fn connect_mux(
     stream: BoxStream,
     cfg: &VlessConfig,
 ) -> Result<MuxClient<BoxStream>, NativeError> {
+    // The mux tunnel only carries XUDP datagrams (or TCP sessions) — the
+    // Raw/PacketAddr packet modes belong to the command=0x02 path
+    // (connect_udp's mux branch never reads the mode value, but a caller
+    // reaching connect_mux directly with a misconfigured params.udp would
+    // silently lose it). Reject upfront.
+    if let Some(mode) = ctx.params.udp
+        && mode != PacketMode::XUdp
+    {
+        return Err(NativeError::Config(format!(
+            "vless mux: params.udp {mode:?} is not XUdp — the mux tunnel only carries XUDP datagrams (Raw/PacketAddr belong to the command=0x02 path)"
+        )));
+    }
     let uuid = header::uuid_bytes(&cfg.uuid)?;
     match cfg.flow.as_deref() {
         None | Some("") => connect_mux_plain(ctx, stream, uuid).await,
@@ -691,7 +703,9 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let cfg = vless(Some("xtls-rprx-vision-udp443"), "tcp", true);
-        let ctx = udp_ctx_for(&cfg, PacketMode::Raw);
+        // XUdp is the mux tunnel's packet mode (connect_mux rejects
+        // Raw/PacketAddr there).
+        let ctx = udp_ctx_for(&cfg, PacketMode::XUdp);
         let (stream, mut peer) = tokio::io::duplex(4096);
         let stream: BoxStream = Box::new(stream);
         let conn = connect_udp(&ctx, stream, &cfg)
@@ -731,7 +745,7 @@ mod tests {
         // flow=vision (plain) + UDP + mux path → Ok: XUDP lifts the vision
         // UDP rejection for the mux tunnel (spec §5.3).
         let cfg = vless(Some("xtls-rprx-vision"), "tcp", true);
-        let mut ctx = udp_ctx_for(&cfg, PacketMode::Raw);
+        let mut ctx = udp_ctx_for(&cfg, PacketMode::XUdp);
         ctx.params.mux = true;
         let (stream, _peer) = tokio::io::duplex(4096);
         let stream: BoxStream = Box::new(stream);
@@ -857,6 +871,30 @@ mod tests {
             &err,
             NativeError::NotImplemented { feature } if feature.contains("xtls-rprx-splice")
         ));
+    }
+
+    #[tokio::test]
+    async fn mux_rejects_non_xudp_udp_mode() {
+        // The mux tunnel only carries XUDP datagrams — a params.udp of
+        // Raw/PacketAddr (a command=0x02 mode) is a misconfiguration,
+        // rejected before any protocol I/O (connect_udp's mux branch never
+        // reads the mode value, so reaching connect_mux with one would
+        // otherwise silently lose it).
+        for mode in [PacketMode::Raw, PacketMode::PacketAddr] {
+            let cfg = vless(None, "tcp", false);
+            let (stream, _peer) = stream_pair();
+            let err = connect_mux(&udp_ctx_for(&cfg, mode), stream, &cfg)
+                .await
+                .err()
+                .expect("non-XUdp udp mode on the mux tunnel must fail");
+            assert!(matches!(&err, NativeError::Config(msg) if msg.contains("not XUdp")));
+        }
+        // XUdp (and None — the TCP-session mux rows) stay accepted.
+        let cfg = vless(None, "tcp", false);
+        let (stream, _peer) = stream_pair();
+        connect_mux(&udp_ctx_for(&cfg, PacketMode::XUdp), stream, &cfg)
+            .await
+            .expect("xudp mode is the mux tunnel's udp mode");
     }
 
     #[tokio::test]
