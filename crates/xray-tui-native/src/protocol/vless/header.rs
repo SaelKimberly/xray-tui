@@ -3,7 +3,12 @@
 //! Request header (v2ray `proxy/vless/encoding/encoding.go`,
 //! `EncodeRequestHeader`): `version(1B, 0) | uuid(16B) | addon_len(1B) |
 //! addons | command(1B) | [addr+port]`, with the addr encoded
-//! PORT-FIRST (`PortThenAddress`). Command: 0x01 TCP, 0x02 UDP, 0x03 MUX.
+//! PORT-FIRST (`PortThenAddress`). The `[addr+port]` is present only for
+//! commands 0x01 TCP and 0x02 UDP; command 0x03 MUX (and 0x04 Rvs)
+//! carries NO destination bytes — `EncodeRequestHeader` skips the address
+//! for those commands and the server derives the fixed `v1.mux.cool` fqdn
+//! from the command byte alone (`DecodeRequestHeader`). Command: 0x01 TCP,
+//! 0x02 UDP, 0x03 MUX.
 //! Response header: `version(1B, echoed 0) | addon_len(1B) | addons`.
 
 use crate::addr::{TargetAddr, encode_addr};
