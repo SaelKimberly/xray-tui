@@ -67,7 +67,8 @@ async fn connect_plain(
 
 /// Vision (`xtls-rprx-vision`) connect path (spec §5.4).
 ///
-/// Guarded preconditions, checked before any I/O:
+/// Guarded preconditions, checked before any protocol-phase I/O (the
+/// header write):
 /// - outer security is TLS or REALITY (the engine is TLS 1.3-only, so the
 ///   `has_tls()` check is the whole story) — mirroring xray's rejection;
 /// - the transport is raw TCP — vision requires the socket for the Direct
@@ -122,10 +123,12 @@ async fn connect_vision(
         })??;
 
     // Wrap the secured stream in the padded codec; the response-header peel
-    // (VlessClientStream) stays OUTSIDE it — the server's `[0,0]` arrives as
-    // its own outer-TLS record before the first padded frame, the codec's
-    // UUID gate passes it through, then the peel consumes it and unpadding
-    // engages (spec §5.4).
+    // (VlessClientStream) stays OUTSIDE it. The server's `[0,0]` response
+    // header is buffered (EncodeResponseHeader + SetFlushNext) and flushed
+    // TOGETHER with the first padded frame in ONE outer-TLS record
+    // (`[0,0][uuid][cmd]...`); the codec's Unpadder skips the leading
+    // `[0,0]` before the UUID gate (vision.rs), and the lenient peel hands
+    // the first non-0x00 content byte back as payload (spec §4.6, §5.4).
     let vision = VisionStream::new(stream, uuid, rng);
     Ok(Box::new(VlessClientStream::new(Box::new(vision))))
 }
@@ -156,7 +159,8 @@ fn check_udp_allowed(flow: Option<&str>, udp: Option<PacketMode>) -> Result<(), 
 /// writes the request header with `command = 0x02` and the UDP destination
 /// (port-first, spec §4.1), then wraps the tunnel in the packet-framed
 /// [`PacketConn`] for the configured mode. The vision+UDP guard
-/// ([`check_udp_allowed`]) runs before any I/O.
+/// ([`check_udp_allowed`]) runs before any protocol-phase I/O (the header
+/// write).
 pub async fn connect_udp(
     ctx: &LinkContext,
     stream: BoxStream,

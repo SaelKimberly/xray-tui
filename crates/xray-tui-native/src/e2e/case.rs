@@ -194,7 +194,13 @@ impl E2eCase for CaseSpec {
         let app = match self.app {
             AppKind::Plain => String::new(),
             AppKind::InnerTls => "/inner-tls".to_string(),
-            AppKind::Udp => "/udp".to_string(),
+            AppKind::Udp => format!(
+                "/udp-{}",
+                self.udp.map_or("raw", |m| match m {
+                    PacketMode::Raw => "raw",
+                    PacketMode::PacketAddr => "packetaddr",
+                })
+            ),
         };
         format!("{proto}/{flow}{}/{tls}{sec}{app}", self.network)
     }

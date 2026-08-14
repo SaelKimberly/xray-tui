@@ -48,9 +48,16 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<V
 /// Writes one `[2B BE len][payload]` frame.
 ///
 /// The payload must fit a u16 length (<= 65535); the caller (the
-/// `PacketConn`) rejects larger datagrams before reaching the codec.
+/// `PacketConn`) rejects larger datagrams before reaching the codec, and
+/// the codec itself returns `InvalidInput` rather than panicking — an
+/// oversized datagram is a client error, never a crash (spec §6).
 pub async fn write_packet<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io::Result<()> {
-    let n = u16::try_from(payload.len()).expect("vless udp frame payload fits u16");
+    let n = u16::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vless udp datagram exceeds the 2-byte frame length (65535)",
+        )
+    })?;
     let mut frame = Vec::with_capacity(payload.len() + 2);
     frame.extend_from_slice(&n.to_be_bytes());
     frame.extend_from_slice(payload);
@@ -91,6 +98,22 @@ mod tests {
         let mut raw = Vec::new();
         b.read_to_end(&mut raw).await.unwrap();
         assert_eq!(raw, [0x00, 0x02, b'h', b'i']);
+    }
+
+    #[tokio::test]
+    async fn oversized_datagram_is_invalid_input() {
+        // A payload that cannot fit the 2-byte length is a client error,
+        // never a panic (spec §6) — even though `PacketConn::send` rejects
+        // it first, the primitive must not crash. Nothing is written on
+        // the error path.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let big = vec![0xAB; 65_536];
+        let err = write_packet(&mut a, &big).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        drop(a);
+        let mut raw = Vec::new();
+        b.read_to_end(&mut raw).await.unwrap();
+        assert!(raw.is_empty());
     }
 
     #[tokio::test]

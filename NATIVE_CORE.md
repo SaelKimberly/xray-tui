@@ -133,7 +133,7 @@ real certificate (potential MITM or redirection)")`.
 
 ## E2E coverage (tier 3)
 
-Two axes. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
+The suite has four subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
 VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 × serving core(s) — 113
 tests = 109 green + 4 documented ignored (vless ws/grpc
 plain-into-reality-server semantic rows × both cores; single-core rows run

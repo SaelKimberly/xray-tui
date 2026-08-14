@@ -14,6 +14,7 @@
 
 - xray-tui-proto NEVER modified. No new dependencies. `NativeError`-only error surface, existing variants.
 - Wire (spec §4): header `version|uuid|addons|cmd=0x02|port-first dest`; frames `[2B BE len][payload]` both directions; empty frames skipped; outgoing ≤ 65535; packetaddr payload = `"sp.packet-addr.v2fly.arpa" | atyp(1B) | addr | port(2B BE)` (atyp 0x01 IPv4 / 0x02 IPv6; fqdn = error).
+- **Correction (spec §4.3, verified at e2e):** packetaddr frames carry `atyp | addr | port` with NO magic — the magic fqdn is the header destination only (the wire bullet above predates the correction; see the spec's §4.3 for the sing-vmess evidence).
 - vision + UDP → `NativeError` (guard; SP3 will lift it via XUDP).
 - Clippy workspace pedantic+nursery 0; `cargo fmt --check` clean; every network step timeout-bounded (harness convention).
 - e2e: `native-e2e` feature + `XRAY_TUI_CORE_BIN_DIR=/tmp/core-bin`. Existing rows untouched (vless 56+4 → 61+4, vmess 48).

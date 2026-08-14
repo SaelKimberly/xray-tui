@@ -53,7 +53,7 @@ pub mod transport;
 pub use chain::{connect_chain, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
-pub use protocol::vless::PacketConn;
+pub use protocol::vless::{PacketConn, PacketMode};
 
 /// Connect through a single proxy to `params.target`.
 pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, NativeError> {
