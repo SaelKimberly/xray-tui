@@ -16,7 +16,10 @@ const MAX_FRAME: usize = 65_535;
 
 /// Datagram mode: `Raw` (header-dest, xray-style) or `PacketAddr`
 /// (per-packet magic-address destination, sing-box-style; spec §4.3).
-#[derive(Clone, Copy, Debug, PartialEq)]
+// Task 3 wires this into the VLESS UDP dispatch; until then the enum is
+// used only by the unit tests below.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketMode {
     Raw,
     PacketAddr,
@@ -27,12 +30,18 @@ pub enum PacketMode {
 ///
 /// Owns the response-header peel: the server sends `[0x00, 0x00]` before
 /// the first downlink frame (spec §4.4), consumed on the first `recv`.
+// Task 3 wires this into the VLESS UDP dispatch; until then the API is
+// used only by the unit tests below.
+#[allow(dead_code)]
 pub struct PacketConn<S> {
     inner: S,
     mode: PacketMode,
     peel: Peel,
 }
 
+// Task 3 wires this into the VLESS UDP dispatch; until then the API is
+// used only by the unit tests below.
+#[allow(dead_code)]
 impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// Wraps a tunnel stream in datagram framing for the given mode.
     pub const fn new(inner: S, mode: PacketMode) -> Self {
@@ -45,7 +54,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
 
     /// Sends one datagram.
     ///
-    /// Raw: one `[len][payload]` frame. PacketAddr: prepends the
+    /// Raw: one `[len][payload]` frame. `PacketAddr`: prepends the
     /// magic-address destination header (spec §4.3) — header and payload go
     /// in ONE frame, mirroring the sing encoder which writes
     /// `AddrPortLen + payload` in a single buffer; the destination is
@@ -64,7 +73,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
                         "vless packetaddr send requires a destination",
                     )
                 })?;
-                let dest = packetaddr::encode_dest(target)?;
+                let dest = packetaddr::encode_dest(target);
                 let total = dest.len() + payload.len();
                 reject_oversized(total)?;
                 let mut frame = Vec::with_capacity(total);
@@ -79,7 +88,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     ///
     /// The response header precedes ALL downlink frames, so the peel runs
     /// before the first frame read. Returns `Ok(None)` on a clean EOF at a
-    /// frame boundary. Raw: `(None, payload)`. PacketAddr: `(Some(dest),
+    /// frame boundary. Raw: `(None, payload)`. `PacketAddr`: `(Some(dest),
     /// payload)` after validating the magic — a malformed destination
     /// header is an error, never delivered as garbage.
     pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
@@ -153,14 +162,14 @@ mod tests {
         let target = "127.0.0.1:8080".parse::<SocketAddr>().unwrap();
         conn.send(Some(target), b"p").await.unwrap();
         let frame = read_packet(&mut server).await.unwrap().unwrap();
-        let mut expected = packetaddr::encode_dest(target).unwrap();
+        let mut expected = packetaddr::encode_dest(target);
         expected.push(b'p');
         assert_eq!(frame, expected);
 
         // Peer replies with a magic-address frame for a different dest.
         let reply_dest = "[::1]:53".parse::<SocketAddr>().unwrap();
         server.write_all(&[0x00, 0x00]).await.unwrap();
-        let mut reply = packetaddr::encode_dest(reply_dest).unwrap();
+        let mut reply = packetaddr::encode_dest(reply_dest);
         reply.extend_from_slice(b"ok");
         write_packet(&mut server, &reply).await.unwrap();
 
@@ -220,6 +229,41 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         drop(addr);
+        assert!(read_packet(&mut server).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn packetaddr_send_requires_dest() {
+        // PacketAddr mode needs a per-datagram destination (spec §4.3);
+        // send(None) must fail before any byte is written.
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut conn = PacketConn::new(client, PacketMode::PacketAddr);
+
+        let err = conn.send(None, b"p").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        drop(conn);
+        // No partial frame reached the peer.
+        assert!(read_packet(&mut server).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn max_frame_boundary() {
+        // The 2-byte length field caps a frame at 65535 payload bytes: that
+        // exact size is accepted and delivered; 65536 is rejected before
+        // any write.
+        let (client, mut server) = tokio::io::duplex(1 << 17);
+        let mut conn = PacketConn::new(client, PacketMode::Raw);
+
+        let max = vec![0u8; MAX_FRAME];
+        conn.send(None, &max).await.unwrap();
+        let frame = read_packet(&mut server).await.unwrap().unwrap();
+        assert_eq!(frame, max);
+
+        let over = vec![0u8; MAX_FRAME + 1];
+        let err = conn.send(None, &over).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        drop(conn);
+        // Nothing more reached the peer.
         assert!(read_packet(&mut server).await.unwrap().is_none());
     }
 }
