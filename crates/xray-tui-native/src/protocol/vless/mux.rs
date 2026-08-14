@@ -467,7 +467,6 @@ enum SessionEvent {
     /// the per-packet destination for UDP sessions (`Some(addr)` — the
     /// dest parsed from the frame's metadata; TCP streams' Keep frames
     /// carry no target, so `None` there).
-    #[allow(dead_code)] // read by UdpSession::recv_from — wired by SP3 Task 2
     Data {
         dest: Option<SocketAddr>,
         bytes: Bytes,
@@ -606,9 +605,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
     /// its target is the first packet's destination, so the first
     /// [`UdpSession::send_to`] writes it (with the `GlobalID`, spec §4.1 —
     /// deviation 3). Fails when the tunnel is dead.
-    // `async` per the SP3 plan interface — Task 2 awaits it; the body is
-    // sync today because no eager New frame is sent.
-    #[allow(dead_code, clippy::unused_async)] // wired by SP3 Task 2 (PacketConn XUdp mode)
+    // `async` per the SP3 plan interface — the caller (connect_udp, the
+    // XUDP path) awaits it; the body is sync because no eager New frame
+    // is sent.
+    #[allow(clippy::unused_async)]
     pub(crate) async fn open_udp_session(&self, global_id: [u8; 8]) -> io::Result<UdpSession> {
         if self.dead.load(Ordering::Acquire) {
             return Err(tunnel_closed());
@@ -1229,7 +1229,6 @@ fn queue_end_fire_and_forget(id: u16, write_tx: &mpsc::Sender<Frame>) {
 /// payload — spec §8 deviation 3: not eager, the target is only known
 /// with the first packet); subsequent sends write `Keep` frames carrying
 /// that packet's own destination (spec §4.1).
-#[allow(dead_code)] // constructed by MuxClient::open_udp_session — wired by SP3 Task 2
 pub struct UdpSession {
     id: u16,
     rx: mpsc::Receiver<SessionEvent>,
@@ -1244,8 +1243,6 @@ pub struct UdpSession {
     first: AtomicBool,
 }
 
-// Methods wired by SP3 Task 2 (PacketConn XUdp mode); dead until then.
-#[allow(dead_code)]
 impl UdpSession {
     /// Sends one datagram to `dest`. The first call writes the session's
     /// `New` frame (network UDP + `dest` + the `GlobalID` + the payload);

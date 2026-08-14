@@ -30,6 +30,12 @@ use crate::protocol::vless::stream::VlessClientStream;
 /// The vision flow name (VLESS `addons.flow`).
 pub const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 
+/// The vision flow with the UDP/443 allowance (VLESS `addons.flow`): on
+/// the wire the addon is truncated to the first 16 bytes
+/// (`xtls-rprx-vision`, xray `requestAddons.Flow[:16]` — spec §4.3) and
+/// UDP traffic is rewritten to the XUDP mux tunnel instead of rejected.
+pub const FLOW_XTLS_RPRX_VISION_UDP443: &str = "xtls-rprx-vision-udp443";
+
 /// Padding command: keep padding, more frames follow.
 pub const CMD_CONTINUE: u8 = 0x00;
 /// Padding command: stop padding, stay inside the outer TLS.

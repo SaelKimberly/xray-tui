@@ -13,7 +13,7 @@
 
 use crate::addr::{TargetAddr, encode_addr};
 use crate::error::NativeError;
-use crate::protocol::vless::vision::FLOW_XTLS_RPRX_VISION;
+use crate::protocol::vless::vision::{FLOW_XTLS_RPRX_VISION, FLOW_XTLS_RPRX_VISION_UDP443};
 
 pub const VERSION: u8 = 0;
 pub const CMD_TCP: u8 = 1;
@@ -32,15 +32,21 @@ pub fn uuid_bytes(uuid_str: &str) -> Result<[u8; 16], NativeError> {
 /// total. Returns `None` for empty/unknown flows (`addon_len` stays 0).
 /// The client sends no `Seed` (field 2 unset) — `addons.proto` declares
 /// `Flow = 1`.
+///
+/// The udp443 variant is truncated to the first 16 bytes on the wire —
+/// xray `outbound.go`: `requestAddons.Flow = requestAddons.Flow[:16]`
+/// (spec §4.3) — so both vision flows encode the identical addon.
 pub(crate) fn encode_addons(flow: Option<&str>) -> Option<Vec<u8>> {
     flow.and_then(|f| {
-        (f == FLOW_XTLS_RPRX_VISION).then(|| {
-            let mut b = Vec::with_capacity(18);
-            b.push(0x0A);
-            b.push(16);
-            b.extend_from_slice(f.as_bytes());
-            b
-        })
+        let vision = match f {
+            FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443 => FLOW_XTLS_RPRX_VISION,
+            _ => return None,
+        };
+        let mut b = Vec::with_capacity(18);
+        b.push(0x0A);
+        b.push(16);
+        b.extend_from_slice(vision.as_bytes());
+        Some(b)
     })
 }
 
@@ -129,6 +135,18 @@ mod tests {
     fn encode_addons_vision_bytes_exact() {
         let got = encode_addons(Some("xtls-rprx-vision")).expect("vision flow encodes");
         // protobuf field 1 (Flow, wire type 2): tag 0x0A, len 0x10, 16 bytes.
+        let mut expected = vec![0x0A, 0x10];
+        expected.extend_from_slice(b"xtls-rprx-vision");
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 18);
+    }
+
+    #[test]
+    fn flow_udp443_truncated_to_vision() {
+        // The udp443 flow is truncated to the first 16 bytes on the wire —
+        // xray `requestAddons.Flow[:16]` (spec §4.3) — so the addon is
+        // byte-identical to the plain vision addon.
+        let got = encode_addons(Some("xtls-rprx-vision-udp443")).expect("udp443 flow encodes");
         let mut expected = vec![0x0A, 0x10];
         expected.extend_from_slice(b"xtls-rprx-vision");
         assert_eq!(got, expected);

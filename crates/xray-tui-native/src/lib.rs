@@ -53,7 +53,9 @@ pub mod transport;
 pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
-pub use protocol::vless::{MuxClient, MuxTarget, PacketConn, PacketMode, SessionStream};
+pub use protocol::vless::{
+    MuxClient, MuxTarget, PacketConn, PacketMode, SessionStream, UdpSession,
+};
 
 /// Connect through a single proxy to `params.target`.
 pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, NativeError> {
@@ -62,12 +64,19 @@ pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, Native
 }
 
 /// Connect through a single proxy with a UDP datagram tunnel to
-/// `params.target` (VLESS command 0x02; `params.udp` selects the packet
-/// mode: `Raw` or `PacketAddr`).
+/// `params.target` (`params.udp` selects the packet mode: `Raw` or
+/// `PacketAddr`).
 ///
 /// The same dial → security → transport chain as [`connect`] runs
-/// unchanged; only the protocol phase differs (command 0x02 + packet
-/// framing). The returned [`PacketConn`] is a datagram API over the tunnel.
+/// unchanged; only the protocol phase differs. Two tunnels:
+/// - RAW (default): VLESS command 0x02 + `[2B len]` datagram framing.
+/// - XUDP (`params.mux`, or the `xtls-rprx-vision-udp443` flow which
+///   forces it): the VLESS mux tunnel (command 0x03) with one UDP session
+///   carrying a random 8-byte `GlobalID`; the returned [`PacketConn`] is
+///   in [`PacketMode::XUdp`] and delegates to the session (per-packet
+///   destinations, no local framing).
+///
+/// The returned [`PacketConn`] is a datagram API over the tunnel.
 pub async fn connect_udp(
     params: &NativeConnectParams,
 ) -> Result<PacketConn<BoxStream>, NativeError> {
@@ -80,10 +89,9 @@ pub async fn connect_udp(
 ///
 /// The same dial → security → transport chain as [`connect`] runs
 /// unchanged; only the protocol phase differs (command 0x03 + mux framing
-/// to the fixed `v1.mux.cool` destination). `params.udp` must be `None`
-/// (the mux tunnel carries TCP sessions; UDP over mux / XUDP is a later
-/// plan). The returned [`MuxClient`] opens concurrent TCP sessions via
-/// [`MuxClient::open_session`].
+/// to the fixed `v1.mux.cool` destination). The returned [`MuxClient`]
+/// opens concurrent TCP sessions via [`MuxClient::open_session`] and UDP
+/// (XUDP) sessions via [`MuxClient::open_udp_session`].
 pub async fn connect_mux(
     params: &NativeConnectParams,
 ) -> Result<MuxClient<BoxStream>, NativeError> {

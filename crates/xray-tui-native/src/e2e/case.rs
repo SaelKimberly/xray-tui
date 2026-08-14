@@ -224,6 +224,7 @@ impl E2eCase for CaseSpec {
                 self.udp.map_or("raw", |m| match m {
                     PacketMode::Raw => "raw",
                     PacketMode::PacketAddr => "packetaddr",
+                    PacketMode::XUdp => "xudp",
                 })
             ),
         };
@@ -406,8 +407,8 @@ mod tests {
         assert!(!CaseSpec::vmess(Aes128GcmVariant).mux());
         // The axis is sticky once selected.
         assert!(CaseSpec::vless().with_mux(true).mux());
-        // Mux rows keep `params.udp` unset — `connect_mux` is TCP-only
-        // (UDP over mux / XUDP is a later plan).
+        // Mux rows keep `params.udp` unset — the TCP mux probe (XUDP rows
+        // set both, via the Task 4 harness plumbing).
         let params = CaseSpec::vless()
             .with_mux(true)
             .client_params(12345, "127.0.0.1:9999".parse().unwrap());

@@ -31,6 +31,12 @@ pub struct NativeConnectParams {
     /// command 0x02) with `Raw` (header-dest) or `PacketAddr` (per-packet
     /// magic-address destinations) framing.
     pub udp: Option<PacketMode>,
+    /// Mux tunnel for UDP: `true` routes [`crate::connect_udp`] through
+    /// the VLESS mux tunnel (XUDP — `connect_mux` → `open_udp_session` →
+    /// [`PacketMode::XUdp`]) instead of the raw `command=0x02` tunnel.
+    /// The `xtls-rprx-vision-udp443` flow forces the mux path regardless
+    /// (spec §4.3). Ignored by the TCP path ([`crate::connect`]).
+    pub mux: bool,
 }
 
 impl NativeConnectParams {
@@ -47,6 +53,7 @@ impl NativeConnectParams {
             resolved_ip: None,
             reality_provisioner: HelloProvisionerChoice::FixedChrome133,
             udp: None,
+            mux: false,
         }
     }
 }

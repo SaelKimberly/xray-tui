@@ -1,5 +1,6 @@
 //! VLESS — the reference protocol for the native core.
 
+use ring::rand::SecureRandom;
 use tokio::io::AsyncWriteExt;
 
 use xray_tui_proto::proto_spec::{SecurityConfig, VlessConfig};
@@ -9,7 +10,9 @@ use crate::addr::{Host, TargetAddr};
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::protocol::vless::stream::VlessClientStream;
-use crate::protocol::vless::vision::{FLOW_XTLS_RPRX_VISION, VisionStream};
+use crate::protocol::vless::vision::{
+    FLOW_XTLS_RPRX_VISION, FLOW_XTLS_RPRX_VISION_UDP443, VisionStream,
+};
 
 pub mod header;
 pub(crate) mod mux;
@@ -19,7 +22,7 @@ pub mod stream;
 pub(crate) mod udp;
 pub(crate) mod vision;
 
-pub use mux::{MuxClient, MuxTarget, SessionStream};
+pub use mux::{MuxClient, MuxTarget, SessionStream, UdpSession};
 pub use packet::{PacketConn, PacketMode};
 
 /// Connect through a VLESS outbound over an already-secured stream.
@@ -28,11 +31,12 @@ pub use packet::{PacketConn, PacketMode};
 /// header on its first read (see `stream.rs` for the eager-vs-lazy header
 /// semantics of xray-core vs sing-box).
 ///
-/// `flow == "xtls-rprx-vision"` takes the vision path: the header carries
-/// the protobuf flow addon (spec §4.1), the camouflage frame is emitted
-/// right after it (spec §4.6 step 3, deviation 1), and the padded codec
-/// wraps the stream (spec §5.4). Any other non-empty flow stays the
-/// `NotImplemented` guard.
+/// `flow == "xtls-rprx-vision"` / `"xtls-rprx-vision-udp443"` takes the
+/// vision path: the header carries the protobuf flow addon (spec §4.1,
+/// the udp443 variant truncated to `xtls-rprx-vision` on the wire — spec
+/// §4.3), the camouflage frame is emitted right after it (spec §4.6 step
+/// 3, deviation 1), and the padded codec wraps the stream (spec §5.4).
+/// Any other non-empty flow stays the `NotImplemented` guard.
 pub async fn connect(
     ctx: &LinkContext,
     stream: BoxStream,
@@ -41,7 +45,9 @@ pub async fn connect(
     let uuid = header::uuid_bytes(&cfg.uuid)?;
     match cfg.flow.as_deref() {
         None | Some("") => connect_plain(ctx, stream, uuid).await,
-        Some(FLOW_XTLS_RPRX_VISION) => connect_vision(ctx, stream, uuid).await,
+        Some(FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443) => {
+            connect_vision(ctx, stream, uuid, cfg.flow.as_deref()).await
+        }
         Some(other) => Err(NativeError::NotImplemented {
             feature: format!("vless flow {other}"),
         }),
@@ -67,7 +73,8 @@ async fn connect_plain(
     Ok(Box::new(VlessClientStream::new(stream)))
 }
 
-/// Vision (`xtls-rprx-vision`) connect path (spec §5.4).
+/// Vision (`xtls-rprx-vision` / `xtls-rprx-vision-udp443`) connect path
+/// (spec §5.4).
 ///
 /// Guarded preconditions, checked before any protocol-phase I/O (the
 /// header write):
@@ -75,13 +82,14 @@ async fn connect_plain(
 ///   `has_tls()` check is the whole story) — mirroring xray's rejection;
 /// - the transport is raw TCP — vision requires the socket for the Direct
 ///   handoff (spec §5.1; ws/grpc/xhttp framing is incompatible);
-/// - the command is TCP. The native VLESS client only has the TCP path
-///   (this file always sends [`header::CMD_TCP`]); a future UDP path must
-///   reject vision here — no XUDP mux (spec §2).
+/// - the command is TCP. The UDP path is separate ([`connect_udp`]); the
+///   udp443 variant takes this same path for TCP — the `-udp443` suffix
+///   only lifts the UDP rejection via the mux rewrite (spec §4.3).
 async fn connect_vision(
     ctx: &LinkContext,
     stream: BoxStream,
     uuid: [u8; 16],
+    flow: Option<&str>,
 ) -> Result<BoxStream, NativeError> {
     if !has_tls(ctx) {
         return Err(NativeError::Config(
@@ -94,12 +102,14 @@ async fn connect_vision(
         ));
     }
 
-    // Step 2: request header with the flow addon (addon_len = 18).
+    // Step 2: request header with the flow addon (addon_len = 18; the
+    // udp443 variant's addon is truncated to `xtls-rprx-vision` — spec
+    // §4.3).
     let request = header::encode_request(
         &uuid,
         &ctx.target,
         header::CMD_TCP,
-        header::encode_addons(Some(FLOW_XTLS_RPRX_VISION)).as_deref(),
+        header::encode_addons(flow).as_deref(),
     )?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;
@@ -145,36 +155,79 @@ fn has_tls(ctx: &LinkContext) -> bool {
     ctx.security().and_then(SecurityConfig::type_str).is_some()
 }
 
-/// UDP/flow guard: the vision flow cannot carry UDP packets (xray rewrites
-/// UDP to the XUDP mux path under vision; until SP3 adds XUDP the honest
-/// behavior is a client-side rejection — spec §2, §6).
-fn check_udp_allowed(flow: Option<&str>, udp: Option<PacketMode>) -> Result<(), NativeError> {
-    if udp.is_some() && flow == Some(FLOW_XTLS_RPRX_VISION) {
+/// UDP/flow guard: the vision flows cannot carry UDP over the RAW
+/// `command=0x02` tunnel — xray rewrites UDP to the XUDP mux path under
+/// vision (spec §2), so the raw path rejects here; the mux path
+/// (`params.mux`, or the udp443 flow which forces it) is allowed (XUDP,
+/// spec §4.3, §5.3).
+fn check_udp_allowed(
+    flow: Option<&str>,
+    udp: Option<PacketMode>,
+    mux: bool,
+) -> Result<(), NativeError> {
+    let vision_flow =
+        flow == Some(FLOW_XTLS_RPRX_VISION) || flow == Some(FLOW_XTLS_RPRX_VISION_UDP443);
+    if udp.is_some() && !mux && vision_flow {
         return Err(NativeError::NotImplemented {
-            feature: "VLESS vision does not support UDP (no XUDP mux)".into(),
+            feature:
+                "VLESS vision does not support UDP over the raw path (XUDP requires the mux tunnel)"
+                    .into(),
         });
     }
     Ok(())
 }
 
+/// A fresh random 8-byte `GlobalID` per tunnel (spec §4.2, deviation 1):
+/// xray derives it per source via blake3; the server requires only
+/// non-empty, so a CSPRNG draw is functionally equivalent for a
+/// single-user client (ring is already a dep — the xhttp `x_padding`
+/// pattern).
+fn random_global_id() -> [u8; 8] {
+    let mut gid = [0u8; 8];
+    ring::rand::SystemRandom::new()
+        .fill(&mut gid)
+        .expect("ring CSPRNG fills");
+    gid
+}
+
 /// UDP connect (protocol phase, parallel to [`connect_plain`]).
 ///
-/// The chain runs dial → security → transport exactly as for TCP; this
-/// writes the request header with `command = 0x02` and the UDP destination
-/// (port-first, spec §4.1), then wraps the tunnel in the packet-framed
-/// [`PacketConn`] for the configured mode. The vision+UDP guard
-/// ([`check_udp_allowed`]) runs before any protocol-phase I/O (the header
-/// write).
+/// The chain runs dial → security → transport exactly as for TCP. Two
+/// tunnels:
+/// - RAW (`params.mux = false`, and not the udp443 flow): writes the
+///   request header with `command = 0x02` and the UDP destination
+///   (port-first, spec §4.1), then wraps the tunnel in the packet-framed
+///   [`PacketConn`] for the configured mode.
+/// - XUDP (`params.mux`, or the udp443 flow which forces it): runs the
+///   mux tunnel (`connect_mux`), opens one UDP session with a fresh
+///   random `GlobalID`, and wraps it in the `XUdp` [`PacketConn`].
+///
+/// The vision+UDP guard ([`check_udp_allowed`]) runs before any
+/// protocol-phase I/O (the header write).
 pub async fn connect_udp(
     ctx: &LinkContext,
     stream: BoxStream,
     cfg: &VlessConfig,
 ) -> Result<PacketConn<BoxStream>, NativeError> {
     let uuid = header::uuid_bytes(&cfg.uuid)?;
-    check_udp_allowed(cfg.flow.as_deref(), ctx.params.udp)?;
+    // The udp443 flow rewrites UDP to the mux tunnel regardless of
+    // `params.mux` — xray's `allowUDP443` skips the vision UDP rejection
+    // and the mux rewrite applies to all UDP under vision (spec §4.3).
+    let mux = ctx.params.mux || cfg.flow.as_deref() == Some(FLOW_XTLS_RPRX_VISION_UDP443);
+    check_udp_allowed(cfg.flow.as_deref(), ctx.params.udp, mux)?;
     let mode = ctx.params.udp.ok_or_else(|| {
         NativeError::Config("vless udp connect requires params.udp (None = TCP path)".into())
     })?;
+    if mux {
+        // XUDP (spec §5.3): the mux tunnel (vision composition for the
+        // vision flows — addon + camouflage, peel inside), one UDP session
+        // with a fresh random GlobalID, wrapped in the XUdp PacketConn. No
+        // 2-byte framing — the mux frames carry the length and the
+        // per-packet destination (spec §4.1, §5.2).
+        let mux_client = connect_mux(ctx, stream, cfg).await?;
+        let session = mux_client.open_udp_session(random_global_id()).await?;
+        return Ok(PacketConn::xudp(session));
+    }
     match cfg.flow.as_deref() {
         None | Some("") => connect_udp_plain(ctx, stream, uuid, mode).await,
         Some(other) => Err(NativeError::NotImplemented {
@@ -226,6 +279,12 @@ fn udp_header_target(ctx: &LinkContext, mode: PacketMode) -> Result<TargetAddr, 
                 0,
             ))
         }
+        // XUdp never builds a raw header destination: the mux command
+        // carries none (connect_mux's mux_header_target) — the UDP header
+        // path is the non-mux one only.
+        PacketMode::XUdp => Err(NativeError::Config(
+            "vless xudp has no header destination (the mux command carries none)".into(),
+        )),
     }
 }
 
@@ -238,23 +297,22 @@ fn udp_header_target(ctx: &LinkContext, mode: PacketMode) -> Result<TargetAddr, 
 /// the mux command (xray's `EncodeRequestHeader` skips the address; the
 /// server derives the magic fqdn from the command byte) — the target
 /// built by [`mux_header_target`] is the semantic destination, not
-/// encoded bytes. `params.udp` must be `None`: the mux tunnel carries
-/// TCP sessions (UDP over mux / XUDP is SP3).
+/// encoded bytes. Sessions are TCP streams
+/// ([`MuxClient::open_session`]) or XUDP datagrams
+/// ([`MuxClient::open_udp_session`] — the UDP path [`connect_udp`] takes
+/// when mux is enabled). The udp443 flow takes the vision composition
+/// here (addon truncated to `xtls-rprx-vision` — spec §4.3).
 pub async fn connect_mux(
     ctx: &LinkContext,
     stream: BoxStream,
     cfg: &VlessConfig,
 ) -> Result<MuxClient<BoxStream>, NativeError> {
-    if ctx.params.udp.is_some() {
-        return Err(NativeError::Config(
-            "vless mux connect is TCP-only (UDP over mux / XUDP is not implemented; use connect_udp)"
-                .into(),
-        ));
-    }
     let uuid = header::uuid_bytes(&cfg.uuid)?;
     match cfg.flow.as_deref() {
         None | Some("") => connect_mux_plain(ctx, stream, uuid).await,
-        Some(FLOW_XTLS_RPRX_VISION) => connect_mux_vision(ctx, stream, uuid).await,
+        Some(FLOW_XTLS_RPRX_VISION | FLOW_XTLS_RPRX_VISION_UDP443) => {
+            connect_mux_vision(ctx, stream, uuid, cfg.flow.as_deref()).await
+        }
         Some(other) => Err(NativeError::NotImplemented {
             feature: format!("vless flow {other}"),
         }),
@@ -284,9 +342,9 @@ async fn connect_mux_plain(
     Ok(MuxClient::new(peeled))
 }
 
-/// Vision (`xtls-rprx-vision`) mux connect (spec §5.3): `cmd = CMD_MUX`
-/// with the flow addon, the camouflage frame, then the vision-padded
-/// multiplexer.
+/// Vision (`xtls-rprx-vision` / `xtls-rprx-vision-udp443`) mux connect
+/// (spec §5.3): `cmd = CMD_MUX` with the flow addon, the camouflage
+/// frame, then the vision-padded multiplexer.
 ///
 /// Guarded preconditions mirror [`connect_vision`], checked before any
 /// protocol-phase I/O:
@@ -297,11 +355,13 @@ async fn connect_mux_plain(
 ///
 /// Unlike the TCP command path there is no command guard: xray servers
 /// accept vision+mux (`inbound.go` splices `RequestCommandMux` under flow
-/// XRV with `CanSpliceCopy = 3`).
+/// XRV with `CanSpliceCopy = 3`). The udp443 variant is the XUDP carrier
+/// under vision — the addon truncates to `xtls-rprx-vision` (spec §4.3).
 async fn connect_mux_vision(
     ctx: &LinkContext,
     stream: BoxStream,
     uuid: [u8; 16],
+    flow: Option<&str>,
 ) -> Result<MuxClient<BoxStream>, NativeError> {
     if !has_tls(ctx) {
         return Err(NativeError::Config(
@@ -314,12 +374,14 @@ async fn connect_mux_vision(
         ));
     }
 
-    // Step 2: request header with the flow addon (addon_len = 18).
+    // Step 2: request header with the flow addon (addon_len = 18; the
+    // udp443 variant's addon is truncated to `xtls-rprx-vision` — spec
+    // §4.3).
     let request = header::encode_request(
         &uuid,
         &mux_header_target(),
         header::CMD_MUX,
-        header::encode_addons(Some(FLOW_XTLS_RPRX_VISION)).as_deref(),
+        header::encode_addons(flow).as_deref(),
     )?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;
@@ -459,10 +521,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vision_udp_is_rejected() {
-        // Vision + UDP is rejected wholesale (no XUDP mux until SP3) in
-        // BOTH packet modes, before any I/O — the guard, exercised through
-        // the real connect_udp entry.
+    async fn vision_udp_raw_still_rejected() {
+        // Vision + UDP on the RAW path is still rejected in BOTH packet
+        // modes, before any I/O — SP1's guard, exercised through the real
+        // connect_udp entry (XUDP requires the mux tunnel; spec §5.3).
         for mode in [PacketMode::Raw, PacketMode::PacketAddr] {
             let cfg = vless(Some("xtls-rprx-vision"), "tcp", true);
             let (stream, _peer) = stream_pair();
@@ -479,19 +541,39 @@ mod tests {
 
     #[test]
     fn check_udp_allowed_guard_matrix() {
-        // The guard rejects ONLY vision + UDP; every other combination
-        // passes (plain flows, unknown flows, vision on the TCP path).
-        for mode in [Some(PacketMode::Raw), Some(PacketMode::PacketAddr)] {
-            let err = check_udp_allowed(Some(FLOW_XTLS_RPRX_VISION), mode).unwrap_err();
-            assert!(
-                matches!(&err, NativeError::NotImplemented { feature } if feature.contains("XUDP"))
-            );
+        // The guard rejects ONLY the vision flows + UDP on the RAW path
+        // (XUDP requires the mux tunnel); every other combination passes —
+        // plain flows, unknown flows, vision over the mux path, vision on
+        // the TCP path.
+        for flow in [
+            Some(FLOW_XTLS_RPRX_VISION),
+            Some(FLOW_XTLS_RPRX_VISION_UDP443),
+        ] {
+            for mode in [Some(PacketMode::Raw), Some(PacketMode::PacketAddr)] {
+                let err = check_udp_allowed(flow, mode, false).unwrap_err();
+                assert!(
+                    matches!(&err, NativeError::NotImplemented { feature } if feature.contains("XUDP")),
+                    "{flow:?} mode {mode:?}: {err}"
+                );
+            }
         }
-        assert!(check_udp_allowed(None, Some(PacketMode::Raw)).is_ok());
-        assert!(check_udp_allowed(Some(""), Some(PacketMode::PacketAddr)).is_ok());
-        assert!(check_udp_allowed(Some("xtls-rprx-splice"), Some(PacketMode::Raw)).is_ok());
-        assert!(check_udp_allowed(Some(FLOW_XTLS_RPRX_VISION), None).is_ok());
-        assert!(check_udp_allowed(None, None).is_ok());
+        // The mux path lifts the rejection (XUDP) for both vision flows.
+        assert!(
+            check_udp_allowed(Some(FLOW_XTLS_RPRX_VISION), Some(PacketMode::Raw), true).is_ok()
+        );
+        assert!(
+            check_udp_allowed(
+                Some(FLOW_XTLS_RPRX_VISION_UDP443),
+                Some(PacketMode::PacketAddr),
+                true
+            )
+            .is_ok()
+        );
+        assert!(check_udp_allowed(None, Some(PacketMode::Raw), false).is_ok());
+        assert!(check_udp_allowed(Some(""), Some(PacketMode::PacketAddr), false).is_ok());
+        assert!(check_udp_allowed(Some("xtls-rprx-splice"), Some(PacketMode::Raw), false).is_ok());
+        assert!(check_udp_allowed(Some(FLOW_XTLS_RPRX_VISION), None, false).is_ok());
+        assert!(check_udp_allowed(None, None, true).is_ok());
     }
 
     #[tokio::test]
@@ -601,16 +683,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mux_rejects_udp_params() {
-        // Mux is TCP-only: params.udp set → config error before any I/O
-        // (UDP over mux / XUDP is SP3).
-        let cfg = vless(None, "tcp", false);
-        let (stream, _peer) = stream_pair();
-        let err = connect_mux(&udp_ctx_for(&cfg, PacketMode::Raw), stream, &cfg)
+    async fn vision_udp443_mux_not_rejected() {
+        // flow=udp443 + UDP + mux path → Ok: the udp443 flow rewrites UDP
+        // to the mux tunnel (XUDP) — the vision UDP rejection is lifted
+        // for the mux path even WITHOUT an explicit params.mux (spec
+        // §4.3, xray's `allowUDP443` + the UDP→mux rewrite).
+        use tokio::io::AsyncReadExt;
+
+        let cfg = vless(Some("xtls-rprx-vision-udp443"), "tcp", true);
+        let ctx = udp_ctx_for(&cfg, PacketMode::Raw);
+        let (stream, mut peer) = tokio::io::duplex(4096);
+        let stream: BoxStream = Box::new(stream);
+        let conn = connect_udp(&ctx, stream, &cfg)
             .await
-            .err()
-            .expect("mux + udp params must fail");
-        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("TCP-only")));
+            .expect("udp443 + UDP must take the XUDP mux path");
+
+        // The wire proves the rewrite: header with the TRUNCATED addon
+        // (addon_len 18, `xtls-rprx-vision` bytes) and cmd 0x03 MUX — not
+        // cmd 0x02 UDP.
+        let uuid = header::uuid_bytes(&cfg.uuid).unwrap();
+        let addons = header::encode_addons(Some(FLOW_XTLS_RPRX_VISION_UDP443)).unwrap();
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&uuid);
+        expected.push(18); // addon_len
+        expected.extend_from_slice(&addons);
+        expected.push(header::CMD_MUX);
+        let mut got = vec![0u8; 1 + 16 + 1 + 18 + 1];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, &expected[..]);
+
+        // The vision camouflage frame follows (the vision mux composition,
+        // spec §5.3).
+        let mut head = [0u8; 21];
+        peer.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[..16], &uuid);
+        assert_eq!(head[16], vision::CMD_CONTINUE);
+        assert_eq!(&head[17..19], &[0x00, 0x00]); // clen 0 (empty content)
+        let plen = usize::from(u16::from_be_bytes([head[19], head[20]]));
+        let mut pad = vec![0u8; plen];
+        peer.read_exact(&mut pad).await.unwrap();
+
+        drop(conn);
+    }
+
+    #[tokio::test]
+    async fn vision_udp_mux_not_rejected() {
+        // flow=vision (plain) + UDP + mux path → Ok: XUDP lifts the vision
+        // UDP rejection for the mux tunnel (spec §5.3).
+        let cfg = vless(Some("xtls-rprx-vision"), "tcp", true);
+        let mut ctx = udp_ctx_for(&cfg, PacketMode::Raw);
+        ctx.params.mux = true;
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let stream: BoxStream = Box::new(stream);
+        let conn = connect_udp(&ctx, stream, &cfg)
+            .await
+            .expect("vision + UDP + mux must take the XUDP path");
+        drop(conn);
+    }
+
+    #[tokio::test]
+    async fn udp443_flow_tcp_connects_like_vision() {
+        // The udp443 flow on the TCP command takes the vision path — the
+        // addon is truncated to `xtls-rprx-vision` (spec §4.3); only the
+        // UDP rejection differs (and only via the mux rewrite).
+        let cfg = vless(Some("xtls-rprx-vision-udp443"), "tcp", true);
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let stream: BoxStream = Box::new(stream);
+        let result = connect(&ctx_for(&cfg), stream, &cfg).await;
+        assert!(result.is_ok(), "udp443 + TCP must take the vision path");
     }
 
     #[tokio::test]
