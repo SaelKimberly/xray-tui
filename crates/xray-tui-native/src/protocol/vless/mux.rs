@@ -36,7 +36,7 @@
 //! Items are `pub` inside the `pub(crate)` module (effective
 //! `pub(crate)`), mirroring `udp.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -76,7 +76,7 @@ pub const OPT_ERROR: u8 = 0x02;
 
 /// Application data chunk size written per Keep frame (xray
 /// `SplitSize(mb, 8*1024)` for stream transfers).
-#[allow(dead_code)] // used by the (test-only until SP2 Task 3) SessionStream
+#[allow(dead_code)] // wired by the SP2 connect_mux task (SessionStream's only user)
 pub const CHUNK_SIZE: usize = 8 * 1024;
 
 /// Server-side `meta_len` rejection cap (`FrameMetadata.Unmarshal`), used
@@ -617,9 +617,12 @@ pub struct SessionStream {
     /// Terminal read state after `End`/`Error` — sticky, so every
     /// subsequent read keeps returning the same EOF/error.
     read_end: Option<ReadEnd>,
-    /// The frame currently being handed to the writer channel (a `Data`
-    /// chunk or the shutdown `End`), not yet counted as accepted.
-    write_pending: Option<WriteItem>,
+    /// Items not yet handed to the writer channel (a parked `Data` chunk
+    /// or the shutdown `End`), in send order. The front item is the one
+    /// with a reservation in flight (if any); an `End` is always queued
+    /// strictly behind accepted data. Bytes in queued `Data` items are
+    /// not yet counted as accepted.
+    write_queue: VecDeque<WriteItem>,
     write_state: WriteState,
     /// The `End` frame was handed over/queued — `Drop` must not send
     /// another.
@@ -633,13 +636,64 @@ enum ReadEnd {
     Err(io::Error),
 }
 
-/// The unit of in-flight write work.
+/// The unit of queued write work.
 #[allow(dead_code)] // wired by the SP2 connect_mux task
 enum WriteItem {
     /// A `Keep`-frame payload chunk; its length is the accepted count.
     Data(Bytes),
     /// The meta-only `End` frame (shutdown); accepted count 0.
     End,
+}
+
+#[allow(dead_code)] // wired by the SP2 connect_mux task
+impl WriteItem {
+    /// The accepted-byte count this item contributes (0 for `End`).
+    const fn len(&self) -> usize {
+        match self {
+            Self::Data(bytes) => bytes.len(),
+            Self::End => 0,
+        }
+    }
+
+    /// Borrowing conversion (for the direct `try_send` path).
+    fn to_frame(&self, id: u16) -> Frame {
+        match self {
+            Self::Data(payload) => Frame {
+                session_id: id,
+                status: STATUS_KEEP,
+                option: OPT_DATA,
+                target: None,
+                payload: payload.clone(),
+            },
+            Self::End => Frame {
+                session_id: id,
+                status: STATUS_END,
+                option: 0,
+                target: None,
+                payload: Bytes::new(),
+            },
+        }
+    }
+
+    /// Owning conversion (for the reservation-completion path).
+    fn into_frame(self, id: u16) -> Frame {
+        match self {
+            Self::Data(payload) => Frame {
+                session_id: id,
+                status: STATUS_KEEP,
+                option: OPT_DATA,
+                target: None,
+                payload,
+            },
+            Self::End => Frame {
+                session_id: id,
+                status: STATUS_END,
+                option: 0,
+                target: None,
+                payload: Bytes::new(),
+            },
+        }
+    }
 }
 
 /// A writer-channel capacity reservation (owns the sender, so the future
@@ -668,51 +722,55 @@ impl SessionStream {
             sessions,
             read_pending: None,
             read_end: None,
-            write_pending: None,
+            write_queue: VecDeque::new(),
             write_state: WriteState::Idle,
             end_queued: false,
         }
     }
 
-    /// Finishes an in-flight writer-channel reservation, returning the
-    /// accepted byte count of the item that was sent (0 for the `End`
-    /// frame). `Ready(Ok(0))` when idle.
-    fn poll_pending_write(&mut self, cx: &mut TaskCx<'_>) -> Poll<io::Result<usize>> {
-        match &mut self.write_state {
-            WriteState::Idle => Poll::Ready(Ok(0)),
-            WriteState::Waiting(fut) => match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(permit)) => {
-                    self.write_state = WriteState::Idle;
-                    let item = self
-                        .write_pending
-                        .take()
-                        .expect("a reservation in flight always has an item");
-                    let accepted = match &item {
-                        WriteItem::Data(bytes) => bytes.len(),
-                        WriteItem::End => 0,
+    /// Sends the front item of the write queue, finishing any in-flight
+    /// reservation first, and returns the accepted byte count of the item
+    /// that was sent (0 for `End`, 0 when idle). A full writer channel
+    /// parks (starts a reservation) rather than reporting `Ok(0)`.
+    fn poll_send_front(&mut self, cx: &mut TaskCx<'_>) -> Poll<io::Result<usize>> {
+        loop {
+            match &mut self.write_state {
+                WriteState::Idle => {
+                    let Some(item) = self.write_queue.front() else {
+                        return Poll::Ready(Ok(0));
                     };
-                    let frame = match item {
-                        WriteItem::Data(payload) => Frame {
-                            session_id: self.id,
-                            status: STATUS_KEEP,
-                            option: OPT_DATA,
-                            target: None,
-                            payload,
-                        },
-                        WriteItem::End => Frame {
-                            session_id: self.id,
-                            status: STATUS_END,
-                            option: 0,
-                            target: None,
-                            payload: Bytes::new(),
-                        },
-                    };
-                    permit.send(frame);
-                    Poll::Ready(Ok(accepted))
+                    let accepted = item.len();
+                    match self.write_tx.try_send(item.to_frame(self.id)) {
+                        Ok(()) => {
+                            self.write_queue.pop_front();
+                            return Poll::Ready(Ok(accepted));
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            self.write_state = WriteState::Waiting(Box::pin(
+                                self.write_tx.clone().reserve_owned(),
+                            ));
+                            // Loop to poll the fresh reservation.
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            return Poll::Ready(Err(tunnel_closed()));
+                        }
+                    }
                 }
-                Poll::Ready(Err(_)) => Poll::Ready(Err(tunnel_closed())),
-                Poll::Pending => Poll::Pending,
-            },
+                WriteState::Waiting(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        self.write_state = WriteState::Idle;
+                        let item = self
+                            .write_queue
+                            .pop_front()
+                            .expect("a reservation in flight always has a front item");
+                        let accepted = item.len();
+                        permit.send(item.into_frame(self.id));
+                        return Poll::Ready(Ok(accepted));
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(Err(tunnel_closed())),
+                    Poll::Pending => return Poll::Pending,
+                },
+            }
         }
     }
 
@@ -781,12 +839,19 @@ impl AsyncWrite for SessionStream {
         cx: &mut TaskCx<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.end_queued {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "vless mux: write after shutdown",
+            )));
+        }
         let mut accepted = 0;
         loop {
-            // Finish the in-flight reservation first; its item belongs to
-            // the prefix of `buf` (the caller re-polls from where we last
-            // returned), so its length counts toward `accepted`.
-            match self.poll_pending_write(cx) {
+            // Drive the queue front first (finishing any parked
+            // reservation); its item belongs to the prefix of `buf` (the
+            // caller re-polls from where we last returned), so its length
+            // counts toward `accepted`.
+            match self.poll_send_front(cx) {
                 Poll::Ready(Ok(n)) => accepted += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
@@ -797,29 +862,17 @@ impl AsyncWrite for SessionStream {
                     };
                 }
             }
-            if accepted >= buf.len() {
-                return Poll::Ready(Ok(accepted));
-            }
-            let n = std::cmp::min(CHUNK_SIZE, buf.len() - accepted);
-            let frame = Frame {
-                session_id: self.id,
-                status: STATUS_KEEP,
-                option: OPT_DATA,
-                target: None,
-                payload: Bytes::copy_from_slice(&buf[accepted..accepted + n]),
-            };
-            match self.write_tx.try_send(frame) {
-                Ok(()) => accepted += n,
-                Err(TrySendError::Full(frame)) => {
-                    // Park until the writer task frees capacity. The chunk
-                    // is kept (write_pending + reservation) so nothing is
-                    // lost; the caller's buffer is not consumed for it.
-                    self.write_pending = Some(WriteItem::Data(frame.payload));
-                    self.write_state =
-                        WriteState::Waiting(Box::pin(self.write_tx.clone().reserve_owned()));
-                    // loop: poll the reservation on the next iteration.
+            // Queue the next chunk from `buf` only when nothing is pending.
+            if self.write_queue.is_empty() {
+                if accepted >= buf.len() {
+                    return Poll::Ready(Ok(accepted));
                 }
-                Err(TrySendError::Closed(_)) => return Poll::Ready(Err(tunnel_closed())),
+                let n = std::cmp::min(CHUNK_SIZE, buf.len() - accepted);
+                self.write_queue
+                    .push_back(WriteItem::Data(Bytes::copy_from_slice(
+                        &buf[accepted..accepted + n],
+                    )));
+                // loop: hand the chunk to the channel.
             }
         }
     }
@@ -827,7 +880,7 @@ impl AsyncWrite for SessionStream {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
         // Frames are drained by the writer task in order; flush only needs
         // the current write handed to the channel (a no-op when idle).
-        match self.poll_pending_write(cx) {
+        match self.poll_send_front(cx) {
             Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
@@ -835,53 +888,111 @@ impl AsyncWrite for SessionStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
-        // Queue the meta-only End frame (spec §4.3) behind any in-flight
+        // First drive any parked data to the channel: the End must never
+        // overtake accepted data (a parked chunk is the current buf's
+        // prefix — sending it is a bonus, never a reorder).
+        loop {
+            match self.poll_send_front(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+            if self.write_queue.is_empty() {
+                break;
+            }
+        }
+        // Queue the meta-only End (spec §4.3) strictly behind the drained
         // data, then unregister. Drop (below) covers the fire-and-forget
         // path when the app never calls shutdown.
         if !self.end_queued {
             self.end_queued = true;
-            let end = Frame {
-                session_id: self.id,
-                status: STATUS_END,
-                option: 0,
-                target: None,
-                payload: Bytes::new(),
-            };
-            match self.write_tx.try_send(end) {
-                // Handed over, or the tunnel is dead — nothing to send in
-                // either case.
-                Ok(()) | Err(TrySendError::Closed(_)) => {}
-                Err(TrySendError::Full(_)) => {
-                    self.write_pending = Some(WriteItem::End);
-                    self.write_state =
-                        WriteState::Waiting(Box::pin(self.write_tx.clone().reserve_owned()));
-                }
-            }
+            self.write_queue.push_back(WriteItem::End);
             self.unregister();
         }
-        // Wait for the End (when queued) to reach the writer channel.
-        match self.poll_pending_write(cx) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        // Drive the End into the channel.
+        loop {
+            match self.poll_send_front(cx) {
+                Poll::Ready(Ok(_)) => {
+                    if self.write_queue.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
 
 impl Drop for SessionStream {
     fn drop(&mut self) {
-        // Fire-and-forget End + unregister (spec §4.3): the End is queued
-        // behind any in-flight data, preserving write order.
+        // Fire-and-forget End + unregister (spec §4.3). If poll_shutdown
+        // parked the End (writer channel full) before the drop, its
+        // reservation must be preserved so the peer still sees the close.
         if !self.end_queued {
-            let _ = self.write_tx.try_send(Frame {
-                session_id: self.id,
-                status: STATUS_END,
-                option: 0,
-                target: None,
-                payload: Bytes::new(),
+            self.end_queued = true;
+            self.queue_end_fire_and_forget();
+        } else if let WriteState::Waiting(fut) =
+            std::mem::replace(&mut self.write_state, WriteState::Idle)
+        {
+            // poll_shutdown queued the End but the writer was blocked when
+            // the stream was dropped — hand the reservation to a spawned
+            // task so the End is delivered once capacity frees.
+            let item = self.write_queue.pop_front().unwrap_or(WriteItem::End);
+            let id = self.id;
+            tokio::spawn(async move {
+                if let Ok(permit) = fut.await {
+                    permit.send(item.into_frame(id));
+                }
             });
         }
         self.unregister();
+    }
+}
+
+impl SessionStream {
+    /// The Drop-path End: delivered strictly after accepted data, even
+    /// when the writer channel is full at drop time. A parked Data chunk
+    /// (never accepted) is replaced by the End and its reservation is
+    /// handed to a spawned task that sends the End the moment the slot is
+    /// acquired; with nothing parked, a one-shot task waits for capacity.
+    #[allow(dead_code)] // wired by the SP2 connect_mux task
+    fn queue_end_fire_and_forget(&mut self) {
+        let end = Frame {
+            session_id: self.id,
+            status: STATUS_END,
+            option: 0,
+            target: None,
+            payload: Bytes::new(),
+        };
+        match self.write_tx.try_send(end) {
+            // Handed over, or the tunnel is dead — nothing to queue in
+            // either case.
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(end)) => {
+                match std::mem::replace(&mut self.write_state, WriteState::Idle) {
+                    WriteState::Waiting(fut) => {
+                        if let Some(front) = self.write_queue.front_mut() {
+                            *front = WriteItem::End;
+                        } else {
+                            self.write_queue.push_back(WriteItem::End);
+                        }
+                        let id = self.id;
+                        tokio::spawn(async move {
+                            if let Ok(permit) = fut.await {
+                                permit.send(WriteItem::End.to_frame(id));
+                            }
+                        });
+                    }
+                    WriteState::Idle => {
+                        let tx = self.write_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(end).await;
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1303,6 +1414,41 @@ mod tests {
         MuxTarget::TcpDomain("echo.test".into(), 80)
     }
 
+    /// A stream whose read half immediately errors (write half is a sink)
+    /// — for the tunnel-read-error teardown test.
+    struct ReadErrStream;
+
+    impl AsyncRead for ReadErrStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "test read error",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ReadErrStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     /// A write/reply round-trip on one session: the peer reads the Keep
     /// frame, answers with `payload`, and the app reads it back.
     async fn echo_roundtrip(
@@ -1612,6 +1758,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tunnel_read_error_ends_all_sessions() {
+        // A transport error on the tunnel read half ends every session
+        // (spec §6) and marks the client dead. Both sessions register
+        // before the first suspension, so the demux tears them down in
+        // one pass.
+        let mux = MuxClient::new(ReadErrStream);
+        let mut a = mux.open_session(echo_target()).await.unwrap();
+        let mut b = mux.open_session(echo_target()).await.unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(a.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(b.read(&mut buf).await.unwrap(), 0);
+        assert!(mux.open_session(echo_target()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn data_for_closed_session_is_ignored() {
+        // After A closes (End delivered), stray Keep frames for A's sid
+        // hit the unknown-session path (the demux unregisters closed
+        // sessions) instead of filling A's closed channel and stalling
+        // the demux head-of-line (8 buffered events would block it).
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let mut a = mux
+            .open_session(MuxTarget::TcpDomain("a.example".into(), 80))
+            .await
+            .unwrap();
+        let mut b = mux
+            .open_session(MuxTarget::TcpDomain("b.example".into(), 80))
+            .await
+            .unwrap();
+        let new_a = read_frame(&mut peer).await.unwrap().unwrap();
+        let new_b = read_frame(&mut peer).await.unwrap().unwrap();
+
+        // The peer ends A; A reads EOF.
+        write_frame(
+            &mut peer,
+            &Frame {
+                session_id: new_a.session_id,
+                status: STATUS_END,
+                option: 0,
+                target: None,
+                payload: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(a.read(&mut buf).await.unwrap(), 0);
+
+        // Ten stray data frames for A's closed sid — more than the 8-event
+        // channel capacity. Without demux unregistration they would fill
+        // the channel and stall the demux head-of-line.
+        for _ in 0..10 {
+            write_frame(
+                &mut peer,
+                &Frame {
+                    session_id: new_a.session_id,
+                    status: STATUS_KEEP,
+                    option: OPT_DATA,
+                    target: None,
+                    payload: Bytes::from_static(b"stray"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // A stays EOF and B's round-trip still works.
+        assert_eq!(a.read(&mut buf).await.unwrap(), 0);
+        echo_roundtrip(&mut b, &mut peer, new_b.session_id, b"b-data", b"b-reply").await;
+    }
+
+    #[tokio::test]
+    async fn data_for_unknown_session_is_ignored() {
+        // A Data frame for a session id that was never opened is dropped
+        // (spec §6: unknown session → ignore + log); the tunnel and its
+        // siblings keep working.
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let mut a = mux.open_session(echo_target()).await.unwrap();
+        let new_a = read_frame(&mut peer).await.unwrap().unwrap();
+
+        for sid in [0xFEED, 0xFFFE] {
+            write_frame(
+                &mut peer,
+                &Frame {
+                    session_id: sid,
+                    status: STATUS_KEEP,
+                    option: OPT_DATA,
+                    target: None,
+                    payload: Bytes::from_static(b"ghost"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        echo_roundtrip(&mut a, &mut peer, new_a.session_id, b"ping", b"pong").await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_parked_write_sends_end_last() {
+        // A caller that abandons a partial write (the channel is full, the
+        // write parked with Pending) and then drops the session must still
+        // deliver the End — strictly after accepted data, with no stray
+        // data after it. The parked chunk's bytes were never accepted, so
+        // dropping them is legal (AsyncWrite contract untouched).
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mux = MuxClient::new(client);
+        let mut a = mux.open_session(echo_target()).await.unwrap();
+        read_frame(&mut peer).await.unwrap().unwrap();
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // Fill the writer channel until a write parks. The peer is not
+        // reading, so the writer task blocks on the tiny duplex and the
+        // channel stays full.
+        let chunk = vec![0xCDu8; CHUNK_SIZE];
+        let mut filled = 0usize;
+        loop {
+            let mut a_pin = Pin::new(&mut a);
+            match a_pin.as_mut().poll_write(&mut cx, &chunk) {
+                Poll::Ready(Ok(n)) => filled += n,
+                Poll::Ready(Err(e)) => panic!("fill write failed: {e}"),
+                Poll::Pending => break, // channel full — the chunk is parked
+            }
+        }
+        assert!(
+            filled > 0,
+            "some data was accepted before the channel filled"
+        );
+
+        // The parked chunk must not jump ahead of the End: shutdown first
+        // parks (writer blocked), then the drop hands the End to a task
+        // that sends it once capacity frees.
+        assert!(
+            Pin::new(&mut a)
+                .as_mut()
+                .poll_shutdown(&mut cx)
+                .is_pending(),
+            "shutdown parks while the channel is full"
+        );
+        drop(a);
+
+        // Drain the peer: the accepted data frames, then the End — and no
+        // data after the End.
+        let mut drained = 0usize;
+        let mut saw_end = false;
+        let mut after_end = 0usize;
+        while let Ok(Ok(Some(frame))) =
+            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut peer)).await
+        {
+            if frame.status == STATUS_END {
+                saw_end = true;
+            } else {
+                drained += frame.payload.len();
+                if saw_end {
+                    after_end += frame.payload.len();
+                }
+            }
+        }
+        assert!(
+            saw_end,
+            "the peer must receive the End for the dropped session"
+        );
+        assert_eq!(drained, filled, "only accepted data is sent");
+        assert_eq!(after_end, 0, "no data after the End");
+    }
+
+    #[tokio::test]
     async fn write_backpressure_never_ok_zero() {
         // A 300 KiB write far exceeds the 32-frame × 8 KiB writer channel:
         // poll_write must park (Pending — never Ok(0)) and the whole
@@ -1658,26 +1972,49 @@ mod tests {
         let (client, mut peer) = tokio::io::duplex(4096);
         let mux = MuxClient::new(client);
         // With no sessions the tunnel still emits a KeepAlive every
-        // interval (deviation 2). Drive the virtual clock forward while
-        // waiting for the first one.
-        let clock = tokio::spawn(async move {
-            for _ in 0..300 {
-                tokio::time::advance(Duration::from_millis(100)).await;
-                tokio::task::yield_now().await;
+        // interval (deviation 2). Drive the virtual clock forward in
+        // steps until the first one arrives.
+        let mut first = None;
+        for _ in 0..(KEEPALIVE_INTERVAL.as_millis() / 100 * 4) {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+            if let Ok(Ok(Some(frame))) =
+                tokio::time::timeout(Duration::ZERO, read_frame(&mut peer)).await
+            {
+                first = Some(frame);
+                break;
             }
-        });
-        let frame = tokio::time::timeout(Duration::from_secs(20), read_frame(&mut peer))
-            .await
-            .expect("keepalive frame within 20 virtual seconds")
-            .expect("frame read")
-            .expect("some frame");
-        assert_eq!(frame.session_id, 0);
-        assert_eq!(frame.status, STATUS_KEEPALIVE);
-        assert_eq!(frame.option, 0);
-        assert!(frame.payload.is_empty());
-        clock.abort();
-        // Dropping the client stops the keepalive; the tunnel then tears
-        // down once the writer channel closes (no sessions hold senders).
+        }
+        let first = first.expect("keepalive frame within 4 intervals");
+        assert_eq!(first.session_id, 0);
+        assert_eq!(first.status, STATUS_KEEPALIVE);
+        assert_eq!(first.option, 0);
+        assert!(first.payload.is_empty());
+
+        // Dropping the client stops the keepalive task. Drain the ready
+        // queue first (the stop branch is the only ready one while the
+        // clock is still, but multiple tasks may be queued), so the task
+        // exits before any advance can make the next interval tick ready.
         drop(mux);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Now prove it: advance the clock past several more intervals and
+        // expect silence.
+        for _ in 0..(KEEPALIVE_INTERVAL.as_millis() / 100 * 4) {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        // Silence (timeout) or a clean tunnel EOF (the writer task exited
+        // once every sender — including the keepalive's — was gone) both
+        // prove the keepalive stopped; a frame would not.
+        match tokio::time::timeout(Duration::ZERO, read_frame(&mut peer)).await {
+            Err(_) | Ok(Ok(None)) => {}
+            Ok(Ok(Some(f))) => panic!(
+                "no keepalive frames after the client is dropped — got status {} sid {}",
+                f.status, f.session_id
+            ),
+            Ok(Err(e)) => panic!("read error after drop: {e}"),
+        }
     }
 }
