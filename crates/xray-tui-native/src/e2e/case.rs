@@ -342,16 +342,21 @@ mod tests {
                 .label(),
             "vless/xtls-rprx-vision/tcp/reality/inner-tls"
         );
+        // UDP rows carry the packet mode in the label (Raw vs PacketAddr).
         assert_eq!(
-            CaseSpec::vless().with_app(AppKind::Udp).label(),
-            "vless/tcp/tls/udp"
+            CaseSpec::vless()
+                .with_app(AppKind::Udp)
+                .with_udp(PacketMode::Raw)
+                .label(),
+            "vless/tcp/tls/udp-raw"
         );
         assert_eq!(
             CaseSpec::vless()
                 .with_tls(Box::new(RealityTls::fresh()))
                 .with_app(AppKind::Udp)
+                .with_udp(PacketMode::PacketAddr)
                 .label(),
-            "vless/tcp/reality/udp"
+            "vless/tcp/reality/udp-packetaddr"
         );
     }
 
