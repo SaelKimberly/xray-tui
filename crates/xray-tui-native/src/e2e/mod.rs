@@ -17,9 +17,10 @@ use std::time::Duration;
 pub use case::{AppKind, CaseSpec, Flow, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{
-    Certs, EchoServer, InnerTlsEchoServer, TlsEchoServer, UDP_PROBE_COUNT, UDP_PROBE_PAYLOADS,
-    UdpEchoServer, free_port, generate_certs, probe, probe_inner_tls, probe_udp, spawn_core,
-    spawn_echo, spawn_inner_tls_echo, spawn_tls_echo, spawn_udp_echo,
+    Certs, EchoServer, InnerTlsEchoServer, MUX_SESSION_COUNT, TlsEchoServer, UDP_PROBE_COUNT,
+    UDP_PROBE_PAYLOADS, UdpEchoServer, free_port, generate_certs, probe, probe_inner_tls,
+    probe_mux, probe_udp, spawn_core, spawn_echo, spawn_inner_tls_echo, spawn_tls_echo,
+    spawn_udp_echo,
 };
 pub use variant::{
     Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, PlainServerRealityClientTls,
@@ -238,6 +239,20 @@ pub async fn run_against(
             }
             eprintln!(
                 "[e2e] {}: attempt {attempt}/{ATTEMPTS} udp probe sent {sent} received {received}",
+                case.label()
+            );
+            continue;
+        }
+        if case.mux() {
+            // Mux rows: the probe drives its own `connect_mux` (one tunnel,
+            // N concurrent sessions) and requires every session's response
+            // back — the single-stream `connect` never runs.
+            let (opened, ok) = probe_mux(&params, case.probe_target(&env)).await;
+            if opened == MUX_SESSION_COUNT && ok == MUX_SESSION_COUNT {
+                return Ok(());
+            }
+            eprintln!(
+                "[e2e] {}: attempt {attempt}/{ATTEMPTS} mux probe opened {opened} ok {ok}",
                 case.label()
             );
             continue;

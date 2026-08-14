@@ -73,6 +73,12 @@ pub struct CaseSpec {
     /// session THROUGH the tunnel to a rustls echo target, or UDP
     /// datagrams to the UDP echo target.
     app: AppKind,
+    /// VLESS mux path: `true` routes the row through
+    /// [`super::harness::probe_mux`] — one `connect_mux` tunnel carrying
+    /// [`super::harness::MUX_SESSION_COUNT`] concurrent sessions to the
+    /// echo target instead of the single-stream probe. The row's `app`
+    /// stays [`AppKind::Plain`] (the probe sends HTTP over the sessions).
+    mux: bool,
     /// UDP packet mode for UDP rows: `None` = the TCP path (default);
     /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`PacketMode`]
     /// `Raw` = header-dest, `PacketAddr` = per-packet address header
@@ -93,6 +99,7 @@ impl CaseSpec {
             xhttp_mode: None,
             flow: None,
             app: AppKind::Plain,
+            mux: false,
             udp: None,
         }
     }
@@ -107,6 +114,7 @@ impl CaseSpec {
             xhttp_mode: None,
             flow: None,
             app: AppKind::Plain,
+            mux: false,
             udp: None,
         }
     }
@@ -156,6 +164,23 @@ impl CaseSpec {
         self.app
     }
 
+    /// Select the VLESS mux probe: `run_against` establishes one
+    /// `connect_mux` tunnel and opens [`super::harness::MUX_SESSION_COUNT`]
+    /// concurrent sessions to the echo target (default `false` = the
+    /// single-stream probe). The label gains `/mux`.
+    #[must_use]
+    pub const fn with_mux(mut self, mux: bool) -> Self {
+        self.mux = mux;
+        self
+    }
+
+    /// Whether the row probes the VLESS mux path (`run_against` routes it
+    /// to [`super::harness::probe_mux`]).
+    #[must_use]
+    pub const fn mux(&self) -> bool {
+        self.mux
+    }
+
     /// Select the TLS transport variant (fingerprint engine or REALITY).
     #[must_use]
     pub fn with_tls(mut self, tls: Box<dyn TlsVariant>) -> Self {
@@ -202,7 +227,8 @@ impl E2eCase for CaseSpec {
                 })
             ),
         };
-        format!("{proto}/{flow}{}/{tls}{sec}{app}", self.network)
+        let mux = if self.mux { "/mux" } else { "" };
+        format!("{proto}/{flow}{}/{tls}{sec}{app}{mux}", self.network)
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
@@ -358,6 +384,34 @@ mod tests {
                 .label(),
             "vless/tcp/reality/udp-packetaddr"
         );
+        // Mux rows: the client-side probe axis gains `/mux`; the app stays
+        // plain (HTTP over the sessions).
+        assert_eq!(
+            CaseSpec::vless().with_mux(true).label(),
+            "vless/tcp/tls/mux"
+        );
+        assert_eq!(
+            CaseSpec::vless()
+                .with_tls(Box::new(RealityTls::fresh()))
+                .with_mux(true)
+                .label(),
+            "vless/tcp/reality/mux"
+        );
+    }
+
+    #[test]
+    fn mux_defaults_off_and_plumbs() {
+        // Default rows keep the single-stream probe.
+        assert!(!CaseSpec::vless().mux());
+        assert!(!CaseSpec::vmess(Aes128GcmVariant).mux());
+        // The axis is sticky once selected.
+        assert!(CaseSpec::vless().with_mux(true).mux());
+        // Mux rows keep `params.udp` unset — `connect_mux` is TCP-only
+        // (UDP over mux / XUDP is a later plan).
+        let params = CaseSpec::vless()
+            .with_mux(true)
+            .client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert_eq!(params.udp, None);
     }
 
     #[test]

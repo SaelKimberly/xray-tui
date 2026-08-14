@@ -460,6 +460,26 @@ pub fn generate_certs() -> Certs {
     }
 }
 
+/// Parse an HTTP/1.1 response buffer into (status, body). Unknown status
+/// lines or a missing body yield `(0, String::new())` — the e2e runner
+/// retries the whole connection on such outcomes.
+fn parse_http_response(buf: &[u8]) -> (u16, String) {
+    let text = String::from_utf8_lossy(buf);
+    let status_line = text.lines().next().unwrap_or_default().to_string();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .trim_end()
+        .to_string();
+    (status, body)
+}
+
 /// Drive one HTTP GET/response exchange over `stream`, return (status, body).
 ///
 /// Fully bounded: the write fails fast on a broken stream instead of
@@ -490,20 +510,7 @@ where
     if read == 0 {
         return (0, String::new());
     }
-    let text = String::from_utf8_lossy(&buf);
-    let status_line = text.lines().next().unwrap_or_default().to_string();
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .trim_end()
-        .to_string();
-    (status, body)
+    parse_http_response(&buf)
 }
 
 /// Write a GET through the tunnel, return (status code, body).
@@ -633,6 +640,128 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
         }
     }
     (sent, received)
+}
+
+/// The number of concurrent sessions [`probe_mux`] opens through one
+/// [`crate::MuxClient`], each carrying a distinct HTTP GET to the echo
+/// target; the e2e runner requires every response back.
+pub const MUX_SESSION_COUNT: usize = 4;
+
+/// Overall budget for the mux probe (connect + all session opens + all
+/// exchanges). REALITY inbounds delay the first app-data exchange ~5s while
+/// the server's post-handshake record detector completes, so the window
+/// must cover that plus the concurrent round-trips.
+const MUX_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Drive one HTTP request/response exchange over `stream` bounded by a
+/// single overall deadline, return (status, body) — the per-session
+/// exchange of [`probe_mux`] (the whole probe runs under one deadline, so
+/// a stalled session must fail the probe, not hang it).
+async fn mux_exchange<S>(
+    stream: &mut S,
+    request: &[u8],
+    deadline: tokio::time::Instant,
+) -> (u16, String)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let write = tokio::time::timeout_at(deadline, stream.write_all(request)).await;
+    if write.is_err() {
+        return (0, String::new());
+    }
+    if let Err(e) = write.unwrap() {
+        eprintln!("probe_mux session write error: {e}");
+        return (0, String::new());
+    }
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout_at(deadline, stream.read_to_end(&mut buf)).await;
+    let Ok(Ok(read)) = read else {
+        return (0, String::new());
+    };
+    if read == 0 {
+        return (0, String::new());
+    }
+    parse_http_response(&buf)
+}
+
+/// Probe the VLESS mux path: one [`crate::connect_mux`] tunnel,
+/// [`MUX_SESSION_COUNT`] concurrent sessions to the echo target, a distinct
+/// HTTP GET per session, asserting every response arrives (order-independent
+/// across sessions).
+///
+/// Fully bounded: the whole exchange (connect, session opens, requests,
+/// responses) runs under one deadline. Returns `(opened, ok)` — the number
+/// of sessions successfully opened and the number whose response matched
+/// the echo (status 200 + [`super::config::BODY`]); the e2e runner asserts
+/// both equal [`MUX_SESSION_COUNT`]. Returns `(0, 0)` on a failed connect.
+pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) -> (usize, usize) {
+    use crate::protocol::vless::MuxTarget;
+    let deadline = tokio::time::Instant::now() + MUX_PROBE_TIMEOUT;
+    let client = match tokio::time::timeout_at(deadline, crate::connect_mux(params)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("probe_mux connect error: {e}");
+            return (0, 0);
+        }
+        Err(_) => {
+            eprintln!("probe_mux connect timed out");
+            return (0, 0);
+        }
+    };
+    // The sessions share one MuxClient; `open_session` takes `&self`, so
+    // the client is shared across the per-session tasks. Dropping the
+    // JoinSet (on deadline expiry) aborts the in-flight sessions.
+    let client = Arc::new(client);
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..MUX_SESSION_COUNT {
+        let client = Arc::clone(&client);
+        set.spawn(async move {
+            let mut session = match tokio::time::timeout_at(
+                deadline,
+                client.open_session(MuxTarget::Tcp(target)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    eprintln!("probe_mux open_session {i} error: {e}");
+                    return None;
+                }
+                Err(_) => {
+                    eprintln!("probe_mux open_session {i} timed out");
+                    return None;
+                }
+            };
+            // A distinct GET per session (the echo answers identically;
+            // the distinct paths prove each session carries its own data).
+            let request =
+                format!("GET /mux-{i} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            Some(mux_exchange(&mut session, request.as_bytes(), deadline).await)
+        });
+    }
+    let mut opened = 0;
+    let mut ok = 0;
+    let finished = tokio::time::timeout_at(deadline, async {
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Some((status, body))) => {
+                    opened += 1;
+                    if status == 200 && body == super::config::BODY {
+                        ok += 1;
+                    }
+                }
+                // open_session failed/timed out or the task panicked —
+                // the session contributed nothing.
+                Ok(None) | Err(_) => {}
+            }
+        }
+    })
+    .await;
+    if finished.is_err() {
+        eprintln!("probe_mux deadline expired with sessions in flight");
+    }
+    (opened, ok)
 }
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
