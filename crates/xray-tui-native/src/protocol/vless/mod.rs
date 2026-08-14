@@ -12,6 +12,7 @@ use crate::protocol::vless::vision::{FLOW_XTLS_RPRX_VISION, VisionStream};
 
 pub mod header;
 pub mod stream;
+pub(crate) mod udp;
 pub(crate) mod vision;
 
 /// Connect through a VLESS outbound over an already-secured stream.

@@ -14,27 +14,152 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::BoxStream;
 use crate::protocol::vless::header;
 
+/// Response-header peel state machine (private to [`Peel`]).
 #[derive(Clone, Copy)]
-enum Peel {
+enum PeelState {
     Head,
     Addons { total: usize, filled: usize },
     Done,
+}
+
+/// The VLESS response-header peel: `version(1B) | addon_len(1B) | addons`,
+/// consumed once from the tunnel before the first payload byte.
+///
+/// Extracted from [`VlessClientStream`] so the UDP `PacketConn` (Task 2)
+/// reuses the exact same logic. State persists in the struct, so the peel
+/// is resumable across Pending polls and dropped futures — a partial poll
+/// never re-consumes the version byte.
+pub(crate) struct Peel {
+    /// Whether the response-header version byte has been read.
+    ver_read: bool,
+    /// Staging for the addons bytes (discarded after the peel).
+    addons: [u8; 255],
+    addons_total: usize,
+    state: PeelState,
+    /// A non-vless first byte (REALITY transparent-proxy fallback) handed
+    /// back to the reader as payload via [`Peel::take_passthrough`].
+    passthrough: Option<u8>,
+}
+
+impl Peel {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            ver_read: false,
+            addons: [0; 255],
+            addons_total: 0,
+            state: PeelState::Head,
+            passthrough: None,
+        }
+    }
+
+    /// True once the response header (or the non-vless passthrough byte)
+    /// has been consumed; the stream is then plain payload.
+    #[must_use]
+    pub(crate) const fn is_peeled(&self) -> bool {
+        matches!(self.state, PeelState::Done)
+    }
+
+    /// Returns the non-vless first byte, if the peel stashed one (REALITY
+    /// transparent-proxy fallback: the first byte is payload, not a vless
+    /// response header).
+    #[must_use]
+    pub(crate) const fn take_passthrough(&mut self) -> Option<u8> {
+        self.passthrough.take()
+    }
+
+    /// Reads the VLESS response header (`version|addons_len|addons`) once.
+    ///
+    /// Reuses the exact `VlessClientStream` logic: eager/lazy-server-safe,
+    /// fragmented-header-safe, non-vless passthrough (stashed via
+    /// [`Peel::take_passthrough`]), EOF-before-header is `UnexpectedEof`.
+    pub(crate) async fn ensure_peeled<R: AsyncRead + Unpin>(
+        &mut self,
+        r: &mut R,
+    ) -> io::Result<()> {
+        loop {
+            match self.state {
+                PeelState::Done => return Ok(()),
+                PeelState::Head => {
+                    // The response header is `version(1) | addon_len(1) |
+                    // addons`. A vless server always sends version 0x00; a
+                    // NON-vless endpoint (REALITY transparent-proxy
+                    // fallback — the client's TLS session terminates at the
+                    // dest, not at a vless server) sends no header at all,
+                    // so the first byte is plain payload. The version byte
+                    // is read first (persisted in `ver_read` so a Pending
+                    // addon-length poll does not re-consume it).
+                    if !self.ver_read {
+                        let mut tmp = [0u8; 1];
+                        let got = r.read(&mut tmp).await?;
+                        if got == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "vless response header truncated (EOF)",
+                            ));
+                        }
+                        self.ver_read = true;
+                        if tmp[0] != header::VERSION {
+                            // No vless response header: hand the byte back
+                            // as payload.
+                            self.state = PeelState::Done;
+                            self.passthrough = Some(tmp[0]);
+                            return Ok(());
+                        }
+                    }
+                    // Version matches: read the addon length.
+                    let mut tmp = [0u8; 1];
+                    let got = r.read(&mut tmp).await?;
+                    if got == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "vless response header truncated (EOF)",
+                        ));
+                    }
+                    self.addons_total = usize::from(tmp[0]);
+                    self.state = if self.addons_total > 0 {
+                        PeelState::Addons {
+                            total: self.addons_total,
+                            filled: 0,
+                        }
+                    } else {
+                        PeelState::Done
+                    };
+                }
+                PeelState::Addons { total, filled } => {
+                    // Bound the staging read to the addons remainder — a
+                    // fixed-size buffer would swallow payload bytes.
+                    let need = total - filled;
+                    let mut tmp = [0u8; 255];
+                    let got = r.read(&mut tmp[..need]).await?;
+                    if got == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "vless response addons truncated (EOF)",
+                        ));
+                    }
+                    self.addons[filled..filled + got].copy_from_slice(&tmp[..got]);
+                    let filled = filled + got;
+                    self.state = if filled == total {
+                        PeelState::Done
+                    } else {
+                        PeelState::Addons { total, filled }
+                    };
+                }
+            }
+        }
+    }
 }
 
 /// Tunnel stream over the secured connection; strips the VLESS response
 /// header once, then transparently streams the body.
 pub struct VlessClientStream {
     inner: BoxStream,
-    /// Whether the response-header version byte has been read (persisted so
-    /// the peel is resumable across Pending polls).
-    ver_read: bool,
-    addons: [u8; 255],
-    addons_total: usize,
     peel: Peel,
 }
 
@@ -43,10 +168,7 @@ impl VlessClientStream {
     pub fn new(inner: BoxStream) -> Self {
         Self {
             inner,
-            ver_read: false,
-            addons: [0; 255],
-            addons_total: 0,
-            peel: Peel::Head,
+            peel: Peel::new(),
         }
     }
 }
@@ -58,84 +180,19 @@ impl AsyncRead for VlessClientStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            let peel = self.peel; // Peel: Copy — no borrow of `self` held across awaits
-            match peel {
-                Peel::Done => break,
-                Peel::Head => {
-                    // The response header is `version(1) | addon_len(1) |
-                    // addons`. A vless server always sends version 0x00; a
-                    // NON-vless endpoint (REALITY transparent-proxy
-                    // fallback — the client's TLS session terminates at the
-                    // dest, not at a vless server) sends no header at all,
-                    // so the first byte is plain payload. The version byte
-                    // is read first (persisted in `ver_read` so a Pending
-                    // addon-length poll does not re-consume it).
-                    if !self.ver_read {
-                        let mut tmp = [0u8; 1];
-                        let mut rb = ReadBuf::new(&mut tmp);
-                        ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
-                        let got = rb.filled().len();
-                        if got == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "vless response header truncated (EOF)",
-                            )));
-                        }
-                        self.ver_read = true;
-                        if tmp[0] != header::VERSION {
-                            // No vless response header: hand the byte back
-                            // as payload.
-                            self.peel = Peel::Done;
-                            buf.put_slice(&[tmp[0]]);
-                            return Poll::Ready(Ok(()));
-                        }
-                    }
-                    // Version matches: read the addon length.
-                    let mut tmp = [0u8; 1];
-                    let mut rb = ReadBuf::new(&mut tmp);
-                    ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
-                    let got = rb.filled().len();
-                    if got == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "vless response header truncated (EOF)",
-                        )));
-                    }
-                    self.addons_total = usize::from(tmp[0]);
-                    self.peel = if self.addons_total > 0 {
-                        Peel::Addons {
-                            total: self.addons_total,
-                            filled: 0,
-                        }
-                    } else {
-                        Peel::Done
-                    };
-                }
-                Peel::Addons { total, filled } => {
-                    // Bound the staging read to the addons remainder — a
-                    // fixed-size buffer would swallow payload bytes.
-                    let need = total - filled;
-                    let mut tmp = [0u8; 255];
-                    let mut rb = ReadBuf::new(&mut tmp[..need]);
-                    ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
-                    let got = rb.filled().len();
-                    if got == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "vless response addons truncated (EOF)",
-                        )));
-                    }
-                    self.addons[filled..filled + got].copy_from_slice(&tmp[..got]);
-                    let filled = filled + got;
-                    self.peel = if filled == total {
-                        Peel::Done
-                    } else {
-                        Peel::Addons { total, filled }
-                    };
-                }
+            let this = self.as_mut().get_mut();
+            // A NON-vless endpoint's first byte was stashed by the peel:
+            // return it as payload before streaming the tunnel.
+            if let Some(b) = this.peel.take_passthrough() {
+                buf.put_slice(&[b]);
+                return Poll::Ready(Ok(()));
             }
+            if this.peel.is_peeled() {
+                return Pin::new(&mut this.inner).poll_read(cx, buf);
+            }
+            let fut = std::pin::pin!(this.peel.ensure_peeled(&mut this.inner));
+            ready!(fut.poll(cx))?;
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
