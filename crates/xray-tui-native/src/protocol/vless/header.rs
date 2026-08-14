@@ -8,7 +8,7 @@
 //! carries NO destination bytes — `EncodeRequestHeader` skips the address
 //! for those commands and the server derives the fixed `v1.mux.cool` fqdn
 //! from the command byte alone (`DecodeRequestHeader`). Command: 0x01 TCP,
-//! 0x02 UDP, 0x03 MUX.
+//! 0x02 UDP, 0x03 MUX, 0x04 Rvs.
 //! Response header: `version(1B, echoed 0) | addon_len(1B) | addons`.
 
 use crate::addr::{TargetAddr, encode_addr};

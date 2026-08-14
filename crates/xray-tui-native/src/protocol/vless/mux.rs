@@ -233,7 +233,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
                 "vless mux new frame requires a target",
             )
         })?;
-        meta.extend_from_slice(&encode_new_target(target));
+        meta.extend_from_slice(&encode_new_target(target)?);
     }
     let meta_len = u16::try_from(meta.len()).map_err(|_| {
         io::Error::new(
@@ -273,9 +273,9 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
 
 /// Encodes a New-frame target as the port-first address bytes:
 /// `[2B port][atyp][addr]` (IPv4 4 / Domain 1+len / IPv6 16). The network
-/// byte (`NETWORK_TCP`) is written separately by [`write_frame`].
-#[must_use]
-pub fn encode_new_target(t: &MuxTarget) -> Vec<u8> {
+/// byte (`NETWORK_TCP`) is written separately by [`write_frame`]. A
+/// domain longer than the wire's 255-byte length field is `InvalidInput`.
+pub fn encode_new_target(t: &MuxTarget) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2 + 1 + 16);
     match t {
         MuxTarget::Tcp(sa) => {
@@ -294,16 +294,22 @@ pub fn encode_new_target(t: &MuxTarget) -> Vec<u8> {
         MuxTarget::TcpDomain(domain, port) => {
             out.extend_from_slice(&port.to_be_bytes());
             out.push(ADDR_TYPE_DOMAIN);
-            // The wire address caps domain length at 255; the VLESS header
+            // The wire address caps domain length at 255. The VLESS header
             // encode rejects longer domains before a mux target is ever
-            // built (addr.rs `encode_addr` → Config error).
-            let len =
-                u8::try_from(domain.len()).expect("mux target domain fits in one length byte");
+            // built (addr.rs `encode_addr` → Config error), so this is
+            // defense-in-depth: a panic here would kill the spawned writer
+            // task and silently tear down the whole tunnel.
+            let len = u8::try_from(domain.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "vless mux target domain exceeds the 255-byte wire limit",
+                )
+            })?;
             out.push(len);
             out.extend_from_slice(domain.as_bytes());
         }
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------
@@ -436,6 +442,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
             self.dead.store(true, Ordering::Release);
             return Err(tunnel_closed());
         }
+        // Re-check the demux: it may have exited between the first check
+        // above and the map insert/send. Its exit clears the session map,
+        // so a registration inserted after the clear would never be
+        // routed — the session's reads would hang on an empty channel.
+        // Unregister and fail cleanly instead.
+        if self.dead.load(Ordering::Acquire) {
+            lock_map(&self.sessions).remove(&id);
+            return Err(tunnel_closed());
+        }
         Ok(SessionStream::new(
             id,
             rx,
@@ -498,6 +513,12 @@ async fn route(frame: Frame, sessions: &Mutex<HashMap<u16, mpsc::Sender<SessionE
         // server-initiated New — nothing to route. Both are no-ops.
         STATUS_KEEPALIVE | STATUS_NEW => return true,
         STATUS_END => {
+            // The Error option reports a session error (spec §4.4) —
+            // surface it rather than a plain EOF. Deviation from xray's
+            // client: `handleStatusEnd` closes with EOF regardless of the
+            // option (`s.Close(false)`); keeping the Error mapping is
+            // arguably more correct, and both cores send session errors
+            // as Keep+Error, so End+Error is a defensive branch.
             if frame.option & OPT_ERROR != 0 {
                 SessionEvent::Error(session_error())
             } else {
@@ -1124,10 +1145,23 @@ mod tests {
     #[test]
     fn domain_target_encode() {
         // port-first: [port 0x01BB][atyp 0x02][len 0x0B][b"example.com"]
-        let bytes = encode_new_target(&MuxTarget::TcpDomain("example.com".into(), 443));
+        let bytes = encode_new_target(&MuxTarget::TcpDomain("example.com".into(), 443)).unwrap();
         let mut expected = vec![0x01, 0xBB, 0x02, 0x0B];
         expected.extend_from_slice(b"example.com");
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn domain_target_too_long_is_error() {
+        // A 256-byte domain cannot fit the wire's 1-byte length field.
+        // The encode returns InvalidInput instead of panicking — a panic
+        // inside the spawned writer task would kill the whole tunnel
+        // (defense-in-depth; the VLESS header encode rejects long domains
+        // before a mux target is ever built).
+        let long = "a".repeat(256);
+        let err = encode_new_target(&MuxTarget::TcpDomain(long, 443)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("255"));
     }
 
     #[tokio::test]
@@ -1630,6 +1664,43 @@ mod tests {
 
         // B is unaffected.
         echo_roundtrip(&mut b, &mut peer, new_b.session_id, b"b-data", b"b-reply").await;
+    }
+
+    #[tokio::test]
+    async fn end_with_error_option_surfaces_error() {
+        // An End frame carrying the Error option reports a session error
+        // (spec §4.4) — the read must surface it, NOT return 0 (EOF) as a
+        // plain End would. Deviation from xray's client: `handleStatusEnd`
+        // closes with EOF regardless of the option; the Error mapping is
+        // deliberately kept (the option exists to carry the peer's error).
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mux = MuxClient::new(client);
+        let mut a = mux
+            .open_session(MuxTarget::TcpDomain("a.example".into(), 80))
+            .await
+            .unwrap();
+        let new_a = read_frame(&mut peer).await.unwrap().unwrap();
+
+        write_frame(
+            &mut peer,
+            &Frame {
+                session_id: new_a.session_id,
+                status: STATUS_END,
+                option: OPT_ERROR,
+                target: None,
+                payload: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 16];
+        let err = a.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        // Terminal reads are sticky: the error keeps coming back.
+        assert_eq!(
+            a.read(&mut buf).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
     }
 
     #[tokio::test]
