@@ -16,9 +16,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Returns `Ok(None)` on a clean EOF at a frame boundary (zero bytes read
 /// for the length). Empty frames (len 0) are skipped. A truncated frame —
 /// a partial length byte or a short payload at EOF — is `UnexpectedEof`.
-// `PacketConn` (Task 2) is the lib consumer; until then the codec is used
-// only by the unit tests below.
-#[allow(dead_code)]
 pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     loop {
         let mut len = [0u8; 2];
@@ -51,10 +48,7 @@ pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<V
 /// Writes one `[2B BE len][payload]` frame.
 ///
 /// The payload must fit a u16 length (<= 65535); the caller (the
-/// `PacketConn`, Task 2) rejects larger datagrams before reaching the codec.
-// `PacketConn` (Task 2) is the lib consumer; until then the codec is used
-// only by the unit tests below.
-#[allow(dead_code)]
+/// `PacketConn`) rejects larger datagrams before reaching the codec.
 pub async fn write_packet<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     let n = u16::try_from(payload.len()).expect("vless udp frame payload fits u16");
     let mut frame = Vec::with_capacity(payload.len() + 2);

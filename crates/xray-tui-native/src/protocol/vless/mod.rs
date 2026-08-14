@@ -11,6 +11,8 @@ use crate::protocol::vless::stream::VlessClientStream;
 use crate::protocol::vless::vision::{FLOW_XTLS_RPRX_VISION, VisionStream};
 
 pub mod header;
+pub(crate) mod packet;
+pub(crate) mod packetaddr;
 pub mod stream;
 pub(crate) mod udp;
 pub(crate) mod vision;
