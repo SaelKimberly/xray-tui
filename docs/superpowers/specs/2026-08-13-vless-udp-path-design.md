@@ -93,16 +93,22 @@ SP3's mux path; SP1 implements only the packetaddr and raw modes):
 - The VLESS **header destination = the magic fqdn** `sp.packet-addr.v2fly.arpa`
   (sing-vmess `SeqPacketMagicAddress`), command = 0x02, the target is NOT in
   the header.
-- Each packet payload carries its own destination:
+- Each packet payload carries its own destination header (NO magic in the
+  frame — the magic is the header destination only):
 
 ```
-"sp.packet-addr.v2fly.arpa" | atyp (1 byte) | addr | port (2 bytes BE)
+atyp (1 byte) | addr | port (2 bytes BE)
 ```
 
   (sing default serializer order: atyp-first, then addr, then port —
   `WriteAddrPort` without `PortThenAddress`, serializer.go:94-121;
   atyp: IPv4 = 0x01, IPv6 = 0x02; **fqdn unsupported** — client error for
-  domain targets.)
+  domain targets. The magic is NOT prefixed to the per-packet header: sing's
+  packetaddr `AddressSerializer` registers only the IP family bytes, and a
+  magic-prefixed frame is rejected by the sing-box server as an unknown
+  address family. **Corrected from an earlier draft that asserted
+  `magic | atyp | addr | port` in the frame — verified against sing-box
+  1.13.16 + mihomo sing-vmess.)**
 - The sing-box server (inbound.go packetaddr unwrap) decodes per-packet
   destinations; the frame payload after the destination header is the
   datagram.
@@ -153,8 +159,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
   return the datagram. EOF between frames → `Ok(None)`.
 - No `AsyncRead`/`AsyncWrite` impls (datagram semantics, not a byte stream).
 - The packetaddr variant lives INSIDE the PacketConn framing: when the mode
-  is packetaddr, `send` prepends `magic + atyp + addr + port` to the payload
-  and `recv` strips it (validating the magic; the destination is returned
+  is packetaddr, `send` prepends `atyp + addr + port` to the payload
+  and `recv` strips it (the destination is returned
   with the payload — see §5.3).
 
 ### 5.3 Packet-mode plumbing
@@ -211,8 +217,8 @@ UDP + REALITY/TLS outer: fine. UDP + vision: rejected (§5.3).
   split-frame reads (2B header / partial payload), EOF at boundary,
   empty-frame skip.
 - PacketConn: peel-then-frames on first recv; multiple datagrams; EOF.
-- packetaddr encode: exact bytes `magic + 0x01 + 4B IPv4 + 2B port` and
-  `magic + 0x02 + 16B IPv6 + 2B port`; decode round-trip; fqdn target error.
+- packetaddr encode: exact bytes `0x01 + 4B IPv4 + 2B port` and
+  `0x02 + 16B IPv6 + 2B port`; decode round-trip; fqdn target error.
 - Vision+UDP guard: connect() with flow=vision + UDP target → error.
 
 ### 7.2 Hermetic
