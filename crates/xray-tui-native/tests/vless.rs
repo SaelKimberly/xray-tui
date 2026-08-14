@@ -108,6 +108,13 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 // it over tls and reality.
 #[case::udp_tls_plain(vless_udp(PacketMode::Raw))]
 #[case::udp_reality_plain(vless_udp_tls(PacketMode::Raw, reality()))]
+// VLESS mux axis (spec §7.3): one `connect_mux` tunnel (command 0x03 to
+// v1.mux.cool:9527) carrying MUX_SESSION_COUNT concurrent sessions to the
+// echo target — each session a distinct HTTP GET, every response asserted
+// (order-independent). Over tls and reality, both cores (the probe
+// smoke-passed 4/4 real-core in Task 5).
+#[case::mux_tls(vless("tcp").with_mux(true))]
+#[case::mux_reality(vless_tls("tcp", reality()).with_mux(true))]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,
@@ -157,6 +164,18 @@ async fn vless_against_cores(
 // has no packetaddr registration (verified — no packetaddr symbols in
 // thirdparty/Xray-core/proxy/vless), so the row is sing-box single-core.
 #[case::udp_packetaddr_tls(vless_udp(PacketMode::PacketAddr), CoreKind::SingBox)]
+// Optional mux+vision row (spec §5.3): the vision flow over the mux
+// tunnel — the header carries the flow addon + camouflage frame, then mux
+// frames ride the vision-padded stream. The server's TLS filter sees the
+// mux New frame (2-byte length prefix) as non-TLS and stays on the End
+// path (no splice), so the mux sessions flow over the padded tunnel —
+// verified interop with sing-box 1.13.16. xray-core 26.3.27 rejects the
+// combination BY DESIGN: for command=mux under flow XRV it sets
+// AllowedNetwork=UDP (inbound.go — vision+mux is the XUDP path), so a TCP
+// New frame fails with "unexpected network TCP" and breaks the whole mux
+// connection ("we will break Mux connections that contain TCP requests").
+// Hence sing-box single-core.
+#[case::mux_vision_singbox(vless("tcp").with_flow(Flow::Vision).with_mux(true), CoreKind::SingBox)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,

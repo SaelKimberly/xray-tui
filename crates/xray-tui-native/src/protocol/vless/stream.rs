@@ -171,6 +171,13 @@ impl VlessClientStream {
             peel: Peel::new(),
         }
     }
+
+    /// The wrapped stream — the vision Direct-splice seam recovers the
+    /// engine `TlsStream` through the peel wrapper (see `vision.rs`
+    /// `tls_stream_mut`).
+    pub(crate) fn inner_mut(&mut self) -> &mut BoxStream {
+        &mut self.inner
+    }
 }
 
 impl AsyncRead for VlessClientStream {

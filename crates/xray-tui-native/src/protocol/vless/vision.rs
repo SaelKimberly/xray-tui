@@ -25,6 +25,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use bytes::Buf;
 
+use crate::protocol::vless::stream::VlessClientStream;
+
 /// The vision flow name (VLESS `addons.flow`).
 pub const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 
@@ -101,12 +103,27 @@ impl DirectMode for Box<dyn crate::Stream> {
 
 /// Recover the concrete engine `TlsStream` behind the boxed seam (upcast
 /// `&mut dyn Stream` → `&mut dyn Any` via the supertrait, then downcast).
+///
+/// Two shapes are possible:
+/// 1. The box holds the `TlsStream` directly.
+/// 2. The box holds the response-header peel (`VlessClientStream`) over
+///    the engine `TlsStream` — the peel-inside composition of both vision
+///    connect paths (`connect_vision`, `connect_mux_vision`), which
+///    matches Go's client (peel before the `VisionReader`). Recover through
+///    the wrapper.
 fn tls_stream_mut(
     stream: &mut Box<dyn crate::Stream>,
 ) -> Option<&mut xray_tui_tls::record::stream::TlsStream<crate::BoxStream>> {
-    let inner: &mut dyn crate::Stream = &mut **stream;
-    let any: &mut dyn std::any::Any = inner;
-    any.downcast_mut::<xray_tui_tls::record::stream::TlsStream<crate::BoxStream>>()
+    let any: &mut dyn std::any::Any = &mut **stream;
+    let tid = std::any::Any::type_id(&*any);
+    if tid == std::any::TypeId::of::<xray_tui_tls::record::stream::TlsStream<crate::BoxStream>>() {
+        return any.downcast_mut::<xray_tui_tls::record::stream::TlsStream<crate::BoxStream>>();
+    }
+    let peeled = any
+        .downcast_mut::<VlessClientStream>()
+        .expect("vision must wrap an engine TlsStream");
+    let wrapped: &mut dyn std::any::Any = &mut **peeled.inner_mut();
+    wrapped.downcast_mut::<xray_tui_tls::record::stream::TlsStream<crate::BoxStream>>()
 }
 
 /// Client-side vision stream: pads uplink writes, unpads downlink reads,
@@ -660,24 +677,20 @@ impl Unpadder {
         // the UUID on its FIRST frame, so a mismatch means no vision) and a
         // cleaner trust boundary (spec §5.4).
         //
-        // Coalesced response header: xray's inbound buffers the [0,0]
-        // response header (EncodeResponseHeader + SetFlushNext) and the
-        // VisionWriter's first padded frame is flushed through the SAME
-        // buffered writer — so both arrive in ONE outer-TLS record,
-        // `[0,0][uuid][frame]`. Go's client peels the header from the raw
-        // conn BEFORE wrapping the VisionReader (outbound.go getResponse),
-        // so its unpadder never sees it; ours sees the coalesced chunk, so
-        // skip a leading `[0,0]` (version + addon_len 0) before the UUID
-        // gate. The peel outside then sees the first *content* byte
-        // (non-zero for every vision response) and finishes immediately.
+        // The response header `[0,0]` never reaches this gate: both vision
+        // connect paths peel it from the raw stream BEFORE wrapping the
+        // codec (`VlessClientStream` inside `VisionStream` — Go's
+        // composition, outbound.go getResponse), whether the server sends
+        // it as its own outer-TLS record or coalesced with the first padded
+        // frame (xray's inbound buffers it via EncodeResponseHeader +
+        // SetFlushNext). A leading `[0,0]` before the UUID would be
+        // ambiguous with a user UUID that starts with 0x00 0x00 (e.g. the
+        // harness's zero UUID), so there is no skip here — the peel owns it.
         if self.remaining_command == -1
             && self.remaining_content == -1
             && self.remaining_padding == -1
         {
-            if chunk.len() >= 18 && chunk[..2] == [0x00, 0x00] && chunk[2..18] == self.user_uuid {
-                self.remaining_command = 5;
-                i = 18; // consume [0,0] + the UUID
-            } else if chunk.len() >= 21 && chunk[..16] == self.user_uuid {
+            if chunk.len() >= 21 && chunk[..16] == self.user_uuid {
                 self.remaining_command = 5;
                 i = 16; // consume the UUID
             } else if chunk.len() >= 21 {
@@ -1088,7 +1101,9 @@ mod tests {
         // The server's [0,0] response header is its own outer-TLS record
         // before the first padded downlink frame (spec §4.6): it passes
         // through, and unpadding still engages on the next (uuid-carrying)
-        // chunk (spec §5.4).
+        // chunk (spec §5.4). (The vision connect paths peel the header from
+        // the raw stream before the codec, so this is a defensive path —
+        // a mis-composed caller.)
         let mut unpad = Unpadder::new(UUID);
         let mut out = Vec::new();
         unpad.feed(&[0x00, 0x00], &mut out);
@@ -1099,31 +1114,6 @@ mod tests {
         let mut out2 = Vec::new();
         unpad.feed(&frame, &mut out2);
         assert_eq!(out2, b"hi");
-    }
-
-    #[test]
-    fn unpad_coalesced_header_and_first_frame() {
-        // xray's inbound flushes the [0,0] response header and the first
-        // padded downlink frame through the SAME buffered writer, so one
-        // outer-TLS record carries `[0,0][uuid][cmd][clen][plen][content]
-        // [pad]` (Go's client peels the header from the raw conn before the
-        // VisionReader engages; our codec sees the coalesced chunk and must
-        // skip the header before the UUID gate). The gate must engage and
-        // the content must decode — the header bytes are consumed, not
-        // leaked into the stream.
-        let mut unpad = Unpadder::new(UUID);
-        let mut chunk = Vec::new();
-        chunk.extend_from_slice(&[0x00, 0x00]);
-        chunk.extend_from_slice(&encode_frame(Some(&UUID), CMD_CONTINUE, b"hi", 0));
-        let mut out = Vec::new();
-        unpad.feed(&chunk, &mut out);
-        assert_eq!(out, b"hi");
-        assert!(!unpad.plain_passthrough);
-        assert!(unpad.within_padding);
-        // The frame continues seamlessly in the next chunk.
-        let mut out2 = Vec::new();
-        unpad.feed(&encode_frame(None, CMD_CONTINUE, b"there", 0), &mut out2);
-        assert_eq!(out2, b"there");
     }
 
     #[test]

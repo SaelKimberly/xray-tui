@@ -686,9 +686,8 @@ where
 }
 
 /// Probe the VLESS mux path: one [`crate::connect_mux`] tunnel,
-/// [`MUX_SESSION_COUNT`] concurrent sessions to the echo target, a distinct
-/// HTTP GET per session, asserting every response arrives (order-independent
-/// across sessions).
+/// [`MUX_SESSION_COUNT`] concurrent sessions to the echo target, each with
+/// a distinct HTTP GET, every response asserted (order-independent).
 ///
 /// Fully bounded: the whole exchange (connect, session opens, requests,
 /// responses) runs under one deadline. Returns `(opened, ok)` — the number
@@ -744,17 +743,14 @@ pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) 
     let mut ok = 0;
     let finished = tokio::time::timeout_at(deadline, async {
         while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(Some((status, body))) => {
-                    opened += 1;
-                    if status == 200 && body == super::config::BODY {
-                        ok += 1;
-                    }
+            if let Ok(Some((status, body))) = joined {
+                opened += 1;
+                if status == 200 && body == super::config::BODY {
+                    ok += 1;
                 }
-                // open_session failed/timed out or the task panicked —
-                // the session contributed nothing.
-                Ok(None) | Err(_) => {}
             }
+            // open_session failed/timed out or the task panicked — the
+            // session contributed nothing.
         }
     })
     .await;

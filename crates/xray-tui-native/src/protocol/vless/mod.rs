@@ -124,15 +124,17 @@ async fn connect_vision(
             limit: timeout,
         })??;
 
-    // Wrap the secured stream in the padded codec; the response-header peel
-    // (VlessClientStream) stays OUTSIDE it. The server's `[0,0]` response
-    // header is buffered (EncodeResponseHeader + SetFlushNext) and flushed
-    // TOGETHER with the first padded frame in ONE outer-TLS record
-    // (`[0,0][uuid][cmd]...`); the codec's Unpadder skips the leading
-    // `[0,0]` before the UUID gate (vision.rs), and the lenient peel hands
-    // the first non-0x00 content byte back as payload (spec §4.6, §5.4).
-    let vision = VisionStream::new(stream, uuid, rng);
-    Ok(Box::new(VlessClientStream::new(Box::new(vision))))
+    // Wrap the secured stream in the padded codec, with the response-header
+    // peel INSIDE it — Go's exact composition (outbound.go getResponse
+    // peels the header from the raw conn BEFORE wrapping the VisionReader).
+    // The server's `[0,0]` response header — whether its own outer-TLS
+    // record or coalesced with the first padded frame (xray's inbound
+    // buffers it via EncodeResponseHeader + SetFlushNext and flushes both
+    // together) — is consumed by the peel, so the codec's UUID gate never
+    // sees it and the multiplexer/payload never sees it either.
+    let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
+    let vision = VisionStream::new(peeled, uuid, rng);
+    Ok(Box::new(vision))
 }
 
 /// True when the link actually runs TLS/REALITY — the check established in
@@ -340,11 +342,14 @@ async fn connect_mux_vision(
             limit: timeout,
         })??;
 
-    // Vision codec, then the response-header peel, then the multiplexer —
-    // the same composition as the TCP vision path (`connect_vision`).
-    let vision = VisionStream::new(stream, uuid, rng);
-    let peeled: BoxStream = Box::new(VlessClientStream::new(Box::new(vision)));
-    Ok(MuxClient::new(peeled))
+    // The response-header peel, THEN the vision codec, then the
+    // multiplexer — Go's client peels the header from the raw conn before
+    // wrapping the VisionReader (outbound.go getResponse), so neither the
+    // VisionReader nor the mux dispatcher ever sees the `[0,0]` (the same
+    // composition as the TCP vision path `connect_vision`).
+    let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
+    let vision = VisionStream::new(peeled, uuid, rng);
+    Ok(MuxClient::new(Box::new(vision)))
 }
 
 /// The header destination for the mux command: the fixed `v1.mux.cool`
