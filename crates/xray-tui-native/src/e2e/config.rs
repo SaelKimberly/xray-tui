@@ -55,14 +55,19 @@ pub fn reality_sid() -> String {
 
 /// Inject the VLESS flow name into an inbound server JSON: xray's
 /// `settings.clients[0].flow`, sing-box's `users[0].flow`.
+///
+/// The server validates the flow against the request's wire addon, which
+/// is always `xtls-rprx-vision` (the udp443 suffix truncates away at
+/// encode time — spec §4.3), so [`Flow::server_str`] is emitted here, not
+/// the client-facing [`Flow::as_str`].
 fn set_flow(json: &mut serde_json::Value, core: CoreKind, flow: Flow) {
     match core {
         CoreKind::Xray => {
             json["inbounds"][0]["settings"]["clients"][0]["flow"] =
-                serde_json::json!(flow.as_str());
+                serde_json::json!(flow.server_str());
         }
         CoreKind::SingBox => {
-            json["inbounds"][0]["users"][0]["flow"] = serde_json::json!(flow.as_str());
+            json["inbounds"][0]["users"][0]["flow"] = serde_json::json!(flow.server_str());
         }
     }
 }
@@ -832,6 +837,51 @@ mod tests {
             panic!("expected a vless client config");
         };
         assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision"));
+    }
+
+    #[test]
+    fn udp443_flow_server_truncates_client_full() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
+        let target = "1.2.3.4:80".parse().unwrap();
+
+        // Server JSON: the udp443 suffix is client-side only — the server
+        // validates the request's wire addon (`xtls-rprx-vision`, the
+        // truncated form — spec §4.3), so both cores get the truncated
+        // flow (xray clients[] / sing-box users[]).
+        for core in [CoreKind::Xray, CoreKind::SingBox] {
+            let server: serde_json::Value = serde_json::from_str(&vless_inbound(
+                core,
+                &env,
+                Some(Flow::Udp443),
+                &StandardTls,
+                "tcp",
+            ))
+            .unwrap();
+            let flow = &server["inbounds"][0]["settings"]["clients"][0]["flow"];
+            let flow_sing = &server["inbounds"][0]["users"][0]["flow"];
+            let emitted = match core {
+                CoreKind::Xray => flow,
+                CoreKind::SingBox => flow_sing,
+            };
+            assert_eq!(emitted, "xtls-rprx-vision");
+        }
+
+        // Client JSON: the native client's VlessConfig keeps the full
+        // udp443 name — connect_udp dispatches on it (mux-forced XUDP).
+        let params =
+            client_params_vless(12345, target, Some(Flow::Udp443), &StandardTls, "tcp", None);
+        let ProtocolConfig::Vless(vless) = &params.protocol else {
+            panic!("expected a vless client config");
+        };
+        assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision-udp443"));
     }
 
     #[test]

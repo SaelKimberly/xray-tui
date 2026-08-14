@@ -605,13 +605,63 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
         crate::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
         crate::addr::Host::Domain(_) => None,
     };
+    let dest = if params.udp == Some(PacketMode::PacketAddr) {
+        ip_target
+    } else {
+        None
+    };
+    udp_exchange(&mut conn, dest, deadline).await
+}
+
+/// Probe the VLESS XUDP path — datagrams through the mux tunnel.
+///
+/// Establishes the tunnel via [`crate::connect_udp`] with `params.mux`
+/// (the mux tunnel → one UDP session → the [`PacketMode::XUdp`]
+/// [`PacketConn`]; the `xtls-rprx-vision-udp443` flow forces the same
+/// path), sends [`UDP_PROBE_COUNT`] distinct payloads to the case target,
+/// and receives until every echo arrives (matched by payload,
+/// order-independent) or the deadline expires. Fully bounded: the whole
+/// exchange (connect, sends, receives) runs under one deadline — the SP1
+/// probe loop ([`udp_exchange`]); only the datagram carrier differs: the
+/// mux UDP session requires a per-packet destination, so `dest` is always
+/// the case target (an IP literal — the UDP echo server). Returns
+/// `(sent, received)` — the e2e runner asserts both equal
+/// [`UDP_PROBE_COUNT`]. Returns `(0, 0)` on a failed connect or a
+/// deadline expiry before any datagram was sent.
+pub async fn probe_udp_mux(params: &crate::NativeConnectParams) -> (usize, usize) {
+    let deadline = tokio::time::Instant::now() + UDP_PROBE_TIMEOUT;
+    let mut conn = match tokio::time::timeout_at(deadline, crate::connect_udp(params)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("probe_udp_mux connect error: {e}");
+            return (0, 0);
+        }
+        Err(_) => {
+            eprintln!("probe_udp_mux connect timed out");
+            return (0, 0);
+        }
+    };
+    // XUDP carries the per-packet destination in the mux frames — always
+    // Some (the UDP echo target).
+    let dest = match &params.target.host {
+        crate::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
+        crate::addr::Host::Domain(_) => None,
+    };
+    udp_exchange(&mut conn, dest, deadline).await
+}
+
+/// The SP1 UDP probe loop, shared by [`probe_udp`] and [`probe_udp_mux`]:
+/// sends [`UDP_PROBE_COUNT`] distinct payloads to `dest` (`None` = the
+/// header-dest path, `Some` = per-datagram destination) and receives until
+/// every echo arrives (matched by payload, order-independent) or the
+/// deadline expires. Returns `(sent, received)`.
+async fn udp_exchange(
+    conn: &mut crate::protocol::vless::PacketConn<crate::BoxStream>,
+    dest: Option<SocketAddr>,
+    deadline: tokio::time::Instant,
+) -> (usize, usize) {
     let mut sent = 0;
     for payload in UDP_PROBE_PAYLOADS {
-        let dest = if params.udp == Some(PacketMode::PacketAddr) {
-            ip_target
-        } else {
-            None
-        };
         match tokio::time::timeout_at(deadline, conn.send(dest, payload)).await {
             Ok(Ok(())) => sent += 1,
             _ => break,
@@ -634,7 +684,7 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
             // expired — either way the remaining echoes will not arrive.
             Ok(Ok(None)) | Err(_) => break,
             Ok(Err(e)) => {
-                eprintln!("probe_udp recv error: {e}");
+                eprintln!("udp probe recv error: {e}");
                 break;
             }
         }

@@ -19,8 +19,8 @@ pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{
     Certs, EchoServer, InnerTlsEchoServer, MUX_SESSION_COUNT, TlsEchoServer, UDP_PROBE_COUNT,
     UDP_PROBE_PAYLOADS, UdpEchoServer, free_port, generate_certs, probe, probe_inner_tls,
-    probe_mux, probe_udp, spawn_core, spawn_echo, spawn_inner_tls_echo, spawn_tls_echo,
-    spawn_udp_echo,
+    probe_mux, probe_udp, probe_udp_mux, spawn_core, spawn_echo, spawn_inner_tls_echo,
+    spawn_tls_echo, spawn_udp_echo,
 };
 pub use variant::{
     Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, PlainServerRealityClientTls,
@@ -232,8 +232,14 @@ pub async fn run_against(
         if case.app() == AppKind::Udp {
             // UDP rows: the probe drives its own `connect_udp` (the tunnel
             // is a datagram tunnel, not a byte stream) and requires every
-            // datagram's echo back.
-            let (sent, received) = probe_udp(&params).await;
+            // datagram's echo back. Mux+UDP rows probe through the mux
+            // tunnel instead (`probe_udp_mux` — the udp443 flow forces the
+            // same path, so `case.mux()` covers it).
+            let (sent, received) = if case.mux() {
+                probe_udp_mux(&params).await
+            } else {
+                probe_udp(&params).await
+            };
             if sent == UDP_PROBE_COUNT && received == UDP_PROBE_COUNT {
                 return Ok(());
             }

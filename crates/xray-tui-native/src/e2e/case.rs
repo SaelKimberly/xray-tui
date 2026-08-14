@@ -19,17 +19,42 @@ pub enum ProtocolKind {
     Vmess,
 }
 
-/// VLESS flow control; only `xtls-rprx-vision` is implemented (None = none).
+/// VLESS flow control: `xtls-rprx-vision` (`Vision`) or the XUDP variant
+/// `xtls-rprx-vision-udp443` (`Udp443`).
+///
+/// The udp443 suffix is client-side only: UDP rides the mux tunnel, the
+/// addon truncates to `xtls-rprx-vision` on the wire (spec §4.3), and the
+/// server validates against that truncated name (see [`Flow::server_str`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Vision,
+    Udp443,
 }
 
 impl Flow {
-    /// The wire flow name both cores and the native client emit.
+    /// The client-facing flow name — what the native client's
+    /// `VlessConfig.flow` carries (the udp443 suffix selects the XUDP
+    /// path client-side: mux-forced, guard lifted, addon truncated).
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
-        "xtls-rprx-vision"
+        match self {
+            Self::Vision => "xtls-rprx-vision",
+            Self::Udp443 => "xtls-rprx-vision-udp443",
+        }
+    }
+
+    /// The flow the SERVER config must carry: the udp443 suffix is
+    /// truncated away at encode time (spec §4.3), so the wire addon is
+    /// always `xtls-rprx-vision` — and both cores reject a server user
+    /// whose flow differs from the request's (xray inbound
+    /// `account.Flow == requestAddons.Flow`; sing-vmess `service.go`
+    /// flow-mismatch / unknown-flow). The server config therefore emits
+    /// `xtls-rprx-vision` for both variants.
+    #[must_use]
+    pub const fn server_str(&self) -> &'static str {
+        match self {
+            Self::Vision | Self::Udp443 => "xtls-rprx-vision",
+        }
     }
 }
 
@@ -175,10 +200,13 @@ impl CaseSpec {
     }
 
     /// Whether the row probes the VLESS mux path (`run_against` routes it
-    /// to [`super::harness::probe_mux`]).
+    /// to [`super::harness::probe_mux`] / [`super::harness::probe_udp_mux`]).
+    /// The `xtls-rprx-vision-udp443` flow forces the mux tunnel regardless
+    /// of the flag (spec §4.3 — `connect_udp` rewrites UDP to XUDP under
+    /// the udp443 flow).
     #[must_use]
     pub const fn mux(&self) -> bool {
-        self.mux
+        self.mux || matches!(self.flow, Some(Flow::Udp443))
     }
 
     /// Select the TLS transport variant (fingerprint engine or REALITY).
@@ -228,7 +256,7 @@ impl E2eCase for CaseSpec {
                 })
             ),
         };
-        let mux = if self.mux { "/mux" } else { "" };
+        let mux = if self.mux() { "/mux" } else { "" };
         format!("{proto}/{flow}{}/{tls}{sec}{app}{mux}", self.network)
     }
 
@@ -274,6 +302,10 @@ impl E2eCase for CaseSpec {
         // packet mode (`connect_udp` requires it; the proto has no
         // `packet_encoding` field — spec §4.3, no proto changes allowed).
         params.udp = self.udp;
+        // Mux rows (incl. the udp443 flow, which forces the mux path):
+        // the probe's `connect_udp` dispatches XUDP on `params.mux`
+        // (connect_mux ignores it, so the TCP mux rows are unaffected).
+        params.mux = self.mux();
         params
     }
 
@@ -398,6 +430,16 @@ mod tests {
                 .label(),
             "vless/tcp/reality/mux"
         );
+        // XUDP rows: the udp443 flow (client-facing name in the label)
+        // forces the `/mux` suffix — the flow implies the mux path.
+        assert_eq!(
+            CaseSpec::vless()
+                .with_flow(Flow::Udp443)
+                .with_app(AppKind::Udp)
+                .with_udp(PacketMode::XUdp)
+                .label(),
+            "vless/xtls-rprx-vision-udp443/tcp/tls/udp-xudp/mux"
+        );
     }
 
     #[test]
@@ -407,12 +449,27 @@ mod tests {
         assert!(!CaseSpec::vmess(Aes128GcmVariant).mux());
         // The axis is sticky once selected.
         assert!(CaseSpec::vless().with_mux(true).mux());
+        // The udp443 flow forces the mux path even without the flag (spec
+        // §4.3 — connect_udp rewrites UDP to XUDP under the udp443 flow);
+        // the plain vision flow does not.
+        assert!(CaseSpec::vless().with_flow(Flow::Udp443).mux());
+        assert!(!CaseSpec::vless().with_flow(Flow::Vision).mux());
         // Mux rows keep `params.udp` unset — the TCP mux probe (XUDP rows
         // set both, via the Task 4 harness plumbing).
         let params = CaseSpec::vless()
             .with_mux(true)
             .client_params(12345, "127.0.0.1:9999".parse().unwrap());
         assert_eq!(params.udp, None);
+        // The probe's `connect_udp` dispatches XUDP on `params.mux`, so the
+        // params carry it: the explicit flag and the udp443 flow both.
+        assert!(params.mux);
+        let params = CaseSpec::vless()
+            .with_flow(Flow::Udp443)
+            .client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert!(params.mux);
+        // Non-mux rows leave the params' default false.
+        let params = CaseSpec::vless().client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert!(!params.mux);
     }
 
     #[test]
@@ -438,6 +495,14 @@ mod tests {
         let params = addr.client_params(12345, "127.0.0.1:9999".parse().unwrap());
         assert_eq!(params.udp, Some(PacketMode::PacketAddr));
 
+        // XUdp mode: plumbed for the probe's connect_udp mux path (the
+        // udp443 flow forces the same).
+        let xudp = CaseSpec::vless()
+            .with_app(AppKind::Udp)
+            .with_udp(PacketMode::XUdp);
+        let params = xudp.client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert_eq!(params.udp, Some(PacketMode::XUdp));
+
         // The vless client protocol payload still parses as a plain vless
         // config — the packet mode lives in the params, NOT the proto
         // (spec §4.3; xray-tui-proto is never modified).
@@ -449,6 +514,17 @@ mod tests {
             }
             other => panic!("expected vless config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn flow_server_string_truncates_udp443() {
+        // The udp443 suffix is client-side only: the wire addon truncates
+        // to `xtls-rprx-vision` (spec §4.3) and the server validates
+        // against that — both flows emit the same server string.
+        assert_eq!(Flow::Vision.as_str(), "xtls-rprx-vision");
+        assert_eq!(Flow::Udp443.as_str(), "xtls-rprx-vision-udp443");
+        assert_eq!(Flow::Vision.server_str(), "xtls-rprx-vision");
+        assert_eq!(Flow::Udp443.server_str(), "xtls-rprx-vision");
     }
 
     #[test]
