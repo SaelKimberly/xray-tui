@@ -20,6 +20,7 @@ use xray_tui_native::e2e::{
     AppKind, CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, Flow, TlsEchoServer, TlsVariant,
     run_against,
 };
+use xray_tui_native::protocol::vless::PacketMode;
 
 /// `CaseSpec::vless()` plus the network axis; these helpers keep the
 /// `#[case]` rows one-liners (mirror of the vmess matrix helpers).
@@ -52,6 +53,21 @@ fn vision(app: AppKind) -> CaseSpec {
 /// VLESS vision rows with an explicit TLS variant (REALITY etc.).
 fn vision_tls(app: AppKind, tls: Box<dyn TlsVariant>) -> CaseSpec {
     vision(app).with_tls(tls)
+}
+
+/// VLESS UDP rows (spec §7.3): datagrams through the tunnel over tcp.
+/// `mode` selects the packet wire: `Raw` = the header destination serves
+/// every datagram (both cores); `PacketAddr` = per-datagram
+/// `atyp|addr|port` frames to the magic-fqdn header destination (the
+/// sing-vmess dialect — xray-core does not register the packetaddr magic
+/// address, so that row is sing-box single-core).
+fn vless_udp(mode: PacketMode) -> CaseSpec {
+    CaseSpec::vless().with_app(AppKind::Udp).with_udp(mode)
+}
+
+/// VLESS UDP row with an explicit TLS variant (REALITY etc.).
+fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
+    vless_udp(mode).with_tls(tls)
 }
 
 #[rstest]
@@ -87,6 +103,11 @@ fn vision_tls(app: AppKind, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[case::vision_tls_inner(vision(AppKind::InnerTls))]
 #[case::vision_reality_plain(vision_tls(AppKind::Plain, reality()))]
 #[case::vision_reality_inner(vision_tls(AppKind::InnerTls, reality()))]
+// VLESS UDP axis (spec §7.3): the UDP command (0x02) over the tunnel, Raw
+// mode — every datagram goes to the header destination; both cores serve
+// it over tls and reality.
+#[case::udp_tls_plain(vless_udp(PacketMode::Raw))]
+#[case::udp_reality_plain(vless_udp_tls(PacketMode::Raw, reality()))]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,
@@ -130,6 +151,12 @@ async fn vless_against_cores(
 // client JSON carries the fp so the engine fingerprints; ALPN h2 comes from
 // the context's transport-implied alpn arm).
 #[case::v2rayhttp_chrome(vless_tls("h2", fp("chrome")), CoreKind::SingBox)]
+// PacketAddr mode: per-datagram `atyp|addr|port` frames to the magic-fqdn
+// header destination (`sp.packet-addr.v2fly.arpa`). The sing-box server
+// unwraps automatically (inbound magic-fqdn detection); xray-core's VLESS
+// has no packetaddr registration (verified — no packetaddr symbols in
+// thirdparty/Xray-core/proxy/vless), so the row is sing-box single-core.
+#[case::udp_packetaddr_tls(vless_udp(PacketMode::PacketAddr), CoreKind::SingBox)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,
