@@ -440,7 +440,9 @@ mod tests {
         peer.read_exact(&mut frame).await.unwrap();
         let mut want = packetaddr::encode_dest(dest);
         want.push(b'p');
-        let mut expected_frame = vec![0x00, 0x21];
+        // Frame length = 1 (atyp) + 4 (addr) + 2 (port) + 1 (payload) = 8 —
+        // no magic prefix in the frame (sing serializer; Task 5 report).
+        let mut expected_frame = vec![0x00, 0x08];
         expected_frame.extend_from_slice(&want);
         assert_eq!(&frame, &expected_frame[..]);
     }

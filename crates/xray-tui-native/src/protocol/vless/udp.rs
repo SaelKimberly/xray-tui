@@ -423,9 +423,11 @@ mod tests {
 
     /// The packetaddr-mode variant (brief step 5, spec §4.3): the header
     /// destination is the magic fqdn with port 0, and each datagram frame
-    /// carries the per-packet magic-address bytes — asserted in the client's
-    /// frame on the server side; the server's reply frame decodes back to a
-    /// per-packet destination on the client side.
+    /// carries the per-packet address header (`atyp | addr | port`, NO
+    /// magic prefix — sing-vmess serializer semantics, corrected in the
+    /// Task 5 report) — asserted in the client's frame on the server side;
+    /// the server's reply frame decodes back to a per-packet destination on
+    /// the client side.
     #[tokio::test]
     async fn hermetic_fake_udp_server_packetaddr_frames() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -457,12 +459,13 @@ mod tests {
             // The `[0,0]` response header.
             write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
 
-            // The client's datagram frame carries the magic-address bytes:
-            // `magic | atyp 0x01 | 1.2.3.4 | port 8080 | 'p'` (spec §4.3).
+            // The client's datagram frame carries the per-packet address
+            // header: `atyp 0x01 | 1.2.3.4 | port 8080 | 'p'` (the magic
+            // fqdn is the header destination only — sing serializer).
             let frame = read_raw_frame(conn, sock)?;
             let mut expected = packetaddr::encode_dest("1.2.3.4:8080".parse().unwrap());
             expected.push(b'p');
-            assert_eq!(frame, expected, "packetaddr magic-address frame");
+            assert_eq!(frame, expected, "packetaddr per-packet address frame");
 
             // One frame back with its own per-packet destination; the
             // client's recv must decode it.
