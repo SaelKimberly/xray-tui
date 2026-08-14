@@ -989,13 +989,24 @@ impl SessionStream {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{self, Read as _, Write as _};
+    use std::net::SocketAddr;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+    use xray_tui_proto::proto_spec::{ProtocolConfig, VlessConfig};
+
     use bytes::Bytes;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+
+    use crate::addr::{ADDR_TYPE_DOMAIN, ADDR_TYPE_IPV4, ADDR_TYPE_IPV6, Host, TargetAddr};
+    use crate::context::{LinkContext, NativeConnectParams};
+    use crate::protocol::vless::{connect_mux, header};
+    use crate::security;
+    use crate::security::fingerprint;
 
     use super::*;
 
@@ -2007,5 +2018,467 @@ mod tests {
             ),
             Ok(Err(e)) => panic!("read error after drop: {e}"),
         }
+    }
+
+    // ---- Hermetic: fake mux server over a real outer TLS session ----
+    //
+    // The raw-TCP fake-server pattern from the SP1 T4 / vision-plan
+    // hermetic tests (fake server = the rustls server double + raw
+    // socket): one `TcpListener`, the outer TLS handshake as a rustls
+    // `ServerConnection`, then the VLESS mux wire spoken exactly — read +
+    // assert the request header (cmd 0x03, NO destination bytes — the
+    // no-addr fix, spec §4.1), send the `[0,0]` response header, then
+    // exchange v1.mux.cool frames (New / Keep / End / KeepAlive) parsed
+    // raw, independently of the codec under test. The CLIENT drives the
+    // real path: `security::wrap` (engine TLS 1.3) +
+    // `protocol::vless::connect_mux` + `MuxClient::open_session`. This is
+    // the frame-level gate (brief steps 1-4) before the real-core e2e
+    // rows.
+
+    /// A VLESS config for the mux path: no flow, plain TLS to the fake
+    /// server. The mux tunnel itself is TCP-only (`params.udp` stays None
+    /// — `connect_mux` rejects a UDP mode).
+    fn vless_mux_config() -> VlessConfig {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+            "transport": { "type": "tcp" },
+            "security": { "type": "tls", "sni": "localhost" }
+        }))
+        .expect("vless mux config parses");
+        match protocol {
+            ProtocolConfig::Vless(cfg) => cfg,
+            _ => panic!("expected a vless config"),
+        }
+    }
+
+    /// rcgen CA + server cert/key PEM + CA DER (the security-phase fixture).
+    fn rcgen_ca_and_server(sni: &str) -> (String, String, Vec<u8>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let mut ca_params = CertificateParams::new(vec![sni.to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_params =
+            CertificateParams::new(vec![sni.to_string(), "127.0.0.1".to_string()]).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        (
+            server_cert.pem(),
+            server_key.serialize_pem(),
+            ca_cert.der().to_vec(),
+        )
+    }
+
+    fn server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
+        use rustls::pki_types::pem::PemObject;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .map(|c| c.expect("cert pem parses"))
+                .collect();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .expect("key pem parses");
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config builds")
+    }
+
+    /// Read exactly `out.len()` decrypted bytes, pulling new outer-TLS
+    /// records from the socket whenever the rustls plaintext buffer is
+    /// empty (rustls 0.23 `Reader::read` signals that with `WouldBlock`).
+    fn read_exact_decrypted(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < out.len() {
+            match conn.reader().read(&mut out[filled..]) {
+                Ok(n) if n > 0 => {
+                    filled += n;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            // No plaintext buffered. `complete_io` may have pulled the
+            // peer's first application-data records into rustls's read
+            // buffer together with the final handshake flight — process
+            // whatever is buffered before blocking on the socket.
+            let state = conn
+                .process_new_packets()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if state.plaintext_bytes_to_read() > 0 {
+                continue;
+            }
+            if conn.read_tls(sock)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "fake mux server: outer TLS peer closed",
+                ));
+            }
+            conn.process_new_packets()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }
+        Ok(())
+    }
+
+    /// Write `data` as decrypted bytes (buffered into the record layer,
+    /// then flushed until nothing is left to send).
+    fn write_all_encrypted(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        conn.writer().write_all(data)?;
+        loop {
+            if conn.write_tls(sock)? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// One raw v1.mux.cool frame, decoded independently of the codec
+    /// under test — the fake server speaks the wire directly (spec §4.2).
+    struct RawMuxFrame {
+        session_id: u16,
+        status: u8,
+        option: u8,
+        /// New-frame target, parsed as wire bytes: `(network, port, atyp,
+        /// addr)` — interpreted in the assertions, never by the parser.
+        target: Option<(u8, u16, u8, Vec<u8>)>,
+        payload: Vec<u8>,
+    }
+
+    /// Reads one raw mux frame from the decrypted stream:
+    /// `[2B meta_len][sid 2B][status 1B][option 1B][New target][2B
+    /// data_len][payload]`, exactly as the server would (spec §4.2).
+    fn read_mux_frame(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+    ) -> std::io::Result<RawMuxFrame> {
+        let mut ml = [0u8; 2];
+        read_exact_decrypted(conn, sock, &mut ml)?;
+        let meta_len = usize::from(u16::from_be_bytes(ml));
+        assert!(meta_len <= MAX_META, "meta_len {meta_len} exceeds the cap");
+        let mut meta = vec![0u8; meta_len];
+        read_exact_decrypted(conn, sock, &mut meta)?;
+        assert!(meta.len() >= 4, "mux metadata too short");
+        let session_id = u16::from_be_bytes([meta[0], meta[1]]);
+        let status = meta[2];
+        let option = meta[3];
+        let mut rest = &meta[4..];
+        let target = if status == STATUS_NEW {
+            assert!(rest.len() >= 4, "new frame metadata too short");
+            let network = rest[0];
+            let port = u16::from_be_bytes([rest[1], rest[2]]);
+            let atyp = rest[3];
+            rest = &rest[4..];
+            let addr_len = match atyp {
+                ADDR_TYPE_IPV4 => 4,
+                ADDR_TYPE_IPV6 => 16,
+                ADDR_TYPE_DOMAIN => {
+                    let (&len, tail) = rest
+                        .split_first()
+                        .expect("domain new frame missing the length byte");
+                    rest = tail;
+                    usize::from(len)
+                }
+                other => panic!("unknown mux address type {other}"),
+            };
+            assert!(
+                rest.len() >= addr_len,
+                "new frame target truncated ({} < {addr_len})",
+                rest.len()
+            );
+            let addr = rest[..addr_len].to_vec();
+            rest = &rest[addr_len..];
+            Some((network, port, atyp, addr))
+        } else {
+            None
+        };
+        assert!(rest.is_empty(), "trailing mux metadata bytes");
+        let payload = if option & OPT_DATA != 0 {
+            let mut dl = [0u8; 2];
+            read_exact_decrypted(conn, sock, &mut dl)?;
+            let n = usize::from(u16::from_be_bytes(dl));
+            let mut data = vec![0u8; n];
+            read_exact_decrypted(conn, sock, &mut data)?;
+            data
+        } else {
+            Vec::new()
+        };
+        Ok(RawMuxFrame {
+            session_id,
+            status,
+            option,
+            target,
+            payload,
+        })
+    }
+
+    /// Writes one raw mux frame to the decrypted stream. The fake server
+    /// only ever sends `Keep` / `KeepAlive` / `End` frames (the server-side
+    /// response writer starts at Keep — no New target on the wire).
+    fn write_mux_frame(
+        conn: &mut rustls::ServerConnection,
+        sock: &mut std::net::TcpStream,
+        session_id: u16,
+        status: u8,
+        option: u8,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let mut meta = Vec::with_capacity(4);
+        meta.extend_from_slice(&session_id.to_be_bytes());
+        meta.push(status);
+        meta.push(option);
+        let meta_len = u16::try_from(meta.len()).expect("metadata fits the 2-byte length");
+        let mut out = Vec::with_capacity(2 + meta.len() + 2 + payload.len());
+        out.extend_from_slice(&meta_len.to_be_bytes());
+        out.extend_from_slice(&meta);
+        if option & OPT_DATA != 0 {
+            let data_len = u16::try_from(payload.len()).expect("payload fits the 2-byte length");
+            out.extend_from_slice(&data_len.to_be_bytes());
+            out.extend_from_slice(payload);
+        }
+        write_all_encrypted(conn, sock, &out)
+    }
+
+    /// Spawn the fake mux server: accept one connection, complete the
+    /// outer TLS handshake as the rustls server double, run the wire
+    /// `script`. Returns the listener address + the join handle
+    /// (server-side assertion failures surface as panics through it).
+    fn spawn_mux_server(
+        cert_pem: &str,
+        key_pem: &str,
+        script: impl FnOnce(
+            &mut rustls::ServerConnection,
+            &mut std::net::TcpStream,
+        ) -> std::io::Result<()>
+        + Send
+        + 'static,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let cfg = server_config(cert_pem, key_pem);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let timeout = Duration::from_secs(15);
+            sock.set_read_timeout(Some(timeout)).expect("read timeout");
+            sock.set_write_timeout(Some(timeout))
+                .expect("write timeout");
+            let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).expect("server conn");
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).expect("outer TLS handshake");
+            }
+            script(&mut conn, &mut sock).expect("fake mux server wire script");
+        });
+        (addr, handle)
+    }
+
+    /// A `LinkContext` pointing the client at the fake server. The mux
+    /// command carries no header destination on the wire, so the context
+    /// target is the tunnel's semantic `v1.mux.cool:9527` (spec §4.1 —
+    /// never encoded).
+    fn mux_ctx(addr: SocketAddr, cfg: VlessConfig) -> LinkContext {
+        let target = TargetAddr::new(Host::Domain(MUX_DEST.to_string()), MUX_PORT);
+        let mut params = NativeConnectParams::new(
+            ProtocolConfig::Vless(cfg),
+            EndpointEssentials::new("127.0.0.1", 1),
+            target.clone(),
+        );
+        params.server = EndpointEssentials::new(addr.ip().to_string(), addr.port());
+        LinkContext::new(params, target)
+    }
+
+    /// The hermetic frame-level gate (brief steps 1-3): the real client
+    /// path — engine TLS wrap + vless `connect_mux` + `MuxClient` — against
+    /// the fake server. Asserts the header's cmd 0x03 with NO destination
+    /// bytes (the no-addr fix: the 19-byte header is followed directly by
+    /// the first mux frame's `meta_len`), the eager New frame (session 1,
+    /// TCP target), Keep data frames in both directions, a second session,
+    /// and End closing session 1 only.
+    #[tokio::test]
+    async fn hermetic_fake_mux_server_frames() {
+        // Feature unification enables both rustls backends; the app installs
+        // the ring provider at startup (workspace convention), tests do it
+        // here (idempotent).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        // The engine verifies through its thread-local harness CA.
+        fingerprint::set_test_ca(&ca_der);
+        let uuid = header::uuid_bytes("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap();
+        let (addr, server) = spawn_mux_server(&cert_pem, &key_pem, move |conn, sock| {
+            // Step 1: the request header — version | uuid | addons_len 0 |
+            // command 0x03, exactly 19 bytes. The mux command carries NO
+            // destination bytes (the no-addr fix; xray's EncodeRequestHeader
+            // skips the address for Mux and the server derives the magic
+            // fqdn from the command byte alone). The frame parsed right
+            // after is the proof: any destination bytes would be misread as
+            // that frame's meta_len and fail the parse/assertions.
+            let mut head = [0u8; 19];
+            read_exact_decrypted(conn, sock, &mut head)?;
+            assert_eq!(head[0], header::VERSION, "vless version byte");
+            assert_eq!(&head[1..17], &uuid, "vless user uuid");
+            assert_eq!(head[17], 0, "addons_len (no flow on the mux path)");
+            assert_eq!(head[18], header::CMD_MUX, "vless command must be MUX 0x03");
+
+            // Step 2: the `[0,0]` response header (consumed by the client's
+            // peel on the first tunnel read).
+            write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
+
+            // Step 3: the client's eager New frame — session 1, TCP target
+            // echo.test:80 (spec §8 deviation 1: open_session sends New
+            // immediately, before any app data).
+            let new1 = read_mux_frame(conn, sock)?;
+            assert_eq!(new1.session_id, 1, "first session id is 1");
+            assert_eq!(new1.status, STATUS_NEW, "eager New frame");
+            assert_eq!(new1.option, 0);
+            assert!(new1.payload.is_empty());
+            let (network, port, atyp, addr) = new1.target.expect("New frame carries a target");
+            assert_eq!(network, 1, "New network byte is TCP");
+            assert_eq!(port, 80, "target port");
+            assert_eq!(atyp, ADDR_TYPE_DOMAIN, "target address type");
+            assert_eq!(addr, b"echo.test", "target domain");
+
+            // The server's Keep reply on session 1; the client's
+            // SessionStream must deliver it.
+            write_mux_frame(conn, sock, 1, STATUS_KEEP, OPT_DATA, b"ok")?;
+
+            // The client's app data rides a Keep frame (the New was eager).
+            let keep = read_mux_frame(conn, sock)?;
+            assert_eq!(keep.session_id, 1);
+            assert_eq!(keep.status, STATUS_KEEP);
+            assert_eq!(keep.option, OPT_DATA);
+            assert_eq!(&keep.payload, b"ping");
+
+            // A second session opens (eager New, session 2, other.test:443).
+            let new2 = read_mux_frame(conn, sock)?;
+            assert_eq!(new2.session_id, 2, "second session id is 2");
+            assert_eq!(new2.status, STATUS_NEW);
+            let (_, port2, atyp2, addr2) = new2.target.expect("New frame carries a target");
+            assert_eq!(port2, 443);
+            assert_eq!(atyp2, ADDR_TYPE_DOMAIN);
+            assert_eq!(addr2, b"other.test");
+
+            // Step 4: End closes session 1 only — session 2 keeps working.
+            write_mux_frame(conn, sock, 1, STATUS_END, 0, &[])?;
+
+            // The client's session-2 write still flows after session 1's
+            // End (session isolation).
+            let keep2 = read_mux_frame(conn, sock)?;
+            assert_eq!(keep2.session_id, 2);
+            assert_eq!(keep2.status, STATUS_KEEP);
+            assert_eq!(&keep2.payload, b"pong");
+            Ok(())
+        });
+        let cfg = vless_mux_config();
+        let ctx = mux_ctx(addr, cfg.clone());
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+            let mux = connect_mux(&ctx, wrapped, &cfg).await.unwrap();
+            let mut s1 = mux
+                .open_session(MuxTarget::TcpDomain("echo.test".into(), 80))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 2];
+            s1.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ok");
+            s1.write_all(b"ping").await.unwrap();
+            let mut s2 = mux
+                .open_session(MuxTarget::TcpDomain("other.test".into(), 443))
+                .await
+                .unwrap();
+            assert_eq!(s1.read(&mut buf).await.unwrap(), 0, "End closes session 1");
+            s2.write_all(b"pong").await.unwrap();
+        })
+        .await
+        .expect("hermetic mux flow timed out");
+        server.await.expect("fake mux server task failed");
+    }
+
+    /// The optional `KeepAlive` round-trip (brief step 4): the client's
+    /// tunnel-level `KeepAlive` (session id 0) reaches the server, is
+    /// answered with a `KeepAlive` the demux consumes, and the live session
+    /// survives untouched. The keepalive fires on the virtual clock (the
+    /// interval is 10 s), so the clock is paused and advanced just past
+    /// the first tick; the server's socket timeouts (15 s real) bound any
+    /// hang.
+    #[tokio::test(start_paused = true)]
+    async fn hermetic_fake_mux_server_keepalive() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem, ca_der) = rcgen_ca_and_server("localhost");
+        fingerprint::set_test_ca(&ca_der);
+        let uuid = header::uuid_bytes("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap();
+        let (addr, server) = spawn_mux_server(&cert_pem, &key_pem, move |conn, sock| {
+            let mut head = [0u8; 19];
+            read_exact_decrypted(conn, sock, &mut head)?;
+            assert_eq!(head[0], header::VERSION, "vless version byte");
+            assert_eq!(&head[1..17], &uuid, "vless user uuid");
+            assert_eq!(head[17], 0, "addons_len (no flow on the mux path)");
+            assert_eq!(head[18], header::CMD_MUX, "vless command must be MUX 0x03");
+            write_all_encrypted(conn, sock, &[header::VERSION, 0x00])?;
+
+            // The eager New + a Keep round-trip, then the client's
+            // tunnel-level KeepAlive (the test advances the virtual clock).
+            let new1 = read_mux_frame(conn, sock)?;
+            assert_eq!(new1.session_id, 1);
+            assert_eq!(new1.status, STATUS_NEW);
+            write_mux_frame(conn, sock, 1, STATUS_KEEP, OPT_DATA, b"ok")?;
+            let keep = read_mux_frame(conn, sock)?;
+            assert_eq!(keep.session_id, 1);
+            assert_eq!(keep.status, STATUS_KEEP);
+            assert_eq!(&keep.payload, b"ping");
+
+            // Step 4: the client's KeepAlive — session id 0, meta-only.
+            let ka = read_mux_frame(conn, sock)?;
+            assert_eq!(ka.session_id, 0, "keepalive uses session id 0");
+            assert_eq!(ka.status, STATUS_KEEPALIVE, "keepalive status");
+            assert_eq!(ka.option, 0);
+            assert!(ka.payload.is_empty());
+            // Answer it; the client's demux consumes the reply (never a
+            // session event — session 1 must stay healthy).
+            write_mux_frame(conn, sock, 0, STATUS_KEEPALIVE, 0, &[])?;
+
+            // The live session survives the keepalive round-trip.
+            let keep2 = read_mux_frame(conn, sock)?;
+            assert_eq!(keep2.session_id, 1);
+            assert_eq!(keep2.status, STATUS_KEEP);
+            assert_eq!(&keep2.payload, b"still-alive");
+            Ok(())
+        });
+        let cfg = vless_mux_config();
+        let ctx = mux_ctx(addr, cfg.clone());
+
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
+        let mux = connect_mux(&ctx, wrapped, &cfg).await.unwrap();
+        let mut s1 = mux
+            .open_session(MuxTarget::TcpDomain("echo.test".into(), 80))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2];
+        s1.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+        s1.write_all(b"ping").await.unwrap();
+
+        // Advance the virtual clock just past the first keepalive tick
+        // (10 s in 100 ms steps + a little slack): the keepalive task
+        // sends the tunnel-level frame, the server reads and answers it,
+        // and the demux consumes the reply — all before the next write.
+        for _ in 0..(KEEPALIVE_INTERVAL.as_millis() / 100 + 5) {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        s1.write_all(b"still-alive").await.unwrap();
+        server.await.expect("fake mux server task failed");
     }
 }
