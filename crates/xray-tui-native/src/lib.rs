@@ -50,14 +50,29 @@ pub mod security;
 pub mod shape;
 pub mod transport;
 
-pub use chain::connect_chain;
+pub use chain::{connect_chain, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
+pub use protocol::vless::PacketConn;
 
 /// Connect through a single proxy to `params.target`.
 pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, NativeError> {
     let target = params.target.clone();
     connect_chain(&[params], target).await
+}
+
+/// Connect through a single proxy with a UDP datagram tunnel to
+/// `params.target` (VLESS command 0x02; `params.udp` selects the packet
+/// mode: `Raw` or `PacketAddr`).
+///
+/// The same dial → security → transport chain as [`connect`] runs
+/// unchanged; only the protocol phase differs (command 0x02 + packet
+/// framing). The returned [`PacketConn`] is a datagram API over the tunnel.
+pub async fn connect_udp(
+    params: &NativeConnectParams,
+) -> Result<PacketConn<BoxStream>, NativeError> {
+    let target = params.target.clone();
+    connect_chain_udp(std::slice::from_ref(params), target).await
 }
 
 /// A completed native tunnel: the byte stream after the full layer stack.

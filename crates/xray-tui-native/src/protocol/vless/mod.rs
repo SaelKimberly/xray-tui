@@ -5,17 +5,20 @@ use tokio::io::AsyncWriteExt;
 use xray_tui_proto::proto_spec::{SecurityConfig, VlessConfig};
 
 use crate::BoxStream;
+use crate::addr::{Host, TargetAddr};
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
 use crate::protocol::vless::stream::VlessClientStream;
 use crate::protocol::vless::vision::{FLOW_XTLS_RPRX_VISION, VisionStream};
 
 pub mod header;
-pub(crate) mod packet;
+pub mod packet;
 pub(crate) mod packetaddr;
 pub mod stream;
 pub(crate) mod udp;
 pub(crate) mod vision;
+
+pub use packet::{PacketConn, PacketMode};
 
 /// Connect through a VLESS outbound over an already-secured stream.
 ///
@@ -135,6 +138,89 @@ fn has_tls(ctx: &LinkContext) -> bool {
     ctx.security().and_then(SecurityConfig::type_str).is_some()
 }
 
+/// UDP/flow guard: the vision flow cannot carry UDP packets (xray rewrites
+/// UDP to the XUDP mux path under vision; until SP3 adds XUDP the honest
+/// behavior is a client-side rejection — spec §2, §6).
+fn check_udp_allowed(flow: Option<&str>, udp: Option<PacketMode>) -> Result<(), NativeError> {
+    if udp.is_some() && flow == Some(FLOW_XTLS_RPRX_VISION) {
+        return Err(NativeError::NotImplemented {
+            feature: "VLESS vision does not support UDP (no XUDP mux)".into(),
+        });
+    }
+    Ok(())
+}
+
+/// UDP connect (protocol phase, parallel to [`connect_plain`]).
+///
+/// The chain runs dial → security → transport exactly as for TCP; this
+/// writes the request header with `command = 0x02` and the UDP destination
+/// (port-first, spec §4.1), then wraps the tunnel in the packet-framed
+/// [`PacketConn`] for the configured mode. The vision+UDP guard
+/// ([`check_udp_allowed`]) runs before any I/O.
+pub async fn connect_udp(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    cfg: &VlessConfig,
+) -> Result<PacketConn<BoxStream>, NativeError> {
+    let uuid = header::uuid_bytes(&cfg.uuid)?;
+    check_udp_allowed(cfg.flow.as_deref(), ctx.params.udp)?;
+    let mode = ctx.params.udp.ok_or_else(|| {
+        NativeError::Config("vless udp connect requires params.udp (None = TCP path)".into())
+    })?;
+    match cfg.flow.as_deref() {
+        None | Some("") => connect_udp_plain(ctx, stream, uuid, mode).await,
+        Some(other) => Err(NativeError::NotImplemented {
+            feature: format!("vless flow {other}"),
+        }),
+    }
+}
+
+/// Plain UDP connect: request header without addons (`cmd = CMD_UDP`), then
+/// the packet-framed tunnel.
+async fn connect_udp_plain(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    uuid: [u8; 16],
+    mode: PacketMode,
+) -> Result<PacketConn<BoxStream>, NativeError> {
+    let request =
+        header::encode_request(&uuid, &udp_header_target(ctx, mode)?, header::CMD_UDP, None)?;
+    let timeout = timeouts::PROTOCOL;
+    let mut stream = stream;
+    tokio::time::timeout(timeout, stream.write_all(&request))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "vless udp request write",
+            limit: timeout,
+        })??;
+
+    Ok(PacketConn::new(stream, mode))
+}
+
+/// The header destination for the UDP command.
+///
+/// Raw mode: the UDP target itself (port-first). `PacketAddr` mode: the magic
+/// fqdn with port 0 — the header carries no real destination, the
+/// per-packet magic-address headers do (spec §4.3; sing-vmess
+/// `DialEarlyPacketConn(conn, Socksaddr{Fqdn: magic})`). Domain targets are
+/// rejected in packetaddr mode (spec §4.3, sing's `ErrFqdnUnsupported`).
+fn udp_header_target(ctx: &LinkContext, mode: PacketMode) -> Result<TargetAddr, NativeError> {
+    match mode {
+        PacketMode::Raw => Ok(ctx.target.clone()),
+        PacketMode::PacketAddr => {
+            if matches!(ctx.target.host, Host::Domain(_)) {
+                return Err(NativeError::Config(
+                    "packetaddr: domain destination is not supported".into(),
+                ));
+            }
+            Ok(TargetAddr::new(
+                Host::Domain(packetaddr::MAGIC.to_string()),
+                0,
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +309,152 @@ mod tests {
             let result = connect(&ctx_for(&cfg), stream, &cfg).await;
             assert!(result.is_ok(), "flow {flow:?} must take the plain path");
         }
+    }
+
+    /// A `LinkContext` with the UDP mode set, otherwise like [`ctx_for`].
+    fn udp_ctx_for(cfg: &VlessConfig, mode: PacketMode) -> LinkContext {
+        let mut ctx = ctx_for(cfg);
+        ctx.params.udp = Some(mode);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn vision_udp_is_rejected() {
+        // Vision + UDP is rejected wholesale (no XUDP mux until SP3) in
+        // BOTH packet modes, before any I/O — the guard, exercised through
+        // the real connect_udp entry.
+        for mode in [PacketMode::Raw, PacketMode::PacketAddr] {
+            let cfg = vless(Some("xtls-rprx-vision"), "tcp", true);
+            let (stream, _peer) = stream_pair();
+            let err = connect_udp(&udp_ctx_for(&cfg, mode), stream, &cfg)
+                .await
+                .err()
+                .expect("vision + UDP must fail");
+            assert!(
+                matches!(&err, NativeError::NotImplemented { feature } if feature.contains("XUDP")),
+                "mode {mode:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_udp_allowed_guard_matrix() {
+        // The guard rejects ONLY vision + UDP; every other combination
+        // passes (plain flows, unknown flows, vision on the TCP path).
+        for mode in [Some(PacketMode::Raw), Some(PacketMode::PacketAddr)] {
+            let err = check_udp_allowed(Some(FLOW_XTLS_RPRX_VISION), mode).unwrap_err();
+            assert!(
+                matches!(&err, NativeError::NotImplemented { feature } if feature.contains("XUDP"))
+            );
+        }
+        assert!(check_udp_allowed(None, Some(PacketMode::Raw)).is_ok());
+        assert!(check_udp_allowed(Some(""), Some(PacketMode::PacketAddr)).is_ok());
+        assert!(check_udp_allowed(Some("xtls-rprx-splice"), Some(PacketMode::Raw)).is_ok());
+        assert!(check_udp_allowed(Some(FLOW_XTLS_RPRX_VISION), None).is_ok());
+        assert!(check_udp_allowed(None, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn udp_connect_requires_udp_mode() {
+        // connect_udp with params.udp = None is a config error (None = the
+        // TCP path), never a silent default.
+        let cfg = vless(None, "tcp", false);
+        let (stream, _peer) = stream_pair();
+        let err = connect_udp(&ctx_for(&cfg), stream, &cfg)
+            .await
+            .err()
+            .expect("udp: None must fail");
+        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("params.udp")));
+    }
+
+    #[tokio::test]
+    async fn udp_connect_writes_cmd_udp_header() {
+        // Raw mode: version, uuid, addon_len 0, cmd 0x02, then the
+        // port-first UDP dest — identical to TCP except the command byte
+        // (spec §4.1). The returned PacketConn is live over the tunnel.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cfg = vless(None, "tcp", false);
+        let mut ctx = ctx_for(&cfg);
+        ctx.target = TargetAddr::new(Host::new("1.2.3.4"), 8080);
+        ctx.params.udp = Some(PacketMode::Raw);
+        let (stream, mut peer) = stream_pair();
+        let mut conn = connect_udp(&ctx, stream, &cfg)
+            .await
+            .expect("raw udp connect");
+
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&header::uuid_bytes(&cfg.uuid).unwrap());
+        expected.push(0x00); // addon_len 0
+        expected.push(0x02); // cmd UDP
+        expected.extend_from_slice(&[0x1f, 0x90, 0x01, 1, 2, 3, 4]); // port-first dest
+        let mut got = [0u8; 26];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, &expected[..]);
+
+        // One datagram roundtrip through the tunnel.
+        conn.send(None, b"ping").await.unwrap();
+        let mut frame = [0u8; 6];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, &[0x00, 0x04, b'p', b'i', b'n', b'g']);
+        peer.write_all(&[0x00, 0x00]).await.unwrap(); // response header
+        peer.write_all(&[0x00, 0x02, b'o', b'k']).await.unwrap();
+        let (dest, payload) = conn.recv().await.unwrap().unwrap();
+        assert_eq!(dest, None);
+        assert_eq!(payload, b"ok");
+    }
+
+    #[tokio::test]
+    async fn udp_packetaddr_header_is_magic_fqdn() {
+        // PacketAddr mode: the header destination is the magic fqdn with
+        // port 0 — the UDP target stays out of the header; per-packet
+        // destinations carry it (spec §4.3).
+        use tokio::io::AsyncReadExt;
+
+        let cfg = vless(None, "tcp", false);
+        let mut ctx = ctx_for(&cfg);
+        ctx.target = TargetAddr::new(Host::new("1.2.3.4"), 8080);
+        ctx.params.udp = Some(PacketMode::PacketAddr);
+        let (stream, mut peer) = stream_pair();
+        let mut conn = connect_udp(&ctx, stream, &cfg)
+            .await
+            .expect("packetaddr udp connect");
+
+        let mut expected = vec![0x00];
+        expected.extend_from_slice(&header::uuid_bytes(&cfg.uuid).unwrap());
+        expected.push(0x00); // addon_len 0
+        expected.push(0x02); // cmd UDP
+        expected.extend_from_slice(&[0x00, 0x00]); // port 0
+        expected.push(0x02); // domain atyp
+        expected.push(u8::try_from(packetaddr::MAGIC.len()).expect("magic fqdn fits one byte"));
+        expected.extend_from_slice(packetaddr::MAGIC.as_bytes());
+        let mut got = [0u8; 1 + 16 + 1 + 1 + 2 + 1 + 1 + 25];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, &expected[..]);
+
+        // The packetaddr tunnel is live: a per-packet destination travels
+        // with the datagram (spec §4.3).
+        let dest = "1.2.3.4:8080".parse().unwrap();
+        conn.send(Some(dest), b"p").await.unwrap();
+        let mut frame = vec![0u8; 2 + packetaddr::encode_dest(dest).len() + 1];
+        peer.read_exact(&mut frame).await.unwrap();
+        let mut want = packetaddr::encode_dest(dest);
+        want.push(b'p');
+        let mut expected_frame = vec![0x00, 0x21];
+        expected_frame.extend_from_slice(&want);
+        assert_eq!(&frame, &expected_frame[..]);
+    }
+
+    #[tokio::test]
+    async fn udp_packetaddr_rejects_domain_target() {
+        // packetaddr fqdn targets are unsupported (spec §4.3): a domain UDP
+        // target errors before any header write (sing's ErrFqdnUnsupported).
+        let cfg = vless(None, "tcp", false);
+        let (stream, _peer) = stream_pair();
+        let err = connect_udp(&udp_ctx_for(&cfg, PacketMode::PacketAddr), stream, &cfg)
+            .await
+            .err()
+            .expect("packetaddr + domain target must fail");
+        assert!(matches!(&err, NativeError::Config(msg) if msg.contains("packetaddr")));
     }
 }

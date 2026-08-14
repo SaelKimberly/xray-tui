@@ -14,9 +14,6 @@ use std::net::{IpAddr, SocketAddr};
 
 /// The magic fqdn that marks a packetaddr payload (sing-vmess
 /// `SeqPacketMagicAddress`; spec §4.3).
-// Task 3 wires this into the VLESS UDP dispatch; until then the codec is
-// used only by the unit tests below.
-#[allow(dead_code)]
 pub const MAGIC: &str = "sp.packet-addr.v2fly.arpa";
 
 const ATYP_IPV4: u8 = 0x01;
@@ -27,9 +24,6 @@ const ATYP_IPV6: u8 = 0x02;
 /// `SocketAddr` is IP-only, so the fqdn case (a client error per spec §4.3)
 /// is unreachable and this always succeeds. The header is at most
 /// `25 + 1 + 16 + 2 = 44` bytes — well within a u16 frame.
-// Task 3 wires this into the VLESS UDP dispatch; until then the codec is
-// used only by the unit tests below.
-#[allow(dead_code)]
 pub fn encode_dest(addr: SocketAddr) -> Vec<u8> {
     let mut out = Vec::with_capacity(MAGIC.len() + 1 + 16 + 2);
     out.extend_from_slice(MAGIC.as_bytes());
@@ -53,9 +47,6 @@ pub fn encode_dest(addr: SocketAddr) -> Vec<u8> {
 /// The magic prefix is validated — a frame without the exact magic is an
 /// error, never delivered as garbage. Truncated headers and unknown atyp
 /// values are errors too (spec §6).
-// Task 3 wires this into the VLESS UDP dispatch; until then the codec is
-// used only by the unit tests below.
-#[allow(dead_code)]
 pub fn decode_dest(data: &[u8]) -> io::Result<(SocketAddr, &[u8])> {
     let mut rest = data
         .strip_prefix(MAGIC.as_bytes())

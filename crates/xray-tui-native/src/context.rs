@@ -8,6 +8,7 @@ use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsC
 
 use crate::addr::Host;
 use crate::error::{NativeError, timeouts};
+use crate::protocol::vless::PacketMode;
 use crate::security::reality::HelloProvisionerChoice;
 
 /// Per-connect parameters: the typed proto config plus the dial address.
@@ -25,6 +26,11 @@ pub struct NativeConnectParams {
     /// the `ClientHello`. Defaults to
     /// [`HelloProvisionerChoice::FixedChrome133`].
     pub reality_provisioner: HelloProvisionerChoice,
+    /// UDP packet mode: `None` = the TCP path (default; [`crate::connect`]);
+    /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`crate::connect_udp`],
+    /// command 0x02) with `Raw` (header-dest) or `PacketAddr` (per-packet
+    /// magic-address destinations) framing.
+    pub udp: Option<PacketMode>,
 }
 
 impl NativeConnectParams {
@@ -40,6 +46,7 @@ impl NativeConnectParams {
             target,
             resolved_ip: None,
             reality_provisioner: HelloProvisionerChoice::FixedChrome133,
+            udp: None,
         }
     }
 }

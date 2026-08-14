@@ -66,3 +66,20 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         ProtocolConfig::Mixed(_) => not_impl("mixed (outbound-only kind)"),
     }
 }
+
+/// Run the UDP protocol phase: VLESS command 0x02 + packet framing over the
+/// given stream — the last link of a `connect_udp` chain.
+///
+/// Only VLESS has a native UDP path; every other protocol stays
+/// `NotImplemented` here.
+pub async fn connect_udp(
+    ctx: &LinkContext,
+    stream: BoxStream,
+) -> Result<crate::protocol::vless::PacketConn<BoxStream>, NativeError> {
+    match &ctx.params.protocol {
+        ProtocolConfig::Vless(cfg) => vless::connect_udp(ctx, stream, cfg).await,
+        _ => Err(NativeError::NotImplemented {
+            feature: "udp protocol connect (native UDP path is vless-only)".into(),
+        }),
+    }
+}

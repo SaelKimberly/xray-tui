@@ -16,9 +16,6 @@ const MAX_FRAME: usize = 65_535;
 
 /// Datagram mode: `Raw` (header-dest, xray-style) or `PacketAddr`
 /// (per-packet magic-address destination, sing-box-style; spec §4.3).
-// Task 3 wires this into the VLESS UDP dispatch; until then the enum is
-// used only by the unit tests below.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketMode {
     Raw,
@@ -30,18 +27,12 @@ pub enum PacketMode {
 ///
 /// Owns the response-header peel: the server sends `[0x00, 0x00]` before
 /// the first downlink frame (spec §4.4), consumed on the first `recv`.
-// Task 3 wires this into the VLESS UDP dispatch; until then the API is
-// used only by the unit tests below.
-#[allow(dead_code)]
 pub struct PacketConn<S> {
     inner: S,
     mode: PacketMode,
     peel: Peel,
 }
 
-// Task 3 wires this into the VLESS UDP dispatch; until then the API is
-// used only by the unit tests below.
-#[allow(dead_code)]
 impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// Wraps a tunnel stream in datagram framing for the given mode.
     pub const fn new(inner: S, mode: PacketMode) -> Self {
