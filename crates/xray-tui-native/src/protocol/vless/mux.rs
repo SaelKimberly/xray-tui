@@ -2789,7 +2789,7 @@ mod tests {
     /// target is the New frame's session target (TCP or UDP — a UDP New
     /// frame carries the 8-byte `GlobalID` right after the address) or a
     /// UDP Keep frame's per-packet destination; the server's own replies
-    /// (TCP Keep / KeepAlive / End) carry no target.
+    /// (TCP `Keep` / `KeepAlive` / `End`) carry no target.
     fn read_mux_frame(
         conn: &mut rustls::ServerConnection,
         sock: &mut std::net::TcpStream,
@@ -2869,7 +2869,7 @@ mod tests {
     /// carrying a target (`[network 1B][port 2B][atyp 1B][addr]`). The
     /// fake server's UDP replies are Keep frames WITH the per-packet
     /// destination (the client threads it to `recv_from`); its TCP
-    /// replies (Keep / KeepAlive / End) carry no target (the server-side
+    /// replies (`Keep` / `KeepAlive` / `End`) carry no target (the server-side
     /// response writer starts at Keep — no New target on the wire).
     fn write_mux_frame_full(
         conn: &mut rustls::ServerConnection,
@@ -3152,8 +3152,8 @@ mod tests {
     /// network=UDP + the destination + the 8-byte `GlobalID` (spec §4.1),
     /// subsequent `send`s are Keep frames carrying their own per-packet
     /// destinations; the server replies per dest (Keep frames carrying
-    /// that destination back) and the client's XUdp [`PacketConn`] recv
-    /// returns the `(dest, payload)` pairs. Asserts the GlobalID bytes
+    /// that destination back) and the client's `XUdp` [`PacketConn`] recv
+    /// returns the `(dest, payload)` pairs. Asserts the `GlobalID` bytes
     /// (a fixed value drives the byte-exact wire check; the production
     /// path draws one randomly per tunnel) and the per-packet dest
     /// framing on both uplink directions.
