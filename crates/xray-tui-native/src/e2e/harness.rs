@@ -322,6 +322,44 @@ pub fn spawn_inner_tls_echo() -> InnerTlsEchoServer {
     InnerTlsEchoServer { addr, handle }
 }
 
+/// A UDP echo target: every received datagram is echoed verbatim back to
+/// its source — the destination for the VLESS UDP e2e rows (the probe's
+/// datagrams traverse the tunnel and return through it).
+pub struct UdpEchoServer {
+    pub addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UdpEchoServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn a `tokio::net::UdpSocket` echo on 127.0.0.1:ephemeral.
+///
+/// `spawn_*` is synchronous (called from fixtures / `run_against`, outside
+/// an async context), so the socket is bound as a std socket and converted
+/// to tokio, mirroring the TLS echo servers.
+#[must_use]
+pub fn spawn_udp_echo() -> UdpEchoServer {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp echo");
+    let addr = socket.local_addr().expect("udp echo ip addr");
+    socket.set_nonblocking(true).expect("udp echo nonblocking");
+    let socket = tokio::net::UdpSocket::from_std(socket).expect("udp echo tokio");
+    let handle = tokio::spawn(async move {
+        // Max UDP payload is 65507 (IPv4); the VLESS frame cap is 65535
+        // (heap buffer — a 64 KiB stack array trips clippy).
+        let mut buf = vec![0u8; 65_535];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            if socket.send_to(&buf[..n], peer).await.is_err() {
+                break;
+            }
+        }
+    });
+    UdpEchoServer { addr, handle }
+}
+
 /// Build a rustls server config from the harness cert/key PEMs (TLS 1.3).
 fn tls_server_config(certs: &Certs) -> rustls::ServerConfig {
     use rustls::pki_types::pem::PemObject;
@@ -510,6 +548,91 @@ pub async fn probe_inner_tls(tunnel: crate::NativeTunnel) -> (u16, String) {
             }
         };
     http_exchange(&mut inner).await
+}
+
+/// Distinct datagrams [`probe_udp`] sends per attempt; the e2e runner
+/// requires every echo back, so the payloads must differ (echoes are
+/// matched by content, order-independent).
+pub const UDP_PROBE_PAYLOADS: [&[u8]; 3] = [b"udp-0", b"udp-1", b"udp-2"];
+
+/// The number of datagrams [`probe_udp`] sends per attempt — the count
+/// `run_against` asserts on the `(sent, received)` outcome.
+pub const UDP_PROBE_COUNT: usize = UDP_PROBE_PAYLOADS.len();
+
+/// Overall budget for the UDP probe (connect + all sends + all echoes).
+/// REALITY inbounds delay the first app-data exchange ~5s while the
+/// server's post-handshake record detector completes, so the window must
+/// cover that plus the datagram round-trips.
+const UDP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Probe the VLESS UDP path over a datagram tunnel.
+///
+/// Establishes the tunnel via [`crate::connect_udp`], sends
+/// [`UDP_PROBE_COUNT`] distinct payloads to the case target, and receives
+/// until every echo arrives (matched by payload, order-independent) or the
+/// deadline expires. Fully bounded: the whole exchange (connect, sends,
+/// receives) runs under one deadline. Returns `(sent, received)` — the
+/// number of datagrams successfully written and the number of distinct
+/// echoes received; the e2e runner asserts both equal
+/// [`UDP_PROBE_COUNT`]. Returns `(0, 0)` on a failed connect or a deadline
+/// expiry before any datagram was sent.
+pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
+    use crate::protocol::vless::PacketMode;
+    let deadline = tokio::time::Instant::now() + UDP_PROBE_TIMEOUT;
+    let mut conn = match tokio::time::timeout_at(deadline, crate::connect_udp(params)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("probe_udp connect error: {e}");
+            return (0, 0);
+        }
+        Err(_) => {
+            eprintln!("probe_udp connect timed out");
+            return (0, 0);
+        }
+    };
+    // Per-datagram destination for packetaddr mode (Raw mode encodes the
+    // target in the request header; send(None)). Domain targets only occur
+    // in Raw mode (packetaddr rejects them client-side), so a domain target
+    // yields None here.
+    let ip_target = match &params.target.host {
+        crate::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
+        crate::addr::Host::Domain(_) => None,
+    };
+    let mut sent = 0;
+    for payload in UDP_PROBE_PAYLOADS {
+        let dest = if params.udp == Some(PacketMode::PacketAddr) {
+            ip_target
+        } else {
+            None
+        };
+        match tokio::time::timeout_at(deadline, conn.send(dest, payload)).await {
+            Ok(Ok(())) => sent += 1,
+            _ => break,
+        }
+    }
+    let mut received = 0;
+    let mut seen = [false; UDP_PROBE_COUNT];
+    while received < UDP_PROBE_COUNT && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, conn.recv()).await {
+            Ok(Ok(Some((_, payload)))) => {
+                let payload = payload.as_slice();
+                if let Some(i) = UDP_PROBE_PAYLOADS.iter().position(|p| *p == payload)
+                    && !seen[i]
+                {
+                    seen[i] = true;
+                    received += 1;
+                }
+            }
+            // Clean EOF at a frame boundary (tunnel closed) or the deadline
+            // expired — either way the remaining echoes will not arrive.
+            Ok(Ok(None)) | Err(_) => break,
+            Ok(Err(e)) => {
+                eprintln!("probe_udp recv error: {e}");
+                break;
+            }
+        }
+    }
+    (sent, received)
 }
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";

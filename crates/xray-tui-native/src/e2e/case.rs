@@ -11,6 +11,7 @@ use super::{
     TlsVariant, config,
 };
 use crate::NativeConnectParams;
+use crate::protocol::vless::PacketMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
@@ -42,6 +43,11 @@ pub enum AppKind {
     /// in the engine TLS client to a rustls echo target (the vision
     /// Direct-splice path).
     InnerTls,
+    /// UDP datagrams through the tunnel (VLESS command 0x02): the probe
+    /// sends datagrams to the UDP echo target and matches echoes by
+    /// payload. The packet mode (`Raw` / `PacketAddr`) lives in
+    /// [`CaseSpec::udp`].
+    Udp,
 }
 
 /// One e2e scenario described as data.
@@ -63,9 +69,16 @@ pub struct CaseSpec {
     /// (`xtls-rprx-vision`) exists; it is emitted in the server's
     /// clients/users and the client outbound (vmess cases never carry one).
     flow: Option<Flow>,
-    /// App-side probe kind: plain HTTP over the tunnel, or an inner TLS
-    /// session THROUGH the tunnel to a rustls echo target.
+    /// App-side probe kind: plain HTTP over the tunnel, an inner TLS
+    /// session THROUGH the tunnel to a rustls echo target, or UDP
+    /// datagrams to the UDP echo target.
     app: AppKind,
+    /// UDP packet mode for UDP rows: `None` = the TCP path (default);
+    /// `Some(mode)` selects the VLESS UDP datagram tunnel ([`PacketMode`]
+    /// `Raw` = header-dest, `PacketAddr` = per-packet magic-address
+    /// destinations). Ignored unless `app` is [`AppKind::Udp`]; drives
+    /// `NativeConnectParams.udp` for the probe's `connect_udp`.
+    udp: Option<PacketMode>,
 }
 
 impl CaseSpec {
@@ -79,6 +92,7 @@ impl CaseSpec {
             xhttp_mode: None,
             flow: None,
             app: AppKind::Plain,
+            udp: None,
         }
     }
 
@@ -92,6 +106,7 @@ impl CaseSpec {
             xhttp_mode: None,
             flow: None,
             app: AppKind::Plain,
+            udp: None,
         }
     }
 
@@ -117,11 +132,20 @@ impl CaseSpec {
         self
     }
 
-    /// Select the app-side probe kind: plain HTTP over the tunnel (default)
-    /// or an inner TLS session through the tunnel to a rustls echo target.
+    /// Select the app-side probe kind: plain HTTP over the tunnel (default),
+    /// an inner TLS session through the tunnel to a rustls echo target, or
+    /// UDP datagrams to the UDP echo target.
     #[must_use]
     pub const fn with_app(mut self, app: AppKind) -> Self {
         self.app = app;
+        self
+    }
+
+    /// Select the UDP packet mode (`Raw` / `PacketAddr`); the row's `app`
+    /// must be [`AppKind::Udp`] (the mode drives the probe's `connect_udp`).
+    #[must_use]
+    pub const fn with_udp(mut self, mode: PacketMode) -> Self {
+        self.udp = Some(mode);
         self
     }
 
@@ -169,6 +193,7 @@ impl E2eCase for CaseSpec {
         let app = match self.app {
             AppKind::Plain => String::new(),
             AppKind::InnerTls => "/inner-tls".to_string(),
+            AppKind::Udp => "/udp".to_string(),
         };
         format!("{proto}/{flow}{}/{tls}{sec}{app}", self.network)
     }
@@ -186,7 +211,7 @@ impl E2eCase for CaseSpec {
     }
 
     fn client_params(&self, port: u16, target: SocketAddr) -> NativeConnectParams {
-        match self.protocol {
+        let mut params = match self.protocol {
             ProtocolKind::Vless => config::client_params_vless(
                 port,
                 target,
@@ -210,7 +235,12 @@ impl E2eCase for CaseSpec {
                     self.xhttp_mode,
                 )
             }
-        }
+        };
+        // UDP rows: the VLESS UDP datagram tunnel dispatches on the params'
+        // packet mode (`connect_udp` requires it; the proto has no
+        // `packet_encoding` field — spec §4.3, no proto changes allowed).
+        params.udp = self.udp;
+        params
     }
 
     fn expected(&self) -> E2eExpect {
@@ -226,11 +256,14 @@ impl E2eCase for CaseSpec {
     }
 
     fn probe_target(&self, env: &ServerEnv) -> SocketAddr {
-        // Inner-TLS rows splice to a rustls echo target (the vision
-        // Direct path); a plain client through a REALITY server is
-        // transparently proxied and terminates at the server's dest —
-        // probe that instead of the plain echo.
-        if self.app == AppKind::InnerTls {
+        // UDP rows echo datagrams to the dedicated UDP target (the probe's
+        // `connect_udp` header destination). Inner-TLS rows splice to a
+        // rustls echo target (the vision Direct path); a plain client
+        // through a REALITY server is transparently proxied and terminates
+        // at the server's dest — probe that instead of the plain echo.
+        if self.app == AppKind::Udp {
+            env.udp_echo.expect("udp rows spawn the UDP echo target")
+        } else if self.app == AppKind::InnerTls {
             env.inner_tls_echo
                 .expect("inner-tls rows spawn the inner TLS echo target")
         } else if self.tls().probe_dest() {
@@ -302,6 +335,53 @@ mod tests {
                 .label(),
             "vless/xtls-rprx-vision/tcp/reality/inner-tls"
         );
+        assert_eq!(
+            CaseSpec::vless().with_app(AppKind::Udp).label(),
+            "vless/tcp/tls/udp"
+        );
+        assert_eq!(
+            CaseSpec::vless()
+                .with_tls(Box::new(RealityTls::fresh()))
+                .with_app(AppKind::Udp)
+                .label(),
+            "vless/tcp/reality/udp"
+        );
+    }
+
+    #[test]
+    fn udp_mode_plumbs_into_client_params() {
+        use xray_tui_proto::proto_spec::ProtoSpec as _;
+
+        // Default (TCP) rows keep `params.udp` unset.
+        let tcp = CaseSpec::vless();
+        let params = tcp.client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert_eq!(params.udp, None);
+
+        // Raw mode: plumbed for the probe's connect_udp.
+        let raw = CaseSpec::vless()
+            .with_app(AppKind::Udp)
+            .with_udp(PacketMode::Raw);
+        let params = raw.client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert_eq!(params.udp, Some(PacketMode::Raw));
+
+        // PacketAddr mode: same plumbing.
+        let addr = CaseSpec::vless()
+            .with_app(AppKind::Udp)
+            .with_udp(PacketMode::PacketAddr);
+        let params = addr.client_params(12345, "127.0.0.1:9999".parse().unwrap());
+        assert_eq!(params.udp, Some(PacketMode::PacketAddr));
+
+        // The vless client protocol payload still parses as a plain vless
+        // config — the packet mode lives in the params, NOT the proto
+        // (spec §4.3; xray-tui-proto is never modified).
+        let protocol: xray_tui_proto::proto_spec::ProtocolConfig =
+            serde_json::from_value(serde_json::to_value(params.protocol).unwrap()).unwrap();
+        match protocol {
+            xray_tui_proto::proto_spec::ProtocolConfig::Vless(cfg) => {
+                assert_eq!(cfg.transport_type(), Some("tcp"));
+            }
+            other => panic!("expected vless config, got {other:?}"),
+        }
     }
 
     #[test]

@@ -17,8 +17,9 @@ use std::time::Duration;
 pub use case::{AppKind, CaseSpec, Flow, ProtocolKind};
 pub use core::{CoreKind, CoreUnderTest};
 pub use harness::{
-    Certs, EchoServer, InnerTlsEchoServer, TlsEchoServer, free_port, generate_certs, probe,
-    probe_inner_tls, spawn_core, spawn_echo, spawn_inner_tls_echo, spawn_tls_echo,
+    Certs, EchoServer, InnerTlsEchoServer, TlsEchoServer, UDP_PROBE_COUNT, UDP_PROBE_PAYLOADS,
+    UdpEchoServer, free_port, generate_certs, probe, probe_inner_tls, probe_udp, spawn_core,
+    spawn_echo, spawn_inner_tls_echo, spawn_tls_echo, spawn_udp_echo,
 };
 pub use variant::{
     Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, PlainServerRealityClientTls,
@@ -48,6 +49,9 @@ pub struct ServerEnv<'a> {
     /// The rustls echo target for inner-TLS rows (the app wraps the tunnel
     /// in an engine TLS session to this server); `None` for plain rows.
     pub inner_tls_echo: Option<SocketAddr>,
+    /// The UDP echo target for UDP rows (the probe's datagram destination
+    /// through the tunnel); `None` for non-UDP rows.
+    pub udp_echo: Option<SocketAddr>,
 }
 
 /// Expected outcome of the initial `connect()` call.
@@ -137,6 +141,13 @@ pub async fn run_against(
     } else {
         None
     };
+    // UDP rows echo datagrams to a dedicated UDP target (created once here,
+    // outliving the attempt loop; mirror of `inner_tls_echo`).
+    let udp_echo = if case.app() == AppKind::Udp {
+        Some(spawn_udp_echo())
+    } else {
+        None
+    };
     let cert_path = dir.path().join("server.crt");
     let key_path = dir.path().join("server.key");
     std::fs::write(&cert_path, &certs.cert_pem).map_err(|e| format!("cert write: {e}"))?;
@@ -157,6 +168,7 @@ pub async fn run_against(
             echo: echo.addr,
             tls_echo: tls_echo.addr,
             inner_tls_echo: inner_tls_echo.as_ref().map(|s| s.addr),
+            udp_echo: udp_echo.as_ref().map(|s| s.addr),
         };
         let config_json = case.server_config(core.kind, &env);
         if std::fs::write(&config_path, &config_json).is_err() {
@@ -216,6 +228,20 @@ pub async fn run_against(
             );
             continue;
         }
+        if case.app() == AppKind::Udp {
+            // UDP rows: the probe drives its own `connect_udp` (the tunnel
+            // is a datagram tunnel, not a byte stream) and requires every
+            // datagram's echo back.
+            let (sent, received) = probe_udp(&params).await;
+            if sent == UDP_PROBE_COUNT && received == UDP_PROBE_COUNT {
+                return Ok(());
+            }
+            eprintln!(
+                "[e2e] {}: attempt {attempt}/{ATTEMPTS} udp probe sent {sent} received {received}",
+                case.label()
+            );
+            continue;
+        }
         let mut tunnel = match crate::connect(params).await {
             Ok(t) => t,
             Err(e) => {
@@ -231,6 +257,8 @@ pub async fn run_against(
             // THROUGH the tunnel to the rustls echo target (Direct splice).
             AppKind::InnerTls => probe_inner_tls(tunnel).await,
             AppKind::Plain => probe(&mut tunnel).await,
+            // UDP rows return above (before the TCP connect).
+            AppKind::Udp => unreachable!("udp rows are handled before the TCP connect"),
         };
         if status == expect.status && body == expect.body {
             return Ok(());

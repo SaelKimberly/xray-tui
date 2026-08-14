@@ -698,6 +698,7 @@ mod tests {
             echo: "127.0.0.1:9999".parse().unwrap(),
             tls_echo: "127.0.0.1:9443".parse().unwrap(),
             inner_tls_echo: None,
+            udp_echo: None,
         };
         let xray: serde_json::Value =
             serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, None, &tls, "tcp")).unwrap();
@@ -782,6 +783,7 @@ mod tests {
             echo: "127.0.0.1:9999".parse().unwrap(),
             tls_echo: "127.0.0.1:9443".parse().unwrap(),
             inner_tls_echo: None,
+            udp_echo: None,
         };
         let target = "1.2.3.4:80".parse().unwrap();
 
@@ -841,6 +843,7 @@ mod tests {
             echo: "127.0.0.1:9999".parse().unwrap(),
             tls_echo: "127.0.0.1:9443".parse().unwrap(),
             inner_tls_echo: None,
+            udp_echo: None,
         };
         let target = "1.2.3.4:80".parse().unwrap();
 
