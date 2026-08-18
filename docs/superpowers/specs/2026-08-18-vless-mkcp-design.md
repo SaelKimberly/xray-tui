@@ -61,15 +61,17 @@ SendingWorker's RTT update — see §5.3).
 
 **CmdOnlySegment** — Ping (cmd=3) and Terminate (cmd=2):
 ```
-[conv u16][cmd u8][opt u8][snd_nxt u32][rcv_nxt u32][peer_rto u32]   (14B)
+[conv u16][cmd u8][opt u8][snd_nxt u32][rcv_nxt u32][peer_rto u32]   (16B)
 ```
 `snd_nxt` = first unacknowledged; `rcv_nxt` = next expected; `peer_rto` = the
 peer's current RTO (adopted by the receiver every ≥3000ms).
 
 **Parse**: read `[conv u16][cmd u8][opt u8]` (≥4B required); conv mismatch
-drops the rest of the datagram; then per-cmd: Data needs ≥16 more bytes
-(ts/sn/una/len) + payload; Ack needs ≥13 more (rcv_wnd/rcv_nxt/ts/count) +
-count×4 numbers; CmdOnly needs 12 more.
+drops the rest of the datagram; then per-cmd: Data needs a ≥15-byte body
+(Go's `len(buf) < 15` check — 16 fixed bytes + payload, where the declared
+`len` must match the remaining bytes; the Go check accepts a 15-byte body);
+Ack needs ≥13 more (rcv_wnd/rcv_nxt/ts/count) + count×4 numbers; CmdOnly
+needs 12 more.
 
 ### 4.2 Conversation id
 
