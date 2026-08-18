@@ -7705,6 +7705,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "md-5",
+ "parking_lot",
  "rcgen",
  "ring",
  "rstest",

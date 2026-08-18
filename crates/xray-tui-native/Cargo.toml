@@ -64,6 +64,9 @@ x25519-dalek = { version = "3", default-features = false, features = ["static_se
 # errors
 thiserror.workspace = true
 
+# infallible sync locks (project rule rs-parking-lot; workspace already uses 0.12)
+parking_lot = "0.12"
+
 # observability (debug diagnostics in transports)
 tracing.workspace = true
 
