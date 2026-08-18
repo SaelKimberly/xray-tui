@@ -1215,6 +1215,23 @@ async fn drive(core: Arc<Mutex<SessionCore>>) {
             () = flush_wake.notified() => 1u8,
             () = tokio::time::sleep(tti), if data_work => 2u8,
         };
+        // Every wake runs flush() — timer ticks included (Go's updaters
+        // call flush on each tick): the silence ping cadence, the RTO
+        // retransmit (via the data tti while the send window is nonempty),
+        // the idle guard and the terminate-handshake state transitions all
+        // live inside flush. Without this, only write/input/close wakeups
+        // flushed, so a stalled window never retransmitted and the 5s ping
+        // tick never fired. (A wakeup that raced the drain loop above makes
+        // this flush redundant — flushing twice is a no-op for empty
+        // windows/ack lists.)
+        {
+            let mut core = lock(&core);
+            if core.is_terminated() {
+                return;
+            }
+            let current = core.elapsed();
+            core.flush(current);
+        }
     }
 }
 

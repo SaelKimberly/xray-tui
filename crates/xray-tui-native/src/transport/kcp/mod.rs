@@ -6,3 +6,6 @@ pub mod wire;
 
 pub use session::{KcpSession, KcpSettings, State};
 pub use wire::{Command, Segment, SegmentOption, encode_segment, parse_datagram};
+
+#[cfg(test)]
+mod fake_peer;
