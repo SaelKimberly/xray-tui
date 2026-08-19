@@ -34,7 +34,11 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 
 - **Xray composition order, one layer stack**: `dial → security → transport
   upgrade → protocol → tunnel` — TLS is OUTERMOST (a ws/grpc transport runs
-  framing INSIDE the engine TLS session, matching xray/sing-box). Each phase
+  framing INSIDE the engine TLS session, matching xray/sing-box). mKCP is the
+  dial-end exception: it is a UDP **dial**, not an upgrade — `connect` gains
+  the kcp arm (`transport/kcp`, fresh UDP socket + KCP session), `upgrade`
+  stays passthrough, and the security layer wraps the KCP stream exactly as
+  it wraps TCP. Each phase
   consumes the previous phase's byte stream (`BoxStream`) and returns the
   next. A protocol = the same handshake-over-stream pipeline unless its
   `ConnectShape` says otherwise (device tunnels, own-handshake protocols,
@@ -63,9 +67,9 @@ future task, so legacy (TLS 1.2-only) servers are not yet reachable.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session) | 361 lib tests (122 tls + 239 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session)) |
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session) | 433 lib tests (122 tls + 311 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP)) |
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
-| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis | 123 tests = 119 green + 4 documented ignored (vless ws/grpc plain-into-reality-server semantic rows × both cores; single-core rows: xhttp/xray, v2rayhttp/sing-box, ws+httpupgrade reality/sing-box, mux-vision/sing-box, vision-udp443/sing-box) |
+| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis, VLESS mKCP axis | 126 tests = 122 green + 4 documented ignored (vless 74+4, vmess 48; ignored: vless ws/grpc plain-into-reality-server semantic rows × both cores; single-core rows: xhttp/xray, v2rayhttp/sing-box, ws+httpupgrade reality/sing-box, mux-vision/sing-box, vision-udp443/sing-box) |
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
@@ -80,7 +84,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `chain.rs` | `connect_chain`: fold the layer stack |
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
-| `transport/` | `connect` = TCP dial (any transport; framing is an upgrade step); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts |
+| `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `BrowserProfile`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec) |
 | `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
@@ -133,9 +137,9 @@ real certificate (potential MITM or redirection)")`.
 
 ## E2E coverage (tier 3)
 
-The suite has six subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
-VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 × serving core(s) — 123
-tests = 119 green + 4 documented ignored (vless ws/grpc
+The suite has seven subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
+VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP × serving core(s) — 126
+tests = 122 green + 4 documented ignored (vless 74+4, vmess 48; ignored: vless ws/grpc
 plain-into-reality-server semantic rows × both cores; single-core rows run
 only on the serving core: xhttp on xray, v2rayhttp + ws/httpupgrade-reality
 on sing-box, mux-vision + vision-udp443 on sing-box). **TLS-variant cases**, each run against both cores (xray
@@ -207,6 +211,22 @@ it). xray serves vision+mux+UDP by design (mux under flow XRV is the XUDP
 path: `AllowedNetwork = UDP` — inbound.go; the SP2 vision+mux TCP
 rejection does not apply to UDP), and sing-box terminates the same XUDP
 session — the xray arm was verified in the final-review fix wave.
+
+**VLESS mKCP axis** (spec §7.3): 2 rows — the mKCP transport (xray's KCP
+fork over UDP; `transport/kcp/` — wire codec `{wire,session,stream}.rs`:
+Data `[conv u16][cmd][opt][ts u32][sn u32][una u32][len u16][payload]`
+18B overhead, Ack, CmdOnly Ping/Terminate; one segment per UDP datagram;
+conv from a process-global counter, xray `dice.RollUint16()` equivalent).
+xray-single-core rows (sing-box has no kcp): `kcp_plain` — the suite's
+first genuinely no-TLS row (server `streamSettings` without `tlsSettings`,
+client security none) — and `kcp_chrome` (tls, chrome fingerprint engine);
+the two composition arms of `dial kcp → security wrap → protocol`. The
+kcp+reality arm is dropped (spec deviation 5): xray-core 26.3.27's
+`StreamConfig.Build()` rejects `security: "reality"` over any protocol but
+tcp/splithttp/grpc — "REALITY only supports RAW, XHTTP and gRPC for now."
+— so no core can serve reality-over-kcp (the native client's
+reality-over-kcp dial stays implemented, unreachable server-side exactly
+like xray's own client).
 
 | Case | Payload security | TLS variant |
 |------|------------------|-------------|
@@ -294,11 +314,11 @@ Notes on the matrix:
 | Encryption | none (identity = UUID; optional `xtls-rprx-vision` flow control, TLS 1.3 framing) |
 | Auth | UUID (command bytes in header) |
 | Obfuscation | none at protocol level; REALITY supplies traffic camouflage |
-| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 ✅ (kcp/quic UDP stacks + XHTTP stream-one deferred). Vision requires raw TCP — the Direct handoff needs the socket (ws/grpc/xhttp framing is incompatible). |
+| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP ✅ (quic UDP stack + XHTTP stream-one deferred). KCP = mKCP over UDP, xray-only (sing-box has no kcp); e2e plain + tls rows. Vision requires raw TCP — the Direct handoff needs the socket (ws/grpc/xhttp framing is incompatible). |
 | UDP | `cmd 0x02` UDP command path ✅ — `[2B BE len][payload]` datagram framing both directions over the tunnel stream (`protocol/vless/udp.rs`), `PacketConn` datagram API with the response-header peel (`packet.rs`), packetaddr mode (`packetaddr.rs`; sing-box-style: header dest = magic fqdn `sp.packet-addr.v2fly.arpa`, per-packet frame header `atyp|addr|port`, no magic in the frame). XUDP ✅ (SP3) — UDP over the mux tunnel (`PacketConn::xudp` over `UdpSession`, per-packet dests + the tunnel's 8-byte `GlobalID`; see Mux). e2e 10 rows: Raw × {tls-standard, reality} × both cores + packetaddr/tls/sing-box (xray has no packetaddr registration) + XUDP × {tls-standard, reality} × both cores + vision-udp443/sing-box. Vision+UDP rejected on the RAW path only — the flow guard refuses UDP under the vision flows over the direct cmd-0x02 tunnel (mirrors xray's UDP/443 rejection); under the mux path the rejection lifts (XUDP). |
 | Flow | `xtls-rprx-vision` ✅ — padded camouflage frames + inner-TLS filter + Direct splice state machine (`protocol/vless/vision.rs`, protobuf flow addon in the request header). TCP transport only; UDP app traffic under the vision flows rides the mux tunnel (XUDP, SP3) — the raw-path guard rejects UDP under vision (mirrors xray's UDP/443 rejection). `xtls-rprx-vision-udp443` ✅ (SP3) — the client config carries the full name (selects the XUDP path: mux-forced, guard lifted), the wire addon truncates to the first 16 bytes (`xtls-rprx-vision`, xray `requestAddons.Flow[:16]`), and the server validates against that truncated name. Requires outer TLS1.3/REALITY over raw TCP (guards in `connect_vision` mirror xray's rejection). Inner TLS1.3 → `Direct` raw splice — both directions abandon the outer TLS after the Direct frame (the Direct frame is the last outer-TLS record); non-1.3 inner traffic → `End`, padding stops, outer TLS continues. Deviations (spec §9): no 500 ms camouflage timer (the empty Continue long-padding frame is emitted immediately after the header — same wire bytes, deterministic), per-direction direct flags (`TlsStream::set_write_direct`/`set_read_direct`) instead of Go's unsafe `tls.Conn` reflection. |
 | Mux | `cmd 0x03` v1.mux.cool multiplexer ✅ — one tunnel (fixed `v1.mux.cool:9527` header destination, NO destination bytes on the wire — the no-addr rule) carrying concurrent TCP sessions + XUDP datagram sessions: `MuxClient` (demux + writer + keepalive tasks, eager `New`, event-driven `Keep`/`End` frames, tunnel-level `KeepAlive` every 10 s, 8 KiB chunks) + `SessionStream` app streams + `UdpSession` (XUDP, SP3: `open_udp_session` with a fresh random 8-byte `GlobalID` — network=UDP New frame — then `Keep` frames carrying each packet's own destination; wrapped by `PacketConn::xudp`) (`protocol/vless/mux.rs`). Vision+mux composition ✅ — peel-inside (response header peeled before the vision codec, mirroring xray `outbound.go`), mux frames ride the vision-padded stream; sing-box server only (xray rejects vision+mux TCP by server design — its vision+mux is the XUDP path). e2e 10 rows: mux-tls + mux-reality × both cores, mux-vision/sing-box, xudp-tls + xudp-reality × both cores, vision-udp443/sing-box. |
-| Status | Native client complete + e2e (tls-standard, tls-chrome, reality, vision-tls, vision-reality, udp-raw, udp-packetaddr, mux-tls, mux-reality, mux-vision, xudp-tls, xudp-reality, vision-udp443) × both cores, full TCP-stream transport matrix e2e (123-test sweep = 119 green + 4 documented ignored). Deferred: kcp/quic (UDP stacks), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux (mux v2) / connection-reuse pooling, browser-masquerade header set. |
+| Status | Native client complete + e2e (tls-standard, tls-chrome, reality, vision-tls, vision-reality, udp-raw, udp-packetaddr, mux-tls, mux-reality, mux-vision, xudp-tls, xudp-reality, vision-udp443, kcp-plain, kcp-chrome) × both cores where the transport allows (kcp rows xray-only), full transport matrix e2e (126-test sweep = 122 green + 4 documented ignored: vless 74+4, vmess 48). Deferred: quic (UDP stack), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux (mux v2) / connection-reuse pooling, browser-masquerade header set. |
 
 **VMess** — ✅ native
 | Capability | Detail |
@@ -306,8 +326,8 @@ Notes on the matrix:
 | Encryption | payload: `aes-128-gcm`, `chacha20-poly1305` (native ✅); legacy `aes-128-cfb` / `none` (xray-only, ⛔ legacy disabled in modern cores) |
 | Auth | AEAD request header (mandatory), MD5/HMAC-SHA256 KDF chain, FNV-1a + CRC-32 frame checks |
 | Obfuscation | none at protocol level (transport-level ws/grpc/http in xray) |
-| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2 (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2 ✅ (kcp/quic UDP stacks + XHTTP stream-one deferred) |
-| Status | Native client complete + e2e (aes-128-gcm, chacha20-poly1305, tls-firefox, reality) × both cores, full TCP-stream transport matrix e2e. Legacy ciphers ⛔. Deferred: kcp/quic (UDP stacks), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set, v2rayhttp no-TLS h1 arm. |
+| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2 (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP ✅ (quic UDP stack + XHTTP stream-one deferred) |
+| Status | Native client complete + e2e (aes-128-gcm, chacha20-poly1305, tls-firefox, reality) × both cores, full transport matrix e2e (kcp rows run via the shared transport; e2e coverage is the vless kcp rows). Legacy ciphers ⛔. Deferred: quic (UDP stack), XHTTP `stream-one`, HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set, v2rayhttp no-TLS h1 arm. |
 
 **Trojan** — 📋 native
 | Capability | Detail |
@@ -464,13 +484,13 @@ Notes on the matrix:
 | XHTTP (splithttp) | ✅ | `transport/xhttp.rs`; v3 dialect (xray-only server): uuid session in path, GET-body download, raw POST uploads (seq + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks); packet-up + stream-up; h1 when no TLS, h2 over TLS; e2e vs xray (single-core) |
 | h2 (v2rayhttp) | ✅ | `transport/v2rayhttp.rs`; h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only (xray removed the h2 transport in 26.x); e2e vs sing-box (single-core) |
 | QUIC | 🔒 | prerequisite for Hysteria1/2 + TUIC clients |
-| KCP | 📋 | xray-core only; UDP (separate UDP-transport project, deferred) |
+| KCP (mKCP) | ✅ | `transport/kcp/` — xray's KCP fork over UDP: wire codec + session (windows/retransmit/RTO/congestion) + stream; one segment per datagram, conv from a process-global counter; xray-only (sing-box has no kcp); e2e vs xray (plain no-TLS + chrome tls) |
 | obfs plugins (SS) | 📋 | plugin URL param already parsed by proto |
 
 ### Transport deferrals (documented, no stub)
 
-- **kcp / quic** — UDP transports (mKCP FEC/session; QUIC stack). Separate
-  project; gates Hysteria1/2 + TUIC clients.
+- **quic** — QUIC transport; gates Hysteria1/2 + TUIC clients. (mKCP landed in
+  SP4; QUIC is the remaining UDP transport.)
 - **XHTTP `stream-one`** — legacy v1 dialect (`auto` selects packet-up; only
   reachable via the REALITY auto-default, which we override explicitly).
 - **HTTPUpgrade `ed` early-data** — xray-only client flag; server sees a
@@ -492,9 +512,9 @@ Notes on the matrix:
 
 1. **Finish the TCP-stream protocol family** (Trojan, Shadowsocks, SOCKS, HTTP,
    AnyTLS, ShadowTLS, Naïve) — the TLS engine is done, the shapes are uniform.
-2. **Non-TCP transports** — the full TCP-stream transport set is done
-   (WS/gRPC/HTTPUpgrade/XHTTP/h2); next is the UDP side (QUIC/KCP), which
-   unlocks Hysteria1/2 + TUIC.
+2. **Non-TCP transports** — the TCP-stream transport set is done
+   (WS/gRPC/HTTPUpgrade/XHTTP/h2) and mKCP landed (SP4, UDP); next is the
+   QUIC UDP stack, which unlocks Hysteria1/2 + TUIC.
 3. **Wire in the TUI**: a per-profile "native" toggle (or auto-fallback when a
    core binary is missing) — the unified `xray_tui_tls::client::connect` /
    `TlsConfig` engine API already proves the integration point.
