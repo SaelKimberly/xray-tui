@@ -60,30 +60,34 @@ const TICK_MS: u32 = 10;
 
 /// Deterministic injection knobs for the fake peer.
 #[derive(Debug, Clone, Default)]
-struct PeerConfig {
+pub struct PeerConfig {
     /// Drop the first `drop_first` datagrams received from the client
     /// (simulates loss before the client's timeout retransmit).
-    drop_first: usize,
+    pub drop_first: usize,
     /// Hold the echo of client datagram `index` (0-based, counted AFTER
     /// drops) for `ticks` peer-loop ticks before sending it, so the client
     /// receives later echoes first (out-of-order delivery, exercising its
     /// recv-window reassembly).
-    delay: Option<(usize, u32)>,
+    pub delay: Option<(usize, u32)>,
+    /// Do not reply to the client's Terminate (keeps serving): the client's
+    /// terminate-handshake state transitions then depend on its own timers
+    /// alone (T4 driver-timer regression).
+    pub ignore_terminate: bool,
 }
 
 /// Observations the tests assert on (shared with the test task).
 #[derive(Debug, Default)]
-struct PeerObs {
+pub struct PeerObs {
     /// `CmdOnly Ping` segments received from the client (conv-matched).
-    pings: u32,
+    pub pings: u32,
     /// Data segments received from the client (first tries + retransmits).
-    data_segments: u32,
+    pub data_segments: u32,
     /// Segments received carrying the Close option.
-    close_opts: u32,
+    pub close_opts: u32,
     /// Terminate commands received from the client.
-    terminates: u32,
+    pub terminates: u32,
     /// The peer closed its side and exited its run loop.
-    done: bool,
+    pub done: bool,
 }
 
 /// A minimal, independent server-side mKCP peer over a loopback UDP socket.
@@ -297,8 +301,13 @@ impl FakeKcpPeer {
                     }
                     Command::Terminate => {
                         self.obs.lock().terminates += 1;
-                        self.terminating_sends = 2;
-                        self.send_terminate().await;
+                        if self.config.ignore_terminate {
+                            // Keep serving, never reply: the client's
+                            // handshake must advance on its own timers.
+                        } else {
+                            self.terminating_sends = 2;
+                            self.send_terminate().await;
+                        }
                     }
                     Command::Ack | Command::Data => {}
                 }
@@ -369,22 +378,22 @@ impl FakeKcpPeer {
 /// closure (sync — called from the driver task) pushes datagrams into an
 /// unbounded channel drained by a task that `send_to`s them, and a recv
 /// task feeds every inbound datagram into [`KcpSession::input`].
-struct ClientHarness {
-    session: Arc<KcpSession>,
+pub struct ClientHarness {
+    pub session: Arc<KcpSession>,
     _sender: tokio::task::JoinHandle<()>,
     _recv: tokio::task::JoinHandle<()>,
 }
 
 impl ClientHarness {
-    async fn write(&self, buf: &[u8]) -> std::io::Result<()> {
+    pub async fn write(&self, buf: &[u8]) -> std::io::Result<()> {
         self.session.write(buf).await
     }
 
-    fn close(&self) {
+    pub fn close(&self) {
         self.session.close();
     }
 
-    fn state(&self) -> State {
+    pub fn state(&self) -> State {
         self.session.state()
     }
 }
@@ -434,7 +443,7 @@ async fn spawn_client(peer_addr: SocketAddr) -> ClientHarness {
 }
 
 /// Bind + spawn the peer, then a client pointing at it.
-async fn spawn_harness(config: PeerConfig) -> (ClientHarness, Arc<Mutex<PeerObs>>) {
+pub async fn spawn_harness(config: PeerConfig) -> (ClientHarness, Arc<Mutex<PeerObs>>) {
     let peer = FakeKcpPeer::bind(config).await;
     let obs = Arc::clone(&peer.obs);
     let peer_addr = peer.sock.local_addr().expect("local addr");
@@ -444,7 +453,7 @@ async fn spawn_harness(config: PeerConfig) -> (ClientHarness, Arc<Mutex<PeerObs>
 }
 
 /// Read exactly `expected` bytes (or EOF) from the client under `deadline`.
-async fn read_all(client: &ClientHarness, expected: usize, deadline: Duration) -> Vec<u8> {
+pub async fn read_all(client: &ClientHarness, expected: usize, deadline: Duration) -> Vec<u8> {
     let mut got = Vec::with_capacity(expected);
     let mut chunk = vec![0u8; 8192];
     loop {
@@ -464,7 +473,7 @@ async fn read_all(client: &ClientHarness, expected: usize, deadline: Duration) -
 
 /// A non-trivial payload spanning `segments` mss-sized chunks (distinct
 /// bytes per chunk, so cross-segment reassembly order is observable).
-fn payload(segments: usize) -> Vec<u8> {
+pub fn payload(segments: usize) -> Vec<u8> {
     let mss = KcpSettings::new(1350, 50).mss; // 1332
     let mut payload = Vec::with_capacity(segments * mss);
     let mut n = 0u32;

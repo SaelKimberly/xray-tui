@@ -46,6 +46,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskCx, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -784,6 +785,12 @@ pub(crate) struct SessionCore {
     since: Instant,
     data_input: Arc<Notify>,
     data_output: Arc<Notify>,
+    /// Waker registered by the stream adapter's `poll_read` when no data is
+    /// available; woken alongside `data_input` (T4 stream adapter).
+    read_waker: Option<Waker>,
+    /// Waker registered by the stream adapter's `poll_write` when the send
+    /// window is full; woken alongside `data_output` (T4 stream adapter).
+    write_waker: Option<Waker>,
     flush_seq: AtomicU64,
     flush_wake: Arc<Notify>,
 }
@@ -805,6 +812,8 @@ impl SessionCore {
             since: Instant::now(),
             data_input: Arc::new(Notify::new()),
             data_output: Arc::new(Notify::new()),
+            read_waker: None,
+            write_waker: None,
             flush_seq: AtomicU64::new(0),
             flush_wake: Arc::new(Notify::new()),
         }
@@ -871,8 +880,26 @@ impl SessionCore {
             self.sending.close_write();
         }
         if state == State::Terminated {
-            self.data_input.notify_one();
-            self.data_output.notify_one();
+            self.signal_input();
+            self.signal_output();
+        }
+    }
+
+    /// Signal the read side: wake the async `read` waiter (stored
+    /// notification latch) AND the stream adapter's poll-registered waker.
+    fn signal_input(&mut self) {
+        self.data_input.notify_one();
+        if let Some(w) = self.read_waker.take() {
+            w.wake();
+        }
+    }
+
+    /// Signal the write side: wake the async `write` waiter AND the stream
+    /// adapter's poll-registered waker.
+    fn signal_output(&mut self) {
+        self.data_output.notify_one();
+        if let Some(w) = self.write_waker.take() {
+            w.wake();
         }
     }
 
@@ -885,8 +912,8 @@ impl SessionCore {
     ///
     /// `ConnectionAborted` when already in ReadyToClose/Terminating/Terminated.
     fn close(&mut self, current: u32) -> io::Result<()> {
-        self.data_input.notify_one();
-        self.data_output.notify_one();
+        self.signal_input();
+        self.signal_output();
         match self.state {
             State::ReadyToClose | State::Terminating | State::Terminated => {
                 return Err(io::Error::new(
@@ -1058,7 +1085,7 @@ impl SessionCore {
                 self.handle_option(current, opt);
                 self.receiving.process_data(sn, ts, una, payload);
                 if self.receiving.is_data_available() {
-                    self.data_input.notify_one();
+                    self.signal_input();
                 }
                 self.wake_flush();
             }
@@ -1085,7 +1112,7 @@ impl SessionCore {
                 if let Some(rtt) = rtt {
                     self.round_trip.update(rtt, current);
                 }
-                self.data_output.notify_one();
+                self.signal_output();
                 self.wake_flush();
             }
             Segment::CmdOnly {
@@ -1115,8 +1142,8 @@ impl SessionCore {
                     }
                 }
                 if opt.is_close() || cmd == Command::Terminate {
-                    self.data_input.notify_one();
-                    self.data_output.notify_one();
+                    self.signal_input();
+                    self.signal_output();
                 }
                 self.sending.clear_up_to(rcv_nxt);
                 self.receiving.clear_acklist(snd_nxt);
@@ -1326,6 +1353,51 @@ impl KcpSession {
             let notifier = lock(&self.core).data_output.clone();
             notifier.notified().await;
         }
+    }
+
+    /// Poll-style read for the stream adapter (spec §5.3): same semantics
+    /// as [`read`] (EOF states resolve first, then a synchronous drain of
+    /// the recv window), but the wait registers the caller's waker on the
+    /// data notifier instead of parking an async `read`. The drain and the
+    /// waker registration happen under one core-lock hold, and every
+    /// data-input signal wakes the stored waker — check-then-wait is
+    /// race-free, no lost wakeups.
+    pub(crate) fn poll_read(&self, buf: &mut [u8], cx: &TaskCx<'_>) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut core = lock(&self.core);
+        if core.read_eof() {
+            return Poll::Ready(Ok(0));
+        }
+        let n = core.try_read(buf);
+        if n > 0 {
+            core.wake_flush();
+            return Poll::Ready(Ok(n));
+        }
+        if core.peer_terminating() {
+            return Poll::Ready(Ok(0));
+        }
+        core.read_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// Poll-style write for the stream adapter (spec §5.3): push as much of
+    /// `buf` as the send window accepts (partial writes are valid
+    /// `AsyncWrite`), and when the window is full register the caller's
+    /// waker on the data-output notifier (woken by every ack signal).
+    pub(crate) fn poll_write(&self, buf: &[u8], cx: &TaskCx<'_>) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut core = lock(&self.core);
+        let pushed = core.push_write(buf)?;
+        if pushed > 0 {
+            core.wake_flush();
+            return Poll::Ready(Ok(pushed));
+        }
+        core.write_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 
     /// Close the session (spec §4.3 Close). Idempotent; the terminate

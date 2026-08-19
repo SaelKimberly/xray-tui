@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 
 use xray_tui_proto::proto_spec::common::{
-    GrpcConfig, HttpConfig, HttpUpgradeConfig, TransportConfig, WebSocketConfig, XHttpConfig,
+    GrpcConfig, HttpConfig, HttpUpgradeConfig, KcpConfig, TransportConfig, WebSocketConfig,
+    XHttpConfig,
 };
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
@@ -226,6 +227,16 @@ impl LinkContext {
     pub fn transport_http(&self) -> Option<&HttpConfig> {
         match self.transport_config()? {
             TransportConfig::Http(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// mKCP transport config, when the link uses `kcp` (the native params
+    /// expose only mtu/tti; everything else derives, spec §4.5).
+    #[must_use]
+    pub fn transport_kcp(&self) -> Option<&KcpConfig> {
+        match self.transport_config()? {
+            TransportConfig::Kcp(c) => Some(c),
             _ => None,
         }
     }

@@ -21,13 +21,13 @@ pub mod ws;
 pub mod xhttp;
 
 /// Run the transport step: dial the server (`base: None`) or reuse the
-/// previous tunnel (`base: Some`) — always TCP; framing is an upgrade over
-/// the secured stream (see [`upgrade`]).
+/// previous tunnel (`base: Some`); `kcp` does a fresh UDP dial.
 pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
         None | Some("tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp" | "http") => {
             tcp::connect(ctx, base).await
         }
+        Some("kcp" | "mkcp") => kcp::connect(ctx, base).await,
         Some(t) => Err(NativeError::NotImplemented {
             feature: format!("transport {t}"),
         }),
@@ -35,7 +35,8 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
 }
 
 /// Run the transport-upgrade step over an established (secured) stream:
-/// TCP = passthrough; ws/grpc/httpupgrade/xhttp/v2rayhttp = framing handshake.
+/// TCP/kcp = passthrough (mKCP is a dial, never framed);
+/// ws/grpc/httpupgrade/xhttp/v2rayhttp = framing handshake.
 pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
         Some("ws") => ws::connect(ctx, stream).await,
@@ -43,7 +44,7 @@ pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         Some("httpupgrade") => httpupgrade::connect(ctx, stream).await,
         Some("xhttp") => xhttp::connect(ctx, stream).await,
         Some("http") => v2rayhttp::connect(ctx, stream).await,
-        None | Some("tcp") => Ok(stream),
+        None | Some("tcp" | "kcp" | "mkcp") => Ok(stream),
         Some(t) => Err(NativeError::NotImplemented {
             feature: format!("transport {t}"),
         }),
