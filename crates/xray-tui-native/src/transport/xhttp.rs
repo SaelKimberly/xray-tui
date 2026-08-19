@@ -2024,10 +2024,10 @@ mod tests {
         /// Stream-up upload bodies (EOF is always observed — the fake reads
         /// each body to completion).
         stream_uploads: Vec<Bytes>,
+        /// Stream-up X-blobs streamed by the server into the upload response
+        /// (xray hub.go keepalive).
+        stream_xblobs: Vec<Bytes>,
         /// Stream-one POSTs: `(referer, content-type)` in arrival order.
-        stream_one_reqs: Vec<(String, String)>,
-        /// Stream-one upload bodies (EOF is always observed).
-        stream_one_uploads: Vec<Bytes>,
         /// The h3 connection closed (the client is gone).
         conn_closed: bool,
     }
@@ -2519,5 +2519,56 @@ mod tests {
         assert!(crate::transport::is_self_contained(&h3));
         let h1 = ctx_at("127.0.0.1:1".parse().unwrap(), "packet-up");
         assert!(!crate::transport::is_self_contained(&h1));
+    }
+    /// H3Reader borrow-slice + partial ReadBuf test: the reader consumes
+    /// chunks without per-chunk allocation. We verify the reader assembles
+    /// chunks correctly into the caller's buffer by reading in small chunks.
+    #[tokio::test]
+    async fn h3_reader_borrow_slice_partial_readbuf() {
+        use tokio::io::AsyncReadExt;
+
+        let (addr, obs, server_task) = spawn_h3_fake(false);
+        let ctx = ctx_h3(addr, "packet-up");
+        let mut t = connect_quic(&ctx).await.expect("h3 connect");
+
+        t.write_all(b"hello").await.expect("upload write");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 2]; // tiny buffer to force multiple poll_read calls
+        loop {
+            let n = t.read(&mut buf).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&out[..], H3_DOWNLOAD);
+        drop(t);
+
+        wait_obs(&obs, |o| o.conn_closed).await;
+        assert_packet_roundtrip(&obs.data.lock().expect("obs lock"));
+        server_task.await.expect("server task");
+    }
+
+    /// Stream-up X-blob drain hermetic test: the fake h3 server streams
+    /// keepalive X-blobs into the upload response body (as xray hub.go does),
+    /// and the client's drain_h3 task must consume them without blocking the
+    /// tunnel. We verify the fake sent X-blobs and the client finished cleanly.
+    #[tokio::test]
+    async fn h3_stream_up_xblob_drain() {
+        let (addr, obs, server_task) = spawn_h3_fake(false);
+        let ctx = ctx_h3(addr, "stream-up");
+        let mut t = connect_quic(&ctx).await.expect("h3 stream-up connect");
+        t.write_all(b"hello").await.expect("upload write");
+        let mut out = [0u8; H3_DOWNLOAD.len()];
+        t.read_exact(&mut out).await.expect("download read");
+        assert_eq!(&out[..], H3_DOWNLOAD);
+        drop(t);
+
+        wait_obs(&obs, |o| !o.stream_uploads.is_empty() && o.conn_closed).await;
+        let o = obs.data.lock().expect("obs lock");
+        assert_stream_up_roundtrip(&o);
+        // Verify the fake server streamed X-blobs into the response.
+        assert_eq!(o.stream_xblobs.len(), 3, "expected 3 X-blobs: {o:#?}");
+        server_task.await.expect("server task");
     }
 }
