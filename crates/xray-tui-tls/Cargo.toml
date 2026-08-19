@@ -14,7 +14,7 @@ ring = "0.17"
 # multi-agreement pair lives in x25519-dalek (same X25519 math as both cores).
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
 # async I/O seam
-tokio = { workspace = true, features = ["io-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "time", "rt"] }
 # cert verification
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
@@ -25,6 +25,8 @@ md-5 = "0.11"
 serde_json.workspace = true
 # errors
 thiserror.workspace = true
+# ML-KEM (Kyber768) via liboqs (vendored build - no system dep required)
+oqs = { version = "0.11", features = ["ml_kem", "vendored"] }
 
 [lints]
 workspace = true
