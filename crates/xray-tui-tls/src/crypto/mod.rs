@@ -9,6 +9,7 @@
 //! RFC 8448 vectors.
 
 pub mod fingerprint;
+pub mod mlkem;
 
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey},
