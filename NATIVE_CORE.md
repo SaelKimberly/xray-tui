@@ -26,9 +26,12 @@ prove wire compatibility.
 
 **Roadmap: engine-only TLS.** The native client path is engine-only — every
 TLS/REALITY connect runs through `xray-tui-tls`. The rustls *client* path was
-removed; rustls remains only as the server-side test double (unit tests + the
-e2e `tls_echo` dest). The engine is TLS 1.3-only: TLS 1.2 engine support is a
-future task, so legacy (TLS 1.2-only) servers are not yet reachable.
+removed; rustls client usage is now limited to the server-side test double
+(unit tests + the e2e `tls_echo` dest) and quinn's internal QUIC TLS for the
+xhttp h3 dial (spec §5.2 — a mandatory native dep) — the engine remains the
+only client-facing TLS path. The engine is TLS 1.3-only: TLS 1.2 engine
+support is a future task, so legacy (TLS 1.2-only) servers are not yet
+reachable.
 
 ## Principles
 
@@ -140,7 +143,7 @@ real certificate (potential MITM or redirection)")`.
 
 ## E2E coverage (tier 3)
 
-The suite has seven subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
+The suite has eight subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
 VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/XHTTP-h3(QUIC) × serving core(s) — 127
 tests = 123 green + 4 documented ignored (vless 75+4, vmess 48; ignored: vless ws/grpc
 plain-into-reality-server semantic rows × both cores; single-core rows run
