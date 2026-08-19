@@ -1609,19 +1609,27 @@ mod tests {
                 }
             });
             let mut handler = handler;
-            loop {
+            let done = loop {
                 tokio::select! {
-                    _ = &mut handler => break,
+                    r = &mut handler => break Some(r),
                     next = conn.accept() => {
                         match next {
-                            None | Some(Err(_)) => break, // client closed / error
+                            None | Some(Err(_)) => break None, // client closed / error
                             Some(Ok(_)) => {} // no second request expected
                         }
                     }
                 }
-            }
+            };
             drop(conn); // close the connection now that the handler is done
-            handler.await.expect("h2 handler");
+            match done {
+                // The select branch already polled the handle to completion —
+                // consuming the result here avoids re-polling it (tokio
+                // panics on `JoinHandle` poll after completion).
+                Some(r) => r.expect("h2 handler"),
+                // The accept branch fired first (client closed early): the
+                // handle was never polled, so awaiting it is safe.
+                None => handler.await.expect("h2 handler"),
+            }
         });
         let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
             "schema": "Vless",
