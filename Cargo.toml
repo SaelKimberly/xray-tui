@@ -36,6 +36,16 @@ yaml-rust2 = "0.11.0"
 anyhow = "1.0"
 
 # ============ Networking ============
+# QUIC (RFC 9000/9001/9002) + HTTP/3 — the xhttp h3 mode (SP5). quinn
+# defaults to `rustls-ring` (ring backend — workspace TLS standard; no
+# aws-lc-rs) + runtime-tokio; platform-verifier/log/bloom left out (the
+# native client supplies its own root stores). h3-quinn 0.0.10 (hyperium,
+# quinn 0.11.x) is the maintained quinn transport for the h3 crate — the
+# h3-quinn↔quinn version pairing is the lockstep constraint here.
+quinn = { version = "0.11.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
 # reqwest 0.13 (latest minor) has no ring feature: `rustls` = aws-lc-rs only,
 # `rustls-no-provider` defers to the process default. Workspace standard is
 # ring (quinn quic-ping, hickory-resolver) — see rustls pins below — so we use

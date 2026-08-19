@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use xray_tui_proto::proto_spec::SecurityConfig;
+use xray_tui_proto::proto_spec::{SecurityConfig, TlsConfig};
 
 use crate::transport::http::{IncomingReader, ReqBody, h1_client, h2_client};
 
@@ -107,6 +107,48 @@ fn path_with(ctx: &LinkContext, session: &str, seq: Option<&str>) -> String {
 /// right test). Drives the HTTP version: no TLS → HTTP/1.1, TLS → HTTP/2.
 fn has_tls(ctx: &LinkContext) -> bool {
     ctx.security().and_then(SecurityConfig::type_str).is_some()
+}
+
+/// HTTP version for xhttp per xray `decideHTTPVersion` (spec §4.1) — a pure
+/// mirror of the Go decision over the proto security config:
+///
+/// | condition | version |
+/// |---|---|
+/// | reality config present | `"2"` |
+/// | no TLS config | `"1.1"` |
+/// | TLS, exactly one ALPN `"http/1.1"` | `"1.1"` |
+/// | TLS, exactly one ALPN `"h3"` | `"3"` (the QUIC path) |
+/// | TLS, exactly one other ALPN | `"2"` |
+/// | TLS, zero or 2+ ALPNs | `"2"` |
+///
+/// ALPN is the comma-separated `TlsOpts::alpn` string, split exactly like
+/// the engine builds its ALPN list ([`LinkContext::alpn_vec`]: split on
+/// `,`, trim, drop empties).
+#[must_use]
+pub(crate) fn http_version(security: Option<&SecurityConfig>) -> &'static str {
+    let Some(sec) = security else {
+        return "1.1";
+    };
+    let alpn = match &sec.tls {
+        None => return "1.1",
+        Some(TlsConfig::Reality(_)) => return "2",
+        Some(TlsConfig::Tls(opts)) => match &opts.alpn {
+            Some(s) => s.as_str(),
+            None => return "2",
+        },
+    };
+    let mut protocols = alpn.split(',').map(str::trim).filter(|s| !s.is_empty());
+    let Some(first) = protocols.next() else {
+        return "2";
+    };
+    if protocols.next().is_some() {
+        return "2";
+    }
+    match first {
+        "http/1.1" => "1.1",
+        "h3" => "3",
+        _ => "2",
+    }
 }
 
 /// Build a request with Host + config headers + Referer padding.
@@ -333,6 +375,21 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         }),
         other => Err(NativeError::Config(format!("unknown xhttp mode: {other}"))),
     }
+}
+
+/// The HTTP/3 arm (xhttp + [`http_version`] == `"3"` → QUIC dial).
+///
+/// A quinn Endpoint over UDP with ALPN `h3`, replacing the dial + security +
+/// upgrade chain (spec §5.2 — quinn's TLS is internal; the engine TLS never
+/// wraps QUIC). T1 lands the dispatch + deps; the client arm (quinn Endpoint
+/// → h3 handshake → the splithttp v3 protocol over h3) lands with T2 — the
+/// stub keeps the decision wired so T2 only fills the body.
+// T2 fills the body with awaits; the signature is the T2 contract.
+#[allow(clippy::unused_async)]
+pub async fn connect_quic(_ctx: &LinkContext) -> Result<BoxStream, NativeError> {
+    Err(NativeError::NotImplemented {
+        feature: "xhttp over HTTP/3 (quinn + h3 client)".into(),
+    })
 }
 
 /// packet-up over HTTP/1.1 (no TLS): GET on the primary stream, upload POSTs
@@ -609,10 +666,13 @@ impl AsyncWrite for XhttpStream {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_tui_proto::proto_spec::ProtocolConfig;
     use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+    use xray_tui_proto::proto_spec::{RealityOpts, TlsOpts};
+    use xray_tui_proto::urlx::TinyText;
 
     use super::*;
     use crate::addr::{Host, TargetAddr};
@@ -854,5 +914,172 @@ mod tests {
             TargetAddr::new(Host::Domain("dest.test".into()), 80),
         );
         assert_eq!(base_path(&ctx2), "/no-slash/");
+    }
+
+    // --- decideHTTPVersion mirror (spec §4.1) -----------------------------
+
+    fn tls(alpn: Option<&str>) -> SecurityConfig {
+        SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts {
+                alpn: alpn.map(TinyText::from),
+                ..TlsOpts::default()
+            })),
+            ..SecurityConfig::default()
+        }
+    }
+
+    fn reality() -> SecurityConfig {
+        SecurityConfig {
+            tls: Some(TlsConfig::Reality(RealityOpts::default())),
+            ..SecurityConfig::default()
+        }
+    }
+
+    #[test]
+    fn dispatch_no_security_is_http_1_1() {
+        assert_eq!(http_version(None), "1.1");
+        assert_eq!(http_version(Some(&SecurityConfig::default())), "1.1");
+    }
+
+    #[test]
+    fn dispatch_reality_is_http_2() {
+        // reality config present → "2", even with a single h3 ALPN
+        // (reality is h2-only in splithttp).
+        assert_eq!(http_version(Some(&reality())), "2");
+    }
+
+    #[test]
+    fn dispatch_single_http_1_1_alpn_is_http_1_1() {
+        assert_eq!(http_version(Some(&tls(Some("http/1.1")))), "1.1");
+        assert_eq!(http_version(Some(&tls(Some(" http/1.1 ")))), "1.1");
+    }
+
+    #[test]
+    fn dispatch_single_h3_alpn_is_http_3() {
+        assert_eq!(http_version(Some(&tls(Some("h3")))), "3");
+        assert_eq!(http_version(Some(&tls(Some(" h3 ")))), "3");
+    }
+
+    #[test]
+    fn dispatch_other_single_alpn_is_http_2() {
+        assert_eq!(http_version(Some(&tls(Some("h2")))), "2");
+        assert_eq!(http_version(Some(&tls(Some("silly")))), "2");
+    }
+
+    #[test]
+    fn dispatch_zero_alpn_is_http_2() {
+        assert_eq!(http_version(Some(&tls(None))), "2");
+        assert_eq!(http_version(Some(&tls(Some("")))), "2");
+        assert_eq!(http_version(Some(&tls(Some(" , ")))), "2");
+    }
+
+    #[test]
+    fn dispatch_two_plus_alpn_is_http_2() {
+        assert_eq!(http_version(Some(&tls(Some("h2,http/1.1")))), "2");
+        assert_eq!(http_version(Some(&tls(Some("h3,h2")))), "2");
+        assert_eq!(http_version(Some(&tls(Some("h2,http/1.1,h3")))), "2");
+    }
+
+    #[test]
+    fn dispatch_mirrors_decide_http_version_table() {
+        // the full xray table in one sweep (dialer.go decideHTTPVersion)
+        let cases: &[(Option<&SecurityConfig>, &str)] = &[
+            (None, "1.1"),
+            (Some(&reality()), "2"),
+            (Some(&tls(None)), "2"),
+            (Some(&tls(Some("http/1.1"))), "1.1"),
+            (Some(&tls(Some("h3"))), "3"),
+            (Some(&tls(Some("h2"))), "2"),
+            (Some(&tls(Some("h2,http/1.1"))), "2"),
+        ];
+        for (sec, want) in cases {
+            assert_eq!(http_version(*sec), *want);
+        }
+    }
+
+    // --- SP5 T1 smoke: the quinn + h3 dep stack ---------------------------
+
+    /// quinn server + client over loopback UDP, self-signed cert, the `h3`
+    /// ALPN (spec §4.1): proves the stack compiles, negotiates TLS 1.3 +
+    /// ALPN, and streams bytes. `h3`/`h3-quinn` compile as deps (the client
+    /// arm consumes them in T2); this exercises the quinn transport their
+    /// `h3-quinn` adapter wraps.
+    #[tokio::test]
+    async fn quic_loopback_smoke() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                .expect("key der");
+
+        let mut server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server tls");
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)
+                    .expect("quic server config"),
+            )),
+            "127.0.0.1:0".parse().expect("bind addr"),
+        )
+        .expect("quic server endpoint");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let conn = server
+                    .accept()
+                    .await
+                    .expect("incoming conn")
+                    .await
+                    .expect("server handshake");
+                let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+                let data = recv.read_to_end(usize::MAX).await.expect("read");
+                send.write_all(&data).await.expect("echo write");
+                send.finish().expect("finish");
+                // Hold the connection until the client closes it: dropping it
+                // here would abort the echoed stream before the client reads.
+                conn.closed().await;
+            })
+        };
+
+        let mut client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates({
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(cert_der).expect("root add");
+                roots
+            })
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind addr"))
+            .expect("quic client endpoint");
+        let conn = client
+            .connect_with(
+                quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
+                        .expect("quic client config"),
+                )),
+                server_addr,
+                "localhost",
+            )
+            .expect("connect")
+            .await
+            .expect("client handshake");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+        send.write_all(b"hello quinn h3").await.expect("write");
+        send.finish().expect("finish");
+        let echoed = recv.read_to_end(usize::MAX).await.expect("echo read");
+        assert_eq!(echoed, b"hello quinn h3");
+
+        conn.close(0u32.into(), b"done");
+        client.wait_idle().await;
+        server_task.await.expect("server task");
+        server.wait_idle().await;
     }
 }

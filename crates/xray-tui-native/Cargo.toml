@@ -53,6 +53,13 @@ http-body = "1"
 # Channel (live request-body pipe) is feature-gated in http-body-util.
 http-body-util = { version = "0.1.5", features = ["channel"] }
 
+# QUIC + HTTP/3 — the xhttp h3 mode (SP5 T1: deps + dispatch rule; the
+# client arm lands in T2). quinn TLS is rustls-ring (workspace standard);
+# h3-quinn brings quinn's futures-io feature via feature unification.
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+
 # X25519 keypair generation for REALITY e2e configs (feature `native-e2e`
 # only): ring 0.17 cannot serialize the private half of a generated
 # `EphemeralPrivateKey` (its `bytes()` is test-gated), and the server inbound

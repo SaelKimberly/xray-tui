@@ -24,6 +24,12 @@ pub mod xhttp;
 /// previous tunnel (`base: Some`); `kcp` does a fresh UDP dial.
 pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxStream, NativeError> {
     match ctx.transport_type() {
+        // xhttp + a single `h3` ALPN → HTTP/3 over QUIC: a different dial
+        // (UDP + quinn) that replaces the dial + security + upgrade chain
+        // (spec §4.1/§5.2); the arm is a stub until T2 lands the client.
+        Some("xhttp") if xhttp::http_version(ctx.security()) == "3" => {
+            xhttp::connect_quic(ctx).await
+        }
         None | Some("tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp" | "http") => {
             tcp::connect(ctx, base).await
         }
