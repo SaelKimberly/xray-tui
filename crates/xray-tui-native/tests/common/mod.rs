@@ -3,7 +3,7 @@
 
 use rstest::fixture;
 use xray_tui_native::e2e::{
-    Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, PlainServerRealityClientTls,
+    Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, NoTls, PlainServerRealityClientTls,
     RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
     SINGBOX_VERSION, TlsEchoServer, TlsVariant, XRAY_VERSION, generate_certs, spawn_echo,
     spawn_tls_echo,
@@ -59,6 +59,15 @@ pub fn fp(id: &'static str) -> Box<dyn TlsVariant> {
 #[must_use]
 pub fn reality() -> Box<dyn TlsVariant> {
     Box::new(RealityTls::fresh())
+}
+
+/// Genuinely no TLS: the raw transport stream end to end (server
+/// streamSettings without tlsSettings, client security none — the `kcp_plain`
+/// row). Vless-only (vmess rows always carry a security layer).
+#[must_use]
+#[allow(dead_code)] // vless-only variant (unused in the vmess test binary)
+pub fn no_tls() -> Box<dyn TlsVariant> {
+    Box::new(NoTls)
 }
 
 // vless-only variant (unused in the vmess test binary, which shares this module).

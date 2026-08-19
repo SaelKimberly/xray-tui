@@ -12,7 +12,7 @@
 mod common;
 
 use common::{
-    certs, cores, echo, fp, pick, plain_server_reality_client, reality,
+    certs, cores, echo, fp, no_tls, pick, plain_server_reality_client, reality,
     reality_server_plain_client, reality_wrong_pbk, reality_wrong_sid, tls_echo,
 };
 use rstest::rstest;
@@ -213,9 +213,11 @@ async fn vless_against_cores(
 // now."), so the server config dies at startup; no core can serve
 // reality-over-kcp (sing-box has no kcp). The native client's
 // reality-over-kcp dial stays implemented (unreachable server-side, like
-// xray itself). Rows: plain (no TLS) + tls (chrome fingerprint engine) —
-// the kcp dial + security-wrap composition arms.
-#[case::kcp_plain(vless("kcp"), CoreKind::Xray)]
+// xray itself). Rows: plain (NO TLS — the NoTls variant: server
+// streamSettings without tlsSettings, client security none, the suite's
+// first genuinely plain row) + tls (chrome fingerprint engine) — the kcp
+// dial + security-wrap composition arms.
+#[case::kcp_plain(vless_tls("kcp", no_tls()), CoreKind::Xray)]
 #[case::kcp_chrome(vless_tls("kcp", fp("chrome")), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(

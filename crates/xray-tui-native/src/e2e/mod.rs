@@ -23,7 +23,7 @@ pub use harness::{
     spawn_tls_echo, spawn_udp_echo,
 };
 pub use variant::{
-    Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, PlainServerRealityClientTls,
+    Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, NoTls, PlainServerRealityClientTls,
     RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
     SecurityVariant, StandardTls, TlsVariant,
 };

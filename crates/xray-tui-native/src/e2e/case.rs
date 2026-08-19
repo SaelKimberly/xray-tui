@@ -356,7 +356,7 @@ impl E2eCase for CaseSpec {
 #[cfg(test)]
 mod tests {
     use super::super::variant::{
-        Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, RealityTls, StandardTls,
+        Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, NoTls, RealityTls, StandardTls,
     };
     use super::*;
 
@@ -380,6 +380,14 @@ mod tests {
                 .with_tls(Box::new(FingerprintTls("chrome")))
                 .label(),
             "vless/tcp/tls-chrome"
+        );
+        // The genuinely plain (no-TLS) row labels with the variant name.
+        assert_eq!(
+            CaseSpec::vless()
+                .with_network("kcp")
+                .with_tls(Box::new(NoTls))
+                .label(),
+            "vless/kcp/plain"
         );
         assert_eq!(
             CaseSpec::vmess(Aes128GcmVariant)

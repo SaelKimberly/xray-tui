@@ -204,10 +204,11 @@ pub fn vmess_inbound(
 /// `flow` selects the VLESS flow control: `Flow::Vision` emits
 /// `"flow": "xtls-rprx-vision"` in xray's `settings.clients[0]` /
 /// sing-box's `users[0]`, `None` omits it. `tls` selects certificate TLS vs
-/// REALITY; `network` selects the transport
-/// (tcp/ws/grpc/httpupgrade/xhttp/h2). For REALITY the transport runs inside
-/// the reality tunnel (reality over raw/grpc/xhttp; the ws/httpupgrade
-/// reality arms are sing-box-gated).
+/// REALITY — or [`NoTls`] for a genuinely plain row (server `streamSettings`
+/// without `tlsSettings`, client params without a `security` key); `network`
+/// selects the transport (tcp/ws/grpc/httpupgrade/xhttp/h2). For REALITY
+/// the transport runs inside the reality tunnel (reality over raw/grpc/xhttp;
+/// the ws/httpupgrade reality arms are sing-box-gated).
 #[must_use]
 pub fn vless_inbound(
     core: CoreKind,
@@ -233,16 +234,22 @@ pub fn vless_inbound(
     };
     let json = match core {
         CoreKind::Xray => {
-            let mut stream = serde_json::json!({
-                "network": network,
-                "security": "tls",
-                "tlsSettings": {
-                    "certificates": [
-                        { "certificateFile": cert_path, "keyFile": key_path }
-                    ],
-                    "alpn": alpn
-                }
-            });
+            // `NoTls` (the kcp_plain row) emits streamSettings WITHOUT
+            // tlsSettings — genuinely no security layer, not cert TLS.
+            let mut stream = if tls.tls_enabled() {
+                serde_json::json!({
+                    "network": network,
+                    "security": "tls",
+                    "tlsSettings": {
+                        "certificates": [
+                            { "certificateFile": cert_path, "keyFile": key_path }
+                        ],
+                        "alpn": alpn
+                    }
+                })
+            } else {
+                serde_json::json!({ "network": network })
+            };
             match network {
                 "ws" => {
                     stream["wsSettings"] = serde_json::json!({ "path": "/ws" });
@@ -285,12 +292,20 @@ pub fn vless_inbound(
             })
         }
         CoreKind::SingBox => {
-            let mut inbound = serde_json::json!({
-                "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
-                "users": [{ "uuid": UUID }],
-                "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path,
-                    "alpn": alpn }
-            });
+            // NoTls: no `tls` object at all — the raw transport stream.
+            let mut inbound = if tls.tls_enabled() {
+                serde_json::json!({
+                    "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
+                    "users": [{ "uuid": UUID }],
+                    "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path,
+                        "alpn": alpn }
+                })
+            } else {
+                serde_json::json!({
+                    "type": "vless", "listen": "127.0.0.1", "listen_port": env.port,
+                    "users": [{ "uuid": UUID }]
+                })
+            };
             match network {
                 "ws" => {
                     inbound["transport"] = serde_json::json!({ "type": "ws", "path": "/ws" });
@@ -665,9 +680,14 @@ pub fn client_params_vless(
     let mut protocol_value = serde_json::json!({
         "schema": "Vless",
         "uuid": UUID,
-        "security": client_security(tls, network),
         "transport": transport
     });
+    // NoTls omits the `security` key entirely (`SecurityConfig` has no null
+    // representation) — the native `wrap` passthrough (`None => Ok(stream)`)
+    // leaves the transport stream raw, so the row is genuinely no-TLS.
+    if tls.tls_enabled() {
+        protocol_value["security"] = client_security(tls, network);
+    }
     if let Some(flow) = flow {
         protocol_value["flow"] = serde_json::json!(flow.as_str());
     }
@@ -684,9 +704,9 @@ pub fn client_params_vless(
 #[cfg(test)]
 mod tests {
     use super::super::harness::generate_certs;
-    use super::super::variant::{FingerprintTls, RealityTls, StandardTls};
+    use super::super::variant::{FingerprintTls, NoTls, RealityTls, StandardTls};
     use super::*;
-    use xray_tui_proto::proto_spec::ProtoSpec;
+    use xray_tui_proto::proto_spec::{ProtoSpec, SecurityConfig};
 
     #[test]
     fn reality_keypair_round_trips() {
@@ -931,5 +951,59 @@ mod tests {
             panic!("expected a vless client config");
         };
         assert!(vless.flow.is_none());
+    }
+
+    #[test]
+    fn no_tls_inbound_has_no_security_layer() {
+        // The kcp_plain row's server config must be GENUINELY no-TLS: xray
+        // streamSettings without `security`/`tlsSettings`, sing-box without
+        // a `tls` object — not cert TLS in disguise.
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
+        let xray: serde_json::Value =
+            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, None, &NoTls, "kcp"))
+                .unwrap();
+        let stream = &xray["inbounds"][0]["streamSettings"];
+        assert_eq!(stream["network"], "kcp");
+        assert!(stream.get("security").is_none());
+        assert!(stream.get("tlsSettings").is_none());
+        assert!(stream.get("kcpSettings").is_some());
+
+        let sing: serde_json::Value =
+            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, None, &NoTls, "kcp"))
+                .unwrap();
+        let inbound = &sing["inbounds"][0];
+        assert!(inbound.get("tls").is_none());
+        assert!(inbound["users"][0]["uuid"].is_string());
+    }
+
+    #[test]
+    fn client_params_no_tls_omit_security() {
+        // The client params carry no TLS type — the `security` key is
+        // omitted entirely, so the `SecurityConfig` parses empty and the
+        // native `wrap` passthrough (`sec.is_empty()` → `Ok(stream)`)
+        // leaves the kcp stream raw.
+        let target = "1.2.3.4:80".parse().unwrap();
+        let params = client_params_vless(12345, target, None, &NoTls, "kcp", None);
+        assert_eq!(
+            params
+                .protocol
+                .security()
+                .and_then(SecurityConfig::type_str),
+            None
+        );
+        // The tls-standard row keeps its security object (regression guard).
+        let tls_params = client_params_vless(12345, target, None, &StandardTls, "kcp", None);
+        assert_eq!(
+            tls_params.protocol.security().unwrap().type_str(),
+            Some("tls")
+        );
     }
 }

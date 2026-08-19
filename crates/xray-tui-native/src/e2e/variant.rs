@@ -65,6 +65,38 @@ pub trait TlsVariant: Sync {
     /// test CA; REALITY needs none (its auth key, not a PKI chain,
     /// authenticates the server).
     fn client_trust(&self, _certs: &Certs) {}
+
+    /// True when the row carries a TLS/REALITY security layer over the
+    /// transport at all. `false` = genuinely no security: the server config
+    /// emits `streamSettings` WITHOUT `tlsSettings` (xray) / no `tls`
+    /// object (sing-box), and the client params omit the `security` key —
+    /// the native `wrap` passthrough (`None => Ok(stream)`) leaves the raw
+    /// transport stream.
+    fn tls_enabled(&self) -> bool {
+        true
+    }
+}
+
+/// No TLS at all — the raw transport stream end to end.
+///
+/// The e2e suite's first genuinely plain row (`kcp_plain`): the server
+/// config emits `streamSettings` without `tlsSettings` (xray) / no `tls`
+/// object (sing-box); the client params omit the `security` key so the
+/// native `wrap` passthrough (`None => Ok(stream)`) leaves the transport
+/// stream unsecured. Vless rows only — the vmess config builders always
+/// emit a security layer (no plain vmess row exists).
+pub struct NoTls;
+
+impl TlsVariant for NoTls {
+    fn name(&self) -> &'static str {
+        "plain"
+    }
+    fn sni(&self) -> &'static str {
+        "" // no TLS handshake — nothing to name
+    }
+    fn tls_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Stock rustls (the tier-1 behavior; no fingerprint, no REALITY).
