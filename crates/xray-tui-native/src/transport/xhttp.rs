@@ -379,20 +379,23 @@ impl V3Send for h3::client::SendRequest<h3_quinn::OpenStreams, Bytes> {
         // so without this rewrite the request reaches quic-go's server
         // missing both and dies with H3_MESSAGE_ERROR (headers.go:
         // `hdr.Scheme == "" || hdr.Authority == ""`). h3 is always TLS.
-        let host = parts
+        let Some(host) = parts
             .headers
             .get("host")
             .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        if let Some(host) = host {
-            let path = parts
-                .uri
-                .path_and_query()
-                .map_or("/", http::uri::PathAndQuery::as_str);
-            parts.uri = format!("https://{host}{path}")
-                .parse()
-                .map_err(|e| NativeError::Transport(format!("{step}: absolute h3 uri: {e}")))?;
-        }
+            .map(str::to_owned)
+        else {
+            return Err(NativeError::Transport(format!(
+                "{step}: h3 absolute URI rewrite requires Host header"
+            )));
+        };
+        let path = parts
+            .uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
+        parts.uri = format!("https://{host}{path}")
+            .parse()
+            .map_err(|e| NativeError::Transport(format!("{step}: absolute h3 uri: {e}")))?;
         let req = http::Request::from_parts(parts, ());
         let err = |e: h3::error::StreamError| NativeError::Transport(format!("{step}: {e}"));
         let mut stream = self.send_request(req).await.map_err(err)?;
@@ -2028,6 +2031,9 @@ mod tests {
         /// (xray hub.go keepalive).
         stream_xblobs: Vec<Bytes>,
         /// Stream-one POSTs: `(referer, content-type)` in arrival order.
+        stream_one_reqs: Vec<(String, String)>,
+        /// Stream-one upload bodies (EOF is always observed).
+        stream_one_uploads: Vec<Bytes>,
         /// The h3 connection closed (the client is gone).
         conn_closed: bool,
     }
@@ -2201,7 +2207,9 @@ mod tests {
         } else {
             // Stream-up upload: `{base}/{uuid}` — 200 immediately (xray
             // hub.go), then the piped body to EOF (the tunnel writer's
-            // close ends it).
+            // close ends it). The server streams keepalive X-blobs into
+            // the response body (xray hub.go scStreamUpServerSecs) — the
+            // client's drain_h3 task must consume them concurrently.
             let content_type = req
                 .headers()
                 .get("content-type")
@@ -2215,6 +2223,18 @@ mod tests {
             bounded(stream.send_response(resp), "stream-up 200")
                 .await
                 .expect("stream-up 200");
+            // Stream keepalive X-blobs (xray hub.go style: periodic empty
+            // DATA frames or small padding). The client's drain task must
+            // consume these without blocking the tunnel.
+            for _ in 0..3 {
+                bounded(
+                    stream.send_data(Bytes::from_static(b"X")),
+                    "stream-up xblob",
+                )
+                .await
+                .expect("stream-up xblob");
+                record(obs, |o| o.stream_xblobs.push(Bytes::from_static(b"X")));
+            }
             let body = bounded(read_h3_body(&mut stream), "stream-up body").await;
             record(obs, |o| o.stream_uploads.push(body));
             bounded(stream.finish(), "stream-up finish")

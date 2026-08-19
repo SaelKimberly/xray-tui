@@ -586,8 +586,9 @@ fn reality_client_security(tls: &dyn TlsVariant, pbk: &str) -> serde_json::Value
 }
 
 /// Native client params dialing a `VMess` listener with payload security `enc`.
+///
 /// `xhttp_mode` selects the client-side xhttp dialect ("stream-up"; `None` →
-/// packet-up) — ignored for non-xhttp networks.
+/// auto (packet-up, stream-one under reality)) — ignored for non-xhttp networks.
 #[must_use]
 pub fn client_params_vmess(
     enc: &str,
@@ -652,8 +653,8 @@ pub fn client_params_vmess(
 /// `flow` selects the VLESS flow control: `Flow::Vision` emits
 /// `"flow": "xtls-rprx-vision"` in the outbound (the native client
 /// dispatches on `VlessConfig.flow`), `None` omits it. `xhttp_mode` selects
-/// the client-side xhttp dialect ("stream-up"; `None` → packet-up) — ignored
-/// for non-xhttp networks.
+/// the client-side xhttp dialect ("stream-up"; `None` → auto (packet-up,
+/// stream-one under reality)) — ignored for non-xhttp networks.
 #[must_use]
 pub fn client_params_vless(
     port: u16,

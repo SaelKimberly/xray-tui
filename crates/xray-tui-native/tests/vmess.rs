@@ -119,6 +119,15 @@ async fn vmess_against_cores(
     vmess_xhttp_tls(Aes128GcmVariant, "stream-up", fp("chrome")),
     CoreKind::Xray
 )]
+// xhttp/h3 (SP5): the exactly-one `h3` ALPN flips xray's splithttp listener
+// to the QUIC/HTTP-3 mode. The client's h3 arm (`connect_quic`, quinn + h3)
+// runs the v3 protocol over HTTP/3; the row rides the DEFAULT verify path
+// (webpki-roots chain walk with the harness CA as trust anchor). One row per
+// payload security: reality is impossible (decideHTTPVersion returns "2" when
+// a reality config is present) and h3 requires TLS (no plain row); sing-box
+// has no xhttp-over-QUIC.
+#[case::xhttp_h3_aes128gcm(vmess(Aes128GcmVariant, "xhttp3"), CoreKind::Xray)]
+#[case::xhttp_h3_chacha20(vmess(Chacha20Poly1305Variant, "xhttp3"), CoreKind::Xray)]
 // v2rayhttp (sing-box `type: http`) over h2 + the chrome fingerprint.
 #[case::v2rayhttp_aes128gcm_chrome(
     vmess_tls(Aes128GcmVariant, "h2", fp("chrome")),
