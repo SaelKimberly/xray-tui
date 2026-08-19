@@ -28,6 +28,20 @@ fn next_target(links: &[NativeConnectParams], i: usize, target: &TargetAddr) -> 
     )
 }
 
+/// One link's stream after the dial: security (TLS/REALITY) OUTERMOST, then
+/// the transport upgrade (ws/grpc framing inside the TLS session) — except
+/// for self-contained dials (xhttp+h3) where the dial already IS the
+/// finished tunnel and the engine TLS/upgrade must be skipped (spec §5.2:
+/// the QUIC dial replaces dial + security + upgrade; quinn's rustls is
+/// internal).
+async fn secured_upgraded(ctx: &LinkContext, dialed: BoxStream) -> Result<BoxStream, NativeError> {
+    if transport::is_self_contained(ctx) {
+        return Ok(dialed);
+    }
+    let secured = security::wrap(ctx, dialed).await?;
+    transport::upgrade(ctx, secured).await
+}
+
 /// Connect through a chain of proxies to the final `target`.
 pub async fn connect_chain(
     links: &[NativeConnectParams],
@@ -38,8 +52,7 @@ pub async fn connect_chain(
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
         let dialed = transport::connect(&ctx, base).await?;
-        let secured = security::wrap(&ctx, dialed).await?;
-        let upgraded = transport::upgrade(&ctx, secured).await?;
+        let upgraded = secured_upgraded(&ctx, dialed).await?;
         base = Some(protocol::connect(&ctx, upgraded).await?);
     }
     base.map(NativeTunnel::from_stream)
@@ -62,8 +75,7 @@ pub async fn connect_chain_udp(
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
         let dialed = transport::connect(&ctx, base).await?;
-        let secured = security::wrap(&ctx, dialed).await?;
-        let upgraded = transport::upgrade(&ctx, secured).await?;
+        let upgraded = secured_upgraded(&ctx, dialed).await?;
         if i + 1 == links.len() {
             // The last link speaks the UDP protocol phase: it owns the
             // stream and returns the datagram tunnel.
@@ -90,8 +102,7 @@ pub async fn connect_chain_mux(
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
         let dialed = transport::connect(&ctx, base).await?;
-        let secured = security::wrap(&ctx, dialed).await?;
-        let upgraded = transport::upgrade(&ctx, secured).await?;
+        let upgraded = secured_upgraded(&ctx, dialed).await?;
         if i + 1 == links.len() {
             // The last link speaks the mux protocol phase: it owns the
             // stream and returns the multiplexer.

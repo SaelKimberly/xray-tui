@@ -26,8 +26,14 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
     match ctx.transport_type() {
         // xhttp + a single `h3` ALPN → HTTP/3 over QUIC: a different dial
         // (UDP + quinn) that replaces the dial + security + upgrade chain
-        // (spec §4.1/§5.2); the arm is a stub until T2 lands the client.
+        // (spec §4.1/§5.2). It is a fresh QUIC dial — it never reuses a
+        // base tunnel (xhttp+h3 as a later chain hop is a Config error).
         Some("xhttp") if xhttp::http_version(ctx.security()) == "3" => {
+            if base.is_some() {
+                return Err(NativeError::Config(
+                    "xhttp over HTTP/3 cannot reuse a base tunnel: the QUIC dial is a fresh connection".into(),
+                ));
+            }
             xhttp::connect_quic(ctx).await
         }
         None | Some("tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp" | "http") => {
@@ -38,6 +44,16 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
             feature: format!("transport {t}"),
         }),
     }
+}
+
+/// True when the transport's [`connect`] already produced the finished
+/// tunnel: xhttp + a single `h3` ALPN (the QUIC dial replaces dial +
+/// security + upgrade — spec §5.2). The chain then skips the security and
+/// upgrade phases and runs the protocol phase directly on the dialed
+/// stream.
+#[must_use]
+pub(crate) fn is_self_contained(ctx: &LinkContext) -> bool {
+    ctx.transport_type() == Some("xhttp") && xhttp::http_version(ctx.security()) == "3"
 }
 
 /// Run the transport-upgrade step over an established (secured) stream:

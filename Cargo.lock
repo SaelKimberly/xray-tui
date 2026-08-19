@@ -7779,6 +7779,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "webpki-roots",
  "x25519-dalek",
  "xray-tui-proto",
  "xray-tui-tls",

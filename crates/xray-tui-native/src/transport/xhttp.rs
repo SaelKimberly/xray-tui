@@ -12,13 +12,13 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context as TaskCx, Poll};
+use std::sync::Arc;
+use std::task::{Context as TaskCx, Poll, ready};
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use http::StatusCode;
 use http::header::HOST;
-use http_body_util::BodyExt;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
@@ -151,14 +151,15 @@ pub(crate) fn http_version(security: Option<&SecurityConfig>) -> &'static str {
     }
 }
 
-/// Build a request with Host + config headers + Referer padding.
+/// Build a request with Host + config headers + Referer padding (shared by
+/// the h1/h2 hyper arm and the h3 arm — the body is unit; callers map in
+/// their transport's body type).
 fn build_request(
     ctx: &LinkContext,
     method: &str,
     url_path: &str,
-    body: ReqBody,
     host: &str,
-) -> Result<http::Request<ReqBody>, NativeError> {
+) -> Result<http::Request<()>, NativeError> {
     let padding = x_padding();
     // xray captures `RawURL` *before* appending session/seq, so the Referer
     // carries the base URL (`{scheme}://{host}{path}`), not the session path.
@@ -175,65 +176,298 @@ fn build_request(
         }
     }
     builder
-        .body(body)
+        .body(())
         .map_err(|e| NativeError::Transport(format!("xhttp request build: {e}")))
 }
 
-/// One-request sender seam: both hyper `http1::SendRequest` and
-/// `http2::SendRequest` expose an inherent `send_request` (neither implements
-/// `hyper::service::Service` in 1.x), so the shared request path is generic
-/// over this.
-trait SendOne {
-    fn send_one(
-        &mut self,
-        req: http::Request<ReqBody>,
-    ) -> impl Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>> + Send;
+/// Request body for the v3 protocol (transport-agnostic). The hyper arms
+/// map it onto `ReqBody`; the h3 arm onto the request stream's send half.
+enum V3Body {
+    Empty,
+    Full(Bytes),
+    /// Stream-up: the upload body is a pipe fed by the tunnel writer
+    /// (`wrx`); the seam forwards into the transport's body mechanism.
+    Pipe(mpsc::Receiver<Bytes>),
 }
 
-impl SendOne for hyper::client::conn::http1::SendRequest<ReqBody> {
+/// A v3 response: status + the response body as an `AsyncRead`. For POSTs
+/// the seam has already started draining the actual body (keepalive
+/// X-blobs — xray hub.go) and the reader here is empty; GETs carry the
+/// download body.
+struct V3Response {
+    status: StatusCode,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+}
+
+/// One-request sender seam for the splithttp v3 protocol. Both the hyper
+/// `SendRequest`s (h1/h2) and the h3 `SendRequest` implement it, so the
+/// protocol logic (session open, GET download, POST uploads, pacing,
+/// packet-up/stream-up) is written once over this seam.
+trait V3Send {
     fn send_one(
         &mut self,
-        req: http::Request<ReqBody>,
-    ) -> impl Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>> + Send
-    {
-        self.send_request(req)
+        req: http::Request<V3Body>,
+        step: &'static str,
+    ) -> impl Future<Output = Result<V3Response, NativeError>> + Send;
+}
+
+/// Drain a hyper response body to completion in a spawned task: the
+/// stream-up server streams keepalive X-blobs into the upload response when
+/// a Referer is present (xray hub.go) — the drain keeps the h1/h2 window
+/// from stalling, so it must run concurrently with the tunnel.
+fn drain_incoming(reader: IncomingReader) {
+    tokio::spawn(async move {
+        let mut reader = reader;
+        if let Err(e) = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await {
+            tracing::debug!(error = %e, "xhttp: drain failed on body read");
+        }
+    });
+}
+
+/// Forward tunnel writes into the stream-up upload pipe.
+///
+/// `send_data` awaits pipe capacity (hyper drains it into h1/h2 DATA
+/// frames), so backpressure propagates without dropping bytes; `SendError`
+/// fires only when the body is gone (stream reset) — the upload side is
+/// then broken.
+async fn forward_pipe(
+    mut pipe_tx: http_body_util::channel::Sender<Bytes>,
+    mut wrx: mpsc::Receiver<Bytes>,
+) {
+    while let Some(b) = wrx.recv().await {
+        if pipe_tx.send_data(b).await.is_err() {
+            return;
+        }
     }
 }
 
-impl SendOne for hyper::client::conn::http2::SendRequest<ReqBody> {
-    fn send_one(
+impl V3Send for hyper::client::conn::http1::SendRequest<ReqBody> {
+    async fn send_one(
         &mut self,
-        req: http::Request<ReqBody>,
-    ) -> impl Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>> + Send
-    {
-        self.send_request(req)
+        req: http::Request<V3Body>,
+        step: &'static str,
+    ) -> Result<V3Response, NativeError> {
+        let (parts, body) = req.into_parts();
+        let (pipe_rx, body) = match body {
+            V3Body::Empty => (None, ReqBody::Empty),
+            V3Body::Full(b) => (None, ReqBody::Full(b)),
+            V3Body::Pipe(rx) => {
+                let (tx, body) = ReqBody::channel();
+                (Some((tx, rx)), body)
+            }
+        };
+        let req = http::Request::from_parts(parts, body);
+        let resp = self
+            .send_request(req)
+            .await
+            .map_err(|e| NativeError::Transport(format!("{step}: {e}")))?;
+        let status = resp.status();
+        let reader: Box<dyn AsyncRead + Send + Unpin> = match pipe_rx {
+            Some((tx, rx)) => {
+                // The stream-up server 200s the POST immediately and streams
+                // keepalive X-blobs into the response (xray hub.go) — drain
+                // concurrently so the h1/h2 window doesn't stall.
+                drain_incoming(IncomingReader::new(resp.into_body()));
+                tokio::spawn(forward_pipe(tx, rx));
+                Box::new(tokio::io::empty())
+            }
+            None => Box::new(IncomingReader::new(resp.into_body())),
+        };
+        Ok(V3Response { status, reader })
+    }
+}
+
+impl V3Send for hyper::client::conn::http2::SendRequest<ReqBody> {
+    async fn send_one(
+        &mut self,
+        req: http::Request<V3Body>,
+        step: &'static str,
+    ) -> Result<V3Response, NativeError> {
+        let (parts, body) = req.into_parts();
+        let (pipe_rx, body) = match body {
+            V3Body::Empty => (None, ReqBody::Empty),
+            V3Body::Full(b) => (None, ReqBody::Full(b)),
+            V3Body::Pipe(rx) => {
+                let (tx, body) = ReqBody::channel();
+                (Some((tx, rx)), body)
+            }
+        };
+        let req = http::Request::from_parts(parts, body);
+        let resp = self
+            .send_request(req)
+            .await
+            .map_err(|e| NativeError::Transport(format!("{step}: {e}")))?;
+        let status = resp.status();
+        let reader: Box<dyn AsyncRead + Send + Unpin> = match pipe_rx {
+            Some((tx, rx)) => {
+                drain_incoming(IncomingReader::new(resp.into_body()));
+                tokio::spawn(forward_pipe(tx, rx));
+                Box::new(tokio::io::empty())
+            }
+            None => Box::new(IncomingReader::new(resp.into_body())),
+        };
+        Ok(V3Response { status, reader })
+    }
+}
+
+/// Drain an h3 response body to completion in a spawned task: the stream-up
+/// server streams keepalive X-blobs into the upload response (xray hub.go)
+/// — Go's client does `io.Copy(io.Discard, resp.Body)`; the drain must run
+/// concurrently with the tunnel.
+fn drain_h3<S>(stream: h3::client::RequestStream<S, Bytes>)
+where
+    S: h3::quic::RecvStream + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut stream = stream;
+        while let Ok(Some(_)) = stream.recv_data().await {}
+    });
+}
+
+/// Forward tunnel writes into the stream-up h3 upload pipe: each channel
+/// item becomes a request-body DATA chunk; the body ends on channel close.
+async fn forward_pipe_h3(
+    mut send: h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut wrx: mpsc::Receiver<Bytes>,
+) {
+    while let Some(b) = wrx.recv().await {
+        if send.send_data(b).await.is_err() {
+            return;
+        }
+    }
+    let _ = send.finish().await;
+}
+
+/// The h3 request seam: one h3 request per call, over the shared QUIC
+/// connection (h3 multiplexes bidirectional streams like h2).
+impl V3Send for h3::client::SendRequest<h3_quinn::OpenStreams, Bytes> {
+    async fn send_one(
+        &mut self,
+        req: http::Request<V3Body>,
+        step: &'static str,
+    ) -> Result<V3Response, NativeError> {
+        let (parts, body) = req.into_parts();
+        let req = http::Request::from_parts(parts, ());
+        let err = |e: h3::error::StreamError| NativeError::Transport(format!("{step}: {e}"));
+        let mut stream = self.send_request(req).await.map_err(err)?;
+        match body {
+            V3Body::Empty => {
+                stream.finish().await.map_err(err)?;
+                let resp = stream.recv_response().await.map_err(err)?;
+                let status = resp.status();
+                Ok(V3Response {
+                    status,
+                    reader: Box::new(H3Reader::new(stream)),
+                })
+            }
+            V3Body::Full(payload) => {
+                stream.send_data(payload).await.map_err(err)?;
+                stream.finish().await.map_err(err)?;
+                let resp = stream.recv_response().await.map_err(err)?;
+                let status = resp.status();
+                drain_h3(stream);
+                Ok(V3Response {
+                    status,
+                    reader: Box::new(tokio::io::empty()),
+                })
+            }
+            V3Body::Pipe(rx) => {
+                let (send, mut recv) = stream.split();
+                let resp = recv.recv_response().await.map_err(err)?;
+                let status = resp.status();
+                // The forward task outlives this call: it must keep a
+                // `SendRequest` clone so the h3 connection stays open for
+                // the tunnel's lifetime (dropping the last clone closes it
+                // with H3_NO_ERROR).
+                let keepalive = self.clone();
+                tokio::spawn(async move {
+                    let _keepalive = keepalive;
+                    forward_pipe_h3(send, rx).await;
+                });
+                drain_h3(recv);
+                Ok(V3Response {
+                    status,
+                    reader: Box::new(tokio::io::empty()),
+                })
+            }
+        }
+    }
+}
+
+/// `AsyncRead` over an h3 response body: `recv_data` yields `Bytes` chunks
+/// (h3-quinn's read-chunk adapter), copied into the pending buffer.
+struct H3Reader {
+    stream: Option<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>,
+    buf: Bytes,
+}
+
+impl H3Reader {
+    const fn new(stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) -> Self {
+        Self {
+            stream: Some(stream),
+            buf: Bytes::new(),
+        }
+    }
+}
+
+impl AsyncRead for H3Reader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskCx<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if !self.buf.is_empty() {
+                let n = self.buf.len().min(buf.remaining());
+                buf.put_slice(&self.buf[..n]);
+                self.buf.advance(n);
+                return Poll::Ready(Ok(()));
+            }
+            let Some(stream) = self.stream.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            match ready!(stream.poll_recv_data(cx)) {
+                Ok(Some(mut data)) => {
+                    self.buf = data.copy_to_bytes(data.remaining());
+                }
+                Ok(None) => {
+                    self.stream = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("xhttp h3 download: {e:?}"),
+                    )));
+                }
+            }
+        }
     }
 }
 
 /// Send a request, require 200, return the response.
-async fn send_200<S: SendOne>(
+async fn send_200<S: V3Send>(
     sender: &mut S,
-    req: http::Request<ReqBody>,
+    req: http::Request<V3Body>,
     step: &'static str,
-) -> Result<hyper::Response<hyper::body::Incoming>, NativeError> {
+) -> Result<V3Response, NativeError> {
     let limit = timeouts::TRANSPORT;
-    let resp = tokio::time::timeout(limit, sender.send_one(req))
+    let resp = tokio::time::timeout(limit, sender.send_one(req, step))
         .await
-        .map_err(|_| NativeError::Timeout { step, limit })?
-        .map_err(|e| NativeError::Transport(format!("{step}: {e}")))?;
-    if resp.status() != StatusCode::OK {
+        .map_err(|_| NativeError::Timeout { step, limit })??;
+    if resp.status != StatusCode::OK {
         return Err(NativeError::Transport(format!(
             "{step}: expected 200, got {}",
-            resp.status()
+            resp.status
         )));
     }
     Ok(resp)
 }
 
 /// Send ONE packet-up POST: path `/x/{session}/{seq}`, raw body, 200
-/// required. Shared by the h1 and h2 upload tasks (the sender type is the
-/// only difference).
-async fn post_packet<S: SendOne>(
+/// required. Shared by the h1, h2 and h3 upload tasks (the sender type is
+/// the only difference).
+async fn post_packet<S: V3Send>(
     sender: &mut S,
     ctx: &LinkContext,
     session: &str,
@@ -243,16 +477,17 @@ async fn post_packet<S: SendOne>(
 ) -> Result<(), NativeError> {
     let seq_str = seq.to_string();
     let url_path = path_with(ctx, session, Some(&seq_str));
-    let req = build_request(ctx, "POST", &url_path, ReqBody::Full(payload), host)?;
+    let req = build_request(ctx, "POST", &url_path, host)?.map(|()| V3Body::Full(payload));
     let _resp = send_200(sender, req, "xhttp upload").await?;
     Ok(())
 }
 
 /// Shared packet-up pacing/batching core. Drains `rx`, accumulates app
 /// bytes, and POSTs chunks (≤ [`MAX_POST_BYTES`], ≥ [`POST_INTERVAL`] apart,
-/// one in flight, via [`post_packet`]) in seq order. The h1/h2 upload tasks
-/// are thin wrappers over this core — they differ only in the sender type.
-async fn upload_loop_core<S: SendOne>(
+/// one in flight, via [`post_packet`]) in seq order. The h1/h2/h3 upload
+/// tasks are thin wrappers over this core — they differ only in the sender
+/// type.
+async fn upload_loop_core<S: V3Send>(
     sender: &mut S,
     ctx: &LinkContext,
     session: &str,
@@ -341,6 +576,35 @@ async fn upload_loop_h2(
     upload_loop_core(&mut sender, &ctx, &session, &host, rx).await;
 }
 
+/// packet-up uploads over the shared HTTP/3 connection (same QUIC conn as
+/// the GET — h3 multiplexes streams like h2).
+async fn upload_loop_h3(
+    mut sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    ctx: LinkContext,
+    session: String,
+    host: String,
+    rx: mpsc::Receiver<Bytes>,
+) {
+    upload_loop_core(&mut sender, &ctx, &session, &host, rx).await;
+}
+
+/// The client-side xhttp dialect (config `mode`): `auto`/empty →
+/// packet-up. Shared by the h1/h2 [`connect`] dispatch and the h3 arm.
+fn xhttp_mode(ctx: &LinkContext) -> Result<&'static str, NativeError> {
+    let mode = ctx
+        .transport_xhttp()
+        .and_then(|c| c.mode.as_deref())
+        .unwrap_or("auto");
+    match mode {
+        "stream-up" => Ok("stream-up"),
+        "packet-up" | "auto" | "" => Ok("packet-up"),
+        "stream-one" => Err(NativeError::NotImplemented {
+            feature: "xhttp stream-one mode".into(),
+        }),
+        other => Err(NativeError::Config(format!("unknown xhttp mode: {other}"))),
+    }
+}
+
 /// Run the XHTTP transport over the established (secured) stream.
 ///
 /// The client-side mode (config `mode`) selects the dialect: `auto`/empty →
@@ -349,13 +613,10 @@ async fn upload_loop_h2(
 /// TLS → HTTP/1.1 (GET on the primary stream, POSTs on a second raw TCP
 /// dial — Go h1 serializes responses in request order, so a long-lived GET
 /// body would block POST responses on its own conn); TLS → HTTP/2 (one conn,
-/// multiplexed streams).
+/// multiplexed streams). The h3 mode is NOT reached here: it is a different
+/// dial ([`connect_quic`]) that replaces this upgrade step (spec §5.2).
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
-    let mode = ctx
-        .transport_xhttp()
-        .and_then(|c| c.mode.as_deref())
-        .unwrap_or("auto");
-    match mode {
+    match xhttp_mode(ctx)? {
         "stream-up" => {
             if has_tls(ctx) {
                 stream_up_h2(ctx, stream).await
@@ -363,33 +624,151 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
                 stream_up_h1(ctx, stream).await
             }
         }
-        "packet-up" | "auto" | "" => {
+        _ => {
             if has_tls(ctx) {
                 packet_up_h2(ctx, stream).await
             } else {
                 packet_up_h1(ctx, stream).await
             }
         }
-        "stream-one" => Err(NativeError::NotImplemented {
-            feature: "xhttp stream-one mode".into(),
-        }),
-        other => Err(NativeError::Config(format!("unknown xhttp mode: {other}"))),
     }
+}
+
+/// rustls `ServerCertVerifier` for the `insecure` TLS option: skips the
+/// certificate chain walk but still verifies the handshake signatures (xray
+/// `allowInsecure` semantics — the QUIC session stays sound, only the
+/// identity check is dropped).
+#[derive(Debug)]
+struct SkipServerVerify {
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// rustls client config for the QUIC dial: ALPN `h3` (the trigger — spec
+/// §4.1), early data enabled (0-RTT), and cert verification mirroring the
+/// TLS opts (`insecure` → skip the chain walk; default → webpki-roots). The
+/// engine TLS + fingerprint machinery does not apply to QUIC (spec §5.2) —
+/// quinn's rustls is internal.
+fn quic_tls_config(ctx: &LinkContext) -> Result<rustls::ClientConfig, NativeError> {
+    let insecure = ctx.tls_opts()?.and_then(|o| o.insecure).unwrap_or(false);
+    let mut tls = if insecure {
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerify { algorithms }))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.enable_early_data = true;
+    Ok(tls)
 }
 
 /// The HTTP/3 arm (xhttp + [`http_version`] == `"3"` → QUIC dial).
 ///
 /// A quinn Endpoint over UDP with ALPN `h3`, replacing the dial + security +
 /// upgrade chain (spec §5.2 — quinn's TLS is internal; the engine TLS never
-/// wraps QUIC). T1 lands the dispatch + deps; the client arm (quinn Endpoint
-/// → h3 handshake → the splithttp v3 protocol over h3) lands with T2 — the
-/// stub keeps the decision wired so T2 only fills the body.
-// T2 fills the body with awaits; the signature is the T2 contract.
-#[allow(clippy::unused_async)]
-pub async fn connect_quic(_ctx: &LinkContext) -> Result<BoxStream, NativeError> {
-    Err(NativeError::NotImplemented {
-        feature: "xhttp over HTTP/3 (quinn + h3 client)".into(),
-    })
+/// wraps QUIC). The splithttp v3 protocol then runs over the h3 connection
+/// (same session/GET/POST logic as the h1/h2 arms, via the [`V3Send`] seam).
+/// 0-RTT: quinn early data is enabled; a fresh connection has no session
+/// ticket and does the full handshake (xray `DialEarly` without a ticket —
+/// spec §8.3).
+pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
+    let mode = xhttp_mode(ctx)?;
+    let server_addr = ctx.server_socket().await?;
+    // Bind the same address family as the server (quinn needs one socket).
+    let bind: std::net::SocketAddr = if server_addr.is_ipv6() {
+        "[::]:0".parse().expect("static ipv6 bind addr")
+    } else {
+        "0.0.0.0:0".parse().expect("static ipv4 bind addr")
+    };
+    let endpoint = quinn::Endpoint::client(bind)?;
+    let tls = quic_tls_config(ctx)?;
+    let quic_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+            .map_err(|e| NativeError::Config(format!("xhttp h3 tls config: {e}")))?,
+    ));
+    let connecting = endpoint
+        .connect_with(quic_config, server_addr, &ctx.sni())
+        .map_err(|e| NativeError::Dial(format!("xhttp h3 connect: {e}")))?;
+    let conn = match connecting.into_0rtt() {
+        Ok((conn, _accepted)) => conn,
+        Err(connecting) => {
+            let limit = timeouts::DIAL;
+            tokio::time::timeout(limit, connecting)
+                .await
+                .map_err(|_| NativeError::Timeout {
+                    step: "xhttp h3 handshake",
+                    limit,
+                })?
+                .map_err(|e| NativeError::Dial(format!("xhttp h3 handshake: {e}")))?
+        }
+    };
+
+    // The h3 connection driver owns the endpoint + quinn connection: it
+    // polls the connection-level state (control frames, settings) and lives
+    // exactly as long as the tunnel — when the last `SendRequest` clone
+    // drops, the connection closes with H3_NO_ERROR, `poll_close` resolves,
+    // and the endpoint goes with it.
+    let h3_quic = h3_quinn::Connection::new(conn);
+    let (mut h3_conn, send_request) = {
+        let limit = timeouts::TRANSPORT;
+        tokio::time::timeout(limit, h3::client::new(h3_quic))
+            .await
+            .map_err(|_| NativeError::Timeout {
+                step: "xhttp h3 open",
+                limit,
+            })?
+            .map_err(|e| NativeError::Transport(format!("xhttp h3 open: {e}")))?
+    };
+    tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| h3_conn.poll_close(cx)).await;
+        drop(endpoint);
+    });
+
+    match mode {
+        "packet-up" => packet_up_h3(ctx, send_request).await,
+        _ => stream_up_h3(ctx, send_request).await,
+    }
 }
 
 /// packet-up over HTTP/1.1 (no TLS): GET on the primary stream, upload POSTs
@@ -399,9 +778,9 @@ async fn packet_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let session = session_id();
     let get_path = path_with(ctx, &session, None);
     let mut get_sender = h1_client(stream).await?;
-    let get_req = build_request(ctx, "GET", &get_path, ReqBody::Empty, &host)?;
+    let get_req = build_request(ctx, "GET", &get_path, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut get_sender, get_req, "xhttp download GET").await?;
-    let reader = IncomingReader::new(resp.into_body());
+    let reader = resp.reader;
 
     // Second raw TCP dial for uploads.
     let post_stream = crate::transport::tcp::connect(ctx, None).await?;
@@ -427,9 +806,9 @@ async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let session = session_id();
     let get_path = path_with(ctx, &session, None);
     let mut sender = h2_client(stream).await?;
-    let get_req = build_request(ctx, "GET", &get_path, ReqBody::Empty, &host)?;
+    let get_req = build_request(ctx, "GET", &get_path, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut sender, get_req, "xhttp download GET").await?;
-    let reader = IncomingReader::new(resp.into_body());
+    let reader = resp.reader;
 
     let (tx, rx) = mpsc::channel::<Bytes>(4);
     let ctx = ctx.clone();
@@ -439,68 +818,49 @@ async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     Ok(Box::new(XhttpStream::new(reader, tx)))
 }
 
-/// Drain a response body to completion in a spawned task. The stream-up
-/// server streams keepalive X-blobs into the upload response when a Referer
-/// is present (xray hub.go) — the drain keeps the h1/h2 window from
-/// stalling, so it must run concurrently with the tunnel.
-fn drain_response(resp: hyper::Response<hyper::body::Incoming>) {
-    tokio::spawn(async move {
-        let mut body = resp.into_body();
-        while let Some(frame) = body.frame().await {
-            match frame {
-                Ok(_) => {} // discard keepalive X-blobs
-                Err(e) => {
-                    tracing::debug!(error = %e, "xhttp stream-up: drain failed on body read");
-                    break;
-                }
-            }
-        }
-    });
-}
+/// packet-up over HTTP/3: one QUIC conn, GET stream + POST streams (h3
+/// multiplexes like h2 — the upload task reuses the same [`V3Send`] loop).
+async fn packet_up_h3(
+    ctx: &LinkContext,
+    mut sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    let session = session_id();
+    let get_path = path_with(ctx, &session, None);
+    let get_req = build_request(ctx, "GET", &get_path, &host)?.map(|()| V3Body::Empty);
+    let resp = send_200(&mut sender, get_req, "xhttp h3 download GET").await?;
+    let reader = resp.reader;
 
-/// Forward tunnel writes into the stream-up upload pipe.
-///
-/// `send_data` awaits pipe capacity (hyper drains it into h1/h2 DATA
-/// frames), so backpressure propagates without dropping bytes; `SendError`
-/// fires only when the body is gone (stream reset) — the upload side is
-/// then broken.
-async fn forward_pipe(
-    mut pipe_tx: http_body_util::channel::Sender<Bytes>,
-    mut wrx: mpsc::Receiver<Bytes>,
-) {
-    while let Some(b) = wrx.recv().await {
-        if pipe_tx.send_data(b).await.is_err() {
-            return;
-        }
-    }
+    let (tx, rx) = mpsc::channel::<Bytes>(4);
+    let ctx = ctx.clone();
+    let session_owned = session.clone();
+    let host_owned = host.clone();
+    tokio::spawn(upload_loop_h3(sender, ctx, session_owned, host_owned, rx));
+    Ok(Box::new(XhttpStream::new(reader, tx)))
 }
 
 /// stream-up: GET (download) + one long-lived POST (upload, pipe body,
 /// `Content-Type: application/grpc`) on a second raw TCP dial. The server
 /// 200s the POST immediately and streams keepalive X-blobs into the response
-/// (drained in a spawned task).
+/// (drained by the seam).
 async fn stream_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     let host = http_host(ctx);
     let session = session_id();
     let url = path_with(ctx, &session, None);
     let mut get_sender = h1_client(stream).await?;
-    let get_req = build_request(ctx, "GET", &url, ReqBody::Empty, &host)?;
+    let get_req = build_request(ctx, "GET", &url, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut get_sender, get_req, "xhttp stream-up GET").await?;
-    let reader = IncomingReader::new(resp.into_body());
+    let reader = resp.reader;
 
     let post_stream = crate::transport::tcp::connect(ctx, None).await?;
     let mut post_sender = h1_client(post_stream).await?;
-    let (tx, body) = ReqBody::channel();
-    let mut req = build_request(ctx, "POST", &url, body, &host)?;
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));
     req.headers_mut().insert(
         "Content-Type",
         http::HeaderValue::from_static("application/grpc"),
     );
-    let resp = send_200(&mut post_sender, req, "xhttp stream-up POST").await?;
-    drain_response(resp);
-
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
-    tokio::spawn(forward_pipe(tx, wrx));
+    let _resp = send_200(&mut post_sender, req, "xhttp stream-up POST").await?;
     Ok(Box::new(XhttpStream::new(reader, wt)))
 }
 
@@ -510,21 +870,40 @@ async fn stream_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let session = session_id();
     let url = path_with(ctx, &session, None);
     let mut sender = h2_client(stream).await?;
-    let get_req = build_request(ctx, "GET", &url, ReqBody::Empty, &host)?;
+    let get_req = build_request(ctx, "GET", &url, &host)?.map(|()| V3Body::Empty);
     let resp = send_200(&mut sender, get_req, "xhttp stream-up GET").await?;
-    let reader = IncomingReader::new(resp.into_body());
+    let reader = resp.reader;
 
-    let (tx, body) = ReqBody::channel();
-    let mut req = build_request(ctx, "POST", &url, body, &host)?;
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));
     req.headers_mut().insert(
         "Content-Type",
         http::HeaderValue::from_static("application/grpc"),
     );
-    let resp = send_200(&mut sender, req, "xhttp stream-up POST").await?;
-    drain_response(resp);
+    let _resp = send_200(&mut sender, req, "xhttp stream-up POST").await?;
+    Ok(Box::new(XhttpStream::new(reader, wt)))
+}
+
+/// stream-up over h3: GET + POST streams on the one QUIC conn (the pipe
+/// body maps onto the h3 request stream's send half).
+async fn stream_up_h3(
+    ctx: &LinkContext,
+    mut sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    let session = session_id();
+    let url = path_with(ctx, &session, None);
+    let get_req = build_request(ctx, "GET", &url, &host)?.map(|()| V3Body::Empty);
+    let resp = send_200(&mut sender, get_req, "xhttp h3 stream-up GET").await?;
+    let reader = resp.reader;
 
     let (wt, wrx) = mpsc::channel::<Bytes>(4);
-    tokio::spawn(forward_pipe(tx, wrx));
+    let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));
+    req.headers_mut().insert(
+        "Content-Type",
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    let _resp = send_200(&mut sender, req, "xhttp h3 stream-up POST").await?;
     Ok(Box::new(XhttpStream::new(reader, wt)))
 }
 
@@ -537,11 +916,12 @@ type PendingSend = Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
 ///
 /// The write path mirrors [`crate::transport::grpc::GrpcStream`]: accepted
 /// bytes sit in `pending` until delivered — `poll_write` never returns
-/// `WouldBlock` (the protocol write path treats it as fatal).
-pub struct XhttpStream {
-    /// The GET download body (read side). Concrete type: `IncomingReader` is
-    /// `AsyncRead`-only, so it cannot live in a `BoxStream`.
-    reader: IncomingReader,
+/// `WouldBlock` (the protocol write path treats it as fatal). `R` is the
+/// download reader: `IncomingReader` on the h1/h2 arms, an h3 body reader
+/// on the QUIC arm.
+pub struct XhttpStream<R> {
+    /// The GET download body (read side).
+    reader: R,
     tx: mpsc::Sender<Bytes>,
     /// Accepted-but-unsent bytes.
     pending: BytesMut,
@@ -549,9 +929,9 @@ pub struct XhttpStream {
     flushing: Option<PendingSend>,
 }
 
-impl XhttpStream {
+impl<R> XhttpStream<R> {
     #[must_use]
-    pub fn new(reader: IncomingReader, tx: mpsc::Sender<Bytes>) -> Self {
+    pub fn new(reader: R, tx: mpsc::Sender<Bytes>) -> Self {
         Self {
             reader,
             tx,
@@ -599,7 +979,7 @@ impl XhttpStream {
     }
 }
 
-impl AsyncRead for XhttpStream {
+impl<R: AsyncRead + Unpin + Send> AsyncRead for XhttpStream<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut TaskCx<'_>,
@@ -609,7 +989,7 @@ impl AsyncRead for XhttpStream {
     }
 }
 
-impl AsyncWrite for XhttpStream {
+impl<R: AsyncRead + Unpin + Send> AsyncWrite for XhttpStream<R> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut TaskCx<'_>,
@@ -1081,5 +1461,191 @@ mod tests {
         client.wait_idle().await;
         server_task.await.expect("server task");
         server.wait_idle().await;
+    }
+
+    // --- SP5 T2: the h3 client arm ----------------------------------------
+
+    /// An xhttp ctx with the h3 ALPN (spec §4.1 trigger) + insecure TLS
+    /// (the loopback server's cert is self-signed — verification is T3's
+    /// e2e concern).
+    fn ctx_h3(addr: SocketAddr, mode: &str) -> LinkContext {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "x_http", "path": "/x", "host": "localhost", "mode": mode },
+            "security": { "type": "tls", "alpn": "h3", "insecure": true }
+        }))
+        .expect("config parses");
+        LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        )
+    }
+
+    /// Minimal h3 server double over loopback quinn (the hermetic pattern):
+    /// answers the v3 protocol — GET `/{base}{session}` with 200 + a
+    /// download body, packet POST `/{base}{session}/{seq}` by reading the
+    /// body and 200ing. The real xray-single-core h3 rows land in T3's e2e.
+    fn spawn_h3_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                .expect("key der");
+        let mut server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server tls");
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)
+                    .expect("quic server config"),
+            )),
+            "127.0.0.1:0".parse().expect("bind addr"),
+        )
+        .expect("quic server endpoint");
+        let addr = server.local_addr().expect("server addr");
+        let task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming conn")
+                .await
+                .expect("server handshake");
+            let h3_quic = h3_quinn::Connection::new(conn);
+            let mut h3_conn = h3::server::Connection::new(h3_quic)
+                .await
+                .expect("h3 server open");
+            while let Ok(Some(resolver)) = h3_conn.accept().await {
+                let (req, mut stream) = resolver.resolve_request().await.expect("resolve request");
+                let path = req.uri().path().to_string();
+                if req.method() == http::Method::GET {
+                    // Session open: path = {base}/{session}, no seq.
+                    assert!(path.starts_with("/x/"), "{path}");
+                    assert!(!path.ends_with("/0"), "GET must not carry seq: {path}");
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::OK)
+                        .body(())
+                        .unwrap();
+                    stream.send_response(resp).await.expect("GET response");
+                    stream
+                        .send_data(Bytes::from_static(b"world"))
+                        .await
+                        .expect("GET body");
+                    stream.finish().await.expect("GET finish");
+                } else if path.ends_with("/0") {
+                    // packet-up upload: path = {base}/{session}/{seq}.
+                    let mut body = Vec::new();
+                    while let Some(chunk) = stream.recv_data().await.expect("read upload") {
+                        let mut chunk = chunk;
+                        body.extend_from_slice(chunk.chunk());
+                        chunk.advance(chunk.remaining());
+                    }
+                    assert_eq!(body, b"hello");
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::OK)
+                        .body(())
+                        .unwrap();
+                    stream.send_response(resp).await.expect("POST response");
+                    stream.finish().await.expect("POST finish");
+                } else {
+                    // stream-up upload: no seq — the server 200s immediately
+                    // (xray hub.go) and reads the piped body to EOF.
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::OK)
+                        .body(())
+                        .unwrap();
+                    stream
+                        .send_response(resp)
+                        .await
+                        .expect("stream-up POST response");
+                    let mut body = Vec::new();
+                    while let Some(chunk) = stream.recv_data().await.expect("read stream-up body") {
+                        let mut chunk = chunk;
+                        body.extend_from_slice(chunk.chunk());
+                        chunk.advance(chunk.remaining());
+                    }
+                    assert_eq!(body, b"hello");
+                    stream.finish().await.expect("stream-up POST finish");
+                }
+            }
+        });
+        (addr, task)
+    }
+
+    /// Full h3 round trip: `connect_quic` dials the loopback quinn server,
+    /// negotiates TLS 1.3 + the h3 ALPN, opens the v3 session (GET
+    /// `/{uuid}` → 200), uploads via the first packet POST (seq 0, raw
+    /// body), and downloads from the GET body — the client arm end to end.
+    #[tokio::test]
+    async fn h3_loopback_get_and_post() {
+        let (addr, server_task) = spawn_h3_server();
+        let ctx = ctx_h3(addr, "packet-up");
+        let mut t = connect_quic(&ctx).await.expect("h3 connect");
+        t.write_all(b"hello").await.expect("upload write");
+        let mut out = [0u8; 5];
+        t.read_exact(&mut out).await.expect("download read");
+        assert_eq!(&out, b"world");
+        drop(t);
+        server_task.await.expect("server task");
+    }
+
+    /// The h3 stream-up path: session open (GET), then one long-lived POST
+    /// with a piped body (the `Pipe` seam arm — 200 immediately, body fed by
+    /// the tunnel writer, keepalive response drained).
+    #[tokio::test]
+    async fn h3_loopback_stream_up() {
+        let (addr, server_task) = spawn_h3_server();
+        let ctx = ctx_h3(addr, "stream-up");
+        let mut t = connect_quic(&ctx).await.expect("h3 stream-up connect");
+        t.write_all(b"hello").await.expect("upload write");
+        let mut out = [0u8; 5];
+        t.read_exact(&mut out).await.expect("download read");
+        assert_eq!(&out, b"world");
+        drop(t);
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connect_quic_rejects_unsupported_modes_before_dialing() {
+        // The mode check precedes the quinn dial: stream-one (legacy XHTTP
+        // v1) and unknown modes error without any network step.
+        let ctx = ctx_h3("127.0.0.1:1".parse().unwrap(), "stream-one");
+        let Err(err) = connect_quic(&ctx).await else {
+            panic!("stream-one must be rejected")
+        };
+        assert!(matches!(err, NativeError::NotImplemented { .. }), "{err}");
+        let ctx = ctx_h3("127.0.0.1:1".parse().unwrap(), "bogus");
+        let Err(err) = connect_quic(&ctx).await else {
+            panic!("unknown mode must be rejected")
+        };
+        assert!(matches!(err, NativeError::Config(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transport_connect_h3_with_base_is_config_error() {
+        // xhttp+h3 as a later chain hop (base = Some) is forbidden: the
+        // QUIC dial is a fresh connection that never reuses a base tunnel.
+        let ctx = ctx_h3("127.0.0.1:1".parse().unwrap(), "packet-up");
+        let Err(err) = crate::transport::connect(&ctx, Some(Box::new(tokio::io::empty()))).await
+        else {
+            panic!("base reuse must be rejected")
+        };
+        assert!(matches!(err, NativeError::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn self_contained_only_for_the_h3_arm() {
+        let h3 = ctx_h3("127.0.0.1:1".parse().unwrap(), "packet-up");
+        assert!(crate::transport::is_self_contained(&h3));
+        let h1 = ctx_at("127.0.0.1:1".parse().unwrap(), "packet-up");
+        assert!(!crate::transport::is_self_contained(&h1));
     }
 }
