@@ -399,9 +399,35 @@ impl Drop for CoreGuard {
     }
 }
 
-/// Spawn a core with the given on-disk config; wait until `port` accepts TCP.
+/// UDP-port readiness probe: send a garbage datagram and treat an ICMP
+/// port-unreachable as "not yet bound". A bound listener consumes the
+/// datagram (recv times out); an unbound port bounces ICMP → recv errors
+/// with `ConnectionRefused`.
+fn udp_ready(port: u16) -> bool {
+    use std::net::UdpSocket;
+    let Ok(sock) = UdpSocket::bind("127.0.0.1:0") else {
+        return false;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(150)));
+    let _ = sock.send_to(&[0u8; 1], ("127.0.0.1", port));
+    let mut buf = [0u8; 4];
+    !matches!(
+        sock.recv(&mut buf),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Spawn a core with the given on-disk config; wait until `port` is ready
+/// (TCP accept for stream transports; bound UDP socket for `udp: true` —
+/// mKCP listeners are datagram-only).
 #[must_use]
-pub fn spawn_core(bin: &Path, kind: CoreKind, config_path: &Path, port: u16) -> CoreGuard {
+pub fn spawn_core(
+    bin: &Path,
+    kind: CoreKind,
+    config_path: &Path,
+    port: u16,
+    udp: bool,
+) -> CoreGuard {
     let p = config_path.to_str().expect("config path utf8");
     let mut cmd = match kind {
         CoreKind::SingBox => {
@@ -421,7 +447,12 @@ pub fn spawn_core(bin: &Path, kind: CoreKind, config_path: &Path, port: u16) -> 
 
     let mut attempts = 0;
     loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        let ready = if udp {
+            udp_ready(port)
+        } else {
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+        };
+        if ready {
             break;
         }
         attempts += 1;

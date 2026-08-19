@@ -139,6 +139,13 @@ pub fn vmess_inbound(
                 // are sing-box single-core, so this arm is unreachable; a
                 // loud panic beats emitting a broken config.
                 "h2" => panic!("h2 (v2rayhttp) transport is sing-box only"),
+                // mKCP: network "kcp" is already set by the template; an
+                // empty kcpSettings exercises the server's getter defaults
+                // (mtu 1350, tti 50, … — spec §4.5) exactly like omitting
+                // the key.
+                "kcp" => {
+                    stream["kcpSettings"] = serde_json::json!({});
+                }
                 _ => {}
             }
             serde_json::json!({
@@ -259,6 +266,13 @@ pub fn vless_inbound(
                 // are sing-box single-core, so this arm is unreachable; a
                 // loud panic beats emitting a broken config.
                 "h2" => panic!("h2 (v2rayhttp) transport is sing-box only"),
+                // mKCP: network "kcp" is already set by the template; an
+                // empty kcpSettings exercises the server's getter defaults
+                // (mtu 1350, tti 50, … — spec §4.5) exactly like omitting
+                // the key.
+                "kcp" => {
+                    stream["kcpSettings"] = serde_json::json!({});
+                }
                 _ => {}
             }
             serde_json::json!({
@@ -582,6 +596,9 @@ pub fn client_params_vmess(
         // v2rayhttp: proto `type: http` (the `h2` network string is only
         // for the test rows/dispatch; the wire name is `http`).
         "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
+        // mKCP: proto `type: kcp`; all params None → the native dial's
+        // spec §4.5 defaults (mtu 1350, tti 50).
+        "kcp" => serde_json::json!({ "type": "kcp" }),
         _ => serde_json::json!({ "type": "tcp" }),
     };
     let mut security = client_security(tls, network);
@@ -640,6 +657,9 @@ pub fn client_params_vless(
         // v2rayhttp: proto `type: http` (the `h2` network string is only
         // for the test rows/dispatch; the wire name is `http`).
         "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
+        // mKCP: proto `type: kcp`; all params None → the native dial's
+        // spec §4.5 defaults (mtu 1350, tti 50).
+        "kcp" => serde_json::json!({ "type": "kcp" }),
         _ => serde_json::json!({ "type": "tcp" }),
     };
     let mut protocol_value = serde_json::json!({

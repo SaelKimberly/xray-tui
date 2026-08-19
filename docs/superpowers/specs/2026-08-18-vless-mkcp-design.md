@@ -256,12 +256,15 @@ arm producing `Box<dyn AsyncReadWrite>` whose inner is the KcpStream, and
 
 ### 7.3 e2e (tier-3, `native-e2e` + `XRAY_TUI_CORE_BIN_DIR=/tmp/core-bin`)
 
-- xray-single-core rows (sing-box has no kcp): kcp + tls, kcp + reality,
-  kcp plain (no TLS) — the three composition arms, one each. Harness: the
-  row's transport is Kcp, the server config carries
+- xray-single-core rows (sing-box has no kcp): kcp + tls (chrome
+  fingerprint engine), kcp plain (no TLS) — the two composition arms, one
+  each. Harness: the row's transport is Kcp, the server config carries
   `"streamSettings":{"network":"kcp"}` (xray config builder side in the
-  e2e harness, like the ws/grpc rows).
-- Count: vless +3 (plain/tls/reality), vmess unchanged, total 123 → **126**.
+  e2e harness, like the ws/grpc rows). The mKCP listener is datagram-only,
+  so the harness's core-readiness probe waits on the UDP port for these
+  rows (an ICMP port-unreachable probe) instead of a TCP accept.
+- Count: vless +2 (plain/tls), vmess unchanged, total **126** (74+4 vless +
+  48 vmess). The kcp+reality arm is dropped — see §8 deviation 5.
 
 ### 7.4 Gates
 
@@ -270,7 +273,7 @@ arm producing `Box<dyn AsyncReadWrite>` whose inner is the KcpStream, and
 - `cargo test -p xray-tui-native --lib`: green (new unit + hermetic).
 - `cargo test -p xray-tui-native --features native-e2e --lib`: green.
 - `cargo test -p xray-tui-native --features native-e2e --test vless` (72+4
-  existing + 3 new = 75+4) and `--test vmess` (48).
+  existing + 2 new = 74+4) and `--test vmess` (48).
 - No `xray-tui-proto` changes.
 
 ## 8. Deviations from Upstream
@@ -286,6 +289,14 @@ arm producing `Box<dyn AsyncReadWrite>` whose inner is the KcpStream, and
 4. **Read-after-Terninate timing** — Rust surfaces EOF immediately on the
    Terminated state; xray's `PeerTerminating` → EOF, `Terminating`/`Terminated`
    → EOF as well — same observable behavior.
+5. **No kcp+reality e2e row (spec §7.3 scope cut)** — xray-core 26.3.27's
+   `StreamConfig.Build()` rejects `security: "reality"` over any protocol
+   but tcp/splithttp/grpc ("REALITY only supports RAW, XHTTP and gRPC for
+   now." — `thirdparty/Xray-core/infra/conf/transport_internet.go`), so a
+   reality mKCP inbound dies at config build and no core can serve it
+   (sing-box has no kcp). The native client's reality-over-kcp dial stays
+   implemented (unreachable server-side, mirroring xray's own client
+   restriction). e2e covers the two achievable arms: plain + tls.
 
 ## 9. Verification Order
 
@@ -293,5 +304,5 @@ arm producing `Box<dyn AsyncReadWrite>` whose inner is the KcpStream, and
 2. session.rs + unit (windows, RTO, state machine) + hermetic peer (real UDP
    session, retransmit, close).
 3. stream.rs + transport integration.
-4. e2e rows (xray kcp: plain/tls/reality).
+4. e2e rows (xray kcp: plain/tls).
 5. Docs (NATIVE_CORE.md mKCP row + counts) + full gates.

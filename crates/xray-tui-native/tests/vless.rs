@@ -205,6 +205,18 @@ async fn vless_against_cores(
 // connection ("we will break Mux connections that contain TCP requests").
 // Hence sing-box single-core.
 #[case::mux_vision_singbox(vless("tcp").with_flow(Flow::Vision).with_mux(true), CoreKind::SingBox)]
+// mKCP (SP4) is xray-single-core: sing-box has no kcp transport. Spec §7.3
+// asked for three arms (plain/tls/reality) — the reality arm is dropped by
+// controller ruling: xray-core 26.3.27's StreamConfig.Build() rejects
+// security=reality over any protocol but tcp/splithttp/grpc
+// (transport_internet.go: "REALITY only supports RAW, XHTTP and gRPC for
+// now."), so the server config dies at startup; no core can serve
+// reality-over-kcp (sing-box has no kcp). The native client's
+// reality-over-kcp dial stays implemented (unreachable server-side, like
+// xray itself). Rows: plain (no TLS) + tls (chrome fingerprint engine) —
+// the kcp dial + security-wrap composition arms.
+#[case::kcp_plain(vless("kcp"), CoreKind::Xray)]
+#[case::kcp_chrome(vless_tls("kcp", fp("chrome")), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,

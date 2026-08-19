@@ -151,6 +151,11 @@ impl CaseSpec {
         self
     }
 
+    #[must_use]
+    pub const fn network(&self) -> &'static str {
+        self.network
+    }
+
     /// Select the client-side xhttp dialect ("stream-up"; packet-up is the
     /// default). Ignored for non-xhttp networks.
     #[must_use]
