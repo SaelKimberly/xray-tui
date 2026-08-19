@@ -2540,7 +2540,7 @@ mod tests {
         let h1 = ctx_at("127.0.0.1:1".parse().unwrap(), "packet-up");
         assert!(!crate::transport::is_self_contained(&h1));
     }
-    /// H3Reader borrow-slice + partial ReadBuf test: the reader consumes
+    /// `H3Reader` borrow-slice + partial `ReadBuf` test: the reader consumes
     /// chunks without per-chunk allocation. We verify the reader assembles
     /// chunks correctly into the caller's buffer by reading in small chunks.
     #[tokio::test]
@@ -2571,7 +2571,7 @@ mod tests {
 
     /// Stream-up X-blob drain hermetic test: the fake h3 server streams
     /// keepalive X-blobs into the upload response body (as xray hub.go does),
-    /// and the client's drain_h3 task must consume them without blocking the
+    /// and the client's `drain_h3` task must consume them without blocking the
     /// tunnel. We verify the fake sent X-blobs and the client finished cleanly.
     #[tokio::test]
     async fn h3_stream_up_xblob_drain() {
@@ -2585,10 +2585,14 @@ mod tests {
         drop(t);
 
         wait_obs(&obs, |o| !o.stream_uploads.is_empty() && o.conn_closed).await;
-        let o = obs.data.lock().expect("obs lock");
-        assert_stream_up_roundtrip(&o);
-        // Verify the fake server streamed X-blobs into the response.
-        assert_eq!(o.stream_xblobs.len(), 3, "expected 3 X-blobs: {o:#?}");
+        let obs_data = {
+            let o = obs.data.lock().expect("obs lock");
+            assert_stream_up_roundtrip(&o);
+            let xblobs_len = o.stream_xblobs.len();
+            drop(o);
+            xblobs_len
+        };
+        assert_eq!(obs_data, 3, "expected 3 X-blobs");
         server_task.await.expect("server task");
     }
 }
