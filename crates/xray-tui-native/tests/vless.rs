@@ -182,6 +182,18 @@ async fn vless_against_cores(
 // is covered by the hermetic unit test.
 #[case::xhttp_stream_plain(vless_xhttp("stream-up"), CoreKind::Xray)]
 #[case::xhttp_stream_chrome(vless_xhttp_tls("stream-up", fp("chrome")), CoreKind::Xray)]
+// xhttp/h3 (SP5): the exactly-one `h3` ALPN flips xray's splithttp listener
+// to the QUIC/HTTP-3 mode (hub.go `isH3` — the row's server config emits
+// tlsSettings.alpn ["h3"], no quic_settings needed: the server's quic-go
+// defaults + the client's 10s keepalive hold the tunnel). The client's h3
+// arm (`connect_quic`, quinn + h3 — the engine TLS never wraps QUIC, spec
+// §5.2) runs the v3 protocol over HTTP/3; the row rides the DEFAULT verify
+// path (webpki-roots chain walk with the harness CA as trust anchor —
+// `StandardTls::client_trust` installs it; the T3-insecure-only cert gap).
+// Packet-up (the default dialect). One row: reality is impossible
+// (decideHTTPVersion returns "2" when a reality config is present) and h3
+// requires TLS (no plain row); sing-box has no xhttp-over-QUIC.
+#[case::xhttp_h3_tls(vless("xhttp3"), CoreKind::Xray)]
 // v2rayhttp (sing-box `type: http`) is sing-box-only: xray-core removed the
 // h2 transport in 26.x. One row over h2 + the chrome fingerprint (the
 // client JSON carries the fp so the engine fingerprints; ALPN h2 comes from

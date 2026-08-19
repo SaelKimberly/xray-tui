@@ -175,13 +175,14 @@ pub async fn run_against(
         if std::fs::write(&config_path, &config_json).is_err() {
             return Err(format!("attempt {attempt}: config write failed"));
         }
-        // mKCP listeners are datagram-only — the readiness probe is UDP.
+        // mKCP and xhttp/h3 listeners are datagram-only — the readiness
+        // probe is UDP.
         let _core = spawn_core(
             &core.bin,
             core.kind,
             &config_path,
             port,
-            case.network() == "kcp",
+            matches!(case.network(), "kcp" | "xhttp3"),
         );
 
         case.client_trust(certs);

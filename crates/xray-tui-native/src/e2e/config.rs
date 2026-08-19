@@ -102,6 +102,9 @@ pub fn vmess_inbound(
     // ws/httpupgrade upgrade with http/1.1 (the default below).
     let alpn = match network {
         "grpc" | "xhttp" | "h2" => serde_json::json!(["h2"]),
+        // xhttp/h3 (SP5): exactly-one ALPN "h3" flips xray's splithttp
+        // listener to the QUIC/HTTP-3 mode (hub.go `isH3`).
+        "xhttp3" => serde_json::json!(["h3"]),
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
@@ -130,7 +133,7 @@ pub fn vmess_inbound(
                 // xray's splithttp dialect: network "splithttp" + settings
                 // key "splithttpSettings". Server mode defaults to auto
                 // (accepts packet-up + stream-up POSTs).
-                "xhttp" => {
+                "xhttp" | "xhttp3" => {
                     stream["network"] = serde_json::json!("splithttp");
                     stream["splithttpSettings"] =
                         serde_json::json!({ "path": "/x", "host": "localhost" });
@@ -230,6 +233,9 @@ pub fn vless_inbound(
     // ws/httpupgrade upgrade with http/1.1 (the default below).
     let alpn = match network {
         "grpc" | "xhttp" | "h2" => serde_json::json!(["h2"]),
+        // xhttp/h3 (SP5): exactly-one ALPN "h3" flips xray's splithttp
+        // listener to the QUIC/HTTP-3 mode (hub.go `isH3`).
+        "xhttp3" => serde_json::json!(["h3"]),
         _ => serde_json::json!(["http/1.1"]),
     };
     let json = match core {
@@ -264,7 +270,7 @@ pub fn vless_inbound(
                 // xray's splithttp dialect: network "splithttp" + settings
                 // key "splithttpSettings". Server mode defaults to auto
                 // (accepts packet-up + stream-up POSTs).
-                "xhttp" => {
+                "xhttp" | "xhttp3" => {
                     stream["network"] = serde_json::json!("splithttp");
                     stream["splithttpSettings"] =
                         serde_json::json!({ "path": "/x", "host": "localhost" });
@@ -547,6 +553,9 @@ fn client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
 fn plain_client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Value {
     let alpn = match network {
         "grpc" | "xhttp" | "h2" => "h2",
+        // xhttp/h3 (SP5): the h3 ALPN is the QUIC trigger client-side
+        // (`http_version` == "3" → `connect_quic`).
+        "xhttp3" => "h3",
         // ws and httpupgrade both upgrade over HTTP/1.1 (the default below).
         _ => "http/1.1",
     };
@@ -604,7 +613,7 @@ pub fn client_params_vmess(
         // auto-defaults to stream-one under REALITY; the packet-up-over-
         // REALITY row tests that on purpose). Stream-up rows pass their
         // mode through.
-        "xhttp" => serde_json::json!({
+        "xhttp" | "xhttp3" => serde_json::json!({
             "type": "x_http", "path": "/x", "host": "localhost",
             "mode": xhttp_mode.unwrap_or("packet-up")
         }),
@@ -665,7 +674,7 @@ pub fn client_params_vless(
         // auto-defaults to stream-one under REALITY; the packet-up-over-
         // REALITY row tests that on purpose). Stream-up rows pass their
         // mode through.
-        "xhttp" => serde_json::json!({
+        "xhttp" | "xhttp3" => serde_json::json!({
             "type": "x_http", "path": "/x", "host": "localhost",
             "mode": xhttp_mode.unwrap_or("packet-up")
         }),
@@ -817,6 +826,47 @@ mod tests {
             Some("stream-up"),
         );
         assert_eq!(mode_of(stream).as_deref(), Some("stream-up"));
+    }
+
+    #[test]
+    fn xhttp3_emits_h3_alpn_both_sides_and_dispatches_quic() {
+        use crate::transport::xhttp::http_version;
+
+        // Server: xray splithttp listener with exactly-one ALPN "h3" → the
+        // QUIC/HTTP-3 mode (hub.go isH3; no quic_settings needed).
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
+        let server: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::Xray,
+            &env,
+            None,
+            &StandardTls,
+            "xhttp3",
+        ))
+        .unwrap();
+        assert_eq!(
+            server["inbounds"][0]["streamSettings"]["network"],
+            "splithttp"
+        );
+        assert_eq!(
+            server["inbounds"][0]["streamSettings"]["tlsSettings"]["alpn"],
+            serde_json::json!(["h3"])
+        );
+
+        // Client: xhttp transport + the h3 ALPN → the QUIC dispatch decision.
+        let target = "1.2.3.4:80".parse().unwrap();
+        let params = client_params_vless(12345, target, None, &StandardTls, "xhttp3", None);
+        assert_eq!(params.protocol.transport_type(), Some("xhttp"));
+        let sec = params.protocol.security().unwrap();
+        assert_eq!(sec.alpn(), Some("h3"));
+        assert_eq!(http_version(Some(sec)), "3");
     }
 
     #[test]

@@ -346,7 +346,28 @@ impl V3Send for h3::client::SendRequest<h3_quinn::OpenStreams, Bytes> {
         req: http::Request<V3Body>,
         step: &'static str,
     ) -> Result<V3Response, NativeError> {
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
+        // RFC 9114 §4.3.1: requests MUST carry `:scheme` + `:authority`.
+        // The shared builder emits a path-only URI + Host header (correct
+        // for h1/h2, where the engine sends Host separately) — but the h3
+        // crate only translates URI scheme/authority into pseudo-headers,
+        // so without this rewrite the request reaches quic-go's server
+        // missing both and dies with H3_MESSAGE_ERROR (headers.go:
+        // `hdr.Scheme == "" || hdr.Authority == ""`). h3 is always TLS.
+        let host = parts
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if let Some(host) = host {
+            let path = parts
+                .uri
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str);
+            parts.uri = format!("https://{host}{path}")
+                .parse()
+                .map_err(|e| NativeError::Transport(format!("{step}: absolute h3 uri: {e}")))?;
+        }
         let req = http::Request::from_parts(parts, ());
         let err = |e: h3::error::StreamError| NativeError::Transport(format!("{step}: {e}"));
         let mut stream = self.send_request(req).await.map_err(err)?;
@@ -678,11 +699,35 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
     }
 }
 
+// Test/e2e override: a QUIC-dial trust anchor trusting exactly one CA (the
+// harness CA) — the counterpart of `security::fingerprint::set_test_ca` for
+// quinn's internal rustls (the engine verifier never sees QUIC; spec §5.2).
+// Thread-local: each `#[tokio::test]` runs on its own OS thread with its own
+// harness CA, so parallel e2e cases can't clobber each other's trust store.
+// Production builds use webpki-roots and carry no test state.
+#[doc(hidden)]
+#[cfg(any(test, feature = "native-e2e"))]
+std::thread_local! {
+    static TEST_CA: std::cell::RefCell<Option<rustls::pki_types::CertificateDer<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a test-only QUIC trust anchor trusting exactly `ca_der`
+/// (test/e2e harness).
+#[doc(hidden)]
+#[cfg(any(test, feature = "native-e2e"))]
+pub fn set_test_ca(ca_der: &[u8]) {
+    let der = rustls::pki_types::CertificateDer::from(ca_der.to_vec());
+    TEST_CA.with(|c| *c.borrow_mut() = Some(der));
+}
+
 /// rustls client config for the QUIC dial: ALPN `h3` (the trigger — spec
 /// §4.1), early data enabled (0-RTT), and cert verification mirroring the
 /// TLS opts (`insecure` → skip the chain walk; default → webpki-roots). The
 /// engine TLS + fingerprint machinery does not apply to QUIC (spec §5.2) —
-/// quinn's rustls is internal.
+/// quinn's rustls is internal. The default (webpki) branch still runs the
+/// full chain walk; the harness CA merely replaces the trust anchor in
+/// test/e2e builds (mirror of `fingerprint::verifier_for`).
 fn quic_tls_config(ctx: &LinkContext) -> Result<rustls::ClientConfig, NativeError> {
     let insecure = ctx.tls_opts()?.and_then(|o| o.insecure).unwrap_or(false);
     let mut tls = if insecure {
@@ -693,6 +738,14 @@ fn quic_tls_config(ctx: &LinkContext) -> Result<rustls::ClientConfig, NativeErro
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
+        #[cfg(any(test, feature = "native-e2e"))]
+        match TEST_CA.with(|c| c.borrow().clone()) {
+            Some(ca) => roots
+                .add(ca)
+                .map_err(|e| NativeError::Config(format!("xhttp h3 test CA: {e}")))?,
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        #[cfg(not(any(test, feature = "native-e2e")))]
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
