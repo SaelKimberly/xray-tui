@@ -1058,9 +1058,12 @@ impl<R: AsyncRead + Unpin + Send> AsyncWrite for XhttpStream<R> {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
     use xray_tui_proto::proto_spec::ProtocolConfig;
     use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
     use xray_tui_proto::proto_spec::{RealityOpts, TlsOpts};
@@ -1498,11 +1501,237 @@ mod tests {
         )
     }
 
-    /// Minimal h3 server double over loopback quinn (the hermetic pattern):
-    /// answers the v3 protocol — GET `/{base}{session}` with 200 + a
-    /// download body, packet POST `/{base}{session}/{seq}` by reading the
-    /// body and 200ing. The real xray-single-core h3 rows land in T3's e2e.
-    fn spawn_h3_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    // --- SP5 T3: the hermetic h3 server double (spec §7.2) ----------------
+
+    /// Bounded server-side await: a hung client must fail the server task
+    /// (and thus the test) instead of hanging forever.
+    async fn bounded<T>(fut: impl Future<Output = T>, what: &'static str) -> T {
+        tokio::time::timeout(H3_DEADLINE, fut)
+            .await
+            .unwrap_or_else(|_| panic!("fake h3 server: {what} timed out after {H3_DEADLINE:?}"))
+    }
+
+    /// Upper bound on every server-side await and the test-side observation
+    /// wait (loopback QUIC round trips are sub-ms; 10 s is generous headroom
+    /// for slow CI without letting a hung client hang the suite).
+    const H3_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// The download body the fake streams on the session-open GET.
+    const H3_DOWNLOAD: &[u8] = b"world";
+
+    /// What the fake server observed, asserted on by the tests. Event-based:
+    /// every record bumps [`H3Handle::changed`], and the tests wait on it
+    /// under a deadline — never sleep-then-assert.
+    #[derive(Debug, Default)]
+    struct H3Obs {
+        /// Session-open GETs: `(path, referer)` in arrival order.
+        gets: Vec<(String, String)>,
+        /// Packet-up POSTs: `(seq, body, referer, arrival)` in arrival order.
+        posts: Vec<(u64, Bytes, String, Instant)>,
+        /// Stream-up POSTs: `(referer, content-type)` in arrival order.
+        stream_reqs: Vec<(String, String)>,
+        /// Stream-up upload bodies (EOF is always observed — the fake reads
+        /// each body to completion).
+        stream_uploads: Vec<Bytes>,
+        /// The h3 connection closed (the client is gone).
+        conn_closed: bool,
+    }
+
+    /// Shared handle: the observations + the event-based wait primitive.
+    /// The Notify lives OUTSIDE the mutex so a waiter never holds the lock
+    /// across an await — holding it there would deadlock the server's
+    /// `record` against the test's wait.
+    struct H3Handle {
+        data: Mutex<H3Obs>,
+        changed: Notify,
+    }
+
+    /// Record one observation and wake the test waiter.
+    fn record(obs: &Arc<H3Handle>, f: impl FnOnce(&mut H3Obs)) {
+        let mut o = obs.data.lock().expect("obs lock");
+        f(&mut o);
+        obs.changed.notify_one();
+    }
+
+    /// Wait until `pred` holds over the observations, under [`H3_DEADLINE`]
+    /// (event-driven via the Notify — the permit model makes a record
+    /// between the check and the wait unmissable).
+    async fn wait_obs(obs: &Arc<H3Handle>, pred: impl Fn(&H3Obs) -> bool) {
+        loop {
+            if pred(&obs.data.lock().expect("obs lock")) {
+                return;
+            }
+            let notified = obs.changed.notified();
+            assert!(
+                tokio::time::timeout(H3_DEADLINE, notified).await.is_ok(),
+                "fake h3 server: expected observation missed: {:#?}",
+                *obs.data.lock().expect("obs lock")
+            );
+        }
+    }
+
+    /// Referer = `{scheme}://{host}{base}?x_padding={X..}` — `X`s in the
+    /// xray `xPaddingBytes` [100, 1000] range (the v3 padding the client
+    /// sends on every request).
+    fn assert_referer(referer: &str) {
+        let (url, pad) = referer
+            .split_once("?x_padding=")
+            .expect("referer carries x_padding");
+        assert_eq!(url, "https://localhost/x/", "{referer}");
+        assert!(pad.bytes().all(|b| b == b'X'), "{referer}");
+        assert!((PAD_MIN..=PAD_MAX).contains(&pad.len()), "{referer}");
+    }
+
+    /// Read an h3 request body to EOF, concatenated. The client always
+    /// finishes its upload bodies (packet POSTs are finite; the stream-up
+    /// pipe ends when the tunnel writer drops), so EOF is the expected
+    /// outcome — a stalled peer trips the outer `bounded` deadline.
+    async fn read_h3_body(
+        stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ) -> Bytes {
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.expect("read request body") {
+            body.extend_from_slice(chunk.chunk());
+            chunk.advance(chunk.remaining());
+        }
+        Bytes::from(body)
+    }
+
+    /// Serve the v3 protocol over one h3 connection until the client closes
+    /// it: session-open GETs, packet-up POSTs (seq in the path), stream-up
+    /// POSTs (200 immediately — xray hub.go — then the piped body to EOF).
+    async fn handle_h3_request(
+        req: http::Request<()>,
+        mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        obs: &Arc<H3Handle>,
+        reject_get: bool,
+    ) {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let referer = req
+            .headers()
+            .get("referer")
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+
+        if method == http::Method::GET {
+            // Session open: `{base}/{uuid}` — never a seq segment.
+            let session = path.strip_prefix("/x/").expect("GET on session path");
+            assert!(
+                !session.contains('/'),
+                "session-open GET must not carry a seq: {path}"
+            );
+            uuid::Uuid::parse_str(session).expect("session is a uuid v4");
+            record(obs, |o| o.gets.push((path, referer)));
+            let status = if reject_get {
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                http::StatusCode::OK
+            };
+            let resp = http::Response::builder().status(status).body(()).unwrap();
+            bounded(stream.send_response(resp), "GET response")
+                .await
+                .expect("GET response");
+            if !reject_get {
+                bounded(
+                    stream.send_data(Bytes::from_static(H3_DOWNLOAD)),
+                    "GET body",
+                )
+                .await
+                .expect("GET body");
+            }
+            bounded(stream.finish(), "GET finish")
+                .await
+                .expect("GET finish");
+        } else if let Ok(seq) = path
+            .rsplit('/')
+            .next()
+            .expect("POST path has a last segment")
+            .parse::<u64>()
+        {
+            // Packet-up upload: `{base}/{uuid}/{seq}` — the raw body, 200.
+            let body = bounded(read_h3_body(&mut stream), "upload body").await;
+            record(obs, |o| o.posts.push((seq, body, referer, Instant::now())));
+            let resp = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(())
+                .unwrap();
+            bounded(stream.send_response(resp), "POST response")
+                .await
+                .expect("POST response");
+            bounded(stream.finish(), "POST finish")
+                .await
+                .expect("POST finish");
+        } else {
+            // Stream-up upload: `{base}/{uuid}` — 200 immediately (xray
+            // hub.go), then the piped body to EOF (the tunnel writer's
+            // close ends it).
+            let content_type = req
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            record(obs, |o| o.stream_reqs.push((referer, content_type)));
+            let resp = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(())
+                .unwrap();
+            bounded(stream.send_response(resp), "stream-up 200")
+                .await
+                .expect("stream-up 200");
+            let body = bounded(read_h3_body(&mut stream), "stream-up body").await;
+            record(obs, |o| o.stream_uploads.push(body));
+            bounded(stream.finish(), "stream-up finish")
+                .await
+                .expect("stream-up finish");
+        }
+    }
+
+    /// The fake server loop: one quinn connection (the tests open exactly
+    /// one), the h3 server connection over it, and the request loop until
+    /// the client closes. Every await is bounded.
+    async fn serve_h3(server: quinn::Endpoint, obs: Arc<H3Handle>, reject_get: bool) {
+        let incoming = bounded(server.accept(), "accept conn")
+            .await
+            .expect("incoming quinn conn");
+        let conn = bounded(incoming.into_future(), "conn handshake")
+            .await
+            .expect("server handshake");
+        let h3_quic = h3_quinn::Connection::new(conn);
+        let mut h3_conn = bounded(h3::server::Connection::new(h3_quic), "h3 open")
+            .await
+            .expect("h3 server open");
+        loop {
+            // The client closes the h3 connection (H3_NO_ERROR after the
+            // last request stream dropped) → accept yields `None`/`Err`.
+            let Some(resolver) = bounded(h3_conn.accept(), "accept request")
+                .await
+                .ok()
+                .flatten()
+            else {
+                record(&obs, |o| o.conn_closed = true);
+                break;
+            };
+            let (req, stream) = bounded(resolver.resolve_request(), "resolve request")
+                .await
+                .expect("resolve request");
+            handle_h3_request(req, stream, &obs, reject_get).await;
+        }
+    }
+
+    /// Bind + spawn the fake h3 server (self-signed cert, `h3` ALPN —
+    /// spec §4.1) over loopback QUIC, returning the socket address + the
+    /// shared observations + the server task.
+    ///
+    /// Cert story: the client's `insecure` TLS mode (the `SkipServerVerify`
+    /// seam — chain walk skipped, handshake signatures still verified)
+    /// accepts the self-signed loopback cert in the hermetic tests; the
+    /// webpki-roots path is the T4 e2e's job (the real xray server's own
+    /// cert — there is no CA-injection hook in `quic_tls_config`).
+    ///
+    /// `reject_get` makes the server 500 the session-open GET (the error
+    /// path test).
+    fn spawn_h3_fake(reject_get: bool) -> (SocketAddr, Arc<H3Handle>, JoinHandle<()>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let certified =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
@@ -1524,104 +1753,158 @@ mod tests {
         )
         .expect("quic server endpoint");
         let addr = server.local_addr().expect("server addr");
-        let task = tokio::spawn(async move {
-            let conn = server
-                .accept()
-                .await
-                .expect("incoming conn")
-                .await
-                .expect("server handshake");
-            let h3_quic = h3_quinn::Connection::new(conn);
-            let mut h3_conn = h3::server::Connection::new(h3_quic)
-                .await
-                .expect("h3 server open");
-            while let Ok(Some(resolver)) = h3_conn.accept().await {
-                let (req, mut stream) = resolver.resolve_request().await.expect("resolve request");
-                let path = req.uri().path().to_string();
-                if req.method() == http::Method::GET {
-                    // Session open: path = {base}/{session}, no seq.
-                    assert!(path.starts_with("/x/"), "{path}");
-                    assert!(!path.ends_with("/0"), "GET must not carry seq: {path}");
-                    let resp = http::Response::builder()
-                        .status(http::StatusCode::OK)
-                        .body(())
-                        .unwrap();
-                    stream.send_response(resp).await.expect("GET response");
-                    stream
-                        .send_data(Bytes::from_static(b"world"))
-                        .await
-                        .expect("GET body");
-                    stream.finish().await.expect("GET finish");
-                } else if path.ends_with("/0") {
-                    // packet-up upload: path = {base}/{session}/{seq}.
-                    let mut body = Vec::new();
-                    while let Some(chunk) = stream.recv_data().await.expect("read upload") {
-                        let mut chunk = chunk;
-                        body.extend_from_slice(chunk.chunk());
-                        chunk.advance(chunk.remaining());
-                    }
-                    assert_eq!(body, b"hello");
-                    let resp = http::Response::builder()
-                        .status(http::StatusCode::OK)
-                        .body(())
-                        .unwrap();
-                    stream.send_response(resp).await.expect("POST response");
-                    stream.finish().await.expect("POST finish");
-                } else {
-                    // stream-up upload: no seq — the server 200s immediately
-                    // (xray hub.go) and reads the piped body to EOF.
-                    let resp = http::Response::builder()
-                        .status(http::StatusCode::OK)
-                        .body(())
-                        .unwrap();
-                    stream
-                        .send_response(resp)
-                        .await
-                        .expect("stream-up POST response");
-                    let mut body = Vec::new();
-                    while let Some(chunk) = stream.recv_data().await.expect("read stream-up body") {
-                        let mut chunk = chunk;
-                        body.extend_from_slice(chunk.chunk());
-                        chunk.advance(chunk.remaining());
-                    }
-                    assert_eq!(body, b"hello");
-                    stream.finish().await.expect("stream-up POST finish");
-                }
-            }
+        let obs = Arc::new(H3Handle {
+            data: Mutex::new(H3Obs::default()),
+            changed: Notify::new(),
         });
-        (addr, task)
+        let handle = tokio::spawn(serve_h3(server, obs.clone(), reject_get));
+        (addr, obs, handle)
     }
 
-    /// Full h3 round trip: `connect_quic` dials the loopback quinn server,
-    /// negotiates TLS 1.3 + the h3 ALPN, opens the v3 session (GET
+    /// Assert the fake's observations for one full packet-up round trip:
+    /// one session-open GET (uuid path, no seq, Referer) + one packet POST
+    /// (seq 0, raw body, Referer). Sync helper — keeps the `MutexGuard` out
+    /// of the async test bodies.
+    fn assert_packet_roundtrip(o: &H3Obs) {
+        assert_eq!(o.gets.len(), 1, "{o:#?}");
+        let (get_path, get_referer) = &o.gets[0];
+        assert!(get_path.starts_with("/x/"), "{get_path}");
+        uuid::Uuid::parse_str(&get_path["/x/".len()..]).expect("GET session uuid");
+        assert_referer(get_referer);
+        assert_eq!(o.posts.len(), 1, "{o:#?}");
+        let (seq, body, post_referer, _arrival) = &o.posts[0];
+        assert_eq!(*seq, 0);
+        assert_eq!(&body[..], &b"hello"[..]);
+        assert_referer(post_referer);
+    }
+
+    /// Assert the chunked-upload observations: two packet POSTs, seqs 0 + 1
+    /// in arrival order, each ≤ the 1 MB cap, concatenated == the payload,
+    /// paced ≥ 25 ms apart, both carrying the Referer.
+    fn assert_chunked_uploads(o: &H3Obs, payload: &[u8]) {
+        assert_eq!(o.posts.len(), 2, "{o:#?}");
+        let (s0, b0, r0, t0) = &o.posts[0];
+        let (s1, b1, r1, t1) = &o.posts[1];
+        assert_eq!(*s0, 0, "seq order");
+        assert_eq!(*s1, 1, "seq order");
+        assert_eq!(b0.len(), MAX_POST_BYTES, "first chunk = the size cap");
+        assert_eq!(b1.len(), 200_000, "tail chunk");
+        let mut joined = Vec::with_capacity(b0.len() + b1.len());
+        joined.extend_from_slice(b0);
+        joined.extend_from_slice(b1);
+        assert_eq!(joined, payload, "no byte loss across the split");
+        assert_referer(r0);
+        assert_referer(r1);
+        assert!(
+            t1.duration_since(*t0) >= POST_INTERVAL.saturating_sub(Duration::from_millis(5)),
+            "posts must be paced ≥ 25 ms apart: {t0:?} -> {t1:?}"
+        );
+    }
+
+    /// Assert the stream-up observations: session-open GET with Referer, one
+    /// pipe POST (application/grpc + Referer, body delivered intact).
+    fn assert_stream_up_roundtrip(o: &H3Obs) {
+        assert_eq!(o.gets.len(), 1, "{o:#?}");
+        assert_referer(&o.gets[0].1);
+        assert_eq!(o.stream_reqs.len(), 1, "{o:#?}");
+        let (referer, content_type) = &o.stream_reqs[0];
+        assert_eq!(content_type, "application/grpc");
+        assert_referer(referer);
+        assert_eq!(o.stream_uploads.len(), 1, "{o:#?}");
+        assert_eq!(
+            &o.stream_uploads[0][..],
+            &b"hello"[..],
+            "piped body delivered intact"
+        );
+    }
+
+    /// Full packet-up round trip: `connect_quic` dials the loopback quinn
+    /// server, negotiates TLS 1.3 + the h3 ALPN, opens the v3 session (GET
     /// `/{uuid}` → 200), uploads via the first packet POST (seq 0, raw
-    /// body), and downloads from the GET body — the client arm end to end.
+    /// body), and downloads from the GET body. The fake's observations pin
+    /// the wire details: the session path is a uuid (no seq on the GET), the
+    /// Referer carries the base URL + `x_padding`, and the client closes the
+    /// h3 connection cleanly afterwards.
     #[tokio::test]
     async fn h3_loopback_get_and_post() {
-        let (addr, server_task) = spawn_h3_server();
+        let (addr, obs, server_task) = spawn_h3_fake(false);
         let ctx = ctx_h3(addr, "packet-up");
         let mut t = connect_quic(&ctx).await.expect("h3 connect");
         t.write_all(b"hello").await.expect("upload write");
-        let mut out = [0u8; 5];
+        let mut out = [0u8; H3_DOWNLOAD.len()];
         t.read_exact(&mut out).await.expect("download read");
-        assert_eq!(&out, b"world");
+        assert_eq!(&out[..], H3_DOWNLOAD);
         drop(t);
+
+        wait_obs(&obs, |o| o.conn_closed).await;
+        assert_packet_roundtrip(&obs.data.lock().expect("obs lock"));
         server_task.await.expect("server task");
     }
 
-    /// The h3 stream-up path: session open (GET), then one long-lived POST
-    /// with a piped body (the `Pipe` seam arm — 200 immediately, body fed by
-    /// the tunnel writer, keepalive response drained).
+    /// Packet-up chunking + seq order + pacing: a > 1 MB tunnel write is
+    /// split at `scMaxEachPostBytes` into consecutive seqs, each POST ≤
+    /// 1 MB, paced ≥ `scMinPostsIntervalMs` apart (the first rides the idle
+    /// window), in arrival order, each carrying the Referer. The split and
+    /// the 30 ms sleep are client-side guarantees, so the assertions are
+    /// lower bounds — deterministic, no flake.
+    #[tokio::test]
+    async fn h3_packet_up_seq_order_and_chunking() {
+        let (addr, obs, server_task) = spawn_h3_fake(false);
+        let ctx = ctx_h3(addr, "packet-up");
+        let mut t = connect_quic(&ctx).await.expect("h3 connect");
+
+        // 1.2 MB in one write: the upload loop splits it into a 1 MB +
+        // 200 KB pair (the server 413s anything over the size cap).
+        let payload = vec![0xABu8; MAX_POST_BYTES + 200_000];
+        t.write_all(&payload).await.expect("upload write");
+        let mut out = [0u8; H3_DOWNLOAD.len()];
+        t.read_exact(&mut out).await.expect("download read");
+        assert_eq!(&out[..], H3_DOWNLOAD);
+        drop(t);
+
+        // Both POSTs arrive (the channel-close flushes the tail after the
+        // tunnel dropped), then the h3 connection closes.
+        wait_obs(&obs, |o| o.posts.len() == 2 && o.conn_closed).await;
+        assert_chunked_uploads(&obs.data.lock().expect("obs lock"), &payload);
+        server_task.await.expect("server task");
+    }
+
+    /// The h3 stream-up path: session open (GET), one long-lived POST with
+    /// a piped body — 200 immediately (xray hub.go), `Content-Type:
+    /// application/grpc`, Referer present. The tunnel writer's drop ends
+    /// the pipe: the fake reads the body to EOF, then the h3 connection
+    /// closes.
     #[tokio::test]
     async fn h3_loopback_stream_up() {
-        let (addr, server_task) = spawn_h3_server();
+        let (addr, obs, server_task) = spawn_h3_fake(false);
         let ctx = ctx_h3(addr, "stream-up");
         let mut t = connect_quic(&ctx).await.expect("h3 stream-up connect");
         t.write_all(b"hello").await.expect("upload write");
-        let mut out = [0u8; 5];
+        let mut out = [0u8; H3_DOWNLOAD.len()];
         t.read_exact(&mut out).await.expect("download read");
-        assert_eq!(&out, b"world");
+        assert_eq!(&out[..], H3_DOWNLOAD);
         drop(t);
+
+        wait_obs(&obs, |o| !o.stream_uploads.is_empty() && o.conn_closed).await;
+        assert_stream_up_roundtrip(&obs.data.lock().expect("obs lock"));
+        server_task.await.expect("server task");
+    }
+
+    /// Error path: a non-200 session-open GET must surface as a transport
+    /// error from `connect_quic` (the v3 contract requires 200 everywhere),
+    /// and the aborted session still closes the h3 connection.
+    #[tokio::test]
+    async fn h3_session_open_reject_surfaces_error() {
+        let (addr, obs, server_task) = spawn_h3_fake(true);
+        let ctx = ctx_h3(addr, "packet-up");
+        let Err(err) = connect_quic(&ctx).await else {
+            panic!("a 500 session open must fail connect_quic")
+        };
+        assert!(
+            matches!(err, NativeError::Transport(ref m) if m.contains("expected 200, got 500")),
+            "{err}"
+        );
+        wait_obs(&obs, |o| o.conn_closed).await;
         server_task.await.expect("server task");
     }
 
