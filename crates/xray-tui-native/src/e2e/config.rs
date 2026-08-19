@@ -609,14 +609,19 @@ pub fn client_params_vmess(
         // Same snake_case tag for xhttp: the variant parses as `x_http`
         // (wire/type_str name `xhttp`). The xray server dialect is
         // `splithttp`; the CLIENT mode drives the client-side dialect.
-        // Packet-up is the default (forced explicitly — xray's client
-        // auto-defaults to stream-one under REALITY; the packet-up-over-
-        // REALITY row tests that on purpose). Stream-up rows pass their
-        // mode through.
-        "xhttp" | "xhttp3" => serde_json::json!({
-            "type": "x_http", "path": "/x", "host": "localhost",
-            "mode": xhttp_mode.unwrap_or("packet-up")
-        }),
+        // An explicit mode is passed through; no mode → the key is omitted
+        // and the native dial auto-selects (xray `dialer.go`, spec §4.1):
+        // no reality → packet-up, reality → stream-one, + download settings
+        // → stream-up.
+        "xhttp" | "xhttp3" => {
+            let mut x = serde_json::json!({
+                "type": "x_http", "path": "/x", "host": "localhost"
+            });
+            if let Some(m) = xhttp_mode {
+                x["mode"] = serde_json::json!(m);
+            }
+            x
+        }
         // v2rayhttp: proto `type: http` (the `h2` network string is only
         // for the test rows/dispatch; the wire name is `http`).
         "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
@@ -670,14 +675,19 @@ pub fn client_params_vless(
         // Same snake_case tag for xhttp: the variant parses as `x_http`
         // (wire/type_str name `xhttp`). The xray server dialect is
         // `splithttp`; the CLIENT mode drives the client-side dialect.
-        // Packet-up is the default (forced explicitly — xray's client
-        // auto-defaults to stream-one under REALITY; the packet-up-over-
-        // REALITY row tests that on purpose). Stream-up rows pass their
-        // mode through.
-        "xhttp" | "xhttp3" => serde_json::json!({
-            "type": "x_http", "path": "/x", "host": "localhost",
-            "mode": xhttp_mode.unwrap_or("packet-up")
-        }),
+        // An explicit mode is passed through; no mode → the key is omitted
+        // and the native dial auto-selects (xray `dialer.go`, spec §4.1):
+        // no reality → packet-up, reality → stream-one, + download settings
+        // → stream-up.
+        "xhttp" | "xhttp3" => {
+            let mut x = serde_json::json!({
+                "type": "x_http", "path": "/x", "host": "localhost"
+            });
+            if let Some(m) = xhttp_mode {
+                x["mode"] = serde_json::json!(m);
+            }
+            x
+        }
         // v2rayhttp: proto `type: http` (the `h2` network string is only
         // for the test rows/dispatch; the wire name is `http`).
         "h2" => serde_json::json!({ "type": "http", "path": "/h2", "host": "localhost" }),
@@ -814,9 +824,11 @@ mod tests {
                 .and_then(|c| c.mode.as_deref())
                 .map(str::to_string)
         };
-        // Default (None) → packet-up; an explicit mode passes through.
+        // Default (None) → the mode key is omitted (the native dial
+        // auto-selects: packet-up, stream-one under reality); an explicit
+        // mode passes through.
         let packet = client_params_vless(12345, target, None, &StandardTls, "xhttp", None);
-        assert_eq!(mode_of(packet).as_deref(), Some("packet-up"));
+        assert_eq!(mode_of(packet).as_deref(), None);
         let stream = client_params_vless(
             12345,
             target,

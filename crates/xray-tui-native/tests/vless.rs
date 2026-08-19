@@ -170,18 +170,25 @@ async fn vless_against_cores(
 // supports RAW, XHTTP and gRPC" — so the reality row runs on sing-box only.
 #[case::httpupgrade_reality_singbox(vless_tls("httpupgrade", reality()), CoreKind::SingBox)]
 // xhttp (splithttp) is xray-only: sing-box's own dialect is the v2rayhttp
-// transport (a different plan task). Packet-up over h1 (no TLS) is covered
-// by the hermetic unit test; these rows exercise the h2 arm (TLS) and the
-// REALITY path (xray's splithttp server accepts packet-up under REALITY —
-// the mode gate is on the client side; verified empirically below).
+// transport (a different plan task). The plain/chrome rows carry no mode →
+// the native dial auto-selects packet-up (no reality); the reality row also
+// carries no mode and auto-selects STREAM-ONE (xray `dialer.go` spec §4.1 —
+// the pre-SP6 packet-up-over-REALITY deviation is gone; the server accepts
+// all modes). The explicit stream-up/stream-one rows exercise those arms
+// directly. Packet-up over h1 (no TLS) is covered by the hermetic unit
+// test; these rows exercise the h2 arm (TLS) + the REALITY path.
 #[case::xhttp_packet_plain(vless("xhttp"), CoreKind::Xray)]
 #[case::xhttp_packet_chrome(vless_tls("xhttp", fp("chrome")), CoreKind::Xray)]
-#[case::xhttp_packet_reality(vless_tls("xhttp", reality()), CoreKind::Xray)]
+#[case::xhttp_stream_one_reality(vless_tls("xhttp", reality()), CoreKind::Xray)]
 // stream-up: the client config carries mode "stream-up" (the client-side
 // mode drives the dialect); both rows run over h2 (TLS → h2). The h1 arm
 // is covered by the hermetic unit test.
 #[case::xhttp_stream_plain(vless_xhttp("stream-up"), CoreKind::Xray)]
 #[case::xhttp_stream_chrome(vless_xhttp_tls("stream-up", fp("chrome")), CoreKind::Xray)]
+// stream-one explicit + standard TLS (the legacy XHTTP v1 full-duplex
+// tunnel — no session id; h2 since TLS → h2; the auto-derived reality
+// row above covers the same arm via the §4.1 default).
+#[case::xhttp_stream_one_tls(vless_xhttp("stream-one"), CoreKind::Xray)]
 // xhttp/h3 (SP5): the exactly-one `h3` ALPN flips xray's splithttp listener
 // to the QUIC/HTTP-3 mode (hub.go `isH3` — the row's server config emits
 // tlsSettings.alpn ["h3"], no quic_settings needed: the server's quic-go
