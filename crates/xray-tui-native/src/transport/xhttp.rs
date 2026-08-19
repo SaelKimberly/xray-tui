@@ -723,10 +723,22 @@ pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
     };
     let endpoint = quinn::Endpoint::client(bind)?;
     let tls = quic_tls_config(ctx)?;
-    let quic_config = quinn::ClientConfig::new(Arc::new(
+    let mut quic_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| NativeError::Config(format!("xhttp h3 tls config: {e}")))?,
     ));
+    // Spec §4.2: xray `ConnIdleTimeout` = 300s + `QuicgoH3KeepAlivePeriod` =
+    // 10s. quinn's defaults (30s idle, no keepalive) would kill an idle h3
+    // tunnel mid-session where xray survives (the e2e wouldn't catch it:
+    // xray's server keepalives reset the client's idle timer).
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_mins(5))
+                .expect("300s idle timeout fits a VarInt"),
+        ))
+        .keep_alive_interval(Some(Duration::from_secs(10)));
+    quic_config.transport_config(Arc::new(transport));
     let connecting = endpoint
         .connect_with(quic_config, server_addr, &ctx.sni())
         .map_err(|e| NativeError::Dial(format!("xhttp h3 connect: {e}")))?;
