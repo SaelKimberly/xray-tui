@@ -188,6 +188,10 @@ enum V3Body {
     /// Stream-up: the upload body is a pipe fed by the tunnel writer
     /// (`wrx`); the seam forwards into the transport's body mechanism.
     Pipe(mpsc::Receiver<Bytes>),
+    /// Stream-one: the single full-duplex request's body is a pipe fed by
+    /// the tunnel writer, and the RESPONSE body becomes the tunnel's read
+    /// side (no drain — unlike stream-up there is no separate GET).
+    PipeFull(mpsc::Receiver<Bytes>),
 }
 
 /// A v3 response: status + the response body as an `AsyncRead`. For POSTs
@@ -253,7 +257,11 @@ impl V3Send for hyper::client::conn::http1::SendRequest<ReqBody> {
             V3Body::Full(b) => (None, ReqBody::Full(b)),
             V3Body::Pipe(rx) => {
                 let (tx, body) = ReqBody::channel();
-                (Some((tx, rx)), body)
+                (Some((tx, rx, false)), body)
+            }
+            V3Body::PipeFull(rx) => {
+                let (tx, body) = ReqBody::channel();
+                (Some((tx, rx, true)), body)
             }
         };
         let req = http::Request::from_parts(parts, body);
@@ -263,13 +271,20 @@ impl V3Send for hyper::client::conn::http1::SendRequest<ReqBody> {
             .map_err(|e| NativeError::Transport(format!("{step}: {e}")))?;
         let status = resp.status();
         let reader: Box<dyn AsyncRead + Send + Unpin> = match pipe_rx {
-            Some((tx, rx)) => {
-                // The stream-up server 200s the POST immediately and streams
-                // keepalive X-blobs into the response (xray hub.go) — drain
-                // concurrently so the h1/h2 window doesn't stall.
-                drain_incoming(IncomingReader::new(resp.into_body()));
+            Some((tx, rx, full)) => {
                 tokio::spawn(forward_pipe(tx, rx));
-                Box::new(tokio::io::empty())
+                if full {
+                    // Stream-one: the response body IS the tunnel's read
+                    // side (no separate GET — dialer.go:453-458).
+                    Box::new(IncomingReader::new(resp.into_body()))
+                } else {
+                    // The stream-up server 200s the POST immediately and
+                    // streams keepalive X-blobs into the response (xray
+                    // hub.go) — drain concurrently so the h1/h2 window
+                    // doesn't stall.
+                    drain_incoming(IncomingReader::new(resp.into_body()));
+                    Box::new(tokio::io::empty())
+                }
             }
             None => Box::new(IncomingReader::new(resp.into_body())),
         };
@@ -289,7 +304,11 @@ impl V3Send for hyper::client::conn::http2::SendRequest<ReqBody> {
             V3Body::Full(b) => (None, ReqBody::Full(b)),
             V3Body::Pipe(rx) => {
                 let (tx, body) = ReqBody::channel();
-                (Some((tx, rx)), body)
+                (Some((tx, rx, false)), body)
+            }
+            V3Body::PipeFull(rx) => {
+                let (tx, body) = ReqBody::channel();
+                (Some((tx, rx, true)), body)
             }
         };
         let req = http::Request::from_parts(parts, body);
@@ -299,10 +318,16 @@ impl V3Send for hyper::client::conn::http2::SendRequest<ReqBody> {
             .map_err(|e| NativeError::Transport(format!("{step}: {e}")))?;
         let status = resp.status();
         let reader: Box<dyn AsyncRead + Send + Unpin> = match pipe_rx {
-            Some((tx, rx)) => {
-                drain_incoming(IncomingReader::new(resp.into_body()));
+            Some((tx, rx, full)) => {
                 tokio::spawn(forward_pipe(tx, rx));
-                Box::new(tokio::io::empty())
+                if full {
+                    // Stream-one: the response body IS the tunnel's read
+                    // side (no separate GET — dialer.go:453-458).
+                    Box::new(IncomingReader::new(resp.into_body()))
+                } else {
+                    drain_incoming(IncomingReader::new(resp.into_body()));
+                    Box::new(tokio::io::empty())
+                }
             }
             None => Box::new(IncomingReader::new(resp.into_body())),
         };
@@ -411,19 +436,38 @@ impl V3Send for h3::client::SendRequest<h3_quinn::OpenStreams, Bytes> {
                     reader: Box::new(tokio::io::empty()),
                 })
             }
+            V3Body::PipeFull(rx) => {
+                let (send, mut recv) = stream.split();
+                let resp = recv.recv_response().await.map_err(err)?;
+                let status = resp.status();
+                // Stream-one: the response body is the tunnel's read side —
+                // the forward task holds the send half + a `SendRequest`
+                // clone so the h3 connection outlives this call.
+                let keepalive = self.clone();
+                tokio::spawn(async move {
+                    let _keepalive = keepalive;
+                    forward_pipe_h3(send, rx).await;
+                });
+                Ok(V3Response {
+                    status,
+                    reader: Box::new(H3Reader::new(recv)),
+                })
+            }
         }
     }
 }
 
 /// `AsyncRead` over an h3 response body: `recv_data` yields `Bytes` chunks
-/// (h3-quinn's read-chunk adapter), copied into the pending buffer.
-struct H3Reader {
-    stream: Option<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>,
+/// (h3-quinn's read-chunk adapter), copied into the pending buffer. `S` is
+/// the recv-stream half: the full `BidiStream` (GET arm) or the split
+/// `RecvStream` (stream-one arm).
+struct H3Reader<S> {
+    stream: Option<h3::client::RequestStream<S, Bytes>>,
     buf: Bytes,
 }
 
-impl H3Reader {
-    const fn new(stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) -> Self {
+impl<S: h3::quic::RecvStream> H3Reader<S> {
+    const fn new(stream: h3::client::RequestStream<S, Bytes>) -> Self {
         Self {
             stream: Some(stream),
             buf: Bytes::new(),
@@ -431,7 +475,7 @@ impl H3Reader {
     }
 }
 
-impl AsyncRead for H3Reader {
+impl<S: h3::quic::RecvStream> AsyncRead for H3Reader<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut TaskCx<'_>,
@@ -609,35 +653,77 @@ async fn upload_loop_h3(
     upload_loop_core(&mut sender, &ctx, &session, &host, rx).await;
 }
 
-/// The client-side xhttp dialect (config `mode`): `auto`/empty →
-/// packet-up. Shared by the h1/h2 [`connect`] dispatch and the h3 arm.
+/// True when the security config is REALITY — the presence the
+/// `http_version()` rule and xray's mode auto-selection read
+/// (`realityConfig != nil`). Reuses the [`SecurityConfig`] accessors
+/// `http_version()` already walks.
+fn is_reality(ctx: &LinkContext) -> bool {
+    matches!(
+        ctx.security().and_then(|s| s.tls.as_ref()),
+        Some(TlsConfig::Reality(_))
+    )
+}
+
+/// True when the xhttp config carries a separate download dial — xray
+/// `Config.DownloadSettings` (JSON `downloadSettings`, config.pb.go:175).
+/// The native proto has no typed field (share links carry it in the raw
+/// `extra` blob); the mode rule honors it for decision parity only (spec
+/// §7.2 — the actual second dial is out of scope).
+fn has_download_settings(ctx: &LinkContext) -> bool {
+    ctx.transport_xhttp()
+        .and_then(|c| c.extra.as_ref())
+        .is_some_and(|v| v.get("downloadSettings").is_some())
+}
+
+/// The client-side xhttp dialect (config `mode`) — xray `dialer.go` mode
+/// selection (spec §4.1): explicit modes honored; `auto`/empty →
+/// packet-up (no reality) or stream-one (reality present), stream-up when
+/// a download dial is also configured. Shared by the h1/h2 [`connect`]
+/// dispatch and the h3 arm.
 fn xhttp_mode(ctx: &LinkContext) -> Result<&'static str, NativeError> {
     let mode = ctx
         .transport_xhttp()
         .and_then(|c| c.mode.as_deref())
         .unwrap_or("auto");
     match mode {
+        "packet-up" => Ok("packet-up"),
         "stream-up" => Ok("stream-up"),
-        "packet-up" | "auto" | "" => Ok("packet-up"),
-        "stream-one" => Err(NativeError::NotImplemented {
-            feature: "xhttp stream-one mode".into(),
-        }),
+        "stream-one" => Ok("stream-one"),
+        "auto" | "" => {
+            if is_reality(ctx) {
+                Ok(if has_download_settings(ctx) {
+                    "stream-up"
+                } else {
+                    "stream-one"
+                })
+            } else {
+                Ok("packet-up")
+            }
+        }
         other => Err(NativeError::Config(format!("unknown xhttp mode: {other}"))),
     }
 }
 
 /// Run the XHTTP transport over the established (secured) stream.
 ///
-/// The client-side mode (config `mode`) selects the dialect: `auto`/empty →
-/// packet-up; `stream-up` supported; `stream-one` (legacy XHTTP v1) →
-/// `NotImplemented`. HTTP version matches xray `decideHTTPVersion`: no
-/// TLS → HTTP/1.1 (GET on the primary stream, POSTs on a second raw TCP
+/// The client-side mode (config `mode`) selects the dialect per
+/// [`xhttp_mode`] (spec §4.1): `packet-up`, `stream-up`, `stream-one`
+/// (legacy XHTTP v1 — a single full-duplex request, no session id), and
+/// the `auto`/empty rules. HTTP version matches xray `decideHTTPVersion`:
+/// no TLS → HTTP/1.1 (GET on the primary stream, POSTs on a second raw TCP
 /// dial — Go h1 serializes responses in request order, so a long-lived GET
 /// body would block POST responses on its own conn); TLS → HTTP/2 (one conn,
 /// multiplexed streams). The h3 mode is NOT reached here: it is a different
 /// dial ([`connect_quic`]) that replaces this upgrade step (spec §5.2).
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match xhttp_mode(ctx)? {
+        "stream-one" => {
+            if has_tls(ctx) {
+                stream_one_h2(ctx, stream).await
+            } else {
+                stream_one_h1(ctx, stream).await
+            }
+        }
         "stream-up" => {
             if has_tls(ctx) {
                 stream_up_h2(ctx, stream).await
@@ -832,6 +918,7 @@ pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
 
     match mode {
         "packet-up" => packet_up_h3(ctx, send_request).await,
+        "stream-one" => stream_one_h3(ctx, send_request).await,
         _ => stream_up_h3(ctx, send_request).await,
     }
 }
@@ -970,6 +1057,63 @@ async fn stream_up_h3(
     );
     let _resp = send_200(&mut sender, req, "xhttp h3 stream-up POST").await?;
     Ok(Box::new(XhttpStream::new(reader, wt)))
+}
+
+/// stream-one (legacy XHTTP v1): ONE full-duplex request — no session id
+/// (`sessionId = ""`, dialer.go:373-376), the request body carries
+/// client→server, the 200 response body carries server→client
+/// (dialer.go:453-458 → client.go `OpenStream`). Method = the uplink
+/// method (default POST); headers = config headers + Referer `x_padding` +
+/// `Content-Type: application/grpc` (config.go `FillStreamRequest`); with
+/// an empty session/seq, `ApplyMetaToRequest` emits NO session/seq meta
+/// (config.go:285,297 — the pinned meta set for stream-one is empty).
+async fn stream_one_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    // The base path only — no session, no seq (dialer.go:454).
+    let url = base_path(ctx);
+    let mut sender = h1_client(stream).await?;
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
+    req.headers_mut().insert(
+        "Content-Type",
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    let resp = send_200(&mut sender, req, "xhttp stream-one").await?;
+    Ok(Box::new(XhttpStream::new(resp.reader, wt)))
+}
+
+/// stream-one over h2 (TLS): the single full-duplex request on the one h2
+/// conn.
+async fn stream_one_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    let url = base_path(ctx);
+    let mut sender = h2_client(stream).await?;
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
+    req.headers_mut().insert(
+        "Content-Type",
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    let resp = send_200(&mut sender, req, "xhttp stream-one").await?;
+    Ok(Box::new(XhttpStream::new(resp.reader, wt)))
+}
+
+/// stream-one over h3: the single full-duplex request on one QUIC stream
+/// (the response body is the read side — [`V3Body::PipeFull`]).
+async fn stream_one_h3(
+    ctx: &LinkContext,
+    mut sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+) -> Result<BoxStream, NativeError> {
+    let host = http_host(ctx);
+    let url = base_path(ctx);
+    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
+    req.headers_mut().insert(
+        "Content-Type",
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    let resp = send_200(&mut sender, req, "xhttp h3 stream-one").await?;
+    Ok(Box::new(XhttpStream::new(resp.reader, wt)))
 }
 
 /// An in-flight channel send (the channel was full when kicked) — a boxed
@@ -1321,6 +1465,190 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// stream-one (legacy XHTTP v1) over h1: ONE request — no session id,
+    /// the POST body is the upload, the 200 response body the download. The
+    /// server asserts the request-target is the base path only (no uuid, no
+    /// seq), the Referer `x_padding`, `Content-Type: application/grpc`, and
+    /// NO session/seq meta (`ApplyMetaToRequest` emits nothing for an empty
+    /// session — config.go:285,297).
+    #[tokio::test]
+    async fn stream_one_h1_full_duplex() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut sock).await;
+            // request-target = the base path only — NO session/seq segment.
+            let target = head.split_whitespace().nth(1).unwrap();
+            assert_eq!(target, "/x/", "{head}");
+            assert!(
+                head.to_lowercase()
+                    .contains("content-type: application/grpc"),
+                "{head}"
+            );
+            assert!(
+                head.to_lowercase()
+                    .contains("referer: http://example.com/x/?x_padding="),
+                "{head}"
+            );
+            assert!(!head.to_lowercase().contains("x-sid"), "{head}");
+            assert!(!head.to_lowercase().contains("x-sq"), "{head}");
+            // 200 immediately; body = the download stream.
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            // read the chunked upload until the payload arrived (the tunnel
+            // POST stays open — no EOF; xray streams the download
+            // continuously, so echoing as soon as the payload arrives
+            // avoids the deadlock).
+            let body = read_chunked_until(&mut sock, b"hello").await;
+            assert_eq!(&body, b"hello");
+            sock.write_all(b"6\r\nworld!\r\n0\r\n\r\n").await.unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ctx = ctx_at(addr, "stream-one");
+        let mut t = connect(&ctx, Box::new(stream)).await.unwrap();
+        t.write_all(b"hello").await.unwrap();
+        let mut out = [0u8; 6];
+        t.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"world!");
+        server.await.unwrap();
+    }
+
+    /// Error path: a non-200 stream-one response must surface as a
+    /// transport error (client.go `OpenStream`: non-200 → discard the
+    /// body, close, error — the v3 contract requires 200).
+    #[tokio::test]
+    async fn stream_one_h1_non_200_surfaces_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let head = read_head(&mut sock).await;
+            assert!(head.starts_with("POST /x/ "), "{head}");
+            sock.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ctx = ctx_at(addr, "stream-one");
+        let Err(err) = connect(&ctx, Box::new(stream)).await else {
+            panic!("a 500 stream-one response must fail connect")
+        };
+        assert!(
+            matches!(err, NativeError::Transport(ref m) if m.contains("expected 200, got 500")),
+            "{err}"
+        );
+        server.await.unwrap();
+    }
+
+    /// stream-one over the h2 arm: hyper h2 client ↔ h2 crate server over a
+    /// tokio duplex (h2c — the framing seam is the unit under test; the TLS
+    /// layer is the e2e's job). One full-duplex request: POST `/x/` (no
+    /// session), the response body is the download.
+    ///
+    /// The h2 crate's per-stream ops (`data()`, `send_response`) only touch
+    /// stream state — the connection itself must be polled for bytes to
+    /// flow, so the handler runs alongside an `accept()` driver (the h2
+    /// docs pattern: spawn handlers and keep accepting). The driver exits
+    /// when the handler completes; dropping the connection then closes it.
+    #[tokio::test]
+    async fn stream_one_h2_full_duplex() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("h2 server handshake");
+            let (req, mut respond) = conn.accept().await.expect("h2 accept").expect("h2 request");
+            let handler = tokio::spawn(async move {
+                let (parts, mut body) = req.into_parts();
+                assert_eq!(parts.method, http::Method::POST);
+                assert_eq!(parts.uri.path(), "/x/", "no session/seq in the path");
+                let headers = &parts.headers;
+                assert_eq!(
+                    headers.get("content-type").and_then(|v| v.to_str().ok()),
+                    Some("application/grpc")
+                );
+                let referer = headers
+                    .get("referer")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("referer");
+                assert!(
+                    referer.starts_with("https://localhost/x/?x_padding="),
+                    "{referer}"
+                );
+                assert!(headers.get("x-sid").is_none(), "no session meta");
+                assert!(headers.get("x-sq").is_none(), "no seq meta");
+                // 200 immediately (xray hub.go 200s the upload POST before
+                // reading the body — the client's forward task only starts
+                // after the response headers resolve), then the download.
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(resp, false).expect("send response");
+                send.send_data(Bytes::from_static(b"world!"), false)
+                    .expect("download data");
+                send.send_data(Bytes::new(), true).expect("download end");
+                // read the upload until the payload arrived (the tunnel POST
+                // stays open — no EOF yet).
+                let mut upload = Vec::new();
+                while upload.len() < 5 {
+                    let chunk = body
+                        .data()
+                        .await
+                        .expect("upload chunk")
+                        .expect("upload EOF before payload");
+                    upload.extend_from_slice(&chunk[..]);
+                }
+                assert_eq!(&upload[..5], b"hello");
+                // drain the rest of the upload (ends when the tunnel drops).
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("upload data");
+                    upload.extend_from_slice(&chunk[..]);
+                }
+            });
+            let mut handler = handler;
+            loop {
+                tokio::select! {
+                    _ = &mut handler => break,
+                    next = conn.accept() => {
+                        match next {
+                            None | Some(Err(_)) => break, // client closed / error
+                            Some(Ok(_)) => {} // no second request expected
+                        }
+                    }
+                }
+            }
+            drop(conn); // close the connection now that the handler is done
+            handler.await.expect("h2 handler");
+        });
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "x_http", "path": "/x", "host": "localhost", "mode": "stream-one" },
+            "security": { "type": "tls" }
+        }))
+        .expect("config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("127.0.0.1".to_string(), 1),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        );
+        let mut t = connect(&ctx, Box::new(client_io))
+            .await
+            .expect("stream-one h2 connect");
+        t.write_all(b"hello").await.unwrap();
+        let mut out = [0u8; 6];
+        t.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"world!");
+        drop(t);
+        server.await.unwrap();
+    }
+
     #[test]
     fn padding_is_repeat_x_within_range() {
         for _ in 0..50 {
@@ -1443,6 +1771,108 @@ mod tests {
         for (sec, want) in cases {
             assert_eq!(http_version(*sec), *want);
         }
+    }
+
+    // --- mode selection mirror (spec §4.1, dialer.go:362-371) ------------
+
+    /// An xhttp ctx with arbitrary mode/security/extra — the full §4.1
+    /// input space (the [`ctx_at`] helper covers the plain h1 rows).
+    fn ctx_mode(
+        mode: &str,
+        security: Option<serde_json::Value>,
+        extra: Option<serde_json::Value>,
+    ) -> LinkContext {
+        let mut transport = serde_json::json!({
+            "type": "x_http", "path": "/x", "host": "example.com"
+        });
+        transport["mode"] = serde_json::json!(mode);
+        if let Some(extra) = extra {
+            transport["extra"] = extra;
+        }
+        let mut protocol = serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": transport,
+        });
+        if let Some(security) = security {
+            protocol["security"] = security;
+        }
+        let protocol: ProtocolConfig = serde_json::from_value(protocol).expect("config parses");
+        LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("127.0.0.1".to_string(), 1),
+                TargetAddr::new(Host::Domain("dest.test".into()), 80),
+            ),
+            TargetAddr::new(Host::Domain("dest.test".into()), 80),
+        )
+    }
+
+    #[test]
+    fn mode_explicit_values_are_honored() {
+        for m in ["packet-up", "stream-up", "stream-one"] {
+            assert_eq!(xhttp_mode(&ctx_mode(m, None, None)).unwrap(), m, "{m}");
+        }
+    }
+
+    #[test]
+    fn mode_auto_without_reality_is_packet_up() {
+        for m in ["auto", ""] {
+            assert_eq!(
+                xhttp_mode(&ctx_mode(m, None, None)).unwrap(),
+                "packet-up",
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_auto_with_plain_tls_is_packet_up() {
+        // TLS (not reality) does not change the auto rule — xray only
+        // checks `realityConfig != nil`.
+        for m in ["auto", ""] {
+            let ctx = ctx_mode(m, Some(serde_json::json!({"type": "tls"})), None);
+            assert_eq!(xhttp_mode(&ctx).unwrap(), "packet-up", "{m}");
+        }
+    }
+
+    #[test]
+    fn mode_auto_with_reality_is_stream_one() {
+        for m in ["auto", ""] {
+            let ctx = ctx_mode(m, Some(serde_json::json!({"type": "reality"})), None);
+            assert_eq!(xhttp_mode(&ctx).unwrap(), "stream-one", "{m}");
+        }
+    }
+
+    #[test]
+    fn mode_auto_with_reality_and_download_settings_is_stream_up() {
+        // `downloadSettings` present (config.pb.go:175) → stream-up,
+        // matching xray's rule (spec §4.1).
+        for m in ["auto", ""] {
+            let ctx = ctx_mode(
+                m,
+                Some(serde_json::json!({"type": "reality"})),
+                Some(serde_json::json!({"downloadSettings": {}})),
+            );
+            assert_eq!(xhttp_mode(&ctx).unwrap(), "stream-up", "{m}");
+        }
+    }
+
+    #[test]
+    fn mode_explicit_overrides_the_auto_rules() {
+        // Explicit modes are honored even with reality present.
+        let ctx = ctx_mode(
+            "packet-up",
+            Some(serde_json::json!({"type": "reality"})),
+            None,
+        );
+        assert_eq!(xhttp_mode(&ctx).unwrap(), "packet-up");
+    }
+
+    #[test]
+    fn mode_unknown_is_config_error() {
+        let err = xhttp_mode(&ctx_mode("bogus", None, None)).unwrap_err();
+        assert!(matches!(err, NativeError::Config(_)), "{err}");
     }
 
     // --- SP5 T1 smoke: the quinn + h3 dep stack ---------------------------
@@ -1586,6 +2016,10 @@ mod tests {
         /// Stream-up upload bodies (EOF is always observed — the fake reads
         /// each body to completion).
         stream_uploads: Vec<Bytes>,
+        /// Stream-one POSTs: `(referer, content-type)` in arrival order.
+        stream_one_reqs: Vec<(String, String)>,
+        /// Stream-one upload bodies (EOF is always observed).
+        stream_one_uploads: Vec<Bytes>,
         /// The h3 connection closed (the client is gone).
         conn_closed: bool,
     }
@@ -1696,6 +2130,47 @@ mod tests {
             bounded(stream.finish(), "GET finish")
                 .await
                 .expect("GET finish");
+        } else if path == "/x/" {
+            // Stream-one (legacy XHTTP v1): the single full-duplex request
+            // on the base path — no session, no seq. 200 + the download
+            // body (client.go OpenStream), then the piped upload to EOF.
+            let content_type = req
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                req.headers().get("x-sid"),
+                None,
+                "no session meta for stream-one"
+            );
+            assert_eq!(
+                req.headers().get("x-sq"),
+                None,
+                "no seq meta for stream-one"
+            );
+            record(obs, |o| o.stream_one_reqs.push((referer, content_type)));
+            let resp = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(())
+                .unwrap();
+            bounded(stream.send_response(resp), "stream-one 200")
+                .await
+                .expect("stream-one 200");
+            bounded(
+                stream.send_data(Bytes::from_static(H3_DOWNLOAD)),
+                "stream-one body",
+            )
+            .await
+            .expect("stream-one body");
+            let body = bounded(read_h3_body(&mut stream), "stream-one upload").await;
+            record(obs, |o| o.stream_one_uploads.push(body));
+            // Teardown race: the client closes the h3 connection as soon as
+            // the tunnel drops (the forward task's `SendRequest` clone goes
+            // with it) — the server's finish may observe RemoteTerminate 0x0
+            // (H3_NO_ERROR) instead of completing cleanly. The download +
+            // upload bytes are already asserted; the finish is pure teardown.
+            let _ = tokio::time::timeout(H3_DEADLINE, stream.finish()).await;
         } else if let Ok(seq) = path
             .rsplit('/')
             .next()
@@ -1961,15 +2436,56 @@ mod tests {
         server_task.await.expect("server task");
     }
 
+    /// Assert the stream-one observations: ONE full-duplex request — no GET,
+    /// no session — the POST carried the Referer + `application/grpc`, the
+    /// upload arrived intact. Sync helper — keeps the `MutexGuard` out of
+    /// the async test body.
+    fn assert_stream_one_roundtrip(o: &H3Obs) {
+        assert!(o.gets.is_empty(), "stream-one must not issue a GET: {o:#?}");
+        assert_eq!(o.stream_one_reqs.len(), 1, "{o:#?}");
+        let (referer, content_type) = &o.stream_one_reqs[0];
+        assert_eq!(content_type, "application/grpc");
+        assert_referer(referer);
+        assert_eq!(o.stream_one_uploads.len(), 1, "{o:#?}");
+        assert_eq!(&o.stream_one_uploads[0][..], &b"hello"[..]);
+    }
+
+    /// The h3 stream-one path: ONE full-duplex request (no GET, no
+    /// session) — the POST body is the upload, the response body the
+    /// download. The fake asserts the path is the base path only, the
+    /// Referer, `application/grpc`, and no session/seq meta.
     #[tokio::test]
-    async fn connect_quic_rejects_unsupported_modes_before_dialing() {
-        // The mode check precedes the quinn dial: stream-one (legacy XHTTP
-        // v1) and unknown modes error without any network step.
+    async fn h3_loopback_stream_one() {
+        let (addr, obs, server_task) = spawn_h3_fake(false);
+        let ctx = ctx_h3(addr, "stream-one");
+        let mut t = connect_quic(&ctx).await.expect("h3 stream-one connect");
+        t.write_all(b"hello").await.expect("upload write");
+        let mut out = [0u8; H3_DOWNLOAD.len()];
+        t.read_exact(&mut out).await.expect("download read");
+        assert_eq!(&out[..], H3_DOWNLOAD);
+        drop(t);
+
+        wait_obs(&obs, |o| !o.stream_one_uploads.is_empty() && o.conn_closed).await;
+        assert_stream_one_roundtrip(&obs.data.lock().expect("obs lock"));
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connect_quic_rejects_unknown_modes_before_dialing() {
+        // The mode check precedes the quinn dial: unknown modes error
+        // without any network step. stream-one is now a real mode — it
+        // proceeds to the dial (a Dial error for the dead loopback port,
+        // not a NotImplemented rejection).
         let ctx = ctx_h3("127.0.0.1:1".parse().unwrap(), "stream-one");
-        let Err(err) = connect_quic(&ctx).await else {
-            panic!("stream-one must be rejected")
-        };
-        assert!(matches!(err, NativeError::NotImplemented { .. }), "{err}");
+        let err = connect_quic(&ctx).await;
+        // The quinn dial to the dead loopback port either refuses fast or
+        // times out (a closed UDP port may drop packets silently) — both
+        // prove stream-one proceeds to the network step instead of being
+        // rejected as NotImplemented/Config.
+        assert!(
+            matches!(err, Err(NativeError::Dial(_) | NativeError::Timeout { .. })),
+            "stream-one must dial, not be rejected"
+        );
         let ctx = ctx_h3("127.0.0.1:1".parse().unwrap(), "bogus");
         let Err(err) = connect_quic(&ctx).await else {
             panic!("unknown mode must be rejected")
