@@ -3,7 +3,7 @@
 use ring::rand::SecureRandom;
 use tokio::io::AsyncWriteExt;
 
-use xray_tui_proto::proto_spec::{SecurityConfig, VlessConfig};
+use xray_tui_proto::proto_spec::{SecurityConfig, VlessConfig, parse_mlkem_encryption};
 
 use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
@@ -14,6 +14,7 @@ use crate::protocol::vless::vision::{
     FLOW_XTLS_RPRX_VISION, FLOW_XTLS_RPRX_VISION_UDP443, VisionStream,
 };
 
+pub mod encryption;
 pub mod header;
 pub(crate) mod mux;
 pub mod packet;
@@ -42,6 +43,12 @@ pub async fn connect(
     stream: BoxStream,
     cfg: &VlessConfig,
 ) -> Result<BoxStream, NativeError> {
+    // `mlkem768x25519plus` account encryption wraps the whole session (xray
+    // outbound.go): the PQ handshake runs on the secured stream first, then
+    // the request header goes through it sealed.
+    if let Some(enc) = cfg.encryption.as_deref().filter(|e| !e.is_empty()) {
+        return connect_encrypted(ctx, stream, cfg, enc).await;
+    }
     let uuid = header::uuid_bytes(&cfg.uuid)?;
     match cfg.flow.as_deref() {
         None | Some("") => connect_plain(ctx, stream, uuid).await,
@@ -52,6 +59,39 @@ pub async fn connect(
             feature: format!("vless flow {other}"),
         }),
     }
+}
+
+/// The `mlkem768x25519plus` connect path (spec §4.3, §5.3): PQ handshake,
+/// then the plain request header through the encrypted tunnel, then the
+/// response-peeled tunnel. Flow addons cannot combine with it (xray treats
+/// the encryption as the account's whole identity layer).
+async fn connect_encrypted(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    cfg: &VlessConfig,
+    enc: &str,
+) -> Result<BoxStream, NativeError> {
+    let invalid = |what: String| NativeError::Config(format!("vless mlkem encryption: {what}"));
+    let parsed = parse_mlkem_encryption(enc)
+        .map_err(|e| invalid(e.to_string()))?
+        .ok_or_else(|| invalid(format!("unsupported encryption value {enc}")))?;
+    if cfg.flow.as_deref().is_some_and(|f| !f.is_empty()) {
+        return Err(invalid(
+            "flow cannot be combined with mlkem encryption".into(),
+        ));
+    }
+    let uuid = header::uuid_bytes(&cfg.uuid)?;
+    let ecfg = encryption::EncryptionConfig::try_from_parsed(&parsed)?;
+    let mut conn = encryption::handshake(stream, &ecfg).await?;
+    let request = header::encode_request(&uuid, &ctx.target, header::CMD_TCP, None)?;
+    let timeout = timeouts::PROTOCOL;
+    tokio::time::timeout(timeout, conn.write_all(&request))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "vless mlkem request write",
+            limit: timeout,
+        })??;
+    Ok(Box::new(VlessClientStream::new(Box::new(conn))))
 }
 
 /// Plain VLESS connect: request header without addons, then the tunnel.

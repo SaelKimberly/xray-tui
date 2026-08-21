@@ -766,6 +766,126 @@ impl VlessConfig {
     }
 }
 
+/// ML-KEM payload-encryption mode (xray `account.XorMode`).
+///
+/// `native` = direct wire, `xorpub` = the transmitted X25519 public key /
+/// ML-KEM ciphertext is XOR-masked with a CTR stream keyed by the server's
+/// own key (`XorMode` 1), `random` = additionally the whole post-handshake
+/// stream is XOR-masked (`XorMode` 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlkemMode {
+    Native,
+    XorPub,
+    Random,
+}
+
+impl MlkemMode {
+    /// The xray `XorMode` integer (0/1/2).
+    #[must_use]
+    pub const fn xor_mode(self) -> u32 {
+        match self {
+            Self::Native => 0,
+            Self::XorPub => 1,
+            Self::Random => 2,
+        }
+    }
+}
+
+/// Parsed `mlkem768x25519plus` VLESS account `encryption` value
+/// (xray `infra/conf/vless.go` outbound parser → `vless.Account`).
+///
+/// Wire format:
+/// `mlkem768x25519plus.<mode>.<1rtt|0rtt>.<padding-segments...>.<keys...>`
+/// — every field dot-separated; padding segments are `<20` chars
+/// (`l-g-min` triples), keys are base64url (raw) of 32 bytes (X25519
+/// public key) or 1184 bytes (ML-KEM-768 encapsulation key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MlkemEncryption {
+    pub mode: MlkemMode,
+    /// xray `account.Seconds`: `1rtt` → 0 (full handshake every dial),
+    /// `0rtt` → 1 (ticket-based 0-RTT resume allowed).
+    pub seconds: u32,
+    /// The padding segments (dot-joined), empty when none.
+    pub padding: String,
+    /// The remaining key material segments (base64url, dot-joined).
+    pub keys: String,
+}
+
+/// Parse an mlkem768x25519plus `encryption` value, mirroring xray's
+/// outbound parser in `infra/conf/vless.go` exactly.
+///
+/// Includes the `27 + len(window)` prefix strip (exactly the
+/// `mlkem768x25519plus.<mode>.<window>.` prefix: 18 + 1 + 6 + 1 + w + 1)
+/// and the `len(segment) + 1` padding accumulation over the segments
+/// shorter than 20 chars.
+///
+/// Returns `Ok(None)` when the value is not an mlkem768x25519plus
+/// encryption at all (`""`, `"none"`, any other scheme — those keep the
+/// raw-string handling); `Err` when it claims to be one but is malformed.
+pub fn parse_mlkem_encryption(value: &str) -> Result<Option<MlkemEncryption>, ParseError> {
+    use base64::Engine as _;
+
+    let invalid = |what: &str| {
+        ParseError::InvalidConf(
+            "mlkem768x25519plus encryption".into(),
+            format!("{what}: {value}").into(),
+        )
+    };
+    let s: Vec<&str> = value.split('.').collect();
+    if s.len() < 4 || s[0] != "mlkem768x25519plus" {
+        return Ok(None);
+    }
+    let mode = match s[1] {
+        "native" => MlkemMode::Native,
+        "xorpub" => MlkemMode::XorPub,
+        "random" => MlkemMode::Random,
+        other => return Err(invalid(other)),
+    };
+    let seconds = match s[2] {
+        "1rtt" => 0,
+        "0rtt" => 1,
+        other => return Err(invalid(other)),
+    };
+    // Padding accumulation: every segment shorter than 20 chars counts
+    // `len + 1` (itself plus its separating dot); longer segments are key
+    // material and must decode to 32 or 1184 bytes (xray checks the decoded
+    // length only — a failed decode yields length 0, also rejected).
+    let mut padding = 0usize;
+    for r in &s[3..] {
+        if r.len() < 20 {
+            padding += r.len() + 1;
+            continue;
+        }
+        let decoded = base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .decode(r)
+            .map_err(|_| invalid("invalid base64url key segment"))?;
+        if decoded.len() != 32 && decoded.len() != 1184 {
+            return Err(invalid("key segment must be 32 or 1184 bytes"));
+        }
+    }
+    // The remainder after the (27 + window) strip carries the padding
+    // segments then the keys, still dot-separated.
+    let rest = value
+        .get(27 + s[2].len()..)
+        .ok_or_else(|| invalid("too short"))?;
+    let (padding_str, keys) = if padding > 0 {
+        let pad = rest
+            .get(..padding - 1)
+            .ok_or_else(|| invalid("too short"))?;
+        let keys = rest.get(padding..).ok_or_else(|| invalid("too short"))?;
+        (pad, keys)
+    } else {
+        ("", rest)
+    };
+    Ok(Some(MlkemEncryption {
+        mode,
+        seconds,
+        padding: padding_str.to_string(),
+        keys: keys.to_string(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -1650,5 +1770,120 @@ mod tests {
             "error must mention xhttp: {err}"
         );
         assert!(matches!(err, SupportError::Config(_)));
+    }
+
+    // ── mlkem768x25519plus encryption parser (xray infra/conf/vless.go) ──
+
+    use super::MlkemMode;
+    use super::parse_mlkem_encryption;
+    use base64::Engine as _;
+
+    /// The documented example from the xray VLESS outbound docs
+    /// (`mlkem768x25519plus.native.0rtt.<padding>.<32-byte key>`).
+    const DOC_EXAMPLE: &str = "mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.50-0-3333.ptjHQxBQxTJ9MWr2cd5qWIflBSACHOevTauCQwa_71U";
+
+    fn key32() -> String {
+        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode([7u8; 32])
+    }
+
+    fn key1184() -> String {
+        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode([9u8; 1184])
+    }
+
+    #[test]
+    fn mlkem_parses_documented_example() {
+        let parsed = parse_mlkem_encryption(DOC_EXAMPLE)
+            .expect("parses")
+            .expect("is mlkem");
+        assert_eq!(parsed.mode, MlkemMode::Native);
+        assert_eq!(parsed.seconds, 1); // 0rtt → Seconds = 1
+        assert_eq!(parsed.padding, "100-111-1111.75-0-111.50-0-3333");
+        assert_eq!(parsed.keys, "ptjHQxBQxTJ9MWr2cd5qWIflBSACHOevTauCQwa_71U");
+    }
+
+    #[test]
+    fn mlkem_modes_and_windows() {
+        for (mode_str, mode, window, seconds) in [
+            ("native", MlkemMode::Native, "1rtt", 0),
+            ("xorpub", MlkemMode::XorPub, "0rtt", 1),
+            ("random", MlkemMode::Random, "1rtt", 0),
+        ] {
+            let value = format!("mlkem768x25519plus.{mode_str}.{window}.{}", key32());
+            let parsed = parse_mlkem_encryption(&value)
+                .expect("parses")
+                .expect("is mlkem");
+            assert_eq!(parsed.mode, mode);
+            assert_eq!(parsed.seconds, seconds);
+            assert_eq!(parsed.padding, "");
+            assert_eq!(parsed.keys, key32());
+        }
+    }
+
+    #[test]
+    fn mlkem_multiple_keys_32_and_1184() {
+        let keys = format!("{}.{}.{}", key32(), key1184(), key32());
+        let value = format!("mlkem768x25519plus.random.1rtt.{keys}");
+        let parsed = parse_mlkem_encryption(&value)
+            .expect("parses")
+            .expect("is mlkem");
+        assert_eq!(parsed.keys, keys);
+    }
+
+    #[test]
+    fn mlkem_padding_split_boundaries() {
+        // Two padding segments then a key: the padding slice is the joined
+        // segments without the trailing dot; keys start right after it.
+        let value = format!(
+            "mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.{}",
+            key32()
+        );
+        let parsed = parse_mlkem_encryption(&value)
+            .expect("parses")
+            .expect("is mlkem");
+        assert_eq!(parsed.padding, "100-111-1111.75-0-111");
+        assert_eq!(parsed.keys, key32());
+    }
+
+    #[test]
+    fn mlkem_non_mlkem_values_are_none() {
+        for value in ["", "none", "auto", "mlkem768x25519plus.native.1rtt"] {
+            let parsed = parse_mlkem_encryption(value).expect("no error");
+            assert!(parsed.is_none(), "not an mlkem value: {value}");
+        }
+    }
+
+    #[test]
+    fn mlkem_rejects_bad_mode_and_window() {
+        assert!(
+            parse_mlkem_encryption(&format!("mlkem768x25519plus.xor.1rtt.{}", key32())).is_err()
+        );
+        assert!(
+            parse_mlkem_encryption(&format!("mlkem768x25519plus.native.0-100s.{}", key32()))
+                .is_err()
+        );
+        assert!(
+            parse_mlkem_encryption(&format!("mlkem768x25519plus.native.rtts.{}", key32())).is_err()
+        );
+    }
+
+    #[test]
+    fn mlkem_rejects_bad_key_segments() {
+        // A ≥20-char segment that does not decode to 32 or 1184 bytes.
+        let short_key = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode([1u8; 16]);
+        assert!(
+            parse_mlkem_encryption(&format!("mlkem768x25519plus.native.1rtt.{short_key}")).is_err()
+        );
+        // Invalid base64url characters in a long segment.
+        assert!(
+            parse_mlkem_encryption("mlkem768x25519plus.native.1rtt.!!!!invalid-base64-segment!!!")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mlkem_too_short_value_errors_without_panicking() {
+        // Shorter than the 27+len(window) strip: an error, not a panic
+        // (upstream Go would panic on the slice).
+        assert!(parse_mlkem_encryption("mlkem768x25519plus.native.1rtt.a.b").is_err());
     }
 }

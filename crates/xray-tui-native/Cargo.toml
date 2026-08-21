@@ -28,6 +28,7 @@ webpki-roots = "1"
 aes = "0.9"
 aes-gcm = "0.11"
 chacha20poly1305 = "0.11"
+ctr = "0.10"
 hmac = "0.13"
 sha2 = "0.11"
 crc32fast = "1"
@@ -113,5 +114,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 serde_json.workspace = true
 rcgen = "0.14"
 rstest.workspace = true
+# blake3 cross-validates the hand-rolled BLAKE3 in
+# protocol/vless/encryption/b3.rs against the reference implementation.
+blake3 = "1"
 # (rustls is a normal dependency now — the h3 arm's QUIC TLS config; the
 # server double reuses the same dep.)
