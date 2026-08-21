@@ -19,8 +19,10 @@
 //! - **Post-handshake records** both ways: `[23 03 03 len_hi len_lo]
 //!   [AEAD(payload ≤8192)]`, nonce auto-incrementing from zero; the two
 //!   directions use different AEAD contexts (each side's PFS public
-//!   material). `random` mode additionally XOR-maskes everything except
-//!   the 5-byte record headers (per-direction CTR streams in `CommonConn`).
+//!   material). `random` mode additionally XOR-masks ONLY the 5-byte record
+//!   headers (per-direction CTR streams in `CommonConn`); the AEAD payloads
+//!   travel clear and the keystream advances 5 bytes per record
+//!   (xray `XorConn`).
 //!
 //! Deviations from upstream (documented in the task report): no 0-RTT
 //! ticket resume — `0rtt` accounts still run the full 1-RTT handshake
@@ -191,10 +193,17 @@ fn new_ctr(key: &[u8], iv: &[u8; 16]) -> Ctr128BE<Aes256> {
 #[allow(clippy::cast_possible_truncation)] // usize >= u64 on supported targets
 fn rand_between(lo: usize, hi: usize, rng: &ring::rand::SystemRandom) -> usize {
     debug_assert!(hi >= lo);
-    let span = hi - lo + 1;
-    let mut buf = [0u8; 8];
-    rng.fill(&mut buf).expect("ring CSPRNG fills");
-    lo + (u64::from_be_bytes(buf) % span as u64) as usize
+    let span = (hi - lo + 1) as u64;
+    // Rejection sampling: no modulo bias (traffic-shaping only, but free).
+    let zone = u64::MAX / span * span;
+    loop {
+        let mut buf = [0u8; 8];
+        rng.fill(&mut buf).expect("ring CSPRNG fills");
+        let v = u64::from_be_bytes(buf);
+        if v < zone {
+            return lo + (v % span) as usize;
+        }
+    }
 }
 
 // ── config ─────────────────────────────────────────────────────────────────
@@ -592,8 +601,10 @@ enum ReadPhase {
 /// Outbound writes are chunked to ≤8192 bytes and sealed as
 /// `[23 03 03 len_hi len_lo][AEAD(chunk, aad=header)]` with an
 /// auto-incrementing nonce; inbound reads mirror the framing after draining
-/// the server padding. `random` mode XOR-masks every byte except the 5-byte
-/// record headers (per-direction CTR streams keyed with the united key).
+/// the server padding. `random` mode XOR-masks ONLY the 5-byte record
+/// headers (per-direction CTR streams keyed with the united key); the AEAD
+/// payloads travel clear and each CTR advances 5 bytes per record (xray
+/// `XorConn`).
 ///
 /// Deviation from upstream: the `MaxNonce` re-key branch (xray re-derives the
 /// AEAD from the record bytes after 2⁹⁶ records) is not implemented — it is
@@ -693,6 +704,13 @@ impl AsyncRead for CommonConn {
                             Poll::Pending => return Poll::Pending,
                         }
                     }
+                    // random mode: unmask the 5-byte header (xray `XorConn`
+                    // masks ONLY headers; payloads stay clear). Applied once
+                    // per complete header so the keystream advances exactly
+                    // 5 bytes per record.
+                    if let Some(ctr) = in_xor {
+                        ctr.apply_keystream(header);
+                    }
                     let l = decode_length(&header[3..]);
                     if header[0] != 23
                         || header[1] != 3
@@ -721,9 +739,6 @@ impl AsyncRead for CommonConn {
                             Poll::Ready(()) => *payload_pos += slice.filled().len(),
                             Poll::Pending => return Poll::Pending,
                         }
-                    }
-                    if let Some(ctr) = in_xor {
-                        ctr.apply_keystream(payload);
                     }
                     let taken = std::mem::take(payload);
                     *in_buf = peer_aead.open(&taken, header)?;
@@ -777,11 +792,15 @@ impl AsyncWrite for CommonConn {
             let chunk = &buf[accepted..end];
             let mut record = Vec::with_capacity(HEADER_LEN + chunk.len() + TAG_LEN);
             let hdr = encode_length_header(chunk.len() + TAG_LEN);
-            record.extend_from_slice(&hdr);
-            record.extend_from_slice(&aead.seal(chunk, &hdr));
+            let sealed = aead.seal(chunk, &hdr);
+            // random mode masks ONLY the wire header (xray `XorConn`); the
+            // AEAD AAD stays the clear header.
+            let mut wire_hdr = hdr;
             if let Some(ctr) = out_xor {
-                ctr.apply_keystream(&mut record[HEADER_LEN..]);
+                ctr.apply_keystream(&mut wire_hdr);
             }
+            record.extend_from_slice(&wire_hdr);
+            record.extend_from_slice(&sealed);
             *out_pending = record;
             accepted = end;
         }
@@ -963,7 +982,8 @@ mod tests {
         conn.read_exact(&mut enc_pad).await?;
         nfs_aead.open(&enc_pad, &[])?;
 
-        // ── record echo loop (random mode masks everything but headers) ──
+        // ── record echo loop (random mode masks ONLY the 5-byte headers,
+        // xray `XorConn`; payloads clear, keystream +5 B/record) ──
         let mut out_ctr = (mode == MlkemMode::Random).then(|| new_ctr(&united, &ticket_plain));
         let mut in_ctr = (mode == MlkemMode::Random).then(|| new_ctr(&united, &iv));
         loop {
@@ -974,19 +994,21 @@ mod tests {
                 }
                 return Err(e);
             }
+            if let Some(c) = &mut in_ctr {
+                c.apply_keystream(&mut hdr);
+            }
             let l = decode_length(&hdr[3..]);
             let mut payload = vec![0u8; l];
             conn.read_exact(&mut payload).await?;
-            if let Some(c) = &mut in_ctr {
-                c.apply_keystream(&mut payload);
-            }
             let plain = peer_aead.open(&payload, &hdr)?;
-            let mut record = Vec::with_capacity(HEADER_LEN + l);
-            record.extend_from_slice(&hdr);
-            record.extend_from_slice(&self_aead.seal(&plain, &hdr));
+            let sealed = self_aead.seal(&plain, &hdr);
+            let mut wire_hdr = hdr;
             if let Some(c) = &mut out_ctr {
-                c.apply_keystream(&mut record[HEADER_LEN..]);
+                c.apply_keystream(&mut wire_hdr);
             }
+            let mut record = Vec::with_capacity(HEADER_LEN + l);
+            record.extend_from_slice(&wire_hdr);
+            record.extend_from_slice(&sealed);
             conn.write_all(&record).await?;
         }
     }
@@ -1078,6 +1100,71 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_random_custom_padding() {
         roundtrip(MlkemMode::Random, "100-35-111.0-0-0", 100).await;
+    }
+
+    /// Pins the random-mode masking semantics against xray `XorConn`
+    /// (xor.go): ONLY the 5-byte record headers are masked on the wire, the
+    /// AEAD payloads travel clear (AAD = the CLEAR header), and the
+    /// keystream advances exactly 5 bytes per record.
+    #[tokio::test]
+    async fn random_mode_masks_headers_only() {
+        let key = [7u8; 32];
+        let iv = [9u8; 16];
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        let mut conn = CommonConn {
+            inner: Box::new(client),
+            aead: WireAead::new(&iv, &key),
+            peer_aead: WireAead::new(&iv, &key),
+            peer_padding: None,
+            pad_pos: 0,
+            in_buf: Vec::new(),
+            in_pos: 0,
+            phase: ReadPhase::Header,
+            header: [0u8; HEADER_LEN],
+            header_pos: 0,
+            payload: Vec::new(),
+            payload_pos: 0,
+            out_pending: Vec::new(),
+            out_pos: 0,
+            out_xor: Some(new_ctr(&key, &iv)),
+            in_xor: None,
+        };
+
+        let payload: Vec<u8> = (0u8..100).collect();
+        let clear_hdr = encode_length_header(payload.len() + TAG_LEN);
+        let wire_len = HEADER_LEN + payload.len() + TAG_LEN;
+
+        for rec in 0..2usize {
+            conn.write_all(&payload).await.expect("write");
+            conn.flush().await.expect("flush");
+
+            // Independent reference seal: fresh AEAD pre-advanced to the
+            // same nonce sequence number (`rec`).
+            let mut reference = WireAead::new(&iv, &key);
+            for _ in 0..rec {
+                reference.seal(&[], &[]);
+            }
+            let expect_payload = reference.seal(&payload, &clear_hdr);
+
+            // Keystream window at byte offset 5*rec — proves the CTR
+            // advanced by exactly one header per record.
+            let mut ctr = new_ctr(&key, &iv);
+            let mut skip = vec![0u8; HEADER_LEN * rec];
+            ctr.apply_keystream(&mut skip);
+            let mut ks = [0u8; HEADER_LEN];
+            ctr.apply_keystream(&mut ks);
+            let masked_hdr: Vec<u8> = clear_hdr.iter().zip(ks).map(|(a, b)| a ^ b).collect();
+
+            let mut wire = vec![0u8; wire_len];
+            server.read_exact(&mut wire).await.expect("wire read");
+            assert_ne!(&wire[..HEADER_LEN], &clear_hdr[..], "header masked");
+            assert_eq!(&wire[..HEADER_LEN], &masked_hdr[..], "rec {rec} header");
+            assert_eq!(
+                &wire[HEADER_LEN..],
+                &expect_payload[..],
+                "rec {rec} payload clear"
+            );
+        }
     }
 
     /// The config builder decodes base64url keys and rejects bad segments.
