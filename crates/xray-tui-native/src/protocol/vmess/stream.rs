@@ -161,6 +161,13 @@ impl VmessClientStream {
         }
     }
 
+    /// The secured connection behind the record codec (crate-internal; the
+    /// e2e PQ assertion recovers the engine `TlsStream` through it).
+    #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))] // e2e PQ assertion only
+    pub(crate) fn inner(&self) -> &BoxStream {
+        &self.inner
+    }
+
     /// Record nonce: response/request IV with the first two bytes replaced by
     /// the BE counter (Go `GenerateChunkNonce`), truncated to 12 bytes.
     fn record_nonce(iv12: &[u8; 12], counter: u16) -> [u8; 12] {

@@ -4,7 +4,7 @@
 use rstest::fixture;
 use xray_tui_native::e2e::{
     Certs, CoreKind, CoreUnderTest, EchoServer, FingerprintTls, NoTls, PlainServerRealityClientTls,
-    RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
+    PqTls, RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
     SINGBOX_VERSION, TlsEchoServer, TlsVariant, XRAY_VERSION, generate_certs, spawn_echo,
     spawn_tls_echo,
 };
@@ -59,6 +59,16 @@ pub fn fp(id: &'static str) -> Box<dyn TlsVariant> {
 #[must_use]
 pub fn reality() -> Box<dyn TlsVariant> {
     Box::new(RealityTls::fresh())
+}
+
+/// Hybrid PQ curve pinned on both ends (`x25519mlkem768`): the client offers
+/// only the X25519MLKEM768 key share and the server's `curvePreferences`
+/// accepts nothing else — a green row is a negotiated ML-KEM-768 exchange
+/// (SP7 spec §7.3).
+#[must_use]
+#[allow(dead_code)] // pq-only variant (unused in one of the two test binaries)
+pub fn pq_tls() -> Box<dyn TlsVariant> {
+    Box::new(PqTls)
 }
 
 /// Genuinely no TLS: the raw transport stream end to end (server

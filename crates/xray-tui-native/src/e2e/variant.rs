@@ -22,6 +22,13 @@ pub trait TlsVariant: Sync {
     fn fingerprint(&self) -> Option<&'static str> {
         None
     }
+    /// TLS curve preferences (`curves` client option / server
+    /// `curvePreferences`): `Some("x25519mlkem768")` pins the hybrid PQ
+    /// curve on BOTH ends — the server then cannot pick anything else, so a
+    /// green row proves PQ negotiation. `None` = the core defaults.
+    fn curves(&self) -> Option<&'static str> {
+        None
+    }
     /// REALITY server private key (base64url); `None` = certificate TLS.
     fn reality_private_key(&self) -> Option<&str> {
         None
@@ -114,6 +121,31 @@ impl TlsVariant for StandardTls {
         crate::security::fingerprint::set_test_ca(&certs.ca_der);
         // The h3 (QUIC) arm's rustls is quinn-internal — the engine verifier
         // never sees it, so the harness CA needs its own hook (SP5 T4).
+        crate::transport::xhttp::set_test_ca(&certs.ca_der);
+    }
+}
+
+/// Stock rustls with the hybrid PQ curve pinned on both ends.
+///
+/// `x25519mlkem768`: the client offers ONLY the X25519MLKEM768 key share
+/// (the engine's `curves` option) and the server's `curvePreferences`
+/// accepts nothing else — a green row is a negotiated ML-KEM-768 exchange,
+/// never a classical fallback.
+pub struct PqTls;
+
+impl TlsVariant for PqTls {
+    fn name(&self) -> &'static str {
+        "tls-pq"
+    }
+    fn sni(&self) -> &'static str {
+        "localhost"
+    }
+    fn curves(&self) -> Option<&'static str> {
+        Some("x25519mlkem768")
+    }
+    fn client_trust(&self, certs: &Certs) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::security::fingerprint::set_test_ca(&certs.ca_der);
         crate::transport::xhttp::set_test_ca(&certs.ca_der);
     }
 }

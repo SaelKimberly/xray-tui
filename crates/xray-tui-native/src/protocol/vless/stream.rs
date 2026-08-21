@@ -178,6 +178,13 @@ impl VlessClientStream {
     pub(crate) fn inner_mut(&mut self) -> &mut BoxStream {
         &mut self.inner
     }
+
+    /// The wrapped stream, shared (the e2e PQ assertion recovers the
+    /// engine `TlsStream` through the peel wrapper).
+    #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))] // e2e PQ assertion only
+    pub(crate) fn inner(&self) -> &BoxStream {
+        &self.inner
+    }
 }
 
 impl AsyncRead for VlessClientStream {

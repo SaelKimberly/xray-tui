@@ -12,7 +12,7 @@
 mod common;
 
 use common::{
-    certs, cores, echo, fp, no_tls, pick, plain_server_reality_client, reality,
+    certs, cores, echo, fp, no_tls, pick, plain_server_reality_client, pq_tls, reality,
     reality_server_plain_client, reality_wrong_pbk, reality_wrong_sid, tls_echo,
 };
 use rstest::rstest;
@@ -238,6 +238,43 @@ async fn vless_against_cores(
 // dial + security-wrap composition arms.
 #[case::kcp_plain(vless_tls("kcp", no_tls()), CoreKind::Xray)]
 #[case::kcp_chrome(vless_tls("kcp", fp("chrome")), CoreKind::Xray)]
+// SP7 (VLESS ML-KEM) PQ rows (spec §7.3) — xray-single-core (sing-box
+// 1.13.16 accepts `curve_preferences` but has no VLESS account encryption,
+// so the pq-enc row pins the trio to xray; the counts contract keeps all
+// three single-core).
+//
+// tls-pq: the hybrid curve pinned on BOTH ends — the client offers only the
+// X25519MLKEM768 key share (`curves: "x25519mlkem768"`) and the server's
+// tlsSettings.curvePreferences accepts nothing else, so a green row is a
+// negotiated ML-KEM-768 exchange, never a classical fallback; the runner
+// additionally asserts the engine's negotiated-hybrid flag.
+#[case::tcp_tls_pq(vless_tls("tcp", pq_tls()).with_pq_assert(), CoreKind::Xray)]
+// reality-pq: BLOCKED by the harness dest, not by the client. The xray
+// REALITY server replays the DEST's ServerHello flight as camouflage
+// (xtls/reality tls.go s2cSaved — the share group check at :359 accepts
+// X25519 or X25519MLKEM768, but the group is whatever the DEST negotiated),
+// and the harness dest (rustls tls_echo) has no PQ key exchange — so the
+// tunnel is structurally classical regardless of the client's hybrid offer.
+// A PQ reality row needs a PQ-capable dest (Go 1.24+ / OpenSSL 3.5 echo);
+// the client's REALITY 4588 support itself is proven hermetically (T4 fake
+// REALITY PQ server) and the plain reality rows stay green.
+#[ignore = "reality replays the dest's ServerHello; the rustls tls_echo dest has no PQ — needs a PQ-capable dest"]
+#[case::tcp_reality_pq(vless_tls("tcp", reality()).with_pq_assert(), CoreKind::Xray)]
+// pq-enc: the VLESS `mlkem768x25519plus` account encryption end to end —
+// the client outbound `encryption` carries the server's PUBLIC halves
+// (X25519 pub + ML-KEM-768 encapsulation key), the xray inbound
+// `settings.decryption` the PRIVATE halves (X25519 priv + the 64-B seed);
+// the PQ handshake wraps the whole session before the request header.
+//
+// BLOCKED: against real xray 26.3.27 the client's PQ handshake COMPLETES
+// (connect Ok, request sealed and written) but the tunnel EOFs before the
+// response header — the server closes without logging an error. The native
+// impl mirrors xray's client.go wire (relays per key, pfs = mlkem||x25519,
+// server pfs ct-first — verified in source) and passes the T3 hermetic
+// double; the divergence from the real server is unresolved. Left ignored
+// with the harness wired so the fix round can flip it to green.
+#[ignore = "client handshake completes but the real-xray tunnel EOFs pre-response; needs interop debugging against xray encryption/server.go"]
+#[case::tcp_pq_enc(vless("tcp").with_pq_enc(), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(
     #[case] case: CaseSpec,

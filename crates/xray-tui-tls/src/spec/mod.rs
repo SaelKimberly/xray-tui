@@ -82,7 +82,8 @@ pub enum KeyShareGroup {
     Grease,
     X25519,
     /// X25519MLKEM768 hybrid (0x11EC / 4588): the entry key exchange is
-    /// `X25519 pub (32) || ML-KEM-768 encapsulation key (1184)` = 1216 bytes.
+    /// `ML-KEM-768 encapsulation key (1184) || X25519 pub (32)` = 1216 bytes
+    /// (Go crypto/tls wire order — ek first).
     X25519Mlkem768,
     /// `SecP256r1MLKEM768` hybrid (0x11EB / 4587). Deferred: the engine has no
     /// P-256 key exchange (xray's primary hybrid is `X25519MLKEM768`).
@@ -202,11 +203,15 @@ impl ExtensionSpec {
                                     rt.mlkem768_pub.len()
                                 )));
                             }
-                            // Entry: group 11 ec, key_exchange_length 04 c0 (1216),
-                            // key_exchange = X25519 pub (32) || ML-KEM-768 encap key (1184).
+                            // Entry: group 11 ec, key_exchange_length 04 c0 (1216).
+                            // Wire order per Go crypto/tls (the xray/reality
+                            // server splits `data[:1184]` as the ML-KEM
+                            // encapsulation key and `data[1184:]` as the
+                            // X25519 public key): ML-KEM-768 encap key (1184)
+                            // FIRST, then X25519 pub (32).
                             entries.extend_from_slice(&[0x11, 0xec, 0x04, 0xc0]);
-                            entries.extend_from_slice(&rt.x25519_pub);
                             entries.extend_from_slice(&rt.mlkem768_pub);
+                            entries.extend_from_slice(&rt.x25519_pub);
                         }
                         KeyShareGroup::Secp256r1Mlkem768 | KeyShareGroup::Secp384r1Mlkem1024 => {
                             return Err(TlsError::Spec(
@@ -529,10 +534,9 @@ mod tests {
             &[0x00, 0x33, 0x04, 0xc6, 0x04, 0xc4, 0x11, 0xec, 0x04, 0xc0]
         );
         assert_eq!(ext.len(), 4 + 2 + 4 + 1216);
-        assert_eq!(&ext[10..42], &[0xAB; 32]);
-        assert_eq!(&ext[42..], &[0xCD; 1184]);
+        assert_eq!(&ext[10..10 + 1184], &[0xCD; 1184]);
+        assert_eq!(&ext[10 + 1184..], &[0xAB; 32]);
     }
-
     #[test]
     fn hybrid_key_share_requires_mlkem_material() {
         let rt = RuntimeValues::default();

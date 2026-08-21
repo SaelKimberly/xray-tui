@@ -131,6 +131,28 @@ impl Mlkem768 {
         Ok((PublicKey(pk.into_vec()), SecretKey(sk.into_vec())))
     }
 
+    /// Derive a keypair from the 64-byte FIPS 203 keygen seed (`d || z`).
+    ///
+    /// Deterministic: the same seed always yields the same keypair. This is
+    /// the seed form xray's VLESS `mlkem768x25519plus` server config carries
+    /// (`decryption` key segment — Go `mlkem.NewDecapsulationKey768`), so
+    /// the e2e harness can derive the encapsulation key the client string
+    /// must carry from the very seed the server config holds.
+    ///
+    /// # Errors
+    /// [`MlkemError::KeygenFailed`] when liboqs rejects the seed length or
+    /// the derandomized keygen fails.
+    pub fn keypair_from_seed(seed: &[u8; 64]) -> Result<(PublicKey, SecretKey), MlkemError> {
+        let kem = Self::kem()?;
+        let seed_ref = kem
+            .keypair_seed_from_bytes(seed.as_slice())
+            .ok_or(MlkemError::KeygenFailed)?;
+        let (pk, sk) = kem
+            .keypair_derand(seed_ref)
+            .map_err(|_| MlkemError::KeygenFailed)?;
+        Ok((PublicKey(pk.into_vec()), SecretKey(sk.into_vec())))
+    }
+
     /// Encapsulate a shared secret to the given public key.
     ///
     /// Returns ([`Ciphertext`], [`SharedSecret`]) where:
@@ -228,6 +250,24 @@ mod tests {
         let ct_bytes = ct.as_bytes();
         let ct2 = Ciphertext::from_bytes(ct_bytes).expect("ciphertext deserialization failed");
         assert_eq!(ct, ct2);
+    }
+
+    #[test]
+    fn seed_keypair_is_deterministic_and_roundtrips() {
+        let mut seed = [0u8; 64];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("fits u8");
+        }
+        let (pk1, sk1) = Mlkem768::keypair_from_seed(&seed).expect("seed keygen failed");
+        let (pk2, sk2) = Mlkem768::keypair_from_seed(&seed).expect("seed keygen failed");
+        assert_eq!(pk1.as_bytes().len(), 1184);
+        assert_eq!(sk1.as_bytes().len(), 2400);
+        assert_eq!(pk1, pk2, "same seed must yield the same encapsulation key");
+        assert_eq!(sk1, sk2);
+        // The derived pair is a working ML-KEM-768 pair.
+        let (ct, ss1) = Mlkem768::encapsulate(&pk1).expect("encapsulation failed");
+        let ss2 = Mlkem768::decapsulate(&sk1, &ct).expect("decapsulation failed");
+        assert_eq!(ss1, ss2);
     }
 
     #[test]

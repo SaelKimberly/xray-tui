@@ -183,10 +183,10 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let server_hello = read_server_hello(&mut stream, offered_session_id).await?;
     let classical_shared = keypair.agree(&server_hello.peer_key)?;
 
-    // Hybrid key exchange (RFC 9180 / draft-ietf-tls-hybrid-design): when
-    // the server selected X25519MLKEM768 it encapsulated to our ML-KEM-768
-    // public key; the shared secret fed to the key schedule is
-    // `classical || pq` (64 bytes for X25519MLKEM768).
+    // Hybrid key exchange (Go crypto/tls X25519MLKEM768): the key-schedule
+    // IKM is `mlkem_shared || classical_shared` — Go's
+    // handshake_client_tls13 appends the ECDH secret AFTER the ML-KEM
+    // shared secret (`sharedKey = append(mlkemShared, sharedKey...)`).
     let shared: Vec<u8> = match (mlkem_sk, server_hello.mlkem_ciphertext.as_deref()) {
         (Some(sk), Some(ct)) => {
             let pq_shared = Mlkem768::decapsulate(
@@ -196,8 +196,8 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
             )
             .map_err(|e| TlsError::Crypto(e.to_string()))?;
             let mut combined = Vec::with_capacity(classical_shared.len() + 32);
-            combined.extend_from_slice(&classical_shared);
             combined.extend_from_slice(pq_shared.as_bytes());
+            combined.extend_from_slice(&classical_shared);
             combined
         }
         _ => classical_shared.to_vec(),
@@ -284,20 +284,17 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master)?;
     let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts)?;
     let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts)?;
-    ks.add_transcript(&cf_hs_msg);
-
-    Ok((
-        TlsStream::new(
-            stream,
-            AppKeys {
-                read_key: server_app_key,
-                write_key: client_app_key,
-                read_seq: 0,
-                write_seq: 0,
-            },
-        ),
-        outcome,
-    ))
+    let mut tls = TlsStream::new(
+        stream,
+        AppKeys {
+            read_key: server_app_key,
+            write_key: client_app_key,
+            read_seq: 0,
+            write_seq: 0,
+        },
+    );
+    tls.set_negotiated_hybrid(server_hello.mlkem_ciphertext.is_some());
+    Ok((tls, outcome))
 }
 
 /// Performs the full TLS 1.3 client handshake over `stream`, returning a
@@ -497,10 +494,13 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
         pos += ext_len;
         if ext_type == EXT_KEY_SHARE {
             // ServerHello key_share: NamedGroup(2) + key_len(2) + key
-            // (RFC 8446 §4.2.8). X25519MLKEM768 (0x11EC) carries
-            // `X25519 pub (32) || ML-KEM-768 ciphertext (1088)` = 1120
-            // bytes; any other group or malformed length is a protocol
-            // error rather than a silently-missing keyshare.
+            // (RFC 8446 §4.2.8). X25519MLKEM768 (0x11EC) carries 1120
+            // bytes in the Go crypto/tls wire order (the reality/utls
+            // client splits `data[:1088]` as the ML-KEM ciphertext and
+            // `data[1088:]` as the X25519 public key):
+            // `ML-KEM-768 ciphertext (1088) || X25519 pub (32)`. Any other
+            // group or malformed length is a protocol error rather than a
+            // silently-missing keyshare.
             if ext_data.len() < 4 {
                 return Err(TlsError::Handshake(
                     "ServerHello key_share extension too short".into(),
@@ -513,8 +513,8 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
                     peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
                 }
                 (0x11EC, 1120, n) if n == 4 + key_len => {
-                    peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
-                    mlkem_ciphertext = Some(ext_data[36..].to_vec());
+                    mlkem_ciphertext = Some(ext_data[4..4 + 1088].to_vec());
+                    peer_key = Some(ext_data[4 + 1088..].try_into().expect("32 bytes"));
                 }
                 (0x11EB | 0x11ED, ..) => {
                     return Err(TlsError::Handshake(
@@ -1342,10 +1342,11 @@ mod tests {
             server_side.read_exact(&mut ch).await.unwrap();
             let parsed = parse_hello(&ch).unwrap();
             let ks_ext = parsed.extension(0x0033).unwrap();
-            // list_len(2) + entry(group 11ec, kx_len 04c0, 1216 bytes).
+            // list_len(2) + entry(group 11ec, kx_len 04c0, 1216 bytes) in
+            // the Go wire order: ML-KEM ek (1184) first, X25519 pub last.
             assert_eq!(&ks_ext[..4], &[0x04, 0xc4, 0x11, 0xec]);
-            let client_x25519: [u8; 32] = ks_ext[6..38].try_into().unwrap();
-            let client_mlkem_pk = MlkemPublicKey::from_bytes(&ks_ext[38..]).unwrap();
+            let client_mlkem_pk = MlkemPublicKey::from_bytes(&ks_ext[6..6 + 1184]).unwrap();
+            let client_x25519: [u8; 32] = ks_ext[6 + 1184..6 + 1216].try_into().unwrap();
 
             // Classical + PQ shared secrets, exactly as a real hybrid server.
             let rng = ring::rand::SystemRandom::new();
@@ -1353,7 +1354,7 @@ mod tests {
             let classical = server_kp.agree(&client_x25519).unwrap();
             let (ct, pq_ss) = Mlkem768::encapsulate(&client_mlkem_pk).unwrap();
 
-            // ServerHello: key_share group 11ec, share = pub(32) || ct(1088).
+            // ServerHello: key_share group 11ec, share = ct(1088) || pub(32).
             let mut sh_body = Vec::new();
             sh_body.extend_from_slice(&0x0303u16.to_be_bytes());
             sh_body.extend_from_slice(&[0x5A; 32]);
@@ -1366,8 +1367,9 @@ mod tests {
             kse.extend_from_slice(&1124u16.to_be_bytes()); // 4 + 1120
             kse.extend_from_slice(&0x11ECu16.to_be_bytes());
             kse.extend_from_slice(&1120u16.to_be_bytes());
-            kse.extend_from_slice(&server_kp.public_key());
+            // Go wire order: ct (1088) first, X25519 pub (32) last.
             kse.extend_from_slice(ct.as_bytes());
+            kse.extend_from_slice(&server_kp.public_key());
             sh_body.extend_from_slice(&u16::try_from(kse.len()).unwrap().to_be_bytes());
             sh_body.extend_from_slice(&kse);
             let sh_msg = make_hs_msg(HS_SERVER_HELLO, &sh_body);
@@ -1376,9 +1378,9 @@ mod tests {
             rec.extend_from_slice(&sh_msg);
             server_side.write_all(&rec).await.unwrap();
 
-            // Key schedule over `classical || pq` — the hybrid contract.
-            let mut combined = classical.to_vec();
-            combined.extend_from_slice(pq_ss.as_bytes());
+            // Key schedule over `pq || classical` — the Go hybrid contract.
+            let mut combined = pq_ss.as_bytes().to_vec();
+            combined.extend_from_slice(&classical);
             assert_eq!(combined.len(), 64);
             let mut sk = KeySchedule::new(suite);
             sk.add_transcript(&ch);

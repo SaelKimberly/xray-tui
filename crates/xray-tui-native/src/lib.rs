@@ -112,6 +112,13 @@ impl NativeTunnel {
     pub(crate) fn from_stream(inner: BoxStream) -> Self {
         Self { inner }
     }
+
+    /// The completed layer stack behind the tunnel (crate-internal; the
+    /// e2e runner inspects it to assert PQ negotiation).
+    #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))]
+    pub(crate) fn inner_stream(&self) -> &BoxStream {
+        &self.inner
+    }
 }
 
 impl tokio::io::AsyncRead for NativeTunnel {

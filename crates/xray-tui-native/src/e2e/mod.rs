@@ -24,7 +24,7 @@ pub use harness::{
 };
 pub use variant::{
     Aes128GcmVariant, Chacha20Poly1305Variant, FingerprintTls, NoTls, PlainServerRealityClientTls,
-    RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
+    PqTls, RealityServerPlainClientTls, RealityTls, RealityWrongPbkTls, RealityWrongSidTls,
     SecurityVariant, StandardTls, TlsVariant,
 };
 
@@ -281,6 +281,14 @@ pub async fn run_against(
                 continue;
             }
         };
+        if case.pq_assert() && !outer_tls_negotiated_hybrid(tunnel.inner_stream()) {
+            eprintln!(
+                "[e2e] {}: attempt {attempt}/{ATTEMPTS} PQ assertion failed: the outer TLS \
+                 handshake fell back to a classical key exchange",
+                case.label()
+            );
+            continue;
+        }
         let (status, body) = match case.app() {
             // Inner-TLS rows: the app establishes a real TLS 1.3 session
             // THROUGH the tunnel to the rustls echo target (Direct splice).
@@ -301,4 +309,32 @@ pub async fn run_against(
         "{}: failed after {ATTEMPTS} attempts",
         case.label()
     ))
+}
+
+/// Whether the tunnel's OUTER TLS/REALITY handshake negotiated a hybrid
+/// (post-quantum) key-share group — the PQ rows' honesty gate (spec §7.3:
+/// a PQ row that silently fell back to classical must fail).
+///
+/// The engine `TlsStream` sits one or two wrappers down the boxed seam
+/// (`VlessClientStream` / `VmessClientStream` response-header peel); the
+/// walk recovers it through the `Any` supertrait like the vision splice.
+fn outer_tls_negotiated_hybrid(stream: &crate::BoxStream) -> bool {
+    use crate::protocol::vless::stream::VlessClientStream;
+    use crate::protocol::vmess::stream::VmessClientStream;
+    use xray_tui_tls::record::stream::TlsStream;
+
+    fn hybrid(s: &crate::BoxStream) -> bool {
+        let any: &dyn std::any::Any = &**s;
+        any.downcast_ref::<TlsStream<crate::BoxStream>>()
+            .is_some_and(xray_tui_tls::record::stream::TlsStream::negotiated_hybrid)
+    }
+
+    let any: &dyn std::any::Any = &**stream;
+    if let Some(v) = any.downcast_ref::<VlessClientStream>() {
+        return hybrid(v.inner());
+    }
+    if let Some(m) = any.downcast_ref::<VmessClientStream>() {
+        return hybrid(m.inner());
+    }
+    hybrid(stream)
 }

@@ -111,6 +111,16 @@ pub struct CaseSpec {
     /// the frame). Ignored unless `app` is [`AppKind::Udp`]; drives
     /// `NativeConnectParams.udp` for the probe's `connect_udp`.
     udp: Option<PacketMode>,
+    /// VLESS `mlkem768x25519plus` account encryption: `(client encryption,
+    /// server decryption)` strings sharing one generated keypair set
+    /// ([`config::mlkem_enc_pair`]). `Some` wires the client outbound's
+    /// `encryption` and the xray inbound's `settings.decryption` (xray-only
+    /// — sing-box has no VLESS account encryption).
+    vless_enc: Option<(String, String)>,
+    /// Assert that the tunnel's outer TLS handshake negotiated a hybrid
+    /// (post-quantum) key share — a PQ row that silently fell back to
+    /// classical fails instead of passing.
+    pq_assert: bool,
 }
 
 impl CaseSpec {
@@ -126,6 +136,8 @@ impl CaseSpec {
             app: AppKind::Plain,
             mux: false,
             udp: None,
+            vless_enc: None,
+            pq_assert: false,
         }
     }
 
@@ -141,7 +153,32 @@ impl CaseSpec {
             app: AppKind::Plain,
             mux: false,
             udp: None,
+            vless_enc: None,
+            pq_assert: false,
         }
+    }
+
+    /// Wire VLESS `mlkem768x25519plus` account encryption: generates a
+    /// fresh keypair set and carries `(client encryption, server
+    /// decryption)` in the case. The row is xray-single-core.
+    #[must_use]
+    pub fn with_pq_enc(mut self) -> Self {
+        self.vless_enc = Some(config::mlkem_enc_pair());
+        self
+    }
+
+    /// Assert PQ negotiation: the runner requires the outer TLS handshake's
+    /// `ServerHello` to have selected a hybrid key-share group.
+    #[must_use]
+    pub const fn with_pq_assert(mut self) -> Self {
+        self.pq_assert = true;
+        self
+    }
+
+    /// Whether the row asserts hybrid (PQ) negotiation.
+    #[must_use]
+    pub const fn pq_assert(&self) -> bool {
+        self.pq_assert
     }
 
     /// Select the transport ("tcp", "ws", "grpc").
@@ -229,6 +266,10 @@ impl CaseSpec {
     /// Cores this case runs against (variant gate; no security → both).
     #[must_use]
     pub fn cores(&self) -> &'static [CoreKind] {
+        if self.vless_enc.is_some() {
+            // VLESS account encryption: sing-box has no decryption support.
+            return &[CoreKind::Xray];
+        }
         self.security
             .as_ref()
             .map_or(&[CoreKind::Xray, CoreKind::SingBox], |s| s.cores())
@@ -262,14 +303,28 @@ impl E2eCase for CaseSpec {
             ),
         };
         let mux = if self.mux() { "/mux" } else { "" };
-        format!("{proto}/{flow}{}/{tls}{sec}{app}{mux}", self.network)
+        let pq = if self.pq_assert { "/pq" } else { "" };
+        let enc = if self.vless_enc.is_some() {
+            "/pq-enc"
+        } else {
+            ""
+        };
+        format!(
+            "{proto}/{flow}{}/{tls}{sec}{app}{mux}{pq}{enc}",
+            self.network
+        )
     }
 
     fn server_config(&self, core: CoreKind, env: &ServerEnv) -> String {
         match self.protocol {
-            ProtocolKind::Vless => {
-                config::vless_inbound(core, env, self.flow, self.tls(), self.network)
-            }
+            ProtocolKind::Vless => config::vless_inbound(
+                core,
+                env,
+                self.flow,
+                self.tls(),
+                self.network,
+                self.vless_enc.as_ref().map(|(_, server)| server.as_str()),
+            ),
             ProtocolKind::Vmess => {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
                 config::vmess_inbound(core, env, security, self.tls(), self.network)
@@ -303,6 +358,13 @@ impl E2eCase for CaseSpec {
                 )
             }
         };
+        // pq-enc rows: the VLESS outbound carries the mlkem768x25519plus
+        // account `encryption` (the client-side PUBLIC key segments).
+        if let Some((client, _)) = &self.vless_enc
+            && let xray_tui_proto::proto_spec::ProtocolConfig::Vless(cfg) = &mut params.protocol
+        {
+            cfg.encryption = Some(client.as_str().into());
+        }
         // UDP rows: the VLESS UDP datagram tunnel dispatches on the params'
         // packet mode (`connect_udp` requires it; the proto has no
         // `packet_encoding` field — spec §4.3, no proto changes allowed).

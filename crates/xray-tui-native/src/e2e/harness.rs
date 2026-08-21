@@ -441,8 +441,13 @@ pub fn spawn_core(
             c
         }
     };
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    if std::env::var("XRAY_TUI_CORE_LOG").is_ok() {
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+    } else {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
     let child = cmd.spawn().expect("spawn core");
 
     let mut attempts = 0;

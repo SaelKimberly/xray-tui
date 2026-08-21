@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{certs, cores, echo, fp, pick, reality, tls_echo};
+use common::{certs, cores, echo, fp, pick, pq_tls, reality, tls_echo};
 use rstest::rstest;
 use xray_tui_native::e2e::{
     Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest,
@@ -132,6 +132,16 @@ async fn vmess_against_cores(
 #[case::v2rayhttp_aes128gcm_chrome(
     vmess_tls(Aes128GcmVariant, "h2", fp("chrome")),
     CoreKind::SingBox
+)]
+// SP7 (VLESS ML-KEM spec §7.3): vmess tls-pq — the hybrid curve pinned on
+// BOTH ends (client `curves: "x25519mlkem768"`, server
+// tlsSettings.curvePreferences), so a green row is a negotiated ML-KEM-768
+// exchange; the runner asserts the engine's negotiated-hybrid flag.
+// xray-single-core per the SP7 counts contract (sing-box 1.13.16 accepts
+// curve_preferences — a both-core upgrade is a future count change).
+#[case::tcp_aes128gcm_tls_pq(
+    vmess_tls(Aes128GcmVariant, "tcp", pq_tls()).with_pq_assert(),
+    CoreKind::Xray
 )]
 #[tokio::test]
 async fn vmess_single_core(

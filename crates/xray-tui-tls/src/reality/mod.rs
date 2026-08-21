@@ -665,7 +665,8 @@ mod tests {
             let parsed = parse_hello(&ch).unwrap();
             let ks_ext = parsed.extension(0x0033).unwrap();
             // Walk the key-share list and find the X25519MLKEM768 entry
-            // (curve 4588 / 0x11EC): share = x25519_pub(32) || mlkem_pk(1184).
+            // (curve 4588 / 0x11EC): Go wire order — mlkem_pk(1184) first,
+            // x25519_pub(32) last.
             let list_len = u16::from_be_bytes([ks_ext[0], ks_ext[1]]) as usize;
             let mut off = 2usize;
             let end = 2 + list_len;
@@ -676,9 +677,9 @@ mod tests {
                 let kx_len = u16::from_be_bytes([ks_ext[off + 2], ks_ext[off + 3]]) as usize;
                 let share = &ks_ext[off + 4..off + 4 + kx_len];
                 if group == 0x11EC {
-                    assert_eq!(kx_len, 1216, "X25519MLKEM768 share must be 32 + 1184 bytes");
-                    client_x25519 = Some(share[..32].try_into().unwrap());
-                    client_mlkem_pk = Some(MlkemPublicKey::from_bytes(&share[32..]).unwrap());
+                    assert_eq!(kx_len, 1216, "X25519MLKEM768 share must be 1184 + 32 bytes");
+                    client_mlkem_pk = Some(MlkemPublicKey::from_bytes(&share[..1184]).unwrap());
+                    client_x25519 = Some(share[1184..].try_into().unwrap());
                 }
                 off += 4 + kx_len;
             }
@@ -698,7 +699,8 @@ mod tests {
             let classical = tls_kp.agree(&client_x25519).unwrap();
             let (ct, pq_ss) = Mlkem768::encapsulate(&client_mlkem_pk).unwrap();
 
-            // ServerHello: key_share group 11ec, share = pub(32) || ct(1088).
+            // ServerHello: key_share group 11ec, share = ct(1088) || pub(32)
+            // (Go wire order).
             let mut sh_body = Vec::new();
             sh_body.extend_from_slice(&0x0303u16.to_be_bytes());
             sh_body.extend_from_slice(&[0x5A; 32]);
@@ -711,8 +713,8 @@ mod tests {
             kse.extend_from_slice(&1124u16.to_be_bytes()); // 4 + 1120
             kse.extend_from_slice(&0x11ECu16.to_be_bytes());
             kse.extend_from_slice(&1120u16.to_be_bytes());
-            kse.extend_from_slice(&tls_kp.public_key());
             kse.extend_from_slice(ct.as_bytes());
+            kse.extend_from_slice(&tls_kp.public_key());
             sh_body.extend_from_slice(&u16::try_from(kse.len()).unwrap().to_be_bytes());
             sh_body.extend_from_slice(&kse);
             let sh_msg = make_hs_msg(HS_SERVER_HELLO, &sh_body);
@@ -721,10 +723,10 @@ mod tests {
             rec.extend_from_slice(&sh_msg);
             server_side.write_all(&rec).await.unwrap();
 
-            // Key schedule over `classical || pq` — 64 bytes for
-            // X25519MLKEM768.
-            let mut combined = classical.to_vec();
-            combined.extend_from_slice(pq_ss.as_bytes());
+            // Key schedule over `pq || classical` (Go hybrid contract) —
+            // 64 bytes for X25519MLKEM768.
+            let mut combined = pq_ss.as_bytes().to_vec();
+            combined.extend_from_slice(&classical);
             assert_eq!(combined.len(), 64);
             let mut sk = KeySchedule::new(suite);
             sk.add_transcript(&ch);

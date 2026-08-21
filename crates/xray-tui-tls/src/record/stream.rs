@@ -54,6 +54,11 @@ pub struct AppKeys {
 /// (RST arrives as an `io::Error` before the record layer observes EOF).
 /// Truncation attacks per RFC 8446 §6.1 are out of scope for this tunnel
 /// semantic; a `close_notify` is still honored as EOF when present.
+#[allow(
+    clippy::struct_excessive_bools,
+    // four per-stream state flags (direct write/read, EOF-closed, PQ
+    // negotiated); packing them into a bitmask saves nothing readable.
+)]
 pub struct TlsStream<S> {
     inner: S,
     keys: AppKeys,
@@ -72,6 +77,10 @@ pub struct TlsStream<S> {
     /// Read side switched to raw passthrough: `poll_read` reads from
     /// `inner` directly (no record parsing, no decryption).
     read_direct: bool,
+    /// The server selected a hybrid (post-quantum) key-share group in its
+    /// `ServerHello` — the key schedule consumed `classical || ML-KEM`
+    /// shared material. `false` = classical-only key exchange.
+    negotiated_hybrid: bool,
 }
 
 /// Incremental state of reading one TLS record off the wire.
@@ -103,7 +112,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             },
             write_direct: false,
             read_direct: false,
+            negotiated_hybrid: false,
         }
+    }
+
+    /// Whether the handshake negotiated a hybrid (post-quantum) key-share
+    /// group (`X25519MLKEM768` & co). Set by the handshake driver from the
+    /// `ServerHello`'s key share; e2e rows assert it so a PQ row that
+    /// silently fell back to classical fails.
+    #[must_use]
+    pub const fn negotiated_hybrid(&self) -> bool {
+        self.negotiated_hybrid
+    }
+
+    /// Record the negotiated key-exchange shape (handshake-driver internal).
+    pub(crate) const fn set_negotiated_hybrid(&mut self, hybrid: bool) {
+        self.negotiated_hybrid = hybrid;
     }
 
     /// Switch the write side to direct raw writes to the underlying stream.

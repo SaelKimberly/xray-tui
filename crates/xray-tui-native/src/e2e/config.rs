@@ -53,6 +53,48 @@ pub fn reality_sid() -> String {
     out
 }
 
+/// Fresh VLESS `mlkem768x25519plus` account key material.
+///
+/// Returns `(client encryption, server decryption)` strings sharing one
+/// keypair set — an X25519 keypair plus an ML-KEM-768 keypair derived from a
+/// random 64-byte FIPS 203 seed (`d || z`, Go `mlkem.NewDecapsulationKey768`'s
+/// format). The client string carries the PUBLIC halves (32-B X25519 pub +
+/// 1184-B encapsulation key); the server string the PRIVATE halves (32-B
+/// X25519 priv + the 64-B seed) — exactly the segment lengths xray's
+/// parsers accept (infra/conf/vless.go: 32/1184 outbound, 32/64 inbound).
+///
+/// Padding: the documented example triplets (first block probability ≥100,
+/// min ≥35 per `ParsePadding`); identical on both sides (each side pads its
+/// own output from its own spec).
+#[must_use]
+pub fn mlkem_enc_pair() -> (String, String) {
+    const PAD: &str = "100-111-1111.75-0-111.50-0-3333";
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let b64 = |b: &[u8]| URL_SAFE_NO_PAD.encode(b);
+    let mut x_priv = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut x_priv)
+        .expect("x25519 private key rng");
+    let x_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(x_priv));
+    let mut seed = [0u8; 64];
+    ring::rand::SystemRandom::new()
+        .fill(&mut seed)
+        .expect("mlkem seed rng");
+    let (ek, _) =
+        xray_tui_tls::crypto::mlkem::Mlkem768::keypair_from_seed(&seed).expect("mlkem seed keygen");
+    let client = format!(
+        "mlkem768x25519plus.native.1rtt.{PAD}.{}.{}",
+        b64(x_pub.as_bytes()),
+        b64(ek.as_bytes())
+    );
+    let server = format!(
+        "mlkem768x25519plus.native.0.{PAD}.{}.{}",
+        b64(&x_priv),
+        b64(&seed)
+    );
+    (client, server)
+}
+
 /// Inject the VLESS flow name into an inbound server JSON: xray's
 /// `settings.clients[0].flow`, sing-box's `users[0].flow`.
 ///
@@ -119,6 +161,9 @@ pub fn vmess_inbound(
                     "alpn": alpn
                 }
             });
+            if let Some(curves) = tls.curves() {
+                stream["tlsSettings"]["curvePreferences"] = serde_json::json!([curves]);
+            }
             match network {
                 "ws" => {
                     stream["wsSettings"] = serde_json::json!({ "path": "/ws" });
@@ -170,6 +215,9 @@ pub fn vmess_inbound(
                 "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path,
                     "alpn": alpn }
             });
+            if let Some(curves) = tls.curves() {
+                inbound["tls"]["curve_preferences"] = serde_json::json!([curves]);
+            }
             match network {
                 "ws" => {
                     inbound["transport"] = serde_json::json!({ "type": "ws", "path": "/ws" });
@@ -219,6 +267,11 @@ pub fn vless_inbound(
     flow: Option<Flow>,
     tls: &dyn TlsVariant,
     network: &str,
+    // The inbound `settings.decryption` value; `None` → `"none"`. The
+    // `mlkem768x25519plus` string (pq-enc row) carries the server's
+    // PRIVATE key segments (xray-only — sing-box has no VLESS account
+    // encryption).
+    decryption: Option<&str>,
 ) -> String {
     if let Some(private_key) = tls.reality_private_key() {
         let sid = tls
@@ -256,6 +309,9 @@ pub fn vless_inbound(
             } else {
                 serde_json::json!({ "network": network })
             };
+            if let Some(curves) = tls.curves() {
+                stream["tlsSettings"]["curvePreferences"] = serde_json::json!([curves]);
+            }
             match network {
                 "ws" => {
                     stream["wsSettings"] = serde_json::json!({ "path": "/ws" });
@@ -291,7 +347,10 @@ pub fn vless_inbound(
             serde_json::json!({
                 "inbounds": [{
                     "listen": "127.0.0.1", "port": env.port, "protocol": "vless",
-                    "settings": { "clients": [{ "id": UUID }], "decryption": "none" },
+                    "settings": {
+                        "clients": [{ "id": UUID }],
+                        "decryption": decryption.unwrap_or("none")
+                    },
                     "streamSettings": stream
                 }],
                 "outbounds": [{ "protocol": "freedom" }]
@@ -312,6 +371,9 @@ pub fn vless_inbound(
                     "users": [{ "uuid": UUID }]
                 })
             };
+            if let Some(curves) = tls.curves() {
+                inbound["tls"]["curve_preferences"] = serde_json::json!([curves]);
+            }
             match network {
                 "ws" => {
                     inbound["transport"] = serde_json::json!({ "type": "ws", "path": "/ws" });
@@ -565,6 +627,9 @@ fn plain_client_security(tls: &dyn TlsVariant, network: &str) -> serde_json::Val
     if let Some(fp) = tls.fingerprint() {
         security["fp"] = serde_json::json!(fp);
     }
+    if let Some(curves) = tls.curves() {
+        security["curves"] = serde_json::json!(curves);
+    }
     security
 }
 
@@ -765,8 +830,15 @@ mod tests {
             inner_tls_echo: None,
             udp_echo: None,
         };
-        let xray: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, None, &tls, "tcp")).unwrap();
+        let xray: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::Xray,
+            &env,
+            None,
+            &tls,
+            "tcp",
+            None,
+        ))
+        .unwrap();
         let settings = &xray["inbounds"][0]["streamSettings"]["realitySettings"];
         assert_eq!(settings["show"], false);
         assert_eq!(settings["dest"], "127.0.0.1:9443");
@@ -774,9 +846,15 @@ mod tests {
         assert_eq!(settings["privateKey"], tls.reality_private_key().unwrap());
         assert_eq!(settings["shortIds"][0], tls.reality_sid().unwrap());
 
-        let sing: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, None, &tls, "tcp"))
-                .unwrap();
+        let sing: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::SingBox,
+            &env,
+            None,
+            &tls,
+            "tcp",
+            None,
+        ))
+        .unwrap();
         let tls_block = &sing["inbounds"][0]["tls"];
         let reality = &tls_block["reality"];
         assert_eq!(tls_block["server_name"], "localhost");
@@ -862,6 +940,7 @@ mod tests {
             None,
             &StandardTls,
             "xhttp3",
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -902,6 +981,7 @@ mod tests {
             Some(Flow::Vision),
             &StandardTls,
             "tcp",
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -914,6 +994,7 @@ mod tests {
             Some(Flow::Vision),
             &StandardTls,
             "tcp",
+            None,
         ))
         .unwrap();
         assert_eq!(sing["inbounds"][0]["users"][0]["flow"], "xtls-rprx-vision");
@@ -926,6 +1007,7 @@ mod tests {
             Some(Flow::Vision),
             &reality,
             "tcp",
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -966,6 +1048,7 @@ mod tests {
                 Some(Flow::Udp443),
                 &StandardTls,
                 "tcp",
+                None,
             ))
             .unwrap();
             let flow = &server["inbounds"][0]["settings"]["clients"][0]["flow"];
@@ -1003,7 +1086,7 @@ mod tests {
         // Neither xray's clients[0] nor sing-box's users[0] carry a flow key.
         for core in [CoreKind::Xray, CoreKind::SingBox] {
             let server: serde_json::Value =
-                serde_json::from_str(&vless_inbound(core, &env, None, &StandardTls, "tcp"))
+                serde_json::from_str(&vless_inbound(core, &env, None, &StandardTls, "tcp", None))
                     .unwrap();
             assert!(server["inbounds"][0]["settings"]["clients"][0]["flow"].is_null());
             assert!(server["inbounds"][0]["users"][0]["flow"].is_null());
@@ -1030,18 +1113,30 @@ mod tests {
             inner_tls_echo: None,
             udp_echo: None,
         };
-        let xray: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::Xray, &env, None, &NoTls, "kcp"))
-                .unwrap();
+        let xray: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::Xray,
+            &env,
+            None,
+            &NoTls,
+            "kcp",
+            None,
+        ))
+        .unwrap();
         let stream = &xray["inbounds"][0]["streamSettings"];
         assert_eq!(stream["network"], "kcp");
         assert!(stream.get("security").is_none());
         assert!(stream.get("tlsSettings").is_none());
         assert!(stream.get("kcpSettings").is_some());
 
-        let sing: serde_json::Value =
-            serde_json::from_str(&vless_inbound(CoreKind::SingBox, &env, None, &NoTls, "kcp"))
-                .unwrap();
+        let sing: serde_json::Value = serde_json::from_str(&vless_inbound(
+            CoreKind::SingBox,
+            &env,
+            None,
+            &NoTls,
+            "kcp",
+            None,
+        ))
+        .unwrap();
         let inbound = &sing["inbounds"][0];
         assert!(inbound.get("tls").is_none());
         assert!(inbound["users"][0]["uuid"].is_string());
