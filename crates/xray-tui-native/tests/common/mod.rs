@@ -66,7 +66,6 @@ pub fn reality() -> Box<dyn TlsVariant> {
 /// accepts nothing else — a green row is a negotiated ML-KEM-768 exchange
 /// (SP7 spec §7.3).
 #[must_use]
-#[allow(dead_code)] // pq-only variant (unused in one of the two test binaries)
 pub fn pq_tls() -> Box<dyn TlsVariant> {
     Box::new(PqTls)
 }

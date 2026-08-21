@@ -144,6 +144,14 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
         .with_app(AppKind::Udp)
         .with_udp(PacketMode::XUdp)
 )]
+// SP7 (VLESS ML-KEM) tls-pq row (spec §7.3): the hybrid curve pinned on
+// BOTH ends — the client offers only the X25519MLKEM768 key share
+// (`curves: "x25519mlkem768"`) and the server's tlsSettings.curvePreferences
+// accepts nothing else, so a green row is a negotiated ML-KEM-768 exchange,
+// never a classical fallback; the runner additionally asserts the engine's
+// negotiated-hybrid flag. Both cores accept curve_preferences (sing-box
+// 1.13.16 verified empirically).
+#[case::tcp_tls_pq(vless_tls("tcp", pq_tls()).with_pq_assert())]
 #[tokio::test]
 async fn vless_against_cores(
     #[case] case: CaseSpec,
@@ -238,17 +246,10 @@ async fn vless_against_cores(
 // dial + security-wrap composition arms.
 #[case::kcp_plain(vless_tls("kcp", no_tls()), CoreKind::Xray)]
 #[case::kcp_chrome(vless_tls("kcp", fp("chrome")), CoreKind::Xray)]
-// SP7 (VLESS ML-KEM) PQ rows (spec §7.3) — xray-single-core (sing-box
-// 1.13.16 accepts `curve_preferences` but has no VLESS account encryption,
-// so the pq-enc row pins the trio to xray; the counts contract keeps all
-// three single-core).
+// SP7 (VLESS ML-KEM) PQ rows (spec §7.3) — xray-single-core: sing-box
+// 1.13.16 has no VLESS account encryption, so pq-enc pins xray; reality-pq
+// is blocked by the harness dest regardless of core.
 //
-// tls-pq: the hybrid curve pinned on BOTH ends — the client offers only the
-// X25519MLKEM768 key share (`curves: "x25519mlkem768"`) and the server's
-// tlsSettings.curvePreferences accepts nothing else, so a green row is a
-// negotiated ML-KEM-768 exchange, never a classical fallback; the runner
-// additionally asserts the engine's negotiated-hybrid flag.
-#[case::tcp_tls_pq(vless_tls("tcp", pq_tls()).with_pq_assert(), CoreKind::Xray)]
 // reality-pq: BLOCKED by the harness dest, not by the client. The xray
 // REALITY server replays the DEST's ServerHello flight as camouflage
 // (xtls/reality tls.go s2cSaved — the share group check at :359 accepts

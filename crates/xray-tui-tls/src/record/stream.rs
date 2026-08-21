@@ -78,8 +78,8 @@ pub struct TlsStream<S> {
     /// `inner` directly (no record parsing, no decryption).
     read_direct: bool,
     /// The server selected a hybrid (post-quantum) key-share group in its
-    /// `ServerHello` — the key schedule consumed `classical || ML-KEM`
-    /// shared material. `false` = classical-only key exchange.
+    /// `ServerHello` — the key schedule consumed `pq || classical` shared
+    /// material. `false` = classical-only key exchange.
     negotiated_hybrid: bool,
 }
 
