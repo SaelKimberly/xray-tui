@@ -410,6 +410,9 @@ impl TlsConfig {
 pub struct TlsOpts {
     pub sni: Option<TinyText>,
     pub alpn: Option<TinyText>,
+    /// Comma-separated TLS curve preferences (`curvePreferences` mirror);
+    /// parsed by [`parse_curve_names`].
+    pub curves: Option<TinyText>,
     pub fp: Option<TinyText>,
     pub insecure: Option<bool>,
     pub pqv: Option<TinyText>,
@@ -417,6 +420,54 @@ pub struct TlsOpts {
     pub vcn: Option<bool>,
     pub pcs: Option<TinyText>,
     pub pin_sha256: Option<TinyText>,
+}
+
+/// TLS curve IDs (Go `tls.CurveID` / utls hybrid groups) — the wire values
+/// the native TLS engine advertises in `supported_groups` / `key_share`.
+pub mod curve_id {
+    pub const P256: u16 = 23;
+    pub const P384: u16 = 24;
+    pub const P521: u16 = 25;
+    pub const X25519: u16 = 29;
+    /// `SecP256r1MLKEM768` hybrid (0x11EB).
+    pub const SECP256R1_MLKEM768: u16 = 4587;
+    /// `X25519MLKEM768` hybrid (0x11EC) — xray's primary hybrid group.
+    pub const X25519_MLKEM768: u16 = 4588;
+    /// `SecP384r1MLKEM1024` hybrid (0x11ED).
+    pub const SECP384R1_MLKEM1024: u16 = 4589;
+}
+
+/// Parse a comma-separated curve-preference list into wire curve IDs — a
+/// mirror of xray's `ParseCurveName` (`transport/internet/tls/config.go`).
+///
+/// The seven known names are matched case-insensitively (`strings.ToLower`);
+/// unsupported names are skipped with a warning, never an error.
+#[must_use]
+pub fn parse_curve_names(names: &str) -> Vec<u16> {
+    use curve_id::{
+        P256, P384, P521, SECP256R1_MLKEM768, SECP384R1_MLKEM1024, X25519, X25519_MLKEM768,
+    };
+    names
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|name| {
+            let id = match name.to_ascii_lowercase().as_str() {
+                "curvep256" => P256,
+                "curvep384" => P384,
+                "curvep521" => P521,
+                "x25519" => X25519,
+                "x25519mlkem768" => X25519_MLKEM768,
+                "secp256r1mlkem768" => SECP256R1_MLKEM768,
+                "secp384r1mlkem1024" => SECP384R1_MLKEM1024,
+                other => {
+                    tracing::warn!(target: "proto_spec::common", curve = %other, "unsupported curve name");
+                    return None;
+                }
+            };
+            Some(id)
+        })
+        .collect()
 }
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1113,6 +1164,46 @@ mod tests {
     use super::*;
     use crate::proto_spec::{ProtoSpec, VlessConfig};
     use crate::urlx::RawUrlX;
+    #[test]
+    fn parse_curve_names_maps_all_seven_xray_names() {
+        use super::curve_id::{
+            P256, P384, P521, SECP256R1_MLKEM768, SECP384R1_MLKEM1024, X25519, X25519_MLKEM768,
+        };
+        assert_eq!(parse_curve_names("curvep256"), vec![P256]);
+        assert_eq!(parse_curve_names("curvep384"), vec![P384]);
+        assert_eq!(parse_curve_names("curvep521"), vec![P521]);
+        assert_eq!(parse_curve_names("x25519"), vec![X25519]);
+        assert_eq!(parse_curve_names("x25519mlkem768"), vec![X25519_MLKEM768]);
+        assert_eq!(
+            parse_curve_names("secp256r1mlkem768"),
+            vec![SECP256R1_MLKEM768]
+        );
+        assert_eq!(
+            parse_curve_names("secp384r1mlkem1024"),
+            vec![SECP384R1_MLKEM1024]
+        );
+    }
+
+    #[test]
+    fn parse_curve_names_is_case_insensitive_and_skips_unknown() {
+        // xray lowercases via strings.ToLower before the map lookup.
+        assert_eq!(
+            parse_curve_names("X25519MLKEM768, CurveP256"),
+            vec![4588, 23]
+        );
+        // Unknown names warn + skip (never error) — ParseCurveName mirror.
+        assert_eq!(parse_curve_names("bogus,x25519,p521x"), vec![29]);
+        assert!(parse_curve_names("").is_empty());
+        assert!(parse_curve_names(" , ").is_empty());
+    }
+
+    #[test]
+    fn tls_opts_curves_serde_roundtrip() {
+        let opts: TlsOpts = serde_json::from_str(r#"{"curves":"x25519mlkem768"}"#).unwrap();
+        assert_eq!(opts.curves.as_deref(), Some("x25519mlkem768"));
+        // Absent field stays None — identity configs are unchanged.
+        assert_eq!(TlsOpts::default().curves, None);
+    }
 
     #[test]
     fn vless_stream_settings_emits_xray_stream_settings() {

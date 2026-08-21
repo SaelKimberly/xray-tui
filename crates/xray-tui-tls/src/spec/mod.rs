@@ -41,7 +41,7 @@ impl Default for RuntimeValues {
 }
 
 /// How the `ClientHello` session id is produced.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionIdSpec {
     /// 32 random bytes, the TLS 1.3 default.
     Random32,
@@ -53,7 +53,7 @@ pub enum SessionIdSpec {
 }
 
 /// A single TLS extension in the `ClientHello`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionSpec {
     ServerName,
     SupportedGroups(Vec<u16>),
@@ -76,7 +76,7 @@ pub enum ExtensionSpec {
 }
 
 /// One key-share entry in the `key_share` extension.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyShareGroup {
     /// A GREASE group; the wire value comes from `RuntimeValues::grease_a`.
     Grease,
@@ -93,7 +93,7 @@ pub enum KeyShareGroup {
 }
 
 /// The semantic `ClientHello` description.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHelloSpec {
     /// TLS legacy record version, always `0x0303` for TLS 1.3.
     pub legacy_version: u16,
@@ -103,6 +103,50 @@ pub struct ClientHelloSpec {
     pub compression_methods: Vec<u8>,
     pub session_id: SessionIdSpec,
     pub extensions: Vec<ExtensionSpec>,
+}
+
+/// Apply config-driven curve preferences to a spec — the client-side mirror
+/// of xray's `CurvePreferences` handling (`transport/internet/tls/config.go`).
+///
+/// - `supported_groups` is replaced by `curves` verbatim (xray replaces the
+///   offered list; the config override intentionally departs from the
+///   fingerprint profile's list).
+/// - `key_share` keeps the profile's GREASE entries (fingerprint-critical,
+///   orthogonal to curve selection) and gains one entry per configured ID
+///   that has a key-share group: X25519 and the three ML-KEM hybrids. The
+///   classical P-256/P-384/P-521 IDs are advertised in `supported_groups`
+///   but produce no key share — the engine implements no P-curve key
+///   exchange (see [`KeyShareGroup`]).
+///
+/// Extensions the spec does not carry are left absent.
+#[must_use]
+pub fn apply_curve_preferences(spec: &ClientHelloSpec, curves: &[u16]) -> ClientHelloSpec {
+    let key_share_group = |id: u16| match id {
+        0x001D => Some(KeyShareGroup::X25519),
+        0x11EC => Some(KeyShareGroup::X25519Mlkem768),
+        0x11EB => Some(KeyShareGroup::Secp256r1Mlkem768),
+        0x11ED => Some(KeyShareGroup::Secp384r1Mlkem1024),
+        _ => None,
+    };
+    let mut out = spec.clone();
+    for ext in &mut out.extensions {
+        match ext {
+            ExtensionSpec::SupportedGroups(_) => {
+                *ext = ExtensionSpec::SupportedGroups(curves.to_vec());
+            }
+            ExtensionSpec::KeyShare(groups) => {
+                let mut rewritten: Vec<KeyShareGroup> = groups
+                    .iter()
+                    .filter(|g| matches!(g, KeyShareGroup::Grease))
+                    .cloned()
+                    .collect();
+                rewritten.extend(curves.iter().filter_map(|id| key_share_group(*id)));
+                *groups = rewritten;
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 impl ExtensionSpec {
@@ -291,6 +335,76 @@ mod tests {
     fn grease_detection() {
         assert!(is_grease(0x0A0A) && is_grease(0xCACA) && is_grease(0xFAFA));
         assert!(!is_grease(0x1301) && !is_grease(0x1516) && !is_grease(0x0000));
+    }
+
+    /// A minimal spec carrying the two curve-bearing extensions.
+    fn curve_spec() -> ClientHelloSpec {
+        ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![
+                ExtensionSpec::SupportedGroups(vec![0x11EC, 0x001D, 0x0017]),
+                ExtensionSpec::KeyShare(vec![
+                    KeyShareGroup::Grease,
+                    KeyShareGroup::X25519Mlkem768,
+                    KeyShareGroup::X25519,
+                ]),
+            ],
+        }
+    }
+
+    #[test]
+    fn curve_preferences_replace_supported_groups_and_key_share() {
+        let out = apply_curve_preferences(&curve_spec(), &[0x001D, 0x11EC]);
+        assert_eq!(
+            out.extensions[0],
+            ExtensionSpec::SupportedGroups(vec![0x001D, 0x11EC])
+        );
+        // GREASE kept, entries re-derived from the configured IDs in order.
+        assert_eq!(
+            out.extensions[1],
+            ExtensionSpec::KeyShare(vec![
+                KeyShareGroup::Grease,
+                KeyShareGroup::X25519,
+                KeyShareGroup::X25519Mlkem768
+            ])
+        );
+    }
+
+    #[test]
+    fn curve_preferences_map_all_hybrid_and_classical_ids() {
+        // P-384/P-521 advertise but yield no key share (no P-curve KEX);
+        // the three ML-KEM hybrids map to their key-share groups.
+        let out = apply_curve_preferences(&curve_spec(), &[0x0018, 0x0019, 0x11EB, 0x11EC, 0x11ED]);
+        assert_eq!(
+            out.extensions[1],
+            ExtensionSpec::KeyShare(vec![
+                KeyShareGroup::Grease,
+                KeyShareGroup::Secp256r1Mlkem768,
+                KeyShareGroup::X25519Mlkem768,
+                KeyShareGroup::Secp384r1Mlkem1024,
+            ])
+        );
+    }
+
+    #[test]
+    fn curve_preferences_leave_absent_extensions_absent() {
+        let mut spec = curve_spec();
+        spec.extensions.retain(|e| {
+            !matches!(
+                e,
+                ExtensionSpec::SupportedGroups(_) | ExtensionSpec::KeyShare(_)
+            )
+        });
+        let out = apply_curve_preferences(&spec, &[0x001D]);
+        assert!(out.extensions.is_empty());
+        // The input spec is untouched (borrow → clone semantics).
+        assert_eq!(
+            curve_spec().extensions[0],
+            ExtensionSpec::SupportedGroups(vec![0x11EC, 0x001D, 0x0017])
+        );
     }
 
     #[rstest]

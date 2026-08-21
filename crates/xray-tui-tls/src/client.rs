@@ -43,9 +43,16 @@ pub struct TlsConfig {
     pub mode: TlsMode,
     /// SNI (the `server_name` extension and verifier host).
     pub server_name: String,
-    /// Plain: override the spec's ALPN list. Reality: ignored (protocol
-    /// forces h2 + http/1.1).
+    /// ALPN protocols to offer; `None`/empty uses the profile's own list
+    /// (REALITY forces h2 + http/1.1).
     pub alpn: Option<Vec<Vec<u8>>>,
+    /// Config-driven curve preferences (wire curve IDs, e.g. from the
+    /// proto's `parse_curve_names`); applied to the plain-TLS spec's
+    /// `supported_groups`/`key_share` via
+    /// [`crate::spec::apply_curve_preferences`]. `None`/empty keeps the
+    /// profile's list. REALITY provisioners own their hello shape and
+    /// ignore this.
+    pub curves: Option<Vec<u16>>,
     /// Random source; `SystemRandom` default.
     pub rng: Arc<dyn SecureRandom>,
 }
@@ -61,6 +68,7 @@ impl TlsConfig {
             mode: TlsMode::Plain { profile, verifier },
             server_name: server_name.into(),
             alpn: None,
+            curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
         }
     }
@@ -82,6 +90,7 @@ impl TlsConfig {
             },
             server_name: server_name.into(),
             alpn: None,
+            curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
         }
     }
@@ -92,7 +101,12 @@ pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Resu
     match &config.mode {
         TlsMode::Plain { profile, verifier } => {
             let profile = profile.unwrap_or(BrowserProfile::Chrome130);
-            let spec = profile.spec();
+            let spec = match config.curves.as_deref() {
+                Some(curves) if !curves.is_empty() => {
+                    crate::spec::apply_curve_preferences(&profile.spec(), curves)
+                }
+                _ => profile.spec(),
+            };
             let alpn: Option<Vec<&str>> = config
                 .alpn
                 .as_ref()
@@ -294,6 +308,7 @@ mod tests {
             },
             server_name: "localhost".to_string(),
             alpn: Some(vec![vec![0xFF]]),
+            curves: None,
             rng: Arc::new(ring::rand::SystemRandom::new()),
         };
         let result = connect(client, &config).await;

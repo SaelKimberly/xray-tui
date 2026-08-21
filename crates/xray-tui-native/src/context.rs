@@ -5,7 +5,9 @@ use xray_tui_proto::proto_spec::common::{
     XHttpConfig,
 };
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
-use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
+use xray_tui_proto::proto_spec::{
+    ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts, parse_curve_names,
+};
 
 use crate::addr::Host;
 use crate::error::{NativeError, timeouts};
@@ -143,6 +145,18 @@ impl LinkContext {
             Some("ws" | "httpupgrade") => vec![b"http/1.1".to_vec()],
             _ => vec![],
         }
+    }
+
+    /// TLS curve preferences: the `curves` option parsed to wire curve IDs
+    /// via the proto's `parse_curve_names` (xray `ParseCurveName` mirror —
+    /// unknown names skipped). Empty when unset or security is REALITY.
+    #[must_use]
+    pub fn curve_ids(&self) -> Vec<u16> {
+        self.tls_opts()
+            .ok()
+            .flatten()
+            .and_then(|o| o.curves.as_ref())
+            .map_or_else(Vec::new, |c| parse_curve_names(c.as_str()))
     }
 
     /// The typed TLS options when security is plain TLS (not Reality).
@@ -318,6 +332,91 @@ mod tests {
         );
         let ctx = LinkContext::new(params, target("example.com"));
         assert!(ctx.alpn_vec().is_empty());
+    }
+
+    #[test]
+    fn curve_ids_parse_curves_option() {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "security": {
+                "type": "tls", "sni": "sni.example",
+                "curves": "X25519MLKEM768, x25519, bogus"
+            },
+            "transport": { "type": "tcp" }
+        }))
+        .expect("vless tls+curves config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("127.0.0.1", 4430),
+                target("example.com"),
+            ),
+            target("example.com"),
+        );
+        // Case-insensitive; unknown names skipped (ParseCurveName mirror).
+        assert_eq!(ctx.curve_ids(), vec![4588, 29]);
+    }
+
+    #[test]
+    fn curve_ids_empty_without_curves_option() {
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                vless_empty(),
+                EndpointEssentials::new("127.0.0.1", 4430),
+                target("example.com"),
+            ),
+            target("example.com"),
+        );
+        assert!(ctx.curve_ids().is_empty());
+    }
+
+    /// The full plumbing: config string → proto parse → native params →
+    /// the TLS spec's `supported_groups`/`key_share` extensions.
+    #[test]
+    fn curves_config_flows_to_tls_spec_extensions() {
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "security": {
+                "type": "tls", "sni": "sni.example",
+                "curves": "x25519mlkem768,x25519"
+            },
+            "transport": { "type": "tcp" }
+        }))
+        .expect("vless tls+curves config parses");
+        let ctx = LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("127.0.0.1", 4430),
+                target("example.com"),
+            ),
+            target("example.com"),
+        );
+        let ids = ctx.curve_ids();
+        assert_eq!(ids, vec![4588, 29]);
+
+        let spec = xray_tui_tls::spec::apply_curve_preferences(
+            &xray_tui_tls::profiles::BrowserProfile::Chrome133.spec(),
+            &ids,
+        );
+        let groups = spec.extensions.iter().find_map(|e| match e {
+            xray_tui_tls::spec::ExtensionSpec::SupportedGroups(g) => Some(g.clone()),
+            _ => None,
+        });
+        assert_eq!(groups, Some(vec![4588, 29]));
+        let key_shares = spec.extensions.iter().find_map(|e| match e {
+            xray_tui_tls::spec::ExtensionSpec::KeyShare(g) => Some(g.clone()),
+            _ => None,
+        });
+        assert!(matches!(
+            key_shares.as_deref(),
+            Some([
+                xray_tui_tls::spec::KeyShareGroup::Grease,
+                xray_tui_tls::spec::KeyShareGroup::X25519Mlkem768,
+                xray_tui_tls::spec::KeyShareGroup::X25519
+            ])
+        ));
     }
 
     #[test]

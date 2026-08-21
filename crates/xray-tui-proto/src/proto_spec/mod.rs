@@ -35,7 +35,10 @@ mod vless;
 mod vmess;
 mod wireguard;
 pub use anytls::AnyTlsConfig;
-pub use common::{HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig};
+pub use common::{
+    HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig, curve_id,
+    parse_curve_names,
+};
 pub use endpoint::{ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials};
 pub use error::SupportError;
 pub use http_client::HttpClientConfig;

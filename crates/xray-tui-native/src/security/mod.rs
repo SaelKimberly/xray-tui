@@ -52,6 +52,10 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 mode: TlsMode::Plain { profile, verifier },
                 server_name: ctx.sni(),
                 alpn: (!ctx.alpn_vec().is_empty()).then(|| ctx.alpn_vec()),
+                curves: {
+                    let ids = ctx.curve_ids();
+                    (!ids.is_empty()).then_some(ids)
+                },
                 rng,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
@@ -96,6 +100,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 // (often IP-literal) server host.
                 server_name: sec.sni().unwrap_or(&ctx.params.server.host).to_string(),
                 alpn: None,
+                curves: None,
                 rng,
             };
             let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
