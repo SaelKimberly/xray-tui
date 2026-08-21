@@ -40,7 +40,7 @@ use crate::handshake::{AuthOutcome, ServerAuth, drive};
 use crate::hello::{BuildParams, build_hello};
 use crate::profiles::BrowserProfile;
 use crate::record::stream::TlsStream;
-use crate::spec::SessionIdSpec;
+use crate::spec::{ExtensionSpec, KeyShareGroup, SessionIdSpec};
 
 /// The `ClientHello` ALPN list REALITY always offers.
 const REALITY_ALPN: &[&str] = &["h2", "http/1.1"];
@@ -53,6 +53,16 @@ pub trait HelloProvisioner: Send + Sync {
     /// Returns the bare `ClientHello` plus the `SessionId` byte range.
     /// The returned range is computed by the builder — never hardcoded.
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello>;
+
+    /// Whether the provisioned `ClientHello` offers a hybrid ML-KEM key
+    /// share. The conservative default `true` keeps the connector
+    /// generating an ML-KEM-768 key pair (a custom provisioner may embed
+    /// a hybrid entry invisible to us); [`ProfileProvisioner`] overrides
+    /// with the actual spec check so classical-only profiles skip the
+    /// keygen entirely.
+    fn offers_hybrid_key_share(&self) -> bool {
+        true
+    }
 }
 
 /// Inputs the REALITY connector hands to a provisioner.
@@ -115,6 +125,21 @@ impl HelloProvisioner for ProfileProvisioner {
         Ok(ProvisionedHello {
             handshake_bytes: built.handshake_bytes,
             session_id_range,
+        })
+    }
+
+    fn offers_hybrid_key_share(&self) -> bool {
+        self.0.spec().extensions.iter().any(|ext| {
+            matches!(
+                ext,
+                ExtensionSpec::KeyShare(groups)
+                    if groups.iter().any(|g| matches!(
+                        g,
+                        KeyShareGroup::X25519Mlkem768
+                            | KeyShareGroup::Secp256r1Mlkem768
+                            | KeyShareGroup::Secp384r1Mlkem1024
+                    ))
+            )
         })
     }
 }
@@ -196,12 +221,16 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
     //    the provisioned hello *is* the REALITY random.
     let keypair = X25519KeyPair::generate(params.rng)?;
 
-    // 1b. Ephemeral ML-KEM-768 key pair: the Chrome-133 family specs offer
-    //     the X25519MLKEM768 hybrid group, so the encapsulation key flows
-    //     into the provisioned key share. Provisioners whose spec has no
-    //     hybrid entry simply ignore it.
-    let (pq_public, pq_secret) =
-        Mlkem768::generate_keypair().map_err(|e| TlsError::Crypto(e.to_string()))?;
+    // 1b. Ephemeral ML-KEM-768 key pair: only when the provisioner's spec
+    //     offers a hybrid key-share entry (the Chrome-133 family does) —
+    //     the encapsulation key then flows into the provisioned key share.
+    //     Classical-only profiles skip the ~100 µs keygen entirely.
+    let (pq_public, pq_secret) = if params.provisioner.offers_hybrid_key_share() {
+        let (pk, sk) = Mlkem768::generate_keypair().map_err(|e| TlsError::Crypto(e.to_string()))?;
+        (Some(pk), Some(sk))
+    } else {
+        (None, None)
+    };
 
     // 2. Provision the Chrome-133-shaped ClientHello with a zeroed
     //    AuthPayload slot; the connector's keyshare and rng flow through.
@@ -209,7 +238,9 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
         server_name: params.server_name,
         alpn: Some(REALITY_ALPN),
         x25519_pub: &keypair.public_key(),
-        mlkem768_pub: Some(pq_public.as_bytes()),
+        mlkem768_pub: pq_public
+            .as_ref()
+            .map(crate::crypto::mlkem::PublicKey::as_bytes),
         rng: params.rng,
     })?;
     let client_random = messages::extract_client_random(&hello.handshake_bytes)?;
@@ -244,7 +275,7 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
         &hello.handshake_bytes,
         hello.session_id(),
         keypair,
-        Some(&pq_secret),
+        pq_secret.as_ref(),
         params.server_name,
         ServerAuth::Reality {
             auth_key: &auth_key,
@@ -588,5 +619,251 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// A REALITY handshake over the X25519MLKEM768 hybrid group (xray
+    /// `reality.go:79` / sing-box `reality_client.go:136` semantics): a
+    /// fake REALITY server double reads the client's 1216-byte hybrid key
+    /// share, encapsulates to the ML-KEM-768 public key, feeds
+    /// `classical || pq` through the key schedule, and authenticates with
+    /// a REALITY-stamped Ed25519 certificate (`HMAC-SHA512(auth_key,
+    /// ed25519_pub)` signature field + `CertificateVerify` over the
+    /// transcript). Client success (`Ok`, not `RealityFallback`) plus the
+    /// encrypted echo proves the PQ path engaged and both sides derived
+    /// matching traffic keys.
+    #[tokio::test]
+    async fn reality_hybrid_handshake_completes_against_fake_pq_server() {
+        use crate::crypto::mlkem::PublicKey as MlkemPublicKey;
+        use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair};
+        use crate::handshake::make_hs_msg;
+        use crate::record::{
+            CONTENT_APPLICATION_DATA, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
+            HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, aead_aad, make_app_data_record,
+        };
+        use ring::hmac;
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const AEAD_TAG_LEN: usize = 16;
+
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let rng = ring::rand::SystemRandom::new();
+
+        // The server's static REALITY identity key (the client's `pbk`).
+        let static_kp = X25519KeyPair::generate(&rng).unwrap();
+
+        let (client_stream, mut server_side) = tokio::io::duplex(64 * 1024);
+        let static_pub = static_kp.public_key();
+        let server_rng = ring::rand::SystemRandom::new();
+        let server = tokio::spawn(async move {
+            // Read the ClientHello record; pull the hybrid key share.
+            let mut hdr = [0u8; 5];
+            server_side.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], 0x16);
+            let mut ch = vec![0u8; u16::from_be_bytes([hdr[3], hdr[4]]) as usize];
+            server_side.read_exact(&mut ch).await.unwrap();
+            let parsed = parse_hello(&ch).unwrap();
+            let ks_ext = parsed.extension(0x0033).unwrap();
+            // Walk the key-share list and find the X25519MLKEM768 entry
+            // (curve 4588 / 0x11EC): share = x25519_pub(32) || mlkem_pk(1184).
+            let list_len = u16::from_be_bytes([ks_ext[0], ks_ext[1]]) as usize;
+            let mut off = 2usize;
+            let end = 2 + list_len;
+            let mut client_x25519 = None;
+            let mut client_mlkem_pk = None;
+            while off + 4 <= end.min(ks_ext.len()) {
+                let group = u16::from_be_bytes([ks_ext[off], ks_ext[off + 1]]);
+                let kx_len = u16::from_be_bytes([ks_ext[off + 2], ks_ext[off + 3]]) as usize;
+                let share = &ks_ext[off + 4..off + 4 + kx_len];
+                if group == 0x11EC {
+                    assert_eq!(kx_len, 1216, "X25519MLKEM768 share must be 32 + 1184 bytes");
+                    client_x25519 = Some(share[..32].try_into().unwrap());
+                    client_mlkem_pk = Some(MlkemPublicKey::from_bytes(&share[32..]).unwrap());
+                }
+                off += 4 + kx_len;
+            }
+            let (client_x25519, client_mlkem_pk) = (
+                client_x25519.expect("ClientHello must offer the X25519MLKEM768 key share"),
+                client_mlkem_pk.unwrap(),
+            );
+
+            // REALITY auth key: ECDH(static_priv, client_keyshare) with
+            // salt = client_random[..20] — mirrors derive on the client.
+            let random = messages::extract_client_random(&ch).unwrap();
+            let auth_shared = static_kp.agree(&client_x25519).unwrap();
+            let auth_key = auth::derive_auth_key(&auth_shared, &random[..20], b"REALITY").unwrap();
+
+            // TLS ephemeral keyshare + PQ encapsulation (hybrid contract).
+            let tls_kp = X25519KeyPair::generate(&server_rng).unwrap();
+            let classical = tls_kp.agree(&client_x25519).unwrap();
+            let (ct, pq_ss) = Mlkem768::encapsulate(&client_mlkem_pk).unwrap();
+
+            // ServerHello: key_share group 11ec, share = pub(32) || ct(1088).
+            let mut sh_body = Vec::new();
+            sh_body.extend_from_slice(&0x0303u16.to_be_bytes());
+            sh_body.extend_from_slice(&[0x5A; 32]);
+            sh_body.push(u8::try_from(parsed.session_id.len()).unwrap());
+            sh_body.extend_from_slice(&parsed.session_id);
+            sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
+            sh_body.push(0); // compression method
+            let mut kse = Vec::new();
+            kse.extend_from_slice(&0x0033u16.to_be_bytes());
+            kse.extend_from_slice(&1124u16.to_be_bytes()); // 4 + 1120
+            kse.extend_from_slice(&0x11ECu16.to_be_bytes());
+            kse.extend_from_slice(&1120u16.to_be_bytes());
+            kse.extend_from_slice(&tls_kp.public_key());
+            kse.extend_from_slice(ct.as_bytes());
+            sh_body.extend_from_slice(&u16::try_from(kse.len()).unwrap().to_be_bytes());
+            sh_body.extend_from_slice(&kse);
+            let sh_msg = make_hs_msg(HS_SERVER_HELLO, &sh_body);
+            let mut rec = vec![0x16, 0x03, 0x03];
+            rec.extend_from_slice(&u16::try_from(sh_msg.len()).unwrap().to_be_bytes());
+            rec.extend_from_slice(&sh_msg);
+            server_side.write_all(&rec).await.unwrap();
+
+            // Key schedule over `classical || pq` — 64 bytes for
+            // X25519MLKEM768.
+            let mut combined = classical.to_vec();
+            combined.extend_from_slice(pq_ss.as_bytes());
+            assert_eq!(combined.len(), 64);
+            let mut sk = KeySchedule::new(suite);
+            sk.add_transcript(&ch);
+            sk.add_transcript(&sh_msg);
+            let hs_secret = sk.handshake_secret(&combined).unwrap();
+            let (_client_hs_ts, server_hs_ts) = sk.handshake_traffic_secrets(&hs_secret).unwrap();
+            let server_hs_key = AeadKey::new(suite, &server_hs_ts).unwrap();
+
+            // A REAL Ed25519 certificate stamped with the REALITY HMAC.
+            let rcgen_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let params =
+                rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
+            let mut cert_der = params.self_signed(&rcgen_key).unwrap().der().to_vec();
+            let signing_key = Ed25519KeyPair::from_pkcs8(rcgen_key.serialized_der()).unwrap();
+            let sig_offset = crate::reality::verify::extract_certificate_signature(&cert_der)
+                .unwrap()
+                .as_ptr() as usize
+                - cert_der.as_ptr() as usize;
+            let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, &auth_key);
+            let tag = hmac::sign(&hmac_key, signing_key.public_key().as_ref());
+            cert_der[sig_offset..sig_offset + 64].copy_from_slice(tag.as_ref());
+
+            // Encrypted flight: EE + Certificate + CertificateVerify
+            // (Ed25519 over the transcript) + Finished (real MAC).
+            let ee_msg = make_hs_msg(HS_ENCRYPTED_EXTENSIONS, &[0x00, 0x00]);
+            let entry_len = 3 + cert_der.len() + 2;
+            let mut cert_body = Vec::new();
+            cert_body.push(0x00); // certificate_request_context length
+            cert_body.extend_from_slice(&u32::try_from(entry_len).unwrap().to_be_bytes()[1..]);
+            cert_body.extend_from_slice(&u32::try_from(cert_der.len()).unwrap().to_be_bytes()[1..]);
+            cert_body.extend_from_slice(&cert_der);
+            cert_body.extend_from_slice(&[0x00, 0x00]); // per-cert extensions
+            let cert_msg = make_hs_msg(HS_CERTIFICATE, &cert_body);
+
+            let mut transcript = Vec::new();
+            transcript.extend_from_slice(&ch);
+            transcript.extend_from_slice(&sh_msg);
+            transcript.extend_from_slice(&ee_msg);
+            transcript.extend_from_slice(&cert_msg);
+            let transcript_hash = ring::digest::digest(&ring::digest::SHA256, &transcript);
+            let mut signed_content = Vec::new();
+            signed_content.extend_from_slice(&[0x20u8; 64]);
+            signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+            signed_content.push(0x00);
+            signed_content.extend_from_slice(transcript_hash.as_ref());
+            let cv_sig = signing_key.sign(&signed_content);
+            let mut cv_body = Vec::new();
+            cv_body.extend_from_slice(&0x0807u16.to_be_bytes());
+            cv_body.extend_from_slice(&0x0040u16.to_be_bytes());
+            cv_body.extend_from_slice(cv_sig.as_ref());
+            let cv_msg = make_hs_msg(HS_CERTIFICATE_VERIFY, &cv_body);
+
+            sk.add_transcript(&ee_msg);
+            sk.add_transcript(&cert_msg);
+            sk.add_transcript(&cv_msg);
+            let sf_key = sk.finished_key(&server_hs_ts).unwrap();
+            let sf_wire = make_hs_msg(HS_FINISHED, &sk.finished_mac(&sf_key));
+            let mut flight = Vec::new();
+            flight.extend_from_slice(&ee_msg);
+            flight.extend_from_slice(&cert_msg);
+            flight.extend_from_slice(&cv_msg);
+            flight.extend_from_slice(&sf_wire);
+            // The inner content type rides inside the AEAD plaintext
+            // (RFC 8446 §5.2) — the record layer reads it from the last
+            // plaintext byte.
+            flight.push(crate::record::CONTENT_HANDSHAKE);
+            sk.add_transcript(&sf_wire);
+            let inner_ct = server_hs_key
+                .seal(0, &aead_aad(flight.len() + AEAD_TAG_LEN), &flight)
+                .unwrap();
+            server_side
+                .write_all(&make_app_data_record(&inner_ct))
+                .await
+                .unwrap();
+
+            // Client Finished record — skip.
+            let mut fin_hdr = [0u8; 5];
+            server_side.read_exact(&mut fin_hdr).await.unwrap();
+            let mut fin = vec![0u8; u16::from_be_bytes([fin_hdr[3], fin_hdr[4]]) as usize];
+            server_side.read_exact(&mut fin).await.unwrap();
+
+            // App traffic secrets; decrypt and echo the client's ping.
+            let master = sk.master_secret(&hs_secret).unwrap();
+            let (client_app_ts, server_app_ts) = sk.app_traffic_secrets(&master).unwrap();
+            let client_app_key = AeadKey::new(suite, &client_app_ts).unwrap();
+            let server_app_key = AeadKey::new(suite, &server_app_ts).unwrap();
+
+            let mut ping_hdr = [0u8; 5];
+            server_side.read_exact(&mut ping_hdr).await.unwrap();
+            let mut ping_ct = vec![0u8; u16::from_be_bytes([ping_hdr[3], ping_hdr[4]]) as usize];
+            server_side.read_exact(&mut ping_ct).await.unwrap();
+            let ping = client_app_key
+                .open(0, &aead_aad(ping_ct.len()), &mut ping_ct)
+                .unwrap();
+            assert!(ping.starts_with(b"ping"));
+
+            let mut inner = b"ping".to_vec();
+            inner.push(CONTENT_APPLICATION_DATA);
+            let echo_ct = server_app_key
+                .seal(0, &aead_aad(inner.len() + AEAD_TAG_LEN), &inner)
+                .unwrap();
+            server_side
+                .write_all(&make_app_data_record(&echo_ct))
+                .await
+                .unwrap();
+        });
+
+        // Bounded waits throughout: a server-side panic or a wire
+        // mismatch must fail the test, never hang it.
+        let mut handshake = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_reality(
+                client_stream,
+                RealityParams {
+                    server_name: "localhost",
+                    public_key: &static_pub,
+                    short_id: &[],
+                    provisioner: &FixedChrome133,
+                    rng: &rng,
+                    spider: &SpiderConfig::default(),
+                },
+            ),
+        )
+        .await
+        .expect("REALITY hybrid handshake timed out")
+        .expect("REALITY hybrid handshake must authenticate (not fall back)");
+        handshake.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handshake.read_exact(&mut buf),
+        )
+        .await
+        .expect("echo timed out")
+        .unwrap();
+        assert_eq!(&buf, b"ping");
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("server task timed out")
+            .unwrap();
     }
 }
