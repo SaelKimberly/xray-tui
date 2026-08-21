@@ -34,6 +34,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::SecureRandom;
 use crate::crypto::X25519KeyPair;
+use crate::crypto::mlkem::Mlkem768;
 use crate::error::{Result, TlsError};
 use crate::handshake::{AuthOutcome, ServerAuth, drive};
 use crate::hello::{BuildParams, build_hello};
@@ -62,6 +63,9 @@ pub struct HelloProvisionParams<'a> {
     pub alpn: Option<&'a [&'a str]>,
     /// The connector's X25519 public key, injected into `key_share`.
     pub x25519_pub: &'a [u8; 32],
+    /// The connector's ML-KEM-768 encapsulation key (1184 bytes) when the
+    /// spec's `key_share` carries a hybrid entry.
+    pub mlkem768_pub: Option<&'a [u8]>,
     /// Random source for the GREASE values and the client random.
     pub rng: &'a dyn SecureRandom,
 }
@@ -101,6 +105,7 @@ impl HelloProvisioner for ProfileProvisioner {
                 server_name: params.server_name,
                 alpn: params.alpn,
                 x25519_pub: params.x25519_pub,
+                mlkem768_pub: params.mlkem768_pub,
                 rng: params.rng,
             },
         )?;
@@ -191,12 +196,20 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
     //    the provisioned hello *is* the REALITY random.
     let keypair = X25519KeyPair::generate(params.rng)?;
 
+    // 1b. Ephemeral ML-KEM-768 key pair: the Chrome-133 family specs offer
+    //     the X25519MLKEM768 hybrid group, so the encapsulation key flows
+    //     into the provisioned key share. Provisioners whose spec has no
+    //     hybrid entry simply ignore it.
+    let (pq_public, pq_secret) =
+        Mlkem768::generate_keypair().map_err(|e| TlsError::Crypto(e.to_string()))?;
+
     // 2. Provision the Chrome-133-shaped ClientHello with a zeroed
     //    AuthPayload slot; the connector's keyshare and rng flow through.
     let mut hello = params.provisioner.provision(&HelloProvisionParams {
         server_name: params.server_name,
         alpn: Some(REALITY_ALPN),
         x25519_pub: &keypair.public_key(),
+        mlkem768_pub: Some(pq_public.as_bytes()),
         rng: params.rng,
     })?;
     let client_random = messages::extract_client_random(&hello.handshake_bytes)?;
@@ -231,6 +244,7 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
         &hello.handshake_bytes,
         hello.session_id(),
         keypair,
+        Some(&pq_secret),
         params.server_name,
         ServerAuth::Reality {
             auth_key: &auth_key,
@@ -267,11 +281,13 @@ mod tests {
     #[test]
     fn fixed_chrome133_provisioner_builds_auth_payload_hello() {
         let rng = ring::rand::SystemRandom::new();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
         let hello = FixedChrome133
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
                 alpn: Some(REALITY_ALPN),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &rng,
             })
             .unwrap();
@@ -341,6 +357,7 @@ mod tests {
         // the identical byte stream (0x42 → every GREASE value 0x2A2A), so
         // byte equality proves `ProfileProvisioner(BrowserProfile::Chrome133)`
         // produces exactly what the fixed Chrome-133 provisioner produces.
+        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
         let fixed_rng = FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
@@ -350,6 +367,7 @@ mod tests {
                 server_name: "www.microsoft.com",
                 alpn: Some(REALITY_ALPN),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &fixed_rng,
             })
             .unwrap();
@@ -362,6 +380,7 @@ mod tests {
                 server_name: "www.microsoft.com",
                 alpn: Some(REALITY_ALPN),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &profile_rng,
             })
             .unwrap();

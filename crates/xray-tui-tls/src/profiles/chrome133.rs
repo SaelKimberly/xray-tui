@@ -75,9 +75,14 @@ pub fn spec() -> ClientHelloSpec {
             ExtensionSpec::SignatureAlgorithms(SIG_ALGOS.to_vec()),
             ExtensionSpec::SignedCertificateTimestamp,
             // uTLS key share: GREASE + X25519MLKEM768 + X25519. The hybrid
-            // entry is omitted here (no MLKEM material in this crate); the
-            // GREASE + X25519 slots remain. Not fingerprinted by JA3/JA4.
-            ExtensionSpec::KeyShare(vec![KeyShareGroup::Grease, KeyShareGroup::X25519]),
+            // entry carries `X25519 pub || ML-KEM-768 encapsulation key`
+            // (1216 bytes); the connector generates the ML-KEM material.
+            // Not fingerprinted by JA3/JA4.
+            ExtensionSpec::KeyShare(vec![
+                KeyShareGroup::Grease,
+                KeyShareGroup::X25519Mlkem768,
+                KeyShareGroup::X25519,
+            ]),
             ExtensionSpec::PskKeyExchangeModes,
             ExtensionSpec::SupportedVersions(vec![GREASE_PLACEHOLDER, 0x0304, 0x0303]),
             // compress_certificate: brotli only (Chrome 133).

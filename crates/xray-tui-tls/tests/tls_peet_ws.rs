@@ -59,12 +59,15 @@ fn local_fingerprints_match_locked_constants() {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
         };
+        let (mlkem_pk, _) =
+            xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
         let hello = build_hello(
             &spec,
             &BuildParams {
                 server_name: HOST,
                 alpn: Some(ALPN),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &fixed,
             },
         )
@@ -146,12 +149,15 @@ async fn fetch_peet_report(
         bytes: vec![0x42; 128],
         pos: AtomicUsize::new(0),
     };
+    let (mlkem_pk, _) =
+        xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
     let local_hello = build_hello(
         &spec,
         &BuildParams {
             server_name: HOST,
             alpn: Some(ALPN),
             x25519_pub: &[0xAB; 32],
+            mlkem768_pub: Some(mlkem_pk.as_bytes()),
             rng: &fixed,
         },
     )?;

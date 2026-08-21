@@ -21,6 +21,9 @@ pub struct BuildParams<'a> {
     /// `None` → use the spec's ALPN list.
     pub alpn: Option<&'a [&'a str]>,
     pub x25519_pub: &'a [u8; 32],
+    /// ML-KEM-768 encapsulation key (1184 bytes) for a hybrid key-share
+    /// entry; required iff the spec's `key_share` contains one.
+    pub mlkem768_pub: Option<&'a [u8]>,
     pub rng: &'a dyn SecureRandom,
 }
 
@@ -74,6 +77,7 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
         server_name: params.server_name.to_string(),
         alpn: effective_alpn(spec, params.alpn),
         x25519_pub: *params.x25519_pub,
+        mlkem768_pub: params.mlkem768_pub.unwrap_or(&[]).to_vec(),
         grease_a,
         grease_b,
         padding_len: 0,
@@ -456,6 +460,7 @@ mod tests {
                 server_name: "tls.peet.ws",
                 alpn: Some(&["h2", "http/1.1"]),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -498,6 +503,7 @@ mod tests {
                 server_name: "example.com",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -552,6 +558,7 @@ mod tests {
                 server_name: "example.com",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -579,6 +586,7 @@ mod tests {
                 server_name: "tls.peet.ws",
                 alpn: Some(&["h2", "http/1.1"]),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -615,6 +623,7 @@ mod tests {
                 server_name: "example.com",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -646,6 +655,7 @@ mod tests {
                 server_name: "example.com",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -680,6 +690,7 @@ mod tests {
                     server_name: "example.com",
                     alpn,
                     x25519_pub: &[0xAB; 32],
+                    mlkem768_pub: None,
                     rng: &rng,
                 },
             )
@@ -731,6 +742,7 @@ mod tests {
                 server_name: "example.com",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -771,6 +783,7 @@ mod tests {
                 server_name: "example.com",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )
@@ -786,6 +799,7 @@ mod tests {
             server_name: "tls.peet.ws",
             alpn: Some(&["h2", "http/1.1"]),
             x25519_pub: &[0xAB; 32],
+            mlkem768_pub: None,
             rng,
         }
     }

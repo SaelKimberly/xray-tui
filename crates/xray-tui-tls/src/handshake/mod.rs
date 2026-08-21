@@ -24,6 +24,7 @@
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::SecureRandom;
+use crate::crypto::mlkem::{Mlkem768, SecretKey as MlkemSecretKey};
 use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair};
 use crate::error::{Result, TlsError};
 use crate::hello::{BuildParams, build_hello, to_record};
@@ -33,7 +34,7 @@ use crate::record::{
     HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, aead_aad, make_app_data_record,
     parse_handshake_messages, skip_ccs,
 };
-use crate::spec::ClientHelloSpec;
+use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup};
 
 // ── Verifier seam ──────────────────────────────────────────────────────────
 
@@ -169,6 +170,10 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     hello: &[u8],
     offered_session_id: &[u8],
     keypair: X25519KeyPair,
+    // ML-KEM-768 secret key when the ClientHello offered a hybrid key
+    // share; decapsulation runs only if the server actually selected the
+    // hybrid group (its `key_share` then carries the ciphertext).
+    mlkem_sk: Option<&MlkemSecretKey>,
     server_name: &str,
     auth: ServerAuth<'_>,
 ) -> Result<(TlsStream<S>, AuthOutcome)> {
@@ -176,7 +181,27 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream.write_all(&to_record(hello)).await?;
 
     let server_hello = read_server_hello(&mut stream, offered_session_id).await?;
-    let shared = keypair.agree(&server_hello.peer_key)?;
+    let classical_shared = keypair.agree(&server_hello.peer_key)?;
+
+    // Hybrid key exchange (RFC 9180 / draft-ietf-tls-hybrid-design): when
+    // the server selected X25519MLKEM768 it encapsulated to our ML-KEM-768
+    // public key; the shared secret fed to the key schedule is
+    // `classical || pq` (64 bytes for X25519MLKEM768).
+    let shared: Vec<u8> = match (mlkem_sk, server_hello.mlkem_ciphertext.as_deref()) {
+        (Some(sk), Some(ct)) => {
+            let pq_shared = Mlkem768::decapsulate(
+                sk,
+                &crate::crypto::mlkem::Ciphertext::from_bytes(ct)
+                    .map_err(|e| TlsError::Crypto(e.to_string()))?,
+            )
+            .map_err(|e| TlsError::Crypto(e.to_string()))?;
+            let mut combined = Vec::with_capacity(classical_shared.len() + 32);
+            combined.extend_from_slice(&classical_shared);
+            combined.extend_from_slice(pq_shared.as_bytes());
+            combined
+        }
+        _ => classical_shared.to_vec(),
+    };
 
     let mut ks = KeySchedule::new(server_hello.suite);
     ks.add_transcript(hello);
@@ -278,21 +303,46 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// Performs the full TLS 1.3 client handshake over `stream`, returning a
 /// record-framed application-data stream.
 ///
-/// Generates an ephemeral X25519 key pair, builds the `ClientHello` record
-/// (fingerprint from `params.spec`), and hands both to the shared [`drive`]
-/// with a [`ServerAuth::Verifier`] dispatch.
+/// Generates an ephemeral X25519 key pair — plus an ML-KEM-768 key pair
+/// when the spec's `key_share` carries a hybrid entry — builds the
+/// `ClientHello` record (fingerprint from `params.spec`), and hands both to
+/// the shared [`drive`] with a [`ServerAuth::Verifier`] dispatch.
 pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     params: HandshakeParams<'_>,
 ) -> Result<TlsStream<S>> {
     let keypair = X25519KeyPair::generate(params.rng)?;
     let x25519_pub = keypair.public_key();
+
+    let offers_hybrid = params.spec.extensions.iter().any(|ext| {
+        matches!(
+            ext,
+            ExtensionSpec::KeyShare(groups)
+                if groups.iter().any(|g| matches!(
+                    g,
+                    KeyShareGroup::X25519Mlkem768
+                        | KeyShareGroup::Secp256r1Mlkem768
+                        | KeyShareGroup::Secp384r1Mlkem1024
+                ))
+        )
+    });
+    let mlkem = if offers_hybrid {
+        let (pk, sk) = Mlkem768::generate_keypair().map_err(|e| TlsError::Crypto(e.to_string()))?;
+        (Some(pk), Some(sk))
+    } else {
+        (None, None)
+    };
+
     let hello = build_hello(
         params.spec,
         &BuildParams {
             server_name: params.server_name,
             alpn: params.alpn,
             x25519_pub: &x25519_pub,
+            mlkem768_pub: mlkem
+                .0
+                .as_ref()
+                .map(crate::crypto::mlkem::PublicKey::as_bytes),
             rng: params.rng,
         },
     )?;
@@ -301,6 +351,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
         &hello.handshake_bytes,
         hello.session_id(),
         keypair,
+        mlkem.1.as_ref(),
         params.server_name,
         ServerAuth::Verifier(params.verifier),
     )
@@ -314,8 +365,11 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
 pub(crate) struct ServerHelloData {
     /// The raw handshake message (type + length + body), for the transcript.
     pub(crate) raw: Vec<u8>,
-    /// The server's X25519 public key from `key_share`.
+    /// The server's classical (X25519) public key from `key_share`.
     pub(crate) peer_key: [u8; 32],
+    /// The ML-KEM ciphertext from the server's hybrid key share
+    /// (`Some` only when a hybrid group was selected).
+    pub(crate) mlkem_ciphertext: Option<Vec<u8>>,
     /// The cipher suite the server selected.
     pub(crate) suite: CipherSuiteId,
 }
@@ -325,6 +379,7 @@ pub(crate) struct ServerHelloData {
 struct ParsedServerHello {
     suite: CipherSuiteId,
     peer_key: [u8; 32],
+    mlkem_ciphertext: Option<Vec<u8>>,
 }
 
 /// Read and parse the `ServerHello` record, skipping CCS records. The
@@ -357,6 +412,7 @@ where
     Ok(ServerHelloData {
         raw: make_hs_msg(HS_SERVER_HELLO, &body),
         peer_key: parsed.peer_key,
+        mlkem_ciphertext: parsed.mlkem_ciphertext,
         suite: parsed.suite,
     })
 }
@@ -427,6 +483,7 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
     }
 
     let mut peer_key = None;
+    let mut mlkem_ciphertext = None;
     while pos + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
         let ext_len = usize::from(u16::from_be_bytes([body[pos + 2], body[pos + 3]]));
@@ -440,9 +497,10 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
         pos += ext_len;
         if ext_type == EXT_KEY_SHARE {
             // ServerHello key_share: NamedGroup(2) + key_len(2) + key
-            // (RFC 8446 §4.2.8). The only group this engine offers is
-            // X25519 (0x001D), so any other group or malformed length is a
-            // protocol error rather than a silently-missing keyshare.
+            // (RFC 8446 §4.2.8). X25519MLKEM768 (0x11EC) carries
+            // `X25519 pub (32) || ML-KEM-768 ciphertext (1088)` = 1120
+            // bytes; any other group or malformed length is a protocol
+            // error rather than a silently-missing keyshare.
             if ext_data.len() < 4 {
                 return Err(TlsError::Handshake(
                     "ServerHello key_share extension too short".into(),
@@ -450,14 +508,25 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
             }
             let group = u16::from_be_bytes([ext_data[0], ext_data[1]]);
             let key_len = usize::from(u16::from_be_bytes([ext_data[2], ext_data[3]]));
-            if group != 0x001D || key_len != 32 || ext_data.len() != 4 + key_len {
-                return Err(TlsError::Handshake(format!(
-                    "ServerHello key_share: group 0x{group:04X} key length {key_len}"
-                )));
+            match (group, key_len, ext_data.len()) {
+                (0x001D, 32, n) if n == 4 + key_len => {
+                    peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
+                }
+                (0x11EC, 1120, n) if n == 4 + key_len => {
+                    peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
+                    mlkem_ciphertext = Some(ext_data[36..].to_vec());
+                }
+                (0x11EB | 0x11ED, ..) => {
+                    return Err(TlsError::Handshake(
+                        "ServerHello selected SecP256r1MLKEM768/SecP384r1MLKEM1024: no P-256/P-384 key exchange in this engine".into(),
+                    ));
+                }
+                _ => {
+                    return Err(TlsError::Handshake(format!(
+                        "ServerHello key_share: group 0x{group:04X} key length {key_len}"
+                    )));
+                }
             }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&ext_data[4..4 + key_len]);
-            peer_key = Some(key);
         }
     }
 
@@ -469,7 +538,11 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
 
     let peer_key = peer_key
         .ok_or_else(|| TlsError::Handshake("ServerHello has no key_share extension".into()))?;
-    Ok(ParsedServerHello { suite, peer_key })
+    Ok(ParsedServerHello {
+        suite,
+        peer_key,
+        mlkem_ciphertext,
+    })
 }
 
 // ── Encrypted server flight ────────────────────────────────────────────────
@@ -781,12 +854,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        AEAD_TAG_LEN, AcceptAll, HRR_RANDOM, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
-        HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, HandshakeParams, connect,
-        make_hs_msg, parse_certificate_message, parse_certificate_verify,
+        AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
+        HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
+        HandshakeParams, connect, make_hs_msg, parse_certificate_message, parse_certificate_verify,
         parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
     };
-    use crate::crypto::{AeadKey, CipherSuiteId};
+    use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
     use crate::record::{CONTENT_HANDSHAKE, aead_aad, make_app_data_record};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
@@ -1234,5 +1307,163 @@ mod tests {
         assert_eq!(parsed.signature_scheme, 0x0403);
         assert_eq!(parsed.cert_verify_body, cv_body);
         assert_eq!(parsed.sf_verify_data, vec![0xBB; 32]);
+    }
+
+    // ── hybrid X25519MLKEM768 handshake (fake PQ server double) ───────────
+
+    /// A loopback server double that negotiates X25519MLKEM768: it
+    /// encapsulates to the client's ML-KEM-768 key share, feeds
+    /// `classical || pq` through the same key schedule, and proves both
+    /// sides derived matching traffic keys by an encrypted app-data echo.
+    #[tokio::test]
+    async fn hybrid_handshake_completes_against_fake_pq_server() {
+        use crate::crypto::X25519KeyPair;
+        use crate::crypto::mlkem::{Mlkem768, PublicKey as MlkemPublicKey};
+        use crate::hello::parse::parse_hello;
+
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let mut spec = test_spec();
+        for ext in &mut spec.extensions {
+            match ext {
+                ExtensionSpec::SupportedGroups(groups) => *groups = vec![0x11EC, 0x001D],
+                ExtensionSpec::KeyShare(groups) => *groups = vec![KeyShareGroup::X25519Mlkem768],
+                _ => {}
+            }
+        }
+
+        let (client_stream, mut server_side) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            // Read the ClientHello record and pull the hybrid key share.
+            let mut hdr = [0u8; 5];
+            server_side.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], 0x16);
+            let mut ch = vec![0u8; u16::from_be_bytes([hdr[3], hdr[4]]) as usize];
+            server_side.read_exact(&mut ch).await.unwrap();
+            let parsed = parse_hello(&ch).unwrap();
+            let ks_ext = parsed.extension(0x0033).unwrap();
+            // list_len(2) + entry(group 11ec, kx_len 04c0, 1216 bytes).
+            assert_eq!(&ks_ext[..4], &[0x04, 0xc4, 0x11, 0xec]);
+            let client_x25519: [u8; 32] = ks_ext[6..38].try_into().unwrap();
+            let client_mlkem_pk = MlkemPublicKey::from_bytes(&ks_ext[38..]).unwrap();
+
+            // Classical + PQ shared secrets, exactly as a real hybrid server.
+            let rng = ring::rand::SystemRandom::new();
+            let server_kp = X25519KeyPair::generate(&rng).unwrap();
+            let classical = server_kp.agree(&client_x25519).unwrap();
+            let (ct, pq_ss) = Mlkem768::encapsulate(&client_mlkem_pk).unwrap();
+
+            // ServerHello: key_share group 11ec, share = pub(32) || ct(1088).
+            let mut sh_body = Vec::new();
+            sh_body.extend_from_slice(&0x0303u16.to_be_bytes());
+            sh_body.extend_from_slice(&[0x5A; 32]);
+            sh_body.push(u8::try_from(parsed.session_id.len()).unwrap());
+            sh_body.extend_from_slice(&parsed.session_id);
+            sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
+            sh_body.push(0); // compression method
+            let mut kse = Vec::new();
+            kse.extend_from_slice(&0x0033u16.to_be_bytes());
+            kse.extend_from_slice(&1124u16.to_be_bytes()); // 4 + 1120
+            kse.extend_from_slice(&0x11ECu16.to_be_bytes());
+            kse.extend_from_slice(&1120u16.to_be_bytes());
+            kse.extend_from_slice(&server_kp.public_key());
+            kse.extend_from_slice(ct.as_bytes());
+            sh_body.extend_from_slice(&u16::try_from(kse.len()).unwrap().to_be_bytes());
+            sh_body.extend_from_slice(&kse);
+            let sh_msg = make_hs_msg(HS_SERVER_HELLO, &sh_body);
+            let mut rec = vec![0x16, 0x03, 0x03];
+            rec.extend_from_slice(&u16::try_from(sh_msg.len()).unwrap().to_be_bytes());
+            rec.extend_from_slice(&sh_msg);
+            server_side.write_all(&rec).await.unwrap();
+
+            // Key schedule over `classical || pq` — the hybrid contract.
+            let mut combined = classical.to_vec();
+            combined.extend_from_slice(pq_ss.as_bytes());
+            assert_eq!(combined.len(), 64);
+            let mut sk = KeySchedule::new(suite);
+            sk.add_transcript(&ch);
+            sk.add_transcript(&sh_msg);
+            let hs_secret = sk.handshake_secret(&combined).unwrap();
+            let (_client_hs_ts, server_hs_ts) = sk.handshake_traffic_secrets(&hs_secret).unwrap();
+            let server_hs_key = AeadKey::new(suite, &server_hs_ts).unwrap();
+
+            // Encrypted flight with a REAL server Finished MAC.
+            let ee_msg = make_hs_msg(HS_ENCRYPTED_EXTENSIONS, &[0x00, 0x00]);
+            let cert_msg = make_hs_msg(
+                HS_CERTIFICATE,
+                &[
+                    0x00, // no certificate_request_context
+                    0x00, 0x00, 0x08, // certificate_list length
+                    0x00, 0x00, 0x03, 0x30, 0x01, 0xAA, 0x00, 0x00, // one entry
+                ],
+            );
+            let mut cv_body = Vec::new();
+            cv_body.extend_from_slice(&0x0403u16.to_be_bytes());
+            cv_body.extend_from_slice(&0x0040u16.to_be_bytes());
+            cv_body.extend_from_slice(&[0xAA; 64]);
+            let cv_msg = make_hs_msg(HS_CERTIFICATE_VERIFY, &cv_body);
+            sk.add_transcript(&ee_msg);
+            sk.add_transcript(&cert_msg);
+            sk.add_transcript(&cv_msg);
+            let sf_key = sk.finished_key(&server_hs_ts).unwrap();
+            let sf_wire = make_hs_msg(HS_FINISHED, &sk.finished_mac(&sf_key));
+            let mut flight = Vec::new();
+            flight.extend_from_slice(&ee_msg);
+            flight.extend_from_slice(&cert_msg);
+            flight.extend_from_slice(&cv_msg);
+            flight.extend_from_slice(&sf_wire);
+            sk.add_transcript(&sf_wire);
+            write_encrypted_flight_chunk(&mut server_side, &server_hs_key, 0, &flight).await;
+
+            // Client Finished record (seq 0 under the client hs key) — skip.
+            let mut fin_hdr = [0u8; 5];
+            server_side.read_exact(&mut fin_hdr).await.unwrap();
+            let mut fin = vec![0u8; u16::from_be_bytes([fin_hdr[3], fin_hdr[4]]) as usize];
+            server_side.read_exact(&mut fin).await.unwrap();
+
+            // App traffic secrets; decrypt and echo the client's ping.
+            let master = sk.master_secret(&hs_secret).unwrap();
+            let (client_app_ts, server_app_ts) = sk.app_traffic_secrets(&master).unwrap();
+            let client_app_key = AeadKey::new(suite, &client_app_ts).unwrap();
+            let server_app_key = AeadKey::new(suite, &server_app_ts).unwrap();
+
+            let mut ping_hdr = [0u8; 5];
+            server_side.read_exact(&mut ping_hdr).await.unwrap();
+            let mut ping_ct = vec![0u8; u16::from_be_bytes([ping_hdr[3], ping_hdr[4]]) as usize];
+            server_side.read_exact(&mut ping_ct).await.unwrap();
+            let ping = client_app_key
+                .open(0, &aead_aad(ping_ct.len()), &mut ping_ct)
+                .unwrap();
+            assert!(ping.starts_with(b"ping"));
+
+            let mut inner = b"ping".to_vec();
+            inner.push(CONTENT_APPLICATION_DATA);
+            let echo_ct = server_app_key
+                .seal(0, &aead_aad(inner.len() + AEAD_TAG_LEN), &inner)
+                .unwrap();
+            server_side
+                .write_all(&make_app_data_record(&echo_ct))
+                .await
+                .unwrap();
+        });
+
+        let rng = ring::rand::SystemRandom::new();
+        let mut tls = connect(
+            client_stream,
+            HandshakeParams {
+                spec: &spec,
+                server_name: "localhost",
+                alpn: None,
+                verifier: &AcceptAll,
+                rng: &rng,
+            },
+        )
+        .await
+        .unwrap();
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.await.unwrap();
     }
 }

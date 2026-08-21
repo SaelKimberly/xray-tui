@@ -154,6 +154,7 @@ mod tests {
 
     #[test]
     fn all_profiles_build_and_parse() {
+        let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
         for profile in BrowserProfile::all() {
             let spec = profile.spec();
             let rng = FixedRandom {
@@ -166,6 +167,7 @@ mod tests {
                     server_name: "tls.peet.ws",
                     alpn: None, // use spec's Alpn
                     x25519_pub: &[0xAB; 32],
+                    mlkem768_pub: Some(mlkem_pk.as_bytes()),
                     rng: &rng,
                 },
             )
@@ -217,6 +219,7 @@ mod tests {
                 server_name: "tls.peet.ws",
                 alpn: None,
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: None,
                 rng: &rng,
             },
         )

@@ -91,6 +91,7 @@ pub fn seal_and_splice(
 mod tests {
     use super::*;
     use crate::crypto::X25519KeyPair;
+    use crate::crypto::mlkem::Mlkem768;
     use crate::hello::parse::parse_hello;
     use crate::reality::auth::{decrypt_session_id, derive_auth_key};
     use crate::reality::{FixedChrome133, HelloProvisionParams, HelloProvisioner};
@@ -155,6 +156,7 @@ mod tests {
                 .unwrap();
         let rng = ring::rand::SystemRandom::new();
         let keypair = X25519KeyPair::generate(&rng).unwrap();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
         let shared = keypair.agree(&server_pub).unwrap();
 
         // Fixed random bytes [0..32]: salt = [0..20], nonce = [20..32].
@@ -171,6 +173,7 @@ mod tests {
                 server_name: "www.microsoft.com",
                 alpn: Some(&["h2", "http/1.1"]),
                 x25519_pub: &keypair.public_key(),
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &rng,
             })
             .unwrap();
@@ -212,11 +215,13 @@ mod tests {
     #[test]
     fn extract_client_random_from_provisioned_hello() {
         let rng = ring::rand::SystemRandom::new();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
         let hello = FixedChrome133
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
                 alpn: Some(&["h2", "http/1.1"]),
                 x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
                 rng: &rng,
             })
             .unwrap();

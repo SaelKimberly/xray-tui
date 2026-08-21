@@ -18,6 +18,9 @@ pub struct RuntimeValues {
     pub server_name: String,
     pub alpn: Vec<String>,
     pub x25519_pub: [u8; 32],
+    /// ML-KEM-768 encapsulation key for hybrid key shares (1184 bytes;
+    /// empty when the spec has no hybrid key-share entry).
+    pub mlkem768_pub: Vec<u8>,
     pub grease_a: u16,
     pub grease_b: u16,
     pub padding_len: usize,
@@ -29,6 +32,7 @@ impl Default for RuntimeValues {
             server_name: String::new(),
             alpn: Vec::new(),
             x25519_pub: [0; 32],
+            mlkem768_pub: Vec::new(),
             grease_a: 0x0A0A,
             grease_b: 0x1A1A,
             padding_len: 0,
@@ -77,6 +81,15 @@ pub enum KeyShareGroup {
     /// A GREASE group; the wire value comes from `RuntimeValues::grease_a`.
     Grease,
     X25519,
+    /// X25519MLKEM768 hybrid (0x11EC / 4588): the entry key exchange is
+    /// `X25519 pub (32) || ML-KEM-768 encapsulation key (1184)` = 1216 bytes.
+    X25519Mlkem768,
+    /// `SecP256r1MLKEM768` hybrid (0x11EB / 4587). Deferred: the engine has no
+    /// P-256 key exchange (xray's primary hybrid is `X25519MLKEM768`).
+    Secp256r1Mlkem768,
+    /// `SecP384r1MLKEM1024` hybrid (0x11ED / 4589). Deferred: the engine has
+    /// no P-384 key exchange (ML-KEM-1024 itself is available via liboqs).
+    Secp384r1Mlkem1024,
 }
 
 /// The semantic `ClientHello` description.
@@ -137,6 +150,24 @@ impl ExtensionSpec {
                             // Entry: group 00 1d (x25519), key_exchange_length 00 20, raw public key.
                             entries.extend_from_slice(&[0x00, 0x1d, 0x00, 0x20]);
                             entries.extend_from_slice(&rt.x25519_pub);
+                        }
+                        KeyShareGroup::X25519Mlkem768 => {
+                            if rt.mlkem768_pub.len() != 1184 {
+                                return Err(TlsError::Spec(format!(
+                                    "X25519MLKEM768 key share requires an ML-KEM-768 encapsulation key of 1184 bytes, got {}",
+                                    rt.mlkem768_pub.len()
+                                )));
+                            }
+                            // Entry: group 11 ec, key_exchange_length 04 c0 (1216),
+                            // key_exchange = X25519 pub (32) || ML-KEM-768 encap key (1184).
+                            entries.extend_from_slice(&[0x11, 0xec, 0x04, 0xc0]);
+                            entries.extend_from_slice(&rt.x25519_pub);
+                            entries.extend_from_slice(&rt.mlkem768_pub);
+                        }
+                        KeyShareGroup::Secp256r1Mlkem768 | KeyShareGroup::Secp384r1Mlkem1024 => {
+                            return Err(TlsError::Spec(
+                                "SecP256r1MLKEM768/SecP384r1MLKEM1024 key shares are not supported: the engine implements no P-256/P-384 key exchange (xray's primary hybrid, X25519MLKEM768, is fully supported)".to_string(),
+                            ));
                         }
                     }
                 }
@@ -366,5 +397,53 @@ mod tests {
         #[case] expected: Vec<u8>,
     ) {
         assert_eq!(ext.encode_body(&rt).unwrap(), expected);
+    }
+
+    #[test]
+    fn x25519mlkem768_key_share_entry_encodes_hybrid_public_keys() {
+        let rt = RuntimeValues {
+            x25519_pub: [0xAB; 32],
+            mlkem768_pub: vec![0xCD; 1184],
+            ..RuntimeValues::default()
+        };
+        let ext = ExtensionSpec::KeyShare(vec![KeyShareGroup::X25519Mlkem768])
+            .encode_body(&rt)
+            .unwrap();
+        // type 0033 + ext_len + list_len + entry(group 11ec, kx_len 04c0, 1216 bytes).
+        assert_eq!(
+            &ext[..10],
+            &[0x00, 0x33, 0x04, 0xc6, 0x04, 0xc4, 0x11, 0xec, 0x04, 0xc0]
+        );
+        assert_eq!(ext.len(), 4 + 2 + 4 + 1216);
+        assert_eq!(&ext[10..42], &[0xAB; 32]);
+        assert_eq!(&ext[42..], &[0xCD; 1184]);
+    }
+
+    #[test]
+    fn hybrid_key_share_requires_mlkem_material() {
+        let rt = RuntimeValues::default();
+        assert!(
+            ExtensionSpec::KeyShare(vec![KeyShareGroup::X25519Mlkem768])
+                .encode_body(&rt)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn p256_p384_hybrid_key_shares_are_deferred() {
+        let rt = RuntimeValues {
+            mlkem768_pub: vec![0xCD; 1184],
+            ..RuntimeValues::default()
+        };
+        for group in [
+            KeyShareGroup::Secp256r1Mlkem768,
+            KeyShareGroup::Secp384r1Mlkem1024,
+        ] {
+            assert!(
+                ExtensionSpec::KeyShare(vec![group])
+                    .encode_body(&rt)
+                    .is_err()
+            );
+        }
     }
 }
