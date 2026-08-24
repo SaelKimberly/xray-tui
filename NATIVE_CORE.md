@@ -94,9 +94,10 @@ ja4db export and emits the **1825-entry JA4-faithful roster**
 fresh render. Fidelity contract: every entry's built ClientHello must
 reproduce its registered source JA4 — pinned offline by
 `tests/generated_ja4_gate.rs` (1825/1825, 0 failures) and confirmed live
-against tls.peet.ws by the grader's `--roster` sweep (1655+ entries
-connect with wire-faithful JA4; the 111 `pre_shared_key` entries are
-documented as peet.ws-incompatible — the report records the finding).
+against tls.peet.ws by the grader's `--roster` sweep (1655 of 1825
+passed both full runs with wire-faithful JA4, 111 `pre_shared_key`
+entries documented as peet.ws-incompatible, 59 transient — the report
+records the full reconciliation).
 
 
 ## Crate maps

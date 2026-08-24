@@ -61,19 +61,25 @@ Content-Length/chunked aware).
 
 ## Live results summary (2026-08-24, two full runs)
 
-| Family | Total | Passed both runs | Wire-faithful (best run) | Deterministic rejections | Transient only |
+| Family | Total | Passed both runs | Wire-faithful (run 1) | Deterministic rejections | Transient only |
 |---|---|---|---|---|---|
 | chrome | 720 | 686 | 695 | 25 | 9 |
 | firefox | 407 | 349 | 374 | 33 | 25 |
 | safari | 33 | 33 | 33 | 0 | 0 |
 | chrome_android | 359 | 321 | 329 | 25 | 13 |
-| safari_ios | 306 | 266 | 278 | 28 | 13 |
-| **Total** | **1825** | **1655** | **1697** | **111** | **60** |
+| safari_ios | 306 | 266 | 278 | 28 | 12 |
+| **Total** | **1825** | **1655** | **1697** | **111** | **59** |
+
+The three result buckets partition the roster exactly per family
+(passed-both + deterministic-rejected + transient-only = total); the
+`Wire-faithful (run 1)` column is the first run's pass count, a separate
+single-run measurement — transient membership differs between runs, so it
+is not a partition of the other columns.
 
 - **1655 entries (90.7%)** connected and matched the local JA4 in **both**
-  runs; the best single run verified **1697 (93.0%)**.
+  runs; the first run verified **1697 (93.0%)**.
 - **111 deterministic handshake rejections** — see finding 1 below.
-- **60 transient entry-runs** hit timeouts (HTTP/2 response timed out /
+- **59 transient entry-runs** hit timeouts (HTTP/2 response timed out /
   fetch timed out) in one of the two runs and passed the other —
   peet.ws throttles under the 16-way burst; none are wire mismatches.
   Per the plan ruling the sweep is a manual report, not a merge gate.
@@ -128,10 +134,12 @@ carry `0x0029` — not because of ECH.
 
 ### Finding 4 — `http/1.1`-only and no-ALPN entries (306 + 533)
 
-- 306 `ht`-letter entries (ALPN `http/1.1` only): 202+ graded via the
+- 306 `ht`-letter entries (ALPN `http/1.1` only): graded via the
   HTTP/1.1 GET path; the server renders the A-part letter `h1`
-  (first+last, matching the crate codec) — the corpus `ht` is a
-  first-two-chars rendering, `ja4_letter_insensitive_eq` normalizes it.
+  (first+last, matching the crate codec and the grader's `peet_a_part`).
+  The corpus `ht` is the ja4db first-two-chars rendering — a documented
+  A-part letter difference that keeps those entries' registered-match
+  flag clear (they are never full-hash class, so it is not a failure).
 - 533 no-ALPN entries: connect over HTTP/1.1 default; the server omits
   the A-part letter entirely and uses non-padded counts (see methodology).
 

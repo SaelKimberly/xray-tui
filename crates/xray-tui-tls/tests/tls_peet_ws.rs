@@ -154,11 +154,12 @@ async fn fetch_peet_report(
 }
 
 /// Sampled live sweep over the generated roster: one entry per
-/// (family, major) band (the same sampling the grader's `--roster
-/// --sample` uses). Asserts the server-reported JA4 matches the local
-/// peet.ws-algorithm JA4 (wire fidelity) and that hash1 still reproduces
-/// the registered corpus value for every sampled entry — the live
-/// complement to the offline gate, run with the full ignored set:
+/// (family, major) band (the grader's `--roster --sample` sampling,
+/// minus the live-infeasible `pre_shared_key` entries — see
+/// `band_sample`). Asserts the server-reported JA4 matches the local
+/// peet.ws-algorithm JA4 (wire fidelity) and that hash1 still
+/// reproduces the registered corpus value for every sampled entry — the
+/// live complement to the offline gate, run with the full ignored set:
 /// `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored`.
 #[tokio::test]
 #[ignore = "network"]
@@ -210,12 +211,19 @@ async fn sampled_roster_bands_match_live_peet_ws() {
             local::ja4_hash2(&fields)
         );
 
+        // One bounded retry: peet.ws throttles under bursts, so a single
+        // transient connect/GET timeout is retried once — a
+        // deterministic rejection (e.g. the pre_shared_key hellos) fails
+        // both attempts and still lands in `failures`.
         let report = match fetch_peet_report_spec(&spec).await {
             Ok(r) => r,
-            Err(e) => {
-                failures.push(format!("{}: fetch: {e}", entry.name));
-                continue;
-            }
+            Err(_) => match fetch_peet_report_spec(&spec).await {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push(format!("{}: fetch: {e}", entry.name));
+                    continue;
+                }
+            },
         };
         // Wire fidelity: the server's JA4 (its own algorithm, unpadded
         // counts and all) must match the locally computed value.
@@ -247,6 +255,11 @@ async fn sampled_roster_bands_match_live_peet_ws() {
 }
 
 /// One entry per (family, major) band of [`GENERATED`], in roster order.
+///
+/// Entries whose spec carries the `pre_shared_key` extension (`0x0029`)
+/// are skipped: tls.peet.ws deterministically rejects any hello with it
+/// (see `docs/tls-fingerprint-roster.md` Finding 1 — live-connect
+/// infeasible, offline-verified only), so no sampled band may select one.
 fn band_sample() -> Vec<GenEntry> {
     let family = |e: &GenEntry| -> &'static str {
         match (e.browser, e.os) {
@@ -257,10 +270,18 @@ fn band_sample() -> Vec<GenEntry> {
             _ => "chrome",
         }
     };
+    let live_gradeable = |e: &GenEntry| -> bool {
+        let spec = (e.spec_fn)();
+        !spec
+            .extensions
+            .iter()
+            .any(|x| matches!(x, xray_tui_tls::spec::ExtensionSpec::Raw { ty: 0x0029, .. }))
+    };
     let mut seen: Vec<(&str, u16)> = Vec::new();
     GENERATED
         .iter()
         .copied()
+        .filter(|e| live_gradeable(e))
         .filter(|e| {
             let key = (family(e), e.major);
             if seen.contains(&key) {
