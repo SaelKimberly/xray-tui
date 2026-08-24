@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import os
 import re
 import sys
@@ -704,6 +705,287 @@ def _write_manifest(csv_dir: str) -> int:
     return 0
 
 
+# --- Rust emitter: profiles/generated/<family>.rs ------------------------------
+#
+# Renders every manifest entry as a `spec!` declaration plus a `GenEntry`
+# registry row (the resolver and the offline JA4 gate consume `GENERATED`).
+# Rendering is byte-deterministic: --emit twice produces identical files,
+# and --selftest asserts both double-render determinism and that the
+# committed files equal a fresh render.
+
+GENERATED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "..", "profiles", "generated")
+
+# Family modules, in file/module declaration order (task brief file list).
+FAMILY_ORDER = ["chrome", "firefox", "safari", "chrome_android",
+                "safari_ios", "okhttp", "fallback"]
+FAMILY_DOC = {
+    "chrome": "Chromium family desktop hellos (Chrome, Edge, Opera, Brave, "
+              "Samsung Internet; the `chrome_desktop` wire template)",
+    "firefox": "Firefox hellos (the `firefox` wire template)",
+    "safari": "Safari hellos on macOS and desktop (the `safari` wire "
+              "template)",
+    "chrome_android": "Chromium family Android hellos (the `chrome_android` "
+                      "wire template)",
+    "safari_ios": "`WebKit` hellos on iOS (the `safari_ios` wire template; "
+                  "`WKWebView` reality)",
+    "okhttp": "Minimal Chromium derived `OkHttp` hellos (the `okhttp` wire "
+              "template; no corpus entries yet)",
+    "fallback": "Entries with no family template (the `ascending` fallback; "
+                "no corpus entries yet)",
+}
+
+_BROWSER_VARIANT = {
+    "chrome": "Chrome", "firefox": "Firefox", "safari": "Safari",
+    "edge": "Edge", "brave": "Brave", "opera": "Opera",
+    "samsung": "SamsungInternet", "okhttp": "Chrome",
+}
+_OS_VARIANT = {"windows": "Windows", "macos": "MacOs", "linux": "Linux",
+               "android": "Android", "ios": "Ios"}
+_DEVICE_VARIANT = {"desktop": "Desktop", "phone": "Phone", "tablet": "Tablet"}
+
+_GROUP_NAMES = {0x001D: "x25519", 0x11EC: "mlkem768", 0x0017: "p256",
+                0x0018: "p384", 0x0019: "p521"}
+_COMPRESS_NAMES = {0x0001: "zlib", 0x0002: "brotli", 0x0003: "zstd"}
+_KEYSHAKE_NAMES = {"Grease": "grease", "X25519": "x25519",
+                   "X25519Mlkem768": "mlkem768"}
+# Bare extension ids -> spec! tokens (extension variant names, spec/mod.rs).
+_BARE_EXT_TOKENS = {
+    "ServerName": "sni", "Grease": "grease", "StatusRequest": "status",
+    "EcPointFormats": "ecpf", "SessionTicket": "ticket",
+    "PskKeyExchangeModes": "psk", "SignedCertificateTimestamp": "sct",
+    "RenegotiationInfo": "reneg", "Padding": "padding",
+}
+
+
+def _family_module(entry):
+    """Module name for a manifest entry: the same browser/OS rules as
+    `template_for`, so one module == one wire template."""
+    browser, os_name = entry["family"], entry["os"]
+    if os_name == "ios":
+        return "safari_ios"
+    if browser == "firefox":
+        return "firefox"
+    if os_name == "android" and browser != "safari":
+        return "chrome_android"
+    if browser == "safari":
+        return "safari"
+    if browser in ("chrome", "edge", "opera", "brave", "samsung"):
+        return "chrome"
+    return "fallback"
+
+
+def _u16_token(v):
+    return "grease" if is_grease(v) else f"0x{v:04x}"
+
+
+def _group_token(v):
+    return "grease" if is_grease(v) else _GROUP_NAMES.get(v, f"0x{v:04x}")
+
+
+def _compress_token(v):
+    return _COMPRESS_NAMES.get(v, f"0x{v:04x}")
+
+
+def _ext_token(ext):
+    """One manifest extension object -> its spec! token (spec! grammar in
+    profiles/mod.rs; kinds are ExtensionSpec variant names, spec/mod.rs)."""
+    kind = ext["kind"]
+    if kind in _BARE_EXT_TOKENS:
+        return _BARE_EXT_TOKENS[kind]
+    args = ext["args"]
+    if kind == "SupportedGroups":
+        return f"groups[{', '.join(_group_token(v) for v in args[0])}]"
+    if kind == "KeyShare":
+        try:
+            groups = [_KEYSHAKE_NAMES[g] for g in args[0]]
+        except KeyError as e:
+            raise ValueError(
+                f"keyshare group {e} has no spec! token (profiles/mod.rs "
+                f"keyshare_token keyspace)") from None
+        return f"keyshare[{', '.join(groups)}]"
+    if kind == "SupportedVersions":
+        return f"versions[{', '.join(_u16_token(v) for v in args[0])}]"
+    if kind == "SignatureAlgorithms":
+        return f"sigalgs[{', '.join(_u16_token(v) for v in args[0])}]"
+    if kind == "CompressCertificate":
+        return f"compress[{', '.join(_compress_token(v) for v in args[0])}]"
+    if kind == "Alpn":
+        return f"alpn[{', '.join(json.dumps(p) for p in args[0])}]"
+    if kind == "ApplicationSettings":
+        return f"appsettings[{', '.join(json.dumps(p) for p in args[0])}]"
+    if kind == "RecordSizeLimit":
+        return f"rslimit[{args[0]}]"
+    if kind == "Raw":
+        return f"raw[0x{ext['ty']:04x}, \"{bytes(args[0]).hex()}\"]"
+    raise ValueError(f"extension kind {kind!r} is not an ExtensionSpec "
+                     f"variant (spec/mod.rs)")
+
+
+def _wrap(prefix, tokens):
+    """Tokens joined onto `prefix`, wrapped at ~100 columns; continuation
+    lines align under the first token, and every line ends with a comma
+    (the spec! grammar needs one after the last cipher — the section
+    separator — and tolerates one after the last extension)."""
+    lines = []
+    line = prefix
+    for tok in tokens:
+        if line == prefix:
+            line += " " + tok
+        elif len(line) + len(tok) + 2 <= 100:
+            line += ", " + tok
+        else:
+            lines.append(line + ",")
+            line = " " * (len(prefix) + 1) + tok
+    lines.append(line + ",")
+    return lines
+
+
+def _spec_text(entry):
+    """The `spec!` declaration for one manifest entry."""
+    wire = entry["wire"]
+    ciphers = wire["cipher_order"]
+    assert not any(is_grease(c) for c in ciphers[1:]), (
+        f"{entry['name']}: GREASE cipher outside the first slot would not "
+        f"parse (spec! matcher requires GREASE first)")
+    cipher_tokens = ["GREASE" if is_grease(c) else f"0x{c:04x}"
+                     for c in ciphers]
+    ext_tokens = [_ext_token(x) for x in wire["extensions"]]
+    lines = ["spec! {",
+             f"    {entry['name']},"]
+    lines += _wrap("    ciphers:", cipher_tokens)
+    lines.append(f"    session: {wire['session_id']},")
+    lines += _wrap("    exts:", ext_tokens)
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _gen_entry_text(entry):
+    """One `GenEntry { ... }` registry literal (generated/mod.rs struct)."""
+    name = entry["name"]
+    try:
+        browser = _BROWSER_VARIANT[entry["browser"]]
+        os_name = _OS_VARIANT[entry["os"]]
+        device = _DEVICE_VARIANT[entry["device"]]
+    except KeyError as e:
+        raise ValueError(
+            f"{name}: no Rust enum variant for {e} (fingerprints/query.rs)"
+        ) from None
+    return ("    GenEntry {\n"
+            f"        name: {json.dumps(name)},\n"
+            f"        browser: Browser::{browser},\n"
+            f"        os: Some(Os::{os_name}),\n"
+            f"        device: Device::{device},\n"
+            f"        major: {entry['browser_major']},\n"
+            f"        ja4: {json.dumps(entry['ja4'])},\n"
+            f"        spec_fn: {name},\n"
+            "    },")
+
+
+def _render_family_module(module, entries):
+    header = (
+        f"//! {FAMILY_DOC[module]}\n"
+        "//!\n"
+        "//! Emitter output (`gen_specs.py --emit`); do not edit by hand.\n"
+        "//! Regeneration is byte-deterministic (`--selftest` verifies the\n"
+        "//! committed files match a fresh render).\n"
+        "\n"
+        "use super::GenEntry;\n"
+    )
+    if entries:
+        header += "use crate::fingerprints::{Browser, Device, Os};\n"
+    if not entries:
+        return (header + "\n" +
+                "// No corpus entries for this family yet; the registry\n"
+                "// stays empty until the catalog grows one.\n"
+                "pub const GENERATED: &[GenEntry] = &[];\n")
+    out = [header, "#[rustfmt::skip]", "pub const GENERATED: &[GenEntry] = &["]
+    out += [_gen_entry_text(e) for e in entries]
+    out.append("];")
+    for e in entries:
+        out.append("")
+        out.append(f"// ja4={e['ja4']} obs={e['observation_count']}")
+        out.append("#[rustfmt::skip]")
+        out.append(_spec_text(e))
+    return "\n".join(out) + "\n"
+
+
+def _render_mod(by_family):
+    out = [
+        "//! Generated JA4-faithful profile roster, one module per browser\n"
+        "//! family.\n"
+        "//!\n"
+        "//! Each family module holds `spec!` declarations and a `GENERATED`\n"
+        "//! registry; `GENERATED` here is the merged slice consumed by the\n"
+        "//! resolver and the offline JA4 gate (later tasks).\n"
+        "//!\n"
+        "//! Emitter output (`gen_specs.py --emit`); do not edit by hand.\n"
+        "\n"
+        "pub mod chrome;\n"
+        "pub mod chrome_android;\n"
+        "pub mod fallback;\n"
+        "pub mod firefox;\n"
+        "pub mod okhttp;\n"
+        "pub mod safari;\n"
+        "pub mod safari_ios;\n"
+        "\n"
+        "use crate::fingerprints::{Browser, Device, Os};\n"
+        "use crate::spec::ClientHelloSpec;\n"
+        "\n"
+        "/// One generated roster entry: identity, registered source JA4 and\n"
+        "/// the spec builder. `name` doubles as the spec function id.\n"
+        "#[derive(Debug, Clone, Copy)]\n"
+        "pub struct GenEntry {\n"
+        "    pub name: &'static str,\n"
+        "    pub browser: Browser,\n"
+        "    pub os: Option<Os>,\n"
+        "    pub device: Device,\n"
+        "    pub major: u16,\n"
+        "    pub ja4: &'static str,\n"
+        "    pub spec_fn: fn() -> ClientHelloSpec,\n"
+        "}\n"
+        "\n"
+        "/// Every generated profile, family by family (module order).\n"
+        "#[rustfmt::skip]\n"
+        "pub const GENERATED: &[GenEntry] = &[",
+    ]
+    for module in FAMILY_ORDER:
+        entries = by_family[module]
+        if not entries:
+            continue
+        out.append(f"    // {module}: {len(entries)} entries")
+        out += [f"    {module}::GENERATED[{i}]," for i in range(len(entries))]
+    out.append("];")
+    return "\n".join(out) + "\n"
+
+
+def render_modules(entries):
+    """Render every generated file from manifest entries (JSON shape).
+    Returns {filename: text}; deterministic for the same input."""
+    by_family = {m: [] for m in FAMILY_ORDER}
+    for e in entries:
+        by_family[_family_module(e)].append(e)
+    texts = {f"{m}.rs": _render_family_module(m, by_family[m])
+             for m in FAMILY_ORDER}
+    texts["mod.rs"] = _render_mod(by_family)
+    return texts
+
+
+def _write_modules(entries: list) -> int:
+    """Render and write every generated file; returns 0 on success."""
+    texts = render_modules(entries)
+    os.makedirs(GENERATED_DIR, exist_ok=True)
+    for fname, text in sorted(texts.items()):
+        with open(os.path.join(GENERATED_DIR, fname), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text)
+    counts = {m: len([e for e in entries if _family_module(e) == m])
+              for m in FAMILY_ORDER}
+    print(f"generated {len(texts)} files -> {counts} "
+          f"({len(entries)} entries)")
+    return 0
+
+
 # --- self-test -----------------------------------------------------------------
 
 
@@ -842,6 +1124,23 @@ def _selftest() -> int:
           f"full-hash unverifiable (no sig-alg segment): {full_skipped}")
     assert a_bad == 0, f"{a_bad} entries fail A-part reconstruction"
     assert full_bad == 0, f"{full_bad} entries fail full-JA4 reconstruction"
+
+    # Task 5: emitter determinism + regenerate == committed. Rendering the
+    # manifest twice must be byte-identical, and the committed files must
+    # equal a fresh render (--emit output is the committed artifact).
+    entries = [_manifest_entry_json(e) for e in man["entries"]]
+    texts = render_modules(entries)
+    assert render_modules(entries) == texts, "emitter output not deterministic"
+    for fname, text in sorted(texts.items()):
+        path = os.path.join(GENERATED_DIR, fname)
+        with open(path, encoding="utf-8") as fh:
+            assert fh.read() == text, (
+                f"{path} differs from a fresh render — run `--emit` and "
+                f"commit the result")
+    per_family = {m: sum(1 for e in entries if _family_module(e) == m)
+                  for m in FAMILY_ORDER}
+    print(f"emitter: {len(texts)} files byte-deterministic and matching "
+          f"committed; entries per family: {per_family}")
     print("PASS")
     return 0
 
@@ -851,6 +1150,9 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--manifest", action="store_true",
                     help="build specs_manifest.json from the ja4db export")
+    ap.add_argument("--emit", action="store_true",
+                    help="write profiles/generated/*.rs from "
+                         "specs_manifest.json")
     args = ap.parse_args()
     if args.selftest:
         sys.exit(_selftest())
@@ -859,4 +1161,8 @@ if __name__ == "__main__":
         csv_dir = os.path.join(here, "..", "..", "..", "..", "..",
                                "thirdparty", "ja4db-export", "csv")
         sys.exit(_write_manifest(csv_dir))
-    ap.error("nothing to do; pass --selftest or --manifest")
+    if args.emit:
+        with open(MANIFEST_PATH, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        sys.exit(_write_modules(manifest["entries"]))
+    ap.error("nothing to do; pass --selftest, --manifest or --emit")

@@ -316,6 +316,10 @@ macro_rules! spec_exts {
     ($ext:tt $args:tt) => { vec![ext_token!($ext $args)] };
 }
 
+// Generated JA4-faithful roster (Task 5 emitter output). Declared after the
+// `spec!` macro so its textual scope reaches `generated/*.rs`.
+pub mod generated;
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -328,11 +332,14 @@ mod tests {
     use crate::spec::ClientHelloSpec;
     use crate::spec::grease::is_grease;
 
-    /// Every transcribed profile: stable `snake_case` name + its spec
+    /// Every hand-transcribed profile: stable `snake_case` name + its spec
     /// function. The resolution table in `crate::fingerprints` points at
-    /// these same functions.
+    /// these same functions. Kept separate from the generated roster: the
+    /// hand-written tier carries resolution precedence, and its GREASE-slot
+    /// expectations are the family archetypes the generated corpus does
+    /// not reproduce (the ja4db export never carries GREASE ids).
     type SpecEntry = (&'static str, fn() -> ClientHelloSpec);
-    const ALL_SPECS: &[SpecEntry] = &[
+    const HAND_WRITTEN: &[SpecEntry] = &[
         ("chrome", super::chrome::spec),
         ("chrome_119", super::chrome119::spec),
         ("chrome_130", super::chrome::spec),
@@ -351,6 +358,20 @@ mod tests {
         ("ios_14", super::ios14::spec),
         ("android_11_okhttp", super::android11_okhttp::spec),
     ];
+
+    /// Hand-written + generated roster, concatenated — the `ALL_SPECS`
+    /// iteration point for the build/parse and uniqueness tests.
+    fn all_specs() -> Vec<SpecEntry> {
+        HAND_WRITTEN
+            .iter()
+            .copied()
+            .chain(
+                super::generated::GENERATED
+                    .iter()
+                    .map(|g| (g.name, g.spec_fn)),
+            )
+            .collect()
+    }
 
     /// Deterministic RNG feeding back a fixed byte sequence (mirrors the
     /// `hello` test double; `AtomicUsize` keeps it `Sync` for the
@@ -374,8 +395,12 @@ mod tests {
 
     #[test]
     fn all_profiles_build_and_parse() {
+        // Task 5 contract: the whole generated roster is wired in (the
+        // manifest is 1825 entries; a truncated roster would silently
+        // shrink this test's coverage).
+        assert_eq!(super::generated::GENERATED.len(), 1825);
         let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
-        for (name, spec_fn) in ALL_SPECS {
+        for (name, spec_fn) in all_specs() {
             let spec = spec_fn();
             let rng = FixedRandom {
                 bytes: vec![0x5A; 256],
@@ -399,15 +424,20 @@ mod tests {
             // preset carry no GREASE placeholders; the Chromium family,
             // HelloIOS_14 and the uTLS Safari 16 / Edge 106 presets do.
             // GREASE-free profiles have a JA3 that is stable across seeds.
-            if !matches!(
-                *name,
-                "firefox"
-                    | "firefox_120"
-                    | "firefox_128_esr"
-                    | "safari_17"
-                    | "safari_ios_17"
-                    | "android_11_okhttp"
-            ) {
+            // Generated entries are exempt: the ja4db export never carries
+            // GREASE ids, so the corpus shapes are GREASE-free by nature.
+            let hand_written = HAND_WRITTEN.iter().any(|(n, _)| *n == name);
+            if hand_written
+                && !matches!(
+                    name,
+                    "firefox"
+                        | "firefox_120"
+                        | "firefox_128_esr"
+                        | "safari_17"
+                        | "safari_ios_17"
+                        | "android_11_okhttp"
+                )
+            {
                 assert!(
                     parsed.cipher_suites.iter().any(|c| is_grease(*c)),
                     "{name} must carry a GREASE cipher slot"
@@ -454,7 +484,7 @@ mod tests {
     #[test]
     fn all_spec_names_are_unique_snake_case() {
         let mut seen = Vec::new();
-        for (name, _) in ALL_SPECS.iter().chain(std::iter::once(&(
+        for (name, _) in all_specs().iter().chain(std::iter::once(&(
             "chrome_133_macro",
             super::macro_tests::chrome133_macro as fn() -> ClientHelloSpec,
         ))) {
