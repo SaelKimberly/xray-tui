@@ -191,7 +191,6 @@ Deliberately skipped: PSK/shuffle parrot variants (randomized
 per-connection fields outside the declarative model), pre-2019 Chrome
 versions (no camouflage value).
 
-
 ## Testing & verification (tier-1)
 
 1. Existing per-profile tests keep passing after the cutover.
