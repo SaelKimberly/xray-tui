@@ -147,6 +147,257 @@ def load_raw_rows(path: str) -> dict[str, RawComponents]:
     return out
 
 
+# --- attribution (verbatim from gen.py) ---------------------------------------
+
+from ua_parser import parse  # noqa: E402
+
+BROWSER_FAMILIES = {
+    "Edge": "edge", "Edge Mobile": "edge",
+    "Samsung Internet": "samsung",
+    "Mobile Safari": "safari",
+    "Mobile Safari UI/WKWebView": "safari",
+    "Safari": "safari",
+    "Firefox": "firefox",
+    "Opera": "opera",
+    "OPR": "opera",
+    "Brave": "brave",
+}
+OS_FAMILIES = {"mac os x": "macos", "windows": "windows", "linux": "linux",
+               "android": "android", "ios": "ios"}
+# Desktop Linux shows up in ua-parser as the distribution name.
+LINUX_DISTROS = {"ubuntu", "debian", "fedora", "centos", "kubuntu", "gentoo",
+                 "mint", "red hat", "suse", "opensuse", "arch"}
+APPLICATION_RE = re.compile(r"^(Chrome|Firefox|Safari|Edge|Brave|Opera|Samsung Internet)"
+                            r"(?: ([0-9]+)(?:\.[0-9]+)?)?\s*$")
+
+
+def map_browser(family):
+    if family is None:
+        return None
+    if family in BROWSER_FAMILIES:
+        return BROWSER_FAMILIES[family]
+    # Chrome + Mobile/CriOS/Webview variants; Firefox and Opera families too.
+    if family.startswith("Chrome") or "CriOS" in family:
+        return "chrome"
+    if family.startswith("Firefox"):
+        return "firefox"
+    if family.startswith("Opera") or family == "OPR":
+        return "opera"
+    return None
+
+
+def map_os(family):
+    """family may be None or an unrecognized name -> drop the row."""
+    if not family:
+        return None
+    key = family.lower()
+    if key in OS_FAMILIES:
+        return OS_FAMILIES[key]
+    # ua-parser reports modern Windows as e.g. 'Windows 10'.
+    if key.startswith("windows"):
+        return "windows"
+    if key in LINUX_DISTROS:
+        return "linux"
+    return None
+
+
+def derive_device(ua, device_family):
+    dev = device_family or ""
+    if "iPhone" in dev or "iPhone" in ua or "Mobile" in dev:
+        return "phone"
+    if "iPad" in dev or "Tablet" in dev or "iPad" in ua:
+        return "tablet"
+    if "Android" in ua and "Mobile" not in ua:
+        return "tablet"
+    return "desktop"
+
+
+def parse_ua(ua):
+    """UA string -> (browser, browser_major, os, os_major, device); None when
+    unidentifiable. Majors are 0 when unknown."""
+    ua = ua.strip()
+    if not ua:
+        return None
+    r = parse(ua)
+    if r.user_agent is None or r.user_agent.family is None:
+        return None
+    browser = map_browser(r.user_agent.family)
+    if browser is None:
+        return None
+    if r.os is None or r.os.family is None:
+        return None
+    os_name = map_os(r.os.family)
+    if os_name is None:
+        return None
+
+    def major(v):
+        return int(v) if v and v.isdigit() else 0
+
+    return (browser, major(r.user_agent.major), os_name,
+            major(r.os.major), derive_device(ua, r.device.family if r.device else ""))
+
+
+def parse_application(application):
+    """Direct application field, e.g. 'Chrome 94.0'; fallback for UA-less rows."""
+    m = APPLICATION_RE.match(application.strip())
+    if not m:
+        return None
+    name = {"Samsung Internet": "samsung"}.get(m.group(1), m.group(1).lower())
+    return name, int(m.group(2)) if m.group(2) else 0, "", 0, ""
+
+
+# --- manifest build ------------------------------------------------------------
+
+MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "specs_manifest.json")
+
+
+def _hexlist(ids):
+    return ",".join(f"{v:04x}" for v in ids)
+
+
+def build_manifest(csv_dir: str) -> dict:
+    """Attributed, joined, deduplicated fingerprint manifest.
+
+    Joins the raw-string export to the label export by recomputed JA4,
+    attributes each joined fingerprint to a browser/OS/device identity,
+    merges identical (ja4, identity) rows and resolves same-identity
+    collisions across different JA4s deterministically.
+    """
+    # Raw side: recomputed JA4 -> (components, observation_count).
+    raw: dict[str, tuple[RawComponents, int]] = {}
+    rows_in = dropped_t12 = dropped_no_ua = 0
+    with open(os.path.join(csv_dir, "ja4_fingerprint_string.csv"),
+              newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rows_in += 1
+            s = (row.get("ja4_fingerprint_string") or "").strip()
+            if not s.startswith("t13d"):
+                continue  # non-TLS1.3 strings are out of scope entirely
+            rc = parse_raw(s)
+            if rc is None:
+                continue
+            try:
+                n = int(row.get("observation_count") or 1)
+            except ValueError:
+                n = 1
+            k = ja4_hash(rc)
+            prev = raw.get(k)
+            raw[k] = (rc, n + prev[1] if prev else n)
+
+    # Label side: attribute + join.
+    entries: dict[tuple, dict] = {}  # (ja4, identity) -> entry
+    with open(os.path.join(csv_dir, "ja4_fingerprint.csv"),
+              newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rows_in += 1
+            ja4 = (row.get("ja4_fingerprint") or "").strip()
+            if not ja4.startswith("t13d"):
+                dropped_t12 += 1
+                continue
+            ua_field = (row.get("user_agent_string") or "").strip()
+            parsed = parse_ua(ua_field) if ua_field else \
+                parse_application(row.get("application") or "")
+            if parsed is None or not parsed[2]:
+                # application-only rows carry no OS evidence -> unattributable
+                dropped_no_ua += 1
+                continue
+            browser, bmaj, os_name, omaj, device = parsed
+            try:
+                n = int(row.get("observation_count") or 1)
+            except ValueError:
+                n = 1
+            hit = raw.get(ja4)
+            if hit is None:
+                continue  # no raw components on the string side; cannot join
+            rc, raw_n = hit
+            verified = (row.get("verified") or "").strip() == "true"
+            ident = (browser, bmaj, os_name, omaj, device)
+            key = (ja4, ident)
+            e = entries.get(key)
+            if e is None:
+                entries[key] = {
+                    "name": None, "browser": browser, "browser_major": bmaj,
+                    "os": os_name, "os_major": omaj, "device": device,
+                    "ja4": ja4, "raw": rc, "family": browser,
+                    "observation_count": n + raw_n, "verified": verified,
+                    "fallback": False,
+                }
+            else:
+                e["observation_count"] += n
+                e["verified"] = e["verified"] or verified
+
+    # Collision resolution: one winner per identity across differing JA4s.
+    by_ident: dict[tuple, list[dict]] = {}
+    for e in entries.values():
+        by_ident.setdefault((e["browser"], e["browser_major"], e["os"],
+                             e["os_major"], e["device"]), []).append(e)
+    winners: list[dict] = []
+    collisions_dropped = 0
+    for group in by_ident.values():
+        group.sort(key=lambda e: (-e["observation_count"], not e["verified"],
+                                  e["ja4"]))
+        winners.append(group[0])
+        collisions_dropped += len(group) - 1
+
+    # Names: {browser}_{major}[_{os}_{device}], snake_case; `_2`, `_3` ...
+    # disambiguate entries sharing a base name (uniqueness asserted below).
+    winners.sort(key=lambda e: e["ja4"])
+    used: dict[str, int] = {}
+    for e in winners:
+        base = f"{e['browser']}_{e['browser_major']}"
+        if e["os"]:
+            base += f"_{e['os']}_{e['device']}"
+        seen = used.get(base, 0)
+        used[base] = seen + 1
+        e["name"] = base if seen == 0 else f"{base}_{seen + 1}"
+
+    stats = {
+        "rows_in": rows_in,
+        "kept": len(winners),
+        "dropped_no_ua": dropped_no_ua,
+        "dropped_t12": dropped_t12,
+        "collisions_dropped": collisions_dropped,
+    }
+    return {"entries": winners, "stats": stats}
+
+
+def _manifest_entry_json(e: dict) -> dict:
+    rc = e["raw"]
+    return {
+        "name": e["name"], "browser": e["browser"],
+        "browser_major": e["browser_major"], "os": e["os"],
+        "os_major": e["os_major"], "device": e["device"], "ja4": e["ja4"],
+        "raw": {
+            "ja4_a": rc.ja4_a, "ciphers": _hexlist(rc.ciphers),
+            "exts_sorted": _hexlist(rc.exts_sorted),
+            "sigalgs_ordered": _hexlist(rc.sigalgs_ordered),
+            "alpn_first": rc.alpn_first,
+        },
+        "family": e["family"], "observation_count": e["observation_count"],
+        "verified": e["verified"], "fallback": e["fallback"],
+    }
+
+def _write_manifest(csv_dir: str) -> int:
+    import json
+    manifest = build_manifest(csv_dir)
+    out = {
+        "entries": [_manifest_entry_json(e) for e in manifest["entries"]],
+        "stats": manifest["stats"],
+    }
+    names = [e["name"] for e in out["entries"]]
+    assert len(names) == len(set(names)), "duplicate entry names"
+    assert all(e["family"] for e in out["entries"]), "entry without family"
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=1)
+        fh.write("\n")
+    s = out["stats"]
+    print(json.dumps(s))
+    print(f"wrote {MANIFEST_PATH} ({len(names)} entries)")
+    assert s["kept"] >= 50, f"kept {s['kept']} < 50"
+    return 0
+
+
 # --- self-test -----------------------------------------------------------------
 
 
@@ -254,7 +505,14 @@ def _selftest() -> int:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--manifest", action="store_true",
+                    help="build specs_manifest.json from the ja4db export")
     args = ap.parse_args()
     if args.selftest:
         sys.exit(_selftest())
-    ap.error("nothing to do; pass --selftest")
+    if args.manifest:
+        here = os.path.dirname(os.path.abspath(__file__))
+        csv_dir = os.path.join(here, "..", "..", "..", "..", "..",
+                               "thirdparty", "ja4db-export", "csv")
+        sys.exit(_write_manifest(csv_dir))
+    ap.error("nothing to do; pass --selftest or --manifest")
