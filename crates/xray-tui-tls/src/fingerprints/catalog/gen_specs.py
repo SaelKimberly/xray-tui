@@ -298,8 +298,8 @@ def build_manifest(csv_dir: str) -> dict:
             ua_field = (row.get("user_agent_string") or "").strip()
             parsed = parse_ua(ua_field) if ua_field else \
                 parse_application(row.get("application") or "")
-            if parsed is None or not parsed[2]:
-                # application-only rows carry no OS evidence -> unattributable
+            if parsed is None or not parsed[2] or not parsed[1] or not parsed[3]:
+                # unattributable: no UA/OS evidence, or unknown browser/OS major
                 dropped_no_ua += 1
                 continue
             browser, bmaj, os_name, omaj, device = parsed
@@ -385,16 +385,16 @@ def _write_manifest(csv_dir: str) -> int:
         "entries": [_manifest_entry_json(e) for e in manifest["entries"]],
         "stats": manifest["stats"],
     }
+    s = out["stats"]
     names = [e["name"] for e in out["entries"]]
     assert len(names) == len(set(names)), "duplicate entry names"
     assert all(e["family"] for e in out["entries"]), "entry without family"
+    assert s["kept"] >= 50, f"kept {s['kept']} < 50"
     with open(MANIFEST_PATH, "w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=1)
         fh.write("\n")
-    s = out["stats"]
     print(json.dumps(s))
     print(f"wrote {MANIFEST_PATH} ({len(names)} entries)")
-    assert s["kept"] >= 50, f"kept {s['kept']} < 50"
     return 0
 
 
