@@ -94,12 +94,20 @@ impl Fingerprint {
         }
     }
 
-    /// Latest-known version/os/device defaults for a browser. Latest-known
-    /// values are filled by the resolution table (Task 4); today this
-    /// returns a bare identity.
+    /// Latest-known identity for a browser: the version/os/device of the
+    /// resolution-table row with the greatest `max_version` (ties → first
+    /// declared). Browsers with no rows yet return a bare identity.
     #[must_use]
-    pub const fn default_for(browser: Browser) -> Self {
-        Self::new(browser)
+    pub fn default_for(browser: Browser) -> Self {
+        crate::fingerprints::resolve::latest_row(browser).map_or_else(
+            || Self::new(browser),
+            |row| Self {
+                browser,
+                version: Some(row.max_version),
+                os: row.os,
+                device: Some(row.device),
+            },
+        )
     }
 
     /// Platform-sensible default. Windows → Chrome/Windows,
@@ -165,11 +173,24 @@ impl Default for Fingerprint {
 mod tests {
     use super::*;
     #[test]
-    fn default_for_returns_bare_identity_until_table_lands() {
+    fn default_for_picks_greatest_max_version_table_row() {
         let fp = Fingerprint::default_for(Browser::Chrome);
         assert_eq!(fp.browser, Browser::Chrome);
-        assert!(fp.version.is_none());
-        assert!(fp.device.is_none());
+        assert_eq!(fp.version, Some(133));
+        assert_eq!(fp.os, None); // chrome desktop rows are os-unpinned
+        assert_eq!(fp.device, Some(Device::Desktop));
+
+        // Safari's rows tie at max_version 17; the first-declared
+        // (desktop macOS) row wins.
+        let sf = Fingerprint::default_for(Browser::Safari);
+        assert_eq!(
+            (sf.version, sf.os, sf.device),
+            (Some(17), Some(Os::MacOs), Some(Device::Desktop))
+        );
+
+        // No rows yet for SamsungInternet — bare identity.
+        let bare = Fingerprint::default_for(Browser::SamsungInternet);
+        assert_eq!((bare.version, bare.os, bare.device), (None, None, None));
     }
 
     #[test]
