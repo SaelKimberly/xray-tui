@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(BrowserProfile::Firefox.name(), "firefox");
         assert_eq!(BrowserProfile::Firefox128Esr.name(), "firefox_128_esr");
         assert_eq!(BrowserProfile::Safari17.name(), "safari_17");
-        assert_eq!(BrowserProfile::Edge130.name(), "edge_130");
+        assert_eq!(BrowserProfile::SafariIos17.name(), "safari_ios_17");
         assert_eq!(BrowserProfile::Edge106.name(), "edge_106");
         assert_eq!(BrowserProfile::Firefox120.name(), "firefox_120");
         assert_eq!(BrowserProfile::Safari16.name(), "safari_16");

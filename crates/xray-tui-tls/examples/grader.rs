@@ -232,10 +232,12 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
     let expected_ja4 = match profile {
         BrowserProfile::Chrome130 => Some(CHROME130_JA4),
         BrowserProfile::Firefox128Esr => Some(FIREFOX128ESR_JA4),
-        // Task 7 desktop batch (safari_16/firefox_120/edge_106): no
-        // frozen constants yet — Task 10 locks them from this grader's
-        // captured JA4 strings.
-        _ => None,
+        // Task 7 desktop batch: no frozen constants yet — Task 10 locks
+        // them from this grader's captured JA4 strings. Enumerated
+        // explicitly so a future profile fails to compile here instead of
+        // silently skipping the locked-JA4 assertion.
+        BrowserProfile::Safari16 | BrowserProfile::Firefox120 | BrowserProfile::Edge106 => None,
+        _ => unreachable!("GRADED_PROFILES and this match must stay in sync"),
     };
     if let Some(expected_ja4) = expected_ja4 {
         assert_eq!(server_ja4, expected_ja4, "server JA4 != locked constant");
