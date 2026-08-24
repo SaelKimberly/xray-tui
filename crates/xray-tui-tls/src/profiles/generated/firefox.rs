@@ -3681,9 +3681,9 @@ spec! {
     ciphers: 0x1301, 0x1302, 0x1303, 0xc013, 0xc014, 0x002f, 0x0035,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1113h2_47af8f603342_f81080dfc557 obs=44
@@ -3693,9 +3693,9 @@ spec! {
     ciphers: 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0x009c, 0x009d,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, padding, rslimit[16385], raw[0x0022, ""],
+          padding, rslimit[16385], raw[0x0022, ""],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3706,9 +3706,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8728
@@ -3719,9 +3719,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -3732,9 +3732,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3745,9 +3745,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3758,9 +3758,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3771,9 +3771,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3784,9 +3784,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3797,9 +3797,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3810,9 +3810,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3823,9 +3823,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3836,9 +3836,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3849,9 +3849,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3862,9 +3862,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3875,9 +3875,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3888,9 +3888,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8716
@@ -3901,9 +3901,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8717
@@ -3914,9 +3914,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8716
@@ -3927,9 +3927,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -3940,9 +3940,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8718
@@ -3953,9 +3953,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3966,9 +3966,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8717
@@ -3979,9 +3979,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -3992,9 +3992,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -4005,9 +4005,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -4018,9 +4018,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -4031,9 +4031,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -4044,9 +4044,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -4057,9 +4057,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -4070,9 +4070,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -4083,9 +4083,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -4096,9 +4096,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8719
@@ -4109,9 +4109,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -4122,9 +4122,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -4135,9 +4135,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -4148,9 +4148,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d131100_f57a46bbacb6_ab7e3b40a677 obs=588
@@ -4161,9 +4161,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d131100_f57a46bbacb6_e5728521abd4 obs=259
@@ -4174,9 +4174,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=435
@@ -4187,9 +4187,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -4200,9 +4200,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -4213,9 +4213,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -4226,9 +4226,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -4239,9 +4239,9 @@ spec! {
              0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1313h2_07be0c029dc8_28652fe741a1 obs=4
@@ -4265,9 +4265,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1513h2_8daaf6152771_8b8ad545d541 obs=6
@@ -4278,9 +4278,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0201],
-          psk, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1513h2_8daaf6152771_8b8ad545d541 obs=6
@@ -4291,9 +4291,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0201],
-          psk, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1514ht_8daaf6152771_a5b99884f7f5 obs=459
@@ -4473,9 +4473,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], sct, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], sct, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1515h2_8daaf6152771_a54fffd0eb61 obs=10
@@ -4486,9 +4486,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], sct, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], sct, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1515ht_8daaf6152771_4769d65a485e obs=534
@@ -5357,9 +5357,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, status,
-          versions[0x0304, 0x0303],
+          keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -5370,9 +5370,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, status,
-          versions[0x0304, 0x0303],
+          keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -5383,9 +5383,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, status,
-          versions[0x0304, 0x0303],
+          keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -5396,9 +5396,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, status,
-          versions[0x0304, 0x0303],
+          keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8608
@@ -5409,9 +5409,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, status,
-          versions[0x0304, 0x0303],
+          keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -5422,9 +5422,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, status,
-          versions[0x0304, 0x0303],
+          keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -5435,9 +5435,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -5448,9 +5448,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -5461,9 +5461,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -5474,9 +5474,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d1710h2_5b57614c22b0_97f8aa674fd9 obs=172
@@ -5487,9 +5487,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf, alpn["h2", "http/1.1"],
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d171100_ab0a1bf427ad_d41ae481755e obs=576
@@ -5656,9 +5656,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1713h2_5b57614c22b0_748f4c70de1c obs=241
@@ -5669,9 +5669,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1713h2_5b57614c22b0_f81080dfc557 obs=27
@@ -5682,9 +5682,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, padding, rslimit[16385], raw[0x0022, ""],
+          padding, rslimit[16385], raw[0x0022, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5695,9 +5695,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=233
@@ -5708,9 +5708,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5721,9 +5721,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=233
@@ -5734,9 +5734,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5747,9 +5747,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5760,9 +5760,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=234
@@ -5773,9 +5773,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5786,9 +5786,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5799,9 +5799,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=235
@@ -5812,9 +5812,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=233
@@ -5825,9 +5825,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1714h2_5b57614c22b0_3dd24b5ebec4 obs=232
@@ -5838,9 +5838,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1715h2_5b57614c22b0_3d5424432f57 obs=680
@@ -6371,9 +6371,9 @@ spec! {
              0x002f, 0x0035, 0x009c, 0x009d, 0xc009, 0xc00a,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          alpn["h2", "http/1.1"], status, versions[0x0304, 0x0303],
+          alpn["h2", "http/1.1"], status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201],
-          psk, compress[brotli], sct, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
+          compress[brotli], sct, rslimit[16385], raw[0x0022, ""], raw[0xfe0d, ""],
 }
 
 // ja4=t13d1716h2_5b57614c22b0_eeeea6562960 obs=1218
@@ -7528,9 +7528,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d201000_314f1408a5a6_e7c285222651 obs=171
@@ -7541,9 +7541,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct,
+          sct,
 }
 
 // ja4=t13d201100_314f1408a5a6_ab7e3b40a677 obs=41
@@ -7554,9 +7554,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_ab7e3b40a677 obs=41
@@ -7567,9 +7567,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_ab7e3b40a677 obs=41
@@ -7580,9 +7580,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_e5728521abd4 obs=82
@@ -7593,9 +7593,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_e5728521abd4 obs=82
@@ -7606,9 +7606,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_e5728521abd4 obs=82
@@ -7619,9 +7619,9 @@ spec! {
              0x002f, 0x0035, 0x003c, 0x009c, 0x009d, 0xc009, 0xc00a, 0xc023, 0xc027,
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384, p521, 0x0100, 0x0101], ecpf,
-          status, versions[0x0304, 0x0303],
+          status, keyshare[x25519], versions[0x0304, 0x0303],
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          psk, sct, raw[0x0032, ""],
+          sct, raw[0x0032, ""],
 }
 
 // ja4=t13d221000_231e334592e8_29829a46703f obs=25

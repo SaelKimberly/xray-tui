@@ -6511,7 +6511,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8728
@@ -6523,7 +6523,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8717
@@ -6535,7 +6535,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6547,7 +6547,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -6559,7 +6559,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6571,7 +6571,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -6583,7 +6583,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -6595,7 +6595,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -6607,7 +6607,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8751
@@ -6619,7 +6619,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6631,7 +6631,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -6643,7 +6643,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8717
@@ -6655,7 +6655,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8758
@@ -6667,7 +6667,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8722
@@ -6679,7 +6679,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8728
@@ -6691,7 +6691,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8726
@@ -6703,7 +6703,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6715,7 +6715,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8722
@@ -6727,7 +6727,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -6739,7 +6739,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -6751,7 +6751,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8722
@@ -6763,7 +6763,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -6775,7 +6775,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -6787,7 +6787,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8717
@@ -6799,7 +6799,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6811,7 +6811,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8727
@@ -6823,7 +6823,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8718
@@ -6835,7 +6835,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6847,7 +6847,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6859,7 +6859,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8730
@@ -6871,7 +6871,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -6883,7 +6883,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8716
@@ -6895,7 +6895,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8717
@@ -6907,7 +6907,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -6919,7 +6919,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -6931,7 +6931,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -6943,7 +6943,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8806
@@ -6955,7 +6955,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -6967,7 +6967,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8721
@@ -6979,7 +6979,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8712
@@ -6991,7 +6991,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -7003,7 +7003,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=9299
@@ -7015,7 +7015,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -7027,7 +7027,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8714
@@ -7039,7 +7039,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8715
@@ -7051,7 +7051,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8716
@@ -7063,7 +7063,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131000_f57a46bbacb6_e7c285222651 obs=8713
@@ -7075,7 +7075,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d131100_f57a46bbacb6_ab7e3b40a677 obs=588
@@ -7087,7 +7087,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          sct, psk, versions[0x0304, 0x0303], raw[0x0032, ""],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303], raw[0x0032, ""],
 }
 
 // ja4=t13d131100_f57a46bbacb6_e5728521abd4 obs=259
@@ -7099,7 +7099,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303], raw[0x0032, ""],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303], raw[0x0032, ""],
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -7112,7 +7112,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=435
@@ -7125,7 +7125,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -7138,7 +7138,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1311h2_f57a46bbacb6_e7c285222651 obs=434
@@ -7151,7 +7151,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1511h2_8daaf6152771_6d021c4c45cd obs=250
@@ -11247,7 +11247,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8716
@@ -11259,7 +11259,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11271,7 +11271,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11283,7 +11283,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8607
@@ -11295,7 +11295,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11307,7 +11307,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11319,7 +11319,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8694
@@ -11331,7 +11331,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11343,7 +11343,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11355,7 +11355,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11367,7 +11367,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11379,7 +11379,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8608
@@ -11391,7 +11391,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8610
@@ -11403,7 +11403,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11415,7 +11415,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11427,7 +11427,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11439,7 +11439,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8607
@@ -11451,7 +11451,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8608
@@ -11463,7 +11463,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11475,7 +11475,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11487,7 +11487,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11499,7 +11499,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11511,7 +11511,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11523,7 +11523,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11535,7 +11535,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11547,7 +11547,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11559,7 +11559,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11571,7 +11571,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11583,7 +11583,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8660
@@ -11595,7 +11595,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11607,7 +11607,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11619,7 +11619,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8623
@@ -11631,7 +11631,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8607
@@ -11643,7 +11643,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11655,7 +11655,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11667,7 +11667,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11679,7 +11679,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11691,7 +11691,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11703,7 +11703,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11715,7 +11715,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11727,7 +11727,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8607
@@ -11739,7 +11739,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11751,7 +11751,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11763,7 +11763,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11775,7 +11775,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11787,7 +11787,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606
@@ -11799,7 +11799,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=806
@@ -11811,7 +11811,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11823,7 +11823,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11835,7 +11835,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11847,7 +11847,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11859,7 +11859,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11871,7 +11871,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11883,7 +11883,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11895,7 +11895,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11907,7 +11907,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11919,7 +11919,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11931,7 +11931,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11943,7 +11943,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11955,7 +11955,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11967,7 +11967,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11979,7 +11979,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -11991,7 +11991,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12003,7 +12003,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12015,7 +12015,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=805
@@ -12027,7 +12027,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12039,7 +12039,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12051,7 +12051,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12063,7 +12063,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12075,7 +12075,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12087,7 +12087,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12099,7 +12099,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12111,7 +12111,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12123,7 +12123,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12135,7 +12135,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12147,7 +12147,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12159,7 +12159,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12171,7 +12171,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171000_5b57614c22b0_e7c285222651 obs=804
@@ -12183,7 +12183,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d171100_5b57614c22b0_be53661681a4 obs=6
@@ -12207,7 +12207,7 @@ spec! {
     session: random32,
     exts: sni, reneg, groups[mlkem768, x25519, p256, p384], ecpf, alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303], raw[0x3374, ""],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303], raw[0x3374, ""],
 }
 
 // ja4=t13d1711h2_5b57614c22b0_e7c285222651 obs=181
@@ -12220,7 +12220,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1711h2_5b57614c22b0_e7c285222651 obs=181
@@ -12233,7 +12233,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1711h2_5b57614c22b0_e7c285222651 obs=181
@@ -12246,7 +12246,7 @@ spec! {
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf,
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d1711ht_ab0a1bf427ad_a29327ec888c obs=17
@@ -12377,7 +12377,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d201000_314f1408a5a6_e7c285222651 obs=172
@@ -12389,7 +12389,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d201000_314f1408a5a6_e7c285222651 obs=171
@@ -12401,7 +12401,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303],
 }
 
 // ja4=t13d201100_314f1408a5a6_ab7e3b40a677 obs=41
@@ -12413,7 +12413,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          sct, psk, versions[0x0304, 0x0303], raw[0x0032, ""],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303], raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_ab7e3b40a677 obs=41
@@ -12425,7 +12425,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603],
-          sct, psk, versions[0x0304, 0x0303], raw[0x0032, ""],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303], raw[0x0032, ""],
 }
 
 // ja4=t13d201100_314f1408a5a6_e5728521abd4 obs=82
@@ -12437,7 +12437,7 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[mlkem768, x25519, p256, p384], ecpf, status,
           sigalgs[0x0804, 0x0403, 0x0807, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0503, 0x0603, 0x0201, 0x0203],
-          sct, psk, versions[0x0304, 0x0303], raw[0x0032, ""],
+          sct, keyshare[mlkem768, x25519], versions[0x0304, 0x0303], raw[0x0032, ""],
 }
 
 // ja4=t13d2212h2_231e334592e8_36bf25f296df obs=7536
