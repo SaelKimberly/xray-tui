@@ -188,9 +188,13 @@ mod tests {
             (Some(17), Some(Os::MacOs), Some(Device::Desktop))
         );
 
-        // No rows yet for SamsungInternet — bare identity.
-        let bare = Fingerprint::default_for(Browser::SamsungInternet);
-        assert_eq!((bare.version, bare.os, bare.device), (None, None, None));
+        // Samsung Internet has no hand rows; the generated roster answers
+        // with its newest band (run 25–29 → version 29, Android desktop).
+        let samsung = Fingerprint::default_for(Browser::SamsungInternet);
+        assert_eq!(
+            (samsung.version, samsung.os, samsung.device),
+            (Some(29), Some(Os::Android), Some(Device::Desktop))
+        );
     }
 
     #[test]

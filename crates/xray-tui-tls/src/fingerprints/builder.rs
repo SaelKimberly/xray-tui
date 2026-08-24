@@ -267,8 +267,10 @@ mod tests {
 
     #[test]
     fn macos_safari_resolves_before_building() {
-        // builder resolves strictly — unknown combos fail at construction
-        let err = FingerprintBuilder::new(&Fingerprint::new(Browser::Chrome).with_version(3));
+        // builder resolves strictly — unknown combos fail at construction.
+        // Chrome 3 now resolves via the generated roster (its Windows run
+        // starts at 3); 2 is below every run in both tiers.
+        let err = FingerprintBuilder::new(&Fingerprint::new(Browser::Chrome).with_version(2));
         assert!(err.is_err());
     }
 }
