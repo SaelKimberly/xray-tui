@@ -13,11 +13,11 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
+use xray_tui_tls::fingerprints::{Browser, Fingerprint};
 use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
 use xray_tui_tls::hello::{BuildParams, build_hello};
 use xray_tui_tls::http2;
-use xray_tui_tls::profiles::BrowserProfile;
 use xray_tui_tls::verify::WebPkiVerifier;
 
 const HOST: &str = "tls.peet.ws";
@@ -42,19 +42,21 @@ const CHROME130_JA3_STRIPPED_MD5: &str = "2b916ec56aedf4a5ecbeb5804f60c242";
 /// No network — runs in every `cargo test`.
 #[test]
 fn local_fingerprints_match_locked_constants() {
-    for (profile, expected_ja4, expected_ja3) in [
+    for (name, fingerprint, expected_ja4, expected_ja3) in [
         (
-            BrowserProfile::Chrome130,
+            "chrome_130",
+            Fingerprint::new(Browser::Chrome).with_version(130),
             CHROME130_JA4,
             CHROME130_JA3_STRIPPED_MD5,
         ),
         (
-            BrowserProfile::Firefox128Esr,
+            "firefox_128_esr",
+            Fingerprint::new(Browser::Firefox).with_version(128),
             FIREFOX128ESR_JA4,
             FIREFOX128ESR_JA3,
         ),
     ] {
-        let spec = profile.spec();
+        let spec = fingerprint.resolve().expect("identity resolves").spec;
         let fixed = local::FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
@@ -77,13 +79,13 @@ fn local_fingerprints_match_locked_constants() {
         assert_eq!(
             local::ja4_v2(&parsed),
             expected_ja4,
-            "{profile:?} JA4 v2 must match the locked constant"
+            "{name} JA4 v2 must match the locked constant"
         );
         let stripped = local::strip_grease(&local::ja3_dash(&parsed));
         assert_eq!(
             local::md5_hex(stripped.as_bytes()),
             expected_ja3,
-            "{profile:?} GREASE-stripped JA3 md5 must match the locked value"
+            "{name} GREASE-stripped JA3 md5 must match the locked value"
         );
     }
 }
@@ -91,7 +93,7 @@ fn local_fingerprints_match_locked_constants() {
 #[tokio::test]
 #[ignore = "network"]
 async fn chrome_130_matches_expected_fingerprints() {
-    let report = fetch_peet_report(BrowserProfile::Chrome130).await;
+    let report = fetch_peet_report(&Fingerprint::new(Browser::Chrome).with_version(130)).await;
     let report = report.expect("live tls.peet.ws fetch for Chrome 130");
 
     // GREASE-normalized JA4 is deterministic: strict equality against both
@@ -116,7 +118,7 @@ async fn chrome_130_matches_expected_fingerprints() {
 #[tokio::test]
 #[ignore = "network"]
 async fn firefox_128_esr_matches_expected_fingerprints() {
-    let report = fetch_peet_report(BrowserProfile::Firefox128Esr).await;
+    let report = fetch_peet_report(&Fingerprint::new(Browser::Firefox).with_version(128)).await;
     let report = report.expect("live tls.peet.ws fetch for Firefox 128 ESR");
 
     // Firefox 128 ESR is GREASE-free: JA3 and JA4 are both stable.
@@ -142,9 +144,9 @@ async fn firefox_128_esr_matches_expected_fingerprints() {
 /// HTTP/2 GET `/api/all`, and compute both the server's report and the
 /// local reconciliation fingerprints.
 async fn fetch_peet_report(
-    profile: BrowserProfile,
+    fingerprint: &Fingerprint,
 ) -> Result<PeetReport, Box<dyn std::error::Error>> {
-    let spec = profile.spec();
+    let spec = fingerprint.resolve().expect("identity resolves").spec;
     let fixed = local::FixedRandom {
         bytes: vec![0x42; 128],
         pos: AtomicUsize::new(0),

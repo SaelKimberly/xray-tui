@@ -15,9 +15,7 @@ use base64::Engine as _;
 
 use crate::error::NativeError;
 
-pub use xray_tui_tls::reality::{
-    FixedChrome133, HelloProvisioner, ProfileProvisioner, SpiderConfig,
-};
+pub use xray_tui_tls::reality::{FixedChrome133, HelloProvisioner, SpecProvisioner, SpiderConfig};
 
 /// Chosen provisioner for a REALITY connect.
 #[derive(Clone, Default)]

@@ -36,11 +36,11 @@ use crate::SecureRandom;
 use crate::crypto::X25519KeyPair;
 use crate::crypto::mlkem::Mlkem768;
 use crate::error::{Result, TlsError};
+use crate::fingerprints::Fingerprint;
 use crate::handshake::{AuthOutcome, ServerAuth, drive};
 use crate::hello::{BuildParams, build_hello};
-use crate::profiles::BrowserProfile;
 use crate::record::stream::TlsStream;
-use crate::spec::{ExtensionSpec, KeyShareGroup, SessionIdSpec};
+use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
 
 /// The `ClientHello` ALPN list REALITY always offers.
 const REALITY_ALPN: &[&str] = &["h2", "http/1.1"];
@@ -57,7 +57,7 @@ pub trait HelloProvisioner: Send + Sync {
     /// Whether the provisioned `ClientHello` offers a hybrid ML-KEM key
     /// share. The conservative default `true` keeps the connector
     /// generating an ML-KEM-768 key pair (a custom provisioner may embed
-    /// a hybrid entry invisible to us); [`ProfileProvisioner`] overrides
+    /// a hybrid entry invisible to us); [`SpecProvisioner`] overrides
     /// with the actual spec check so classical-only profiles skip the
     /// keygen entirely.
     fn offers_hybrid_key_share(&self) -> bool {
@@ -101,13 +101,38 @@ impl ProvisionedHello {
 /// Fixed Chrome-133-shaped provisioner (first engine; ported from shoes).
 pub struct FixedChrome133;
 
-/// A `HelloProvisioner` shaped by any browser profile: the profile's
-/// `ClientHello` spec with the REALITY `AuthPayload` session id slot.
-pub struct ProfileProvisioner(pub BrowserProfile);
+/// A `HelloProvisioner` shaped by any concrete hello spec: REALITY's
+/// auth payload rides the session-id slot of the given spec.
+pub struct SpecProvisioner {
+    spec_source: Box<dyn Fn() -> ClientHelloSpec + Send + Sync>,
+}
 
-impl HelloProvisioner for ProfileProvisioner {
+impl SpecProvisioner {
+    /// Shapes the provisioner from a spec-producing closure.
+    #[must_use]
+    pub fn new(spec_source: impl Fn() -> ClientHelloSpec + Send + Sync + 'static) -> Self {
+        Self {
+            spec_source: Box::new(spec_source),
+        }
+    }
+}
+
+impl From<&Fingerprint> for SpecProvisioner {
+    fn from(fp: &Fingerprint) -> Self {
+        // REALITY provisioning needs a concrete hello; unknown identities
+        // panic here by contract (resolve errors are a configuration bug —
+        // validated upstream when the fingerprint was configured).
+        let spec_source = {
+            let fp = fp.clone();
+            move || fp.resolve().expect("fingerprint must resolve").spec
+        };
+        Self::new(spec_source)
+    }
+}
+
+impl HelloProvisioner for SpecProvisioner {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
-        let mut spec = self.0.spec();
+        let mut spec = (self.spec_source)();
         spec.session_id = SessionIdSpec::AuthPayload { len: 32 };
         let built = build_hello(
             &spec,
@@ -119,9 +144,9 @@ impl HelloProvisioner for ProfileProvisioner {
                 rng: params.rng,
             },
         )?;
-        let session_id_range = built.session_id_range.ok_or_else(|| {
-            TlsError::Spec("profile spec must use SessionIdSpec::AuthPayload".into())
-        })?;
+        let session_id_range = built
+            .session_id_range
+            .ok_or_else(|| TlsError::Spec("spec must use SessionIdSpec::AuthPayload".into()))?;
         Ok(ProvisionedHello {
             handshake_bytes: built.handshake_bytes,
             session_id_range,
@@ -129,7 +154,7 @@ impl HelloProvisioner for ProfileProvisioner {
     }
 
     fn offers_hybrid_key_share(&self) -> bool {
-        self.0.spec().extensions.iter().any(|ext| {
+        (self.spec_source)().extensions.iter().any(|ext| {
             matches!(
                 ext,
                 ExtensionSpec::KeyShare(groups)
@@ -146,7 +171,7 @@ impl HelloProvisioner for ProfileProvisioner {
 
 impl HelloProvisioner for FixedChrome133 {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
-        ProfileProvisioner(BrowserProfile::Chrome133).provision(params)
+        SpecProvisioner::new(crate::profiles::chrome133::spec).provision(params)
     }
 }
 
@@ -303,6 +328,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::fingerprints::Browser;
     use crate::hello::parse::parse_hello;
     use crate::http2;
     use parking_lot::Mutex;
@@ -383,10 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_provisioner_chrome133_matches_fixed_chrome133() {
+    fn spec_provisioner_chrome133_matches_fixed_chrome133() {
         // A fresh fixed-seed RNG per call: both provisioners must consume
         // the identical byte stream (0x42 → every GREASE value 0x2A2A), so
-        // byte equality proves `ProfileProvisioner(BrowserProfile::Chrome133)`
+        // byte equality proves `SpecProvisioner::from(&chrome_133 fingerprint)`
         // produces exactly what the fixed Chrome-133 provisioner produces.
         let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
         let fixed_rng = FixedRandom {
@@ -406,7 +432,7 @@ mod tests {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
         };
-        let profile = ProfileProvisioner(BrowserProfile::Chrome133)
+        let profile = SpecProvisioner::from(&Fingerprint::new(Browser::Chrome).with_version(133))
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
                 alpn: Some(REALITY_ALPN),

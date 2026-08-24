@@ -570,12 +570,16 @@ pub async fn probe(tunnel: &mut crate::NativeTunnel) -> (u16, String) {
 /// be established (the e2e runner retries the whole connection).
 pub async fn probe_inner_tls(tunnel: crate::NativeTunnel) -> (u16, String) {
     use xray_tui_tls::client::{TlsConfig, connect as tls_connect};
+    use xray_tui_tls::fingerprints::{Browser, Fingerprint};
     use xray_tui_tls::handshake::ServerVerifier;
-    use xray_tui_tls::profiles::BrowserProfile;
     use xray_tui_tls::verify::WebPkiVerifier;
     let verifier: Arc<dyn ServerVerifier> =
         Arc::new(WebPkiVerifier::webpki_roots().with_insecure(true));
-    let config = TlsConfig::plain(Some(BrowserProfile::Chrome130), verifier, INNER_TLS_SNI);
+    let config = TlsConfig::plain(
+        Some(Fingerprint::new(Browser::Chrome).with_version(130)),
+        verifier,
+        INNER_TLS_SNI,
+    );
     // Bound the handshake: through the tunnel + REALITY's post-handshake
     // detector the ServerHello flight can lag several seconds.
     let mut inner =

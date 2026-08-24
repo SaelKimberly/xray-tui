@@ -7,7 +7,9 @@
 pub mod fingerprints;
 pub mod profiles;
 pub mod spec;
-pub use profiles::BrowserProfile;
+pub use fingerprints::{
+    Browser, Device, Fingerprint, FingerprintBuilder, FingerprintError, GreasePolicy, Os, Resolved,
+};
 pub mod client;
 pub mod crypto;
 pub mod handshake;

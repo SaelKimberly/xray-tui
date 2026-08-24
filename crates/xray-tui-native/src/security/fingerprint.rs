@@ -2,12 +2,12 @@
 //!
 //! `wrap()` routes every TLS connect through the engine
 //! (`xray_tui_tls::client::connect`); this module supplies the engine-side
-//! pieces: the URL `fp` id parser, the id → [`BrowserProfile`] mapping, and
+//! pieces: the URL `fp` id parser, the id → [`Fingerprint`] identity mapping, and
 //! the [`WebPkiVerifier`] builder — harness CA (test/e2e), `webpki-roots`
 //! (production), `allowInsecure`, or a `pinSHA256` SPKI pin.
 
 use base64::Engine as _;
-use xray_tui_tls::profiles::BrowserProfile;
+use xray_tui_tls::fingerprints::{Browser, Fingerprint, Os};
 use xray_tui_tls::verify::WebPkiVerifier;
 
 use crate::error::NativeError;
@@ -53,17 +53,21 @@ pub fn parse_fingerprint_id(s: &str) -> Result<FingerprintId, NativeError> {
     }
 }
 
-/// Resolve a fingerprint id to the concrete browser profile.
+/// Resolve a fingerprint id to the engine's [`Fingerprint`] identity.
 ///
-/// `Random` maps to the latest stable Chrome capture, matching the engine's
+/// `Random` maps to the Chrome-130 capture, matching the engine's
 /// "generic Chrome" convention.
-pub const fn profile_for(fp: FingerprintId) -> Result<BrowserProfile, NativeError> {
+pub const fn profile_for(fp: FingerprintId) -> Result<Fingerprint, NativeError> {
     Ok(match fp {
         FingerprintId::Chrome | FingerprintId::ChromeRandomized | FingerprintId::Random => {
-            BrowserProfile::Chrome130
+            Fingerprint::new(Browser::Chrome).with_version(130)
         }
-        FingerprintId::Firefox => BrowserProfile::Firefox128Esr,
-        FingerprintId::Safari => BrowserProfile::Safari17,
+        FingerprintId::Firefox => Fingerprint::new(Browser::Firefox)
+            .with_version(128)
+            .with_os(Os::Linux),
+        FingerprintId::Safari => Fingerprint::new(Browser::Safari)
+            .with_version(17)
+            .with_os(Os::MacOs),
     })
 }
 

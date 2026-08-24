@@ -45,11 +45,11 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
+use xray_tui_tls::fingerprints::{Browser, Device, Fingerprint, Os};
 use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
 use xray_tui_tls::hello::{BuildParams, build_hello};
 use xray_tui_tls::http2;
-use xray_tui_tls::profiles::BrowserProfile;
 use xray_tui_tls::verify::WebPkiVerifier;
 
 const HOST: &str = "tls.peet.ws";
@@ -74,15 +74,14 @@ const FIREFOX128ESR_JA4: &str = "t13d1314h2_07be0c029dc8_46701d79520f";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let profiles = parse_args();
-
-    for profile in profiles {
+    for idx in parse_args() {
+        let (name, fingerprint) = &GRADED_PROFILES[idx];
         println!("\n{}", "=".repeat(60));
-        println!("Profile : {}", profile.name());
+        println!("Profile : {name}");
         println!("Protocol: HTTP/2");
         println!("{}", "=".repeat(60));
 
-        if let Err(e) = grade(profile).await {
+        if let Err(e) = grade(name, fingerprint).await {
             eprintln!("GRADE: FAIL — {e}");
             std::process::exit(1);
         }
@@ -92,24 +91,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Profiles the grader can grade (all others are rejected at the CLI).
-const GRADED_PROFILES: &[BrowserProfile] = &[
-    BrowserProfile::Chrome130,
-    BrowserProfile::Firefox128Esr,
-    BrowserProfile::Safari16,
-    BrowserProfile::Firefox120,
-    BrowserProfile::Edge106,
-    BrowserProfile::Ios14,
-    // `Android11OkHttp` is deliberately NOT gradable: the uTLS preset is a
+/// Profiles the grader can grade (all others are rejected at the CLI):
+/// stable resolution-table names + the fingerprint identity selecting them.
+const GRADED_PROFILES: &[(&str, Fingerprint)] = &[
+    (
+        "chrome_130",
+        Fingerprint::new(Browser::Chrome).with_version(130),
+    ),
+    (
+        "firefox_128_esr",
+        Fingerprint::new(Browser::Firefox).with_version(128),
+    ),
+    (
+        "safari_16",
+        Fingerprint::new(Browser::Safari).with_version(16),
+    ),
+    (
+        "firefox_120",
+        Fingerprint::new(Browser::Firefox).with_version(120),
+    ),
+    (
+        "edge_106",
+        Fingerprint::new(Browser::Edge).with_version(106),
+    ),
+    (
+        "ios_14",
+        Fingerprint::new(Browser::Safari)
+            .with_version(14)
+            .with_os(Os::Ios)
+            .with_device(Device::Phone),
+    ),
+    // `android_11_okhttp` is deliberately NOT gradable: the uTLS preset is a
     // TLS 1.2-era hello (no supported_versions/key_share/ALPN, only ≤1.2
     // cipher suites), so it cannot negotiate TLS 1.3 or speak HTTP/2 —
-    // both hard requirements of the live grading path below.
 ];
 
 /// Parses `--profile <name>` (repeatable); defaults to both graded
 /// profiles. Only [`GRADED_PROFILES`] are accepted — any other profile
 /// name is a CLI error (`grade()` cannot handle it).
-fn parse_args() -> Vec<BrowserProfile> {
+fn parse_args() -> Vec<usize> {
     let mut args = std::env::args().skip(1);
     let mut selected = Vec::new();
     while let Some(arg) = args.next() {
@@ -121,34 +141,33 @@ fn parse_args() -> Vec<BrowserProfile> {
             eprintln!("--profile requires a value");
             std::process::exit(2);
         });
-        let profile = GRADED_PROFILES
+        let idx = GRADED_PROFILES
             .iter()
-            .copied()
-            .find(|p| p.name() == name)
+            .position(|(n, _)| *n == name)
             .unwrap_or_else(|| {
                 eprintln!(
                     "unknown or unsupported profile {name:?}; grader supports: {}",
                     GRADED_PROFILES
                         .iter()
-                        .map(|p| p.name())
+                        .map(|(n, _)| *n)
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
                 std::process::exit(2);
             });
-        selected.push(profile);
+        selected.push(idx);
     }
     if selected.is_empty() {
-        GRADED_PROFILES.to_vec()
+        (0..GRADED_PROFILES.len()).collect()
     } else {
         selected
     }
 }
 
-async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
+async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), Box<dyn Error>> {
     // Local fingerprint of the profile (fixed seed → deterministic GREASE;
     // JA4 is GREASE-normalized anyway; JA3 is compared GREASE-stripped).
-    let spec = profile.spec();
+    let spec = fingerprint.resolve()?.spec;
     let fixed = local::FixedRandom {
         bytes: vec![0x42; 128],
         pos: AtomicUsize::new(0),
@@ -235,16 +254,13 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
         "server JA4 != local JA4 v2 — wire or algorithm divergence"
     );
     let expected_ja4 = match profile {
-        BrowserProfile::Chrome130 => Some(CHROME130_JA4),
-        BrowserProfile::Firefox128Esr => Some(FIREFOX128ESR_JA4),
+        "chrome_130" => Some(CHROME130_JA4),
+        "firefox_128_esr" => Some(FIREFOX128ESR_JA4),
         // Task 7 desktop batch and Task 8 ios_14: no frozen constants yet
         // — Task 10 locks them from this grader's captured JA4 strings.
         // Enumerated explicitly so a future profile fails to compile here
         // instead of silently skipping the locked-JA4 assertion.
-        BrowserProfile::Safari16
-        | BrowserProfile::Firefox120
-        | BrowserProfile::Edge106
-        | BrowserProfile::Ios14 => None,
+        "safari_16" | "firefox_120" | "edge_106" | "ios_14" => None,
         _ => unreachable!("GRADED_PROFILES and this match must stay in sync"),
     };
     if let Some(expected_ja4) = expected_ja4 {
@@ -264,7 +280,7 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
         local::md5_hex(local::strip_grease(server_ja3).as_bytes()),
         "server JA3 hash must be the md5 of its own GREASE-stripped string"
     );
-    if profile == BrowserProfile::Firefox128Esr {
+    if profile == "firefox_128_esr" {
         assert_eq!(
             server_ja3_hash, FIREFOX128ESR_JA3,
             "Firefox JA3 is stable and locked"

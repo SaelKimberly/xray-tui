@@ -14,9 +14,9 @@ use xray_tui_proto::proto_spec::TlsConfig;
 use xray_tui_tls::SecureRandom;
 use xray_tui_tls::client::{TlsConfig as EngineTlsConfig, TlsMode, connect as client_connect};
 use xray_tui_tls::error::TlsError;
+use xray_tui_tls::fingerprints::{Browser, Fingerprint};
 use xray_tui_tls::handshake::ServerVerifier;
-use xray_tui_tls::profiles::BrowserProfile;
-use xray_tui_tls::reality::{HelloProvisioner, ProfileProvisioner, SpiderConfig};
+use xray_tui_tls::reality::{HelloProvisioner, SpecProvisioner, SpiderConfig};
 
 use crate::BoxStream;
 use crate::context::LinkContext;
@@ -39,7 +39,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
     let rng: Arc<dyn SecureRandom> = Arc::new(ring::rand::SystemRandom::new());
     match &sec.tls {
         Some(TlsConfig::Tls(opts)) => {
-            let profile = opts
+            let fingerprint = opts
                 .fp
                 .as_ref()
                 .map(|fp| fingerprint::parse_fingerprint_id(fp).and_then(fingerprint::profile_for))
@@ -49,7 +49,10 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 fingerprint::decode_pin_sha256(opts.pin_sha256.as_deref())?,
             ));
             let config = EngineTlsConfig {
-                mode: TlsMode::Plain { profile, verifier },
+                mode: TlsMode::Plain {
+                    fingerprint,
+                    verifier,
+                },
                 server_name: ctx.sni(),
                 alpn: (!ctx.alpn_vec().is_empty()).then(|| ctx.alpn_vec()),
                 curves: {
@@ -74,10 +77,13 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
             let provisioner: Arc<dyn HelloProvisioner> = match &ctx.params.reality_provisioner {
                 HelloProvisionerChoice::Custom(p) => p.clone(),
                 HelloProvisionerChoice::FixedChrome133 => match &opts.fp {
-                    Some(fp) => Arc::new(ProfileProvisioner(
-                        fingerprint::parse_fingerprint_id(fp).and_then(fingerprint::profile_for)?,
+                    Some(fp) => Arc::new(SpecProvisioner::from(
+                        &fingerprint::parse_fingerprint_id(fp)
+                            .and_then(fingerprint::profile_for)?,
                     )),
-                    None => Arc::new(ProfileProvisioner(BrowserProfile::Chrome133)),
+                    None => Arc::new(SpecProvisioner::from(
+                        &Fingerprint::new(Browser::Chrome).with_version(133),
+                    )),
                 },
             };
             let spider = SpiderConfig {

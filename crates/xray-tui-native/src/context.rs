@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(ids, vec![4588, 29]);
 
         let spec = xray_tui_tls::spec::apply_curve_preferences(
-            &xray_tui_tls::profiles::BrowserProfile::Chrome133.spec(),
+            &xray_tui_tls::profiles::chrome133::spec(),
             &ids,
         );
         let groups = spec.extensions.iter().find_map(|e| match e {

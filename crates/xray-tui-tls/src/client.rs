@@ -1,14 +1,14 @@
 //! Unified client API: one `TlsConfig` + `connect`.
 //!
-//! Covers plain TLS (any browser profile, verifier seam) and REALITY (any
-//! profile via `ProfileProvisioner`, Spider-X fallback). The single entry
+//! Covers plain TLS (any fingerprint identity, verifier seam) and REALITY
+//! (any identity via `SpecProvisioner`, Spider-X fallback). The single entry
 //! the native layer and external engine users call.
 
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::fingerprints::{Browser, Fingerprint};
 use crate::handshake::{self, HandshakeParams, ServerVerifier};
-use crate::profiles::BrowserProfile;
 use crate::reality;
 use crate::reality::{HelloProvisioner, RealityParams, SpiderConfig};
 use crate::record::stream::TlsStream;
@@ -18,16 +18,16 @@ use crate::{SecureRandom, Stream};
 pub enum TlsMode {
     /// Plain TLS 1.3, fingerprint-shaped hello.
     Plain {
-        /// Fingerprint profile; `None` → `BrowserProfile::Chrome130`.
-        profile: Option<BrowserProfile>,
+        /// Fingerprint identity; `None` → `Fingerprint::default_for(Browser::Chrome)`.
+        fingerprint: Option<Fingerprint>,
         /// Server-authentication seam (`WebPkiVerifier` or a test verifier).
         verifier: Arc<dyn ServerVerifier>,
     },
     /// REALITY: fingerprint-shaped hello + sealed session id + HMAC/Ed25519
     /// server auth; Spider-X fallback on auth failure.
     Reality {
-        /// `ProfileProvisioner(profile)` for a browser shape, or any custom
-        /// `HelloProvisioner`.
+        /// `SpecProvisioner::from(&Fingerprint)` for a browser shape, or any
+        /// custom `HelloProvisioner`.
         provisioner: Arc<dyn HelloProvisioner>,
         /// The server's static X25519 public key (decoded `pbk`).
         public_key: [u8; 32],
@@ -60,12 +60,15 @@ pub struct TlsConfig {
 impl TlsConfig {
     #[must_use]
     pub fn plain(
-        profile: Option<BrowserProfile>,
+        fingerprint: Option<Fingerprint>,
         verifier: Arc<dyn ServerVerifier>,
         server_name: impl Into<String>,
     ) -> Self {
         Self {
-            mode: TlsMode::Plain { profile, verifier },
+            mode: TlsMode::Plain {
+                fingerprint,
+                verifier,
+            },
             server_name: server_name.into(),
             alpn: None,
             curves: None,
@@ -99,13 +102,21 @@ impl TlsConfig {
 /// Run a TLS/REALITY connect over `stream`, dispatching on `config.mode`.
 pub async fn connect<S: Stream + 'static>(stream: S, config: &TlsConfig) -> Result<TlsStream<S>> {
     match &config.mode {
-        TlsMode::Plain { profile, verifier } => {
-            let profile = profile.unwrap_or(BrowserProfile::Chrome130);
+        TlsMode::Plain {
+            fingerprint,
+            verifier,
+        } => {
+            let fp = fingerprint
+                .clone()
+                .unwrap_or_else(|| Fingerprint::default_for(Browser::Chrome));
+            let resolved = fp
+                .resolve()
+                .map_err(|e| crate::error::TlsError::Handshake(e.to_string()))?;
             let spec = match config.curves.as_deref() {
                 Some(curves) if !curves.is_empty() => {
-                    crate::spec::apply_curve_preferences(&profile.spec(), curves)
+                    crate::spec::apply_curve_preferences(&resolved.spec, curves)
                 }
-                _ => profile.spec(),
+                _ => resolved.spec,
             };
             let alpn: Option<Vec<&str>> = config
                 .alpn
@@ -162,15 +173,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
 
-    use parking_lot::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     use super::{TlsConfig, TlsMode, connect};
     use crate::error::TlsError;
+    use crate::fingerprints::{Browser, Fingerprint};
     use crate::handshake::ServerVerifier;
-    use crate::profiles::BrowserProfile;
-    use crate::reality::{ProfileProvisioner, SpiderConfig};
+    use crate::reality::{SpecProvisioner, SpiderConfig};
     use crate::verify::WebPkiVerifier;
+    use parking_lot::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The engine's insecure trust mode: accepts any server (used exactly
     /// like native's `verifier_for` when `insecure` is set).
@@ -249,8 +259,8 @@ mod tests {
         addr
     }
 
-    /// The public plain entry with `profile: None` must default to a
-    /// Chrome-130-shaped hello, complete the handshake against a real
+    /// The public plain entry with `fingerprint: None` must default to the
+    /// latest-Chrome hello, complete the handshake against a real
     /// rustls server, and round-trip application bytes.
     #[tokio::test]
     async fn plain_default_profile_connects() {
@@ -280,10 +290,11 @@ mod tests {
     async fn reality_mode_against_plain_server_is_fallback() {
         let recorded: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let addr = spawn_recording_tls_server(recorded.clone());
-
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let config = TlsConfig::reality(
-            Arc::new(ProfileProvisioner(BrowserProfile::Chrome130)),
+            Arc::new(SpecProvisioner::from(
+                &Fingerprint::new(Browser::Chrome).with_version(130),
+            )),
             [0xAB; 32],
             vec![],
             SpiderConfig::default(),
@@ -303,7 +314,7 @@ mod tests {
         let (client, _server) = tokio::io::duplex(64);
         let config = TlsConfig {
             mode: TlsMode::Plain {
-                profile: None,
+                fingerprint: None,
                 verifier: insecure_verifier(),
             },
             server_name: "localhost".to_string(),

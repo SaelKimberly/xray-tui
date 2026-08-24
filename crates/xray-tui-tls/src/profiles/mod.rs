@@ -2,9 +2,9 @@
 //!
 //! Each profile module ports one `ClientHello` shape from the reference
 //! implementations (`thirdparty/tls-fingerprint/src/profiles/*.rs` and the
-//! uTLS `HelloChrome_133` preset) into a [`ClientHelloSpec`]. The
-//! [`define_profiles!`] macro turns the profile list into the
-//! [`BrowserProfile`] enum with `name()` / `spec()` / `all()` dispatch.
+//! uTLS `HelloChrome_133` preset) into a [`ClientHelloSpec`]. Each module
+//! exposes one `pub fn spec()`; resolution lives in
+//! `crate::fingerprints`.
 
 pub mod android11_okhttp;
 pub mod brave167;
@@ -23,106 +23,41 @@ pub mod safari;
 pub mod safari16;
 pub mod safari_ios17;
 
-use crate::spec::ClientHelloSpec;
-
-/// Generates the [`BrowserProfile`] enum and its dispatch impl.
-///
-/// Input: a comma-separated variant list, then a `;`, then
-/// `Variant => ("name", path::spec)` pairs. The variant list drives the
-/// enum and `all()`; the pairs drive `name()` and `spec()`. Every variant
-/// MUST appear in exactly one pair — the generated `match` arms are
-/// exhaustive, so a missing pair is a compile error.
-///
-/// Adapted from `thirdparty/wreq-util/src/emulate.rs` `define_enum!`.
-macro_rules! define_profiles {
-    (
-        $(#[$meta:meta])*
-        $(
-            $variant:ident
-        ),+ $(,)?;
-        $(
-            $paired:ident => ($name:expr, $spec_fn:path)
-        ),+ $(,)?
-    ) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum BrowserProfile {
-            $(
-                $variant,
-            )*
-        }
-
-        impl BrowserProfile {
-            /// Stable `snake_case` identifier (used in configs and logs).
-            #[must_use]
-            pub const fn name(self) -> &'static str {
-                match self {
-                    $(
-                        Self::$paired => $name,
-                    )*
-                }
-            }
-
-            /// The `ClientHello` spec for this profile.
-            #[must_use]
-            pub fn spec(self) -> ClientHelloSpec {
-                match self {
-                    $(
-                        Self::$paired => $spec_fn(),
-                    )*
-                }
-            }
-
-            /// All known profiles.
-            #[must_use]
-            pub const fn all() -> &'static [BrowserProfile] {
-                &[
-                    $(
-                        Self::$variant,
-                    )*
-                ]
-            }
-        }
-    };
-}
-
-define_profiles! {
-    /// Supported browser fingerprint profiles.
-    Chrome, Chrome119, Chrome130, ChromeAndroid130, Edge130, Edge106, Brave167, Opera114,
-    Firefox, Firefox120, Firefox128Esr, Safari16, Safari17, SafariIos17, Chrome133,
-    Ios14, Android11OkHttp;
-    // `Chrome` is the generic/latest-Chrome alias (chrome::spec is the
-    // Chrome 130 capture); the skeleton's pair list is otherwise verbatim.
-    Chrome          => ("chrome",            chrome::spec),
-    Chrome119       => ("chrome_119",        chrome119::spec),
-    Chrome130       => ("chrome_130",        chrome::spec),
-    Chrome133       => ("chrome_133",        chrome133::spec),
-    ChromeAndroid130=> ("chrome_android_130", chrome_android130::spec),
-    Edge106         => ("edge_106",          edge106::spec),
-    Edge130         => ("edge_130",          edge::spec),
-    Brave167        => ("brave_167",         brave167::spec),
-    Opera114        => ("opera_114",         opera114::spec),
-    Firefox         => ("firefox",           firefox::spec),
-    Firefox120      => ("firefox_120",       firefox120::spec),
-    Firefox128Esr   => ("firefox_128_esr",   firefox128esr::spec),
-    Safari16        => ("safari_16",         safari16::spec),
-    Safari17        => ("safari_17",         safari::spec),
-    SafariIos17     => ("safari_ios_17",     safari_ios17::spec),
-    Ios14           => ("ios_14",            ios14::spec),
-    Android11OkHttp => ("android_11_okhttp", android11_okhttp::spec),
-}
-
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::BrowserProfile;
     use crate::SecureRandom;
     use crate::crypto::fingerprint::ja3::{Ja3Fields, ja3_hash};
     use crate::crypto::fingerprint::ja4::ja4_a;
     use crate::hello::parse::parse_hello;
     use crate::hello::{BuildParams, build_hello};
+    use crate::spec::ClientHelloSpec;
     use crate::spec::grease::is_grease;
+
+    /// Every transcribed profile: stable `snake_case` name + its spec
+    /// function. The resolution table in `crate::fingerprints` points at
+    /// these same functions.
+    type SpecEntry = (&'static str, fn() -> ClientHelloSpec);
+    const ALL_SPECS: &[SpecEntry] = &[
+        ("chrome", super::chrome::spec),
+        ("chrome_119", super::chrome119::spec),
+        ("chrome_130", super::chrome::spec),
+        ("chrome_133", super::chrome133::spec),
+        ("chrome_android_130", super::chrome_android130::spec),
+        ("edge_106", super::edge106::spec),
+        ("edge_130", super::edge::spec),
+        ("brave_167", super::brave167::spec),
+        ("opera_114", super::opera114::spec),
+        ("firefox", super::firefox::spec),
+        ("firefox_120", super::firefox120::spec),
+        ("firefox_128_esr", super::firefox128esr::spec),
+        ("safari_16", super::safari16::spec),
+        ("safari_17", super::safari::spec),
+        ("safari_ios_17", super::safari_ios17::spec),
+        ("ios_14", super::ios14::spec),
+        ("android_11_okhttp", super::android11_okhttp::spec),
+    ];
 
     /// Deterministic RNG feeding back a fixed byte sequence (mirrors the
     /// `hello` test double; `AtomicUsize` keeps it `Sync` for the
@@ -166,8 +101,8 @@ mod tests {
     #[test]
     fn all_profiles_build_and_parse() {
         let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
-        for profile in BrowserProfile::all() {
-            let spec = profile.spec();
+        for (name, spec_fn) in ALL_SPECS {
+            let spec = spec_fn();
             let rng = FixedRandom {
                 bytes: vec![0x5A; 256],
                 pos: AtomicUsize::new(0),
@@ -191,24 +126,21 @@ mod tests {
             // HelloIOS_14 and the uTLS Safari 16 / Edge 106 presets do.
             // GREASE-free profiles have a JA3 that is stable across seeds.
             if !matches!(
-                profile,
-                BrowserProfile::Firefox
-                    | BrowserProfile::Firefox120
-                    | BrowserProfile::Firefox128Esr
-                    | BrowserProfile::Safari17
-                    | BrowserProfile::SafariIos17
-                    | BrowserProfile::Android11OkHttp
+                *name,
+                "firefox"
+                    | "firefox_120"
+                    | "firefox_128_esr"
+                    | "safari_17"
+                    | "safari_ios_17"
+                    | "android_11_okhttp"
             ) {
                 assert!(
                     parsed.cipher_suites.iter().any(|c| is_grease(*c)),
-                    "{profile:?} must carry a GREASE cipher slot"
+                    "{name} must carry a GREASE cipher slot"
                 );
             }
-            assert!(!ja3_hash(&fields).is_empty(), "{profile:?} JA3");
-            assert!(
-                ja4_a(&fields).starts_with("t13d"),
-                "{profile:?} JA4-A prefix"
-            );
+            assert!(!ja3_hash(&fields).is_empty(), "{name} JA3");
+            assert!(ja4_a(&fields).starts_with("t13d"), "{name} JA4-A prefix");
         }
     }
 
@@ -223,7 +155,7 @@ mod tests {
 
     #[test]
     fn firefox128esr_golden_hello_with_fixed_seed() {
-        let spec = BrowserProfile::Firefox128Esr.spec();
+        let spec = super::firefox128esr::spec();
         let rng = FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
@@ -243,26 +175,16 @@ mod tests {
     }
 
     #[test]
-    fn macro_dispatch_names() {
-        assert_eq!(BrowserProfile::Chrome119.name(), "chrome_119");
-        assert_eq!(BrowserProfile::Chrome130.name(), "chrome_130");
-        assert_eq!(BrowserProfile::Chrome.name(), "chrome");
-        assert_eq!(BrowserProfile::Chrome133.name(), "chrome_133");
-        assert_eq!(
-            BrowserProfile::ChromeAndroid130.name(),
-            "chrome_android_130"
-        );
-        assert_eq!(BrowserProfile::Edge130.name(), "edge_130");
-        assert_eq!(BrowserProfile::Brave167.name(), "brave_167");
-        assert_eq!(BrowserProfile::Opera114.name(), "opera_114");
-        assert_eq!(BrowserProfile::Firefox.name(), "firefox");
-        assert_eq!(BrowserProfile::Firefox128Esr.name(), "firefox_128_esr");
-        assert_eq!(BrowserProfile::Safari17.name(), "safari_17");
-        assert_eq!(BrowserProfile::SafariIos17.name(), "safari_ios_17");
-        assert_eq!(BrowserProfile::Edge106.name(), "edge_106");
-        assert_eq!(BrowserProfile::Firefox120.name(), "firefox_120");
-        assert_eq!(BrowserProfile::Safari16.name(), "safari_16");
-        assert_eq!(BrowserProfile::Ios14.name(), "ios_14");
-        assert_eq!(BrowserProfile::Android11OkHttp.name(), "android_11_okhttp");
+    fn all_spec_names_are_unique_snake_case() {
+        let mut seen = Vec::new();
+        for (name, _) in ALL_SPECS {
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "{name} must be snake_case"
+            );
+            assert!(!seen.contains(name), "duplicate profile name {name}");
+            seen.push(name);
+        }
     }
 }
