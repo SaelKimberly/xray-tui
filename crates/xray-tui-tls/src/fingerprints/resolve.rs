@@ -210,6 +210,15 @@ type GroupKey = (Browser, Option<Os>, Device);
 /// row's band is the run's major span and its spec is the run's
 /// greatest-major entry (last declared on ties). Group and run order is
 /// deterministic so ties resolve to the first-declared row.
+///
+/// The roster may carry multiple entries with the same
+/// `(browser, os, device, major)` but distinct JA4s — those are
+/// intentional variant fingerprints and are kept, never deduped. They
+/// land in separate single-major bands, so two generated bands can
+/// overlap at a boundary major; ties resolve first-declared, and when the
+/// winning band's representative major equals the requested version the
+/// served spec is exactly that version's (version-faithful by
+/// construction).
 fn generated_rows() -> Vec<Row> {
     let mut groups: Vec<(GroupKey, Vec<GenEntry>)> = Vec::new();
     for entry in GENERATED {
@@ -269,8 +278,11 @@ fn greatest_row<'a>(rows: impl Iterator<Item = &'a Row>) -> Option<&'a Row> {
 /// exactly at its max, or inside a band whose lower edge some earlier
 /// row witnesses; below the oldest row of a platform group we refuse.
 fn choose_hand<'a>(candidates: &'a [&'a Row], version: Option<u16>) -> Option<&'a Row> {
+    // Version-unset queries follow latest_row's contract: greatest
+    // max_version, ties → first declared (greatest_row), not max_by_key's
+    // last-on-tie.
     version.map_or_else(
-        || candidates.iter().max_by_key(|r| r.max_version).copied(),
+        || greatest_row(candidates.iter().copied()),
         |v| {
             let covering = candidates
                 .iter()
@@ -293,8 +305,9 @@ fn choose_hand<'a>(candidates: &'a [&'a Row], version: Option<u16>) -> Option<&'
 /// Generated-tier chooser: a band row answers exactly its contiguous
 /// major run (`min_version <= v <= max_version`); run gaps strict-refuse.
 fn choose_generated<'a>(candidates: &'a [&'a Row], version: Option<u16>) -> Option<&'a Row> {
+    // Same first-on-ties contract as choose_hand (see there).
     version.map_or_else(
-        || candidates.iter().max_by_key(|r| r.max_version).copied(),
+        || greatest_row(candidates.iter().copied()),
         |v| {
             candidates
                 .iter()
@@ -568,7 +581,7 @@ mod tests {
         assert_eq!(ok.name, "chrome_119");
         // 118 is below every hand chrome row, so the hand tier strictly
         // refuses; the generated roster answers instead. Its Windows run
-        // spans majors 118–126, served by the run's greatest-major spec
+        // spans majors 114–126, served by the run's greatest-major spec
         // (chrome_126_windows_desktop).
         let generated = Fingerprint::new(Browser::Chrome)
             .with_version(118)
@@ -660,13 +673,16 @@ mod tests {
     #[test]
     fn tablet_queries_resolve_via_generated_rows() {
         // No hand row is a tablet; the generated roster carries Chrome
-        // Android/iOS tablet identities and answers bare tablet queries.
+        // Android/iOS tablet identities. A bare tablet query lands on the
+        // newest band (greatest max_version): the iOS run [147, 148].
         let r = Fingerprint::new(Browser::Chrome)
             .with_device(Device::Tablet)
             .resolve()
             .unwrap();
+        assert_eq!(r.name, "chrome_148_ios_tablet");
+        assert_eq!(r.fingerprint.os, Some(Os::Ios));
         assert_eq!(r.fingerprint.device, Some(Device::Tablet));
-        assert!(r.name.starts_with("chrome_"), "{}", r.name);
+        assert_eq!(r.fingerprint.version, Some(148));
     }
 
     #[test]
