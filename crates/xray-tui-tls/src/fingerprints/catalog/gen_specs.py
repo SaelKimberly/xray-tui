@@ -497,8 +497,13 @@ def synthesize_wire(entry):
                 extensions.append({"kind": "Grease"})
             continue
         if slot in offered:
-            extensions.append(build_extension(slot, tmpl, protocols, sig_algos))
+            ext = build_extension(slot, tmpl, protocols, sig_algos)
+            extensions.append(ext)
             placed.add(slot)
+            # The empty ECH-GREASE outer is a wire approximation even when
+            # it comes from the canonical order.
+            if slot == ECH_GREASE and ext["kind"] == "Raw":
+                low_fidelity = True
     for ty in sorted(offered - placed):  # ids outside the canonical order
         ext = build_extension(ty, tmpl, protocols, sig_algos)
         extensions.append(ext)
