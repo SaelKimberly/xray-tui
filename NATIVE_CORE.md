@@ -93,7 +93,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
 | `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp) **or the QUIC h3 dial** (xhttp + exactly-one `h3` ALPN → `connect_quic`: a quinn Endpoint over UDP; the dial REPLACES dial + security + upgrade — `is_self_contained`, quinn/rustls TLS is internal, webpki-roots default verify with the harness-CA override in test/e2e builds); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS — the h3 mode is the `connect` QUIC dial above, not an upgrade step; the v3 protocol (session open, GET download, POST uploads, pacing) is written once over the `V3Send` seam shared by h1/h2/h3, and h3 requests use absolute-URI form (`:scheme`/`:authority` per RFC 9114 §4.3.1 — the interop fix)) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts. QUIC/HTTP-3 is quinn 0.11 (rustls-ring) + h3 0.0.8 + h3-quinn 0.0.10 + webpki-roots (the h3 arm's default trust store); rustls (ring) is a mandatory native dep (was native-e2e-gated optional) — the h3 arm's quinn TLS config + the unit/e2e server double |
-| `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `BrowserProfile`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
+| `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `Fingerprint`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT) |
 | `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
 | `shape.rs` | `ConnectShape`: uniform vs divergent connect paths |
@@ -104,14 +104,15 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | Module | Responsibility |
 |--------|----------------|
 | `spec/` | declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec`, RFC 6066/8446 wire encodings, GREASE (RFC 8701), hybrid key-share encoding (`X25519MLKEM768`: client share = ML-KEM ek(1184) ‖ X25519 pub(32)) |
-| `profiles/` | 12 browser profiles as spec data (`define_profiles!` macro): Chrome119/130/133, ChromeAndroid130, Edge130, Brave167, Opera114, Firefox, Firefox128Esr, Safari17, SafariIos17 (+ `Chrome` = Chrome130 alias) |
+| `profiles/` | 17 transcribed hello specs (`ALL_SPECS` table; hand-transcribed from uTLS presets + real captures): Chrome119/130/133, ChromeAndroid130, Android11OkHttp, iOS14, Edge106/130, Brave167, Opera114, Firefox120, Firefox128Esr, Safari16/17, SafariIos17 (`chrome` = Chrome130 alias) |
+| `fingerprints/` | identity selector: `Fingerprint { browser, version?, os?, device? }` → strict table resolution (never a different browser, never older than requested; unknown combos error listing what IS resolvable); `FingerprintBuilder` overrides (ciphers/extensions/curves/ALPN/signature-algs, `GreasePolicy::Keep|Strip`); generated JA4 catalog (`catalog/catalog_data.rs`, from the frozen ja4db-export snapshot 2026-05-15 via ua-parser — rerun `gen.py`, never hand-edit) as evidence (`Resolved::in_catalog`); full-JA4 oracle in `crypto/fingerprint/ja4.rs` (final FoxIO scheme, peet.ws-validated) |
 | `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
 | `crypto/` | key schedule (RFC 8448-verified; hybrid input = `pq ‖ classical` shared secrets), AEAD record keys (IV XOR seq), `X25519KeyPair`, `mlkem.rs` ML-KEM-768 primitives via liboqs (`oqs`, vendored — pk 1184 / sk 2400 / ct 1088 / ss 32), `fingerprint/` JA3 + JA4 encoders |
 | `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF; per-direction direct mode `set_write_direct`/`set_read_direct` — raw record-layer bypass that hands the socket to the tunnel, backing the vision Direct splice) |
 | `handshake/` | TLS 1.3 client handshake, `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY; hybrid-curve key exchange (curve 4588 selected → decapsulate the ServerHello's 1088-B ML-KEM ciphertext, feed `pq ‖ classical` to the key schedule) |
 | `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked) |
-| `reality/` | `HelloProvisioner` + `ProfileProvisioner(BrowserProfile)` (any of the 12 profiles) + 9-step wire contract, `FixedChrome133`, auth-key/session-seal/server-auth, REALITY over the `X25519MLKEM768` share (curve 4588 — xray `reality.go:79` / sing-box `reality_client.go:136`), `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
+| `reality/` | `HelloProvisioner` + `SpecProvisioner` (`From<&Fingerprint>` — any of the 17 resolvable identities) + 9-step wire contract, `FixedChrome133`, auth-key/session-seal/server-auth, REALITY over the `X25519MLKEM768` share (curve 4588 — xray `reality.go:79` / sing-box `reality_client.go:136`), `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
 | `http2/` | minimal h2 layer (tls.peet.ws grading + Spider-X fallback GETs) |
 | `error.rs` | `TlsError`/`Result` (thiserror) |
 
@@ -124,15 +125,15 @@ rustls client path and the `TlsProvider` plug are gone.
 
 | Path | Trigger | Mechanism | Status |
 |------|---------|-----------|--------|
-| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → Chrome130 default), `WebPkiVerifier` via `verifier_for(insecure, pin)`; profile = `parse_fingerprint_id(fp)` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
-| REALITY | `reality` config | engine `TlsMode::Reality`: fingerprint-shaped hello with any of the 12 profiles via `ProfileProvisioner(BrowserProfile)` (or a custom `HelloProvisioner`), sealed session id, X25519 auth key + HMAC/Ed25519 server auth (no PKI); Spider-X fallback on auth failure | ✅ |
+| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → Chrome130 default), `WebPkiVerifier` via `verifier_for(insecure, pin)`; identity = `parse_fingerprint_id(fp)` + `profile_for` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
+| REALITY | `reality` config | engine `TlsMode::Reality`: fingerprint-shaped hello with any resolvable identity via `SpecProvisioner::from(&Fingerprint)` (or a custom `HelloProvisioner`), sealed session id, X25519 auth key + HMAC/Ed25519 server auth (no PKI); Spider-X fallback on auth failure | ✅ |
 | Trust modes | `insecure` / `pin_sha256` | `with_insecure()` skips chain walk; `with_pin(sha256(SPKI))` replaces chain+SAN but **never** skips the CertificateVerify signature (a MITM must hold the private key) | ✅ |
 
 The unified API: `TlsConfig { mode: TlsMode, server_name, alpn, rng }` with a
-single entry point `connect(stream, &TlsConfig)` — `TlsMode::Plain { profile,
-verifier }` and `TlsMode::Reality { provisioner, public_key, short_id,
-spider }`. REALITY is a security layer over the same TLS machinery: plain and
-REALITY handshakes share one driver (`handshake::drive`).
+single entry point `connect(stream, &TlsConfig)` — `TlsMode::Plain {
+fingerprint, verifier }` and `TlsMode::Reality { provisioner, public_key,
+short_id, spider }`. REALITY is a security layer over the same TLS machinery:
+plain and REALITY handshakes share one driver (`handshake::drive`).
 
 **Spider-X fallback.** On a REALITY auth failure — the server flight is a real
 certificate (a transparent proxy / possible MITM), mirroring xray-core
@@ -328,8 +329,8 @@ sing-box — `thirdparty/`) provide for each protocol. "Native client" is the
 xray-tui-native tunnel; "TLS engine" is the xray-tui-tls path — engine-only
 now, every TLS/REALITY connect routes through `xray_tui_tls::client::connect`
 (the column marks whether the protocol routes through it); "REALITY" marks
-REALITY compatibility (any of the 12 browser profiles via
-`ProfileProvisioner`); "e2e" is tier-3 proof.
+REALITY compatibility (any resolvable identity via
+`SpecProvisioner`); "e2e" is tier-3 proof.
 
 ### Overview matrix
 
