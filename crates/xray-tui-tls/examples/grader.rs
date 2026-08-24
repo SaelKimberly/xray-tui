@@ -45,9 +45,9 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
-use xray_tui_tls::handshake::{connect, HandshakeParams};
+use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
-use xray_tui_tls::hello::{build_hello, BuildParams};
+use xray_tui_tls::hello::{BuildParams, build_hello};
 use xray_tui_tls::http2;
 use xray_tui_tls::profiles::BrowserProfile;
 use xray_tui_tls::verify::WebPkiVerifier;
@@ -99,6 +99,11 @@ const GRADED_PROFILES: &[BrowserProfile] = &[
     BrowserProfile::Safari16,
     BrowserProfile::Firefox120,
     BrowserProfile::Edge106,
+    BrowserProfile::Ios14,
+    // `Android11OkHttp` is deliberately NOT gradable: the uTLS preset is a
+    // TLS 1.2-era hello (no supported_versions/key_share/ALPN, only ≤1.2
+    // cipher suites), so it cannot negotiate TLS 1.3 or speak HTTP/2 —
+    // both hard requirements of the live grading path below.
 ];
 
 /// Parses `--profile <name>` (repeatable); defaults to both graded
@@ -232,11 +237,14 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
     let expected_ja4 = match profile {
         BrowserProfile::Chrome130 => Some(CHROME130_JA4),
         BrowserProfile::Firefox128Esr => Some(FIREFOX128ESR_JA4),
-        // Task 7 desktop batch: no frozen constants yet — Task 10 locks
-        // them from this grader's captured JA4 strings. Enumerated
-        // explicitly so a future profile fails to compile here instead of
-        // silently skipping the locked-JA4 assertion.
-        BrowserProfile::Safari16 | BrowserProfile::Firefox120 | BrowserProfile::Edge106 => None,
+        // Task 7 desktop batch and Task 8 ios_14: no frozen constants yet
+        // — Task 10 locks them from this grader's captured JA4 strings.
+        // Enumerated explicitly so a future profile fails to compile here
+        // instead of silently skipping the locked-JA4 assertion.
+        BrowserProfile::Safari16
+        | BrowserProfile::Firefox120
+        | BrowserProfile::Edge106
+        | BrowserProfile::Ios14 => None,
         _ => unreachable!("GRADED_PROFILES and this match must stay in sync"),
     };
     if let Some(expected_ja4) = expected_ja4 {
@@ -278,9 +286,9 @@ mod local {
     use md5::{Digest, Md5};
     use ring::digest;
 
+    use xray_tui_tls::SecureRandom;
     use xray_tui_tls::hello::parse::ParsedClientHello;
     use xray_tui_tls::spec::grease::is_grease;
-    use xray_tui_tls::SecureRandom;
 
     /// Deterministic RNG (all `0x42`) mirroring the crate's test double.
     pub struct FixedRandom {

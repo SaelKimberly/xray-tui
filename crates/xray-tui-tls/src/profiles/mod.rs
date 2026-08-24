@@ -6,6 +6,7 @@
 //! [`define_profiles!`] macro turns the profile list into the
 //! [`BrowserProfile`] enum with `name()` / `spec()` / `all()` dispatch.
 
+pub mod android11_okhttp;
 pub mod brave167;
 pub mod chrome;
 pub mod chrome119;
@@ -16,6 +17,7 @@ pub mod edge106;
 pub mod firefox;
 pub mod firefox120;
 pub mod firefox128esr;
+pub mod ios14;
 pub mod opera114;
 pub mod safari;
 pub mod safari16;
@@ -87,7 +89,8 @@ macro_rules! define_profiles {
 define_profiles! {
     /// Supported browser fingerprint profiles.
     Chrome, Chrome119, Chrome130, ChromeAndroid130, Edge130, Edge106, Brave167, Opera114,
-    Firefox, Firefox120, Firefox128Esr, Safari16, Safari17, SafariIos17, Chrome133;
+    Firefox, Firefox120, Firefox128Esr, Safari16, Safari17, SafariIos17, Chrome133,
+    Ios14, Android11OkHttp;
     // `Chrome` is the generic/latest-Chrome alias (chrome::spec is the
     // Chrome 130 capture); the skeleton's pair list is otherwise verbatim.
     Chrome          => ("chrome",            chrome::spec),
@@ -105,6 +108,8 @@ define_profiles! {
     Safari16        => ("safari_16",         safari16::spec),
     Safari17        => ("safari_17",         safari::spec),
     SafariIos17     => ("safari_ios_17",     safari_ios17::spec),
+    Ios14           => ("ios_14",            ios14::spec),
+    Android11OkHttp => ("android_11_okhttp", android11_okhttp::spec),
 }
 
 #[cfg(test)]
@@ -112,12 +117,12 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::BrowserProfile;
-    use crate::crypto::fingerprint::ja3::{ja3_hash, Ja3Fields};
+    use crate::SecureRandom;
+    use crate::crypto::fingerprint::ja3::{Ja3Fields, ja3_hash};
     use crate::crypto::fingerprint::ja4::ja4_a;
     use crate::hello::parse::parse_hello;
-    use crate::hello::{build_hello, BuildParams};
+    use crate::hello::{BuildParams, build_hello};
     use crate::spec::grease::is_grease;
-    use crate::SecureRandom;
 
     /// Deterministic RNG feeding back a fixed byte sequence (mirrors the
     /// `hello` test double; `AtomicUsize` keeps it `Sync` for the
@@ -180,9 +185,10 @@ mod tests {
             .unwrap();
             let parsed = parse_hello(&hello.handshake_bytes).unwrap();
             let fields = Ja3Fields::from(&parsed);
-            // The tls-fingerprint Firefox models AND the uTLS
-            // HelloFirefox_120 preset carry no GREASE placeholders; the
-            // Chromium family and the uTLS Safari 16 / Edge 106 presets do.
+            // The tls-fingerprint Firefox models, the uTLS
+            // HelloFirefox_120 preset and the uTLS HelloAndroid_11_OkHttp
+            // preset carry no GREASE placeholders; the Chromium family,
+            // HelloIOS_14 and the uTLS Safari 16 / Edge 106 presets do.
             // GREASE-free profiles have a JA3 that is stable across seeds.
             if !matches!(
                 profile,
@@ -191,6 +197,7 @@ mod tests {
                     | BrowserProfile::Firefox128Esr
                     | BrowserProfile::Safari17
                     | BrowserProfile::SafariIos17
+                    | BrowserProfile::Android11OkHttp
             ) {
                 assert!(
                     parsed.cipher_suites.iter().any(|c| is_grease(*c)),
@@ -255,5 +262,7 @@ mod tests {
         assert_eq!(BrowserProfile::Edge106.name(), "edge_106");
         assert_eq!(BrowserProfile::Firefox120.name(), "firefox_120");
         assert_eq!(BrowserProfile::Safari16.name(), "safari_16");
+        assert_eq!(BrowserProfile::Ios14.name(), "ios_14");
+        assert_eq!(BrowserProfile::Android11OkHttp.name(), "android_11_okhttp");
     }
 }

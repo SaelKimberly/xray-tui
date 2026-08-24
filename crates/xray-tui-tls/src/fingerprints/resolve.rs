@@ -19,12 +19,17 @@ pub(crate) struct Row {
     pub device: Device,
     /// Inclusive maximum requested major this row answers.
     pub max_version: u16,
+    /// Inclusive minimum requested major this row answers (`0` =
+    /// unbounded below). Rows covering disjoint bands of the same
+    /// platform group set this so overlap is impossible by construction
+    /// (e.g. `android_11_okhttp` ≤ 11 vs `chrome_android_130` ≥ 12).
+    pub min_version: u16,
     pub spec: fn() -> ClientHelloSpec,
 }
 
 use crate::profiles::{
-    brave167, chrome, chrome119, chrome133, chrome_android130, edge, edge106, firefox120,
-    firefox128esr, opera114, safari, safari16, safari_ios17,
+    android11_okhttp, brave167, chrome, chrome_android130, chrome119, chrome133, edge, edge106,
+    firefox120, firefox128esr, ios14, opera114, safari, safari_ios17, safari16,
 };
 
 /// Ordered ascending by `max_version` within each `(browser, os, device)`.
@@ -35,6 +40,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 119,
+        min_version: 0,
         spec: chrome119::spec,
     },
     Row {
@@ -43,6 +49,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 130,
+        min_version: 0,
         spec: chrome::spec,
     },
     Row {
@@ -51,6 +58,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 133,
+        min_version: 0,
         spec: chrome133::spec,
     },
     Row {
@@ -59,6 +67,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: Some(Os::Android),
         device: Device::Phone,
         max_version: 130,
+        min_version: 12,
         spec: chrome_android130::spec,
     },
     Row {
@@ -67,6 +76,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 106,
+        min_version: 0,
         spec: edge106::spec,
     },
     Row {
@@ -75,6 +85,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 130,
+        min_version: 0,
         spec: edge::spec,
     },
     Row {
@@ -83,6 +94,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 167,
+        min_version: 0,
         spec: brave167::spec,
     },
     Row {
@@ -91,6 +103,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 114,
+        min_version: 0,
         spec: opera114::spec,
     },
     Row {
@@ -99,6 +112,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 120,
+        min_version: 0,
         spec: firefox120::spec,
     },
     Row {
@@ -107,6 +121,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: None,
         device: Device::Desktop,
         max_version: 128,
+        min_version: 0,
         spec: firefox128esr::spec,
     },
     Row {
@@ -115,6 +130,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: Some(Os::MacOs),
         device: Device::Desktop,
         max_version: 16,
+        min_version: 0,
         spec: safari16::spec,
     },
     Row {
@@ -123,6 +139,7 @@ pub(crate) static TABLE: &[Row] = &[
         os: Some(Os::MacOs),
         device: Device::Desktop,
         max_version: 17,
+        min_version: 0,
         spec: safari::spec,
     },
     Row {
@@ -131,14 +148,36 @@ pub(crate) static TABLE: &[Row] = &[
         os: Some(Os::Ios),
         device: Device::Phone,
         max_version: 17,
+        min_version: 0,
         spec: safari_ios17::spec,
     },
-    // Task 8 appends: ios_14, android_11_okhttp — keeping per-browser
-    // ascending order.
+    Row {
+        name: "ios_14",
+        browser: Browser::Safari,
+        os: Some(Os::Ios),
+        device: Device::Phone,
+        max_version: 14,
+        min_version: 0,
+        spec: ios14::spec,
+    },
+    Row {
+        name: "android_11_okhttp",
+        browser: Browser::Chrome,
+        os: Some(Os::Android),
+        device: Device::Phone,
+        max_version: 11,
+        // Disjoint from chrome_android_130 (min_version 12): the
+        // Chromium/Android/Phone bands can never overlap.
+        min_version: 0,
+        spec: android11_okhttp::spec,
+    },
 ];
 
 impl Row {
-    fn matches(&self, q_os: Option<Os>, q_device: Option<Device>) -> bool {
+    fn matches(&self, q_version: Option<u16>, q_os: Option<Os>, q_device: Option<Device>) -> bool {
+        if q_version.is_some_and(|v| v < self.min_version) {
+            return false; // below this row's band floor
+        }
         if let Some(d) = q_device {
             if d != self.device {
                 return false;
@@ -184,16 +223,17 @@ impl Fingerprint {
     /// version → error listing alternatives.
     ///
     /// A row covers `v` when `v` is its exact major, or `v` lies inside
-    /// its band `(nearest lower candidate's max_version, row.max_version]`.
-    /// Below the oldest row of a platform group we refuse — never serve a
-    /// hello from a wildly different era than asked for.
+    /// its band `(nearest lower candidate's max_version, row.max_version]`,
+    /// and never below the row's `min_version` floor. Below the oldest row
+    /// of a platform group we refuse — never serve a hello from a wildly
+    /// different era than asked for.
     ///
     /// # Errors
     /// [`FingerprintError::Unknown`] when no row satisfies the query.
     pub fn resolve(&self) -> Result<Resolved, FingerprintError> {
         let candidates: Vec<&Row> = TABLE
             .iter()
-            .filter(|r| r.browser == self.browser && r.matches(self.os, self.device))
+            .filter(|r| r.browser == self.browser && r.matches(self.version, self.os, self.device))
             .collect();
         let chosen = self.version.map_or_else(
             || candidates.iter().max_by_key(|r| r.max_version),
@@ -210,11 +250,7 @@ impl Fingerprint {
                             .max_by_key(|r| r.max_version)
                             .is_some()
                 });
-                if covered {
-                    covering
-                } else {
-                    None
-                }
+                if covered { covering } else { None }
             },
         );
         let Some(row) = chosen else {
@@ -357,6 +393,43 @@ mod tests {
         let r = fp.resolve().unwrap();
         assert_eq!(r.name, "chrome_android_130");
         assert_eq!(r.fingerprint.version, Some(130));
+    }
+
+    #[test]
+    fn android_11_hits_okhttp_row_chrome_12_hits_modern_row() {
+        let old = Fingerprint::new(Browser::Chrome)
+            .with_version(11)
+            .with_os(Os::Android)
+            .with_device(Device::Phone)
+            .resolve()
+            .unwrap();
+        assert_eq!(old.name, "android_11_okhttp");
+        let modern = Fingerprint::new(Browser::Chrome)
+            .with_version(12)
+            .with_os(Os::Android)
+            .with_device(Device::Phone)
+            .resolve()
+            .unwrap();
+        assert_eq!(modern.name, "chrome_android_130");
+    }
+
+    #[test]
+    fn ios_14_query_hits_ios14_row() {
+        // Safari/iOS 14 → the legacy iOS row; 15-17 stay on safari_ios_17.
+        let old = Fingerprint::new(Browser::Safari)
+            .with_version(14)
+            .with_os(Os::Ios)
+            .with_device(Device::Phone)
+            .resolve()
+            .unwrap();
+        assert_eq!(old.name, "ios_14");
+        let modern = Fingerprint::new(Browser::Safari)
+            .with_version(15)
+            .with_os(Os::Ios)
+            .with_device(Device::Phone)
+            .resolve()
+            .unwrap();
+        assert_eq!(modern.name, "safari_ios_17");
     }
 
     #[test]
