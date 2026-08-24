@@ -4,5 +4,7 @@
 pub mod error;
 pub mod query;
 
+pub mod catalog;
+
 pub use error::FingerprintError;
 pub use query::{Browser, Device, Fingerprint, Os};
