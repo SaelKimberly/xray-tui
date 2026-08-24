@@ -1,7 +1,7 @@
 //! tls.peet.ws grader — tier-2 verification of the fingerprint engine.
 //!
-//! Connects to `tls.peet.ws` with a browser profile (Chrome 130 or
-//! Firefox 128 ESR, selectable via `--profile <name>`), speaks HTTP/2
+//! Connects to `tls.peet.ws` with a browser profile (`--profile <name>`;
+//! any [`GRADED_PROFILES`] entry, all six by default), speaks HTTP/2
 //! through [`xray_tui_tls::http2`], and compares the server-reported
 //! JA3/JA4 against the locked expected values.
 //!
@@ -18,14 +18,15 @@
 //!    [`ja3_string`](xray_tui_tls::crypto::fingerprint::ja3::ja3_string)
 //!    joins everything with commas, so its `md5` differs. The grader
 //!    computes the dash form locally (see [`local::ja3_dash`]).
-//! 2. **JA4 version.** tls.peet.ws reports the current `FoxIO` JA4 (`t13d` +
-//!    SNI flag + non-GREASE cipher/extension counts + 12-hex `SHA-256` of
-//!    sorted ciphers / sorted extensions+sigalgs). The crate's offline
+//! 2. **JA4 padding exclusion.** tls.peet.ws excludes the padding
+//!    extension (0x0015) from the JA4-c hash list, while the strict
+//!    `FoxIO` spec includes it. The crate's offline
 //!    [`ja4_a`](xray_tui_tls::crypto::fingerprint::ja4::ja4_a) implements
-//!    the original 2023 JA4-A (`t13d` + 4-hex first cipher + `d` + counts),
-//!    a different format. The grader re-implements the current `FoxIO`
-//!    algorithm (verified byte-for-byte against the reference `ja4.py` and
-//!    live curl captures) in [`local::ja4_v2`].
+//!    the final `FoxIO` scheme (validated byte-for-byte against live
+//!    captures); the grader re-implements the server's variant with the
+//!    padding exclusion (verified against the reference `ja4.py`) in
+//!    [`local::ja4_v2`] and asserts the two agree on every non-padding
+//!    field via the server report.
 //!
 //! # Assertions
 //!
@@ -56,21 +57,18 @@ const HOST: &str = "tls.peet.ws";
 const PORT: u16 = 443;
 const API_PATH: &str = "/api/all";
 const ALPN: &[&str] = &["h2", "http/1.1"];
-
 /// Locked expected fingerprints (captured live against tls.peet.ws with
-/// this engine, 2026-08-11; see the task report).
-///
-/// Chrome 130's JA3 is GREASE-randomized per connection and is therefore
-/// NOT locked — it is asserted GREASE-stripped instead. Note on the JA4
-/// constants: tls.peet.ws excludes the padding extension (0x0015) from
-/// the JA4-c hash list (its `ja4.go` skips `0015`), while the `FoxIO` spec
-/// includes it — so the locked values below differ from the `FoxIO`
-/// canonical example (`t13d1516h2_8daaf6152771_e5627efa2ab1`) purely in
-/// that padding-exclusion.
+/// this engine; Chrome 130 / Firefox 128 ESR on 2026-08-11, `safari_16` /
+/// `firefox_120` / `edge_106` / `ios_14` in Tasks 7/8 — see the task report).
 const CHROME130_JA4: &str = "t13d1516h2_8daaf6152771_f37e75b10bcc";
 /// Firefox 128 ESR is GREASE-free, hence its JA3 is stable and lockable.
 const FIREFOX128ESR_JA3: &str = "361e0ca6ef1ca4dbe3a1d987722a1980";
 const FIREFOX128ESR_JA4: &str = "t13d1314h2_07be0c029dc8_46701d79520f";
+/// Frozen in Tasks 7/8 from this grader's live captures (2026-08-24).
+const SAFARI16_JA4: &str = "t13d2014h2_a09f3c656075_874d27d7ca63";
+const FIREFOX120_JA4: &str = "t13d1714h2_5b57614c22b0_967e8e80b303";
+const EDGE106_JA4: &str = "t13d1516h2_8daaf6152771_f37e75b10bcc";
+const IOS14_JA4: &str = "t13d2613h2_2802a3db6c62_38ba08824cc9";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -256,11 +254,12 @@ async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), B
     let expected_ja4 = match profile {
         "chrome_130" => Some(CHROME130_JA4),
         "firefox_128_esr" => Some(FIREFOX128ESR_JA4),
-        // Task 7 desktop batch and Task 8 ios_14: no frozen constants yet
-        // — Task 10 locks them from this grader's captured JA4 strings.
-        // Enumerated explicitly so a future profile fails to compile here
-        // instead of silently skipping the locked-JA4 assertion.
-        "safari_16" | "firefox_120" | "edge_106" | "ios_14" => None,
+        // Tasks 7/8 desktop + mobile batches (live-captured by this
+        // grader, then frozen).
+        "safari_16" => Some(SAFARI16_JA4),
+        "firefox_120" => Some(FIREFOX120_JA4),
+        "edge_106" => Some(EDGE106_JA4),
+        "ios_14" => Some(IOS14_JA4),
         _ => unreachable!("GRADED_PROFILES and this match must stay in sync"),
     };
     if let Some(expected_ja4) = expected_ja4 {

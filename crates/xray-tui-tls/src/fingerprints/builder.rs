@@ -24,9 +24,14 @@ pub enum GreasePolicy {
 ///
 /// Overrides apply in call order; each validates immediately where cheap
 /// (empty lists) and finally at `build()` (duplicates, parseability).
+/// [`GreasePolicy`] is likewise stored and applied inside `build()` —
+/// after every override, so stripping sees the FINAL lists (eager
+/// application would let a later `override_ciphers` reintroduce GREASE
+/// values past the policy).
 #[derive(Debug, Clone)]
 pub struct FingerprintBuilder {
     spec: ClientHelloSpec,
+    grease: GreasePolicy,
     missing: Option<String>,
 }
 
@@ -38,6 +43,7 @@ impl FingerprintBuilder {
     pub fn new(fingerprint: &Fingerprint) -> Result<Self, FingerprintError> {
         Ok(Self {
             spec: fingerprint.resolve()?.spec,
+            grease: GreasePolicy::default(),
             missing: None,
         })
     }
@@ -88,15 +94,10 @@ impl FingerprintBuilder {
         self
     }
 
-    /// GREASE handling policy applied at `build()`.
+    /// GREASE handling policy; stored and applied at `build()`.
     #[must_use]
-    pub fn grease(mut self, policy: GreasePolicy) -> Self {
-        if policy == GreasePolicy::Strip {
-            self.spec.cipher_suites.retain(|&c| !is_grease(c));
-            self.spec
-                .extensions
-                .retain(|e| !matches!(e, ExtensionSpec::Grease));
-        }
+    pub const fn grease(mut self, policy: GreasePolicy) -> Self {
+        self.grease = policy;
         self
     }
 
@@ -105,9 +106,15 @@ impl FingerprintBuilder {
     /// # Errors
     /// [`FingerprintError::InvalidOverride`] on a missing base extension,
     /// an empty cipher list, or duplicate extension types.
-    pub fn build(self) -> Result<ClientHelloSpec, FingerprintError> {
+    pub fn build(mut self) -> Result<ClientHelloSpec, FingerprintError> {
         if let Some(msg) = self.missing {
             return Err(FingerprintError::InvalidOverride(msg));
+        }
+        if self.grease == GreasePolicy::Strip {
+            self.spec.cipher_suites.retain(|&c| !is_grease(c));
+            self.spec
+                .extensions
+                .retain(|e| !matches!(e, ExtensionSpec::Grease));
         }
         if self.spec.cipher_suites.is_empty() {
             return Err(FingerprintError::InvalidOverride(
@@ -227,6 +234,18 @@ mod tests {
             &curves,
         );
         assert_eq!(built, direct);
+    }
+
+    #[test]
+    fn grease_strip_applies_to_later_overrides() {
+        // Policy is applied in build(), AFTER overrides — a GREASE value
+        // introduced by override_ciphers must still be stripped.
+        let spec = base()
+            .grease(GreasePolicy::Strip)
+            .override_ciphers(&[0xCACA, 0x1301])
+            .build()
+            .unwrap();
+        assert_eq!(spec.cipher_suites, vec![0x1301]);
     }
 
     #[test]

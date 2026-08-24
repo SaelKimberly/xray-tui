@@ -5,6 +5,12 @@
 //! Capture provenance: every expected string below was reported by
 //! `tls.peet.ws` for a live connection made by this engine with the
 //! profile's hello (grader example, 2026-08-24; Tasks 7/8/10).
+//!
+//! Known JA4 collisions (verified genuine, not copy-paste errors): both
+//! `brave_167 == chrome_119` AND `edge_106 == chrome_130` share the same
+//! cipher set, extension-id set, and signature-alg order — they differ
+//! only in extension ORDER, which JA4 hashes sorted, so the full strings
+//! coincide.
 
 use rstest::rstest;
 use xray_tui_tls::fingerprints::{
@@ -62,12 +68,14 @@ fn ja4_matches_peet_ground_truth(#[case] fp: Fingerprint, #[case] expected: &str
     assert_eq!(resolved.ja4(), expected, "{}", resolved.name);
 }
 
-/// `android_11_okhttp` is TLS-1.2-shaped (no `supported_versions`/`ALPN`), so
-/// its offline `ja4_a` hardcodes the `t12d…` prefix and cannot equal the
-/// peet.ws JA4 computed over an HTTP/2-capable TLS-1.3 capture — it is not
-/// asserted here. Offline ground truth from its uTLS transcription:
-/// `t12d120700_d34a8e72043a_036209cd1ead`. We pin only that the identity
-/// resolves to the intended catalog row.
+/// `android_11_okhttp` is TLS-1.2-shaped (no `supported_versions`/`ALPN`),
+/// but this crate's offline `ja4_a` renders the `t13d` prefix
+/// unconditionally — so it cannot equal a peet.ws JA4 computed over an
+/// HTTP/2-capable TLS-1.3 capture and is not asserted here. The value
+/// `t12d120700_d34a8e72043a_036209cd1ead` is formula-level offline ground
+/// truth from its uTLS transcription (the A-part prefix would need the
+/// negotiated-version flag, which the synthetic table does not model).
+/// We pin only that the identity resolves to the intended catalog row.
 #[test]
 fn android_11_okhttp_resolves_to_its_row() {
     let fp = Fingerprint::new(Browser::Chrome)

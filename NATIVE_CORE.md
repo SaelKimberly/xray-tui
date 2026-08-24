@@ -125,7 +125,7 @@ rustls client path and the `TlsProvider` plug are gone.
 
 | Path | Trigger | Mechanism | Status |
 |------|---------|-----------|--------|
-| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → Chrome130 default), `WebPkiVerifier` via `verifier_for(insecure, pin)`; identity = `parse_fingerprint_id(fp)` + `profile_for` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
+| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → chrome_133 default via `Fingerprint::default_for`), `WebPkiVerifier` via `verifier_for(insecure, pin)`; identity = `parse_fingerprint_id(fp)` + `profile_for` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
 | REALITY | `reality` config | engine `TlsMode::Reality`: fingerprint-shaped hello with any resolvable identity via `SpecProvisioner::from(&Fingerprint)` (or a custom `HelloProvisioner`), sealed session id, X25519 auth key + HMAC/Ed25519 server auth (no PKI); Spider-X fallback on auth failure | ✅ |
 | Trust modes | `insecure` / `pin_sha256` | `with_insecure()` skips chain walk; `with_pin(sha256(SPKI))` replaces chain+SAN but **never** skips the CertificateVerify signature (a MITM must hold the private key) | ✅ |
 

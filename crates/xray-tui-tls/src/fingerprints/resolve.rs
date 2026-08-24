@@ -296,6 +296,12 @@ impl Resolved {
     /// its claimed browser identity (catalog evidence). Version is passed
     /// as `None`: recall over precision — evidence-only check, so catalog
     /// rows without a recorded browser major still count.
+    ///
+    /// Honest caveat: engine hellos are synthetic variants (uTLS-style
+    /// transcriptions), so today NO resolvable identity's full JA4 appears
+    /// in the catalog — this returns `false` for every current row. The
+    /// check is forward-looking: it becomes live evidence the moment a
+    /// captured hello's JA4 lands in [`super::catalog::CATALOG`].
     #[must_use]
     pub fn in_catalog(&self) -> bool {
         super::catalog::contains(self.fingerprint.browser.name(), None, &self.ja4())
@@ -508,5 +514,39 @@ mod tests {
         assert_eq!(parts.len(), 3, "A_hash1_hash2");
         assert_eq!(parts[1].len(), 12);
         assert_eq!(parts[2].len(), 12);
+    }
+
+    #[test]
+    fn resolved_ja4_not_in_catalog_today() {
+        // Synthetic engine hellos: no resolvable identity's full JA4 is in
+        // the catalog yet (documented on `Resolved::in_catalog`).
+        for fp in [
+            Fingerprint::new(Browser::Chrome).with_version(133),
+            Fingerprint::new(Browser::Firefox).with_version(128),
+            Fingerprint::new(Browser::Safari)
+                .with_version(17)
+                .with_os(Os::MacOs),
+        ] {
+            let r = fp.resolve().unwrap();
+            assert!(!r.in_catalog(), "{} must not be catalog evidence", r.name);
+        }
+    }
+
+    #[test]
+    fn in_catalog_wiring_matches_contains() {
+        // Wiring proof (not hello fidelity): a real CATALOG entry fed
+        // through the same contains() call in_catalog() makes.
+        use crate::fingerprints::catalog;
+        let entry = catalog::CATALOG
+            .iter()
+            .find(|e| e.application == "chrome")
+            .expect("catalog has chrome rows");
+        assert!(catalog::contains("chrome", None, entry.ja4));
+        // ...and a fabricated JA4 is correctly rejected.
+        assert!(!catalog::contains(
+            "chrome",
+            None,
+            "t13d9999zzzz_zzzzzzzzzzzz_zzzzzzzzzzzz"
+        ));
     }
 }

@@ -29,8 +29,15 @@ const HASH2_EXCLUDED: [u16; 3] = [0x0000, 0x0010, 0x0015];
 /// offers TLS 1.3 via `supported_versions`.
 #[must_use]
 pub fn ja4_a(f: &Ja3Fields) -> String {
-    let cipher_count = f.ciphers.iter().filter(|&&c| !is_grease(c)).count();
-    let ext_count = f.extensions.iter().filter(|&&e| !is_grease(e)).count();
+    // Clamped at 99 per the FoxIO spec (`99` renders as-is): a >99-element
+    // list must not overflow into a malformed 3-digit segment.
+    let cipher_count = f.ciphers.iter().filter(|&&c| !is_grease(c)).count().min(99);
+    let ext_count = f
+        .extensions
+        .iter()
+        .filter(|&&e| !is_grease(e))
+        .count()
+        .min(99);
     let alpn = match f.alpn.first() {
         None => "00".to_string(),
         Some(p) if p.bytes().all(|b| b.is_ascii()) => {
@@ -175,7 +182,20 @@ mod tests {
     fn no_sig_algs_drops_trailing_segment() {
         let mut f = peet_vector();
         f.signature_algorithms.clear();
-        let h2 = hash2(&f); // payload ends after ext list, no trailing underscore join
-        assert_eq!(h2.len(), 12);
+        // Ext-only payload: sorted non-GREASE extensions minus SNI/ALPN/
+        // padding, comma-joined, NO sig segment and no trailing underscore:
+        // `000a,000b,000d,0016,0017,002b,002d,0031,0033,3374`
+        assert_eq!(hash2(&f), "619e7cdd0224");
+    }
+
+    #[test]
+    fn counts_clamp_at_99() {
+        let mut f = peet_vector();
+        f.ciphers.extend(std::iter::repeat_n(0x009c, 80));
+        f.extensions.extend(std::iter::repeat_n(0x000b, 100));
+        let a = ja4_a(&f);
+        let counts = &a[4..8]; // after `t13d`
+        assert_eq!(&counts[..2], "99");
+        assert_eq!(&counts[2..], "99");
     }
 }
