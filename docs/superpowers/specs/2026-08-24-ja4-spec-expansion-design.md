@@ -68,9 +68,9 @@ crates/xray-tui-tls/src/profiles/generated/
 
 ## Resolution Integration
 
-The generator also emits resolver table rows: `(identity, coverage band)` derived from contiguous `browser_major` runs of winning entries, mirroring the hand-maintained TABLE semantics ((prev.max, row.max]).
+Strict-error behavior unchanged; the alternatives listing in errors shows the first 8 matches plus a total count.
 
-Merge rule: **hand-written row wins** when generated and transcribed rows claim the same identity/band overlap (wire-exact precedence). Strict-error behavior unchanged; the alternatives listing in errors is capped (e.g. first 8 + count).
+Merge rule: **hand-written row wins** when generated and transcribed rows claim the same identity/band overlap (wire-exact precedence).
 
 ## Verification
 
