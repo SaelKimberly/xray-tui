@@ -72,7 +72,11 @@ const IOS14_JA4: &str = "t13d2613h2_2802a3db6c62_38ba08824cc9";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    for idx in parse_args() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--roster") {
+        return roster::main(&args).await;
+    }
+    for idx in parse_args(&args) {
         let (name, fingerprint) = &GRADED_PROFILES[idx];
         println!("\n{}", "=".repeat(60));
         println!("Profile : {name}");
@@ -87,6 +91,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+/// Parses `--profile <name>` (repeatable); defaults to both graded
+/// profiles. Only [`GRADED_PROFILES`] are accepted — any other profile
+/// name is a CLI error (`grade()` cannot handle it).
+fn parse_args(args: &[String]) -> Vec<usize> {
+    let mut it = args.iter();
+    let mut selected = Vec::new();
+    while let Some(arg) = it.next() {
+        if arg != "--profile" {
+            eprintln!("usage: grader [--profile <name>] | --roster [--family <name>] [--sample]");
+            std::process::exit(2);
+        }
+        let name = it.next().unwrap_or_else(|| {
+            eprintln!("--profile requires a value");
+            std::process::exit(2);
+        });
+        let idx = GRADED_PROFILES
+            .iter()
+            .position(|(n, _)| *n == name)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "unknown or unsupported profile {name:?}; grader supports: {}",
+                    GRADED_PROFILES
+                        .iter()
+                        .map(|(n, _)| *n)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(2);
+            });
+        selected.push(idx);
+    }
+    if selected.is_empty() {
+        (0..GRADED_PROFILES.len()).collect()
+    } else {
+        selected
+    }
 }
 
 /// Profiles the grader can grade (all others are rejected at the CLI):
@@ -127,41 +168,6 @@ const GRADED_PROFILES: &[(&str, Fingerprint)] = &[
 /// Parses `--profile <name>` (repeatable); defaults to both graded
 /// profiles. Only [`GRADED_PROFILES`] are accepted — any other profile
 /// name is a CLI error (`grade()` cannot handle it).
-fn parse_args() -> Vec<usize> {
-    let mut args = std::env::args().skip(1);
-    let mut selected = Vec::new();
-    while let Some(arg) = args.next() {
-        if arg != "--profile" {
-            eprintln!("usage: grader [--profile <name>]");
-            std::process::exit(2);
-        }
-        let name = args.next().unwrap_or_else(|| {
-            eprintln!("--profile requires a value");
-            std::process::exit(2);
-        });
-        let idx = GRADED_PROFILES
-            .iter()
-            .position(|(n, _)| *n == name)
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "unknown or unsupported profile {name:?}; grader supports: {}",
-                    GRADED_PROFILES
-                        .iter()
-                        .map(|(n, _)| *n)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                std::process::exit(2);
-            });
-        selected.push(idx);
-    }
-    if selected.is_empty() {
-        (0..GRADED_PROFILES.len()).collect()
-    } else {
-        selected
-    }
-}
-
 async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), Box<dyn Error>> {
     // Local fingerprint of the profile (fixed seed → deterministic GREASE;
     // JA4 is GREASE-normalized anyway; JA3 is compared GREASE-stripped).
@@ -371,8 +377,7 @@ mod local {
             .collect()
     }
 
-    /// First ALPN protocol from the ALPN extension (0x0010).
-    fn alpn(hello: &ParsedClientHello) -> Option<String> {
+    pub fn alpn(hello: &ParsedClientHello) -> Option<String> {
         let body = hello.extension(0x0010)?;
         let list_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
         let rest = body.get(2..)?;
@@ -507,5 +512,656 @@ mod local {
         );
 
         format!("t13d{cipher_count:02}{ext_count:02}{alpn_token}_{cipher_sha}_{ext_sha}")
+    }
+}
+
+/// Live roster sweep — tier-2 verification over the generated roster.
+///
+/// `grader --roster [--family <name>] [--sample]`
+///
+/// Builds every roster entry's `ClientHello` with a fixed seed, computes
+/// the local JA4 (tls.peet.ws algorithm, padding excluded from the hash
+/// list), connects live and compares the server-reported JA4 against both
+/// the local value (wire fidelity) and the registered `GenEntry.ja4`
+/// (corpus match, classified against the four documented corpus/codec
+/// semantics gaps — padding in hello, padding omitted by the 512-byte
+/// target rule, no-sig, `ht` ALPN letter — the same classification the
+/// offline gate `tests/generated_ja4_gate.rs` pins).
+mod roster {
+    use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::fmt::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    use xray_tui_tls::crypto::fingerprint::ja3::Ja3Fields;
+    use xray_tui_tls::crypto::fingerprint::ja4::{full_ja4, hash1, hash2, ja4_a};
+    use xray_tui_tls::error::TlsError;
+    use xray_tui_tls::fingerprints::{Browser, Os};
+    use xray_tui_tls::handshake::{HandshakeParams, connect};
+    use xray_tui_tls::hello::parse::parse_hello;
+    use xray_tui_tls::hello::{BuildParams, build_hello};
+    use xray_tui_tls::http2;
+    use xray_tui_tls::profiles::generated::{GENERATED, GenEntry};
+    use xray_tui_tls::record::stream::TlsStream;
+    use xray_tui_tls::spec::ExtensionSpec;
+    use xray_tui_tls::spec::grease::is_grease;
+    use xray_tui_tls::verify::WebPkiVerifier;
+
+    use super::local;
+    use super::{API_PATH, HOST, PORT};
+
+    /// Bounded concurrency for the live sweep (politeness + local socket
+    /// limits; peet.ws grades thousands of fingerprints, but bursty is
+    /// rude).
+    const CONCURRENCY: usize = 16;
+    /// Per-entry cap for the whole fetch (connect + handshake + GET).
+    const FETCH_TIMEOUT_SECS: u64 = 20;
+
+    pub async fn main(args: &[String]) -> Result<(), Box<dyn Error>> {
+        let mut family_filter: Option<&str> = None;
+        let mut sample = false;
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--roster" => {}
+                "--sample" => sample = true,
+                "--family" => {
+                    family_filter = Some(it.next().unwrap_or_else(|| {
+                        eprintln!("--family requires a value");
+                        std::process::exit(2);
+                    }));
+                }
+                other => {
+                    eprintln!("usage: grader --roster [--family <name>] [--sample]");
+                    eprintln!("unexpected roster argument {other:?}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        let mut entries: Vec<GenEntry> = GENERATED.to_vec();
+        if let Some(f) = family_filter {
+            entries.retain(|e| family(e) == f);
+            if entries.is_empty() {
+                eprintln!(
+                    "unknown roster family {f:?}; families: chrome, firefox, safari, \
+                     chrome_android, safari_ios"
+                );
+                std::process::exit(2);
+            }
+        }
+        if sample {
+            entries = band_sample(&entries);
+        }
+        let scope = match (family_filter, sample) {
+            (Some(f), false) => format!("family {f}, full"),
+            (Some(f), true) => format!("family {f}, per-band sample"),
+            (None, false) => "full roster".to_string(),
+            (None, true) => "per-family/band sample".to_string(),
+        };
+        println!("roster sweep: {} entries ({scope})", entries.len());
+
+        let (mlkem_pk, _) =
+            xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+        // One shared ML-KEM keypair for the whole sweep (the key-share BODY
+        // is JA4-invisible; only the group ids count). Leaked once: the
+        // sweep tasks need `'static` — a CLI-sized, single allocation.
+        let pk: &'static [u8] = Box::leak(mlkem_pk.as_bytes().to_vec().into_boxed_slice());
+        let results = sweep(&entries, pk).await;
+
+        for r in &results {
+            println!(
+                "{} {:<32} {:<13} {:>3} {:>3} {:>4} {:>4}  {}  {}",
+                if r.failed() { "FAIL" } else { "pass" },
+                r.name,
+                r.family,
+                class_abbr(r.class),
+                if r.ht { "ht" } else { "·" },
+                if r.ech { "ech" } else { "·" },
+                r.alpn,
+                r.server_ja4,
+                r.error.as_deref().unwrap_or(""),
+            );
+        }
+        let table = summary_table(&results);
+        print!("{table}");
+        let failures = results.iter().filter(|r| r.failed()).count();
+        let total = results.len();
+        if failures > 0 {
+            eprintln!("\nROSTER: {failures}/{total} FAILED — see per-entry lines above");
+            std::process::exit(1);
+        }
+        println!("\nROSTER: ALL {total} PASS");
+        Ok(())
+    }
+
+    /// Generated-module family of an entry (the five roster modules; the
+    /// `safari_ios` module is the `WKWebView` reality — any browser on iOS).
+    const fn family(entry: &GenEntry) -> &'static str {
+        match (entry.browser, entry.os) {
+            (_, Some(Os::Ios)) => "safari_ios",
+            (Browser::Firefox, _) => "firefox",
+            (Browser::Safari, _) => "safari",
+            (_, Some(Os::Android)) => "chrome_android",
+            _ => "chrome",
+        }
+    }
+
+    /// One entry per (family, major) band, in roster order.
+    fn band_sample(all: &[GenEntry]) -> Vec<GenEntry> {
+        let mut seen: Vec<(&str, u16)> = Vec::new();
+        all.iter()
+            .copied()
+            .filter(|e| {
+                let key = (family(e), e.major);
+                if seen.contains(&key) {
+                    false
+                } else {
+                    seen.push(key);
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// Offline classification of the registered JA4 vs the built hello —
+    /// the same semantics the offline gate (`generated_ja4_gate.rs`) pins.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Class {
+        Full,
+        PaddingInHello,
+        PaddingOmitted,
+        NoSig,
+    }
+
+    const fn class_abbr(class: Option<Class>) -> &'static str {
+        match class {
+            Some(Class::Full) => "full",
+            Some(Class::PaddingInHello) => "pad+",
+            Some(Class::PaddingOmitted) => "pad-",
+            Some(Class::NoSig) => "nsg",
+            None => "???",
+        }
+    }
+
+    fn sha12(payload: &str) -> String {
+        use std::fmt::Write;
+        let digest = Sha256::digest(payload.as_bytes());
+        let mut out = String::with_capacity(12);
+        for b in &digest[..6] {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+
+    /// Corpus-rule hash2 (original `FoxIO`/ja4db semantics): sorted
+    /// non-GREASE ext ids minus SNI (`0000`) and ALPN (`0010`), padding
+    /// (`0015`) KEPT in the list — and forced back in when the 512-byte
+    /// target rule dropped it — then `_` + sig algs in hello order when
+    /// `with_sigs`.
+    fn corpus_hash2(f: &Ja3Fields, force_padding: bool, with_sigs: bool) -> String {
+        let mut exts: Vec<String> = f
+            .extensions
+            .iter()
+            .copied()
+            .filter(|&e| !is_grease(e) && e != 0x0000 && e != 0x0010)
+            .map(|e| format!("{e:04x}"))
+            .collect();
+        if force_padding && !exts.iter().any(|e| e == "0015") {
+            exts.push("0015".to_string());
+        }
+        exts.sort_unstable();
+        let mut payload = exts.join(",");
+        if with_sigs && !f.signature_algorithms.is_empty() {
+            payload.push('_');
+            payload.push_str(
+                &f.signature_algorithms
+                    .iter()
+                    .map(|s| format!("{s:04x}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        sha12(&payload)
+    }
+
+    /// Classifies an entry offline; the returned bool marks the corpus
+    /// `ht` ALPN letter rendering (first-two-chars vs the codec's
+    /// first+last `h1`) — orthogonal to the class.
+    fn classify(f: &Ja3Fields, registered: &str) -> Option<(Class, bool)> {
+        if full_ja4(f) == registered {
+            return Some((Class::Full, false));
+        }
+        let parts: Vec<&str> = registered.split('_').collect();
+        if parts.len() != 3 || hash1(f) != parts[1] {
+            return None;
+        }
+        let ht = parts[0].ends_with("ht") && ja4_a(f).ends_with("h1");
+        if corpus_hash2(f, false, true) == parts[2] {
+            Some((Class::PaddingInHello, ht))
+        } else if corpus_hash2(f, true, true) == parts[2] {
+            Some((Class::PaddingOmitted, ht))
+        } else if corpus_hash2(f, false, false) == parts[2]
+            || corpus_hash2(f, true, false) == parts[2]
+        {
+            Some((Class::NoSig, ht))
+        } else {
+            None
+        }
+    }
+
+    /// tls.peet.ws's A-part rendering (its `ja4.go`): `t13d` + NON-padded
+    /// decimal cipher/ext counts + first+last ALPN letter, with NO letter
+    /// when no ALPN is offered — the server deviates from the `FoxIO` spec's
+    /// `%02d` counts and `00` letter. Observed live: registered
+    /// `t13d170900_…` is reported as `t13d179_…` (17 ciphers, 9 exts).
+    fn peet_a_part(f: &Ja3Fields) -> String {
+        let cipher_count = f.ciphers.iter().filter(|&&c| !is_grease(c)).count();
+        let ext_count = f.extensions.iter().filter(|&&e| !is_grease(e)).count();
+        let letter = match f.alpn.first() {
+            None => String::new(),
+            Some(p) if p.bytes().all(|b| b.is_ascii()) => {
+                let bytes = p.as_bytes();
+                if bytes.len() > 2 {
+                    format!("{}{}", bytes[0] as char, bytes[bytes.len() - 1] as char)
+                } else {
+                    p.clone()
+                }
+            }
+            Some(_) => "99".to_string(),
+        };
+        format!("t13d{cipher_count}{ext_count}{letter}")
+    }
+
+    /// The JA4 the server should report for the built hello: peet A-part +
+    /// the codec's hash1 and hash2 (peet.ws excludes padding from hash2,
+    /// matching `ja4.rs`).
+    fn peet_ja4(f: &Ja3Fields) -> String {
+        format!("{}_{}_{}", peet_a_part(f), hash1(f), hash2(f))
+    }
+
+    /// A registered JA4 (`FoxIO` rendering: padded counts, `00`/`ht` letters)
+    /// converted to the server's rendering for comparison — the shape the
+    /// wire would produce for the same hello when every hash matches.
+    fn to_peet_rendering(ja4: &str) -> Option<String> {
+        let (a, rest) = ja4.split_once('_')?;
+        let a = a.strip_prefix("t13d")?;
+        let digits = a.get(..4)?;
+        let c: usize = digits[..2].parse().ok()?;
+        let e: usize = digits[2..4].parse().ok()?;
+        let letter = match &a[4..] {
+            "00" => "",
+            l => l,
+        };
+        Some(format!("t13d{c}{e}{letter}_{rest}"))
+    }
+
+    fn has_ech(spec: &xray_tui_tls::spec::ClientHelloSpec) -> bool {
+        spec.extensions
+            .iter()
+            .any(|e| matches!(e, ExtensionSpec::Raw { ty: 0xfe0d, .. }))
+    }
+
+    #[allow(clippy::struct_excessive_bools)] // verdict flags, one per check
+    struct EntryResult {
+        name: &'static str,
+        family: &'static str,
+        class: Option<Class>,
+        ht: bool,
+        ech: bool,
+        alpn: &'static str,
+        server_ja4: String,
+        registered_ok: bool,
+        wire_ok: bool,
+        hash1_ok: bool,
+        error: Option<String>,
+    }
+
+    impl EntryResult {
+        fn error(
+            entry: &GenEntry,
+            spec: &xray_tui_tls::spec::ClientHelloSpec,
+            msg: String,
+        ) -> Self {
+            Self {
+                name: entry.name,
+                family: family(entry),
+                class: None,
+                ht: false,
+                ech: has_ech(spec),
+                alpn: "·",
+                server_ja4: String::new(),
+                registered_ok: false,
+                wire_ok: false,
+                hash1_ok: false,
+                error: Some(msg),
+            }
+        }
+
+        fn failed(&self) -> bool {
+            if self.error.is_some() || !self.wire_ok || !self.hash1_ok {
+                return true;
+            }
+            self.class == Some(Class::Full) && !self.registered_ok
+        }
+    }
+
+    async fn sweep(entries: &[GenEntry], mlkem_pk: &'static [u8]) -> Vec<EntryResult> {
+        let sem = Arc::new(Semaphore::new(CONCURRENCY));
+        let mut set = JoinSet::new();
+        for entry in entries {
+            let sem = Arc::clone(&sem);
+            let entry = *entry;
+            set.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                grade_entry(entry, mlkem_pk).await
+            });
+        }
+        let mut results = Vec::with_capacity(entries.len());
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(r) => results.push(r),
+                Err(e) => results.push(EntryResult {
+                    name: "<task panic>",
+                    family: "?",
+                    class: None,
+                    ht: false,
+                    ech: false,
+                    alpn: "·",
+                    server_ja4: String::new(),
+                    registered_ok: false,
+                    wire_ok: false,
+                    hash1_ok: false,
+                    error: Some(format!("sweep task panicked: {e}")),
+                }),
+            }
+        }
+        results
+    }
+
+    async fn grade_entry(entry: GenEntry, mlkem_pk: &'static [u8]) -> EntryResult {
+        let spec = (entry.spec_fn)();
+        let ech = has_ech(&spec);
+        let fixed = local::FixedRandom {
+            bytes: vec![0x5A; 512],
+            pos: AtomicUsize::new(0),
+        };
+        let local_hello = match build_hello(
+            &spec,
+            &BuildParams {
+                server_name: HOST,
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk),
+                rng: &fixed,
+            },
+        ) {
+            Ok(h) => h,
+            Err(e) => return EntryResult::error(&entry, &spec, format!("build_hello: {e}")),
+        };
+        let parsed = match parse_hello(&local_hello.handshake_bytes) {
+            Ok(p) => p,
+            Err(e) => return EntryResult::error(&entry, &spec, format!("parse_hello: {e}")),
+        };
+        let fields = Ja3Fields::from(&parsed);
+        let peet_ja4 = peet_ja4(&fields);
+        let Some((class, ht)) = classify(&fields, entry.ja4) else {
+            return EntryResult::error(&entry, &spec, "unclassifiable offline".to_string());
+        };
+        let alpn = match local::alpn(&parsed).as_deref() {
+            Some("h2") => "h2",
+            Some(_) => "h1",
+            None => "00",
+        };
+
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(FETCH_TIMEOUT_SECS),
+            fetch_peet(&spec, alpn),
+        )
+        .await;
+        let server_ja4 = match fetched {
+            Ok(Ok(ja4)) => ja4,
+            Ok(Err(e)) => {
+                let mut r = EntryResult::error(&entry, &spec, e);
+                r.class = Some(class);
+                r.ht = ht;
+                r.ech = ech;
+                r.alpn = alpn;
+                return r;
+            }
+            Err(_) => {
+                let mut r = EntryResult::error(&entry, &spec, "fetch timed out".to_string());
+                r.class = Some(class);
+                r.ht = ht;
+                r.ech = ech;
+                r.alpn = alpn;
+                return r;
+            }
+        };
+        let wire_ok = server_ja4 == peet_ja4;
+        let registered_ok = to_peet_rendering(entry.ja4).is_some_and(|r| server_ja4 == r);
+        let hash1_ok = server_ja4.split('_').nth(1) == entry.ja4.split('_').nth(1);
+
+        EntryResult {
+            name: entry.name,
+            family: family(&entry),
+            class: Some(class),
+            ht,
+            ech,
+            alpn,
+            server_ja4,
+            registered_ok,
+            wire_ok,
+            hash1_ok,
+            error: None,
+        }
+    }
+
+    async fn fetch_peet(
+        spec: &xray_tui_tls::spec::ClientHelloSpec,
+        alpn: &str,
+    ) -> Result<String, String> {
+        let stream = TcpStream::connect((HOST, PORT))
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let verifier = WebPkiVerifier::webpki_roots();
+        let mut conn = connect(
+            stream,
+            HandshakeParams {
+                spec,
+                server_name: HOST,
+                alpn: None,
+                verifier: &verifier,
+                rng: &ring::rand::SystemRandom::new(),
+            },
+        )
+        .await
+        .map_err(|e| format!("handshake: {e}"))?;
+        let body = match alpn {
+            "h2" => http2::get(&mut conn, API_PATH, HOST).await,
+            _ => http1_get(&mut conn, API_PATH, HOST).await,
+        }
+        .map_err(|e| format!("GET {API_PATH}: {e}"))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("response JSON: {e}"))?;
+        let ja4 = json["tls"]["ja4"]
+            .as_str()
+            .unwrap_or("<missing>")
+            .to_string();
+        if std::env::var_os("ROSTER_DEBUG").is_some() {
+            let ja4_r = json["tls"]["ja4_r"].as_str().unwrap_or("");
+            let ver = json["tls"]["tls_version_negotiated"].as_str().unwrap_or("");
+            let alpn_neg = json["tls"]["alpn_protocol"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            eprintln!("DEBUG {alpn}: ja4={ja4} ja4_r={ja4_r} version={ver} alpn_neg={alpn_neg}");
+        }
+        Ok(ja4)
+    }
+
+    /// HTTP/1.1 GET for entries whose hello does not offer h2 (the 306
+    /// `http/1.1`-only and 533 no-ALPN entries; peet.ws serves /api/all
+    /// over both). Sends `Connection: close`, honors `Content-Length`,
+    /// de-chunks when the server chunks.
+    async fn http1_get<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        conn: &mut TlsStream<S>,
+        path: &str,
+        host: &str,
+    ) -> Result<String, TlsError> {
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+        );
+        conn.write_all(req.as_bytes()).await?;
+        let mut buf = [0u8; 8192];
+        let mut raw: Vec<u8> = Vec::new();
+        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = conn.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let header_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| TlsError::Protocol("HTTP/1.1 response without headers".to_string()))?;
+        let head = String::from_utf8_lossy(&raw[..header_end]);
+        let mut body = raw[header_end + 4..].to_vec();
+        let chunked = head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        let content_length = head
+            .lines()
+            .find_map(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().to_string())
+            })
+            .and_then(|v| v.parse::<usize>().ok());
+        if let Some(len) = content_length {
+            while body.len() < len {
+                let n = conn.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            body.truncate(len);
+        } else if chunked {
+            loop {
+                let n = conn.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            body = dechunk(&body)
+                .ok_or_else(|| TlsError::Protocol("malformed chunked body".to_string()))?;
+        } else {
+            loop {
+                let n = conn.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+        }
+        String::from_utf8(body).map_err(|_| TlsError::Protocol("body not UTF-8".to_string()))
+    }
+
+    /// RFC 9112 §7.1 chunked decoding (chunk-size line, data, CRLF per
+    /// chunk; a 0-size chunk ends the body, trailing trailers ignored).
+    fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let line_end = data.iter().position(|&b| b == b'\n')?;
+            let size_line = std::str::from_utf8(&data[..line_end]).ok()?.trim();
+            let size = usize::from_str_radix(size_line.split(';').next()?.trim(), 16).ok()?;
+            data = data.get(line_end + 1..)?;
+            if size == 0 {
+                return Some(out);
+            }
+            let chunk = data.get(..size)?;
+            out.extend_from_slice(chunk);
+            data = data.get(size..)?;
+            if !data.starts_with(b"\r\n") {
+                return None;
+            }
+            data = data.get(2..)?;
+        }
+    }
+
+    fn summary_table(results: &[EntryResult]) -> String {
+        let mut by_family: BTreeMap<&str, Vec<&EntryResult>> = BTreeMap::new();
+        for r in results {
+            by_family.entry(r.family).or_default().push(r);
+        }
+        let mut out = String::from("\n\n");
+        let _ = writeln!(
+            out,
+            "{:<14} {:>5} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>5}",
+            "family", "total", "full", "pad+", "pad-", "no-sig", "ht", "wire-ok", "reg-ok", "fail"
+        );
+        let mut totals = [0usize; 9];
+        for (fam, group) in &by_family {
+            let total = group.len();
+            let full = group
+                .iter()
+                .filter(|r| r.class == Some(Class::Full))
+                .count();
+            let pad_in = group
+                .iter()
+                .filter(|r| r.class == Some(Class::PaddingInHello))
+                .count();
+            let pad_out = group
+                .iter()
+                .filter(|r| r.class == Some(Class::PaddingOmitted))
+                .count();
+            let no_sig = group
+                .iter()
+                .filter(|r| r.class == Some(Class::NoSig))
+                .count();
+            let ht = group.iter().filter(|r| r.ht).count();
+            let wire_ok = group.iter().filter(|r| r.wire_ok).count();
+            let reg_ok = group.iter().filter(|r| r.registered_ok).count();
+            let fail = group.iter().filter(|r| r.failed()).count();
+            totals[0] += total;
+            totals[1] += full;
+            totals[2] += pad_in;
+            totals[3] += pad_out;
+            totals[4] += no_sig;
+            totals[5] += ht;
+            totals[6] += wire_ok;
+            totals[8] += fail;
+            let _ = writeln!(
+                out,
+                "{fam:<14} {total:>5} {full:>6} {pad_in:>6} {pad_out:>6} {no_sig:>6} {ht:>6} {wire_ok:>7} {reg_ok:>7} {fail:>5}"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "{:<14} {:>5} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>5}",
+            "TOTAL",
+            totals[0],
+            totals[1],
+            totals[2],
+            totals[3],
+            totals[4],
+            totals[5],
+            totals[6],
+            totals[7],
+            totals[8]
+        );
+        out
     }
 }

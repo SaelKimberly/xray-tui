@@ -28,6 +28,21 @@ segments are comma-joined lowercase hex ids. Only `t13d` A-parts are
 accepted (this crate's profiles all offer TLS 1.3); other prefixes in the
 export (t12d/t13i/t12i/q13d) yield None.
 
+Generator usage:
+
+- `--manifest` — rebuild `specs_manifest.json` from the ja4db export
+  (attribution/join/dedup; stats printed).
+- `--emit` — render `profiles/generated/*.rs` from the manifest
+  (byte-deterministic; `--selftest` verifies committed == fresh render).
+- `--selftest` — parse/hash round-trip + emitter determinism checks.
+
+Output: the 1825-entry JA4-faithful roster (chrome 720, firefox 407,
+safari 33, chrome_android 359, safari_ios 306; fallback/okhttp empty).
+Fidelity contract: each emitted spec's built ClientHello must reproduce
+its registered source JA4 — enforced offline by
+`tests/generated_ja4_gate.rs` (1825/1825) and confirmed live by the
+grader `--roster` sweep against tls.peet.ws (`docs/tls-fingerprint-roster.md`).
+
 Self-test: `python3 gen_specs.py --selftest`
 
 Corpus quirks (investigated; see UNMATCHED breakdown printed by the
@@ -291,6 +306,11 @@ ECPF = 0x000B
 TICKET = 0x0023
 SIGALGS = 0x000D
 SCT = 0x0012
+SIGALGS_CERT = 0x0032   # signature_algorithms_cert; body synthesized from
+                        # the sigalgs list (RFC 8446 §4.2.3 default) — the
+                        # string export carries ids only, and an EMPTY body
+                        # is malformed (rejected by real servers; see
+                        # docs/tls-fingerprint-roster.md Task 8 finding)
 KEYSHARE = 0x0033
 PSK_MODES = 0x002D
 VERSIONS = 0x002B
@@ -457,6 +477,15 @@ def build_extension(ty, tmpl, protocols, sig_algos):
         return {"ty": ty, "kind": "Raw", "args": [_alps_new_body(protocols)]}
     if ty == EMS:  # extended_master_secret
         return {"ty": ty, "kind": "Raw", "args": [[]]}
+    if ty == SIGALGS_CERT:
+        # signature_algorithms_cert: u16 length + sig-alg ids. The corpus
+        # string export carries the id but no body; RFC 8446 §4.2.3 makes
+        # the extension default to signature_algorithms, so mirror that
+        # list. An EMPTY body is malformed and real servers reject the
+        # hello (Task 8 live-sweep finding). JA4-invisible (body only).
+        payload = b"".join(a.to_bytes(2, "big") for a in sig_algos)
+        return {"ty": ty, "kind": "Raw",
+                "args": [list(len(payload).to_bytes(2, "big")) + list(payload)]}
     return {"ty": ty, "kind": "Raw", "args": [[]]}
 
 

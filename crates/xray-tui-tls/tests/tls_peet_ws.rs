@@ -13,11 +13,14 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
-use xray_tui_tls::fingerprints::{Browser, Fingerprint};
+use xray_tui_tls::crypto::fingerprint::ja3::Ja3Fields;
+use xray_tui_tls::fingerprints::{Browser, Fingerprint, Os};
 use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
 use xray_tui_tls::hello::{BuildParams, build_hello};
 use xray_tui_tls::http2;
+use xray_tui_tls::profiles::generated::{GENERATED, GenEntry};
+use xray_tui_tls::spec::ClientHelloSpec;
 use xray_tui_tls::verify::WebPkiVerifier;
 
 const HOST: &str = "tls.peet.ws";
@@ -147,6 +150,137 @@ async fn fetch_peet_report(
     fingerprint: &Fingerprint,
 ) -> Result<PeetReport, Box<dyn std::error::Error>> {
     let spec = fingerprint.resolve().expect("identity resolves").spec;
+    fetch_peet_report_spec(&spec).await
+}
+
+/// Sampled live sweep over the generated roster: one entry per
+/// (family, major) band (the same sampling the grader's `--roster
+/// --sample` uses). Asserts the server-reported JA4 matches the local
+/// peet.ws-algorithm JA4 (wire fidelity) and that hash1 still reproduces
+/// the registered corpus value for every sampled entry — the live
+/// complement to the offline gate, run with the full ignored set:
+/// `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored`.
+#[tokio::test]
+#[ignore = "network"]
+async fn sampled_roster_bands_match_live_peet_ws() {
+    let entries = band_sample();
+    assert!(
+        !entries.is_empty(),
+        "per-family/band sample must not be empty"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let (mlkem_pk, _) =
+        xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+    for entry in entries {
+        let spec = (entry.spec_fn)();
+        let fixed = local::FixedRandom {
+            bytes: vec![0x5A; 512],
+            pos: AtomicUsize::new(0),
+        };
+        let local_hello = match build_hello(
+            &spec,
+            &BuildParams {
+                server_name: HOST,
+                alpn: None,
+                x25519_pub: &[0xAB; 32],
+                mlkem768_pub: Some(mlkem_pk.as_bytes()),
+                rng: &fixed,
+            },
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                failures.push(format!("{}: build_hello: {e}", entry.name));
+                continue;
+            }
+        };
+        let parsed = match parse_hello(&local_hello.handshake_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                failures.push(format!("{}: parse_hello: {e}", entry.name));
+                continue;
+            }
+        };
+        let fields = Ja3Fields::from(&parsed);
+        let local_ja4 = local::ja4_v2(&parsed);
+        let peet_ja4 = format!(
+            "{}_{}_{}",
+            local::peet_a_part(&fields),
+            local::ja4_hash1(&fields),
+            local::ja4_hash2(&fields)
+        );
+
+        let report = match fetch_peet_report_spec(&spec).await {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!("{}: fetch: {e}", entry.name));
+                continue;
+            }
+        };
+        // Wire fidelity: the server's JA4 (its own algorithm, unpadded
+        // counts and all) must match the locally computed value.
+        if report.ja4 != peet_ja4 {
+            failures.push(format!(
+                "{}: wire mismatch server={} local={}",
+                entry.name, report.ja4, local_ja4
+            ));
+            continue;
+        }
+        // hash1 is the one JA4 segment the corpus/codec semantics gaps
+        // never touch: the server must reproduce the registered cipher
+        // hash for every entry.
+        let server_hash1 = report.ja4.split('_').nth(1);
+        let registered_hash1 = entry.ja4.split('_').nth(1);
+        if server_hash1 != registered_hash1 {
+            failures.push(format!(
+                "{}: hash1 mismatch server={:?} registered={:?}",
+                entry.name, server_hash1, registered_hash1
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "sampled roster bands failed against tls.peet.ws:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// One entry per (family, major) band of [`GENERATED`], in roster order.
+fn band_sample() -> Vec<GenEntry> {
+    let family = |e: &GenEntry| -> &'static str {
+        match (e.browser, e.os) {
+            (_, Some(Os::Ios)) => "safari_ios",
+            (Browser::Firefox, _) => "firefox",
+            (Browser::Safari, _) => "safari",
+            (_, Some(Os::Android)) => "chrome_android",
+            _ => "chrome",
+        }
+    };
+    let mut seen: Vec<(&str, u16)> = Vec::new();
+    GENERATED
+        .iter()
+        .copied()
+        .filter(|e| {
+            let key = (family(e), e.major);
+            if seen.contains(&key) {
+                false
+            } else {
+                seen.push(key);
+                true
+            }
+        })
+        .collect()
+}
+
+/// One live round-trip for a `ClientHelloSpec` (the shared core: the
+/// resolved identities above delegate to it and the sampled roster sweep
+/// below drives it directly). Builds the hello with the fixed seed,
+/// connects, HTTP/2 GET `/api/all`, and computes both the server report
+/// and the local reconciliation fingerprints.
+async fn fetch_peet_report_spec(
+    spec: &ClientHelloSpec,
+) -> Result<PeetReport, Box<dyn std::error::Error>> {
     let fixed = local::FixedRandom {
         bytes: vec![0x42; 128],
         pos: AtomicUsize::new(0),
@@ -154,10 +288,10 @@ async fn fetch_peet_report(
     let (mlkem_pk, _) =
         xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
     let local_hello = build_hello(
-        &spec,
+        spec,
         &BuildParams {
             server_name: HOST,
-            alpn: Some(ALPN),
+            alpn: None,
             x25519_pub: &[0xAB; 32],
             mlkem768_pub: Some(mlkem_pk.as_bytes()),
             rng: &fixed,
@@ -170,9 +304,9 @@ async fn fetch_peet_report(
     let mut conn = connect(
         stream,
         HandshakeParams {
-            spec: &spec,
+            spec,
             server_name: HOST,
-            alpn: Some(ALPN),
+            alpn: None,
             verifier: &verifier,
             rng: &ring::rand::SystemRandom::new(),
         },
@@ -213,6 +347,7 @@ mod local {
     use ring::digest;
 
     use xray_tui_tls::SecureRandom;
+    use xray_tui_tls::crypto::fingerprint::ja3::Ja3Fields;
     use xray_tui_tls::hello::parse::ParsedClientHello;
     use xray_tui_tls::spec::grease::is_grease;
 
@@ -398,5 +533,65 @@ mod local {
         );
 
         format!("t13d{cipher_count:02}{ext_count:02}{alpn_token}_{cipher_sha}_{ext_sha}")
+    }
+
+    /// hash1 segment: sha256[:12] of sorted non-GREASE ciphers.
+    pub fn ja4_hash1(f: &Ja3Fields) -> String {
+        let mut ciphers: Vec<String> = f
+            .ciphers
+            .iter()
+            .filter(|&&c| !is_grease(c))
+            .map(|c| format!("{c:04x}"))
+            .collect();
+        ciphers.sort_unstable();
+        sha256_hex12(ciphers.join(",").as_bytes())
+    }
+
+    /// hash2 segment (peet.ws semantics: padding `0015` excluded from the
+    /// list, matching the crate's `ja4.rs` codec).
+    pub fn ja4_hash2(f: &Ja3Fields) -> String {
+        let mut exts: Vec<String> = f
+            .extensions
+            .iter()
+            .copied()
+            .filter(|&e| !is_grease(e) && e != 0x0000 && e != 0x0010 && e != 0x0015)
+            .map(|e| format!("{e:04x}"))
+            .collect();
+        exts.sort_unstable();
+        let mut payload = exts.join(",");
+        if !f.signature_algorithms.is_empty() {
+            payload.push('_');
+            payload.push_str(
+                &f.signature_algorithms
+                    .iter()
+                    .map(|s| format!("{s:04x}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        sha256_hex12(payload.as_bytes())
+    }
+
+    /// tls.peet.ws's A-part rendering (its `ja4.go`): `t13d` + NON-padded
+    /// decimal cipher/ext counts + first+last ALPN letter, with NO letter
+    /// when no ALPN is offered — the server deviates from the `FoxIO`
+    /// spec's `%02d` counts and `00` letter (observed live; see
+    /// `docs/tls-fingerprint-roster.md`).
+    pub fn peet_a_part(f: &Ja3Fields) -> String {
+        let cipher_count = f.ciphers.iter().filter(|&&c| !is_grease(c)).count();
+        let ext_count = f.extensions.iter().filter(|&&e| !is_grease(e)).count();
+        let letter = match f.alpn.first() {
+            None => String::new(),
+            Some(p) if p.bytes().all(|b| b.is_ascii()) => {
+                let bytes = p.as_bytes();
+                if bytes.len() > 2 {
+                    format!("{}{}", bytes[0] as char, bytes[bytes.len() - 1] as char)
+                } else {
+                    p.clone()
+                }
+            }
+            Some(_) => "99".to_string(),
+        };
+        format!("t13d{cipher_count}{ext_count}{letter}")
     }
 }

@@ -76,11 +76,28 @@ reachable.
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
 | 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session), xhttp h3 (the `decideHTTPVersion` dispatch rule — single `h3` ALPN → QUIC, `http/1.1` → h1, 0/2+ or other → h2; the shared v3 protocol over the `V3Send` seam; hermetic h3 server double over loopback QUIC; ML-KEM-768 primitives (liboqs roundtrips + size pins), TLS hybrid curves (X25519MLKEM768 key-share encode/parse, `pq || classical` key schedule, fake-PQ-server handshake), VLESS `mlkem768x25519plus` encryption (parser, relay/AEAD chain, xor-mode masking, hermetic double), REALITY 4588 hybrid share (hermetic fake REALITY PQ server)) | 476 lib tests (142 tls + 334 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP))
-| 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f` |
+| 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo run -p xray-tui-tls --example grader -- --roster [--family <name>] [--sample]`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f`; full 1825-entry roster live sweep + offline gate (see `docs/tls-fingerprint-roster.md`) |
 | 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis, VLESS mKCP axis, VLESS XHTTP/3 axis, VLESS ML-KEM PQ axis | 136 tests = 130 green + 6 documented ignored (vless 78+6, vmess 52; ignored: the 4 ws/grpc plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (SP7 — see the ML-KEM axis below); single-core rows run only on the serving core: xhttp + xhttp-h3 + kcp + pq-enc on xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on sing-box)
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
+
+### Generated fingerprint roster
+
+`crates/xray-tui-tls/src/fingerprints/catalog/gen_specs.py` parses the
+ja4db export and emits the **1825-entry JA4-faithful roster**
+(`spec!` specs + `GENERATED` registry under `profiles/generated/`; chrome
+720, firefox 407, safari 33, chrome_android 359, safari_ios 306 — see
+`docs/tls-fingerprint-roster.md`). Generator usage: `--manifest` rebuilds
+`specs_manifest.json` from the export, `--emit` re-renders the Rust files
+(byte-deterministic), `--selftest` verifies the committed files match a
+fresh render. Fidelity contract: every entry's built ClientHello must
+reproduce its registered source JA4 — pinned offline by
+`tests/generated_ja4_gate.rs` (1825/1825, 0 failures) and confirmed live
+against tls.peet.ws by the grader's `--roster` sweep (1655+ entries
+connect with wire-faithful JA4; the 111 `pre_shared_key` entries are
+documented as peet.ws-incompatible — the report records the finding).
+
 
 ## Crate maps
 
@@ -104,7 +121,7 @@ not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 | Module | Responsibility |
 |--------|----------------|
 | `spec/` | declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec`, RFC 6066/8446 wire encodings, GREASE (RFC 8701), hybrid key-share encoding (`X25519MLKEM768`: client share = ML-KEM ek(1184) ‖ X25519 pub(32)) |
-| `profiles/` | 17 transcribed hello specs (`ALL_SPECS` table; hand-transcribed from uTLS presets + real captures): Chrome119/130/133, ChromeAndroid130, Android11OkHttp, iOS14, Edge106/130, Brave167, Opera114, Firefox120, Firefox128Esr, Safari16/17, SafariIos17 (`chrome` = Chrome130 alias) |
+| `profiles/` | 17 transcribed hello specs (`ALL_SPECS` table; hand-transcribed from uTLS presets + real captures): Chrome119/130/133, ChromeAndroid130, Android11OkHttp, iOS14, Edge106/130, Brave167, Opera114, Firefox120, Firefox128Esr, Safari16/17, SafariIos17 (`chrome` = Chrome130 alias) + the **generated 1825-entry roster** (`generated/`, emitted by `gen_specs.py --emit`; JA4-faithful tier, resolver-merged under hand-written precedence; offline gate + live peet.ws sweep pin the fidelity contract — `tests/generated_ja4_gate.rs`, `docs/tls-fingerprint-roster.md`) |
 | `fingerprints/` | identity selector: `Fingerprint { browser, version?, os?, device? }` → strict table resolution (never a different browser, never older than requested; unknown combos error listing what IS resolvable); `FingerprintBuilder` overrides (ciphers/extensions/curves/ALPN/signature-algs, `GreasePolicy::Keep|Strip`); generated JA4 catalog (`catalog/catalog_data.rs`, from the frozen ja4db-export snapshot 2026-05-15 via ua-parser — rerun `gen.py`, never hand-edit) as evidence (`Resolved::in_catalog`); full-JA4 oracle in `crypto/fingerprint/ja4.rs` (final FoxIO scheme, peet.ws-validated) |
 | `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
