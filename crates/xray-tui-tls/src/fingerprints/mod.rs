@@ -9,4 +9,5 @@ pub mod catalog;
 
 pub use error::FingerprintError;
 pub use query::{Browser, Device, Fingerprint, Os};
+pub use resolve::Resolved;
 pub use resolve::available_identities;

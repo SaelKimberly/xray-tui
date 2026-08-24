@@ -219,6 +219,25 @@ pub struct Resolved {
     pub spec: ClientHelloSpec,
 }
 
+impl Resolved {
+    /// The full JA4 of this resolved hello (computed, not looked up).
+    #[must_use]
+    pub fn ja4(&self) -> String {
+        crate::crypto::fingerprint::ja4::full_ja4(
+            &crate::crypto::fingerprint::ja3::Ja3Fields::from_spec(&self.spec),
+        )
+    }
+
+    /// True when this resolved hello's JA4 was observed in the wild for
+    /// its claimed browser identity (catalog evidence). Version is passed
+    /// as `None`: recall over precision — evidence-only check, so catalog
+    /// rows without a recorded browser major still count.
+    #[must_use]
+    pub fn in_catalog(&self) -> bool {
+        super::catalog::contains(self.fingerprint.browser.name(), None, &self.ja4())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +377,18 @@ mod tests {
             "firefox_128_esr"
         );
         assert!(latest_row(Browser::SamsungInternet).is_none());
+    }
+    #[test]
+    fn resolved_computes_full_ja4() {
+        let r = Fingerprint::new(Browser::Chrome)
+            .with_version(133)
+            .resolve()
+            .unwrap();
+        let ja4 = r.ja4();
+        assert!(ja4.starts_with("t13d"), "{ja4}");
+        let parts: Vec<&str> = ja4.split('_').collect();
+        assert_eq!(parts.len(), 3, "A_hash1_hash2");
+        assert_eq!(parts[1].len(), 12);
+        assert_eq!(parts[2].len(), 12);
     }
 }
