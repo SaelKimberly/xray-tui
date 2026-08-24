@@ -7,17 +7,15 @@ pub use catalog_data::{CATALOG, CatalogEntry};
 
 /// All catalog entries observed for a browser name (e.g. `"chrome"`),
 /// optionally filtered to an exact major version.
+///
+/// Entries with an unknown browser version (`browser_major == 0`) are only
+/// matched by the unversioned query.
 #[must_use]
 pub fn entries_for(application: &str, version: Option<u16>) -> Vec<&'static CatalogEntry> {
     CATALOG
         .iter()
         .filter(|e| {
-            if e.application != application {
-                return false;
-            }
-            // The application column stores the browser name; versions
-            // ride the user_agent. Match on `/major.` in the UA.
-            version.is_none_or(|v| e.user_agent.contains(&format!("/{v}.")))
+            e.application == application && version.is_none_or(|v| v != 0 && e.browser_major == v)
         })
         .collect()
 }
@@ -55,5 +53,33 @@ mod tests {
     #[test]
     fn chrome_entries_exist() {
         assert!(!entries_for("chrome", None).is_empty());
+    }
+
+    #[test]
+    fn versioned_query_matches_exact_major() {
+        let known = CATALOG
+            .iter()
+            .find(|e| e.application == "chrome" && e.browser_major > 0)
+            .expect("catalog has chrome rows with a parsed major");
+        let hits = entries_for("chrome", Some(known.browser_major));
+        assert!(!hits.is_empty());
+        assert!(hits.iter().any(|e| std::ptr::eq(*e, known)));
+        for e in &hits {
+            assert_eq!(e.browser_major, known.browser_major);
+        }
+    }
+
+    #[test]
+    fn zero_major_excluded_from_versioned_included_in_unversioned() {
+        if let Some(e) = CATALOG.iter().find(|e| e.browser_major == 0) {
+            let app = e.application;
+            assert!(entries_for(app, Some(0)).is_empty());
+            assert!(
+                entries_for(app, Some(u16::MAX))
+                    .iter()
+                    .all(|h| h.browser_major != 0)
+            );
+            assert!(entries_for(app, None).iter().any(|h| std::ptr::eq(*h, e)));
+        }
     }
 }
