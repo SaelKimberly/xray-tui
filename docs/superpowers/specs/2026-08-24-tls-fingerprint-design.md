@@ -150,9 +150,30 @@ Curve overrides compose with REALITY keyshare injection because
 
 ## JA4 oracle
 
-Extend `crypto/fingerprint/ja4.rs` from JA4-A-only to full JA4:
-SHA256-truncated cipher-list hash + sorted extension/signature hash after
-the A part (FoxIO spec). Known-vector unit tests first.
+**Codec divergence discovered (2026-08-24, must fix first).** The existing
+`crypto/fingerprint/ja4.rs` implements the obsolete September-2023 JA4
+variant: first-cipher A-part, GREASE rendered as `g` and still counted,
+no hash segments. Real-world JA4s (ja4db dataset, live `tls.peet.ws`)
+use the final FoxIO scheme below. `ja4_a` is replaced outright — no
+compatibility shims; its call sites (profile tests) migrate to the new
+API in the same change.
+
+The validated algorithm (reproduced byte-for-byte against a live
+`tls.peet.ws` capture, `t13d3113h2_e8f1e7e78f70_db572f7c111e`):
+
+- A-part: `{t|q}{tls_version:2}{d|i}{cipher_count:02}{ext_count:02}{alpn}`
+  — counts EXCLUDE GREASE values entirely but INCLUDE SNI (`0000`),
+  ALPN (`0010`) and padding (`0015`); ALPN rendered as first+last char of
+  the first protocol (or `00`; non-ASCII → `99`).
+- hash1 = sha256(`","`.join(sorted cipher ids, lowercase 4-hex,
+  GREASE removed))[:12].
+- hash2 = sha256(`","`.join(extension ids sorted, GREASE **and** SNI,
+  ALPN, padding excluded) + `"_"` + signature-algorithm ids in hello
+  order)[:12]. The padding exclusion follows peet.ws semantics (the
+  de-facto grader standard); it is pinned by the known-vector test.
+
+New API: `Ja3Fields::from_spec(&ClientHelloSpec)` + `full_ja4(fields)`
+(and the raw segment strings for audits). `Resolved::ja4()` delegates.
 
 ## Preset batch (this round)
 
@@ -170,6 +191,7 @@ Deliberately skipped: PSK/shuffle parrot variants (randomized
 per-connection fields outside the declarative model), pre-2019 Chrome
 versions (no camouflage value).
 
+
 ## Testing & verification (tier-1)
 
 1. Existing per-profile tests keep passing after the cutover.
@@ -185,6 +207,29 @@ versions (no camouflage value).
 
 Tier-2 (`examples/grader.rs`, peet.ws) unchanged; optionally assert
 reported JA4 equals locally computed full JA4.
+
+### rstest fingerprint cases
+
+Fingerprint tests use `rstest` (workspace dep, conventions from
+`xray-tui-native` e2e: `#[case::name(...)]` tables). A dedicated
+`crates/xray-tui-tls/tests/fingerprints.rs` holds a case table of
+`(Device, Os, Browser, Version)` combos with their expected JA4
+(and JA3 where known), so common fingerprints are instantly verifiable:
+
+```rust
+#[rstest]
+#[case::chrome_130_windows(Fingerprint::chrome130_windows(), "t13d1514h2_8daaf6152771_…")]
+#[case::firefox_120_linux(  Fingerprint::firefox120_linux(),   "…")]
+// ...
+fn ja4_matches_expected(#[case] fp: Fingerprint, #[case] expected: &str) { … }
+```
+
+Expected values are sourced by driving the engine against `tls.peet.ws`
+(`/api/all` reports the received ClientHello's JA4) once per profile and
+freezing the result into the table — a self-consistent oracle that needs
+no third-party DB. The catalog cross-check then additionally asserts
+computed JA4s appear in ja4db rows for the claimed identity where such
+rows exist.
 
 ## Risks
 
