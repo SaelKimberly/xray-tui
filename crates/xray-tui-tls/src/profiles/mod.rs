@@ -22,6 +22,290 @@ pub mod opera114;
 pub mod safari;
 pub mod safari16;
 pub mod safari_ios17;
+use crate::spec::{ClientHelloSpec, ExtensionSpec, SessionIdSpec};
+
+/// Assembles a [`ClientHelloSpec`] from the pieces a `spec!` declaration
+/// names. `legacy_version` is fixed at `0x0303` and compression at `[0]` —
+/// both TLS 1.3 invariants (see [`ClientHelloSpec`]).
+#[allow(dead_code)] // consumed by spec! (Task 5) and the equivalence tests below
+pub(crate) fn spec_from_parts(
+    cipher_suites: Vec<u16>,
+    extensions: Vec<ExtensionSpec>,
+    session_id: SessionIdSpec,
+) -> ClientHelloSpec {
+    ClientHelloSpec {
+        legacy_version: 0x0303,
+        cipher_suites,
+        compression_methods: vec![0x00],
+        session_id,
+        extensions,
+    }
+}
+
+/// Decodes the hex body of a `spec!` `raw[ty, "hex"]` token into bytes.
+/// Panics on malformed input — a `spec!` declaration is source code, so a
+/// bad body is a compile-time-adjacent authoring error, surfaced the moment
+/// the profile function runs.
+#[allow(dead_code)] // consumed by spec! (Task 5) and the equivalence tests below
+pub(crate) fn decode_hex(s: &str) -> Vec<u8> {
+    assert_eq!(
+        s.len() % 2,
+        0,
+        "spec! raw body must be even-length hex, got {s:?}"
+    );
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|c| (hex_val(c[0]) << 4) | hex_val(c[1]))
+        .collect()
+}
+
+/// Decodes one hex digit into its value (spec! `raw` bodies).
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => panic!("invalid hex digit {b:#x} in spec! raw body"),
+    }
+}
+
+/// One cipher-suite token: `GREASE` (either case) or a u16 literal.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! cipher_token {
+    (GREASE) => {
+        $crate::spec::grease::GREASE_PLACEHOLDER
+    };
+    (grease) => {
+        $crate::spec::grease::GREASE_PLACEHOLDER
+    };
+    ($lit:literal) => {
+        $lit
+    };
+}
+
+/// A u16 in a plain id-list context (`versions`, `sigalgs`): `grease` or a
+/// u16 literal.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! u16_token {
+    (grease) => {
+        $crate::spec::grease::GREASE_PLACEHOLDER
+    };
+    (GREASE) => {
+        $crate::spec::grease::GREASE_PLACEHOLDER
+    };
+    ($lit:literal) => {
+        $lit
+    };
+}
+
+/// A `groups[...]` entry: u16 literal or a named group id.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! group_token {
+    (grease) => {
+        $crate::spec::grease::GREASE_PLACEHOLDER
+    };
+    (GREASE) => {
+        $crate::spec::grease::GREASE_PLACEHOLDER
+    };
+    (x25519) => {
+        0x001D
+    };
+    (mlkem768) => {
+        0x11EC
+    }; // x25519mlkem768 hybrid
+    (p256) => {
+        0x0017
+    };
+    (p384) => {
+        0x0018
+    };
+    (p521) => {
+        0x0019
+    };
+    ($lit:literal) => {
+        $lit
+    };
+}
+
+/// A `compress[...]` entry: RFC 8879 algorithm name or u16 literal.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! compress_token {
+    (zlib) => {
+        0x0001
+    };
+    (brotli) => {
+        0x0002
+    };
+    (zstd) => {
+        0x0003
+    };
+    ($lit:literal) => {
+        $lit
+    };
+}
+
+/// A `keyshare[...]` entry. `p521` has no [`KeyShareGroup`] variant — the
+/// engine has no P-521 key exchange — so it fails with a clear error rather
+/// than silently mapping to nothing.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! keyshare_token {
+    (grease) => {
+        $crate::spec::KeyShareGroup::Grease
+    };
+    (x25519) => {
+        $crate::spec::KeyShareGroup::X25519
+    };
+    (mlkem768) => {
+        $crate::spec::KeyShareGroup::X25519Mlkem768
+    };
+    (p256) => {
+        $crate::spec::KeyShareGroup::Secp256r1Mlkem768
+    };
+    (p384) => {
+        $crate::spec::KeyShareGroup::Secp384r1Mlkem1024
+    };
+    (p521) => {
+        compile_error!(
+            "spec!: keyshare `p521` has no KeyShareGroup variant \
+             (see spec/mod.rs; the engine has no P-521 key exchange)"
+        )
+    };
+}
+
+/// A `session:` token.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! session_token {
+    (random32) => {
+        $crate::spec::SessionIdSpec::Random32
+    };
+    (empty) => {
+        $crate::spec::SessionIdSpec::Empty
+    };
+}
+
+/// One `exts:` token: a bare unit-variant id or a `name[args]` tuple form.
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! ext_token {
+    (grease) => { $crate::spec::ExtensionSpec::Grease };
+    (sni) => { $crate::spec::ExtensionSpec::ServerName };
+    (reneg) => { $crate::spec::ExtensionSpec::RenegotiationInfo };
+    (ecpf) => { $crate::spec::ExtensionSpec::EcPointFormats };
+    (ticket) => { $crate::spec::ExtensionSpec::SessionTicket };
+    (status) => { $crate::spec::ExtensionSpec::StatusRequest };
+    (sct) => { $crate::spec::ExtensionSpec::SignedCertificateTimestamp };
+    (psk) => { $crate::spec::ExtensionSpec::PskKeyExchangeModes };
+    (padding) => { $crate::spec::ExtensionSpec::Padding };
+    (groups[$($g:tt),*]) => {
+        $crate::spec::ExtensionSpec::SupportedGroups(vec![$(group_token!($g)),*])
+    };
+    (keyshare[$($k:tt),*]) => {
+        $crate::spec::ExtensionSpec::KeyShare(vec![$(keyshare_token!($k)),*])
+    };
+    (versions[$($v:tt),*]) => {
+        $crate::spec::ExtensionSpec::SupportedVersions(vec![$(u16_token!($v)),*])
+    };
+    (sigalgs[$($s:tt),*]) => {
+        $crate::spec::ExtensionSpec::SignatureAlgorithms(vec![$(u16_token!($s)),*])
+    };
+    (compress[$($c:tt),*]) => {
+        $crate::spec::ExtensionSpec::CompressCertificate(vec![$(compress_token!($c)),*])
+    };
+    (alpn[$($p:literal),*]) => {
+        $crate::spec::ExtensionSpec::Alpn(vec![$($p.to_string()),*])
+    };
+    (appsettings[$($p:literal),*]) => {
+        $crate::spec::ExtensionSpec::ApplicationSettings(vec![$($p.to_string()),*])
+    };
+    (rslimit[$n:literal]) => { $crate::spec::ExtensionSpec::RecordSizeLimit($n) };
+    (raw[$ty:literal, $data:literal]) => {
+        $crate::spec::ExtensionSpec::Raw {
+            ty: $ty,
+            data: $crate::profiles::decode_hex($data),
+        }
+    };
+}
+
+/// Declaratively defines a fingerprint profile function.
+///
+/// Expands `name` into `pub(crate) fn name() -> ClientHelloSpec` — the
+/// [`SpecEntry`] shape — with `legacy_version` fixed at `0x0303` and
+/// compression at `[0]` (TLS 1.3 invariants):
+///
+/// ```ignore
+/// spec! {
+///     chrome_gen_137,
+///     ciphers: GREASE, 0x1301, 0x1302, 0x1303, 0xc02b,
+///     session: random32,
+///     exts: grease, sni, groups[grease, x25519, mlkem768],
+///           versions[0x0304, 0x0303], sigalgs[0x0403, 0x0804],
+///           alpn["h2", "http/1.1"], psk, padding
+/// }
+/// ```
+///
+/// # Token grammar
+///
+/// `ciphers:` — u16 literals (decimal or `0x`-hex) or `GREASE` (either
+/// case) for a GREASE slot. A GREASE cipher, when present, must be the
+/// first token (the generator and every Chromium-family profile emit it
+/// first; this is what keeps the list unambiguous for the parser).
+///
+/// `session:` — `random32` | `empty`.
+///
+/// `exts:` — extension tokens in profile order:
+/// - bare ids (unit variants): `grease`, `sni`, `reneg`, `ecpf`,
+///   `ticket`, `status`, `sct`, `psk`, `padding`;
+/// - `groups[..]` — `supported_groups`: u16 literals or named group ids
+///   (`grease`, `x25519`, `mlkem768`, `p256`, `p384`, `p521`);
+/// - `keyshare[..]` — `key_share`: `grease`, `x25519`, `mlkem768`, `p256`,
+///   `p384` (no `p521` — no [`KeyShareGroup`] variant exists);
+/// - `versions[..]`, `sigalgs[..]` — u16 literals or `grease`;
+/// - `alpn[..]`, `appsettings[..]` — string literals;
+/// - `compress[..]` — `zlib` | `brotli` | `zstd` or u16 literals;
+/// - `rslimit[N]` — `record_size_limit`;
+/// - `raw[ty, "hex"]` — arbitrary extension: u16 `ty` and the body as a
+///   hex string (`""` for an empty body).
+///
+/// A trailing comma after the last cipher, the session value, or the last
+/// extension is accepted.
+#[allow(unused_macros)] // consumed by profiles/generated/*.rs (Task 5) and the equivalence tests below
+macro_rules! spec {
+    ($name:ident,
+     ciphers: $first:tt $(, $cipher:literal)*,
+     session: $session:tt,
+     exts: $($ext_tail:tt)*) => {
+        pub(crate) fn $name() -> $crate::spec::ClientHelloSpec {
+            $crate::profiles::spec_from_parts(
+                vec![cipher_token!($first) $(, cipher_token!($cipher))*],
+                spec_exts!($($ext_tail)*),
+                session_token!($session),
+            )
+        }
+    };
+}
+
+/// Splits the `exts:` token tail into `ExtensionSpec`s, in order.
+///
+/// Each item is either a bare unit-variant id (`grease`) or an id with a
+/// bracketed argument group (`groups[0x001d, x25519]`) — two token trees —
+/// so the list is munched one item at a time instead of parsed with a
+/// comma-separated `tt` repetition (which cannot express the optional
+/// trailing group).
+#[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
+macro_rules! spec_exts {
+    () => { Vec::new() };
+    ($ext:tt , $($rest:tt)*) => {{
+        let mut v = vec![ext_token!($ext)];
+        v.extend(spec_exts!($($rest)*));
+        v
+    }};
+    ($ext:tt $args:tt , $($rest:tt)*) => {{
+        let mut v = vec![ext_token!($ext $args)];
+        v.extend(spec_exts!($($rest)*));
+        v
+    }};
+    ($ext:tt) => { vec![ext_token!($ext)] };
+    ($ext:tt $args:tt) => { vec![ext_token!($ext $args)] };
+}
 
 #[cfg(test)]
 mod tests {
@@ -177,7 +461,10 @@ mod tests {
     #[test]
     fn all_spec_names_are_unique_snake_case() {
         let mut seen = Vec::new();
-        for (name, _) in ALL_SPECS {
+        for (name, _) in ALL_SPECS.iter().chain(std::iter::once(&(
+            "chrome_133_macro",
+            super::macro_tests::chrome133_macro as fn() -> ClientHelloSpec,
+        ))) {
             assert!(
                 name.chars()
                     .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
@@ -186,5 +473,35 @@ mod tests {
             assert!(!seen.contains(name), "duplicate profile name {name}");
             seen.push(name);
         }
+    }
+}
+
+/// Rebuilds `chrome133::spec` from declarative `spec!` tokens and asserts
+/// field-for-field equality with the hand-transcribed profile: same cipher
+/// suite order, GREASE slots, extension order, and raw extension bodies.
+#[cfg(test)]
+#[allow(clippy::redundant_pub_crate)] // spec! emits pub(crate) fn; the test module is private
+mod macro_tests {
+    use super::chrome133;
+
+    spec! {
+        chrome133_macro,
+        ciphers: GREASE, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c,
+                 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d,
+                 0x002f, 0x0035,
+        session: random32,
+        exts: grease, sni, raw[0x0017, ""], reneg,
+              groups[grease, mlkem768, x25519, p256, p384],
+              ecpf, ticket, alpn["h2", "http/1.1"], status,
+              sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501,
+                      0x0806, 0x0601],
+              sct, keyshare[grease, mlkem768, x25519], psk,
+              versions[grease, 0x0304, 0x0303], compress[zstd],
+              raw[0x446d, "0003026832"], grease
+    }
+
+    #[test]
+    fn macro_rebuilds_chrome133() {
+        assert_eq!(chrome133_macro(), chrome133::spec());
     }
 }
