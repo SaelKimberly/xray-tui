@@ -223,12 +223,21 @@ Fingerprint tests use `rstest` (workspace dep, conventions from
 fn ja4_matches_expected(#[case] fp: Fingerprint, #[case] expected: &str) { … }
 ```
 
-Expected values are sourced by driving the engine against `tls.peet.ws`
-(`/api/all` reports the received ClientHello's JA4) once per profile and
-freezing the result into the table — a self-consistent oracle that needs
-no third-party DB. The catalog cross-check then additionally asserts
-computed JA4s appear in ja4db rows for the claimed identity where such
-rows exist.
+**Determinism rules** (GREASE is drawn randomly per hello):
+
+- Fixed expected values are **JA4 only** — the JA4 spec mandates
+  GREASE removal before hashing, so full-JA4 is deterministic across
+  runs for every profile.
+- **JA3 is not stable for GREASE-carrying profiles** (Chrome/Edge/Brave/
+  Opera families): classic JA3 hashes the wire bytes including GREASE.
+  Where a case pins JA3, the fixture must use one of:
+  (a) a seeded `FixedRandom`-style RNG exactly like the existing
+  golden-hello tests (byte-reproducible hello ⇒ byte-reproducible JA3),
+  or (b) a documented `ja3_grease_stripped()` variant that removes
+  GREASE ids before encoding (deterministic, but *not* the on-wire JA3 —
+  named accordingly so nobody mistakes it for classic JA3).
+- GREASE-free profiles (Firefox/Safari families) may pin plain JA3
+  directly.
 
 ## Risks
 
