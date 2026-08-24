@@ -4,6 +4,7 @@
 //! including JA3 fingerprinting, TLS record and handshake handling, certificate
 //! verification, and REALITY protocol integration.
 
+pub mod fingerprints;
 pub mod profiles;
 pub mod spec;
 pub use profiles::BrowserProfile;

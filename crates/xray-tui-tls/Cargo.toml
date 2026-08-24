@@ -25,6 +25,8 @@ md-5 = "0.11"
 sha2 = "0.10"
 # JSON parsing for the tls.peet.ws grader (example + ignored network test)
 serde_json.workspace = true
+# Fingerprint selection persistence (TUI settings)
+serde = { version = "1", features = ["derive"] }
 # errors
 thiserror.workspace = true
 # ML-KEM (Kyber768) via liboqs (vendored build - no system dep required)
