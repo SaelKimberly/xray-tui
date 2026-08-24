@@ -144,9 +144,9 @@ macro_rules! compress_token {
     };
 }
 
-/// A `keyshare[...]` entry. `p521` has no [`KeyShareGroup`] variant — the
-/// engine has no P-521 key exchange — so it fails with a clear error rather
-/// than silently mapping to nothing.
+/// A `keyshare[...]` entry. The P-curve hybrids are rejected at compile
+/// time: the wire encoder hard-fails on Secp256r1Mlkem768/Secp384r1Mlkem1024
+/// (`TlsError::Spec`, spec/mod.rs) and there is no P-521 variant at all.
 #[allow(unused_macros)] // consumed by spec! (Task 5) and the equivalence tests below
 macro_rules! keyshare_token {
     (grease) => {
@@ -159,15 +159,21 @@ macro_rules! keyshare_token {
         $crate::spec::KeyShareGroup::X25519Mlkem768
     };
     (p256) => {
-        $crate::spec::KeyShareGroup::Secp256r1Mlkem768
+        compile_error!(
+            "spec!: keyshare `p256` is rejected: the engine implements no \
+             P-256 key exchange (see spec/mod.rs)"
+        )
     };
     (p384) => {
-        $crate::spec::KeyShareGroup::Secp384r1Mlkem1024
+        compile_error!(
+            "spec!: keyshare `p384` is rejected: the engine implements no \
+             P-384 key exchange (see spec/mod.rs)"
+        )
     };
     (p521) => {
         compile_error!(
-            "spec!: keyshare `p521` has no KeyShareGroup variant \
-             (see spec/mod.rs; the engine has no P-521 key exchange)"
+            "spec!: keyshare `p521` has no KeyShareGroup variant (see \
+             spec/mod.rs; the engine implements no P-521 key exchange)"
         )
     };
 }
@@ -228,7 +234,7 @@ macro_rules! ext_token {
 /// Declaratively defines a fingerprint profile function.
 ///
 /// Expands `name` into `pub(crate) fn name() -> ClientHelloSpec` — the
-/// [`SpecEntry`] shape — with `legacy_version` fixed at `0x0303` and
+/// `SpecEntry` shape — with `legacy_version` fixed at `0x0303` and
 /// compression at `[0]` (TLS 1.3 invariants):
 ///
 /// ```ignore
@@ -256,8 +262,10 @@ macro_rules! ext_token {
 ///   `ticket`, `status`, `sct`, `psk`, `padding`;
 /// - `groups[..]` — `supported_groups`: u16 literals or named group ids
 ///   (`grease`, `x25519`, `mlkem768`, `p256`, `p384`, `p521`);
-/// - `keyshare[..]` — `key_share`: `grease`, `x25519`, `mlkem768`, `p256`,
-///   `p384` (no `p521` — no [`KeyShareGroup`] variant exists);
+/// - `keyshare[..]` — `key_share`: `grease`, `x25519`, `mlkem768` only;
+///   the P-curve hybrids `p256`/`p384`/`p521` are rejected (the engine has
+///   no P-256/P-384/P-521 key exchange, so those specs would fail at
+///   hello-build time);
 /// - `versions[..]`, `sigalgs[..]` — u16 literals or `grease`;
 /// - `alpn[..]`, `appsettings[..]` — string literals;
 /// - `compress[..]` — `zlib` | `brotli` | `zstd` or u16 literals;
@@ -265,8 +273,9 @@ macro_rules! ext_token {
 /// - `raw[ty, "hex"]` — arbitrary extension: u16 `ty` and the body as a
 ///   hex string (`""` for an empty body).
 ///
-/// A trailing comma after the last cipher, the session value, or the last
-/// extension is accepted.
+/// A comma must follow the last cipher and the session value (they separate
+/// the three sections); a trailing comma after the last extension is
+/// optional.
 #[allow(unused_macros)] // consumed by profiles/generated/*.rs (Task 5) and the equivalence tests below
 macro_rules! spec {
     ($name:ident,
@@ -363,25 +372,6 @@ mod tests {
         }
     }
 
-    /// Decodes a hex digit into its value (test helper).
-    fn hex_val(b: u8) -> u8 {
-        match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => panic!("invalid hex digit: {b:#x}"),
-        }
-    }
-
-    /// Decodes a hex string into bytes (test helper).
-    fn decode_hex(s: &str) -> Vec<u8> {
-        assert_eq!(s.len() % 2, 0, "hex string must have even length");
-        s.as_bytes()
-            .chunks_exact(2)
-            .map(|c| (hex_val(c[0]) << 4) | hex_val(c[1]))
-            .collect()
-    }
-
     #[test]
     fn all_profiles_build_and_parse() {
         let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
@@ -455,7 +445,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(hello.handshake_bytes, decode_hex(EXPECTED_FF128_HELLO_HEX));
+        assert_eq!(
+            hello.handshake_bytes,
+            super::decode_hex(EXPECTED_FF128_HELLO_HEX)
+        );
     }
 
     #[test]
@@ -503,5 +496,71 @@ mod macro_tests {
     #[test]
     fn macro_rebuilds_chrome133() {
         assert_eq!(chrome133_macro(), chrome133::spec());
+    }
+
+    spec! {
+        kitchen_sink,
+        ciphers: GREASE, 0x1301, 0x1302, 0xc02b,
+        session: empty,
+        exts: padding, reneg, ecpf, status, sct,
+              groups[grease, x25519, mlkem768, p256, p384, p521, 0x001a],
+              versions[grease, 0x0304, 0x0303],
+              sigalgs[grease, 0x0403, 0x0804],
+              alpn["h2", "http/1.1"],
+              appsettings["h2"],
+              compress[zlib, brotli, zstd, 0x0002],
+              rslimit[16385],
+              keyshare[grease, x25519, mlkem768],
+              raw[0x446d, "0003026832"], psk
+    }
+
+    /// Exercises every `spec!` token form not covered by the chrome133
+    /// equivalence test: `session: empty`, `padding`, `appsettings`,
+    /// `rslimit`, `compress` names + literal, `grease` inside `sigalgs`,
+    /// named group ids incl. the P-curve ids, and a trailing comma.
+    #[test]
+    fn kitchen_sink_macro_arms() {
+        use crate::spec::grease::GREASE_PLACEHOLDER;
+        use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
+
+        let expected = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![GREASE_PLACEHOLDER, 0x1301, 0x1302, 0xc02b],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Empty,
+            extensions: vec![
+                ExtensionSpec::Padding,
+                ExtensionSpec::RenegotiationInfo,
+                ExtensionSpec::EcPointFormats,
+                ExtensionSpec::StatusRequest,
+                ExtensionSpec::SignedCertificateTimestamp,
+                ExtensionSpec::SupportedGroups(vec![
+                    GREASE_PLACEHOLDER,
+                    0x001D,
+                    0x11EC,
+                    0x0017,
+                    0x0018,
+                    0x0019,
+                    0x001a,
+                ]),
+                ExtensionSpec::SupportedVersions(vec![GREASE_PLACEHOLDER, 0x0304, 0x0303]),
+                ExtensionSpec::SignatureAlgorithms(vec![GREASE_PLACEHOLDER, 0x0403, 0x0804]),
+                ExtensionSpec::Alpn(vec!["h2".into(), "http/1.1".into()]),
+                ExtensionSpec::ApplicationSettings(vec!["h2".into()]),
+                ExtensionSpec::CompressCertificate(vec![0x0001, 0x0002, 0x0003, 0x0002]),
+                ExtensionSpec::RecordSizeLimit(16385),
+                ExtensionSpec::KeyShare(vec![
+                    KeyShareGroup::Grease,
+                    KeyShareGroup::X25519,
+                    KeyShareGroup::X25519Mlkem768,
+                ]),
+                ExtensionSpec::Raw {
+                    ty: 0x446D,
+                    data: vec![0x00, 0x03, 0x02, 0x68, 0x32],
+                },
+                ExtensionSpec::PskKeyExchangeModes,
+            ],
+        };
+        assert_eq!(kitchen_sink(), expected);
     }
 }
