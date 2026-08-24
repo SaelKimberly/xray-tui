@@ -59,6 +59,7 @@ import hashlib
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 
 # --- parsing -----------------------------------------------------------------
@@ -246,6 +247,297 @@ def parse_application(application):
     return name, int(m.group(2)) if m.group(2) else 0, "", 0, ""
 
 
+# --- family templates: wire synthesis -----------------------------------------
+#
+# Ground truth: crates/xray-tui-tls/src/profiles/*.rs (17 hand-written specs).
+# Each template records a family's canonical wire shape; per-entry synthesis
+# filters the canonical sequences down to the observed id sets:
+#   - ciphers: canonical order filtered to the row's set, leftovers ascending;
+#   - extensions: canonical order filtered to the row's ids, unknown ids
+#     appended ascending as `Raw {ty, data: []}` (entry flagged low-fidelity);
+#   - signature algorithms: copied verbatim from the observation when the raw
+#     string carried them, otherwise the family canonical list (low-fidelity);
+#   - supported_versions: always [0x0304, 0x0303] (engine is TLS-1.3-only);
+#   - key_share: family canonical groups; the X25519MLKEM768 hybrid entry
+#     appears only where the family's canonical group list advertises 4588.
+# The ja4db string export omits the SNI (0000) and ALPN (0010) extension ids
+# and never carries GREASE values, so ServerName is always added and Alpn
+# whenever the A-part letter is not `00`; a GREASE slot is emitted (at the
+# family's canonical position) only if an observed id is GREASE-shaped.
+
+GREASE_CIPHER_PLACEHOLDER = 0xCACA  # profiles' GREASE cipher slot
+
+
+def _template(ciphers, ext_order, groups, key_share, sig_algos,
+              compress_cert=(), session_id="random32"):
+    return {
+        "ciphers": ciphers, "ext_order": ext_order, "groups": groups,
+        "key_share": key_share, "sig_algos": sig_algos,
+        "compress_cert": list(compress_cert), "session_id": session_id,
+    }
+
+
+_CHROME_CIPHERS = [
+    0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8,
+    0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
+]
+_CHROME_SIG = [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601]
+# Extension type constants (spec/mod.rs construction sites).
+EMS = 0x0017           # extended_master_secret -> Raw (no dedicated variant)
+RENEG = 0xFF01
+GROUPS = 0x000A
+ECPF = 0x000B
+TICKET = 0x0023
+SIGALGS = 0x000D
+SCT = 0x0012
+KEYSHARE = 0x002D
+PSK_MODES = 0x0033
+VERSIONS = 0x002B
+COMPRESS_CERT = 0x001B
+ALPS_OLD = 0x4469      # ApplicationSettings draft form
+ALPS_NEW = 0x44CD      # ALPS u8-length form (engine emits it via Raw)
+ECH_GREASE = 0xFE0D    # ECH GREASE outer; emitted as empty Raw (see
+                       # chrome133.rs: a valid ECH outer is not emittable)
+RECORD_SIZE_LIMIT = 0x001C
+STATUS_REQ = 0x0005
+
+# chrome133.rs order: GREASE first, sig algs ahead of SCT, ALPS/ECH near end,
+# padding last. `"grease"` marks the standalone-GREASE slot position.
+_CHROME_EXT_ORDER = [
+    "grease", SNI, EMS, RENEG, GROUPS, ECPF, TICKET, ALPN, STATUS_REQ,
+    SIGALGS, SCT, KEYSHARE, PSK_MODES, VERSIONS, COMPRESS_CERT, ALPS_OLD,
+    ALPS_NEW, ECH_GREASE, PADDING,
+]
+_CHROME_ANDROID_EXT_ORDER = [
+    "grease", SNI, EMS, RENEG, GROUPS, ECPF, TICKET, ALPN, STATUS_REQ,
+    SCT, KEYSHARE, PSK_MODES, VERSIONS, SIGALGS,
+]
+_FIREFOX_EXT_ORDER = [
+    SNI, EMS, RENEG, GROUPS, ECPF, TICKET, ALPN, STATUS_REQ, KEYSHARE,
+    VERSIONS, SIGALGS, PSK_MODES, COMPRESS_CERT, PADDING,
+]
+_SAFARI_EXT_ORDER = [
+    SNI, EMS, RENEG, GROUPS, ECPF, ALPN, STATUS_REQ, SCT, KEYSHARE,
+    VERSIONS, PSK_MODES, SIGALGS,
+]
+_SAFARI_IOS_EXT_ORDER = [
+    SNI, EMS, RENEG, GROUPS, ALPN, STATUS_REQ, KEYSHARE, VERSIONS,
+    PSK_MODES, SIGALGS,
+]
+_OKHTTP_EXT_ORDER = [SNI, EMS, RENEG, GROUPS, ECPF, STATUS_REQ, SIGALGS]
+
+FAMILY_TEMPLATES = {
+    # chrome.rs/chrome133.rs: modern desktop Chromium (incl. Edge/Opera/Brave).
+    "chrome_desktop": _template(
+        _CHROME_CIPHERS, _CHROME_EXT_ORDER,
+        [0x11EC, 0x001D, 0x0017, 0x0018],
+        ["X25519Mlkem768", "X25519"], _CHROME_SIG, [0x0002, 0x0003]),
+    # chrome_android130.rs: no ALPS/compress_certificate/padding; SHA-1 sig.
+    "chrome_android": _template(
+        _CHROME_CIPHERS, _CHROME_ANDROID_EXT_ORDER,
+        [0x001D, 0x0017, 0x0018], ["X25519"], _CHROME_SIG + [0x0201]),
+    # firefox.rs: no GREASE, distinct ordering, zlib-only compress_certificate.
+    "firefox": _template(
+        [0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9,
+         0xCCA8, 0xC013, 0xC014, 0x002F, 0x0035],
+        _FIREFOX_EXT_ORDER,
+        [0x001D, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101],
+        ["X25519"],
+        [0x0403, 0x0503, 0x0603, 0x0807, 0x0808, 0x0804, 0x0805, 0x0806,
+         0x0401, 0x0501, 0x0601, 0x0201, 0x0203],
+        [0x0002]),
+    # safari.rs: EMPTY session id, no session_ticket/compress_certificate.
+    "safari": _template(
+        [0x1301, 0x1302, 0x1303, 0xC02C, 0xC02B, 0xC030, 0xC02F, 0xCCA9,
+         0xCCA8, 0xC024, 0xC023, 0xC028, 0xC027, 0xC00A, 0xC009, 0xC014,
+         0xC013, 0x009D, 0x009C, 0x003D, 0x003C, 0x0035, 0x002F, 0x000A],
+        _SAFARI_EXT_ORDER, [0x001D, 0x0017, 0x0018, 0x0019],
+        ["X25519"],
+        [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
+         0x0601, 0x0201, 0x0203],
+        session_id="empty"),
+    # safari_ios17.rs: additionally no ec_point_formats/SCT/3DES/secp521r1.
+    "safari_ios": _template(
+        [0x1301, 0x1302, 0x1303, 0xC02C, 0xC02B, 0xC030, 0xC02F, 0xCCA9,
+         0xCCA8, 0xC024, 0xC023, 0xC028, 0xC027, 0xC00A, 0xC009, 0xC014,
+         0xC013, 0x009D, 0x009C, 0x003D, 0x003C, 0x0035, 0x002F],
+        _SAFARI_IOS_EXT_ORDER, [0x001D, 0x0017, 0x0018], ["X25519"],
+        [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
+         0x0601, 0x0201, 0x0203],
+        session_id="empty"),
+    # android11_okhttp.rs: Chromium-derived minimal preset.
+    "okhttp": _template(
+        [0xC02B, 0xC02C, 0xCCA9, 0xC02F, 0xC030, 0xCCA8, 0xC013, 0xC014,
+         0x009C, 0x009D, 0x002F, 0x0035],
+        _OKHTTP_EXT_ORDER, [0x001D, 0x0017, 0x0018], ["X25519"], _CHROME_SIG),
+}
+
+# Fallback (`ascending`) template: minimal standard contents, everything in
+# ascending id order. Used only when no family template applies.
+_FALLBACK = _template(
+    [], [], [0x001D, 0x0017, 0x0018], ["X25519"], _CHROME_SIG, [0x0002])
+
+
+
+def template_for(entry):
+    """Pick the family template. OS decides before browser where WebKit
+    reality dictates shape: everything on iOS is Safari-shaped (WKWebView),
+    Firefox keeps its own shape on Android (never trust `device`, which
+    mislabels Android phones as desktop)."""
+    browser, os_name = entry["family"], entry["os"]
+    if os_name == "ios":
+        return "safari_ios"
+    if browser == "firefox":
+        return "firefox"
+    if os_name == "android" and browser != "safari":
+        return "chrome_android"
+    if browser == "safari":
+        return "safari"
+    if browser in ("chrome", "edge", "opera", "brave", "samsung"):
+        return "chrome_desktop"
+    return None
+
+
+def _alpn_protocols(letter):
+    """A-part ALPN letter -> offered protocol list."""
+    if letter == "h2":
+        return ["h2", "http/1.1"]
+    if letter == "00":
+        return []
+    return ["http/1.1"]
+
+
+def _alps_new_body(protocols):
+    """uTLS new-codepoint ALPS body: u16 total len, then u8 len + bytes
+    per protocol (chrome133.rs `Raw { ty: 0x446D, .. }` shape)."""
+    entries = [bytes([len(p)]) + p.encode() for p in protocols]
+    body = b"".join(entries)
+    return list(len(body).to_bytes(2, "big")) + list(body)
+
+
+def build_extension(ty, tmpl, protocols, sig_algos):
+    """One extension id -> its `{ty, kind, args}` manifest object."""
+    if ty == SNI:
+        return {"ty": ty, "kind": "ServerName"}
+    if ty == STATUS_REQ:
+        return {"ty": ty, "kind": "StatusRequest"}
+    if ty == GROUPS:
+        return {"ty": ty, "kind": "SupportedGroups",
+                "args": [list(tmpl["groups"])]}
+    if ty == ECPF:
+        return {"ty": ty, "kind": "EcPointFormats"}
+    if ty == SIGALGS:
+        return {"ty": ty, "kind": "SignatureAlgorithms", "args": [sig_algos]}
+    if ty == ALPN:
+        return {"ty": ty, "kind": "Alpn", "args": [protocols]}
+    if ty == PADDING:
+        return {"ty": ty, "kind": "Padding"}
+    if ty == TICKET:
+        return {"ty": ty, "kind": "SessionTicket"}
+    if ty == KEYSHARE:
+        return {"ty": ty, "kind": "KeyShare", "args": [list(tmpl["key_share"])]}
+    if ty == VERSIONS:
+        return {"ty": ty, "kind": "SupportedVersions",
+                "args": [[0x0304, 0x0303]]}
+    if ty == PSK_MODES:
+        return {"ty": ty, "kind": "PskKeyExchangeModes"}
+    if ty == SCT:
+        return {"ty": ty, "kind": "SignedCertificateTimestamp"}
+    if ty == RENEG:
+        return {"ty": ty, "kind": "RenegotiationInfo"}
+    if ty == COMPRESS_CERT:
+        return {"ty": ty, "kind": "CompressCertificate",
+                "args": [list(tmpl["compress_cert"])]}
+    if ty == RECORD_SIZE_LIMIT:
+        return {"ty": ty, "kind": "RecordSizeLimit", "args": [16385]}
+    if ty == ALPS_OLD:
+        return {"ty": ty, "kind": "ApplicationSettings", "args": [protocols]}
+    if ty == ALPS_NEW:
+        return {"ty": ty, "kind": "Raw", "args": [_alps_new_body(protocols)]}
+    if ty == EMS:  # extended_master_secret
+        return {"ty": ty, "kind": "Raw", "args": [[]]}
+    return {"ty": ty, "kind": "Raw", "args": [[]]}
+
+
+def synthesize_wire(entry):
+    """`(wire, template_name, low_fidelity)` for one manifest entry."""
+    rc = entry["raw"]
+    tname = template_for(entry)
+    tmpl = FAMILY_TEMPLATES.get(tname) if tname else None
+    if tmpl is None:
+        tname, tmpl = "ascending", _FALLBACK
+
+    # Ciphers: canonical order filtered to the row's multiset (some corpus
+    # rows carry a duplicated suite id), leftovers ascending.
+    grease_ciphers = [c for c in rc.ciphers if is_grease(c)]
+    row_counts = Counter(c for c in rc.ciphers if not is_grease(c))
+    ordered: list[int] = []
+    for c in tmpl["ciphers"]:
+        if row_counts.get(c, 0):
+            ordered.append(c)
+            row_counts[c] -= 1
+    cipher_order = ([GREASE_CIPHER_PLACEHOLDER] * bool(grease_ciphers) +
+                    ordered + sorted(row_counts.elements()))
+    # Extensions. The raw-string export omits SNI/ALPN ids; reconstruct the
+    # real offered set before filtering against the canonical order.
+    protocols = _alpn_protocols(rc.alpn_first)
+    offered = set(rc.exts_sorted) | {SNI}
+    if protocols:
+        offered.add(ALPN)
+    grease_ids = {t for t in offered if is_grease(t)}
+    offered -= grease_ids
+    sig_algos = list(rc.sigalgs_ordered) or list(tmpl["sig_algos"])
+    low_fidelity = not rc.sigalgs_ordered
+
+    extensions = []
+    placed = set()
+    for slot in tmpl["ext_order"]:
+        if slot == "grease":
+            if grease_ids:
+                extensions.append({"kind": "Grease"})
+            continue
+        if slot in offered:
+            extensions.append(build_extension(slot, tmpl, protocols, sig_algos))
+            placed.add(slot)
+    for ty in sorted(offered - placed):  # ids outside the canonical order
+        ext = build_extension(ty, tmpl, protocols, sig_algos)
+        extensions.append(ext)
+        # Deliberate Raw forms (extended_master_secret, new-codepoint ALPS)
+        # carry real bodies; anything else falling through to an empty Raw
+        # is a genuine approximation.
+        if ext["kind"] == "Raw" and ty not in (EMS, ALPS_NEW):
+            low_fidelity = True
+
+    wire = {
+        "cipher_order": cipher_order,
+        "extensions": extensions,
+        "session_id": tmpl["session_id"],
+        "compression": [0],
+    }
+    return wire, tname, low_fidelity
+
+
+def verify_wire(entry):
+    """Reconstruct the JA4 inputs from a synthesized `wire` block and check
+    them against the recorded fingerprint. Returns `(a_part_ok, full_ok)`
+    where `full_ok` is None when the reconstruction cannot be expected to
+    reproduce hash2 (row carried no signature-algorithm segment)."""
+    rc, wire = entry["raw"], entry["wire"]
+    ciphers = [c for c in wire["cipher_order"] if not is_grease(c)]
+    ext_tys = [x["ty"] for x in wire["extensions"]
+               if x.get("ty") is not None and not is_grease(x["ty"])]
+    sig = next((a for x in wire["extensions"]
+                if x["kind"] == "SignatureAlgorithms" for a in x["args"]), [])
+    letter = "h2" if rc.alpn_first == "h2" else \
+        ("00" if rc.alpn_first == "00" else "ht")
+    a_ok = format_ja4_a(len(ciphers), len(ext_tys), letter) == rc.ja4_a
+    if not entry["raw"].sigalgs_ordered:
+        return a_ok, None
+    recon = RawComponents(rc.ja4_a, ciphers,
+                          sorted(set(ext_tys) - {SNI, ALPN}), sig, letter)
+    return a_ok, ja4_hash(recon) == entry["ja4"]
+
+
 # --- manifest build ------------------------------------------------------------
 
 MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -352,6 +644,14 @@ def build_manifest(csv_dir: str) -> dict:
         used[base] = seen + 1
         e["name"] = base if seen == 0 else f"{base}_{seen + 1}"
 
+    # Wire synthesis: per-entry family template + low-fidelity flag.
+    for e in winners:
+        wire, tname, low_fi = synthesize_wire(e)
+        e["wire"] = wire
+        e["wire_template"] = tname
+        e["low_fidelity"] = low_fi
+        e["fallback"] = tname == "ascending"
+
     stats = {
         "rows_in": rows_in,
         "kept": len(winners),
@@ -376,6 +676,7 @@ def _manifest_entry_json(e: dict) -> dict:
         },
         "family": e["family"], "observation_count": e["observation_count"],
         "verified": e["verified"], "fallback": e["fallback"],
+        "wire": e["wire"], "low_fidelity": e["low_fidelity"],
     }
 
 def _write_manifest(csv_dir: str) -> int:
@@ -498,6 +799,44 @@ def _selftest() -> int:
     assert row_rate >= 0.99, f"row match rate {row_rate:.4%} < 99%"
     assert obs_rate >= 0.988, f"observation-weighted rate {obs_rate:.4%} < 98.8%"
     assert d_rate >= 0.899, f"distinct-string rate {d_rate:.4%} < 89.9%"
+    # Task 3: family-template wire synthesis round-trip. Every entry's
+    # synthesized wire must reproduce the A-part exactly and the full JA4
+    # wherever the observation carried its signature algorithms.
+    VALID_KINDS = {
+        "ServerName", "SupportedGroups", "KeyShare", "SupportedVersions",
+        "SignatureAlgorithms", "Alpn", "EcPointFormats", "SessionTicket",
+        "PskKeyExchangeModes", "StatusRequest", "SignedCertificateTimestamp",
+        "RenegotiationInfo", "CompressCertificate", "ApplicationSettings",
+        "RecordSizeLimit", "Padding", "Grease", "Raw",
+    }
+    man = build_manifest(csv_dir)
+    tmpl_dist: dict[str, int] = {}
+    a_bad = full_bad = full_skipped = n_fallback = n_lowfi = 0
+    for e in man["entries"]:
+        w = e["wire"]
+        assert all(x["kind"] in VALID_KINDS for x in w["extensions"])
+        assert w["compression"] == [0]
+        assert w["session_id"] in ("random32", "empty")
+        cs = [c for c in w["cipher_order"] if not is_grease(c)]
+        assert sorted(cs) == sorted(c for c in e["raw"].ciphers
+                                    if not is_grease(c)), e["name"]
+        a_ok, full_ok = verify_wire(e)
+        if not a_ok:
+            a_bad += 1
+            print(f"A-PART MISMATCH: {e['name']}")
+        if full_ok is None:
+            full_skipped += 1
+        elif not full_ok:
+            full_bad += 1
+            print(f"JA4 MISMATCH: {e['name']}")
+        tmpl_dist[e["wire_template"]] = tmpl_dist.get(e["wire_template"], 0) + 1
+        n_fallback += e["fallback"]
+        n_lowfi += e["low_fidelity"]
+    print(f"wire templates: {len(man['entries'])} entries -> {tmpl_dist}")
+    print(f"wire fallback: {n_fallback}  low-fidelity: {n_lowfi}  "
+          f"full-hash unverifiable (no sig-alg segment): {full_skipped}")
+    assert a_bad == 0, f"{a_bad} entries fail A-part reconstruction"
+    assert full_bad == 0, f"{full_bad} entries fail full-JA4 reconstruction"
     print("PASS")
     return 0
 
