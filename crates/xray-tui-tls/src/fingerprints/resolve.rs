@@ -23,8 +23,8 @@ pub(crate) struct Row {
 }
 
 use crate::profiles::{
-    brave167, chrome, chrome_android130, chrome119, chrome133, edge, firefox128esr, opera114,
-    safari, safari_ios17,
+    brave167, chrome, chrome119, chrome133, chrome_android130, edge, edge106, firefox120,
+    firefox128esr, opera114, safari, safari16, safari_ios17,
 };
 
 /// Ordered ascending by `max_version` within each `(browser, os, device)`.
@@ -62,6 +62,14 @@ pub(crate) static TABLE: &[Row] = &[
         spec: chrome_android130::spec,
     },
     Row {
+        name: "edge_106",
+        browser: Browser::Edge,
+        os: None,
+        device: Device::Desktop,
+        max_version: 106,
+        spec: edge106::spec,
+    },
+    Row {
         name: "edge_130",
         browser: Browser::Edge,
         os: None,
@@ -86,12 +94,28 @@ pub(crate) static TABLE: &[Row] = &[
         spec: opera114::spec,
     },
     Row {
+        name: "firefox_120",
+        browser: Browser::Firefox,
+        os: None,
+        device: Device::Desktop,
+        max_version: 120,
+        spec: firefox120::spec,
+    },
+    Row {
         name: "firefox_128_esr",
         browser: Browser::Firefox,
         os: None,
         device: Device::Desktop,
         max_version: 128,
         spec: firefox128esr::spec,
+    },
+    Row {
+        name: "safari_16",
+        browser: Browser::Safari,
+        os: Some(Os::MacOs),
+        device: Device::Desktop,
+        max_version: 16,
+        spec: safari16::spec,
     },
     Row {
         name: "safari_17",
@@ -109,8 +133,8 @@ pub(crate) static TABLE: &[Row] = &[
         max_version: 17,
         spec: safari_ios17::spec,
     },
-    // Tasks 7/8 append: safari_16 (15), firefox_120 (120), edge_106 (106),
-    // ios_14, android_11_okhttp — keeping per-browser ascending order.
+    // Task 8 appends: ios_14, android_11_okhttp — keeping per-browser
+    // ascending order.
 ];
 
 impl Row {
@@ -186,7 +210,11 @@ impl Fingerprint {
                             .max_by_key(|r| r.max_version)
                             .is_some()
                 });
-                if covered { covering } else { None }
+                if covered {
+                    covering
+                } else {
+                    None
+                }
             },
         );
         let Some(row) = chosen else {
@@ -357,6 +385,23 @@ mod tests {
         for entry in TABLE {
             let _ = (entry.spec)();
         }
+    }
+    #[test]
+    fn firefox_120_query_hits_firefox_120_row() {
+        let r = Fingerprint::new(Browser::Firefox)
+            .with_version(120)
+            .resolve()
+            .unwrap();
+        assert_eq!(r.name, "firefox_120");
+    }
+
+    #[test]
+    fn safari_16_query_hits_safari_16_row() {
+        let r = Fingerprint::new(Browser::Safari)
+            .with_version(16)
+            .resolve()
+            .unwrap();
+        assert_eq!(r.name, "safari_16");
     }
 
     #[test]

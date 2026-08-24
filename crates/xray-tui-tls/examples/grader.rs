@@ -45,9 +45,9 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
-use xray_tui_tls::handshake::{HandshakeParams, connect};
+use xray_tui_tls::handshake::{connect, HandshakeParams};
 use xray_tui_tls::hello::parse::parse_hello;
-use xray_tui_tls::hello::{BuildParams, build_hello};
+use xray_tui_tls::hello::{build_hello, BuildParams};
 use xray_tui_tls::http2;
 use xray_tui_tls::profiles::BrowserProfile;
 use xray_tui_tls::verify::WebPkiVerifier;
@@ -93,8 +93,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Profiles the grader can grade (all others are rejected at the CLI).
-const GRADED_PROFILES: &[BrowserProfile] =
-    &[BrowserProfile::Chrome130, BrowserProfile::Firefox128Esr];
+const GRADED_PROFILES: &[BrowserProfile] = &[
+    BrowserProfile::Chrome130,
+    BrowserProfile::Firefox128Esr,
+    BrowserProfile::Safari16,
+    BrowserProfile::Firefox120,
+    BrowserProfile::Edge106,
+];
 
 /// Parses `--profile <name>` (repeatable); defaults to both graded
 /// profiles. Only [`GRADED_PROFILES`] are accepted — any other profile
@@ -225,11 +230,16 @@ async fn grade(profile: BrowserProfile) -> Result<(), Box<dyn Error>> {
         "server JA4 != local JA4 v2 — wire or algorithm divergence"
     );
     let expected_ja4 = match profile {
-        BrowserProfile::Chrome130 => CHROME130_JA4,
-        BrowserProfile::Firefox128Esr => FIREFOX128ESR_JA4,
-        _ => unreachable!("grader only grades Chrome130/Firefox128Esr"),
+        BrowserProfile::Chrome130 => Some(CHROME130_JA4),
+        BrowserProfile::Firefox128Esr => Some(FIREFOX128ESR_JA4),
+        // Task 7 desktop batch (safari_16/firefox_120/edge_106): no
+        // frozen constants yet — Task 10 locks them from this grader's
+        // captured JA4 strings.
+        _ => None,
     };
-    assert_eq!(server_ja4, expected_ja4, "server JA4 != locked constant");
+    if let Some(expected_ja4) = expected_ja4 {
+        assert_eq!(server_ja4, expected_ja4, "server JA4 != locked constant");
+    }
 
     // JA3: tls.peet.ws strips GREASE from its canonical string before
     // hashing (unlike the classic spec). Assert its hash equals the md5 of
@@ -266,9 +276,9 @@ mod local {
     use md5::{Digest, Md5};
     use ring::digest;
 
-    use xray_tui_tls::SecureRandom;
     use xray_tui_tls::hello::parse::ParsedClientHello;
     use xray_tui_tls::spec::grease::is_grease;
+    use xray_tui_tls::SecureRandom;
 
     /// Deterministic RNG (all `0x42`) mirroring the crate's test double.
     pub struct FixedRandom {
