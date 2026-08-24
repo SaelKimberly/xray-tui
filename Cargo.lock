@@ -7921,6 +7921,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-webpki",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
  "webpki-roots",

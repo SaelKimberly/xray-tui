@@ -39,6 +39,90 @@ impl From<&ParsedClientHello> for Ja3Fields {
     }
 }
 
+/// Wire codepoint of an `ExtensionSpec` (single source of truth for
+/// `from_spec`; GREASE renders as the canonical 0x0A0A sentinel id).
+const fn extension_codepoint(ext: &crate::spec::ExtensionSpec) -> u16 {
+    use crate::spec::ExtensionSpec as E;
+    match ext {
+        E::ServerName => 0x0000,
+        E::SupportedGroups(_) => 0x000A,
+        E::KeyShare(_) => 0x0033,
+        E::SupportedVersions(_) => 0x002B,
+        E::SignatureAlgorithms(_) => 0x000D,
+        E::Alpn(_) => 0x0010,
+        E::EcPointFormats => 0x000B,
+        E::SessionTicket => 0x0023,
+        E::PskKeyExchangeModes => 0x002D,
+        E::StatusRequest => 0x0005,
+        E::SignedCertificateTimestamp => 0x0012,
+        E::RenegotiationInfo => 0xFF01,
+        E::CompressCertificate(_) => 0x001B,
+        E::ApplicationSettings(_) => 0x4469,
+        E::RecordSizeLimit(_) => 0x001C,
+        E::Padding => 0x0015,
+        E::Grease => 0x0A0A,
+        E::Raw { ty, .. } => *ty,
+    }
+}
+
+impl Ja3Fields {
+    /// Extracts JA3/JA4 fields from a semantic [`ClientHelloSpec`] without
+    /// building wire bytes. GREASE slots appear verbatim as 0x0A0A
+    /// sentinels (callers decide whether to strip — JA4 always does,
+    /// classic JA3 never does).
+    #[must_use]
+    pub fn from_spec(spec: &crate::spec::ClientHelloSpec) -> Self {
+        use crate::spec::ExtensionSpec as E;
+        let mut out = Self {
+            version: spec.legacy_version,
+            ciphers: spec.cipher_suites.clone(),
+            extensions: spec.extensions.iter().map(extension_codepoint).collect(),
+            curves: Vec::new(),
+            point_formats: Vec::new(),
+            signature_algorithms: Vec::new(),
+            alpn: Vec::new(),
+        };
+        for ext in &spec.extensions {
+            match ext {
+                E::SupportedGroups(g) => out.curves.clone_from(g),
+                E::SignatureAlgorithms(s) => out.signature_algorithms.clone_from(s),
+                E::Alpn(p) => out.alpn.clone_from(p),
+                E::EcPointFormats => out.point_formats = vec![0],
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// Canonical JA3 string over GREASE-stripped fields (deterministic
+/// variant; NOT the classic on-wire JA3 for GREASE-carrying clients —
+/// see the design spec's determinism rules).
+#[must_use]
+pub fn ja3_grease_stripped(f: &Ja3Fields) -> String {
+    use crate::spec::grease::is_grease;
+    let clean = Ja3Fields {
+        version: f.version,
+        ciphers: f
+            .ciphers
+            .iter()
+            .copied()
+            .filter(|&c| !is_grease(c))
+            .collect(),
+        extensions: f
+            .extensions
+            .iter()
+            .copied()
+            .filter(|&e| !is_grease(e))
+            .collect(),
+        curves: f.curves.clone(),
+        point_formats: f.point_formats.clone(),
+        signature_algorithms: f.signature_algorithms.clone(),
+        alpn: f.alpn.clone(),
+    };
+    ja3_string(&clean)
+}
+
 /// The canonical pre-hash JA3 string.
 #[must_use]
 pub fn ja3_string(f: &Ja3Fields) -> String {
@@ -238,5 +322,36 @@ mod tests {
         assert_eq!(f.point_formats, vec![0]);
         assert_eq!(f.signature_algorithms, vec![0x0403, 0x0804]);
         assert_eq!(f.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+    }
+    #[test]
+    fn from_spec_maps_chrome_like_extension_order() {
+        use crate::spec::{ClientHelloSpec, ExtensionSpec, SessionIdSpec};
+        let spec = ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![0x1301],
+            compression_methods: vec![0],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![
+                ExtensionSpec::ServerName,
+                ExtensionSpec::Grease,
+                ExtensionSpec::SupportedVersions(vec![0x0304]),
+                ExtensionSpec::SignatureAlgorithms(vec![0x0403]),
+            ],
+        };
+        let f = Ja3Fields::from_spec(&spec);
+        assert_eq!(f.extensions, vec![0x0000, 0x0A0A, 0x002B, 0x000D]);
+        assert_eq!(f.signature_algorithms, vec![0x0403]);
+        assert_eq!(
+            ja3_grease_stripped(&f),
+            ja3_string(&Ja3Fields {
+                version: 771,
+                ciphers: vec![0x1301],
+                extensions: vec![0x0000, 0x002B, 0x000D],
+                curves: vec![],
+                point_formats: vec![],
+                signature_algorithms: vec![0x0403],
+                alpn: vec![],
+            })
+        );
     }
 }
