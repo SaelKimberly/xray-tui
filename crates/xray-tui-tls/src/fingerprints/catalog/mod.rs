@@ -3,7 +3,7 @@
 
 mod catalog_data;
 
-pub use catalog_data::{CatalogEntry, CATALOG};
+pub use catalog_data::{CATALOG, CatalogEntry};
 
 /// All catalog entries observed for a browser name (e.g. `"chrome"`),
 /// optionally filtered to an exact major version.
@@ -25,7 +25,9 @@ pub fn entries_for(application: &str, version: Option<u16>) -> Vec<&'static Cata
 /// True when `ja4` was observed in the wild for this browser (+version).
 #[must_use]
 pub fn contains(application: &str, version: Option<u16>, ja4: &str) -> bool {
-    entries_for(application, version).iter().any(|e| e.ja4 == ja4)
+    entries_for(application, version)
+        .iter()
+        .any(|e| e.ja4 == ja4)
 }
 
 #[cfg(test)]
@@ -34,11 +36,18 @@ mod tests {
 
     #[test]
     fn catalog_nonempty_and_wellformed() {
-        assert!(CATALOG.len() > 500, "catalog suspiciously small: {}", CATALOG.len());
+        assert!(
+            CATALOG.len() > 500,
+            "catalog suspiciously small: {}",
+            CATALOG.len()
+        );
         for e in CATALOG.iter().take(100) {
             assert!(e.ja4.starts_with("t1"), "{}", e.ja4);
-            assert!(e.ja4.split('_').count() == 3 || e.ja4.split('_').count() == 2,
-                    "unexpected ja4 shape: {}", e.ja4);
+            assert!(
+                e.ja4.split('_').count() == 3 || e.ja4.split('_').count() == 2,
+                "unexpected ja4 shape: {}",
+                e.ja4
+            );
             assert!(!e.application.is_empty());
         }
     }
