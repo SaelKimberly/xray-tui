@@ -164,6 +164,7 @@ pub(crate) enum AuthOutcome {
 /// auth dispatch — the key schedule carries its own transcript
 /// (`KeySchedule::add_transcript`) for the `Finished` MACs and app secrets.
 /// `offered_session_id` must be the legacy session id of `hello`; the
+/// `offered_session_id` must be the legacy session id of `hello`; the
 /// server's `ServerHello` must echo it exactly (RFC 8446 §4.1.3).
 pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
@@ -175,6 +176,10 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // hybrid group (its `key_share` then carries the ciphertext).
     mlkem_sk: Option<&MlkemSecretKey>,
     server_name: &str,
+    // RFC 8879 `compress_certificate` algorithms the ClientHello offered
+    // (0x0001 zlib, 0x0002 brotli, 0x0003 zstd). Empty when the hello
+    // advertised none; the server then must not compress its Certificate.
+    offered_compress: &[u16],
     auth: ServerAuth<'_>,
 ) -> Result<(TlsStream<S>, AuthOutcome)> {
     let mut stream = stream;
@@ -211,7 +216,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts)?;
     let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts)?;
 
-    let flight = read_server_hs_messages(&mut stream, &server_hs_key).await?;
+    let flight = read_server_hs_messages(&mut stream, &server_hs_key, offered_compress).await?;
 
     // Transcript up to (excluding) CertificateVerify — consumed only by the
     // auth dispatch below (RFC 8446 §4.4.3).
@@ -343,6 +348,15 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
             rng: params.rng,
         },
     )?;
+    let offered_compress: Vec<u16> = params
+        .spec
+        .extensions
+        .iter()
+        .find_map(|ext| match ext {
+            ExtensionSpec::CompressCertificate(algs) => Some(algs.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
     let (tls, _) = drive(
         stream,
         &hello.handshake_bytes,
@@ -350,6 +364,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
         keypair,
         mlkem.1.as_ref(),
         params.server_name,
+        &offered_compress,
         ServerAuth::Verifier(params.verifier),
     )
     .await?;
@@ -576,6 +591,8 @@ pub(crate) struct ServerFlight {
 pub(crate) async fn read_server_hs_messages<S>(
     stream: &mut S,
     server_hs_key: &AeadKey,
+    // RFC 8879 `compress_certificate` algorithms the ClientHello offered.
+    offered_compress: &[u16],
 ) -> Result<ServerFlight>
 where
     S: AsyncRead + Unpin,
@@ -610,7 +627,7 @@ where
                     ee_raw = Some(raw);
                 }
                 HS_CERTIFICATE => {
-                    chain = Some(parse_certificate_message(&body)?);
+                    chain = Some(parse_certificate_message(&body, offered_compress)?);
                     cert_raw = Some(raw);
                 }
                 HS_CERTIFICATE_VERIFY => {
@@ -749,8 +766,10 @@ fn parse_encrypted_extensions(body: &[u8]) -> Result<()> {
 /// `cert_req_ctx_len(1) || ctx || certificate_list_len(3) || certificate_list`.
 ///
 /// Each list entry is `cert_data_len(3) || cert_data || extensions_len(2) ||
-/// extensions`; returns the DER chain, leaf first.
-fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
+/// extensions`; returns the DER chain, leaf first. Per RFC 8879 the server
+/// may compress each `cert_data` with one of the `compress_certificate`
+/// algorithms the client offered (see [`decompress_cert`]).
+fn parse_certificate_message(body: &[u8], offered_compress: &[u16]) -> Result<Vec<Vec<u8>>> {
     if body.len() < 4 {
         return Err(TlsError::Handshake("Certificate message too short".into()));
     }
@@ -780,7 +799,10 @@ fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         if pos + cert_len > list_end {
             return Err(TlsError::Handshake("certificate data truncated".into()));
         }
-        chain.push(body[pos..pos + cert_len].to_vec());
+        chain.push(decompress_cert(
+            &body[pos..pos + cert_len],
+            offered_compress,
+        )?);
         pos += cert_len;
         if pos + 2 > list_end {
             return Err(TlsError::Handshake(
@@ -796,6 +818,86 @@ fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         }
     }
     Ok(chain)
+}
+
+/// Decompress one RFC 8879 `cert_data` entry.
+///
+/// The server compresses each certificate in the chain with one of the
+/// `compress_certificate` algorithms the client offered (the same extension
+/// list). A raw (uncompressed) DER certificate is used as-is; otherwise each
+/// offered algorithm is tried in offer order and the first that yields valid
+/// DER wins. If no offered algorithm recovers valid DER, the raw bytes are
+/// returned so the verifier rejects a genuinely malformed certificate
+/// cleanly.
+fn decompress_cert(data: &[u8], offered: &[u16]) -> Result<Vec<u8>> {
+    if is_der_cert(data) {
+        return Ok(data.to_vec());
+    }
+    for &alg in offered {
+        let out = match alg {
+            0x0001 => flate2_zlib_decompress(data),
+            0x0002 => brotli_decompress(data),
+            0x0003 => zstd_decompress(data),
+            _ => None,
+        };
+        if let Some(out) = out {
+            if is_der_cert(&out) {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(data.to_vec())
+}
+
+/// Is `data` a complete DER X.509 certificate (a SEQUENCE whose length
+/// field covers exactly the payload)? Compressed blobs never start with
+/// `0x30` followed by a self-consistent length, so this distinguishes raw
+/// from compressed `cert_data`.
+fn is_der_cert(data: &[u8]) -> bool {
+    if data.first() != Some(&0x30) {
+        return false;
+    }
+    der_sequence_length(data) == Some(data.len())
+}
+
+/// Length in bytes of a DER SEQUENCE (`0x30`, short/long form) given its
+/// header; `None` when the header is malformed or truncated.
+fn der_sequence_length(data: &[u8]) -> Option<usize> {
+    let b = *data.get(1)?;
+    if b & 0x80 == 0 {
+        return Some(2 + usize::from(b));
+    }
+    let n = usize::from(b & 0x7f);
+    if n == 0 || n > 4 || data.len() < 2 + n {
+        return None;
+    }
+    let mut len = 0usize;
+    for &byte in &data[2..2 + n] {
+        len = (len << 8) | usize::from(byte);
+    }
+    Some(2 + n + len)
+}
+
+fn flate2_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+fn brotli_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    brotli::Decompressor::new(data, 1 << 20)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+fn zstd_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    zstd::stream::decode_all(data).ok()
 }
 
 /// Parse a `CertificateVerify` body: `signature_scheme(2) ||
@@ -856,8 +958,9 @@ mod tests {
     use super::{
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
         HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
-        HandshakeParams, connect, make_hs_msg, parse_certificate_message, parse_certificate_verify,
-        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
+        HandshakeParams, connect, is_der_cert, make_hs_msg, parse_certificate_message,
+        parse_certificate_verify, parse_encrypted_extensions, parse_server_hello,
+        read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
@@ -1166,7 +1269,7 @@ mod tests {
     #[test]
     fn parse_certificate_message_extracts_leaf_first_chain() {
         let msg = decode_hex(CERTIFICATE_VEC);
-        let chain = parse_certificate_message(&msg[4..]).unwrap();
+        let chain = parse_certificate_message(&msg[4..], &[]).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].len(), 0x0000_01b0);
         assert_eq!(&chain[0][..2], &[0x30, 0x82]);
@@ -1187,8 +1290,47 @@ mod tests {
         let mut body = vec![0x00]; // no certificate_request_context
         body.extend_from_slice(&u32::try_from(list.len()).unwrap().to_be_bytes()[1..]);
         body.extend_from_slice(&list);
-        let chain = parse_certificate_message(&body).unwrap();
+        let chain = parse_certificate_message(&body, &[]).unwrap();
         assert_eq!(chain, vec![leaf.to_vec(), root.to_vec()]);
+    }
+
+    #[test]
+    fn parse_certificate_message_decompresses_offered_cert() {
+        use std::io::{Read, Write};
+
+        // A self-consistent DER blob (0x30 SEQUENCE, 0x81 long form, 26-byte
+        // body → total 29 bytes) that `is_der_cert` recognizes after
+        // decompression.
+        let mut der = vec![0x30u8, 0x81, 26];
+        der.extend_from_slice(&[0xAA; 26]);
+        assert_eq!(is_der_cert(&der), true);
+
+        // Server compressed it with brotli (0x0002) — one of the offered
+        // algorithms. On drop the writer flushes the stream.
+        let mut compressed = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            w.write_all(&der).unwrap();
+        }
+        assert_eq!(is_der_cert(&compressed), false);
+
+        // Wrap the compressed cert_data in a Certificate body.
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_be_bytes()[1..]);
+        entry.extend_from_slice(&compressed);
+        entry.extend_from_slice(&0x0000u16.to_be_bytes()); // no per-cert extensions
+        let mut body = vec![0x00]; // no certificate_request_context
+        body.extend_from_slice(&u32::try_from(entry.len()).unwrap().to_be_bytes()[1..]);
+        body.extend_from_slice(&entry);
+
+        // Without offering compression the raw bytes pass through.
+        assert_eq!(
+            parse_certificate_message(&body, &[]).unwrap(),
+            vec![compressed.clone()]
+        );
+        // With brotli offered, the original DER is recovered.
+        let chain = parse_certificate_message(&body, &[0x0001, 0x0002, 0x0003]).unwrap();
+        assert_eq!(chain, vec![der]);
     }
 
     #[test]
@@ -1299,7 +1441,7 @@ mod tests {
         write_encrypted_flight_chunk(&mut server_side, &key, 0, &raw_flight[..split]).await;
         write_encrypted_flight_chunk(&mut server_side, &key, 1, &raw_flight[split..]).await;
 
-        let parsed = read_server_hs_messages(&mut client_stream, &key)
+        let parsed = read_server_hs_messages(&mut client_stream, &key, &[])
             .await
             .unwrap();
         assert_eq!(parsed.chain.len(), 1);

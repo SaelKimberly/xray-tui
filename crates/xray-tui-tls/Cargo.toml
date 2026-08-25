@@ -31,6 +31,14 @@ serde.workspace = true
 thiserror.workspace = true
 # ML-KEM (Kyber768) via liboqs (vendored build - no system dep required)
 oqs = { version = "0.11", features = ["ml_kem", "kyber", "vendored"] }
+# Certificate decompression (RFC 8879) — the engine advertises
+# `compress_certificate` in its fingerprints (Chrome offers brotli+zstd), so
+# a real server (e.g. Cloudflare) may return a compressed Certificate
+# message; the client must decompress the offered algorithms. flate2/zstd
+# are already in the workspace lockfile; brotli is new.
+flate2 = "1.1"
+brotli = "6"
+zstd = "0.13"
 [lints]
 workspace = true
 

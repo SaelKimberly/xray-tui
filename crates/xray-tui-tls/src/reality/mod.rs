@@ -328,6 +328,7 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
         keypair,
         pq_secret.as_ref(),
         params.server_name,
+        &[],
         ServerAuth::Reality {
             auth_key: &auth_key,
         },

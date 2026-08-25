@@ -45,6 +45,7 @@ pub mod crypto;
 #[cfg(feature = "native-e2e")]
 pub mod e2e;
 pub mod error;
+pub mod headers;
 pub mod protocol;
 pub mod security;
 pub mod shape;
