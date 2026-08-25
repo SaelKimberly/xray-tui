@@ -172,24 +172,27 @@ impl Default for Fingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn default_for_picks_greatest_max_version_table_row() {
         let fp = Fingerprint::default_for(Browser::Chrome);
         assert_eq!(fp.browser, Browser::Chrome);
-        assert_eq!(fp.version, Some(133));
-        assert_eq!(fp.os, None); // chrome desktop rows are os-unpinned
+        // The hand chrome_130 row wins latest_row over every generated
+        // chrome major (149 included) and is now os-concrete Windows.
+        assert_eq!(fp.version, Some(130));
+        assert_eq!(fp.os, Some(Os::Windows));
         assert_eq!(fp.device, Some(Device::Desktop));
 
-        // Safari's rows tie at max_version 17; the first-declared
-        // (desktop macOS) row wins.
+        // Safari's generated rows tie at max_version 26; the first-declared
+        // group (iOS phone) wins.
         let sf = Fingerprint::default_for(Browser::Safari);
         assert_eq!(
             (sf.version, sf.os, sf.device),
-            (Some(17), Some(Os::MacOs), Some(Device::Desktop))
+            (Some(26), Some(Os::Ios), Some(Device::Phone))
         );
 
         // Samsung Internet has no hand rows; the generated roster answers
-        // with its newest band (run 25–29 → version 29, Android desktop).
+        // with its newest entry (version 29, Android desktop).
         let samsung = Fingerprint::default_for(Browser::SamsungInternet);
         assert_eq!(
             (samsung.version, samsung.os, samsung.device),

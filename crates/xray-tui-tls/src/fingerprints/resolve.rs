@@ -1,10 +1,14 @@
 //! Identity → concrete hello resolution over a two-tier table.
 //!
-//! The hand-written wire-exact rows are authoritative: wherever they and
-//! a generated band claim the same identity/band overlap, the hand row
-//! wins (design's wire-exact precedence). Generated rows are derived from
-//! the roster as contiguous-major bands and answer only what the hand
-//! tier strictly refuses.
+//! Resolution is **next-modern**: a query version `v` resolves to the
+//! smallest kept major `>= v` within the os/device-compatible identity
+//! group; versions above the group's newest row, or below its oldest kept
+//! major (era mismatch), refuse.
+//!
+//! When the query's exact `(browser, os, device)` triple has no rows, the
+//! query retries with the os dropped (same browser+device over any-os
+//! rows): desktop hellos are OS-independent within a family, so e.g.
+//! `chrome/linux` serves the family's `windows/macos` chrome rows.
 //!
 //! Strict per the design spec: unknown combinations error with the list
 //! of what IS resolvable. Never silently substitute a different browser,
@@ -29,10 +33,10 @@ pub(crate) struct Row {
     /// Inclusive maximum requested major this row answers.
     pub max_version: u16,
     /// Inclusive minimum requested major this row answers (`0` =
-    /// unbounded below). Rows covering disjoint bands of the same
-    /// platform group set this so overlap is impossible by construction
-    /// (e.g. `android_11_okhttp` ≤ 11 vs `chrome_android_130` ≥ 12).
-    /// Generated band rows set it to their run's lowest major.
+    /// unbounded below). Hand rows set this to `0` — their band absorbs
+    /// every version up to `max_version`. Generated rows set it to their
+    /// own major; the chooser refuses queries below the group's oldest
+    /// kept major (its smallest `min_version`).
     pub min_version: u16,
     pub spec: fn() -> ClientHelloSpec,
 }
@@ -75,70 +79,36 @@ pub(crate) fn table() -> &'static [Row] {
     &TABLE
 }
 
-/// The generated-tier slice of [`table`]: derived bands only.
+/// The generated-tier slice of [`table`]: derived rows only.
 fn generated_rows_slice() -> &'static [Row] {
     &table()[HAND_ROWS.len()..]
 }
 
-/// A generated-roster identity group key.
-type GroupKey = (Browser, Option<Os>, Device);
-
-/// Derives the generated-tier rows from the roster: one [`Row`] per
-/// contiguous-major run within each `(browser, os, device)` group. The
-/// row's band is the run's major span and its spec is the run's
-/// greatest-major entry (last declared on ties). Group and run order is
-/// deterministic so ties resolve to the first-declared row.
-///
-/// The roster may carry multiple entries with the same
-/// `(browser, os, device, major)` but distinct JA4s — those are
-/// intentional variant fingerprints and are kept, never deduped. They
-/// land in separate single-major bands, so two generated bands can
-/// overlap at a boundary major; ties resolve first-declared, and when the
-/// winning band's representative major equals the requested version the
-/// served spec is exactly that version's (version-faithful by
-/// construction).
+/// Derives the generated-tier rows from the roster: one [`Row`] per kept
+/// entry, so every kept identity stays individually resolvable — next-modern
+/// must answer `v` with the smallest *kept major* `>= v`, which per-major
+/// rows preserve exactly (band merging would collapse e.g. the firefox
+/// macOS majors 148/149/150 into one row and mis-serve 148/149). Rows are
+/// ordered by `(browser, os, device)` — the same deterministic group order
+/// the roster's band construction used — so ties (rows sharing a
+/// `max_version`, and variant fingerprints sharing a
+/// `(browser, os, device, major)` — distinct JA4s, never deduped) resolve
+/// to the first-declared row (stable sort keeps [`GENERATED`] order).
 fn generated_rows() -> Vec<Row> {
-    let mut groups: Vec<(GroupKey, Vec<GenEntry>)> = Vec::new();
-    for entry in GENERATED {
-        let key = (entry.browser, entry.os, entry.device);
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, entries)) => entries.push(*entry),
-            None => groups.push((key, vec![*entry])),
-        }
-    }
-    groups.sort_by_key(|(k, _)| (k.0.name(), k.1.map(Os::name), k.2.name()));
-    let mut rows = Vec::new();
-    for (_, mut entries) in groups {
-        entries.sort_by_key(|e| e.major); // stable: ties keep GENERATED order
-        let mut run: Vec<GenEntry> = Vec::new();
-        for entry in entries {
-            let extending = run.last().is_some_and(|last| entry.major == last.major + 1);
-            if !extending && !run.is_empty() {
-                rows.push(band_row(&run));
-                run.clear();
-            }
-            run.push(entry);
-        }
-        if !run.is_empty() {
-            rows.push(band_row(&run));
-        }
-    }
-    rows
-}
-
-/// One table row from a non-empty contiguous-major run: band = the run's
-/// major span, spec = the greatest-major entry.
-fn band_row(run: &[GenEntry]) -> Row {
-    let rep = run[run.len() - 1];
-    Row {
-        name: rep.name,
-        browser: rep.browser,
-        os: rep.os,
-        device: rep.device,
-        max_version: rep.major,
-        min_version: run[0].major,
-        spec: rep.spec_fn,
-    }
+    let mut entries: Vec<&GenEntry> = GENERATED.iter().collect();
+    entries.sort_by_key(|e| (e.browser.name(), e.os.map(Os::name), e.device.name()));
+    entries
+        .into_iter()
+        .map(|e| Row {
+            name: e.name,
+            browser: e.browser,
+            os: e.os,
+            device: e.device,
+            max_version: e.major,
+            min_version: e.major,
+            spec: e.spec_fn,
+        })
+        .collect()
 }
 
 /// Greatest `max_version` row (ties → first declared).
@@ -152,44 +122,24 @@ fn greatest_row<'a>(rows: impl Iterator<Item = &'a Row>) -> Option<&'a Row> {
     })
 }
 
-/// Hand-tier chooser: strict era-witnessed covering — a row answers `v`
-/// exactly at its max, or inside a band whose lower edge some earlier
-/// row witnesses; below the oldest row of a platform group we refuse.
-fn choose_hand<'a>(candidates: &'a [&'a Row], version: Option<u16>) -> Option<&'a Row> {
-    // Version-unset queries follow latest_row's contract: greatest
-    // max_version, ties → first declared (greatest_row), not max_by_key's
-    // last-on-tie.
+/// Next-modern chooser, shared by both tiers: among the
+/// os/device-compatible rows of the group, pick the row with the smallest
+/// `max_version >= v` (first-declared on ties). Refuse when `v` sits above
+/// the group's newest row (no `max_version >= v`) or below its oldest kept
+/// major (era mismatch — never serve a hello from a wildly different era
+/// than asked for). Version-unset queries take the greatest `max_version`
+/// row, ties → first declared ([`greatest_row`]).
+fn choose_next_modern<'b>(candidates: &[&'b Row], version: Option<u16>) -> Option<&'b Row> {
     version.map_or_else(
         || greatest_row(candidates.iter().copied()),
         |v| {
-            let covering = candidates
-                .iter()
-                .filter(|r| r.max_version >= v)
-                .min_by_key(|r| r.max_version)
-                .copied();
-            let covered = covering.is_some_and(|row| {
-                row.max_version == v
-                    || candidates
-                        .iter()
-                        .filter(|r| r.max_version < v)
-                        .max_by_key(|r| r.max_version)
-                        .is_some()
-            });
-            if covered { covering } else { None }
-        },
-    )
-}
-
-/// Generated-tier chooser: a band row answers exactly its contiguous
-/// major run (`min_version <= v <= max_version`); run gaps strict-refuse.
-fn choose_generated<'a>(candidates: &'a [&'a Row], version: Option<u16>) -> Option<&'a Row> {
-    // Same first-on-ties contract as choose_hand (see there).
-    version.map_or_else(
-        || greatest_row(candidates.iter().copied()),
-        |v| {
+            let oldest_kept_major = candidates.iter().map(|r| r.min_version).min()?;
+            if v < oldest_kept_major {
+                return None;
+            }
             candidates
                 .iter()
-                .filter(|r| r.min_version <= v && v <= r.max_version)
+                .filter(|r| v <= r.max_version)
                 .min_by_key(|r| r.max_version)
                 .copied()
         },
@@ -197,10 +147,10 @@ fn choose_generated<'a>(candidates: &'a [&'a Row], version: Option<u16>) -> Opti
 }
 
 impl Row {
-    fn matches(&self, q_version: Option<u16>, q_os: Option<Os>, q_device: Option<Device>) -> bool {
-        if q_version.is_some_and(|v| v < self.min_version) {
-            return false; // below this row's band floor
-        }
+    /// Identity/os/device compatibility with a query. Version gating
+    /// lives in [`choose_next_modern`], not here: rows above `v` are
+    /// valid next-modern candidates.
+    fn matches(&self, q_os: Option<Os>, q_device: Option<Device>) -> bool {
         if let Some(d) = q_device {
             if d != self.device {
                 return false;
@@ -241,36 +191,36 @@ pub fn available_identities() -> Vec<String> {
 }
 
 impl Fingerprint {
-    /// Rows in `rows` that could answer this query (identity, band floor
-    /// and os/device compat), in declaration order.
-    fn matching<'a>(&self, rows: &'a [Row]) -> Vec<&'a Row> {
+    /// Rows in `rows` that could answer this query (same browser, and
+    /// os/device compat against `q_os`), in declaration order. Version is
+    /// not filtered here: next-modern candidates may sit above `v`.
+    fn matching<'a>(&self, rows: &'a [Row], q_os: Option<Os>) -> Vec<&'a Row> {
         rows.iter()
-            .filter(|r| r.browser == self.browser && r.matches(self.version, self.os, self.device))
+            .filter(|r| r.browser == self.browser && r.matches(q_os, self.device))
             .collect()
     }
 
-    /// Strict resolution to a concrete hello. Fallback chain: hand tier
-    /// (exact → same browser/device(+compatible os) row covering the
-    /// requested version) → generated tier (contiguous-major band
-    /// containing the version) → error listing alternatives.
+    /// Resolves to a concrete hello in two passes, hand tier first in
+    /// both (wire-exact precedence): the query's exact
+    /// `(browser, os, device)` triple, then — when that yields no row —
+    /// the same browser+device over any-os rows (cross-triple os-drop:
+    /// desktop hellos are OS-independent within a family, so e.g.
+    /// `chrome/linux` serves the family's `windows/macos` chrome rows).
     ///
-    /// A hand row covers `v` when `v` is its exact major, or `v` lies
-    /// inside its band `(nearest lower candidate's max_version,
-    /// row.max_version]`, and never below the row's `min_version` floor.
-    /// Below the oldest hand row of a platform group we fall through to
-    /// the generated tier, which answers exactly the majors its roster
-    /// runs contain. If neither tier answers, we refuse — never serve a
-    /// hello from a wildly different era than asked for.
+    /// Within a pass both tiers apply next-modern: query `v` resolves to
+    /// the smallest kept major `>= v` in the os/device-compatible group,
+    /// refusing versions above the group's newest row or below its oldest
+    /// kept major (era mismatch).
     ///
     /// # Errors
-    /// [`FingerprintError::Unknown`] when no row satisfies the query.
+    /// [`FingerprintError::Unknown`] when neither pass finds a row.
     pub fn resolve(&self) -> Result<Resolved, FingerprintError> {
-        // Hand tier first: wire-exact transcriptions win wherever they
-        // and a generated band claim the same identity/band overlap.
-        let hand_candidates = self.matching(HAND_ROWS);
-        let hand = choose_hand(&hand_candidates, self.version);
-        let generated_candidates = self.matching(generated_rows_slice());
-        let chosen = hand.or_else(|| choose_generated(&generated_candidates, self.version));
+        let chosen = if self.os.is_some() {
+            self.resolve_in_pass(self.os)
+                .or_else(|| self.resolve_in_pass(None))
+        } else {
+            self.resolve_in_pass(None)
+        };
         let Some(row) = chosen else {
             return Err(FingerprintError::Unknown {
                 query: self.render(),
@@ -288,12 +238,22 @@ impl Fingerprint {
             spec: (row.spec)(),
         })
     }
+
+    /// One resolution pass over both tiers for a fixed query os: hand
+    /// tier first (wire-exact wins over generated rows), then the
+    /// generated tier; both next-modern.
+    fn resolve_in_pass(&self, q_os: Option<Os>) -> Option<&'static Row> {
+        let hand_candidates = self.matching(HAND_ROWS, q_os);
+        let generated_candidates = self.matching(generated_rows_slice(), q_os);
+        let hand = choose_next_modern(&hand_candidates, self.version);
+        hand.or_else(|| choose_next_modern(&generated_candidates, self.version))
+    }
 }
 
 /// A successfully resolved fingerprint: identity + concrete hello.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    /// Resolution-table name (`chrome_133`).
+    /// Resolution-table name (`chrome_130`).
     pub name: &'static str,
     /// Fully concretized identity (unset query fields filled from the row).
     pub fingerprint: Fingerprint,
@@ -315,11 +275,12 @@ impl Resolved {
     /// as `None`: recall over precision — evidence-only check, so catalog
     /// rows without a recorded browser major still count.
     ///
-    /// Honest caveat: engine hellos are synthetic variants (uTLS-style
-    /// transcriptions), so today NO resolvable identity's full JA4 appears
-    /// in the catalog — this returns `false` for every current row. The
-    /// check is forward-looking: it becomes live evidence the moment a
-    /// captured hello's JA4 lands in [`super::catalog::CATALOG`].
+    /// Honest caveat: the hand-transcribed rows (`chrome_130`, `edge_106`)
+    /// were captured outside the observed corpus, so their JA4s are absent
+    /// from the catalog and this returns `false` for them; every kept
+    /// generated row, however, IS a catalog observation
+    /// (`manifest-derived`) and returns `true`. The check distinguishes
+    /// wire-captured evidence from hand-written transcriptions.
     #[must_use]
     pub fn in_catalog(&self) -> bool {
         super::catalog::contains(self.fingerprint.browser.name(), None, &self.ja4())
@@ -330,64 +291,124 @@ impl Resolved {
 mod tests {
     use super::*;
 
+    /// Build a fingerprint with an optional os.
+    fn fp(browser: Browser, version: u16, os: Option<Os>, device: Device) -> Fingerprint {
+        let mut fp = Fingerprint::new(browser)
+            .with_version(version)
+            .with_device(device);
+        fp.os = os;
+        fp
+    }
+
+    /// Next-modern fallback: a version between kept majors resolves to the
+    /// smallest kept major `>= v`. The hand `chrome_130` band `(0, 130]`
+    /// absorbs every version up to 130 (hand precedence); above it the
+    /// generated tier answers next-modern; above the newest row refuses.
+    /// Cross-triple os-drop covers linux/os-less chrome desktop queries.
+    #[rstest::rstest]
+    #[case::chrome_windows_50_hand_band(
+        fp(Browser::Chrome, 50, Some(Os::Windows), Device::Desktop),
+        Ok("chrome_130")
+    )]
+    #[case::chrome_windows_93_hand_band(
+        fp(Browser::Chrome, 93, Some(Os::Windows), Device::Desktop),
+        Ok("chrome_130")
+    )]
+    #[case::chrome_windows_115_hand_band(
+        fp(Browser::Chrome, 115, Some(Os::Windows), Device::Desktop),
+        Ok("chrome_130")
+    )]
+    #[case::chrome_windows_140_next_modern(
+        fp(Browser::Chrome, 140, Some(Os::Windows), Device::Desktop),
+        Ok("chrome_143_windows_desktop")
+    )]
+    #[case::chrome_windows_200_refuses(fp(Browser::Chrome, 200, Some(Os::Windows), Device::Desktop), Err(()))]
+    #[case::chrome_linux_115_cross_triple(
+        fp(Browser::Chrome, 115, Some(Os::Linux), Device::Desktop),
+        Ok("chrome_130")
+    )]
+    #[case::chrome_osless_115_any_os(
+        fp(Browser::Chrome, 115, None, Device::Desktop),
+        Ok("chrome_130")
+    )]
+    fn resolves_under_reduced_roster(
+        #[case] fp: Fingerprint,
+        #[case] expected: Result<&'static str, ()>,
+    ) {
+        match expected {
+            Ok(name) => {
+                let r = fp.resolve().unwrap();
+                assert_eq!(r.name, name);
+            }
+            Err(()) => assert!(fp.resolve().is_err()),
+        }
+    }
+
     #[test]
     fn resolves_exact_query() {
-        let fp = Fingerprint::new(Browser::Chrome).with_version(133);
+        let fp = Fingerprint::new(Browser::Chrome)
+            .with_version(143)
+            .with_os(Os::Windows)
+            .with_device(Device::Desktop);
         let r = fp.resolve().unwrap();
-        assert_eq!(r.name, "chrome_133");
+        assert_eq!(r.name, "chrome_143_windows_desktop");
         assert!(!r.spec.cipher_suites.is_empty());
     }
 
     #[test]
-    fn falls_forward_to_nearest_covering_version_same_platform() {
+    fn falls_forward_to_next_modern_major_same_platform() {
         let fp = Fingerprint::new(Browser::Chrome)
             .with_version(132)
             .with_os(Os::Windows)
             .with_device(Device::Desktop);
         let r = fp.resolve().unwrap();
-        // No chrome_132 row exists; the nearest row whose max_version
-        // covers 132 is chrome_133.
-        assert_eq!(r.name, "chrome_133");
+        // The hand chrome_130 band caps at 130; the smallest kept chrome
+        // windows major >= 132 is 143.
+        assert_eq!(r.name, "chrome_143_windows_desktop");
         assert_eq!(r.fingerprint.version, Some(132));
     }
 
     #[test]
     fn unset_fields_default_to_desktop_rows() {
-        // Bare Firefox query lands on firefox_128_esr: os-unpinned row,
-        // so the resolved os stays unset; device fills from the row.
+        // Bare Firefox query lands on the newest desktop row: the Android
+        // desktop band [149, 150], served by firefox_150_android_desktop
+        // (greatest max_version; first-declared group wins ties). The
+        // resolved os fills from the row.
         let r = Fingerprint::new(Browser::Firefox).resolve().unwrap();
-        assert_eq!(r.name, "firefox_128_esr");
-        assert_eq!(r.fingerprint.os, None);
+        assert_eq!(r.name, "firefox_150_android_desktop");
+        assert_eq!(r.fingerprint.os, Some(Os::Android));
         assert_eq!(r.fingerprint.device, Some(Device::Desktop));
     }
 
     #[test]
     fn pinned_os_fills_from_row_when_query_unspecified() {
-        // Safari with no os/device: desktop macos row answers and pins os.
+        // Safari v17 with no os/device: next-modern picks the smallest
+        // kept macOS desktop major >= 17 (26); the row pins os macOS.
         let r = Fingerprint::new(Browser::Safari)
             .with_version(17)
             .resolve()
             .unwrap();
-        assert_eq!(r.name, "safari_17");
+        assert_eq!(r.name, "safari_26_macos_desktop");
         assert_eq!(r.fingerprint.os, Some(Os::MacOs));
         assert_eq!(r.fingerprint.device, Some(Device::Desktop));
     }
 
     #[test]
-    fn version_inside_band_picks_covering_row() {
-        // 125 sits in chrome_130's band (119, 130].
+    fn version_inside_hand_band_picks_hand_row() {
+        // 125 sits inside the hand chrome_130 band (0, 130].
         let r = Fingerprint::new(Browser::Chrome)
             .with_version(125)
             .resolve()
             .unwrap();
         assert_eq!(r.name, "chrome_130");
     }
+
     #[test]
     fn hand_row_wins_over_generated_band_overlap() {
         // Chrome 125 Windows desktop: the hand chrome_130 row's band
-        // (119, 130] claims it AND the generated roster carries
-        // chrome_125_windows_desktop. Wire-exact precedence: the query
-        // must resolve to the hand-written row, never the generated one.
+        // (0, 130] claims it even though generated chrome windows rows
+        // (93, 143) carry different majors. Wire-exact precedence: the
+        // query resolves to the hand-written row, never the generated one.
         let r = Fingerprint::new(Browser::Chrome)
             .with_version(125)
             .with_os(Os::Windows)
@@ -400,10 +421,8 @@ mod tests {
     #[test]
     fn generated_only_identity_resolves_to_registered_ja4() {
         // chrome_148_android_desktop is a kept generated-roster identity
-        // the hand tier strictly refuses (no hand row serves Android
-        // desktop, and the Chrome desktop hand rows cap at 133). It must
-        // resolve, and the resolved hello must hash to the roster's
-        // registered source JA4 for that identity.
+        // with no hand row. It must resolve, and the resolved hello must
+        // hash to the roster's registered source JA4 for that identity.
         let registered = GENERATED
             .iter()
             .find(|e| e.name == "chrome_148_android_desktop")
@@ -439,10 +458,12 @@ mod tests {
 
     #[test]
     fn unresolvable_query_message_is_capped() {
-        // Chrome 2 sits below the oldest chrome run in both tiers; the
-        // ~990-name alternatives list must render capped, not verbatim.
+        // Chrome 200 sits above the newest chrome row in both tiers; the
+        // 71-name alternatives list must render capped, not verbatim.
         let err = Fingerprint::new(Browser::Chrome)
-            .with_version(2)
+            .with_version(200)
+            .with_os(Os::Windows)
+            .with_device(Device::Desktop)
             .resolve()
             .unwrap_err();
         let msg = err.to_string();
@@ -451,97 +472,109 @@ mod tests {
     }
 
     #[test]
-    fn below_oldest_hand_row_falls_back_to_generated_tier() {
-        // 119 is the oldest hand chrome row and answers only its own major.
-        let ok = Fingerprint::new(Browser::Chrome)
-            .with_version(119)
-            .resolve()
-            .unwrap();
-        assert_eq!(ok.name, "chrome_119");
-        // 93 is below every hand chrome row, so the hand tier strictly
-        // refuses; the kept generated roster answers instead. Its Windows
-        // run is the single-major band [93] (the kept Windows runs are
-        // 93 and 143, non-contiguous), served by chrome_93_windows_desktop.
-        let generated = Fingerprint::new(Browser::Chrome)
+    fn hand_band_absorbs_old_versions_generated_refuses_below_oldest() {
+        // Chrome/Windows 93 sits inside the hand chrome_130 band (0, 130]:
+        // the wire-exact row answers, never the generated single-major band.
+        let hand = Fingerprint::new(Browser::Chrome)
             .with_version(93)
             .with_os(Os::Windows)
             .with_device(Device::Desktop)
             .resolve()
             .unwrap();
-        assert_eq!(generated.name, "chrome_93_windows_desktop");
-        assert_eq!(generated.fingerprint.version, Some(93));
-        // 2 sits below every generated chrome run too: strict error.
-        let err = Fingerprint::new(Browser::Chrome)
-            .with_version(2)
+        assert_eq!(hand.name, "chrome_130");
+        assert_eq!(hand.fingerprint.version, Some(93));
+        // Firefox has no hand rows; 50 sits below its oldest kept desktop
+        // major (125): era mismatch, strict error.
+        let err = Fingerprint::new(Browser::Firefox)
+            .with_version(50)
+            .with_os(Os::Windows)
+            .with_device(Device::Desktop)
             .resolve()
             .unwrap_err();
         assert!(matches!(err, FingerprintError::Unknown { .. }));
     }
 
     #[test]
-    fn version_below_every_row_errors_with_available_list() {
-        // 2 is below every chrome run in both tiers: strict error.
-        let fp = Fingerprint::new(Browser::Chrome).with_version(2);
+    fn version_above_every_row_errors_with_available_list() {
+        // 200 is above every chrome row in both tiers: strict error.
+        let fp = Fingerprint::new(Browser::Chrome).with_version(200);
         let err = fp.resolve().unwrap_err();
         let FingerprintError::Unknown { query, available } = err else {
             panic!("wrong variant")
         };
-        assert_eq!(query, "chrome/2/-/-");
+        assert_eq!(query, "chrome/200/-/-");
         assert!(available.iter().any(|a| a.starts_with("chrome")));
     }
 
     #[test]
-    fn mobile_query_lands_on_mobile_row() {
+    fn mobile_query_lands_on_mobile_row_via_cross_triple() {
+        // Chrome/Android/Phone has no kept rows; the exact triple pass
+        // fails and the os drops: any-os chrome phone rows answer,
+        // greatest major (no version) = 144.
         let fp = Fingerprint::new(Browser::Chrome)
             .with_os(Os::Android)
             .with_device(Device::Phone);
         let r = fp.resolve().unwrap();
-        assert_eq!(r.name, "chrome_android_130");
-        assert_eq!(r.fingerprint.version, Some(130));
+        assert_eq!(r.name, "chrome_144_ios_phone_2");
+        assert_eq!(r.fingerprint.version, Some(144));
     }
 
     #[test]
-    fn android_11_hits_okhttp_row_chrome_12_hits_modern_row() {
-        let old = Fingerprint::new(Browser::Chrome)
-            .with_version(11)
+    fn mobile_versions_below_oldest_refuse_and_between_majors_go_next_modern() {
+        // The oldest kept chrome phone major is 133 (iOS phone); 100 is
+        // below it: era mismatch even through the os-drop pass.
+        let err = Fingerprint::new(Browser::Chrome)
+            .with_version(100)
             .with_os(Os::Android)
             .with_device(Device::Phone)
             .resolve()
-            .unwrap();
-        assert_eq!(old.name, "android_11_okhttp");
+            .unwrap_err();
+        assert!(matches!(err, FingerprintError::Unknown { .. }));
+        // 140 sits between the kept phone majors 133 and 143: next-modern
+        // serves the smallest kept major >= 140, cross-triple (os dropped).
         let modern = Fingerprint::new(Browser::Chrome)
-            .with_version(12)
+            .with_version(140)
             .with_os(Os::Android)
             .with_device(Device::Phone)
             .resolve()
             .unwrap();
-        assert_eq!(modern.name, "chrome_android_130");
+        assert_eq!(modern.name, "chrome_143_ios_phone");
+        assert_eq!(modern.fingerprint.version, Some(140));
     }
 
     #[test]
-    fn ios_14_query_hits_ios14_row() {
-        // Safari/iOS 14 → the legacy iOS row; 15-17 stay on safari_ios_17.
+    fn ios_versions_resolve_next_modern_to_kept_ios_rows() {
+        // Safari/iOS 14: the smallest kept iOS phone major >= 14 is 18;
+        // 18 itself stays on the same row.
         let old = Fingerprint::new(Browser::Safari)
             .with_version(14)
             .with_os(Os::Ios)
             .with_device(Device::Phone)
             .resolve()
             .unwrap();
-        assert_eq!(old.name, "ios_14");
-        let modern = Fingerprint::new(Browser::Safari)
-            .with_version(15)
+        assert_eq!(old.name, "safari_18_ios_phone");
+        let exact = Fingerprint::new(Browser::Safari)
+            .with_version(18)
             .with_os(Os::Ios)
             .with_device(Device::Phone)
             .resolve()
             .unwrap();
-        assert_eq!(modern.name, "safari_ios_17");
+        assert_eq!(exact.name, "safari_18_ios_phone");
     }
 
     #[test]
-    fn incompatible_os_device_combo_errors_strictly() {
-        // Android phone Safari: no such row — must error, not substitute.
-        let err = Fingerprint::new(Browser::Safari)
+    fn os_dropped_when_exact_triple_absent_but_still_refuses_no_rows() {
+        // Safari/Android/Phone has no kept rows; the os drops and any-os
+        // Safari phone rows answer (greatest major 26).
+        let dropped = Fingerprint::new(Browser::Safari)
             .with_os(Os::Android)
+            .with_device(Device::Phone)
+            .resolve()
+            .unwrap();
+        assert_eq!(dropped.name, "safari_26_ios_phone");
+        // Brave has no phone rows at all: neither pass finds anything.
+        let err = Fingerprint::new(Browser::Brave)
+            .with_os(Os::Ios)
             .with_device(Device::Phone)
             .resolve()
             .unwrap_err();
@@ -552,7 +585,7 @@ mod tests {
     fn tablet_queries_resolve_via_generated_rows() {
         // No hand row is a tablet; the generated roster carries Chrome
         // Android/iOS tablet identities. A bare tablet query lands on the
-        // newest band (greatest max_version): the iOS run [147, 148].
+        // newest band (greatest max_version): the iOS tablet major 148.
         let r = Fingerprint::new(Browser::Chrome)
             .with_device(Device::Tablet)
             .resolve()
@@ -570,40 +603,66 @@ mod tests {
             let _ = (entry.spec)();
         }
     }
+
     #[test]
-    fn firefox_120_query_hits_firefox_120_row() {
-        let r = Fingerprint::new(Browser::Firefox)
+    fn firefox_below_oldest_kept_major_refuses() {
+        // Firefox 120 sits below the oldest kept firefox desktop major
+        // (125): era mismatch — strict error, no substitution.
+        let err = Fingerprint::new(Browser::Firefox)
             .with_version(120)
             .resolve()
-            .unwrap();
-        assert_eq!(r.name, "firefox_120");
+            .unwrap_err();
+        assert!(matches!(err, FingerprintError::Unknown { .. }));
     }
 
     #[test]
-    fn safari_16_query_hits_safari_16_row() {
+    fn firefox_125_exact_and_126_next_modern() {
+        let exact = Fingerprint::new(Browser::Firefox)
+            .with_version(125)
+            .with_os(Os::Windows)
+            .with_device(Device::Desktop)
+            .resolve()
+            .unwrap();
+        assert_eq!(exact.name, "firefox_125_windows_desktop");
+        // 126 sits between the kept firefox windows majors 125 and 139.
+        let modern = Fingerprint::new(Browser::Firefox)
+            .with_version(126)
+            .with_os(Os::Windows)
+            .with_device(Device::Desktop)
+            .resolve()
+            .unwrap();
+        assert_eq!(modern.name, "firefox_139_windows_desktop");
+    }
+
+    #[test]
+    fn safari_16_query_hits_safari_16_macos_row() {
         let r = Fingerprint::new(Browser::Safari)
             .with_version(16)
             .resolve()
             .unwrap();
-        assert_eq!(r.name, "safari_16");
+        assert_eq!(r.name, "safari_16_macos_desktop");
     }
 
     #[test]
     fn available_identities_sorted_and_complete() {
         let names = available_identities();
         assert_eq!(names.len(), table().len());
+        assert_eq!(names.len(), HAND_ROWS.len() + GENERATED.len());
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
-        assert!(names.contains(&"chrome_android_130".to_string()));
+        assert!(names.contains(&"chrome_130".to_string()));
+        assert!(names.contains(&"edge_106".to_string()));
     }
 
     #[test]
     fn latest_row_finds_greatest_max_version() {
-        assert_eq!(latest_row(Browser::Chrome).unwrap().name, "chrome_133");
+        // Hand-tier rows win: chrome_130 (wire-exact) beats every
+        // generated chrome major, 149 included.
+        assert_eq!(latest_row(Browser::Chrome).unwrap().name, "chrome_130");
         assert_eq!(
             latest_row(Browser::Firefox).unwrap().name,
-            "firefox_128_esr"
+            "firefox_150_android_desktop"
         );
         // Samsung Internet has no hand rows; the generated roster answers.
         assert_eq!(
@@ -611,10 +670,13 @@ mod tests {
             "samsung_29_android_desktop"
         );
     }
+
     #[test]
     fn resolved_computes_full_ja4() {
         let r = Fingerprint::new(Browser::Chrome)
-            .with_version(133)
+            .with_version(130)
+            .with_os(Os::Windows)
+            .with_device(Device::Desktop)
             .resolve()
             .unwrap();
         let ja4 = r.ja4();
@@ -626,19 +688,31 @@ mod tests {
     }
 
     #[test]
-    fn resolved_ja4_not_in_catalog_today() {
-        // Synthetic engine hellos: no resolvable identity's full JA4 is in
-        // the catalog yet (documented on `Resolved::in_catalog`).
+    fn in_catalog_evidence_marks_generated_rows_live() {
+        // Hand-transcribed hellos (chrome_130, edge_106) were captured
+        // outside the observed corpus: their JA4s are NOT catalog evidence.
         for fp in [
-            Fingerprint::new(Browser::Chrome).with_version(133),
-            Fingerprint::new(Browser::Firefox).with_version(128),
-            Fingerprint::new(Browser::Safari)
-                .with_version(17)
-                .with_os(Os::MacOs),
+            Fingerprint::new(Browser::Chrome)
+                .with_version(130)
+                .with_os(Os::Windows),
+            Fingerprint::new(Browser::Edge)
+                .with_version(106)
+                .with_os(Os::Windows),
         ] {
             let r = fp.resolve().unwrap();
             assert!(!r.in_catalog(), "{} must not be catalog evidence", r.name);
         }
+        // Kept generated rows ARE catalog observations (manifest-derived).
+        let generated_row = Fingerprint::new(Browser::Firefox)
+            .with_version(150)
+            .with_os(Os::MacOs)
+            .resolve()
+            .unwrap();
+        assert!(
+            generated_row.in_catalog(),
+            "{} must be catalog evidence",
+            generated_row.name
+        );
     }
 
     #[test]
