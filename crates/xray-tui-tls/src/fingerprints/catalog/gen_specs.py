@@ -714,24 +714,109 @@ def _manifest_entry_json(e: dict) -> dict:
         "wire": e["wire"], "low_fidelity": e["low_fidelity"],
     }
 
-def _write_manifest(csv_dir: str) -> int:
-    import json
-    manifest = build_manifest(csv_dir)
-    out = {
-        "entries": [_manifest_entry_json(e) for e in manifest["entries"]],
-        "stats": manifest["stats"],
-    }
-    s = out["stats"]
-    names = [e["name"] for e in out["entries"]]
-    assert len(names) == len(set(names)), "duplicate entry names"
-    assert all(e["family"] for e in out["entries"]), "entry without family"
-    assert s["kept"] >= 50, f"kept {s['kept']} < 50"
-    with open(MANIFEST_PATH, "w", encoding="utf-8") as fh:
-        json.dump(out, fh, indent=1)
-        fh.write("\n")
-    print(json.dumps(s))
-    print(f"wrote {MANIFEST_PATH} ({len(names)} entries)")
-    return 0
+# --- kept-roster selection -----------------------------------------------------
+#
+# Deterministic reduction of the generated roster: top-3 observed distinct
+# JA4 clusters per (browser, os, device) triple, most-modern major rep,
+# family range filtered, PSK excluded; the top-ranked slot whose A+hash2
+# matches a hand profile's assigned triple is removed from the generated
+# keep (the hand profile replaces it), one slot per hand profile. Later
+# tasks consume the emitted kept `name`s.
+
+# Family sanity ranges (spec §1). Keyed by manifest `browser`.
+FAMILY_RANGES = {
+    'chrome': (80, 155), 'edge': (80, 155), 'opera': (80, 155),
+    'brave': (80, 155), 'firefox': (80, 155), 'samsung': (10, 40),
+    'safari': (3, 30),
+}
+# Hand profiles that survive as wire-exact upgrades: assigned concrete
+# triple -> (A-part, hash2). Their JA4s are absent from the corpus, so they
+# can never win by count; they replace the top-ranked cluster slot whose
+# A-part+hash2 they share. (Source: tests/fingerprints.rs captured JA4s.)
+HAND_UPGRADES = {
+    'chrome_130': (('chrome', 'windows', 'desktop'), 't13d1516h2', '8daaf6152771'),
+    'edge_106':   (('edge', 'windows', 'desktop'),  't13d1516h2', '8daaf6152771'),
+}
+
+
+def is_psk(e):
+    return any(x.get('ty') == 0x0029 for x in e['wire'].get('extensions', []))
+
+
+def select_roster(entries):
+    """Top-3 observed distinct JA4 clusters per triple, most-modern major
+    rep, family range filtered, PSK excluded; the top-ranked slot matching
+    a hand profile's A+hash2 is removed from the generated keep (the hand
+    profile replaces it), one slot per hand profile. Returns the set of
+    kept generated `name`s."""
+    from collections import defaultdict
+    triples = defaultdict(list)
+    for e in entries:
+        triples[(e['browser'], e['os'], e['device'])].append(e)
+    kept = set()
+    used_upgrades: set[str] = set()
+    for t, es in triples.items():
+        flo, cap = FAMILY_RANGES[t[0]]
+        es = [e for e in es if flo <= e['browser_major'] <= cap and not is_psk(e)]
+        if not es:
+            continue
+        clusters = defaultdict(list)
+        for e in es:
+            clusters[e['ja4']].append(e)
+        ranked = sorted(clusters.items(),
+                        key=lambda kv: (-sum(x['observation_count'] for x in kv[1]), kv[0]))
+        for ja4, cl in ranked[:3]:
+            rep = max(cl, key=lambda x: x['browser_major'])
+            a, h2 = ja4.split('_')[0], ja4.split('_')[1]
+            # wire-exact upgrade: first (top-ranked) cluster in this triple
+            # whose A+hash2 matches an unused hand profile is replaced.
+            upgraded = False
+            for hname, (ht, ha, hh2) in HAND_UPGRADES.items():
+                if hname not in used_upgrades and ht == t and (ha, hh2) == (a, h2):
+                    used_upgrades.add(hname)
+                    upgraded = True
+                    break
+            if not upgraded:
+                kept.add(rep['name'])
+    return kept
+# Expected kept roster (69 generated names; the 2 hand-upgraded generated
+# slots -- chrome_148_windows_desktop, edge_149_windows_desktop -- excluded).
+# Asserted verbatim by --selftest.
+KEPT_STATS = [
+    'chrome_148_android_desktop', 'chrome_134_android_desktop',
+    'chrome_141_android_desktop_3', 'chrome_147_android_tablet',
+    'chrome_131_android_tablet', 'chrome_83_android_tablet',
+    'chrome_144_ios_phone_2', 'chrome_143_ios_phone', 'chrome_133_ios_phone',
+    'chrome_148_ios_tablet', 'chrome_146_ios_tablet', 'chrome_141_ios_tablet',
+    'chrome_149_macos_desktop', 'chrome_122_macos_desktop',
+    'chrome_115_macos_desktop', 'chrome_143_windows_desktop',
+    'chrome_93_windows_desktop',
+    'edge_146_android_desktop', 'edge_134_android_desktop',
+    'edge_121_android_desktop', 'edge_144_android_tablet',
+    'edge_143_ios_phone_3', 'edge_143_ios_phone_2', 'edge_121_ios_phone',
+    'edge_131_ios_tablet', 'edge_148_macos_desktop', 'edge_132_macos_desktop',
+    'edge_112_macos_desktop', 'edge_128_windows_desktop',
+    'edge_121_windows_desktop',
+    'firefox_150_android_desktop', 'firefox_149_android_desktop_2',
+    'firefox_144_android_desktop_5', 'firefox_146_ios_phone_2',
+    'firefox_138_ios_phone', 'firefox_137_ios_phone',
+    'firefox_150_macos_desktop', 'firefox_149_macos_desktop',
+    'firefox_148_macos_desktop', 'firefox_148_windows_desktop',
+    'firefox_139_windows_desktop', 'firefox_125_windows_desktop',
+    'opera_96_android_desktop', 'opera_88_android_desktop',
+    'opera_80_android_desktop', 'opera_130_macos_desktop',
+    'opera_119_macos_desktop', 'opera_98_macos_desktop',
+    'opera_130_windows_desktop', 'opera_128_windows_desktop',
+    'opera_97_windows_desktop', 'brave_90_macos_desktop',
+    'brave_89_windows_desktop', 'brave_126_windows_desktop',
+    'safari_26_ios_phone', 'safari_18_ios_phone', 'safari_9_ios_phone',
+    'safari_18_ios_tablet', 'safari_17_ios_tablet', 'safari_6_ios_tablet',
+    'safari_26_macos_desktop', 'safari_16_macos_desktop',
+    'safari_12_macos_desktop', 'safari_12_windows_desktop',
+    'safari_12_windows_desktop_2', 'safari_5_windows_desktop',
+    'samsung_29_android_desktop', 'samsung_28_android_desktop',
+    'samsung_17_android_desktop',
+]
 
 
 # --- Rust emitter: profiles/generated/<family>.rs ------------------------------
@@ -1166,10 +1251,16 @@ def _selftest() -> int:
             assert fh.read() == text, (
                 f"{path} differs from a fresh render — run `--emit` and "
                 f"commit the result")
-    per_family = {m: sum(1 for e in entries if _family_module(e) == m)
-                  for m in FAMILY_ORDER}
-    print(f"emitter: {len(texts)} files byte-deterministic and matching "
-          f"committed; entries per family: {per_family}")
+    # Task 1: deterministic kept-roster selection. The 2 hand-upgraded
+    # generated slots (chrome_148_windows_desktop, edge_149_windows_desktop)
+    # are excluded; chrome_143_windows_desktop / edge_128_windows_desktop are
+    # second-slot distinct-JA4 variants and MUST remain.
+    kept = select_roster(man["entries"])
+    assert sorted(kept) == sorted(KEPT_STATS), (
+        f"kept roster mismatch: {sorted(kept - set(KEPT_STATS))} extra, "
+        f"{sorted(set(KEPT_STATS) - kept)} missing")
+    print(f"selection: {len(kept)} kept generated names == expected "
+          f"{len(KEPT_STATS)} (2 hand-upgraded slots excluded)")
     print("PASS")
     return 0
 
@@ -1182,9 +1273,19 @@ if __name__ == "__main__":
     ap.add_argument("--emit", action="store_true",
                     help="write profiles/generated/*.rs from "
                          "specs_manifest.json")
+    ap.add_argument("--select", action="store_true",
+                    help="print the deterministic kept roster (names)")
     args = ap.parse_args()
     if args.selftest:
         sys.exit(_selftest())
+    if args.select:
+        here = os.path.dirname(os.path.abspath(__file__))
+        csv_dir = os.path.join(here, "..", "..", "..", "..", "..",
+                               "thirdparty", "ja4db-export", "csv")
+        kept = select_roster(build_manifest(csv_dir)["entries"])
+        for name in sorted(kept):
+            print(name)
+        sys.exit(0)
     if args.manifest:
         here = os.path.dirname(os.path.abspath(__file__))
         csv_dir = os.path.join(here, "..", "..", "..", "..", "..",
