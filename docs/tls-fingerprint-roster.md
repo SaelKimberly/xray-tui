@@ -1,177 +1,199 @@
-# TLS fingerprint roster — JA4 fidelity verification report
+# TLS fingerprint roster — JA4 fidelity verification report (reduced roster)
 
-**Date:** 2026-08-24
-**Branch:** `native-core-stub` (JA4 spec expansion, Task 8)
-**Roster:** 1825 generated JA4-faithful profiles (`xray-tui-tls` `profiles/generated/`)
+**Date:** 2026-08-25
+**Branch:** `native-core-stub` (JA4 roster reduction, Task 5)
+**Roster:** 71 kept profiles = 69 generated JA4-faithful + 2 wire-exact hand
+(`chrome_130`, `edge_106`)
 **Live target:** `https://tls.peet.ws` (`/api/all`, TLS 1.3, HTTP/2 + HTTP/1.1)
+**Result:** **71/71 PASS on both full runs** — every kept entry connected and
+returned its expected JA4; the 2 hand profiles returned their hand-captured
+JA4.
 
 ## Roster scale
 
-| Family (module) | Entries | Wire template |
+| Module (`profiles/generated/`) | Entries | Wire template |
 |---|---|---|
-| chrome (desktop Chromium: Chrome/Edge/Opera/Brave/Samsung) | 720 | `chrome_desktop` |
-| firefox (incl. Firefox for Android) | 407 | `firefox` |
-| safari (macOS/Windows WebKit) | 33 | `safari` |
-| chrome_android (Chromium Android) | 359 | `chrome_android` |
-| safari_ios (WKWebView reality — any browser on iOS) | 306 | `safari_ios` |
-| **Total** | **1825** | (fallback/okhttp families empty) |
+| `chrome.rs` (desktop Chromium: Chrome/Edge/Opera/Brave/Samsung) | 19 | `chrome_desktop` |
+| `firefox.rs` (incl. Firefox for Android) | 9 | `firefox` |
+| `safari.rs` (macOS/Windows WebKit) | 6 | `safari` |
+| `chrome_android.rs` (Chromium Android) | 16 | `chrome_android` |
+| `safari_ios.rs` (WKWebView reality — any browser on iOS) | 19 | `safari_ios` |
+| **Generated total** | **69** | (fallback/okhttp families empty) |
+| Hand (`profiles/hand_selected.rs`, `spec!`-declared wire-exact) | 2 | — |
+| **Kept total** | **71** | |
+
+The 69 generated entries are the deterministic `select_roster` subset of the
+1825-entry manifest (top-3 distinct-JA4 clusters per browser/os/device triple,
+family-range filtered, PSK excluded); they collapse to **18 distinct JA4s**.
+The 2 hand profiles share one hand-captured JA4 absent from the corpus, so the
+combined roster carries **19 distinct JA4s** and **0 pre_shared_key entries**.
 
 Generator: `crates/xray-tui-tls/src/fingerprints/catalog/gen_specs.py`
 (`--manifest` → `specs_manifest.json` from the ja4db export; `--emit` →
 `profiles/generated/*.rs`, byte-deterministic; `--selftest` verifies the
-committed files match a fresh render).
+committed files match a fresh render of the kept subset).
+
+## The 2 hand-upgraded slots
+
+Per the design's wire-exact upgrade rule, a hand profile whose JA4 shares
+A-part + hash2 with a kept cluster **and** whose triple equals the cluster's
+triple replaces the top-ranked matching slot (one hand profile fills one slot):
+
+| Hand profile | Triple | Replaces | Expected JA4 on tls.peet.ws |
+|---|---|---|---|
+| `chrome_130` | chrome / windows / desktop | `chrome_148_windows_desktop` | `t13d1516h2_8daaf6152771_f37e75b10bcc` |
+| `edge_106` | edge / windows / desktop | `edge_149_windows_desktop` | `t13d1516h2_8daaf6152771_f37e75b10bcc` |
+
+Both were transcribed byte-for-byte into `spec!` tokens from the original hand
+modules (deleted; the equality was pinned by the removed
+`hand_selected_matches_original_wire_bytes` equivalence test). They share the
+same GREASE-normalized JA4 — `t13d1516h2_8daaf6152771_f37e75b10bcc` — which is
+the **hand-captured** value, not the cluster's: it matches the #1 cluster
+(`t13d1516h2_8daaf6152771_d8a2da3f94cd` / `…_02713d6af862`) in A-part, hash1
+and hash2 and differs only in hash3 (signature-algorithms order — Edge 106
+also carries two GREASE extensions to Chrome 130's one). The expected JA4 on
+peet.ws for these slots is the hand-captured value, and the live sweep
+confirms both return it exactly.
 
 ## Fidelity contract
 
-Every entry's built `ClientHello` must reproduce its registered source JA4
-(the ja4db corpus value, `GenEntry.ja4`):
+Every kept entry's built `ClientHello` must reproduce its registered source
+JA4 (`GenEntry.ja4`; for the hand profiles, the hand-captured value):
 
 - **Offline gate** (`tests/generated_ja4_gate.rs`, runs in every
-  `cargo test`): all 1825 entries — 1003 full-hash exact, 475
-  padding-in-hello, 245 padding-omitted (512-byte target rule), 102 no-sig
-  (locked), 0 failures; 306 entries carry the corpus `ht` ALPN letter
-  (orthogonal rendering note).
+  `cargo test`): all 69 generated entries — 49 full-hash exact, 16
+  padding-in-hello, 4 padding-omitted (512-byte target rule), 0 no-sig, 3
+  corpus-`ht` entries, 0 failures. The 2 hand profiles are pinned offline by
+  `tests/tls_peet_ws.rs::local_fingerprints_match_locked_constants`
+  (chrome_130 JA4-v2 and GREASE-stripped JA3 md5 under the fixed seed) and by
+  the resolver JA4-fidelity tests.
 - **Live sweep** (`cargo run -p xray-tui-tls --example grader -- --roster`):
-  empirical confirmation against the real peet.ws API — this report.
+  empirical confirmation against the real peet.ws API — this report. The
+  grader walks the combined roster (`roster::combined_roster` = `GENERATED` +
+  the 2 hand profiles).
 
 ## Live sweep — methodology
 
-Each entry: `ClientHello` built from the generated spec with the fixed-seed
-fixture (all-`0x5A`), parsed locally, then a real TLS 1.3 connection to
-tls.peet.ws (per-connection GREASE via `SystemRandom`; JA4 is
-GREASE-normalized so the fixed-seed local value is comparable). The server's
-reported JA4 is checked against:
+Each entry: `ClientHello` built from the spec with the fixed-seed fixture
+(all-`0x5A`), parsed locally, then a real TLS 1.3 connection to tls.peet.ws
+(per-connection GREASE via `SystemRandom`; JA4 is GREASE-normalized so the
+fixed-seed local value is comparable). The server's reported JA4 is checked
+against:
 
 1. the local JA4 computed with the server's own algorithm (wire fidelity),
-2. the registered corpus JA4 (normalized for the server's rendering).
+2. the registered expected JA4 (corpus value for generated entries,
+   hand-captured value for the hand profiles — normalized for the server's
+   rendering).
 
-Two full runs (16 concurrent connections, 20 s per-entry cap). The server's
-`ja4.go` rendering differs from the FoxIO spec in ways the grader
-replicates:
+16 concurrent connections, 20 s per-entry cap. The server's `ja4.go`
+rendering differs from the FoxIO spec in ways the grader replicates:
 
-- A-part counts are **non-padded decimal** and the ALPN letter is
-  **omitted when no ALPN is offered** (registered `t13d170900_…` is
-  reported as `t13d179_…`);
+- A-part counts are **non-padded decimal** and the ALPN letter is **omitted
+  when no ALPN is offered** (registered `t13d170900_…` is reported as
+  `t13d179_…`);
 - hash2 excludes the padding extension `0015` (already documented in the
   grader's reconciliation notes).
 
-Entries whose hello offers no `h2` ALPN (the 306 `http/1.1`-only and 533
+Entries whose hello offers no `h2` ALPN (the 3 `http/1.1`-only and 14
 no-ALPN entries) are graded over an HTTP/1.1 GET (`Connection: close`,
 Content-Length/chunked aware).
 
-## Live results summary (2026-08-24, two full runs)
+## Live results summary (2026-08-25, two full runs — identical)
 
-| Family | Total | Passed both runs | Wire-faithful (run 1) | Deterministic rejections | Transient only |
-|---|---|---|---|---|---|
-| chrome | 720 | 686 | 695 | 25 | 9 |
-| firefox | 407 | 349 | 374 | 33 | 25 |
-| safari | 33 | 33 | 33 | 0 | 0 |
-| chrome_android | 359 | 321 | 329 | 25 | 13 |
-| safari_ios | 306 | 266 | 278 | 28 | 12 |
-| **Total** | **1825** | **1655** | **1697** | **111** | **59** |
+| Family | Total | Full | Pad+ | Pad− | No-sig | `ht` | Wire-ok | Reg-ok | Fail |
+|---|---|---|---|---|---|---|---|---|---|
+| chrome (incl. `chrome_130`, `edge_106`) | 21 | 17 | 0 | 4 | 0 | 2 | 21 | 17 | 0 |
+| chrome_android | 16 | 13 | 3 | 0 | 0 | 0 | 16 | 13 | 0 |
+| firefox | 9 | 8 | 1 | 0 | 0 | 0 | 9 | 8 | 0 |
+| safari | 6 | 5 | 1 | 0 | 0 | 0 | 6 | 5 | 0 |
+| safari_ios | 19 | 8 | 11 | 0 | 0 | 1 | 19 | 8 | 0 |
+| **TOTAL** | **71** | **51** | **16** | **4** | **0** | **3** | **71** | **51** | **0** |
 
-The three result buckets partition the roster exactly per family
-(passed-both + deterministic-rejected + transient-only = total); the
-`Wire-faithful (run 1)` column is the first run's pass count, a separate
-single-run measurement — transient membership differs between runs, so it
-is not a partition of the other columns.
+- **71/71 entries (100%)** connected and matched the local JA4 (wire
+  fidelity) in **both** runs; both hand profiles returned their hand-captured
+  JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc` — the hard gate.
+- **0 deterministic rejections, 0 transient failures** across the two runs
+  (the kept roster is PSK-free by construction, so the pre-reduction
+  `0x0029` rejection class — see Finding 1 below — cannot occur).
+- Reg-ok (51) counts the full-hash-class entries only: the pad+/pad−
+  entries' registered corpus hash2 includes the padding extension while the
+  server's `ja4.go` excludes it (the documented codec gap), so their
+  registered-match flag stays clear by design — they are never failures.
+- 54 entries speak HTTP/2, 3 are `http/1.1`-only (the `ht` entries), 14 offer
+  no ALPN; 36 carry the ECH-GREASE outer extension.
 
-- **1655 entries (90.7%)** connected and matched the local JA4 in **both**
-  runs; the first run verified **1697 (93.0%)**.
-- **111 deterministic handshake rejections** — see finding 1 below.
-- **59 transient entry-runs** hit timeouts (HTTP/2 response timed out /
-  fetch timed out) in one of the two runs and passed the other —
-  peet.ws throttles under the 16-way burst; none are wire mismatches.
-  Per the plan ruling the sweep is a manual report, not a merge gate.
+## Findings
 
-### Finding 1 — extension `0x0029` (pre_shared_key): peet.ws/Go rejects any hello carrying it (111 entries)
+### Finding 1 — `0x0029` (pre_shared_key) exclusion (historical; no longer applies)
 
-All 111 entries whose spec carries `raw[0x0029, ""]` (chrome 25, firefox
-33, chrome_android 25, safari_ios 28) fail the live handshake with fatal
-`unexpected_message` (alert 2 10) — deterministically, across both runs.
-Bisection proved the rejection is caused by the extension's **presence**,
-not its body or position: an empty body fails, a structurally valid
-one-identity/one-binder body fails, moving it last (RFC 8446 §4.2.11
-requires last) fails; removing it makes the identical hello connect and
-report a JA4 that matches every remaining field.
+The pre-reduction roster had 111 entries carrying `raw[0x0029, ""]`; peet.ws
+(Go `crypto/tls`) deterministically rejects any hello with it (fatal
+`unexpected_message`), so those entries were live-connect-infeasible. The kept
+roster **excludes PSK by construction** (`select_roster` drops `0x0029`
+carriers), so no kept entry can hit this rejection — the sweep's zero-failure
+runs confirm it. The sampled test keeps its PSK filter as a harmless guard.
 
-The ja4db string export carries extension ids but no bodies; the corpus
-counts `0029` in hash2, so the roster keeps it (JA4 fidelity is the
-contract) and the entry is recorded as **live-connect-infeasible against
-tls.peet.ws**. Real clients that send `pre_shared_key` carry a session
-ticket issued by the server they are talking to; a generated hello cannot
-fabricate one, and this server rejects the offer outright (Go
-`crypto/tls`). These 111 entries remain offline-verified JA4-faithful
-(the gate asserts hash2 including `0029`); a real server that issued a
-ticket would accept the shape.
+### Finding 2 — ECH `0xfe0d` empty-Raw entries: accepted
 
-### Finding 2 — empty `0x0032` (signature_algorithms_cert) was a real template bug; fixed and regenerated
+36 kept entries carry the empty ECH GREASE outer (`fe0d`); all connect and
+grade cleanly (the server treats it as an unknown extension, RFC 8446 §4.2).
 
-The first sweep exposed **225 handshake rejections** (69 chrome, 80
-firefox, 4 safari, 27 chrome_android, 45 safari_ios) from
-`raw[0x0032, ""]` — `signature_algorithms_cert` with an **empty body**,
-which is malformed (RFC 8446 §4.2.3 requires a 2-byte length + scheme
-list). The corpus string export has no bodies, so the emitter emitted
-`""`.
+### Finding 3 — `http/1.1`-only and no-ALPN entries (3 + 14)
 
-**Fix (template bug → regenerated):** `gen_specs.py` now emits the
-`signature_algorithms_cert` body mirroring the spec's `signature_algorithms`
-list (the RFC default when the extension is absent) — 2-byte length +
-sig-alg ids. The body is JA4-invisible, so the offline gate is unchanged
-(1825/1825, identical classification counts) and the regenerated diff is
-exactly the 225 `raw[0x0032, ""]` → `raw[0x0032, "<hex>"]` tokens (plus the
-225 matching manifest wire blocks). Re-sweep: all four previously failing
-safari entries and every other `0x0032` entry now connect. The bisect
-probe is preserved in the commit history; the grader itself no longer
-carries it.
+- 3 `ht`-letter entries (brave_89_windows_desktop, brave_90_macos_desktop,
+  firefox_138_ios_phone; ALPN `http/1.1` only): graded via the HTTP/1.1 GET
+  path; the server renders the A-part letter `h1` (first+last, matching the
+  crate codec). The corpus `ht` is the ja4db first-two-chars rendering — a
+  documented A-part letter difference that keeps those entries'
+  registered-match flag clear (they are never full-hash class, so it is not a
+  failure).
+- 14 no-ALPN entries: connect over HTTP/1.1 default; the server omits the
+  A-part letter entirely and uses non-padded counts (see methodology).
 
-### Finding 3 — ECH `0xfe0d` empty-Raw entries (Task 3 flag): accepted
+### Finding 4 — 50 low-fidelity slots (JA4-faithful tier, by design)
 
-The 620 entries carrying the empty ECH `fe0d` outer connect and grade
-cleanly (the server treats it as an unknown extension, RFC 8446 §4.2).
-The 5 ECH entries among the 111 rejections fail solely because they also
-carry `0x0029` — not because of ECH.
+At selection time **50 of the 71 slots were low-fidelity** — 48 of the 69 kept
+generated entries are flagged `low_fidelity` in the manifest (their byte-level
+wire shape — sigalgs ordering, extension bodies — is synthesized, not
+observed; only their JA4 is corpus-faithful), plus the 2 upgraded slots
+(`chrome_148_windows_desktop`, `edge_149_windows_desktop`) which were
+low-fidelity generated entries replaced by wire-exact hand profiles. The 2
+hand profiles are wire-exact (transcribed from real browser hellos); the
+remaining 48 generated entries are **JA4-faithful**: they reproduce the
+registered JA4 exactly (pinned offline and live) while their byte-level shape
+may diverge from a real browser. This is the documented JA4-faithful tier —
+JA4 reproduction is the contract, not byte-level wire mimicry.
 
-### Finding 4 — `http/1.1`-only and no-ALPN entries (306 + 533)
+### Finding 5 — dropped artifacts (historical)
 
-- 306 `ht`-letter entries (ALPN `http/1.1` only): graded via the
-  HTTP/1.1 GET path; the server renders the A-part letter `h1`
-  (first+last, matching the crate codec and the grader's `peet_a_part`).
-  The corpus `ht` is the ja4db first-two-chars rendering — a documented
-  A-part letter difference that keeps those entries' registered-match
-  flag clear (they are never full-hash class, so it is not a failure).
-- 533 no-ALPN entries: connect over HTTP/1.1 default; the server omits
-  the A-part letter entirely and uses non-padded counts (see methodology).
-
-### Finding 5 — `chrome_619_windows_desktop` (Task 6 spoofed-UA artifact)
-
-Surfaced **cleanly** in the live sweep (single-major band 619; connects
-and reports a wire-faithful JA4). Kept in the roster; the offline gate
-already pins it.
-
-### Transient failures
-
-60 entry-runs hit timeouts across the two runs (firefox 25,
-chrome_android 13, safari_ios 13, chrome 9; safari 0) — peet.ws
-throttling under load, not wire divergence: every one of them passed the
-other run. Rerun `--roster` for a clean pass on any flagged entry.
+- `chrome_619_windows_desktop` (spoofed-UA artifact, 35,850 corpus
+  observations) and other out-of-range majors are excluded by the family
+  sanity floors/caps (chrome 80–155, etc.) — see the design spec's range
+  table.
+- The empty-`0x0032` (`signature_algorithms_cert`) template bug found by the
+  original 1825-entry sweep was fixed in the generator (synthesized RFC 8446
+  §4.2.3 default body) and is gone from the regenerated roster.
 
 ## Reproduction
 
 ```bash
-# Full live sweep (1825 entries, ~2.5 min)
+# Full live sweep over the kept 71 (69 generated + 2 hand), ~5 s
 cargo run -p xray-tui-tls --example grader -- --roster
-# Per family / per (family, major)-band sample
-cargo run -p xray-tui-tls --example grader -- --roster --family safari
+# Per family / per (family, major)-band sample (hand profiles claim their band)
+cargo run -p xray-tui-tls --example grader -- --roster --family chrome
 cargo run -p xray-tui-tls --example grader -- --roster --sample
 # Offline gate (no network; runs in every cargo test)
 cargo test -p xray-tui-tls --test generated_ja4_gate
-# Sampled live test (one entry per family/band, ignored by default)
+# Offline hand-profile pins + sampled live test (one entry per family/band,
+# incl. the hand profiles; ignored by default)
+cargo test -p xray-tui-tls --test tls_peet_ws
 cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored
-# Generator self-check
+# Generator self-check (kept-set regeneration byte-deterministic)
 python3 crates/xray-tui-tls/src/fingerprints/catalog/gen_specs.py --selftest
 ```
 
-The grader's `--roster` mode prints per-entry lines (`name family class ht
-ech alpn server_ja4 error`) and a per-family summary (full / pad+ / pad- /
-no-sig / ht / wire-ok / reg-ok / fail).
+The grader's `--roster` mode prints per-entry lines (`name family class ht ech
+alpn server_ja4 error`) and a per-family summary (full / pad+ / pad− / no-sig
+/ ht / wire-ok / reg-ok / fail). With `--sample` the wire-exact hand profiles
+claim their (family, major) band first — `chrome_130` shares band 130 with the
+generated `opera_130_*` entries — so the sample always covers them.

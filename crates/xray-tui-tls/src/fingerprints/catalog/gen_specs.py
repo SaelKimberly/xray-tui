@@ -268,8 +268,11 @@ def parse_application(application):
 
 # --- family templates: wire synthesis -----------------------------------------
 #
-# Ground truth: crates/xray-tui-tls/src/profiles/*.rs (17 hand-written specs).
-# Each template records a family's canonical wire shape; per-entry synthesis
+# Ground truth: the canonical wire shapes below, distilled from the
+# pre-reduction hand-written specs (deleted in the roster reduction; see
+# profiles/hand_selected.rs for the surviving 2 and git history for the
+# originals). Each template records a family's canonical wire shape;
+# per-entry synthesis
 # filters the canonical sequences down to the observed id sets:
 #   - ciphers: canonical order filtered to the row's set, leftovers ascending;
 #   - extensions: canonical order filtered to the row's ids, unknown ids
@@ -321,11 +324,11 @@ COMPRESS_CERT = 0x001B
 ALPS_OLD = 0x4469      # ApplicationSettings draft form
 ALPS_NEW = 0x44CD      # ALPS u8-length form (engine emits it via Raw)
 ECH_GREASE = 0xFE0D    # ECH GREASE outer; emitted as empty Raw (see
-                       # chrome133.rs: a valid ECH outer is not emittable)
+                       # chrome.rs: a valid ECH outer is not emittable)
 RECORD_SIZE_LIMIT = 0x001C
 STATUS_REQ = 0x0005
 
-# chrome133.rs order: GREASE first, sig algs ahead of SCT, ALPS/ECH near end,
+# chrome.rs order: GREASE first, sig algs ahead of SCT, ALPS/ECH near end,
 # padding last. `"grease"` marks the standalone-GREASE slot position.
 _CHROME_EXT_ORDER = [
     "grease", SNI, EMS, RENEG, GROUPS, ECPF, TICKET, ALPN, STATUS_REQ,
@@ -351,12 +354,12 @@ _SAFARI_IOS_EXT_ORDER = [
 _OKHTTP_EXT_ORDER = [SNI, EMS, RENEG, GROUPS, ECPF, STATUS_REQ, SIGALGS]
 
 FAMILY_TEMPLATES = {
-    # chrome.rs/chrome133.rs: modern desktop Chromium (incl. Edge/Opera/Brave).
+    # chrome.rs: modern desktop Chromium (incl. Edge/Opera/Brave).
     "chrome_desktop": _template(
         _CHROME_CIPHERS, _CHROME_EXT_ORDER,
         [0x11EC, 0x001D, 0x0017, 0x0018],
         ["X25519Mlkem768", "X25519"], _CHROME_SIG, [0x0002, 0x0003]),
-    # chrome_android130.rs: no ALPS/compress_certificate/padding; SHA-1 sig.
+    # chrome_android.rs: no ALPS/compress_certificate/padding; SHA-1 sig.
     "chrome_android": _template(
         _CHROME_CIPHERS, _CHROME_ANDROID_EXT_ORDER,
         [0x001D, 0x0017, 0x0018], ["X25519"], _CHROME_SIG + [0x0201]),
@@ -380,7 +383,7 @@ FAMILY_TEMPLATES = {
         [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
          0x0601, 0x0201, 0x0203],
         session_id="empty"),
-    # safari_ios17.rs: additionally no ec_point_formats/SCT/3DES/secp521r1.
+    # safari_ios.rs: additionally no ec_point_formats/SCT/3DES/secp521r1.
     "safari_ios": _template(
         [0x1301, 0x1302, 0x1303, 0xC02C, 0xC02B, 0xC030, 0xC02F, 0xCCA9,
          0xCCA8, 0xC024, 0xC023, 0xC028, 0xC027, 0xC00A, 0xC009, 0xC014,
@@ -389,7 +392,7 @@ FAMILY_TEMPLATES = {
         [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
          0x0601, 0x0201, 0x0203],
         session_id="empty"),
-    # android11_okhttp.rs: Chromium-derived minimal preset.
+    # okhttp.rs: Chromium-derived minimal preset.
     "okhttp": _template(
         [0xC02B, 0xC02C, 0xCCA9, 0xC02F, 0xC030, 0xCCA8, 0xC013, 0xC014,
          0x009C, 0x009D, 0x002F, 0x0035],
@@ -433,7 +436,7 @@ def _alpn_protocols(letter):
 
 def _alps_new_body(protocols):
     """uTLS new-codepoint ALPS body: u16 total len, then u8 len + bytes
-    per protocol (chrome133.rs `Raw { ty: 0x446D, .. }` shape)."""
+    per protocol (chrome.rs `Raw { ty: 0x446D, .. }` shape)."""
     entries = [bytes([len(p)]) + p.encode() for p in protocols]
     body = b"".join(entries)
     return list(len(body).to_bytes(2, "big")) + list(body)

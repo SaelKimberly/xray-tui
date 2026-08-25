@@ -216,7 +216,7 @@ macro_rules! ext_token {
 
 /// Declaratively defines a fingerprint profile function.
 ///
-/// Expands `name` into `pub(crate) fn name() -> ClientHelloSpec` — the
+/// Expands `name` into `pub fn name() -> ClientHelloSpec` — the
 /// `SpecEntry` shape — with `legacy_version` fixed at `0x0303` and
 /// compression at `[0]` (TLS 1.3 invariants):
 ///
@@ -265,7 +265,7 @@ macro_rules! spec {
      ciphers: $first:tt $(, $cipher:literal)*,
      session: $session:tt,
      exts: $($ext_tail:tt)*) => {
-        pub(crate) fn $name() -> $crate::spec::ClientHelloSpec {
+        pub fn $name() -> $crate::spec::ClientHelloSpec {
             $crate::profiles::spec_from_parts(
                 vec![cipher_token!($first) $(, cipher_token!($cipher))*],
                 spec_exts!($($ext_tail)*),

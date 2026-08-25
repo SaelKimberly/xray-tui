@@ -1,7 +1,7 @@
 //! tls.peet.ws grader — tier-2 verification of the fingerprint engine.
 //!
 //! Connects to `tls.peet.ws` with a browser profile (`--profile <name>`;
-//! any [`GRADED_PROFILES`] entry, all six by default), speaks HTTP/2
+//! any [`GRADED_PROFILES`] entry, both by default), speaks HTTP/2
 //! through [`xray_tui_tls::http2`], and compares the server-reported
 //! JA3/JA4 against the locked expected values.
 //!
@@ -46,7 +46,7 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::net::TcpStream;
 
-use xray_tui_tls::fingerprints::{Browser, Device, Fingerprint, Os};
+use xray_tui_tls::fingerprints::{Browser, Fingerprint};
 use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
 use xray_tui_tls::hello::{BuildParams, build_hello};
@@ -57,18 +57,13 @@ const HOST: &str = "tls.peet.ws";
 const PORT: u16 = 443;
 const API_PATH: &str = "/api/all";
 const ALPN: &[&str] = &["h2", "http/1.1"];
-/// Locked expected fingerprints (captured live against tls.peet.ws with
-/// this engine; Chrome 130 / Firefox 128 ESR on 2026-08-11, `safari_16` /
-/// `firefox_120` / `edge_106` / `ios_14` in Tasks 7/8 — see the task report).
+/// Locked expected fingerprints of the two kept hand profiles (captured
+/// live against tls.peet.ws with this engine: Chrome 130 on 2026-08-11,
+/// Edge 106 in Task 7/8 — see the task report). Both share the same
+/// GREASE-normalized JA4; they differ in wire bytes (Edge carries two
+/// GREASE extensions, Chrome one).
 const CHROME130_JA4: &str = "t13d1516h2_8daaf6152771_f37e75b10bcc";
-/// Firefox 128 ESR is GREASE-free, hence its JA3 is stable and lockable.
-const FIREFOX128ESR_JA3: &str = "361e0ca6ef1ca4dbe3a1d987722a1980";
-const FIREFOX128ESR_JA4: &str = "t13d1314h2_07be0c029dc8_46701d79520f";
-/// Frozen in Tasks 7/8 from this grader's live captures (2026-08-24).
-const SAFARI16_JA4: &str = "t13d2014h2_a09f3c656075_874d27d7ca63";
-const FIREFOX120_JA4: &str = "t13d1714h2_5b57614c22b0_967e8e80b303";
 const EDGE106_JA4: &str = "t13d1516h2_8daaf6152771_f37e75b10bcc";
-const IOS14_JA4: &str = "t13d2613h2_2802a3db6c62_38ba08824cc9";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -131,38 +126,18 @@ fn parse_args(args: &[String]) -> Vec<usize> {
 }
 
 /// Profiles the grader can grade (all others are rejected at the CLI):
-/// stable resolution-table names + the fingerprint identity selecting them.
+/// the two kept wire-exact hand profiles + the fingerprint identity
+/// selecting them (the deep single-profile check; the whole kept roster
+/// is covered by `--roster`).
 const GRADED_PROFILES: &[(&str, Fingerprint)] = &[
     (
         "chrome_130",
         Fingerprint::new(Browser::Chrome).with_version(130),
     ),
     (
-        "firefox_128_esr",
-        Fingerprint::new(Browser::Firefox).with_version(128),
-    ),
-    (
-        "safari_16",
-        Fingerprint::new(Browser::Safari).with_version(16),
-    ),
-    (
-        "firefox_120",
-        Fingerprint::new(Browser::Firefox).with_version(120),
-    ),
-    (
         "edge_106",
         Fingerprint::new(Browser::Edge).with_version(106),
     ),
-    (
-        "ios_14",
-        Fingerprint::new(Browser::Safari)
-            .with_version(14)
-            .with_os(Os::Ios)
-            .with_device(Device::Phone),
-    ),
-    // `android_11_okhttp` is deliberately NOT gradable: the uTLS preset is a
-    // TLS 1.2-era hello (no supported_versions/key_share/ALPN, only ≤1.2
-    // cipher suites), so it cannot negotiate TLS 1.3 or speak HTTP/2 —
 ];
 
 /// Parses `--profile <name>` (repeatable); defaults to both graded
@@ -259,13 +234,7 @@ async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), B
     );
     let expected_ja4 = match profile {
         "chrome_130" => Some(CHROME130_JA4),
-        "firefox_128_esr" => Some(FIREFOX128ESR_JA4),
-        // Tasks 7/8 desktop + mobile batches (live-captured by this
-        // grader, then frozen).
-        "safari_16" => Some(SAFARI16_JA4),
-        "firefox_120" => Some(FIREFOX120_JA4),
         "edge_106" => Some(EDGE106_JA4),
-        "ios_14" => Some(IOS14_JA4),
         _ => unreachable!("GRADED_PROFILES and this match must stay in sync"),
     };
     if let Some(expected_ja4) = expected_ja4 {
@@ -285,12 +254,6 @@ async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), B
         local::md5_hex(local::strip_grease(server_ja3).as_bytes()),
         "server JA3 hash must be the md5 of its own GREASE-stripped string"
     );
-    if profile == "firefox_128_esr" {
-        assert_eq!(
-            server_ja3_hash, FIREFOX128ESR_JA3,
-            "Firefox JA3 is stable and locked"
-        );
-    }
 
     Ok(())
 }
@@ -515,18 +478,22 @@ mod local {
     }
 }
 
-/// Live roster sweep — tier-2 verification over the generated roster.
+/// Live roster sweep — tier-2 verification over the kept roster.
 ///
 /// `grader --roster [--family <name>] [--sample]`
 ///
-/// Builds every roster entry's `ClientHello` with a fixed seed, computes
-/// the local JA4 (tls.peet.ws algorithm, padding excluded from the hash
-/// list), connects live and compares the server-reported JA4 against both
-/// the local value (wire fidelity) and the registered `GenEntry.ja4`
-/// (corpus match, classified against the four documented corpus/codec
-/// semantics gaps — padding in hello, padding omitted by the 512-byte
-/// target rule, no-sig, `ht` ALPN letter — the same classification the
-/// offline gate `tests/generated_ja4_gate.rs` pins).
+/// Walks the combined kept roster — the 69 generated `GenEntry`s plus the
+/// 2 wire-exact hand profiles (`chrome_130`, `edge_106`; see
+/// [`combined_roster`]). For every entry it builds the `ClientHello` with
+/// a fixed seed, computes the local JA4 (tls.peet.ws algorithm, padding
+/// excluded from the hash list), connects live and compares the
+/// server-reported JA4 against both the local value (wire fidelity) and
+/// the registered expected JA4 (corpus value for generated entries,
+/// hand-captured value for the hand profiles), classified against the
+/// four documented corpus/codec semantics gaps — padding in hello,
+/// padding omitted by the 512-byte target rule, no-sig, `ht` ALPN letter
+/// — the same classification the offline gate
+/// `tests/generated_ja4_gate.rs` pins.
 mod roster {
     use std::collections::BTreeMap;
     use std::error::Error;
@@ -544,7 +511,7 @@ mod roster {
     use xray_tui_tls::crypto::fingerprint::ja3::Ja3Fields;
     use xray_tui_tls::crypto::fingerprint::ja4::{full_ja4, hash1, hash2, ja4_a};
     use xray_tui_tls::error::TlsError;
-    use xray_tui_tls::fingerprints::{Browser, Os};
+    use xray_tui_tls::fingerprints::{Browser, Device, Os};
     use xray_tui_tls::handshake::{HandshakeParams, connect};
     use xray_tui_tls::hello::parse::parse_hello;
     use xray_tui_tls::hello::{BuildParams, build_hello};
@@ -587,7 +554,7 @@ mod roster {
             }
         }
 
-        let mut entries: Vec<GenEntry> = GENERATED.to_vec();
+        let mut entries: Vec<GenEntry> = combined_roster();
         if let Some(f) = family_filter {
             entries.retain(|e| family(e) == f);
             if entries.is_empty() {
@@ -655,21 +622,59 @@ mod roster {
         }
     }
 
-    /// One entry per (family, major) band, in roster order.
+    /// The combined kept roster: the 69 generated `GenEntry`s (in
+    /// `GENERATED` order) plus the 2 wire-exact hand profiles. The hand
+    /// entries are synthesized `GenEntry`s so the sweep/classification
+    /// machinery (family, band sample, offline class, registered-JA4
+    /// comparison) treats every kept identity uniformly; their `ja4` is
+    /// the hand-captured expected value.
+    fn combined_roster() -> Vec<GenEntry> {
+        let mut entries: Vec<GenEntry> = GENERATED.to_vec();
+        entries.push(GenEntry {
+            name: "chrome_130",
+            browser: Browser::Chrome,
+            os: Some(Os::Windows),
+            device: Device::Desktop,
+            major: 130,
+            ja4: super::CHROME130_JA4,
+            spec_fn: xray_tui_tls::profiles::hand_selected::chrome_130,
+        });
+        entries.push(GenEntry {
+            name: "edge_106",
+            browser: Browser::Edge,
+            os: Some(Os::Windows),
+            device: Device::Desktop,
+            major: 106,
+            ja4: super::EDGE106_JA4,
+            spec_fn: xray_tui_tls::profiles::hand_selected::edge_106,
+        });
+        entries
+    }
+
+    /// One entry per (family, major) band, in roster order. The wire-exact
+    /// hand profiles claim their band first (they are the roster's most
+    /// valuable live checks — `chrome_130` shares band 130 with the
+    /// generated `opera_130_*` entries), then generated entries fill the
+    /// remaining slots.
     fn band_sample(all: &[GenEntry]) -> Vec<GenEntry> {
+        let is_hand = |e: &GenEntry| matches!(e.name, "chrome_130" | "edge_106");
         let mut seen: Vec<(&str, u16)> = Vec::new();
-        all.iter()
-            .copied()
-            .filter(|e| {
-                let key = (family(e), e.major);
-                if seen.contains(&key) {
-                    false
-                } else {
-                    seen.push(key);
-                    true
-                }
-            })
-            .collect()
+        let mut out: Vec<GenEntry> = Vec::with_capacity(all.len());
+        for entry in all.iter().copied().filter(|e| is_hand(e)) {
+            let key = (family(&entry), entry.major);
+            if !seen.contains(&key) {
+                seen.push(key);
+                out.push(entry);
+            }
+        }
+        for entry in all.iter().copied().filter(|e| !is_hand(e)) {
+            let key = (family(&entry), entry.major);
+            if !seen.contains(&key) {
+                seen.push(key);
+                out.push(entry);
+            }
+        }
+        out
     }
 
     /// Offline classification of the registered JA4 vs the built hello —
@@ -1142,6 +1147,7 @@ mod roster {
             totals[4] += no_sig;
             totals[5] += ht;
             totals[6] += wire_ok;
+            totals[7] += reg_ok;
             totals[8] += fail;
             let _ = writeln!(
                 out,

@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicUsize;
 use tokio::net::TcpStream;
 
 use xray_tui_tls::crypto::fingerprint::ja3::Ja3Fields;
-use xray_tui_tls::fingerprints::{Browser, Fingerprint, Os};
+use xray_tui_tls::fingerprints::{Browser, Device, Fingerprint, Os};
 use xray_tui_tls::handshake::{HandshakeParams, connect};
 use xray_tui_tls::hello::parse::parse_hello;
 use xray_tui_tls::hello::{BuildParams, build_hello};
@@ -30,8 +30,11 @@ const ALPN: &[&str] = &["h2", "http/1.1"];
 
 /// Locked expected fingerprints — same constants as the grader.
 const CHROME130_JA4: &str = "t13d1516h2_8daaf6152771_f37e75b10bcc";
-const FIREFOX128ESR_JA3: &str = "361e0ca6ef1ca4dbe3a1d987722a1980";
-const FIREFOX128ESR_JA4: &str = "t13d1314h2_07be0c029dc8_46701d79520f";
+/// Stable fingerprints of the kept Firefox hello that version 128 resolves
+/// to (`firefox_139_windows_desktop` — Firefox is GREASE-free, so JA3 is
+/// stable and lockable). Live-locked 2026-08-25.
+const FIREFOX128_RESOLVED_JA3: &str = "fdb1b23bd019c5596f46c8bf59f21968";
+const FIREFOX128_RESOLVED_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
 
 /// GREASE-stripped JA3 md5 of the Chrome 130 profile under the fixed seed
 /// (all `0x42`); deterministic because stripping removes the seed-dependent
@@ -113,17 +116,20 @@ async fn chrome_130_matches_expected_fingerprints() {
 
 #[tokio::test]
 #[ignore = "network"]
-async fn firefox_128_esr_matches_expected_fingerprints() {
+async fn firefox_128_resolves_to_kept_profile() {
+    // The hand `firefox_128_esr` profile was dropped in the roster
+    // reduction; version 128 now resolves to the kept
+    // `firefox_139_windows_desktop` hello (next-modern). Firefox is
+    // GREASE-free, so both JA3 and JA4 are stable and lockable.
     let report = fetch_peet_report(&Fingerprint::new(Browser::Firefox).with_version(128)).await;
-    let report = report.expect("live tls.peet.ws fetch for Firefox 128 ESR");
+    let report = report.expect("live tls.peet.ws fetch for resolved Firefox 128");
 
-    // Firefox 128 ESR is GREASE-free: JA3 and JA4 are both stable.
     assert_eq!(
-        report.ja3_hash, FIREFOX128ESR_JA3,
+        report.ja3_hash, FIREFOX128_RESOLVED_JA3,
         "Firefox JA3 must match the locked constant"
     );
     assert_eq!(
-        report.ja4, FIREFOX128ESR_JA4,
+        report.ja4, FIREFOX128_RESOLVED_JA4,
         "Firefox JA4 must match the locked constant"
     );
     assert_eq!(
@@ -146,13 +152,16 @@ async fn fetch_peet_report(
     fetch_peet_report_spec(&spec).await
 }
 
-/// Sampled live sweep over the generated roster: one entry per
-/// (family, major) band (the grader's `--roster --sample` sampling,
-/// minus the live-infeasible `pre_shared_key` entries — see
+/// Sampled live sweep over the kept roster: one entry per (family,
+/// major) band (the grader's `--roster --sample` sampling of the
+/// combined 71-entry roster — 69 generated + the 2 wire-exact hand
+/// profiles `chrome_130` / `edge_106`, which claim their band first —
+/// minus the live-infeasible `pre_shared_key` entries; see
 /// `band_sample`). Asserts the server-reported JA4 matches the local
 /// peet.ws-algorithm JA4 (wire fidelity) and that hash1 still
-/// reproduces the registered corpus value for every sampled entry — the
-/// live complement to the offline gate, run with the full ignored set:
+/// reproduces the registered corpus value for every sampled entry (the
+/// hand profiles must reproduce their hand-captured hash1) — the live
+/// complement to the offline gate, run with the full ignored set:
 /// `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored`.
 #[tokio::test]
 #[ignore = "network"]
@@ -247,7 +256,37 @@ async fn sampled_roster_bands_match_live_peet_ws() {
     );
 }
 
-/// One entry per (family, major) band of [`GENERATED`], in roster order.
+/// The combined kept roster — the 69 generated `GenEntry`s plus the 2
+/// wire-exact hand profiles, synthesized as `GenEntry`s (mirrors the
+/// grader's `roster::combined_roster`) so the sample loop treats every
+/// kept identity uniformly; the hand `ja4` is the hand-captured value.
+fn combined_roster() -> Vec<GenEntry> {
+    let mut entries: Vec<GenEntry> = GENERATED.to_vec();
+    entries.push(GenEntry {
+        name: "chrome_130",
+        browser: Browser::Chrome,
+        os: Some(Os::Windows),
+        device: Device::Desktop,
+        major: 130,
+        ja4: CHROME130_JA4,
+        spec_fn: xray_tui_tls::profiles::hand_selected::chrome_130,
+    });
+    entries.push(GenEntry {
+        name: "edge_106",
+        browser: Browser::Edge,
+        os: Some(Os::Windows),
+        device: Device::Desktop,
+        major: 106,
+        ja4: CHROME130_JA4, // same expected JA4 as chrome_130 (hand-captured)
+        spec_fn: xray_tui_tls::profiles::hand_selected::edge_106,
+    });
+    entries
+}
+
+/// One entry per (family, major) band of the kept roster, in roster
+/// order. The wire-exact hand profiles claim their band first
+/// (`chrome_130` shares band 130 with generated `opera_130_*` entries),
+/// then generated entries fill the remaining slots.
 ///
 /// Entries whose spec carries the `pre_shared_key` extension (`0x0029`)
 /// are skipped: tls.peet.ws deterministically rejects any hello with it
@@ -270,21 +309,31 @@ fn band_sample() -> Vec<GenEntry> {
             .iter()
             .any(|x| matches!(x, xray_tui_tls::spec::ExtensionSpec::Raw { ty: 0x0029, .. }))
     };
+    let is_hand = |e: &GenEntry| matches!(e.name, "chrome_130" | "edge_106");
+    let roster = combined_roster();
     let mut seen: Vec<(&str, u16)> = Vec::new();
-    GENERATED
-        .iter()
-        .copied()
-        .filter(|e| live_gradeable(e))
-        .filter(|e| {
-            let key = (family(e), e.major);
-            if seen.contains(&key) {
-                false
-            } else {
-                seen.push(key);
-                true
-            }
-        })
-        .collect()
+    let mut out: Vec<GenEntry> = Vec::new();
+    for entry in roster.iter().copied().filter(|e| is_hand(e)) {
+        if !live_gradeable(&entry) {
+            continue;
+        }
+        let key = (family(&entry), entry.major);
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(entry);
+        }
+    }
+    for entry in roster.iter().copied().filter(|e| !is_hand(e)) {
+        if !live_gradeable(&entry) {
+            continue;
+        }
+        let key = (family(&entry), entry.major);
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(entry);
+        }
+    }
+    out
 }
 
 /// One live round-trip for a `ClientHelloSpec` (the shared core: the
