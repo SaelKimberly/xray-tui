@@ -177,7 +177,7 @@ fn chrome_sec_ch_ua(major: u16) -> String {
 /// unset for firefox/safari; the sweep pins `262_144` (hyper's h2 default
 /// cap) uniformly.
 #[must_use]
-pub fn h2_settings(browser: Browser) -> (u32, u32, u32) {
+pub const fn h2_settings(browser: Browser) -> (u32, u32, u32) {
     match browser {
         Browser::Firefox => (131_072, 12_517_377, 262_144),
         Browser::Safari => (2_097_152, 10_485_760, 262_144),
@@ -190,30 +190,32 @@ pub fn h2_settings(browser: Browser) -> (u32, u32, u32) {
 }
 
 /// Chromium-family `User-Agent` product token (the version slot).
-fn ua_brand(browser: Browser) -> &'static str {
+const fn ua_brand(browser: Browser) -> &'static str {
     match browser {
-        Browser::Chrome => "Chrome",
+        // Firefox/Safari never reach this function (`user_agent` handles
+        // them first); "Chrome" is the unreachable fallback token.
+        Browser::Chrome | Browser::Firefox | Browser::Safari => "Chrome",
         Browser::Edge => "Edg",
         Browser::Brave => "Brave",
         Browser::Opera => "OPR",
         Browser::SamsungInternet => "SamsungBrowser",
-        Browser::Firefox | Browser::Safari => "Chrome", // unreachable from user_agent
     }
 }
 
 /// `sec-ch-ua` family-brand token (the real-brand slot).
-fn sec_ch_ua_brand(browser: Browser) -> &'static str {
+const fn sec_ch_ua_brand(browser: Browser) -> &'static str {
     match browser {
-        Browser::Chrome => "Chrome",
+        // Firefox/Safari never reach this function (`sec_ch_ua` returns
+        // `None` for them); "Chrome" is the unreachable fallback token.
+        Browser::Chrome | Browser::Firefox | Browser::Safari => "Chrome",
         Browser::Edge => "Microsoft Edge",
         Browser::Brave => "Brave",
         Browser::Opera => "Opera",
         Browser::SamsungInternet => "Samsung Internet",
-        Browser::Firefox | Browser::Safari => "Chrome", // unreachable from sec_ch_ua
     }
 }
 
-fn os_token_chromium(os: Os, device: Device) -> &'static str {
+const fn os_token_chromium(os: Os, device: Device) -> &'static str {
     match (os, device) {
         (Os::Windows, _) => "Windows NT 10.0; Win64; x64",
         (Os::MacOs, _) => "Macintosh; Intel Mac OS X 10_15_7",
@@ -224,7 +226,7 @@ fn os_token_chromium(os: Os, device: Device) -> &'static str {
     }
 }
 
-fn os_token_firefox(os: Os) -> &'static str {
+const fn os_token_firefox(os: Os) -> &'static str {
     match os {
         Os::Windows => "Windows NT 10.0; Win64; x64",
         Os::MacOs => "Macintosh; Intel Mac OS X 10.15",

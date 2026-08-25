@@ -822,31 +822,57 @@ fn parse_certificate_message(body: &[u8], offered_compress: &[u16]) -> Result<Ve
 
 /// Decompress one RFC 8879 `cert_data` entry.
 ///
-/// The server compresses each certificate in the chain with one of the
-/// `compress_certificate` algorithms the client offered (the same extension
-/// list). A raw (uncompressed) DER certificate is used as-is; otherwise each
-/// offered algorithm is tried in offer order and the first that yields valid
-/// DER wins. If no offered algorithm recovers valid DER, the raw bytes are
-/// returned so the verifier rejects a genuinely malformed certificate
-/// cleanly.
+///
+/// Decompression is bounded: a server-supplied compressed blob may not
+/// expand past [`MAX_CERT_BYTES`] (a decompression bomb would otherwise OOM
+/// the process). An over-bound stream fails the handshake; a stream that is
+/// not valid for the algorithm is skipped (next offered algorithm).
 fn decompress_cert(data: &[u8], offered: &[u16]) -> Result<Vec<u8>> {
     if is_der_cert(data) {
         return Ok(data.to_vec());
     }
     for &alg in offered {
         let out = match alg {
-            0x0001 => flate2_zlib_decompress(data),
-            0x0002 => brotli_decompress(data),
-            0x0003 => zstd_decompress(data),
+            0x0001 => decompress_bounded(flate2::read::ZlibDecoder::new(data))?,
+            0x0002 => decompress_bounded(brotli::Decompressor::new(data, 4096))?,
+            0x0003 => match zstd::stream::read::Decoder::new(data) {
+                Ok(d) => decompress_bounded(d)?,
+                Err(_) => None, // not a zstd stream — try the next algorithm
+            },
             _ => None,
         };
-        if let Some(out) = out {
-            if is_der_cert(&out) {
-                return Ok(out);
-            }
+        if let Some(out) = out.filter(|o| is_der_cert(o)) {
+            return Ok(out);
         }
     }
     Ok(data.to_vec())
+}
+
+/// Maximum decompressed size of one RFC 8879 certificate entry.
+const MAX_CERT_BYTES: u64 = 1 << 20;
+
+/// Decompress `reader` into at most [`MAX_CERT_BYTES`] bytes.
+///
+/// `Ok(None)` when the input is not a valid stream of the algorithm (the
+/// caller tries the next offered algorithm); `Err` when the stream inflates
+/// past the bound (decompression bomb).
+fn decompress_bounded<R: std::io::Read>(mut reader: R) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    if reader
+        .by_ref()
+        .take(MAX_CERT_BYTES + 1)
+        .read_to_end(&mut out)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if out.len() as u64 > MAX_CERT_BYTES {
+        return Err(TlsError::Handshake(
+            "certificate decompression exceeds the 1 MiB bound (decompression bomb)".into(),
+        ));
+    }
+    Ok(Some(out))
 }
 
 /// Is `data` a complete DER X.509 certificate (a SEQUENCE whose length
@@ -877,29 +903,6 @@ fn der_sequence_length(data: &[u8]) -> Option<usize> {
     }
     Some(2 + n + len)
 }
-
-fn flate2_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(data)
-        .read_to_end(&mut out)
-        .ok()?;
-    Some(out)
-}
-
-fn brotli_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut out = Vec::new();
-    brotli::Decompressor::new(data, 1 << 20)
-        .read_to_end(&mut out)
-        .ok()?;
-    Some(out)
-}
-
-fn zstd_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    zstd::stream::decode_all(data).ok()
-}
-
 /// Parse a `CertificateVerify` body: `signature_scheme(2) ||
 /// signature_len(2) || signature`; returns the signature scheme.
 fn parse_certificate_verify(body: &[u8]) -> Result<u16> {
@@ -958,9 +961,9 @@ mod tests {
     use super::{
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
         HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
-        HandshakeParams, connect, is_der_cert, make_hs_msg, parse_certificate_message,
-        parse_certificate_verify, parse_encrypted_extensions, parse_server_hello,
-        read_server_hs_messages,
+        HandshakeParams, connect, decompress_cert, is_der_cert, make_hs_msg,
+        parse_certificate_message, parse_certificate_verify, parse_encrypted_extensions,
+        parse_server_hello, read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
@@ -1296,14 +1299,14 @@ mod tests {
 
     #[test]
     fn parse_certificate_message_decompresses_offered_cert() {
-        use std::io::{Read, Write};
+        use std::io::Write;
 
         // A self-consistent DER blob (0x30 SEQUENCE, 0x81 long form, 26-byte
         // body → total 29 bytes) that `is_der_cert` recognizes after
         // decompression.
         let mut der = vec![0x30u8, 0x81, 26];
         der.extend_from_slice(&[0xAA; 26]);
-        assert_eq!(is_der_cert(&der), true);
+        assert!(is_der_cert(&der));
 
         // Server compressed it with brotli (0x0002) — one of the offered
         // algorithms. On drop the writer flushes the stream.
@@ -1312,7 +1315,7 @@ mod tests {
             let mut w = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
             w.write_all(&der).unwrap();
         }
-        assert_eq!(is_der_cert(&compressed), false);
+        assert!(!is_der_cert(&compressed));
 
         // Wrap the compressed cert_data in a Certificate body.
         let mut entry = Vec::new();
@@ -1331,6 +1334,38 @@ mod tests {
         // With brotli offered, the original DER is recovered.
         let chain = parse_certificate_message(&body, &[0x0001, 0x0002, 0x0003]).unwrap();
         assert_eq!(chain, vec![der]);
+    }
+
+    #[test]
+    fn decompress_cert_rejects_decompression_bomb() {
+        use std::io::Write;
+
+        // 8 MiB of zeros compresses to a few hundred bytes — a classic
+        // decompression bomb. The bounded decompressor must refuse it
+        // instead of inflating it into memory.
+        let bomb: Vec<u8> = vec![0x00; 8 << 20];
+        let mut compressed = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            w.write_all(&bomb).unwrap();
+        }
+        assert!(compressed.len() < 1024, "bomb must compress small");
+
+        let err = decompress_cert(&compressed, &[0x0002]).unwrap_err();
+        assert!(
+            err.to_string().contains("decompression bomb"),
+            "expected the bound error, got: {err}"
+        );
+
+        // A valid (bounded) certificate still decompresses fine.
+        let mut der = vec![0x30u8, 0x81, 26];
+        der.extend_from_slice(&[0xAA; 26]);
+        let mut small = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut small, 4096, 5, 22);
+            w.write_all(&der).unwrap();
+        }
+        assert_eq!(decompress_cert(&small, &[0x0002]).unwrap(), der);
     }
 
     #[test]
