@@ -76,28 +76,56 @@ reachable.
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
 | 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session), xhttp h3 (the `decideHTTPVersion` dispatch rule — single `h3` ALPN → QUIC, `http/1.1` → h1, 0/2+ or other → h2; the shared v3 protocol over the `V3Send` seam; hermetic h3 server double over loopback QUIC; ML-KEM-768 primitives (liboqs roundtrips + size pins), TLS hybrid curves (X25519MLKEM768 key-share encode/parse, `pq || classical` key schedule, fake-PQ-server handshake), VLESS `mlkem768x25519plus` encryption (parser, relay/AEAD chain, xor-mode masking, hermetic double), REALITY 4588 hybrid share (hermetic fake REALITY PQ server)) | 476 lib tests (142 tls + 334 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP))
-| 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo run -p xray-tui-tls --example grader -- --roster [--family <name>] [--sample]`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox128ESR JA3 `361e0ca6ef1ca4dbe3a1d987722a1980` + JA4 `t13d1314h2_07be0c029dc8_46701d79520f`; full 1825-entry roster live sweep + offline gate (see `docs/tls-fingerprint-roster.md`) |
+| 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo run -p xray-tui-tls --example grader -- --roster [--family <name>] [--sample]`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox 128 resolves next-modern to the kept `firefox_139_windows_desktop` (JA3 `fdb1b23bd019c5596f46c8bf59f21968` + JA4 `t13d1516h2_8daaf6152771_02713d6af862`); kept 71-profile roster live sweep (71/71 both runs) + offline JA4 gate + Cloudflare amiabot report (see `docs/tls-fingerprint-roster.md`, `docs/amiabot-roster-report.md`) |
 | 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis, VLESS mKCP axis, VLESS XHTTP/3 axis, VLESS ML-KEM PQ axis | 136 tests = 130 green + 6 documented ignored (vless 78+6, vmess 52; ignored: the 4 ws/grpc plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (SP7 — see the ML-KEM axis below); single-core rows run only on the serving core: xhttp + xhttp-h3 + kcp + pq-enc on xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on sing-box)
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
 
-### Generated fingerprint roster
+### Fingerprint roster (two tiers)
 
-`crates/xray-tui-tls/src/fingerprints/catalog/gen_specs.py` parses the
-ja4db export and emits the **1825-entry JA4-faithful roster**
-(`spec!` specs + `GENERATED` registry under `profiles/generated/`; chrome
-720, firefox 407, safari 33, chrome_android 359, safari_ios 306 — see
-`docs/tls-fingerprint-roster.md`). Generator usage: `--manifest` rebuilds
-`specs_manifest.json` from the export, `--emit` re-renders the Rust files
-(byte-deterministic), `--selftest` verifies the committed files match a
-fresh render. Fidelity contract: every entry's built ClientHello must
-reproduce its registered source JA4 — pinned offline by
-`tests/generated_ja4_gate.rs` (1825/1825, 0 failures) and confirmed live
-against tls.peet.ws by the grader's `--roster` sweep (1655 of 1825
-passed both full runs with wire-faithful JA4, 111 `pre_shared_key`
-entries documented as peet.ws-incompatible, 59 transient — the report
-records the full reconciliation).
+The TLS engine's fingerprint corpus is a **two-tier roster of 71 profiles**:
+
+- **Hand tier — 2 wire-exact profiles** (`profiles/hand_selected.rs`,
+  `spec!`-declared): `chrome_130` and `edge_106`, both Windows desktop.
+  Transcribed byte-for-byte from the original hand modules (deleted; the
+  equality was pinned by the removed equivalence test). These are the only
+  profiles whose byte-level wire shape — extension order, signature-algorithm
+  ordering, GREASE placement (Edge 106 carries two GREASE extensions to
+  Chrome 130's one) — is captured from a real browser, not synthesized.
+- **Generated tier — 69 JA4-faithful entries** (`profiles/generated/`,
+  emitted by `gen_specs.py --emit`; chrome 19, firefox 9, safari 6,
+  chrome_android 16, safari_ios 19): the deterministic `select_roster` kept
+  subset of the 1825-entry ja4db manifest (top-3 distinct-JA4 clusters per
+  browser/os/device triple, family sanity floors/caps, PSK excluded, 2
+  hand-upgraded slots removed). Every entry reproduces its registered source
+  JA4 exactly, but byte-level shape may be synthesized (48 of 69 flagged
+  `low_fidelity` in the manifest — the JA4-faithful contract).
+
+Generator (`crates/xray-tui-tls/src/fingerprints/catalog/gen_specs.py`):
+`--manifest` rebuilds `specs_manifest.json` from the ja4db export (writing
+the `kept` flags), `--select` prints the deterministic kept roster (names),
+`--emit` re-renders the Rust files (byte-deterministic), `--selftest`
+verifies the committed files match a fresh render of the kept subset.
+
+Fidelity contract: every entry's built ClientHello must reproduce its
+registered source JA4 — pinned offline by `tests/generated_ja4_gate.rs`
+(69/69 generated entries, 0 failures; the 2 hand profiles are pinned by
+`tests/tls_peet_ws.rs::local_fingerprints_match_locked_constants`) and
+confirmed live against tls.peet.ws by the grader's `--roster` sweep
+(71/71 both runs — every entry connected and returned its expected JA4;
+0 `pre_shared_key` entries by construction). Cloudflare-side verification
+is the amiabot sweep (`docs/amiabot-roster-report.md`): 35/71 profiles got a
+verdict (the remaining 36 are HRR-limited against Cloudflare — the engine
+has no HRR retry and rejects the HRR a hybrid-unaware server sends), every
+successful row `likely_human` under an IP-pollution caveat.
+
+Resolution over the two tiers: **next-modern** (a query version `v`
+resolves to the smallest kept major `>= v` within the os/device-compatible
+identity group; above the group's newest row or below its oldest kept major
+refuses) with **cross-triple os-drop** fallback (an exact
+`(browser, os, device)` triple miss retries with the os dropped — desktop
+hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`.
 
 
 ## Crate maps
@@ -122,15 +150,15 @@ records the full reconciliation).
 | Module | Responsibility |
 |--------|----------------|
 | `spec/` | declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec`, RFC 6066/8446 wire encodings, GREASE (RFC 8701), hybrid key-share encoding (`X25519MLKEM768`: client share = ML-KEM ek(1184) ‖ X25519 pub(32)) |
-| `profiles/` | 17 transcribed hello specs (`ALL_SPECS` table; hand-transcribed from uTLS presets + real captures): Chrome119/130/133, ChromeAndroid130, Android11OkHttp, iOS14, Edge106/130, Brave167, Opera114, Firefox120, Firefox128Esr, Safari16/17, SafariIos17 (`chrome` = Chrome130 alias) + the **generated 1825-entry roster** (`generated/`, emitted by `gen_specs.py --emit`; JA4-faithful tier, resolver-merged under hand-written precedence; offline gate + live peet.ws sweep pin the fidelity contract — `tests/generated_ja4_gate.rs`, `docs/tls-fingerprint-roster.md`) |
-| `fingerprints/` | identity selector: `Fingerprint { browser, version?, os?, device? }` → strict table resolution (never a different browser, never older than requested; unknown combos error listing what IS resolvable); `FingerprintBuilder` overrides (ciphers/extensions/curves/ALPN/signature-algs, `GreasePolicy::Keep|Strip`); generated JA4 catalog (`catalog/catalog_data.rs`, from the frozen ja4db-export snapshot 2026-05-15 via ua-parser — rerun `gen.py`, never hand-edit) as evidence (`Resolved::in_catalog`); full-JA4 oracle in `crypto/fingerprint/ja4.rs` (final FoxIO scheme, peet.ws-validated) |
+| `profiles/` | two-tier roster: the **hand tier** (`hand_selected.rs`, `spec!`-declared) = 2 wire-exact profiles, `chrome_130` + `edge_106` (transcribed byte-for-byte from the deleted hand modules — the only byte-level-wire-faithful profiles) + the **generated tier** (`generated/`, emitted by `gen_specs.py --emit`) = 69 JA4-faithful entries, the `select_roster` kept subset of the 1825-entry manifest; the resolver merges both tiers (hand bands win on identity overlap) — offline gate + live peet.ws sweep pin the fidelity contract (`tests/generated_ja4_gate.rs`, `docs/tls-fingerprint-roster.md`) |
+| `fingerprints/` | identity selector: `Fingerprint { browser, version?, os?, device? }` → **next-modern** table resolution over the 71-row two-tier table (smallest kept major `>= v` within the os/device-compatible group; above-newest / below-oldest refuse) with **cross-triple os-drop** fallback (exact triple miss → retry os-dropped — desktop hellos are OS-independent within a family); never a different browser, never older than requested; unknown combos error listing what IS resolvable; `FingerprintBuilder` overrides (ciphers/extensions/curves/ALPN/signature-algs, `GreasePolicy::Keep|Strip`); generated JA4 catalog (`catalog/catalog_data.rs`, from the frozen ja4db-export snapshot 2026-05-15 via ua-parser — rerun `gen.py`, never hand-edit) as evidence (`Resolved::in_catalog`); full-JA4 oracle in `crypto/fingerprint/ja4.rs` (final FoxIO scheme, peet.ws-validated) |
 | `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
 | `crypto/` | key schedule (RFC 8448-verified; hybrid input = `pq ‖ classical` shared secrets), AEAD record keys (IV XOR seq), `X25519KeyPair`, `mlkem.rs` ML-KEM-768 primitives via liboqs (`oqs`, vendored — pk 1184 / sk 2400 / ct 1088 / ss 32), `fingerprint/` JA3 + JA4 encoders |
 | `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF; per-direction direct mode `set_write_direct`/`set_read_direct` — raw record-layer bypass that hands the socket to the tunnel, backing the vision Direct splice) |
 | `handshake/` | TLS 1.3 client handshake, `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY; hybrid-curve key exchange (curve 4588 selected → decapsulate the ServerHello's 1088-B ML-KEM ciphertext, feed `pq ‖ classical` to the key schedule) |
 | `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked) |
-| `reality/` | `HelloProvisioner` + `SpecProvisioner` (`From<&Fingerprint>` — any of the 17 resolvable identities) + 9-step wire contract, `FixedChrome133`, auth-key/session-seal/server-auth, REALITY over the `X25519MLKEM768` share (curve 4588 — xray `reality.go:79` / sing-box `reality_client.go:136`), `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
+| `reality/` | `HelloProvisioner` + `SpecProvisioner` (`From<&Fingerprint>` — any resolvable identity over the 71-row two-tier table) + 9-step wire contract, `FixedChrome133` (the surviving wire-exact chrome_130 spec + the X25519MLKEM768 hybrid share — the Chrome-133 hand profile was dropped in the roster reduction), auth-key/session-seal/server-auth, REALITY over the `X25519MLKEM768` share (curve 4588 — xray `reality.go:79` / sing-box `reality_client.go:136`), `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
 | `http2/` | minimal h2 layer (tls.peet.ws grading + Spider-X fallback GETs) |
 | `error.rs` | `TlsError`/`Result` (thiserror) |
 
@@ -143,7 +171,7 @@ rustls client path and the `TlsProvider` plug are gone.
 
 | Path | Trigger | Mechanism | Status |
 |------|---------|-----------|--------|
-| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → chrome_133 default via `Fingerprint::default_for`), `WebPkiVerifier` via `verifier_for(insecure, pin)`; identity = `parse_fingerprint_id(fp)` + `profile_for` (exact ids: `chrome`/`chrome-randomized`/`firefox`/`safari`/`random` → Chrome130/Firefox128Esr/Safari17; unknown → config error) | ✅ |
+| Plain TLS | `tls` config | engine `TlsMode::Plain`: fingerprint-shaped hello from the `fp` profile (`None` → `Fingerprint::default_for(Browser::Chrome)` = the newest kept chrome row), `WebPkiVerifier` via `verifier_for(insecure, pin)`; identity = `parse_fingerprint_id(fp)` + `profile_for` (exact ids: `chrome`/`chrome-randomized`/`random` → Chrome v130 — the hand `chrome_130` band; `firefox` → Firefox v128 (Linux); `safari` → Safari v17 (macOS); unknown → config error) | ✅ |
 | REALITY | `reality` config | engine `TlsMode::Reality`: fingerprint-shaped hello with any resolvable identity via `SpecProvisioner::from(&Fingerprint)` (or a custom `HelloProvisioner`), sealed session id, X25519 auth key + HMAC/Ed25519 server auth (no PKI); Spider-X fallback on auth failure | ✅ |
 | Trust modes | `insecure` / `pin_sha256` | `with_insecure()` skips chain walk; `with_pin(sha256(SPKI))` replaces chain+SAN but **never** skips the CertificateVerify signature (a MITM must hold the private key) | ✅ |
 
@@ -175,9 +203,10 @@ with Go's `crypto/mlkem`). `SecP256r1MLKEM768` (4587) /
 `SecP384r1MLKEM1024` (4589) are parsed but rejected at handshake time — the
 engine has no P-256/P-384 ECDH (explicit error, not a silent classical
 fallback). REALITY accepts the 4588 share per xray `reality.go:79` /
-sing-box `reality_client.go:136`. The chrome133 profile's PQ fingerprint
-(supported_groups GREASE + X25519MLKEM768 + X25519/P256/P384, hybrid key
-share) now works end-to-end.
+sing-box `reality_client.go:136`. The fixed-chrome REALITY provisioner's PQ
+fingerprint (`fixed_chrome_spec` = the chrome_130 hand spec + the
+X25519MLKEM768 share: supported_groups GREASE + X25519MLKEM768 +
+X25519/P256/P384, hybrid key share) now works end-to-end.
 
 ## E2E coverage (tier 3)
 

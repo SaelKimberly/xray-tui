@@ -539,9 +539,10 @@ serialize — REALITY must agree twice with the same scalar.
 
 - `spec/` — declarative `ClientHelloSpec`/`ExtensionSpec`/`SessionIdSpec` +
   exact RFC 6066/8446 wire encodings; GREASE per RFC 8701.
-- `profiles/` — 12 browser profiles (`define_profiles!` macro): Chrome119/130/
-  133, ChromeAndroid130, Edge130, Brave167, Opera114, Firefox, Firefox128Esr,
-  Safari17, SafariIos17 (+ `Chrome` = Chrome130 alias).
+- `profiles/` — two-tier roster: hand tier (`hand_selected.rs`, `spec!`-declared)
+  = 2 wire-exact profiles (`chrome_130`, `edge_106`); generated tier
+  (`generated/`, emitted by `gen_specs.py --emit`) = 69 JA4-faithful entries —
+  the deterministic `select_roster` kept subset of the 1825-entry ja4db manifest.
 - `hello/` — `build_hello`/`to_record` (GREASE pairing, 512-byte record
   padding), `parse_hello`.
 - `crypto/` — TLS 1.3 key schedule (RFC 8448-verified), AEAD record keys
