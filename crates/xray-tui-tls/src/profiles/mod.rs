@@ -1,27 +1,10 @@
 //! Browser fingerprint profiles as spec data.
 //!
-//! Each profile module ports one `ClientHello` shape from the reference
-//! implementations (`thirdparty/tls-fingerprint/src/profiles/*.rs` and the
-//! uTLS `HelloChrome_133` preset) into a [`ClientHelloSpec`]. Each module
-//! exposes one `pub fn spec()`; resolution lives in
+//! The two surviving hand-transcribed profiles (`hand_selected::chrome_130`,
+//! `hand_selected::edge_106`) are declared via `spec!`; the generated
+//! roster (`generated/`) holds the JA4-faithful corpus. Resolution lives in
 //! `crate::fingerprints`.
 
-pub mod android11_okhttp;
-pub mod brave167;
-pub mod chrome;
-pub mod chrome119;
-pub mod chrome133;
-pub mod chrome_android130;
-pub mod edge;
-pub mod edge106;
-pub mod firefox;
-pub mod firefox120;
-pub mod firefox128esr;
-pub mod ios14;
-pub mod opera114;
-pub mod safari;
-pub mod safari16;
-pub mod safari_ios17;
 use crate::spec::{ClientHelloSpec, ExtensionSpec, SessionIdSpec};
 
 /// Assembles a [`ClientHelloSpec`] from the pieces a `spec!` declaration
@@ -319,6 +302,10 @@ macro_rules! spec_exts {
 // Generated JA4-faithful roster (Task 5 emitter output). Declared after the
 // `spec!` macro so its textual scope reaches `generated/*.rs`.
 pub mod generated;
+// The surviving hand-transcribed profiles (chrome_130, edge_106),
+// `spec!`-declared (see `hand_selected.rs`). Declared after the `spec!`
+// macro so its textual scope reaches the declarations.
+pub mod hand_selected;
 
 #[cfg(test)]
 mod tests {
@@ -340,23 +327,8 @@ mod tests {
     /// not reproduce (the ja4db export never carries GREASE ids).
     type SpecEntry = (&'static str, fn() -> ClientHelloSpec);
     const HAND_WRITTEN: &[SpecEntry] = &[
-        ("chrome", super::chrome::spec),
-        ("chrome_119", super::chrome119::spec),
-        ("chrome_130", super::chrome::spec),
-        ("chrome_133", super::chrome133::spec),
-        ("chrome_android_130", super::chrome_android130::spec),
-        ("edge_106", super::edge106::spec),
-        ("edge_130", super::edge::spec),
-        ("brave_167", super::brave167::spec),
-        ("opera_114", super::opera114::spec),
-        ("firefox", super::firefox::spec),
-        ("firefox_120", super::firefox120::spec),
-        ("firefox_128_esr", super::firefox128esr::spec),
-        ("safari_16", super::safari16::spec),
-        ("safari_17", super::safari::spec),
-        ("safari_ios_17", super::safari_ios17::spec),
-        ("ios_14", super::ios14::spec),
-        ("android_11_okhttp", super::android11_okhttp::spec),
+        ("chrome_130", super::hand_selected::chrome_130),
+        ("edge_106", super::hand_selected::edge_106),
     ];
 
     /// Hand-written + generated roster, concatenated — the `ALL_SPECS`
@@ -419,25 +391,12 @@ mod tests {
             .unwrap();
             let parsed = parse_hello(&hello.handshake_bytes).unwrap();
             let fields = Ja3Fields::from(&parsed);
-            // The tls-fingerprint Firefox models, the uTLS
-            // HelloFirefox_120 preset and the uTLS HelloAndroid_11_OkHttp
-            // preset carry no GREASE placeholders; the Chromium family,
-            // HelloIOS_14 and the uTLS Safari 16 / Edge 106 presets do.
-            // GREASE-free profiles have a JA3 that is stable across seeds.
-            // Generated entries are exempt: the ja4db export never carries
-            // GREASE ids, so the corpus shapes are GREASE-free by nature.
+            // Both surviving hand profiles (chrome_130, edge_106) carry a
+            // GREASE cipher slot — the family archetype the generated
+            // corpus does not reproduce (the ja4db export never carries
+            // GREASE ids, so generated entries are exempt by nature).
             let hand_written = HAND_WRITTEN.iter().any(|(n, _)| *n == name);
-            if hand_written
-                && !matches!(
-                    name,
-                    "firefox"
-                        | "firefox_120"
-                        | "firefox_128_esr"
-                        | "safari_17"
-                        | "safari_ios_17"
-                        | "android_11_okhttp"
-                )
-            {
+            if hand_written {
                 assert!(
                     parsed.cipher_suites.iter().any(|c| is_grease(*c)),
                     "{name} must carry a GREASE cipher slot"
@@ -448,86 +407,27 @@ mod tests {
         }
     }
 
-    /// Golden Firefox 128 ESR `ClientHello` captured from the reference
-    /// implementation (`tls-fingerprint` crate `profiles/firefox128esr.rs`,
-    /// same constants + extension list) with a fixed-seed RNG (all `0x42`),
-    /// X25519 public key `[0xAB; 32]`, and the builder's 512-byte padding
-    /// rule (the reference `build()` pads to a fixed 312 bytes; the
-    /// JA3-invisible padding length is the only divergence). The ported
-    /// spec must reproduce it byte-for-byte.
-    const EXPECTED_FF128_HELLO_HEX: &str = "010001f703034242424242424242424242424242424242424242424242424242424242424242204242424242424242424242424242424242424242424242424242424242424242001a130113021303c02bc02fc02cc030cca9cca8c013c014002f00350100019400000010000e00000b746c732e706565742e777300170000ff01000100000a000e000c001d00170018001901000101000b00020100002300000010000e000c02683208687474702f312e31000500050100000000003300260024001d0020abababababababababababababababababababababababababababababababab002b00050403040303000d001c001a0403050306030807080808040805080604010501060102010203002d00020101001b00050400030002001500da0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-
-    #[test]
-    fn firefox128esr_golden_hello_with_fixed_seed() {
-        let spec = super::firefox128esr::spec();
-        let rng = FixedRandom {
-            bytes: vec![0x42; 128],
-            pos: AtomicUsize::new(0),
-        };
-        let hello = build_hello(
-            &spec,
-            &BuildParams {
-                server_name: "tls.peet.ws",
-                alpn: None,
-                x25519_pub: &[0xAB; 32],
-                mlkem768_pub: None,
-                rng: &rng,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            hello.handshake_bytes,
-            super::decode_hex(EXPECTED_FF128_HELLO_HEX)
-        );
-    }
-
     #[test]
     fn all_spec_names_are_unique_snake_case() {
-        let mut seen = Vec::new();
-        for (name, _) in all_specs().iter().chain(std::iter::once(&(
-            "chrome_133_macro",
-            super::macro_tests::chrome133_macro as fn() -> ClientHelloSpec,
-        ))) {
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, _) in all_specs() {
             assert!(
                 name.chars()
                     .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
                 "{name} must be snake_case"
             );
-            assert!(!seen.contains(name), "duplicate profile name {name}");
+            assert!(!seen.contains(&name), "duplicate profile name {name}");
             seen.push(name);
         }
     }
 }
 
-/// Rebuilds `chrome133::spec` from declarative `spec!` tokens and asserts
-/// field-for-field equality with the hand-transcribed profile: same cipher
-/// suite order, GREASE slots, extension order, and raw extension bodies.
+/// Exercises the `spec!` macro arms directly (the surviving hand profiles
+/// in `hand_selected.rs` are themselves `spec!` declarations, so the macro
+/// is exercised in production code as well as here).
 #[cfg(test)]
 #[allow(clippy::redundant_pub_crate)] // spec! emits pub(crate) fn; the test module is private
 mod macro_tests {
-    use super::chrome133;
-
-    spec! {
-        chrome133_macro,
-        ciphers: GREASE, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c,
-                 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d,
-                 0x002f, 0x0035,
-        session: random32,
-        exts: grease, sni, raw[0x0017, ""], reneg,
-              groups[grease, mlkem768, x25519, p256, p384],
-              ecpf, ticket, alpn["h2", "http/1.1"], status,
-              sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501,
-                      0x0806, 0x0601],
-              sct, keyshare[grease, mlkem768, x25519], psk,
-              versions[grease, 0x0304, 0x0303], compress[zstd],
-              raw[0x446d, "0003026832"], grease
-    }
-
-    #[test]
-    fn macro_rebuilds_chrome133() {
-        assert_eq!(chrome133_macro(), chrome133::spec());
-    }
-
     spec! {
         kitchen_sink,
         ciphers: GREASE, 0x1301, 0x1302, 0xc02b,
@@ -544,10 +444,10 @@ mod macro_tests {
               raw[0x446d, "0003026832"], psk
     }
 
-    /// Exercises every `spec!` token form not covered by the chrome133
-    /// equivalence test: `session: empty`, `padding`, `appsettings`,
-    /// `rslimit`, `compress` names + literal, `grease` inside `sigalgs`,
-    /// named group ids incl. the P-curve ids, and a trailing comma.
+    /// Exercises every `spec!` token form: `session: empty`, `padding`,
+    /// `appsettings`, `rslimit`, `compress` names + literal, `grease`
+    /// inside `sigalgs`, named group ids incl. the P-curve ids, and a
+    /// trailing comma.
     #[test]
     fn kitchen_sink_macro_arms() {
         use crate::spec::grease::GREASE_PLACEHOLDER;

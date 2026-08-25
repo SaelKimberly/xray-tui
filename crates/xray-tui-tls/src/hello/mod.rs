@@ -176,8 +176,8 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 // Standalone GREASE extensions must carry DISTINCT values:
                 // real browsers draw each slot independently, and Go's TLS
                 // parser rejects a ClientHello with duplicate extension
-                // types (Chrome 133 carries two — see
-                // `profiles/chrome133.rs`). The first slot uses `grease_b`;
+                // types (the Edge 106 profile carries two — see
+                // `profiles/hand_selected.rs`). The first slot uses `grease_b`;
                 // later slots draw fresh values distinct from every
                 // extension type already used.
                 let value = if first_grease_ext {
@@ -443,11 +443,11 @@ mod tests {
         // Reference capture (run the CURRENT tls-fingerprint example with
         // the same fixed seed): RNG all 0x42 → every GREASE value 0x2A2A,
         // random and session id all 0x42, X25519 public key [0xAB; 32].
-        // The real chrome::spec() ends with a Padding extension, so the
+        // The real chrome_130 spec ends with a Padding extension, so the
         // record is padded to exactly 512 bytes (same target as the
         // reference `profiles/chrome.rs`). The ported builder must produce
         // byte-identical output.
-        let spec = crate::profiles::chrome::spec();
+        let spec = crate::profiles::hand_selected::chrome_130();
         // 2 GREASE bytes + 32 random + 32 session id = 66 bytes needed; give
         // the fixed RNG headroom so exhaustion is never the failure mode.
         let rng = FixedRandom {
@@ -575,7 +575,7 @@ mod tests {
         // Full Chrome 130 layout + padding, per the reference
         // (`chrome.rs:125-139`): the padding data length is
         // `512 - (unpadded record + 4)`, so the record is exactly 512 bytes.
-        let spec = crate::profiles::chrome::spec();
+        let spec = crate::profiles::hand_selected::chrome_130();
         let rng = FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
@@ -806,7 +806,7 @@ mod tests {
 
     #[test]
     fn parse_roundtrip_of_built_hello() {
-        let spec = crate::profiles::chrome::spec();
+        let spec = crate::profiles::hand_selected::chrome_130();
         let rng = FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),

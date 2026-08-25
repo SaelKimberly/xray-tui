@@ -98,7 +98,33 @@ impl ProvisionedHello {
     }
 }
 
-/// Fixed Chrome-133-shaped provisioner (first engine; ported from shoes).
+/// The wire-exact `chrome_130` spec with the X25519MLKEM768 key share (and
+/// its `supported_groups` entry) restored. Real Chrome 130+ sends the
+/// hybrid share; the JA4-driven profile omits it because JA3/JA4 do not
+/// fingerprint key shares. Grafting it back keeps REALITY's post-quantum
+/// path alive after the roster reduction dropped the Chrome-133 preset.
+fn fixed_chrome_spec() -> ClientHelloSpec {
+    let mut spec = crate::profiles::hand_selected::chrome_130();
+    for ext in &mut spec.extensions {
+        match ext {
+            ExtensionSpec::SupportedGroups(groups) => {
+                groups.insert(1, 0x11EC); // x25519mlkem768, after GREASE
+            }
+            ExtensionSpec::KeyShare(groups) => {
+                groups.insert(1, KeyShareGroup::X25519Mlkem768);
+            }
+            _ => {}
+        }
+    }
+    spec
+}
+
+/// Fixed Chrome-shaped provisioner (first engine; ported from shoes).
+///
+/// Serves the surviving wire-exact Chrome desktop spec
+/// (`profiles::hand_selected::chrome_130` plus the hybrid key share — see
+/// [`fixed_chrome_spec`]). The Chrome-133 hand profile was dropped in the
+/// roster reduction.
 pub struct FixedChrome133;
 
 /// A `HelloProvisioner` shaped by any concrete hello spec: REALITY's
@@ -171,7 +197,7 @@ impl HelloProvisioner for SpecProvisioner {
 
 impl HelloProvisioner for FixedChrome133 {
     fn provision(&self, params: &HelloProvisionParams<'_>) -> Result<ProvisionedHello> {
-        SpecProvisioner::new(crate::profiles::chrome133::spec).provision(params)
+        SpecProvisioner::new(fixed_chrome_spec).provision(params)
     }
 }
 
@@ -328,7 +354,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::fingerprints::Browser;
     use crate::hello::parse::parse_hello;
     use crate::http2;
     use parking_lot::Mutex;
@@ -409,13 +434,20 @@ mod tests {
     }
 
     #[test]
-    fn spec_provisioner_chrome133_matches_fixed_chrome133() {
-        // A fresh fixed-seed RNG per call: both provisioners must consume
-        // the identical byte stream (0x42 → every GREASE value 0x2A2A), so
-        // byte equality proves `SpecProvisioner::from(&chrome_133 fingerprint)`
-        // produces exactly what the fixed Chrome-133 provisioner produces.
+    fn fixed_chrome_provisioner_keeps_hybrid_share_and_chrome130_ja4() {
+        // The roster reduction dropped the Chrome-133 preset; the fixed
+        // provisioner now shapes the surviving chrome_130 spec with the
+        // X25519MLKEM768 key share grafted back (see `fixed_chrome_spec`).
+        // Assert both halves of that contract: the hello still offers the
+        // 1216-byte hybrid share (REALITY's PQ path), and its JA4-relevant
+        // wire — cipher set, extension ids, signature-alg order — still
+        // matches the chrome_130 profile exactly (JA3/JA4 do not
+        // fingerprint key shares, so the graft is invisible to them).
+        use crate::crypto::fingerprint::ja3::Ja3Fields;
+        use crate::crypto::fingerprint::ja4::full_ja4;
+
         let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
-        let fixed_rng = FixedRandom {
+        let rng = FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
         };
@@ -425,24 +457,43 @@ mod tests {
                 alpn: Some(REALITY_ALPN),
                 x25519_pub: &[0xAB; 32],
                 mlkem768_pub: Some(mlkem_pk.as_bytes()),
-                rng: &fixed_rng,
+                rng: &rng,
             })
             .unwrap();
-        let profile_rng = FixedRandom {
-            bytes: vec![0x42; 128],
-            pos: AtomicUsize::new(0),
-        };
-        let profile = SpecProvisioner::from(&Fingerprint::new(Browser::Chrome).with_version(133))
-            .provision(&HelloProvisionParams {
-                server_name: "www.microsoft.com",
-                alpn: Some(REALITY_ALPN),
-                x25519_pub: &[0xAB; 32],
-                mlkem768_pub: Some(mlkem_pk.as_bytes()),
-                rng: &profile_rng,
-            })
-            .unwrap();
-        assert_eq!(fixed.handshake_bytes, profile.handshake_bytes);
-        assert_eq!(fixed.session_id_range, profile.session_id_range);
+
+        let parsed = parse_hello(&fixed.handshake_bytes).unwrap();
+        let ks_ext = parsed.extension(0x0033).unwrap();
+        let list_len = u16::from_be_bytes([ks_ext[0], ks_ext[1]]) as usize;
+        let mut off = 2usize;
+        let mut saw_hybrid = false;
+        while off + 4 <= (2 + list_len).min(ks_ext.len()) {
+            let group = u16::from_be_bytes([ks_ext[off], ks_ext[off + 1]]);
+            let kx_len = u16::from_be_bytes([ks_ext[off + 2], ks_ext[off + 3]]) as usize;
+            if group == 0x11EC {
+                assert_eq!(kx_len, 1216, "X25519MLKEM768 share must be 1184 + 32 bytes");
+                saw_hybrid = true;
+            }
+            off += 4 + kx_len;
+        }
+        assert!(
+            saw_hybrid,
+            "fixed provisioner must offer the X25519MLKEM768 key share"
+        );
+
+        // The grafted hybrid share pushes the record past the 512-byte
+        // padding target, so the builder omits the padding extension —
+        // exactly what a real Chrome 130+ hello with a hybrid share looks
+        // like. Compare JA4 modulo padding, which is never fingerprinted.
+        let mut profile_spec = crate::profiles::hand_selected::chrome_130();
+        profile_spec
+            .extensions
+            .retain(|e| !matches!(e, ExtensionSpec::Padding));
+        let profile_ja4 = full_ja4(&Ja3Fields::from_spec(&profile_spec));
+        assert_eq!(
+            full_ja4(&Ja3Fields::from(&parsed)),
+            profile_ja4,
+            "fixed provisioner must preserve the chrome_130 JA4"
+        );
     }
 
     /// A plain rustls server (no REALITY on the wire): echoes the client's

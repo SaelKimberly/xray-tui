@@ -14,14 +14,13 @@ use xray_tui_proto::proto_spec::TlsConfig;
 use xray_tui_tls::SecureRandom;
 use xray_tui_tls::client::{TlsConfig as EngineTlsConfig, TlsMode, connect as client_connect};
 use xray_tui_tls::error::TlsError;
-use xray_tui_tls::fingerprints::{Browser, Fingerprint};
 use xray_tui_tls::handshake::ServerVerifier;
 use xray_tui_tls::reality::{HelloProvisioner, SpecProvisioner, SpiderConfig};
 
 use crate::BoxStream;
 use crate::context::LinkContext;
 use crate::error::{NativeError, timeouts};
-use crate::security::reality::HelloProvisionerChoice;
+use crate::security::reality::{FixedChrome133, HelloProvisionerChoice};
 
 /// Wrap the transport stream according to the profile's security config.
 ///
@@ -81,9 +80,13 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                         &fingerprint::parse_fingerprint_id(fp)
                             .and_then(fingerprint::profile_for)?,
                     )),
-                    None => Arc::new(SpecProvisioner::from(
-                        &Fingerprint::new(Browser::Chrome).with_version(133),
-                    )),
+                    // No explicit fingerprint: the fixed provisioner shapes
+                    // the surviving wire-exact chrome_130 spec (the
+                    // Chrome-133 hand profile was dropped in the roster
+                    // reduction). Byte-equivalent to the previous
+                    // chrome_133-fingerprint default modulo the dropped
+                    // profile's keyshare shape — see `fixed_chrome_spec`.
+                    None => Arc::new(FixedChrome133),
                 },
             };
             let spider = SpiderConfig {

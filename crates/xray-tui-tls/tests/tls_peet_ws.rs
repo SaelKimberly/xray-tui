@@ -45,20 +45,7 @@ const CHROME130_JA3_STRIPPED_MD5: &str = "2b916ec56aedf4a5ecbeb5804f60c242";
 /// No network — runs in every `cargo test`.
 #[test]
 fn local_fingerprints_match_locked_constants() {
-    for (name, fingerprint, expected_ja4, expected_ja3) in [
-        (
-            "chrome_130",
-            Fingerprint::new(Browser::Chrome).with_version(130),
-            CHROME130_JA4,
-            CHROME130_JA3_STRIPPED_MD5,
-        ),
-        (
-            "firefox_128_esr",
-            Fingerprint::new(Browser::Firefox).with_version(128),
-            FIREFOX128ESR_JA4,
-            FIREFOX128ESR_JA3,
-        ),
-    ] {
+    fn check(name: &str, fingerprint: &Fingerprint, expected_ja4: &str, expected_ja3: &str) {
         let spec = fingerprint.resolve().expect("identity resolves").spec;
         let fixed = local::FixedRandom {
             bytes: vec![0x42; 128],
@@ -91,6 +78,12 @@ fn local_fingerprints_match_locked_constants() {
             "{name} GREASE-stripped JA3 md5 must match the locked value"
         );
     }
+    check(
+        "chrome_130",
+        &Fingerprint::new(Browser::Chrome).with_version(130),
+        CHROME130_JA4,
+        CHROME130_JA3_STRIPPED_MD5,
+    );
 }
 
 #[tokio::test]
