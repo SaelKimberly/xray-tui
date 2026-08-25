@@ -521,22 +521,23 @@ mod tests {
 
     #[test]
     fn generated_only_identity_resolves_to_registered_ja4() {
-        // edge_79_windows_desktop is a generated-roster identity the hand
-        // tier strictly refuses (below edge_106 with no lower band
-        // witness). It must resolve, and the resolved hello must hash to
-        // the roster's registered source JA4 for that identity.
+        // chrome_148_android_desktop is a kept generated-roster identity
+        // the hand tier strictly refuses (no hand row serves Android
+        // desktop, and the Chrome desktop hand rows cap at 133). It must
+        // resolve, and the resolved hello must hash to the roster's
+        // registered source JA4 for that identity.
         let registered = GENERATED
             .iter()
-            .find(|e| e.name == "edge_79_windows_desktop")
-            .expect("roster pins edge_79_windows_desktop");
-        let r = Fingerprint::new(Browser::Edge)
-            .with_version(79)
-            .with_os(Os::Windows)
+            .find(|e| e.name == "chrome_148_android_desktop")
+            .expect("roster pins chrome_148_android_desktop");
+        let r = Fingerprint::new(Browser::Chrome)
+            .with_version(148)
+            .with_os(Os::Android)
             .with_device(Device::Desktop)
             .resolve()
             .unwrap();
         assert_eq!(r.name, registered.name);
-        assert_eq!(r.fingerprint.version, Some(79));
+        assert_eq!(r.fingerprint.version, Some(148));
         assert_eq!(r.ja4(), registered.ja4, "JA4 fidelity for {}", r.name);
     }
 
@@ -579,18 +580,18 @@ mod tests {
             .resolve()
             .unwrap();
         assert_eq!(ok.name, "chrome_119");
-        // 118 is below every hand chrome row, so the hand tier strictly
-        // refuses; the generated roster answers instead. Its Windows run
-        // spans majors 114–126, served by the run's greatest-major spec
-        // (chrome_126_windows_desktop).
+        // 93 is below every hand chrome row, so the hand tier strictly
+        // refuses; the kept generated roster answers instead. Its Windows
+        // run is the single-major band [93] (the kept Windows runs are
+        // 93 and 143, non-contiguous), served by chrome_93_windows_desktop.
         let generated = Fingerprint::new(Browser::Chrome)
-            .with_version(118)
+            .with_version(93)
             .with_os(Os::Windows)
             .with_device(Device::Desktop)
             .resolve()
             .unwrap();
-        assert_eq!(generated.name, "chrome_126_windows_desktop");
-        assert_eq!(generated.fingerprint.version, Some(118));
+        assert_eq!(generated.name, "chrome_93_windows_desktop");
+        assert_eq!(generated.fingerprint.version, Some(93));
         // 2 sits below every generated chrome run too: strict error.
         let err = Fingerprint::new(Browser::Chrome)
             .with_version(2)
@@ -601,8 +602,7 @@ mod tests {
 
     #[test]
     fn version_below_every_row_errors_with_available_list() {
-        // Chrome 3 now resolves via the generated roster (its Windows
-        // run starts at 3); 2 is below every run in both tiers.
+        // 2 is below every chrome run in both tiers: strict error.
         let fp = Fingerprint::new(Browser::Chrome).with_version(2);
         let err = fp.resolve().unwrap_err();
         let FingerprintError::Unknown { query, available } = err else {

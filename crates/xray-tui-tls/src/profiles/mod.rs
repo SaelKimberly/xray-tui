@@ -395,10 +395,10 @@ mod tests {
 
     #[test]
     fn all_profiles_build_and_parse() {
-        // Task 5 contract: the whole generated roster is wired in (the
-        // manifest is 1825 entries; a truncated roster would silently
-        // shrink this test's coverage).
-        assert_eq!(super::generated::GENERATED.len(), 1825);
+        // Task 2 contract: the generated kept roster is wired in (69
+        // entries; a truncated roster would silently shrink this test's
+        // coverage).
+        assert_eq!(super::generated::GENERATED.len(), 69);
         let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
         for (name, spec_fn) in all_specs() {
             let spec = spec_fn();

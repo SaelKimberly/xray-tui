@@ -36,11 +36,14 @@ Generator usage:
   (byte-deterministic; `--selftest` verifies committed == fresh render).
 - `--selftest` — parse/hash round-trip + emitter determinism checks.
 
-Output: the 1825-entry JA4-faithful roster (chrome 720, firefox 407,
-safari 33, chrome_android 359, safari_ios 306; fallback/okhttp empty).
+Output: a 69-entry kept JA4-faithful roster (the deterministic
+`select_roster` subset of the 1825-entry manifest: top-3 distinct JA4
+clusters per browser/os/device triple, family-range filtered, PSK
+excluded, 2 hand-upgraded slots removed). Only `kept` manifest entries
+are emitted; `specs_manifest.json` carries the `kept` flags.
 Fidelity contract: each emitted spec's built ClientHello must reproduce
 its registered source JA4 — enforced offline by
-`tests/generated_ja4_gate.rs` (1825/1825) and confirmed live by the
+`tests/generated_ja4_gate.rs` (69/69) and confirmed live by the
 grader `--roster` sweep against tls.peet.ws (`docs/tls-fingerprint-roster.md`).
 
 Self-test: `python3 gen_specs.py --selftest`
@@ -714,6 +717,28 @@ def _manifest_entry_json(e: dict) -> dict:
         "wire": e["wire"], "low_fidelity": e["low_fidelity"],
     }
 
+
+def _write_manifest(csv_dir: str) -> int:
+    """Build the manifest, mark the kept-roster subset and write
+    specs_manifest.json (the `--emit` input). Every entry carries
+    `"kept": name in select_roster(...)`; the emitter renders only those."""
+    man = build_manifest(csv_dir)
+    kept = select_roster(man["entries"])
+    entries = []
+    for e in man["entries"]:
+        j = _manifest_entry_json(e)
+        j["kept"] = j["name"] in kept
+        entries.append(j)
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"entries": entries, "stats": man["stats"]}, fh,
+                  indent=1)
+        fh.write("\n")
+    n_kept = sum(1 for e in entries if e["kept"])
+    print(f"wrote {len(entries)} entries to {MANIFEST_PATH} "
+          f"({n_kept} kept)")
+    return 0
+
+
 # --- kept-roster selection -----------------------------------------------------
 #
 # Deterministic reduction of the generated roster: top-3 observed distinct
@@ -1239,19 +1264,7 @@ def _selftest() -> int:
     assert a_bad == 0, f"{a_bad} entries fail A-part reconstruction"
     assert full_bad == 0, f"{full_bad} entries fail full-JA4 reconstruction"
 
-    # Task 5: emitter determinism + regenerate == committed. Rendering the
-    # manifest twice must be byte-identical, and the committed files must
-    # equal a fresh render (--emit output is the committed artifact).
-    entries = [_manifest_entry_json(e) for e in man["entries"]]
-    texts = render_modules(entries)
-    assert render_modules(entries) == texts, "emitter output not deterministic"
-    for fname, text in sorted(texts.items()):
-        path = os.path.join(GENERATED_DIR, fname)
-        with open(path, encoding="utf-8") as fh:
-            assert fh.read() == text, (
-                f"{path} differs from a fresh render — run `--emit` and "
-                f"commit the result")
-    # Task 1: deterministic kept-roster selection. The 2 hand-upgraded
+    # Task 2: the kept roster is what gets emitted. The 2 hand-upgraded
     # generated slots (chrome_148_windows_desktop, edge_149_windows_desktop)
     # are excluded; chrome_143_windows_desktop / edge_128_windows_desktop are
     # second-slot distinct-JA4 variants and MUST remain.
@@ -1259,8 +1272,44 @@ def _selftest() -> int:
     assert sorted(kept) == sorted(KEPT_STATS), (
         f"kept roster mismatch: {sorted(kept - set(KEPT_STATS))} extra, "
         f"{sorted(set(KEPT_STATS) - kept)} missing")
+
+    # Task 5: emitter determinism + regenerate == committed. Rendering the
+    # manifest twice must be byte-identical, and the committed files must
+    # equal a fresh render of the kept subset (--emit output is the
+    # committed artifact; only `kept` entries are emitted).
+    entries = [_manifest_entry_json(e) for e in man["entries"]]
+    for e in entries:
+        e["kept"] = e["name"] in kept
+    # The committed manifest carries the same kept flags as the selection.
+    with open(MANIFEST_PATH, encoding="utf-8") as fh:
+        committed = json.load(fh)
+    committed_kept = {e["name"] for e in committed["entries"]
+                      if e.get("kept")}
+    assert committed_kept == kept, (
+        f"committed manifest kept flags drifted: "
+        f"{sorted(committed_kept - kept)} extra, "
+        f"{sorted(kept - committed_kept)} missing")
+    kept_entries = [e for e in entries if e["kept"]]
+    texts = render_modules(kept_entries)
+    assert render_modules(kept_entries) == texts, \
+        "emitter output not deterministic"
+    for fname, text in sorted(texts.items()):
+        path = os.path.join(GENERATED_DIR, fname)
+        with open(path, encoding="utf-8") as fh:
+            assert fh.read() == text, (
+                f"{path} differs from a fresh render — run `--emit` and "
+                f"commit the result")
+    rendered_names = {e["name"] for e in kept_entries}
+    assert len(rendered_names) == 69, \
+        f"expected 69 kept entries, got {len(rendered_names)}"
+    for excluded in ("chrome_148_windows_desktop",
+                     "edge_149_windows_desktop"):
+        assert excluded not in rendered_names, (
+            f"excluded hand-upgraded slot {excluded} still emitted")
     print(f"selection: {len(kept)} kept generated names == expected "
           f"{len(KEPT_STATS)} (2 hand-upgraded slots excluded)")
+    print(f"emit: {len(kept_entries)} entries -> {len(texts)} files, "
+          f"excluded slots absent, manifest kept flags consistent")
     print("PASS")
     return 0
 
@@ -1294,5 +1343,11 @@ if __name__ == "__main__":
     if args.emit:
         with open(MANIFEST_PATH, encoding="utf-8") as fh:
             manifest = json.load(fh)
-        sys.exit(_write_modules(manifest["entries"]))
+        entries = manifest["entries"]
+        # Kept roster: the `kept` flag written by --manifest is
+        # authoritative; recomputing select_roster covers manifests that
+        # predate the flag. Both routes are deterministic and agree.
+        kept = select_roster(entries)
+        entries = [e for e in entries if e.get("kept", e["name"] in kept)]
+        sys.exit(_write_modules(entries))
     ap.error("nothing to do; pass --selftest, --manifest or --emit")

@@ -1,6 +1,7 @@
-//! Offline JA4 oracle gate over the entire generated roster.
+//! Offline JA4 oracle gate over the generated kept roster.
 //!
-//! Every entry of [`generated::GENERATED`] (1825 profiles) is built into a
+//! Every entry of [`generated::GENERATED`] (69 kept profiles, the
+//! `select_roster` subset of the 1825-entry manifest) is built into a
 //! `ClientHello` with a fixed-seed RNG (all-`0x5A` fixture, the same
 //! pattern as the `profiles/mod.rs` tests), parsed back, and its JA4 is
 //! recomputed with the crate's own `full_ja4` codec. The registered
@@ -9,14 +10,10 @@
 //! result: GREASE ids are excluded from every JA4 segment and SNI value /
 //! random bytes / padding length are JA4-invisible.
 //!
-//! Three corpus-vs-codec semantics gaps prevent byte-exact `full_ja4`
-//! equality for part of the roster; each is classified and asserted to
-//! its fully verifiable components (failures on anything else):
+//! Corpus-vs-codec semantics gaps prevent byte-exact `full_ja4` equality
+//! for part of the kept roster; each is classified and asserted to its
+//! fully verifiable components (failures on anything else):
 //!
-//! - **no-sig** (exactly 102, the Task 5 known limitation): the source raw
-//!   string carried no signature-algorithm segment, so the registered
-//!   hash2 has no sig segment while every built hello carries one. The
-//!   A-part, hash1 and the extension part of hash2 are still asserted.
 //! - **padding-in-hello**: `ja4.rs` hash2 excludes padding (`peet.ws`
 //!   semantics) but the corpus keeps `0015` (original `FoxIO` rule). When
 //!   the built hello carries a padding extension the full hash cannot
@@ -234,11 +231,32 @@ fn every_generated_entry_hashes_to_source_ja4() {
         u32::try_from(total).expect("roster fits in u32"),
         "classification must cover the whole roster"
     );
-    // The no-sig class is the committed Task 5 known limitation (raw
-    // strings without a signature-algorithm segment); the manifest-derived
-    // count is part of the gate contract.
+    // Kept-roster classification contract (recomputed over the 69 kept
+    // entries after the roster reduction; a drift in any class means the
+    // emitted roster's semantics changed and the counts are re-derived
+    // from the manifest before updating these).
+    assert_eq!(total, 69, "kept roster drifted from 69 entries");
     assert_eq!(
-        no_sig, 102,
-        "no-sig entries (full-hash unverifiable by design) drifted from the known 102"
+        full, 49,
+        "full-hash (byte-exact) entries drifted from the kept-roster 49"
+    );
+    assert_eq!(
+        padding_in_hello, 16,
+        "padding-in-hello entries drifted from the kept-roster 16"
+    );
+    assert_eq!(
+        padding_omitted, 4,
+        "padding-omitted entries drifted from the kept-roster 4"
+    );
+    // The no-sig class (raw strings without a signature-algorithm segment;
+    // 102 across the full 1825-entry manifest) is absent from the kept
+    // roster: no kept entry's registered hash2 lacks the sig segment.
+    assert_eq!(
+        no_sig, 0,
+        "no-sig entries appeared in the kept roster; expected none"
+    );
+    assert_eq!(
+        ht_letter, 3,
+        "ht-letter entries drifted from the kept-roster 3"
     );
 }
