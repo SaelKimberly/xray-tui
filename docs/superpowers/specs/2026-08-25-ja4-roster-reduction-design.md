@@ -94,8 +94,8 @@ Kills Chrome 619, Chrome 9/linux, Firefox 2/3, Brave 1, Safari 5-era junk.
 18 distinct JA4s, 0 PSK, 50 low-fidelity. Triples with survivors: 26.
 Triples with no survivors after floors: chrome/linux, firefox/linux,
 firefox/android-tablet, opera/android-tablet, brave/ios(phone/tablet),
-opera/linux, firefox/macos none. These are covered by the cross-triple
-fallback (§3), not dropped from resolution.
+opera/linux. These are covered by the cross-triple fallback (§3), not
+dropped from resolution.
 
 ## Hand-tier conversion
 
