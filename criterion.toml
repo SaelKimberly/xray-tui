@@ -1,0 +1,3 @@
+# cargo-criterion configuration (https://github.com/criterion-rs/cargo-criterion)
+# Benchmark data lives outside target/ so `cargo clean` does not purge results.
+criterion_home = "./.benchmarks"

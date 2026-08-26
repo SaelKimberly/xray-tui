@@ -2,6 +2,7 @@
 name = "xray-tui-dns"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -23,6 +24,7 @@ anyhow.workspace = true
 
 # ============ Observability ============
 tracing.workspace = true
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true

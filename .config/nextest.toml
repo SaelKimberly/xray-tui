@@ -1,0 +1,9 @@
+# Repository configuration for cargo-nextest (https://nexte.st/docs/configuration/)
+
+# CI profile: run every test, report all failures, minimal output.
+# Launched via `cargo nextest run --profile ci` (the `just quality-gate-ci` test step).
+[profile.ci]
+inherits = "default"
+fail-fast = false
+status-level = "fail"
+final-status-level = "fail"

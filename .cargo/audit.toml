@@ -1,0 +1,23 @@
+# cargo-audit project configuration.
+# Location is tool-fixed: .cargo/audit.toml (cargo-audit has no --config flag and ignores .config/).
+# `path`/`url` omitted: a literal `~` in a config path is NOT expanded by cargo-audit
+# (rustsec issue #585 — it creates a literal `./~` directory); the built-in defaults
+# (~/.cargo/advisory-db via home_dir, github.com/rustsec/advisory-db) are correct.
+
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained", "unsound", "notice"]
+severity_threshold = "low"
+
+[database]
+fetch = true
+stale = false
+
+[output]
+format = "terminal"
+quiet = false
+show_tree = true
+
+[yanked]
+enabled = true
+update_index = true

@@ -465,7 +465,9 @@ mod local {
         };
         let len = usize::from(u16::from_be_bytes([body[0], body[1]]));
         rest[..len.min(rest.len())]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect()
     }

@@ -37,7 +37,9 @@ pub(crate) fn decode_hex(s: &str) -> Vec<u8> {
         "spec! raw body must be even-length hex, got {s:?}"
     );
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| (hex_val(c[0]) << 4) | hex_val(c[1]))
         .collect()
 }

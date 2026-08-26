@@ -290,7 +290,7 @@ impl ChunkState {
 
     fn block_words(&self) -> [u32; 16] {
         let mut words = [0u32; 16];
-        for (word, chunk) in words.iter_mut().zip(self.block.chunks_exact(4)) {
+        for (word, chunk) in words.iter_mut().zip(self.block.as_chunks::<4>().0.iter()) {
             *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         words

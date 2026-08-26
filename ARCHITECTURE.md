@@ -14,14 +14,19 @@ xray-tui (bin)
   └── xray-tui-host-features  (SNI/IP/CIDR whitelist membership — enrichment pipeline)
 ```
 
-Native stack (in-process tunnel alternative to the subprocess path; not yet
-wired into the binary — verified standalone via its e2e harness):
+	Native stack (in-process tunnel alternative to the subprocess path; not yet
+	wired into the binary — verified standalone via its e2e harness):
 
-```
-xray-tui-native     (in-process proxy core — VLESS + VMess tunnels, security phase)
-  ├── xray-tui-tls   (ring TLS 1.3 client, browser fingerprints, REALITY client)
-  └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
-```
+	```
+	xray-tui-native     (in-process proxy core — VLESS + VMess tunnels, security phase)
+	  ├── xray-tui-tls   (ring TLS 1.3 client, browser fingerprints, REALITY client)
+	  └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
+	```
+
+	Build tooling: `xray-tui-hakari` (crates/xray-tui-hakari/) is a cargo-hakari
+	generated feature-unification crate — every workspace member depends on it,
+	its dependencies exist only to unify feature flags and are never referenced
+	from code. Regenerate after any Cargo.lock change (`cargo hakari generate`).
 
 ## Crate Responsibilities
 

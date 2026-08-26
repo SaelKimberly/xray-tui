@@ -260,7 +260,7 @@ fn parse_ack(conv: u16, opt: SegmentOption, body: &[u8]) -> Option<Segment> {
         return None;
     }
     let mut list = Vec::with_capacity(count);
-    for chunk in numbers[..count * 4].chunks_exact(4) {
+    for chunk in numbers[..count * 4].as_chunks::<4>().0 {
         list.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Some(Segment::Ack {
@@ -273,7 +273,12 @@ fn parse_ack(conv: u16, opt: SegmentOption, body: &[u8]) -> Option<Segment> {
     })
 }
 
-fn parse_cmd_only(conv: u16, cmd: Command, opt: SegmentOption, body: &[u8]) -> Option<Segment> {
+const fn parse_cmd_only(
+    conv: u16,
+    cmd: Command,
+    opt: SegmentOption,
+    body: &[u8],
+) -> Option<Segment> {
     if body.len() < 12 {
         return None;
     }

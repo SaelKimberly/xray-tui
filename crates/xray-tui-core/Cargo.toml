@@ -2,6 +2,7 @@
 name = "xray-tui-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 
 [features]
@@ -20,11 +21,8 @@ thiserror.workspace = true
 reqwest.workspace = true
 reqwest.features = ["socks", "stream", "json"]
 
-# ============ Config & Filesystem ============
-dirs.workspace = true
-
 # ============ Async Runtime & I/O ============
-tokio.workspace = true
+	tokio.workspace = true
 tokio.features = ["process", "signal", "sync", "fs", "time", "io-util", "rt", "rt-multi-thread", "net"]
 futures-util.workspace = true
 
@@ -52,8 +50,8 @@ flate2 = "1.1"
 tar = "0.4"
 
 # ============ Internal ============
-xray-tui-db = { path = "../xray-tui-db" }
-xray-tui-proto = { path = "../xray-tui-proto" }
+xray-tui-db = { path = "../xray-tui-db", version = "0.1.0" }
+xray-tui-proto = { path = "../xray-tui-proto", version = "0.1.0" }
 
 # ============ Logging ============
 tracing.workspace = true
@@ -63,12 +61,19 @@ tempfile = "3"
 # ============ Persistent Log Storage ============
 heed = { version = "0.22" }
 postcard = { version = "1", features = ["alloc"] }
-byteorder = "1"
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
-[build-dependencies]
-tonic-prost-build = "0.14"
+	[build-dependencies]
+	tonic-prost-build = "0.14"
 
-[dev-dependencies]
-xray-tui-config = { path = "../xray-tui-config" }
-toasty = "0.9"
-jiff.workspace = true
+	[dev-dependencies]
+	toasty = "0.9"
+	jiff.workspace = true
+
+	[package.metadata.cargo-machete]
+	# Deps used only by build.rs / OUT_DIR-generated code (invisible to
+	# cargo-machete) or documented feature overrides:
+	# - prost, tonic-prost, tonic-prost-build: tonic codegen output in OUT_DIR
+	# - tokio-rustls: deliberate transitive backend override (ring pin), see the
+	#   comment in [dependencies]
+	ignored = ["prost", "tonic-prost", "tonic-prost-build", "tokio-rustls"]

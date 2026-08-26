@@ -608,7 +608,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
     // `async` per the SP3 plan interface — the caller (connect_udp, the
     // XUDP path) awaits it; the body is sync because no eager New frame
     // is sent.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub(crate) async fn open_udp_session(&self, global_id: [u8; 8]) -> io::Result<UdpSession> {
         if self.dead.load(Ordering::Acquire) {
             return Err(tunnel_closed());

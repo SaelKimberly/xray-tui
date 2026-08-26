@@ -422,7 +422,9 @@ mod tests {
     fn decode_hex(s: &str) -> Vec<u8> {
         assert_eq!(s.len() % 2, 0, "hex string must have even length");
         s.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (hex_val(c[0]) << 4) | hex_val(c[1]))
             .collect()
     }
@@ -518,7 +520,9 @@ mod tests {
         // supported_groups[0] → grease_a (skip the u16 byte-length prefix).
         let groups = parsed.extension(0x000A).expect("supported_groups");
         let groups: Vec<u16> = groups[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(groups[0], 0x0A0A);
@@ -526,7 +530,9 @@ mod tests {
         // prefix).
         let key_share = parsed.extension(0x0033).expect("key_share");
         let ks_groups: Vec<u16> = key_share[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(ks_groups[0], 0x0A0A);

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 
-members = ["crates/*", "crates/xray-tui-tls"]
+members = ["crates/*", "crates/xray-tui-hakari", "crates/xray-tui-tls"]
 
 [workspace.package]
 version = "0.1.0"
@@ -89,9 +89,9 @@ rustls = { version = "0.23", default-features = false }
 ratatui-themes = "0.2"
 
 # ============ Proto crate ============
-xray-tui-proto = { path = "crates/xray-tui-proto" }
+xray-tui-proto = { path = "crates/xray-tui-proto", version = "0.1.0" }
 # ============ TLS engine crate ============
-xray-tui-tls = { path = "crates/xray-tui-tls" }
+xray-tui-tls = { path = "crates/xray-tui-tls", version = "0.1.0" }
 
 # ============ Logging ============
 tracing = { version = "0.1" }
@@ -100,3 +100,7 @@ tracing = { version = "0.1" }
 humantime = "2.4.0"
 url = "2"
 jiff = "0.2"
+[workspace.metadata.cargo-machete]
+# The hakari (feature-unification) crate's dependencies are never referenced
+# from code by design; its own manifest carries the full per-crate ignore list.
+ignored = ["xray-tui-hakari"]

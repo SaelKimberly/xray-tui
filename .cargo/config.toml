@@ -1,3 +1,7 @@
+[build]
+rustc-wrapper = "sccache"
+incremental = false
+
 [target.'cfg(target_os = "linux")']
 linker = "clang"
 rustflags = ["-Clink-arg=-fuse-ld=mold", "-Ctarget-cpu=native"]

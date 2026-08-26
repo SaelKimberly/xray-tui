@@ -2,6 +2,7 @@
 name = "xray-tui-native"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -98,6 +99,7 @@ tiny_http = { version = "0.12", optional = true }
 # only (workspace TLS standard — tokio-rustls 0.26 defaults to aws_lc_rs;
 # see the workspace rustls pin / xray-tui-core's transitive override).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true

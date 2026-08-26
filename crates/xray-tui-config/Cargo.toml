@@ -2,6 +2,7 @@
 name = "xray-tui-config"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # ============ Serialization ============
@@ -25,8 +26,7 @@ simdutf8 = "0.1"
 url.workspace = true
 
 # ============ Text / Search / Hash ============
-uuid.workspace = true
-aho-corasick.workspace = true
+	aho-corasick.workspace = true
 memchr.workspace = true
 ratatui-themes.workspace = true
 
@@ -34,12 +34,9 @@ ratatui-themes.workspace = true
 smallvec.workspace = true
 
 # ============ Internal ============
-xray-tui-core = { path = "../xray-tui-core" }
-xray-tui-proto = { path = "../xray-tui-proto" }
-xray-tui-db = { path = "../xray-tui-db" }
-
-# ============ Logging ============
-tracing.workspace = true
+xray-tui-core = { path = "../xray-tui-core", version = "0.1.0" }
+xray-tui-proto = { path = "../xray-tui-proto", version = "0.1.0" }
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true

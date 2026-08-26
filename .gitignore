@@ -9,6 +9,7 @@ ralph.yml
 *.zip
 *.tar.gz
 .worktrees/
+.benchmarks/
 
 # SDD scratch (per-plan workspaces, briefs, review packages)
 .superpowers/

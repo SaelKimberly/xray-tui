@@ -570,36 +570,36 @@ mod tests {
     }
 
     impl SchedulerDb for MockDb {
-        async fn read_link(
+        fn read_link(
             &self,
             protocol_id: ProtocolId,
             endpoint_id: EndpointId,
-        ) -> xray_tui_db::Result<Option<ProfileStats>> {
+        ) -> impl Future<Output = xray_tui_db::Result<Option<ProfileStats>>> + Send {
             let state = self.state.lock();
-            Ok(state
-                .get(&(protocol_id.get(), endpoint_id.get()))
-                .map(|(task_id, queue)| {
+            std::future::ready(Ok(state.get(&(protocol_id.get(), endpoint_id.get())).map(
+                |(task_id, queue)| {
                     link(
                         protocol_id.get(),
                         endpoint_id.get(),
                         *task_id,
                         queue.clone(),
                     )
-                }))
+                },
+            )))
         }
 
-        async fn write_task_state(
+        fn write_task_state(
             &self,
             protocol_id: ProtocolId,
             endpoint_id: EndpointId,
             task_id: Option<u16>,
             queue: &[u16],
-        ) -> xray_tui_db::Result<()> {
+        ) -> impl Future<Output = xray_tui_db::Result<()>> + Send {
             self.state.lock().insert(
                 (protocol_id.get(), endpoint_id.get()),
                 (task_id, queue.to_vec()),
             );
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 

@@ -52,6 +52,7 @@ cargo run
 - `crates/xray-tui-native/src/` — in-process native proxy core (subprocess-free alternative to spawning xray-core/sing-box). Layering (Xray composition order): dial → security → transport upgrade → protocol → tunnel, folded by `connect_chain` — TLS is OUTERMOST, ws/grpc framing runs INSIDE the engine TLS session (matches xray/sing-box; xhttp with a single `h3` ALPN is the exception — `connect_quic` replaces dial + security + upgrade, quinn/rustls is internal and the engine TLS never wraps QUIC). **XHTTP mode auto-rule mirrors xray: `""`/`auto` → packet-up; reality present → stream-one (legacy v1, single full-duplex request, no session id); reality + download_settings → stream-up.** Transports: `transport/tcp.rs` (dial), `transport/ws.rs` (tokio-tungstenite over the engine stream, v2ray Host/path/headers, write-through), `transport/grpc.rs` (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via …
 - **SP7 VLESS ML-KEM (post-quantum)** — spans both crates: `xray-tui-tls` gains ML-KEM-768 primitives (`crypto/mlkem.rs`, liboqs via `oqs` vendored — 2nd major dep), the X25519MLKEM768 hybrid curve (4588) in plain + REALITY handshakes (client share ek(1184)‖x25519pub(32); ServerHello ct(1088)‖x25519pub(32); IKM = pq‖classical — Go wire order), PQ fingerprints end-to-end (the `FixedChrome133` provisioner = chrome_130 hand spec + the X25519MLKEM768 share), and curve-name parsing (23/24/25/29/4587/4588/4589; P-curve hybrids parsed but rejected — no P-256/P-384 ECDH); `xray-tui-native` gains `protocol/vless/encryption/` (`mlkem768x25519plus` account encryption: native/xorpub/random modes + padding, ChaCha-only client sealing, 0-RTT resume omitted). Proto modified (encryption parser + curve names). e2e: vless/vmess tls-pq rows BOTH cores (negotiated-hybrid asserted); reality-pq ignored (harness dest has no PQ — needs Go 1.24+/OpenSSL 3.5 dest); pq-enc ignored (open real-xray interop divergence, xray-single-core anyway). Counts: unit 476 lib (142 tls + 334 native) + proto 343; e2e 136 = 130 green + 6 ignored (vless 78+6, vmess 52).
 
+- `crates/xray-tui-hakari/` — generated feature-unification crate (cargo-hakari); deps exist only to unify features, never referenced from code. Every member depends on it; regenerate after any Cargo.lock change.
 ### TUI screens (crates/xray-tui/src/ui/)
 - `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
 - `profiles.rs` — profile list DataGrid with connected indicator, Test column (colored delay + `[name]`/`[fast]`/`[real]` labels from the persisted failure marker), Feat flag column, multi-sort indicators (Test column sortable: ranks endpoints by best protocol's test priority), purgatory view filter (`p`: Active/Stale/All), tree markers (▶/▾) for expandable endpoints, column separators; sub-row protocol variants; reverse-highlighted selected sub-row; multi-select, delete confirmation, batch import overlay; expand/collapse (←/→), variant navigation (↑↓), Enter to activate variant
@@ -254,6 +255,17 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 
 - `cargo test` — runs all tests
 - `cargo clippy` — lint
+- `just quality-gate` — full quality gate: fmt, hakari, clippy, nextest, deny, machete, outdated, audit
+	  (verbose report; `just quality-gate-ci` for CI, exit-code only, stops at first failure)
+	- Unused deps: `cargo machete --with-metadata --skip-target-dir`; ignores live in
+	  `[package/workspace.metadata.cargo-machete]` (Cargo.toml). The hakari crate's
+	  deps are ignored by design — regenerate its list after `cargo hakari generate`:
+	  `awk '/^\[/ {in_deps = ($0 ~ /dependencies\]/)} in_deps && /^[a-zA-Z0-9_-]+ = \{/ {print $1}' Cargo.toml | sort -u`
+	- Outdated deps: `cargo outdated --workspace --root-deps-only` — informational
+	  (`--exit-code 0`); semver-major tracks (toasty 0.10, base64 0.23, brotli 8,
+	  sha2 0.11) need manual triage, so the gate never hard-fails on them
+- Benchmarks: run only via `cargo criterion` (criterion.toml; results in `.benchmarks/`, survive `cargo clean`);
+  `cargo bench` is not used
 - `cargo build --release` — release build
 - Manual: run xray-tui against real xray-core and sing-box binaries, verify connect/speedtest/disconnect flow for both backends
 

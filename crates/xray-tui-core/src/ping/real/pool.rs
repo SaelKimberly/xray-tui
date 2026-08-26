@@ -251,7 +251,7 @@ impl CorePool {
                 // Wait for SOCKS5 readiness — evict core on failure
                 if wait_for_socks5(&self.proxy_addr, port, READY_DEADLINE)
                     .await
-                    .is_err()
+                    .is_none()
                 {
                     let _ = guard.take();
                     return super::super::PingResult {
@@ -377,7 +377,7 @@ impl CorePool {
         // Wait for SOCKS5 readiness — return error on failure
         if wait_for_socks5(&self.proxy_addr, port, READY_DEADLINE)
             .await
-            .is_err()
+            .is_none()
         {
             return super::super::PingResult {
                 profile_key: super::super::ProfileKey {

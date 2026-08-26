@@ -68,7 +68,9 @@ pub fn parse_hello(handshake_bytes: &[u8]) -> Result<ParsedClientHello, TlsError
     }
     let cs_bytes = r.take(cs_len)?;
     let cipher_suites = cs_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
         .collect();
 

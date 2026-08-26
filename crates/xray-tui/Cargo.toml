@@ -2,15 +2,16 @@
 name = "xray-tui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
-xray-tui-core = { path = "../xray-tui-core" }
-xray-tui-db = { path = "../xray-tui-db" }
-xray-tui-config = { path = "../xray-tui-config" }
-xray-tui-proto = { path = "../xray-tui-proto" }
-xray-tui-geoip = { path = "../xray-tui-geoip" }
-xray-tui-dns = { path = "../xray-tui-dns" }
-xray-tui-host-features = { path = "../xray-tui-host-features" }
+xray-tui-core = { path = "../xray-tui-core", version = "0.1.0" }
+xray-tui-db = { path = "../xray-tui-db", version = "0.1.0" }
+xray-tui-config = { path = "../xray-tui-config", version = "0.1.0" }
+xray-tui-proto = { path = "../xray-tui-proto", version = "0.1.0" }
+xray-tui-geoip = { path = "../xray-tui-geoip", version = "0.1.0" }
+xray-tui-dns = { path = "../xray-tui-dns", version = "0.1.0" }
+xray-tui-host-features = { path = "../xray-tui-host-features", version = "0.1.0" }
 toasty = "0.9"
 jiff.workspace = true
 
@@ -44,11 +45,8 @@ tui-popup = "0.7"
 tui-scrollbar = "0.2"
 arboard = "3.6"
 
-# ============ CLI ============
-clap = { version = "4.6", features = ["derive"] }
-
 # ============ Error Handling ============
-anyhow = "1.0"
+	anyhow = "1.0"
 
 # ============ Text / Search / Hash ============
 uuid.workspace = true
@@ -58,9 +56,9 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "json"] }
 chrono = { version = "0.4" }
 humantime.workspace = true
-regex = "1"
 url.workspace = true
 parking_lot = "0.12"
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true

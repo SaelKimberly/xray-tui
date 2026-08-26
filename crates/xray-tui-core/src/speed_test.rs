@@ -53,11 +53,11 @@ pub async fn tcp_ping(
 
 /// Poll a SOCKS5 proxy port until it responds with a valid server-selection
 /// (VER=5, METHOD=0x00), indicating the proxy stack is fully initialized.
-/// Polls every 50ms up to `deadline`. Returns `Ok(())` on success, `Err(())` on timeout.
+/// Polls every 50ms up to `deadline`. Returns `Some(())` on success, `None` on timeout.
 ///
 /// Pattern from v2rayN's `WaitForProxyPort()` — more reliable than raw TCP connect
 /// because it confirms the SOCKS5 handshake layer is ready, not just the TCP listener.
-pub async fn wait_for_socks5(addr: &str, port: u16, deadline: Duration) -> Result<(), ()> {
+pub async fn wait_for_socks5(addr: &str, port: u16, deadline: Duration) -> Option<()> {
     let start = Instant::now();
     let greeting: [u8; 3] = [0x05, 0x01, 0x00]; // VER=5, NMETHODS=1, METHOD=0 (no auth)
     let mut buf = [0u8; 2];
@@ -69,16 +69,16 @@ pub async fn wait_for_socks5(addr: &str, port: u16, deadline: Duration) -> Resul
                     && stream.read_exact(&mut buf).await.is_ok()
                     && buf == [0x05, 0x00]
                 {
-                    return Ok(());
+                    return Some(());
                 }
             }
             Err(_) if start.elapsed() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Err(_) => return Err(()),
+            Err(_) => return None,
         }
         if start.elapsed() >= deadline {
-            return Err(());
+            return None;
         }
     }
 }
@@ -462,7 +462,7 @@ mod tests {
     async fn wait_for_socks5_timeout() {
         // Port 1 is privileged — no real service listens there
         let result = wait_for_socks5("127.0.0.1", 1, Duration::from_millis(100)).await;
-        assert!(result.is_err());
+        assert!(result.is_none());
     }
 
     #[tokio::test]

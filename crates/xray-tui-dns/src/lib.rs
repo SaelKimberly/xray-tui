@@ -115,7 +115,7 @@ async fn read_dnscrypt_cache(cache_file: &Path) -> (Option<Vec<NameServerConfig>
     }
     // A future-dated mtime makes `elapsed()` fail; treat that as stale so an
     // undatable cache is eventually re-fetched instead of living forever.
-    let stale = metadata.modified().ok().is_some_and(|mtime| {
+    let stale = metadata.modified().is_ok_and(|mtime| {
         mtime
             .elapsed()
             .map_or(true, |age| age > DNSCRYPT_CACHE_MAX_AGE)

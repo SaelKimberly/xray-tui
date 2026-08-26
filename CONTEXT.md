@@ -16,10 +16,10 @@ crates/
 ├── xray-tui-dns/      # Library: secure DNS resolution via DNSCrypt stamps (DOH/DOT/DOQ)
 ├── xray-tui-geoip/    # Library: country/city lookup by IP (GeoLite2-City mmdb)
 ├── xray-tui-host-features/ # Library: SNI/exact-IP/CIDR whitelist membership checks (fastbloom)
-├── xray-tui-native/   # Library: in-process proxy core (subprocess-free tunnels; VLESS+VMess, TLS engine-backed)
-├── xray-tui-tls/      # Library: ring-based TLS 1.3 client, browser fingerprint mimicry, REALITY client
-thirdparty/
-├── Xray-core/         # Source of truth for protocols and behavior
+	├── xray-tui-native/   # Library: in-process proxy core (subprocess-free tunnels; VLESS+VMess, TLS engine-backed)
+	├── xray-tui-tls/      # Library: ring-based TLS 1.3 client, browser fingerprint mimicry, REALITY client
+	├── xray-tui-hakari/   # Generated feature-unification crate (cargo-hakari); every member depends on it
+	thirdparty/
 ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
 ├── v2rayN/            # Source of truth for UI/UX feature set
 ├── shoes/             # Rust proxy - possible protocol reference

@@ -21,7 +21,6 @@ serde_with = { version = "^3.21.0", default-features = false, features = ["macro
 url = { workspace = true }
 urlencoding.workspace = true
 base64 = { version = "^0.22.1" }
-escape8259.workspace = true
 
 # ============ Error Handling ============
 thiserror = { workspace = true }
@@ -29,12 +28,9 @@ thiserror = { workspace = true }
 # ============ Text / Search / Hash ============
 rapidhash.workspace = true
 uuid = { workspace = true, features = ["v5"] }
-itoa = { version = "^1.0" }
-memchr.workspace = true
 
 # ============ TLS ============
 rustls = { workspace = true, features = ["std", "tls12"] }
-rustls-pki-types = { version = "1.15.1" }
 
 # ============ Parsing ============
 nom = { version = "^8.0.0", default-features = false, features = ["std"] }
@@ -51,11 +47,9 @@ smartstring = { version = "^1.0.1", features = ["serde"] }
 # ============ IDNA for hostname parsing ============
 idna = { version = "^1.1.0", default-features = false, features = ["std", "compiled_data"] }
 
-# ============ Character encoding detection ============
-chardetng = { version = "^1.0.0", features = ["multithreading"] }
-
 # ============ Logging ============
 tracing = { workspace = true }
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true
