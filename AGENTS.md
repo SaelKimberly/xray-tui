@@ -257,6 +257,8 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - `cargo clippy` — lint
 - `just quality-gate` — full quality gate: fmt, hakari, clippy, nextest, deny, machete, outdated, audit
 	  (verbose report; `just quality-gate-ci` for CI, exit-code only, stops at first failure)
+	  (subsets: `just quality-gate code` = fmt-check/clippy/nextest only, `just quality-gate deps` =
+	  hakari-check/deny/machete/outdated/audit only — same `code|deps` arg on `quality-gate-ci`)
 	- Unused deps: `cargo machete --with-metadata --skip-target-dir`; ignores live in
 	  `[package/workspace.metadata.cargo-machete]` (Cargo.toml). The hakari crate's
 	  deps are ignored by design — regenerate its list after `cargo hakari generate`:

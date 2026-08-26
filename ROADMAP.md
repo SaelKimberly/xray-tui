@@ -231,7 +231,7 @@
 - ✅ Host validation — `validate_host` rejects unspecified IP addresses (`0.0.0.0`/`::`) as a hard rule (not gated by `allow_private_ips`); bracketed-IPv6 forms (`[::]`, `[::1]`) now parse for all host checks (previously slipped past everything). Subscription summary counts them as host validation. 5 new tests — 580 workspace tests pass
 ## Phase 17 — Quality Gate ✅
 
-- ✅ 8-tool quality gate — `just quality-gate` (verbose report, all checks run) + `just quality-gate-ci` (minimal, exit 0/1, stops at first failure). Order: fmt-check → hakari-check → clippy → nextest → deny → machete → outdated → audit.
+- ✅ Gate target selector — `just quality-gate code|deps|all` (and `quality-gate-ci`): `code` = fmt-check/clippy/nextest (source checks), `deps` = hakari-check/deny/machete/outdated/audit (dependency checks), `all` default. Run source checks without dep audits and vice versa.
 - ✅ Tooling configs — rustfmt.toml (edition 2024, max_width 100, Unix newlines), criterion.toml (`.benchmarks/` home; `cargo criterion` is the only bench launcher), .config/nextest.toml (`ci` profile), .cargo/audit.toml (vuln scan; 5 allowed informational warnings), deny.toml (licenses/bans/sources).
 - ✅ cargo-hakari unified deps — `crates/xray-tui-hakari/` (renamed from workspace-hack to match the `xray-tui-*` crate convention); `.config/hakari.toml` targets the two toolchain triples; regenerate after any Cargo.lock change.
 - ✅ cargo-machete (unused deps, hard-fail) — 16 genuinely unused deps removed; OUT_DIR/build.rs-generated deps (prost, tonic-prost, tonic-prost-build) and the documented tokio-rustls override ignored via `[package.metadata.cargo-machete]`; hakari crate's deps ignored by design (regeneration command in the manifest comment + AGENTS.md).

@@ -1,16 +1,20 @@
 # ─── Quality gate ─────────────────────────────────────────────────
 # Docs: https://github.com/casey/just
 #
-# `just quality-gate`    — every check, verbose report, all checks run even on failure
-# `just quality-gate-ci` — every check, minimal output, stops at first failure (exit 0/1, for CI)
+# `just quality-gate`            — every check, verbose report, all checks run even on failure
+# `just quality-gate code`       — source checks only (fmt-check, clippy, nextest)
+# `just quality-gate deps`       — dependency checks only (hakari-check, deny, machete, outdated, audit)
+# `just quality-gate-ci`         — every check, minimal output, stops at first failure (exit 0/1, for CI)
+# `just quality-gate-ci code|deps` — the same subsets in CI mode
 
-# Run the full quality gate (verbose report). Exit 0 = all passed, 1 = any failed.
-quality-gate:
-    @just _gate report
+# Run the quality gate (verbose report). `target` selects the group:
+# code | deps | all (default). Exit 0 = all passed, 1 = any failed.
+quality-gate target='all':
+    @just _gate report "{{target}}"
 
-# Run the full quality gate for CI (minimal output, stop at first failure). Exit 0/1.
-quality-gate-ci:
-    @just _gate ci
+# Run the quality gate for CI (minimal output, stop at first failure). Exit 0/1.
+quality-gate-ci target='all':
+    @just _gate ci "{{target}}"
 
 # ─── Individual checks ────────────────────────────────────────────
 
@@ -38,12 +42,13 @@ deny mode='report':
 machete mode='report':
     @cargo machete --with-metadata --skip-target-dir
 
+# Outdated direct dependencies. Informational by design (`--exit-code 0`):
 # direct deps are kept at latest (semver-major tracks toasty 0.10, base64 0.23,
 # brotli 8, sha2 0.11 are applied with breakage fixes). The residual entries are
 # graph-inherent dual-major pins in the generated xray-tui-hakari (e.g.
-# crypto-common 0.1 via turso's aes-gcm, hashbrown 0.16 via yaml-rust2,
-# compact_str 0.9 via ratatui, windows-sys platform pins) that only upstream
-# bumps can remove, so a hard fail would keep the gate red indefinitely.
+# base64 0.22 via dns-stamp-parser, hashbrown 0.16 via yaml-rust2,
+# compact_str 0.9 via ratatui, syn 2, windows-sys platform pins) that only
+# upstream bumps can remove, so a hard fail would keep the gate red indefinitely.
 outdated mode='report':
     @cargo outdated --workspace --root-deps-only --exit-code 0 {{ if mode == "ci" { "--quiet" } else { "" } }}
 
@@ -53,11 +58,20 @@ audit mode='report':
 
 # ─── Gate runner (private) ────────────────────────────────────────
 
-_gate mode:
+_gate mode target:
     #!/usr/bin/env bash
     set -uo pipefail
     mode="{{mode}}"
-    tools=(fmt-check hakari-check clippy nextest deny machete outdated audit)
+    target="{{target}}"
+    case "$target" in
+        code) tools=(fmt-check clippy nextest) ;;
+        deps) tools=(hakari-check deny machete outdated audit) ;;
+        all)  tools=(fmt-check clippy nextest hakari-check deny machete outdated audit) ;;
+        *)
+            echo "unknown gate target: $target (expected code | deps | all)" >&2
+            exit 2
+            ;;
+    esac
     total=${#tools[@]}
     passed=0
     failed=()
