@@ -32,7 +32,9 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
     let Some(sec) = ctx.security() else {
         return Ok(stream);
     };
-    if sec.is_empty() {
+    // Single decision-surface guard: `is_tls()` collapses the old
+    // `sec.is_empty()` and the two byte-identical `has_tls()` copies.
+    if !ctx.is_tls() {
         return Ok(stream);
     }
     let rng: Arc<dyn SecureRandom> = Arc::new(ring::rand::SystemRandom::new());
@@ -52,7 +54,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     fingerprint,
                     verifier,
                 },
-                server_name: ctx.sni(),
+                server_name: ctx.server_name(),
                 alpn: (!ctx.alpn_vec().is_empty()).then(|| ctx.alpn_vec()),
                 curves: {
                     let ids = ctx.curve_ids();
@@ -103,11 +105,10 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                     short_id: reality::decode_sid(sec.sid().unwrap_or_default())?,
                     spider,
                 },
-                // The REALITY steal target: `SecurityConfig::sni()` reads
-                // `RealityOpts.sni` — NOT `ctx.sni()`, whose `tls_opts()`
-                // helper rejects Reality configs and would fall back to the
-                // (often IP-literal) server host.
-                server_name: sec.sni().unwrap_or(&ctx.params.server.host).to_string(),
+                // The REALITY steal target: `ctx.server_name()` walks
+                // `SecurityConfig::sni()` (which reads `RealityOpts.sni`),
+                // so the (often IP-literal) server host never leaks through.
+                server_name: ctx.server_name(),
                 alpn: None,
                 curves: None,
                 rng,

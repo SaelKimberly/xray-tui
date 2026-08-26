@@ -3,7 +3,7 @@
 use ring::rand::SecureRandom;
 use tokio::io::AsyncWriteExt;
 
-use xray_tui_proto::proto_spec::{SecurityConfig, VlessConfig, parse_mlkem_encryption};
+use xray_tui_proto::proto_spec::{VlessConfig, parse_mlkem_encryption};
 
 use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
@@ -119,7 +119,7 @@ async fn connect_plain(
 /// Guarded preconditions, checked before any protocol-phase I/O (the
 /// header write):
 /// - outer security is TLS or REALITY (the engine is TLS 1.3-only, so the
-///   `has_tls()` check is the whole story) — mirroring xray's rejection;
+///   `ctx.is_tls()` check is the whole story) — mirroring xray's rejection;
 /// - the transport is raw TCP — vision requires the socket for the Direct
 ///   handoff (spec §5.1; ws/grpc/xhttp framing is incompatible);
 /// - the command is TCP. The UDP path is separate ([`connect_udp`]); the
@@ -131,7 +131,7 @@ async fn connect_vision(
     uuid: [u8; 16],
     flow: Option<&str>,
 ) -> Result<BoxStream, NativeError> {
-    if !has_tls(ctx) {
+    if !ctx.is_tls() {
         return Err(NativeError::Config(
             "XTLS only supports TLS and REALITY directly for now".into(),
         ));
@@ -185,14 +185,6 @@ async fn connect_vision(
     let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
     let vision = VisionStream::new(peeled, uuid, rng);
     Ok(Box::new(vision))
-}
-
-/// True when the link actually runs TLS/REALITY — the check established in
-/// the transports work (`transport/xhttp.rs`): the proto always carries a
-/// `SecurityConfig`, even an empty one, so `security().is_some()` alone is
-/// not the right test.
-fn has_tls(ctx: &LinkContext) -> bool {
-    ctx.security().and_then(SecurityConfig::type_str).is_some()
 }
 
 /// UDP/flow guard: the vision flows cannot carry UDP over the RAW
@@ -400,7 +392,7 @@ async fn connect_mux_plain(
 ///
 /// Guarded preconditions mirror [`connect_vision`], checked before any
 /// protocol-phase I/O:
-/// - outer security is TLS or REALITY (`has_tls()`) — mirroring xray's
+/// - outer security is TLS or REALITY (`ctx.is_tls()`) — mirroring xray's
 ///   rejection of bare vision;
 /// - the transport is raw TCP — vision requires the socket for the Direct
 ///   handoff (spec §5.1; ws/grpc/xhttp framing is incompatible).
@@ -415,7 +407,7 @@ async fn connect_mux_vision(
     uuid: [u8; 16],
     flow: Option<&str>,
 ) -> Result<MuxClient<BoxStream>, NativeError> {
-    if !has_tls(ctx) {
+    if !ctx.is_tls() {
         return Err(NativeError::Config(
             "XTLS only supports TLS and REALITY directly for now".into(),
         ));

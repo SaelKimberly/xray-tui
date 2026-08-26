@@ -28,7 +28,7 @@ pub async fn connect(ctx: &LinkContext, base: Option<BoxStream>) -> Result<BoxSt
         // (UDP + quinn) that replaces the dial + security + upgrade chain
         // (spec §4.1/§5.2). It is a fresh QUIC dial — it never reuses a
         // base tunnel (xhttp+h3 as a later chain hop is a Config error).
-        Some("xhttp") if xhttp::http_version(ctx.security()) == "3" => {
+        Some("xhttp") if is_self_contained(ctx) => {
             if base.is_some() {
                 return Err(NativeError::Config(
                     "xhttp over HTTP/3 cannot reuse a base tunnel: the QUIC dial is a fresh connection".into(),

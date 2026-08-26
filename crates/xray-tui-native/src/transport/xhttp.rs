@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::BoxStream;
-use crate::context::LinkContext;
+use crate::context::{LinkContext, split_alpn};
 use crate::error::{NativeError, timeouts};
 use xray_tui_proto::proto_spec::{SecurityConfig, TlsConfig};
 
@@ -102,13 +102,6 @@ fn path_with(ctx: &LinkContext, session: &str, seq: Option<&str>) -> String {
     p
 }
 
-/// True when the link actually runs TLS/REALITY (the proto always carries a
-/// `SecurityConfig`, even an empty one — `security().is_some()` is not the
-/// right test). Drives the HTTP version: no TLS → HTTP/1.1, TLS → HTTP/2.
-fn has_tls(ctx: &LinkContext) -> bool {
-    ctx.security().and_then(SecurityConfig::type_str).is_some()
-}
-
 /// HTTP version for xhttp per xray `decideHTTPVersion` (spec §4.1) — a pure
 /// mirror of the Go decision over the proto security config:
 ///
@@ -121,9 +114,9 @@ fn has_tls(ctx: &LinkContext) -> bool {
 /// | TLS, exactly one other ALPN | `"2"` |
 /// | TLS, zero or 2+ ALPNs | `"2"` |
 ///
-/// ALPN is the comma-separated `TlsOpts::alpn` string, split exactly like
-/// the engine builds its ALPN list ([`LinkContext::alpn_vec`]: split on
-/// `,`, trim, drop empties).
+/// ALPN is the comma-separated `TlsOpts::alpn` string, split by the shared
+/// [`crate::context::split_alpn`] (the one set of split rules the engine's
+/// ALPN list uses too — they cannot drift).
 #[must_use]
 pub(crate) fn http_version(security: Option<&SecurityConfig>) -> &'static str {
     let Some(sec) = security else {
@@ -137,7 +130,7 @@ pub(crate) fn http_version(security: Option<&SecurityConfig>) -> &'static str {
             None => return "2",
         },
     };
-    let mut protocols = alpn.split(',').map(str::trim).filter(|s| !s.is_empty());
+    let mut protocols = split_alpn(alpn).into_iter();
     let Some(first) = protocols.next() else {
         return "2";
     };
@@ -163,7 +156,7 @@ fn build_request(
     let padding = x_padding();
     // xray captures `RawURL` *before* appending session/seq, so the Referer
     // carries the base URL (`{scheme}://{host}{path}`), not the session path.
-    let scheme = if has_tls(ctx) { "https" } else { "http" };
+    let scheme = if ctx.is_tls() { "https" } else { "http" };
     let referer_url = format!("{scheme}://{host}{}", base_path(ctx));
     let mut builder = http::Request::builder()
         .method(method)
@@ -721,21 +714,21 @@ fn xhttp_mode(ctx: &LinkContext) -> Result<&'static str, NativeError> {
 pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
     match xhttp_mode(ctx)? {
         "stream-one" => {
-            if has_tls(ctx) {
+            if ctx.is_tls() {
                 stream_one_h2(ctx, stream).await
             } else {
                 stream_one_h1(ctx, stream).await
             }
         }
         "stream-up" => {
-            if has_tls(ctx) {
+            if ctx.is_tls() {
                 stream_up_h2(ctx, stream).await
             } else {
                 stream_up_h1(ctx, stream).await
             }
         }
         _ => {
-            if has_tls(ctx) {
+            if ctx.is_tls() {
                 packet_up_h2(ctx, stream).await
             } else {
                 packet_up_h1(ctx, stream).await
@@ -882,7 +875,7 @@ pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
         .keep_alive_interval(Some(Duration::from_secs(10)));
     quic_config.transport_config(Arc::new(transport));
     let connecting = endpoint
-        .connect_with(quic_config, server_addr, &ctx.sni())
+        .connect_with(quic_config, server_addr, &ctx.server_name())
         .map_err(|e| NativeError::Dial(format!("xhttp h3 connect: {e}")))?;
     let conn = match connecting.into_0rtt() {
         Ok((conn, _accepted)) => conn,

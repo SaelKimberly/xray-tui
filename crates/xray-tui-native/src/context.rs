@@ -102,44 +102,63 @@ impl LinkContext {
         }
     }
 
-    /// TLS SNI: explicit `sni` option, else the endpoint host.
+    /// True when the link actually runs TLS or REALITY: `sec.tls.is_some()`.
+    ///
+    /// The one predicate every phase uses — `security::wrap` (skip the
+    /// handshake), the xhttp scheme/HTTP-version decision, and the VLESS
+    /// vision/mux guards — collapsing the three historical re-derivations
+    /// (`sec.is_empty()` and two byte-identical `has_tls()` copies) onto
+    /// this single decision surface.
     #[must_use]
-    pub fn sni(&self) -> String {
+    pub fn is_tls(&self) -> bool {
+        self.security().is_some_and(|s| s.tls.is_some())
+    }
+
+    /// The TLS server name (SNI): explicit `sni` option — plain TLS or the
+    /// REALITY steal target — else the endpoint host.
+    ///
+    /// Unifies the two historical SNI paths (`ctx.sni()` routed through
+    /// `tls_opts()`, which rejected Reality configs and fell back to the
+    /// often-IP server host; `sec.sni()` read the steal target) into one
+    /// decision. `SecurityConfig::sni()` reads `RealityOpts.sni`, so a
+    /// REALITY link never leaks the endpoint host as its steal target.
+    #[must_use]
+    pub fn server_name(&self) -> String {
+        self.security()
+            .and_then(SecurityConfig::sni)
+            .map_or_else(|| self.params.server.host.clone(), str::to_string)
+    }
+
+    /// Canonical split of the explicit `alpn` option — the ONE place the
+    /// `split(',') → trim → drop-empty` rules live (shared with the xhttp
+    /// transport's `http_version` decision). Empty when no explicit ALPN;
+    /// the transport-implied fallback is `alpn_vec`'s job, not this.
+    #[must_use]
+    pub fn alpn_tokens(&self) -> Vec<&str> {
         self.tls_opts()
             .ok()
             .flatten()
-            .and_then(|o| o.sni.as_ref())
-            .map_or_else(
-                || self.params.server.host.clone(),
-                std::string::ToString::to_string,
-            )
+            .and_then(|o| o.alpn.as_deref())
+            .map(split_alpn)
+            .unwrap_or_default()
     }
 
-    /// TLS ALPN list: comma-separated `alpn` option, else empty (no ALPN).
+    /// TLS ALPN list: explicit `alpn` tokens (via [`Self::alpn_tokens`]),
+    /// else transport-implied ALPN — grpc/xhttp/http ride HTTP/2 (xhttp
+    /// falls back to HTTP/1.1 only when there is no TLS at all — no ALPN
+    /// then), ws/httpupgrade are HTTP/1.1 exchanges. (Reality forces
+    /// h2+http/1.1 server-side; an explicit `alpn` option wins above.)
     #[must_use]
     pub fn alpn_vec(&self) -> Vec<Vec<u8>> {
         let explicit: Vec<Vec<u8>> = self
-            .tls_opts()
-            .ok()
-            .flatten()
-            .and_then(|o| o.alpn.as_ref())
-            .map(|a| {
-                a.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::as_bytes)
-                    .map(<[u8]>::to_vec)
-                    .collect()
-            })
-            .unwrap_or_default();
+            .alpn_tokens()
+            .into_iter()
+            .map(str::as_bytes)
+            .map(<[u8]>::to_vec)
+            .collect();
         if !explicit.is_empty() {
             return explicit;
         }
-        // Transport-implied ALPN: the grpc, xhttp and v2rayhttp (`http`)
-        // transports are HTTP/2 (xhttp falls back to HTTP/1.1 only when
-        // there is no TLS at all — no ALPN then), the ws and httpupgrade
-        // upgrades are HTTP/1.1 exchanges. (Reality forces h2+http/1.1
-        // server-side; an explicit `alpn` option wins above.)
         match self.transport_type() {
             Some("grpc" | "xhttp" | "http") => vec![b"h2".to_vec()],
             Some("ws" | "httpupgrade") => vec![b"http/1.1".to_vec()],
@@ -256,6 +275,16 @@ impl LinkContext {
     }
 }
 
+/// Split a comma-separated ALPN string — `split(',')`, trim, drop empties.
+/// The canonical rules shared by [`LinkContext::alpn_tokens`] and the xhttp
+/// transport's `http_version` decision, so neither can drift from the other.
+pub(crate) fn split_alpn(s: &str) -> Vec<&str> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,14 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn sni_falls_back_to_endpoint_host() {
+    fn server_name_falls_back_to_endpoint_host() {
         let params = NativeConnectParams::new(
             vless_empty(),
             EndpointEssentials::new("my.server.test", 4430),
             target("example.com"),
         );
         let ctx = LinkContext::new(params, target("example.com"));
-        assert_eq!(ctx.sni(), "my.server.test");
+        assert_eq!(ctx.server_name(), "my.server.test");
     }
 
     #[test]
@@ -510,7 +539,106 @@ mod tests {
             target("example.com"),
         );
         let ctx = LinkContext::new(params, target("example.com"));
-        assert_eq!(ctx.sni(), "sni.example");
+        assert_eq!(ctx.server_name(), "sni.example");
         assert_eq!(ctx.alpn_vec(), vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    // ---- policy decision surface --------------------------------------
+
+    /// Build a link with the given `security` JSON value (None = the field
+    /// omitted entirely; the proto still yields an empty `SecurityConfig`).
+    fn ctx_with_sec(security: Option<serde_json::Value>) -> LinkContext {
+        let sec = security.unwrap_or_else(|| serde_json::json!({}));
+        let protocol: ProtocolConfig = serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "security": sec,
+            "transport": { "type": "tcp" }
+        }))
+        .expect("vless config parses");
+        LinkContext::new(
+            NativeConnectParams::new(
+                protocol,
+                EndpointEssentials::new("my.server.test", 4430),
+                target("example.com"),
+            ),
+            target("example.com"),
+        )
+    }
+
+    #[test]
+    fn is_tls_false_without_tls() {
+        // Omitted security → empty SecurityConfig → not TLS.
+        assert!(!ctx_with_sec(None).is_tls());
+        // Explicit empty security object → not TLS either.
+        assert!(!ctx_with_sec(Some(serde_json::json!({}))).is_tls());
+    }
+
+    #[test]
+    fn is_tls_true_for_plain_tls_and_reality() {
+        assert!(ctx_with_sec(Some(serde_json::json!({ "type": "tls" }))).is_tls());
+        assert!(
+            ctx_with_sec(Some(serde_json::json!({
+                "type": "reality", "pbk": "x", "sid": "y"
+            })))
+            .is_tls()
+        );
+    }
+
+    #[test]
+    fn server_name_plain_sni_wins_over_host() {
+        let ctx = ctx_with_sec(Some(serde_json::json!({
+            "type": "tls", "sni": "sni.example"
+        })));
+        assert_eq!(ctx.server_name(), "sni.example");
+    }
+
+    #[test]
+    fn server_name_reality_steal_sni_wins_over_host() {
+        // REALITY's `RealityOpts.sni` is the steal target — the endpoint
+        // host (often an IP literal) must NOT leak through.
+        let ctx = ctx_with_sec(Some(serde_json::json!({
+            "type": "reality", "sni": "steal.target", "pbk": "x", "sid": "y"
+        })));
+        assert_eq!(ctx.server_name(), "steal.target");
+    }
+
+    #[test]
+    fn server_name_falls_back_to_host() {
+        // No security, and TLS without an explicit sni, both fall back to
+        // the endpoint host.
+        assert_eq!(ctx_with_sec(None).server_name(), "my.server.test");
+        assert_eq!(
+            ctx_with_sec(Some(serde_json::json!({ "type": "tls" }))).server_name(),
+            "my.server.test"
+        );
+        assert_eq!(
+            ctx_with_sec(Some(serde_json::json!({
+                "type": "reality", "pbk": "x", "sid": "y"
+            })))
+            .server_name(),
+            "my.server.test"
+        );
+    }
+
+    #[test]
+    fn alpn_tokens_split_trims_drops_empty() {
+        let ctx = ctx_with_sec(Some(serde_json::json!({
+            "type": "tls", "alpn": " h2 , ,http/1.1 "
+        })));
+        assert_eq!(ctx.alpn_tokens(), vec!["h2", "http/1.1"]);
+        assert_eq!(ctx.alpn_vec(), vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn alpn_tokens_empty_without_explicit_alpn() {
+        // No explicit ALPN → no tokens (the transport-implied fallback lives
+        // only in `alpn_vec`, never in the tokens).
+        assert!(ctx_with_sec(None).alpn_tokens().is_empty());
+        assert!(
+            ctx_with_sec(Some(serde_json::json!({ "type": "tls" })))
+                .alpn_tokens()
+                .is_empty()
+        );
     }
 }
