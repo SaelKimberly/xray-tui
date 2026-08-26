@@ -17,6 +17,8 @@ publish = false
 [dependencies]
 aho-corasick = { version = "1" }
 base64 = { version = "0.22" }
+bit-set = { version = "0.11", features = ["serde"] }
+bit-vec = { version = "0.10", default-features = false, features = ["serde", "std"] }
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 bytes = { version = "1" }
@@ -24,18 +26,17 @@ chacha20 = { version = "0.10", default-features = false, features = ["rng", "xch
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper"] }
 compact_str = { version = "0.9", default-features = false, features = ["std"] }
 constant_time_eq = { version = "0.4" }
-crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
-crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["getrandom", "std"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
 data-encoding = { version = "2" }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
 either = { version = "1", features = ["use_std"] }
 fastbloom = { version = "0.17" }
 flate2 = { version = "1", features = ["zlib-rs"] }
+form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
@@ -63,6 +64,7 @@ prost = { version = "0.14" }
 quinn = { version = "0.11", features = ["futures-io"] }
 quinn-proto = { version = "0.11", default-features = false, features = ["bloom", "log", "platform-verifier", "rustls-ring"] }
 quinn-udp = { version = "0.5", default-features = false, features = ["log"] }
+rand = { version = "0.10" }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 rapidhash = { version = "4", features = ["unsafe"] }
 ratatui-core = { version = "0.1", features = ["layout-cache", "std", "underline-color"] }
@@ -85,17 +87,20 @@ strum = { version = "0.28", default-features = false, features = ["derive", "std
 subtle = { version = "2", default-features = false, features = ["const-generics"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "parsing"] }
 tinystr = { version = "0.8", default-features = false, features = ["alloc", "zerovec"] }
-toasty = { version = "0.9", features = ["jiff", "serde", "turso"] }
-toasty-core = { version = "0.9", features = ["jiff"] }
-tokio = { version = "1", features = ["full", "test-util"] }
+toasty = { version = "0.10", default-features = false, features = ["jiff", "serde", "turso"] }
+toasty-core = { version = "0.10", features = ["jiff", "migration"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["early-data", "logging", "ring", "tls12"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+toml_datetime = { version = "1", features = ["serde"] }
+toml_parser = { version = "1" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 unicode-truncate = { version = "2", default-features = false, features = ["std"] }
-uuid = { version = "1", features = ["fast-rng", "v4", "v5", "v7"] }
+uuid = { version = "1", features = ["fast-rng", "js", "v4", "v5", "v7"] }
+winnow = { version = "1" }
 writeable = { version = "0.6", default-features = false, features = ["alloc"] }
 yoke = { version = "0.8", default-features = false, features = ["alloc", "derive"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
@@ -107,43 +112,48 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 
 [build-dependencies]
 aho-corasick = { version = "1" }
+bit-set = { version = "0.11", features = ["serde"] }
+bit-vec = { version = "0.10", default-features = false, features = ["serde", "std"] }
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 clang-sys = { version = "1", default-features = false, features = ["clang_11_0", "runtime"] }
 either = { version = "1", features = ["use_std"] }
+form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 itertools = { version = "0.14" }
 libc = { version = "0.2" }
-lock_api = { version = "0.4", features = ["arc_lock"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 once_cell = { version = "1", features = ["critical-section"] }
-parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+percent-encoding = { version = "2" }
 portable-atomic = { version = "1", features = ["std"] }
 prost = { version = "0.14" }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
+serde = { version = "1", features = ["alloc", "derive"] }
 serde_core = { version = "1", features = ["alloc"] }
 siphasher = { version = "1" }
-smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-toasty-core = { version = "0.9", features = ["jiff"] }
-tokio = { version = "1", features = ["full", "test-util"] }
+toasty-core = { version = "0.10", features = ["jiff", "migration"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+toml_datetime = { version = "1", features = ["serde"] }
+toml_parser = { version = "1" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
-uuid = { version = "1", features = ["fast-rng", "v4", "v5", "v7"] }
+uuid = { version = "1", features = ["fast-rng", "js", "v4", "v5", "v7"] }
+winnow = { version = "1" }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bytemuck = { version = "1", default-features = false, features = ["derive", "extern_crate_alloc"] }
 deranged = { version = "0.5", features = ["serde"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
@@ -166,12 +176,13 @@ zstd-sys = { version = "2", default-features = false, features = ["experimental"
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper"] }
-crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
 rustix = { version = "1", features = ["io_uring", "pipe", "process", "stdio", "system", "termios", "time"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = false, features = ["visit"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", default-features = false, features = ["serde"] }
 zeroize = { version = "1" }
@@ -180,7 +191,7 @@ zeroize = { version = "1" }
 bytemuck = { version = "1", default-features = false, features = ["derive", "extern_crate_alloc"] }
 deranged = { version = "0.5", features = ["serde"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 miniz_oxide = { version = "0.8", features = ["simd"] }
@@ -192,8 +203,8 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip", "follow-redirect"] }
 uuid = { version = "1", default-features = false, features = ["serde"] }
 winapi = { version = "0.3", default-features = false, features = ["consoleapi", "handleapi", "impl-default", "processenv", "synchapi", "sysinfoapi", "winbase", "winerror", "winuser"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Globalization", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Threading", "Win32_UI_Shell"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 zeroize = { version = "1" }
 zstd = { version = "0.13", default-features = false, features = ["experimental"] }
 zstd-safe = { version = "7", default-features = false, features = ["experimental"] }
@@ -203,14 +214,14 @@ zstd-sys = { version = "2", default-features = false, features = ["experimental"
 block-buffer = { version = "0.12", default-features = false, features = ["zeroize"] }
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper"] }
-crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
-getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 nom = { version = "7" }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = false, features = ["visit"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", default-features = false, features = ["serde"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Globalization", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Threading", "Win32_UI_Shell"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 zeroize = { version = "1" }
 
 ### END HAKARI SECTION
@@ -223,6 +234,8 @@ zeroize = { version = "1" }
 ignored = [
     "aho-corasick",
     "base64",
+    "bit-set",
+    "bit-vec",
     "bitflags",
     "block-buffer",
     "bytemuck",
@@ -233,21 +246,20 @@ ignored = [
     "clang-sys",
     "compact_str",
     "constant_time_eq",
-    "crypto-common-6f8ce4dd05d13bba",
-    "crypto-common-c65f7effa3be6d31",
+    "crypto-common",
     "data-encoding",
     "deranged",
     "digest",
     "either",
     "fastbloom",
     "flate2",
+    "form_urlencoded",
     "futures-channel",
     "futures-core",
     "futures-io",
     "futures-task",
     "futures-util",
-    "getrandom-468e82937335b1c9",
-    "getrandom-9fbad63c4bcf4a8f",
+    "getrandom",
     "h2",
     "hashbrown-9067fe90e8c1f593",
     "hashbrown-986da7b5efc2b80e",
@@ -280,6 +292,7 @@ ignored = [
     "quinn",
     "quinn-proto",
     "quinn-udp",
+    "rand",
     "rand_core",
     "rapidhash",
     "ratatui-core",
@@ -310,6 +323,8 @@ ignored = [
     "tokio",
     "tokio-rustls",
     "tokio-stream",
+    "toml_datetime",
+    "toml_parser",
     "tower",
     "tower-http",
     "tracing",
@@ -321,6 +336,7 @@ ignored = [
     "winapi",
     "windows-sys-73dcd821b1037cfd",
     "windows-sys-d4189bed749088b6",
+    "winnow",
     "writeable",
     "yoke",
     "zerofrom",

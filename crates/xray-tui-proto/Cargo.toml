@@ -20,7 +20,7 @@ serde_with = { version = "^3.21.0", default-features = false, features = ["macro
 # ============ URL & Encoding ============
 url = { workspace = true }
 urlencoding.workspace = true
-base64 = { version = "^0.22.1" }
+base64 = { version = "^0.23.1" }
 
 # ============ Error Handling ============
 thiserror = { workspace = true }
@@ -36,7 +36,7 @@ rustls = { workspace = true, features = ["std", "tls12"] }
 nom = { version = "^8.0.0", default-features = false, features = ["std"] }
 
 # ============ ORM (Embed derives only) ============
-toasty = { version = "0.9", default-features = false }
+toasty.workspace = true
 
 # ============ Performance & Memory ============
 smallvec.workspace = true

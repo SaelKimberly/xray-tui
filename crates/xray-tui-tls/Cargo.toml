@@ -23,7 +23,7 @@ webpki-roots = "1"
 # JA3 hash
 md-5 = "0.11"
 # JA4 hash segments (sha256 truncated)
-sha2 = "0.10"
+sha2 = "0.11"
 # JSON parsing for the tls.peet.ws grader (example + ignored network test)
 serde_json.workspace = true
 # Fingerprint selection persistence (TUI settings)
@@ -38,7 +38,7 @@ oqs = { version = "0.11", features = ["ml_kem", "kyber", "vendored"] }
 # message; the client must decompress the offered algorithms. flate2/zstd
 # are already in the workspace lockfile; brotli is new.
 flate2 = "1.1"
-brotli = "6"
+brotli = "8"
 zstd = "0.13"
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 [lints]

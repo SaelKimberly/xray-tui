@@ -89,7 +89,7 @@ cargo run
 1. **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. TUI writes JSON configs and manages binary lifetime.
 2. **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, etc.) → xray-core by default. Shadowsocks/Shadowsocks-2022 is cipher-aware: AEAD + 2022-blake3 methods → xray-core, legacy methods (`aes-*-cfb`, `aes-*-ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`) → sing-box (xray-core's `CipherType` enum has no legacy entries — `XRAY_SS_METHODS`/`SINGBOX_SS_METHODS` in `proto_spec/core_mapping.rs` are the whitelists). Both config builders reject ciphers neither core supports. User overrides per-profile; a forced core that can't build the cipher fails at build time with a clear error, never an invalid config. **Config validity is enforced at build**: the reality/cipher checks now live in `inject_to` (`xray-tui-proto`, `SupportError` → `BuildError::Support`) — the xray injector rejects `security: "reality"` configs whose reality settings lack `publicKey`/`serverName` (`validate_xray_reality`; xray-core dies at startup with `REALITY: Empty "realitySettings"` or `empty "password"` otherwise) and ciphers xray-core's `CipherType` enum has no entry for, and the sing-box reality block emits only `enabled`/`public_key`/`short_id` (sing-box has no `spider_x` outbound field — the URL's `spx` is dropped, never written into `short_id`).
 3. **One core at a time**: Only one backend process runs per connection session. Switching profiles between backends stops current core and starts other. Matches v2rayN.
-4. **SQLite via toasty ORM (async)** — Single DB file for all persistent data, 7 typed tables (`models_toasty.rs`). Schema pushed once by toasty's `db.push_schema()` under a `PRAGMA user_version=5` tag — `push_schema` is not idempotent (CREATE TABLE without IF NOT EXISTS), so the tag skips re-push on reopen; it is a tag, not migration machinery (any other tag = pre-T8 9-table DB, recreated from scratch; bump the tag on schema changes). No raw SQL outside PRAGMAs. All DB methods are `async fn` on `Database` struct backed by `toasty::Db`; `Database::open()` accepts impl AsRef<Path>. No system groups (All/Graveyard are view filters — `PurgatoryView` — not rows; `Group` has no `is_system`). Toasty v0.9 with `turso` driver for async SQLite.
+4. **SQLite via toasty ORM (async)** — Single DB file for all persistent data, 7 typed tables (`models_toasty.rs`). Schema pushed once by toasty's `db.push_schema()` under a `PRAGMA user_version=5` tag — `push_schema` is not idempotent (CREATE TABLE without IF NOT EXISTS), so the tag skips re-push on reopen; it is a tag, not migration machinery (any other tag = pre-T8 9-table DB, recreated from scratch; bump the tag on schema changes). No raw SQL outside PRAGMAs. All DB methods are `async fn` on `Database` struct backed by `toasty::Db`; `Database::open()` accepts impl AsRef<Path>. No system groups (All/Graveyard are view filters — `PurgatoryView` — not rows; `Group` has no `is_system`). Toasty v0.10 with `turso` driver for async SQLite.
 5. **Config generation** — Two builders: xray.rs (ports v2rayN's CoreConfigContextBuilder) and singbox.rs (ports sing-box JSON format).
 6. **gRPC stats abstraction**: `StatsProvider` trait with unified `GrpcStatsClient` (both backends share the same V2Ray Stats gRPC API).
 7. **Sing-box config differs structurally** from xray-core: `type` vs `protocol`, `route` vs `routing`, `experimental.v2ray_api` vs `stats`+`api`+`policy`, different TLS/transport key names.
@@ -242,7 +242,7 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 - Use `tokio` for async runtime
 - gRPC via `tonic` crate
 - `reqwest` for HTTP client (subscription fetch)
-- `toasty` ORM v0.9 with `toasty-driver-turso` for async SQLite
+- `toasty` ORM v0.10 with `toasty-driver-turso` for async SQLite
 - `tracing` for diagnostic event system (subscriber in bin crate, macros in lib crates)
 - `tracing-subscriber` for event filtering, formatting, and TuiLogLayer routing
 - `escape8259` for JSON string unescaping
@@ -261,9 +261,12 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 	  `[package/workspace.metadata.cargo-machete]` (Cargo.toml). The hakari crate's
 	  deps are ignored by design — regenerate its list after `cargo hakari generate`:
 	  `awk '/^\[/ {in_deps = ($0 ~ /dependencies\]/)} in_deps && /^[a-zA-Z0-9_-]+ = \{/ {print $1}' Cargo.toml | sort -u`
-	- Outdated deps: `cargo outdated --workspace --root-deps-only` — informational
-	  (`--exit-code 0`); semver-major tracks (toasty 0.10, base64 0.23, brotli 8,
-	  sha2 0.11) need manual triage, so the gate never hard-fails on them
+	  (`--exit-code 0`); direct deps are kept at latest — semver-major tracks
+	  (toasty 0.10, base64 0.23, brotli 8, sha2 0.11) are applied with their
+	  breaking-change fixes. Residual entries are graph-inherent dual-major pins
+	  in the generated `xray-tui-hakari` (base64 0.22 via dns-stamp-parser,
+	  compact_str 0.9 via ratatui, hashbrown 0.16 via yaml-rust2, syn 2,
+	  windows-sys platform pins), so the gate never hard-fails on them
 - Benchmarks: run only via `cargo criterion` (criterion.toml; results in `.benchmarks/`, survive `cargo clean`);
   `cargo bench` is not used
 - `cargo build --release` — release build

@@ -67,7 +67,7 @@ xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 	tonic-prost-build = "0.14"
 
 	[dev-dependencies]
-	toasty = "0.9"
+	toasty = { workspace = true, features = ["serde"] }
 	jiff.workspace = true
 
 	[package.metadata.cargo-machete]

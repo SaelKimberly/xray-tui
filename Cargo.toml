@@ -100,6 +100,9 @@ tracing = { version = "0.1" }
 humantime = "2.4.0"
 url = "2"
 jiff = "0.2"
+
+# ============ ORM (Turso backend only — no other drivers enabled) ============
+toasty = { version = "0.10", default-features = false }
 [workspace.metadata.cargo-machete]
 # The hakari (feature-unification) crate's dependencies are never referenced
 # from code by design; its own manifest carries the full per-crate ignore list.

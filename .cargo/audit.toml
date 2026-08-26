@@ -5,7 +5,13 @@
 # (~/.cargo/advisory-db via home_dir, github.com/rustsec/advisory-db) are correct.
 
 [advisories]
-ignore = []
+
+# RUSTSEC-2023-0071 (rsa 0.10.0-rc.18, Marvin Attack): reachable only via
+# toasty's optional `mysql` driver (toasty-driver-mysql → sqlx-mysql), which
+# no workspace member enables — this project is SQLite/turso-only. The chain
+# sits in Cargo.lock as an unactivated optional resolution; no fixed rsa
+# release exists. Ignored as unreachable, re-evaluate when toasty/sqlx bump.
+ignore = ["RUSTSEC-2023-0071"]
 informational_warnings = ["unmaintained", "unsound", "notice"]
 severity_threshold = "low"
 

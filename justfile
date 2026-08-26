@@ -38,9 +38,12 @@ deny mode='report':
 machete mode='report':
     @cargo machete --with-metadata --skip-target-dir
 
-# Outdated direct dependencies. Informational by design (`--exit-code 0`):
-# semver-major tracks (toasty 0.10, base64 0.23, brotli 8, sha2 0.11) need
-# manual triage, so a hard fail would keep the gate red indefinitely.
+# direct deps are kept at latest (semver-major tracks toasty 0.10, base64 0.23,
+# brotli 8, sha2 0.11 are applied with breakage fixes). The residual entries are
+# graph-inherent dual-major pins in the generated xray-tui-hakari (e.g.
+# crypto-common 0.1 via turso's aes-gcm, hashbrown 0.16 via yaml-rust2,
+# compact_str 0.9 via ratatui, windows-sys platform pins) that only upstream
+# bumps can remove, so a hard fail would keep the gate red indefinitely.
 outdated mode='report':
     @cargo outdated --workspace --root-deps-only --exit-code 0 {{ if mode == "ci" { "--quiet" } else { "" } }}
 
