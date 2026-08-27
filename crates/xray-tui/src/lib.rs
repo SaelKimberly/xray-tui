@@ -11,6 +11,7 @@
 )]
 
 pub mod ops;
+pub mod route_compile;
 mod state;
 mod types;
 pub mod ui;

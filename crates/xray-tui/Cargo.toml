@@ -9,6 +9,7 @@ xray-tui-core = { path = "../xray-tui-core", version = "0.1.0" }
 xray-tui-db = { path = "../xray-tui-db", version = "0.1.0" }
 xray-tui-config = { path = "../xray-tui-config", version = "0.1.0" }
 xray-tui-proto = { path = "../xray-tui-proto", version = "0.1.0" }
+xray-tui-route = { path = "../xray-tui-route", version = "0.1" }
 xray-tui-geoip = { path = "../xray-tui-geoip", version = "0.1.0" }
 xray-tui-dns = { path = "../xray-tui-dns", version = "0.1.0" }
 xray-tui-host-features = { path = "../xray-tui-host-features", version = "0.1.0" }
