@@ -592,23 +592,22 @@ mod tests {
                 PortRange { start: 53, end: 64 },
                 PortRange {
                     start: 9050,
-                    end: 9050
+                    end: 9050,
                 },
             ]),
             MatchItem::Network(NetworkMask {
                 tcp: false,
-                udp: true
+                udp: true,
             }),
             MatchItem::InboundTag {
-                tags: vec!["tun".into(), "dokodemo".into()]
+                tags: vec!["tun".into(), "dokodemo".into()],
             },
         ];
-        for (rule, proto) in out
-            .ruleset
-            .rules
-            .iter()
-            .zip([SniffedProtocol::Http, SniffedProtocol::Dns, SniffedProtocol::Tls])
-        {
+        for (rule, proto) in out.ruleset.rules.iter().zip([
+            SniffedProtocol::Http,
+            SniffedProtocol::Dns,
+            SniffedProtocol::Tls,
+        ]) {
             let Cond::All(items) = &rule.cond else {
                 panic!("expanded rule cond must stay All");
             };
@@ -617,7 +616,10 @@ mod tests {
             assert_eq!(items[..], expected[..]);
             assert_eq!(
                 rule.action,
-                Action::Route { tag: "b".into(), override_addr: None }
+                Action::Route {
+                    tag: "b".into(),
+                    override_addr: None
+                }
             );
         }
     }
@@ -666,7 +668,10 @@ mod tests {
         };
         assert_eq!(
             items[0],
-            MatchItem::Network(NetworkMask { tcp: true, udp: true })
+            MatchItem::Network(NetworkMask {
+                tcp: true,
+                udp: true
+            })
         );
     }
 

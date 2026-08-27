@@ -9,7 +9,7 @@ pub mod ir;
 pub mod matchers;
 
 pub use addr::{Cidr, NetAddr, NetHost, PortRange};
-pub use compiler::{CompileOutput, compile_xray};
+pub use compiler::{CompileOutput, compile_singbox, compile_xray};
 pub use engine::{ConnMeta, Decision, Engine};
 pub use error::RouteError;
 pub use events::RouteEvent;

@@ -1,7 +1,9 @@
 //! Compiler frontends translating vendor routing configs into [`RuleSet`] IR.
 
+mod singbox;
 mod xray;
 
+pub use singbox::compile_singbox;
 pub use xray::compile_xray;
 
 use crate::ir::RuleSet;

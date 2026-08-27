@@ -1,0 +1,27 @@
+{
+  "route": {
+    "final": "proxy-main",
+    "rules": [
+      { "domain_suffix": [".google.com"], "action": "hijack-dns" },
+      {
+        "mode": "and",
+        "rules": [
+          { "ip_cidr": ["10.0.0.0/8"] },
+          { "inbound": ["tun-in"] }
+        ],
+        "action": "route",
+        "outbound": "local-bypass"
+      },
+      {
+        "port_range": ["1000:2000", "8080:"],
+        "action": "reject",
+        "method": "drop"
+      },
+      {
+        "protocol": ["http", "tls", "dns"],
+        "action": "bypass"
+      }
+    ],
+    "rule_set": [{ "type": "local", "tag": "geo" }]
+  }
+}
