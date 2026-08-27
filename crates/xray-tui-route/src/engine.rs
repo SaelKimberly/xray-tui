@@ -67,13 +67,25 @@ pub enum Decision {
 
 /// A match item compiled once at build time.
 ///
-/// `geo_country` / outbound-tag data are intentionally dropped here: they are
-/// inert this task, so carrying them would be dead weight; the geoip/outbound
-/// wiring tasks rebuild the engine anyway.
+/// `geo_country` entries are carried verbatim but evaluate `false` this task:
+/// the geoip feature resolves them later, and erasing them here would let a
+/// CN-routing config compile clean while silently routing through default.
 enum ItemMatcher {
     Domain(CompiledDomain),
-    IpCidr { cidrs: CidrSet, private: bool },
-    SourceIpCidr { cidrs: CidrSet, private: bool },
+    IpCidr {
+        cidrs: CidrSet,
+        private: bool,
+        // Retained verbatim for the geoip feature's later resolution pass.
+        #[allow(dead_code)]
+        geo_country: Vec<String>,
+    },
+    SourceIpCidr {
+        cidrs: CidrSet,
+        private: bool,
+        // Retained verbatim for the geoip feature's later resolution pass.
+        #[allow(dead_code)]
+        geo_country: Vec<String>,
+    },
     Ports(Vec<PortRange>),
     SourcePorts(Vec<PortRange>),
     Network(NetworkMask),
@@ -93,7 +105,7 @@ impl ItemMatcher {
                 // SNI/DNS enrichment as the reverse-lookup path.
                 NetHost::Ip(_) => false,
             },
-            Self::IpCidr { cidrs, private } => {
+            Self::IpCidr { cidrs, private, .. } => {
                 let literal_hit = match &meta.target.host {
                     NetHost::Ip(ip) => ip_candidate_matches(cidrs, *private, ip),
                     NetHost::Domain(_) => false,
@@ -104,7 +116,7 @@ impl ItemMatcher {
                         .iter()
                         .any(|ip| ip_candidate_matches(cidrs, *private, ip))
             }
-            Self::SourceIpCidr { cidrs, private } => {
+            Self::SourceIpCidr { cidrs, private, .. } => {
                 let socket_hit =
                     meta.source.as_ref().is_some_and(|s| ip_candidate_matches(cidrs, *private, &s.ip()));
                 socket_hit
@@ -196,17 +208,18 @@ impl Engine {
     /// every `Cond::All` item holds wins; otherwise the rule-set default.
     ///
     /// No DNS resolution, sniffing side effects, or I/O happens here; `meta`
-    /// is reserved mutable for Task 12's DNS/SNI enrichment pass.
+    /// is reserved mutable for the Task 12 integration (DNS/SNI enrichment
+    /// pass mutates `resolved_host_ips`/`sniffed`; this allow must be removed
+    /// there once that lands).
     #[allow(clippy::needless_pass_by_ref_mut)]
     pub fn decide(&self, meta: &mut ConnMeta) -> Decision {
         if let Some(rule) = self.rules.iter().find(|rule| rule.matches(meta)) {
             let decision = Decision::from(&rule.action);
-            let emit_name = self.event_sink.as_ref().map(|_| rule.name.as_deref());
-            self.emit_decision(decision.tag(), emit_name.flatten());
+            self.emit_decision(&decision, rule.name.as_deref());
             return decision;
         }
         let decision = Decision::from(&self.default_route);
-        self.emit_decision(decision.tag(), None);
+        self.emit_decision(&decision, None);
         decision
     }
 
@@ -219,28 +232,23 @@ impl Engine {
     }
 
     /// Emits `DecisionApplied` when a sink is registered; drops on send error
-    /// (a closed receiver must never fail routing).
-    fn emit_decision(&self, tag: Option<String>, rule_name: Option<&str>) {
-        if let Some(tx) = &self.event_sink {
-            let _ = tx.send(RouteEvent::DecisionApplied {
-                rule_name: rule_name.map(str::to_owned),
-                tag,
-                sni: None,
-                at: jiff::Timestamp::now(),
-            });
-        }
+    /// (a closed receiver must never fail routing). Tag extraction happens
+    /// only here so the sink-less hot path clones nothing.
+    fn emit_decision(&self, decision: &Decision, rule_name: Option<&str>) {
+        let Some(tx) = &self.event_sink else { return };
+        let tag = match decision {
+            Decision::Route { tag, .. } => Some(tag.clone()),
+            _ => None,
+        };
+        let _ = tx.send(RouteEvent::DecisionApplied {
+            rule_name: rule_name.map(str::to_owned),
+            tag,
+            sni: None,
+            at: jiff::Timestamp::now(),
+        });
     }
 }
 
-impl Decision {
-    /// Outbound tag carried by routed decisions, for event emission.
-    fn tag(&self) -> Option<String> {
-        match self {
-            Self::Route { tag, .. } => Some(tag.clone()),
-            _ => None,
-        }
-    }
-}
 
 impl From<&Action> for Decision {
     fn from(action: &Action) -> Self {
@@ -275,13 +283,15 @@ fn compile_item(item: crate::ir::MatchItem, idx: usize) -> Result<ItemMatcher, R
             CompiledDomain::build(&DomainRulesSpec { exact, suffix, keywords, regexes })
                 .map_err(|e| reindex(e, idx))?,
         ),
-        M::IpCidr { cidrs, private, .. } => ItemMatcher::IpCidr {
+        M::IpCidr { cidrs, private, geo_country } => ItemMatcher::IpCidr {
             cidrs: build_cidr_set(cidrs, idx)?,
             private,
+            geo_country,
         },
-        M::SourceIpCidr { cidrs, private, .. } => ItemMatcher::SourceIpCidr {
+        M::SourceIpCidr { cidrs, private, geo_country } => ItemMatcher::SourceIpCidr {
             cidrs: build_cidr_set(cidrs, idx)?,
             private,
+            geo_country,
         },
         M::Ports(ranges) => ItemMatcher::Ports(check_ranges(ranges, idx, "ports")?),
         M::SourcePorts(ranges) => {
@@ -322,8 +332,7 @@ fn check_ranges(
 }
 
 /// Rewrites a matcher error's placeholder rule index to the real one.
-#[allow(clippy::missing_const_for_fn)] // rewriting foreign-enum field; const-ness adds nothing
-fn reindex(mut e: RouteError, idx: usize) -> RouteError {
+const fn reindex(mut e: RouteError, idx: usize) -> RouteError {
     if let RouteError::Parse { rule_index, .. } = &mut e {
         *rule_index = idx;
     }
@@ -539,13 +548,35 @@ mod tests {
         assert!(e.decide(&mut meta("192.168.1.5", 22, NetworkMask::TCP)).is_routed_to("home"));
         assert!(!e.decide(&mut meta("8.8.8.8", 22, NetworkMask::TCP)).is_routed_to("home"));
 
-        // geo_country compiles but always misses this task (geoip wiring later).
+        // geo_country is carried verbatim through compilation but evaluates
+        // false this task; the geoip feature resolves it later.
         let geo = Engine::build(rs(vec![(
             MatchItem::IpCidr { cidrs: vec![], private: false, geo_country: vec!["CN".into()] },
             route("cn"),
         )]))
         .unwrap();
         assert!(!geo.decide(&mut meta("1.2.3.4", 80, NetworkMask::TCP)).is_routed_to("cn"));
+        // Entries survive compilation verbatim (no silent erasure): a later
+        // task's geoip feature finds them right where it needs them.
+        let ItemMatcher::IpCidr { geo_country, .. } = &geo.rules[0].items[0] else {
+            panic!("expected compiled IpCidr item");
+        };
+        assert_eq!(geo_country, &["CN".to_owned()]);
+        // Source-side mirror carries them too.
+        let src_geo =
+            Engine::build(rs(vec![(
+                MatchItem::SourceIpCidr {
+                    cidrs: vec![],
+                    private: false,
+                    geo_country: vec!["DE".into()],
+                },
+                route("de"),
+            )]))
+            .unwrap();
+        let ItemMatcher::SourceIpCidr { geo_country, .. } = &src_geo.rules[0].items[0] else {
+            panic!("expected compiled SourceIpCidr item");
+        };
+        assert_eq!(geo_country, &["DE".to_owned()]);
     }
 
     #[test]
