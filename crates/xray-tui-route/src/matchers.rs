@@ -39,27 +39,39 @@ impl CompiledDomain {
     /// Compiles a spec into a matcher.
     ///
     /// # Errors
-    /// Returns [`RouteError::Parse`] when any regex fails to compile.
+    /// Returns [`RouteError::Parse`] when any regex fails to compile or a
+    /// suffix entry is empty.
     pub fn build(spec: &DomainRulesSpec) -> Result<Self, RouteError> {
         let lower_all = |xs: &[String]| xs.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
         let exact = lower_all(&spec.exact).into_iter().collect();
         // Suffix entries are stored dot-prefixed so `ends_with` enforces the
         // label boundary ("a.foo.com" hits ".foo.com"; "xfoo.com" does not).
-        let suffix = lower_all(&spec.suffix)
-            .iter()
-            .map(|s| format!(".{s}"))
-            .collect();
-        let keywords = AhoCorasick::new(lower_all(&spec.keywords)).map_err(|e| RouteError::Parse {
-            rule_index: 0,
-            field: "keywords",
-            message: e.to_string(),
-        })?;
-        let regexes =
-            RegexSet::new(lower_all(&spec.regexes)).map_err(|e| RouteError::Parse {
+        // Leading dots on the input are trimmed; empty entries are rejected.
+        let mut suffix = HashSet::new();
+        for s in lower_all(&spec.suffix) {
+            let s = s.trim_start_matches('.');
+            if s.is_empty() {
+                return Err(RouteError::Parse {
+                    rule_index: 0,
+                    field: "suffix",
+                    message: "empty suffix".to_owned(),
+                });
+            }
+            suffix.insert(format!(".{s}"));
+        }
+        let keyword_pats = lower_all(&spec.keywords);
+        let keywords =
+            AhoCorasick::new(&keyword_pats).map_err(|e| RouteError::Parse {
                 rule_index: 0,
-                field: "regex",
+                field: "keyword",
                 message: e.to_string(),
             })?;
+        let regex_pats = lower_all(&spec.regexes);
+        let regexes = RegexSet::new(&regex_pats).map_err(|e| RouteError::Parse {
+            rule_index: 0,
+            field: "regex",
+            message: format!("invalid pattern: {e}"),
+        })?;
         Ok(Self {
             n_rules: spec.exact.len()
                 + spec.suffix.len()
@@ -103,20 +115,30 @@ pub struct CidrSetBuilder {
     v6: Vec<(Ipv6Addr, u8)>,
 }
 
-/// The built read-only set of prefixes.
-#[derive(Debug, Clone, Default)]
-pub struct CidrSet {
-    v4: Vec<(Ipv4Addr /* masked */, u8 /* bits */)>,
-    v6: Vec<(Ipv6Addr, u8)>,
-}
-
 impl CidrSetBuilder {
     /// Adds a CIDR block to the set; the network address is masked to `bits`.
-    pub fn insert(&mut self, c: Cidr) {
+    ///
+    /// # Errors
+    /// Returns [`RouteError::Parse`] when `c.bits` exceeds the address
+    /// family's maximum (hand-built or deserialized values can carry an
+    /// out-of-range prefix length that would panic in [`CidrSet::contains`]).
+    pub fn insert(&mut self, c: Cidr) -> Result<(), RouteError> {
+        let max = match c.addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if c.bits > max {
+            return Err(RouteError::Parse {
+                rule_index: 0,
+                field: "cidr",
+                message: format!("prefix length {} exceeds /{max}", c.bits),
+            });
+        }
         match c.addr {
             IpAddr::V4(a) => self.v4.push((mask_v4(a, c.bits), c.bits)),
             IpAddr::V6(a) => self.v6.push((mask_v6(a, c.bits), c.bits)),
         }
+        Ok(())
     }
 
     /// Builds the [`CidrSet`].
@@ -127,6 +149,13 @@ impl CidrSetBuilder {
             v6: self.v6,
         }
     }
+}
+
+/// The built read-only set of prefixes.
+#[derive(Debug, Clone, Default)]
+pub struct CidrSet {
+    v4: Vec<(Ipv4Addr /* masked */, u8 /* bits */)>,
+    v6: Vec<(Ipv6Addr, u8)>,
 }
 
 impl CidrSet {
@@ -238,7 +267,7 @@ mod tests {
     #[test]
     fn cidrset_v6_contains_exact_prefix() {
         let mut b = CidrSetBuilder::default();
-        b.insert(Cidr::parse("fd00::/8").unwrap());
+        b.insert(Cidr::parse("fd00::/8").unwrap()).unwrap();
         let s = b.build();
         assert!(s.contains(&"fd00:dead::1".parse().unwrap()));
         assert!(!s.contains(&"fe80::1".parse().unwrap()));
@@ -271,5 +300,35 @@ mod tests {
     fn empty_spec_and_empty_cidrset() {
         assert!(CompiledDomain::build(&empty_spec()).unwrap().is_empty());
         assert!(CidrSetBuilder::default().build().is_empty());
+    }
+
+    #[test]
+    fn insert_rejects_out_of_range_bits_no_panic() {
+        // Hand-built/deserialized values can carry bits above the family max.
+        let mut b = CidrSetBuilder::default();
+        let bad = Cidr {
+            addr: "192.0.2.1".parse().unwrap(),
+            bits: 100,
+        };
+        assert!(matches!(b.insert(bad), Err(RouteError::Parse { .. })));
+        assert!(CidrSetBuilder::default().build().is_empty());
+    }
+
+    #[test]
+    fn suffix_normalizes_leading_dots_and_rejects_empty() {
+        let m = CompiledDomain::build(&DomainRulesSpec {
+            suffix: vec![".foo.com".into()],
+            ..empty_spec()
+        })
+        .unwrap();
+        assert!(m.matches_domain("a.foo.com"));
+        assert!(!m.matches_domain("xfoo.com"));
+        assert!(matches!(
+            CompiledDomain::build(&DomainRulesSpec {
+                suffix: vec!["..".into()],
+                ..empty_spec()
+            }),
+            Err(RouteError::Parse { field: "suffix", .. })
+        ));
     }
 }
