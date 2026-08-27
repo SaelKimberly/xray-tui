@@ -1,10 +1,11 @@
 //! Network address primitives: hosts, CIDR blocks, port ranges.
 
 use crate::error::RouteError;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// A network host: either a literal IP address or a domain name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NetHost {
     Ip(IpAddr),
     Domain(String),
@@ -28,14 +29,14 @@ impl NetHost {
 }
 
 /// A destination address: host plus port.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NetAddr {
     pub host: NetHost,
     pub port: u16,
 }
 
 /// An inclusive IPv4/IPv6 CIDR block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cidr {
     pub addr: IpAddr,
     pub bits: u8,
@@ -101,7 +102,7 @@ fn prefix_match(a: &[u8], b: &[u8], bits: u8) -> bool {
 }
 
 /// An inclusive TCP/UDP port range `[start, end]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,

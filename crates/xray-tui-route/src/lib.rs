@@ -1,6 +1,7 @@
 //! First-match routing engine primitives (addr/error foundation).
 
 pub mod addr;
+pub mod ir;
 pub mod error;
 
 pub use addr::{Cidr, NetAddr, NetHost, PortRange};
