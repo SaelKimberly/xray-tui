@@ -95,7 +95,7 @@ impl Cidr {
 }
 
 /// Byte-wise inclusive prefix comparison over octet arrays.
-fn prefix_match(a: &[u8], b: &[u8], bits: u8) -> bool {
+pub(crate) fn prefix_match(a: &[u8], b: &[u8], bits: u8) -> bool {
     let (full, rem) = ((bits / 8) as usize, bits % 8);
     a[..full] == b[..full]
         && (rem == 0 || a[full] >> (8 - rem) == b[full] >> (8 - rem))

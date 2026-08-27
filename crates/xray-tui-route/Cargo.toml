@@ -14,7 +14,7 @@ thiserror.workspace = true
 
 # ============ Text / Search / Hash ============
 aho-corasick.workspace = true
-regex = "1"
+regex = "1.11"
 
 # ============ Time / Duration Parsing ============
 jiff.workspace = true
