@@ -6,7 +6,7 @@
 //!
 //! | sing-box token / field            | IR target                                    |
 //! |-----------------------------------|----------------------------------------------|
-//! | `domain`                          | `Domain.exact` AND `Domain.suffix` pair      |
+//! | `domain`                          | `Domain.exact` only ("match full domain")    |
 //! | `domain_suffix`                   | `Domain.suffix`                              |
 //! | `domain_keyword`                  | `Domain.keywords`                            |
 //! | `domain_regex`                    | `Domain.regexes`                             |
@@ -168,14 +168,14 @@ fn compile_rule(
     let action = parse_action(obj, i)?;
 
     let arms = if mode.is_empty() {
-        let arms = collect_items(obj, i)?;
+        let arms = collect_items(obj, i, warnings)?;
         if arms[0].is_empty() {
             warnings.push((i, "rule has no matchable condition; skipped".to_owned()));
             return Ok(());
         }
         arms
     } else {
-        let arms = logical_arms(obj, i, mode)?;
+        let arms = logical_arms(obj, i, mode, warnings)?;
         if arms.is_empty() {
             warnings.push((
                 i,
@@ -227,10 +227,11 @@ fn check_rule(
     }
     let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("");
     if !mode.is_empty() && mode != "and" && mode != "or" {
-        return Err(parse_err(
-            i,
-            "mode",
-            format!("unknown logical mode {mode:?}"),
+        // e.g. "xor": routing-expressible only with T11 logic — Unsupported
+        // positionally, never silently compiled as OR. (Message is static:
+        // Unsupported carries &'static str, per Task 2's error contract.)
+        return Err(RouteError::Unsupported(
+            "logical mode outside \"and\"/\"or\" awaits T11",
         ));
     }
     Ok(())
@@ -239,51 +240,82 @@ fn check_rule(
 /// Expands a logical (`mode`) rule's children into flat condition arms:
 /// `and` children cartesian-combine (each combination one `Cond::All` set),
 /// `or` children alternate. Recurses through nested logical children.
-/// Upstream logical children are condition-only rule objects; an `action`
-/// key on a child is tolerated but ignored — the parent rule's action
-/// applies.
+///
+/// Children get the same `check_rule` vetting as top-level rules: unknown
+/// keys warn, `rule_set`/`dns-router`/`invert` are positionally Unsupported,
+/// and `mode:"xor"` is Unsupported (only `and`/`or` are routing-expressible
+/// without T11). An `action` key on a child is tolerated but ignored — the
+/// parent rule's action applies. A child with genuinely no conditions is
+/// skipped with a warning; a catch-all (`Cond::All([])`) arm is impossible
+/// by construction.
 fn logical_arms(
     obj: &serde_json::Map<String, Value>,
     i: usize,
     mode: &str,
+    warnings: &mut Vec<(usize, String)>,
 ) -> Result<Vec<Vec<MatchItem>>, RouteError> {
     let children = obj
         .get("rules")
         .ok_or_else(|| parse_err(i, "mode", "logical rule missing \"rules\" array"))?
         .as_array()
         .ok_or_else(|| parse_err(i, "mode", "\"rules\" must be an array"))?;
-    let mut child_arms: Vec<Vec<MatchItem>> = Vec::new();
+    // Each child contributes a LIST of alternative arms (flat child: one;
+    // or-child: many; and-child: cartesian products). Keeping them per-child
+    // is what makes `and` cartesian across children while `or` concatenates.
+    let mut per_child: Vec<Vec<Vec<MatchItem>>> = Vec::new();
     for cv in children {
         let cobj = cv
             .as_object()
             .ok_or_else(|| parse_err(i, "rule", "logical child must be an object"))?;
+        // Same vetting as top-level rules — no silent skips for accelerators,
+        // invert, or unknown modes (xor) inside logical children.
+        check_rule(cobj, i, warnings)?;
         let cmode = cobj.get("mode").and_then(Value::as_str).unwrap_or("");
-        let arms = if cmode.is_empty() {
-            // Flat child: exactly one arm (empty arm = no conditions).
-            collect_items(cobj, i)?
+        let mut arms = if cmode.is_empty() {
+            // Flat child: one arm (possibly empty = no conditions).
+            collect_items(cobj, i, warnings)?
         } else {
             // Nested logical child: already expanded into arms.
-            logical_arms(cobj, i, cmode)?
+            logical_arms(cobj, i, cmode, warnings)?
         };
-        child_arms.extend(arms);
+        // An empty child arm means the child matched nothing; dropping it
+        // keeps the parent's semantics (an empty condition can never gate a
+        // catch-all through) and must never survive as Cond::All([]).
+        let n_before = arms.len();
+        arms.retain(|arm| !arm.is_empty());
+        if arms.len() < n_before {
+            warnings.push((
+                i,
+                format!("logical child at rule {i} has no conditions; arm skipped"),
+            ));
+        }
+        if !arms.is_empty() {
+            per_child.push(arms);
+        }
     }
     if mode == "and" {
-        if child_arms.is_empty() {
+        if per_child.is_empty() {
+            // Every child was empty: the logical rule has no conditions.
             return Ok(Vec::new());
         }
+        // Cartesian product across children; each child's arms are its
+        // alternatives. and( or(a,b), c ) ⇒ (a∧c) ∨-as-two-rules (b∧c).
         let mut combos: Vec<Vec<MatchItem>> = vec![Vec::new()];
-        for arm in &child_arms {
-            let mut next: Vec<Vec<MatchItem>> = Vec::with_capacity(combos.len());
+        for child in &per_child {
+            let mut next: Vec<Vec<MatchItem>> = Vec::with_capacity(combos.len() * child.len());
             for prefix in &combos {
-                let mut merged = prefix.clone();
-                merged.extend(arm.iter().cloned());
-                next.push(merged);
+                for arm in child {
+                    let mut merged = prefix.clone();
+                    merged.extend(arm.iter().cloned());
+                    next.push(merged);
+                }
             }
             combos = next;
         }
         Ok(combos)
     } else {
-        Ok(child_arms)
+        // OR: the union of every child's alternative arms.
+        Ok(per_child.into_iter().flatten().collect())
     }
 }
 
@@ -356,6 +388,7 @@ fn other_action_hint(other: &str) -> &'static str {
 fn collect_items(
     obj: &serde_json::Map<String, Value>,
     i: usize,
+    warnings: &mut Vec<(usize, String)>,
 ) -> Result<Vec<Vec<MatchItem>>, RouteError> {
     let mut domains = DomainBucket::default();
     let mut ip = IpBucket::default();
@@ -372,12 +405,10 @@ fn collect_items(
     for (field, v) in obj {
         match field.as_str() {
             "domain" => {
-                for tok in field_strings(v, i, "domain")? {
-                    // Upstream sing matches a bare `domain` entry as itself
-                    // plus all subdomains; register both exact and suffix.
-                    domains.exact.push(tok.clone());
-                    domains.suffix.push(tok);
-                }
+                // Upstream rule.md: bare `domain` entries "Match full
+                // domain" — exact equality, no subdomain expansion. Only
+                // `domain_suffix` widens to subdomains.
+                domains.exact.extend(field_strings(v, i, "domain")?);
             }
             "domain_suffix" => domains.suffix.extend(field_strings(v, i, "domain_suffix")?),
             "domain_keyword" => domains
@@ -421,8 +452,12 @@ fn collect_items(
             "network" => network = parse_network(v, i)?,
             "inbound" => inbound_tags = field_strings(v, i, "inbound")?,
             "protocol" => collect_protocols(v, i, &mut protocols)?,
-            // action/outbound/method keys are action-side; logical-only
-            // keys never reach here (mode branched earlier).
+            // action/outbound/method keys are action-side; a stray `rules`
+            // key on a flat rule would silently drop its children, so warn.
+            "rules" => warnings.push((
+                i,
+                format!("ignored `rules` key on flat rule (needs `mode`): {v}"),
+            )),
             _ => {}
         }
     }
@@ -978,6 +1013,138 @@ mod tests {
     }
 
     #[test]
+    fn nested_and_or_distributes_with_engine_roundtrip() {
+        // and( or(suffix .a.com, ip 192.168/16), port 443 ) expands to two
+        // flat rules: (suffix∧port) and (ip∧port), both → tag "mix".
+        let txt = r#"{"route":{"rules":[{
+            "mode":"and",
+            "rules":[
+                {"mode":"or","rules":[
+                    {"domain_suffix":[".a.com"]},
+                    {"ip_cidr":["192.168.0.0/16"]}
+                ]},
+                {"port":[443]}
+            ],
+            "action":"route","outbound":"mix"}]}}"#;
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 2, "distributive expansion");
+        for r in &out.ruleset.rules {
+            assert_eq!(
+                r.action,
+                Action::Route {
+                    tag: "mix".into(),
+                    override_addr: None
+                }
+            );
+        }
+        // Engine roundtrip: suffix+port hits, ip+port hits, port-only and
+        // subdomain-without-port fall through.
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str, port: u16| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(matches!(
+            engine.decide(&mut meta("www.a.com", 443)),
+            Decision::Route { tag, .. } if tag == "mix"
+        ));
+        assert!(matches!(
+            engine.decide(&mut meta("192.168.1.1", 443)),
+            Decision::Route { tag, .. } if tag == "mix"
+        ));
+        assert!(matches!(
+            engine.decide(&mut meta("www.a.com", 8443)),
+            Decision::Route { tag, .. } if tag == "direct"
+        ));
+        assert!(matches!(
+            engine.decide(&mut meta("other.net", 443)),
+            Decision::Route { tag, .. } if tag == "direct"
+        ));
+    }
+
+    #[test]
+    fn child_vetting_inside_logical_rules() {
+        // (a) child rule_set ref ⇒ Unsupported, positionally.
+        let rule_set_child = r#"{"route":{"rules":[{"mode":"and","rules":[
+            {"rule_set":["geo"]},{"domain_suffix":[".a.com"]}],
+            "action":"route","outbound":"o"}]}}"#;
+        match compile_singbox(rule_set_child) {
+            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("rule_set"), "{msg}"),
+            other => panic!("child rule_set must be Unsupported, got {other:?}"),
+        }
+        // (b) child invert ⇒ Unsupported (T11).
+        let invert_child = r#"{"route":{"rules":[{"mode":"or","rules":[
+            {"domain_suffix":[".a.com"],"invert":true}],"action":"route","outbound":"o"}]}}"#;
+        match compile_singbox(invert_child) {
+            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("T11"), "{msg}"),
+            other => panic!("child invert must be Unsupported, got {other:?}"),
+        }
+        // (c) child mode:"xor" ⇒ Unsupported, never silently OR'd.
+        let xor_child = r#"{"route":{"rules":[{"mode":"or","rules":[
+            {"mode":"xor","rules":[{"domain_suffix":[".a.com"]}]},
+            {"ip_cidr":["10.0.0.0/8"]}],"action":"route","outbound":"o"}]}}"#;
+        match compile_singbox(xor_child) {
+            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("mode"), "{msg}"),
+            other => panic!("child xor must be Unsupported, got {other:?}"),
+        }
+        // (d) top-level xor ⇒ Unsupported.
+        let xor_top = r#"{"route":{"rules":[{"mode":"xor","rules":[
+            {"domain_suffix":[".a.com"]}],"action":"route","outbound":"o"}]}}"#;
+        match compile_singbox(xor_top) {
+            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("mode"), "{msg}"),
+            other => panic!("xor must be Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_logical_child_is_skipped_never_catch_all() {
+        // OR rule with an empty child {} among real children: the empty arm
+        // is dropped with a warning; NO Cond::All([]) catch-all may exist.
+        let txt = r#"{"route":{"rules":[{"mode":"or","rules":[
+            {},{"domain_suffix":[".a.com"]}],"action":"route","outbound":"o"}]}}"#;
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1, "empty child arm dropped");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|(_, m)| m.contains("no conditions")),
+            "empty child warned: {:?}",
+            out.warnings
+        );
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!()
+        };
+        assert!(!items.is_empty(), "no catch-all arm may survive");
+        // AND rule where every child is empty: whole rule skipped.
+        let all_empty = r#"{"route":{"rules":[{"mode":"and","rules":[{},{},{}],
+            "action":"route","outbound":"o"}]}}"#;
+        let out2 = compile_singbox(all_empty).unwrap();
+        assert_eq!(out2.ruleset.rules.len(), 0, "all-empty AND skips");
+    }
+
+    #[test]
+    fn rules_key_on_flat_rule_warns() {
+        let txt = r#"{"route":{"rules":[{"domain_suffix":[".a.com"],"rules":[
+            {"ip_cidr":["10.0.0.0/8"]}],"action":"route","outbound":"o"}]}}"#;
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1, "flat rule still compiles");
+        assert!(
+            out.warnings.iter().any(|(_, m)| m.contains("`rules` key")),
+            "stray rules key warned: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
     fn reject_method_variants_map() {
         for (method, expected) in [
             ("drop", RejectMethod::Drop),
@@ -1077,20 +1244,51 @@ mod tests {
     }
 
     #[test]
-    fn domain_bare_entry_pairs_exact_and_suffix() {
+    fn domain_bare_entry_is_exact_only_no_subdomains() {
         let txt =
             r#"{"route":{"rules":[{"domain":["test.com"],"action":"route","outbound":"o"}]}}"#;
         let out = compile_singbox(txt).unwrap();
         let Cond::All(items) = &out.ruleset.rules[0].cond else {
             panic!()
         };
+        // Upstream rule.md: bare `domain` "Match full domain" — no suffix
+        // registration, so sub.example.com must NOT hit.
         assert_eq!(
             items[0],
             MatchItem::Domain {
                 exact: vec!["test.com".into()],
-                suffix: vec!["test.com".into()],
+                suffix: vec![],
                 keywords: vec![],
                 regexes: vec![]
+            }
+        );
+        // Engine-path proof: exact host routes, subdomain falls through.
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port: 443,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            resolved_host_ips: vec![],
+        };
+        assert_eq!(
+            engine.decide(&mut meta("test.com")),
+            Decision::Route {
+                tag: "o".into(),
+                override_addr: None
+            }
+        );
+        assert_eq!(
+            engine.decide(&mut meta("sub.test.com")),
+            Decision::Route {
+                tag: "direct".into(),
+                override_addr: None
             }
         );
     }
