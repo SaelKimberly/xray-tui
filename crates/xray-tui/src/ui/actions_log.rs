@@ -10,7 +10,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
 
-#[allow(clippy::missing_const_for_fn)]
 fn connection_icon(state: &AppState) -> (&'static str, Style) {
     let palette = state.current_palette();
     if state.connecting {

@@ -386,11 +386,14 @@ async fn handle_tree_key(state: &mut AppState, key: &KeyEvent) {
     // Handle Enter separately — needs to release borrow before async call
     if key.code == KeyCode::Enter {
         let (g, child) = {
-            let tree_state = match &mut state.mode {
-                AppMode::Settings {
-                    mode: SettingsMode::Split { tree, .. },
-                } => tree,
-                _ => return,
+            let AppMode::Settings {
+                mode:
+                    SettingsMode::Split {
+                        tree: tree_state, ..
+                    },
+            } = &mut state.mode
+            else {
+                return;
             };
 
             tree_state.borrow().selected()
@@ -697,13 +700,11 @@ fn render_form_with_area(
 
 fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     // Borrow mode to extract data, then work through mutable state
-    let mode = match &state.mode {
-        AppMode::Settings { mode } => mode,
-        _ => return,
+    let AppMode::Settings { mode } = &state.mode else {
+        return;
     };
-    let section = match section_from_mode(mode) {
-        Some(s) => s,
-        None => return,
+    let Some(section) = section_from_mode(mode) else {
+        return;
     };
 
     // Get field defs
@@ -713,21 +714,21 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     }
     let max_idx = field_defs.len().saturating_sub(1);
     // Extract current fields, focus_index, and form_errors from mutable state
-    let (fields, focus_index, form_errors) = match &mut state.mode {
-        AppMode::Settings {
-            mode:
-                SettingsMode::Split {
-                    right:
-                        SplitRightPane::Form {
-                            fields,
-                            focus_index,
-                            form_errors,
-                            ..
-                        },
-                    ..
-                },
-        } => (fields, focus_index, form_errors),
-        _ => return,
+    let AppMode::Settings {
+        mode:
+            SettingsMode::Split {
+                right:
+                    SplitRightPane::Form {
+                        fields,
+                        focus_index,
+                        form_errors,
+                        ..
+                    },
+                ..
+            },
+    } = &mut state.mode
+    else {
+        return;
     };
 
     match key.code {

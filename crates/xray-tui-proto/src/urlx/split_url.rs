@@ -214,7 +214,6 @@ impl<'a> RawUrlX<'a> {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn from_str_impl(s: &'a str) -> Option<Self> {
         // we just parse this from sides to the center
         let mut unparsed = s.trim_end();

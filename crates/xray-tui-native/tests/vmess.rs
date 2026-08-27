@@ -7,8 +7,11 @@
 //! source fn's attributes when embedding it beside the generated tests, so no
 //! fn-/statement-level `#[allow]` reaches the nested async fn that holds the
 //! non-`Send` `CaseSpec` across the runner await. No narrower scope works.
+#![allow(
+    clippy::future_not_send,
+    reason = "rstest-generated futures lose their Send bound; they run on one local tokio runtime"
+)]
 #![cfg(feature = "native-e2e")]
-#![allow(clippy::future_not_send)]
 
 mod common;
 

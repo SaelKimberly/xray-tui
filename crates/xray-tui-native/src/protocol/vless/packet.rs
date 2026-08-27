@@ -361,7 +361,7 @@ mod tests {
         // → recv() returns (Some(dest), payload).
         let (client, mut server) = tokio::io::duplex(1024);
         let mux = MuxClient::new(client);
-        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let session = mux.open_udp_session([0xAA; 8]).unwrap();
         // XUdp holds no stream, so S is unconstrained — pin it for the
         // test (production pins it via connect_udp's return type).
         let mut conn: PacketConn<crate::BoxStream> = PacketConn::xudp(session);
@@ -401,7 +401,7 @@ mod tests {
         // per-packet dest); send(None) must fail before any frame is queued.
         let (client, mut server) = tokio::io::duplex(1024);
         let mux = MuxClient::new(client);
-        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let session = mux.open_udp_session([0xAA; 8]).unwrap();
         let mut conn: PacketConn<crate::BoxStream> = PacketConn::xudp(session);
 
         let err = conn.send(None, b"p").await.unwrap_err();

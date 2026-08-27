@@ -257,7 +257,7 @@ pub async fn connect_udp(
         // 2-byte framing — the mux frames carry the length and the
         // per-packet destination (spec §4.1, §5.2).
         let mux_client = connect_mux(ctx, stream, cfg).await?;
-        let session = mux_client.open_udp_session(random_global_id()).await?;
+        let session = mux_client.open_udp_session(random_global_id())?;
         return Ok(PacketConn::xudp(session));
     }
     match cfg.flow.as_deref() {

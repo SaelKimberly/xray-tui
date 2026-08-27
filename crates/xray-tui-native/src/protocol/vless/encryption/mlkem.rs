@@ -79,7 +79,10 @@ const PFS_EXCHANGE_LEN: usize = 18 + 1184 + X25519_LEN + TAG_LEN;
 // ── wire helpers ───────────────────────────────────────────────────────────
 
 /// Big-endian u16 into two bytes (xray `EncodeLength`).
-#[allow(clippy::cast_possible_truncation)] // l < 2^16 by construction
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "ML-KEM length fields are < 2^16 by protocol construction"
+)]
 const fn encode_length(l: usize) -> [u8; 2] {
     [(l >> 8) as u8, l as u8]
 }
@@ -190,7 +193,10 @@ fn new_ctr(key: &[u8], iv: &[u8; 16]) -> Ctr128BE<Aes256> {
 }
 
 /// Uniform random integer in `[lo, hi]` (xray `crypto.RandBetween`).
-#[allow(clippy::cast_possible_truncation)] // usize >= u64 on supported targets
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "usize is at least u64-wide on all supported targets"
+)]
 fn rand_between(lo: usize, hi: usize, rng: &ring::rand::SystemRandom) -> usize {
     debug_assert!(hi >= lo);
     let span = (hi - lo + 1) as u64;

@@ -57,10 +57,9 @@ enum ReadState {
 
 /// Record cipher selected by the payload security byte. The response-header
 /// peel is ALWAYS AES-128-GCM; only the body records dispatch here.
-#[allow(clippy::large_enum_variant)]
 enum Cipher {
-    Aes128Gcm(Aes128Gcm),
-    Chacha20Poly1305(ChaCha20Poly1305),
+    Aes128Gcm(Box<Aes128Gcm>),
+    Chacha20Poly1305(Box<ChaCha20Poly1305>),
 }
 
 impl Cipher {
@@ -68,14 +67,14 @@ impl Cipher {
     /// expanded to 32 bytes for chacha (md5 chain) inside.
     fn new(security: u8, key16: &[u8; 16]) -> Self {
         match security {
-            SECURITY_AES128_GCM => {
-                Self::Aes128Gcm(Aes128Gcm::new_from_slice(key16).expect("16-byte key"))
-            }
+            SECURITY_AES128_GCM => Self::Aes128Gcm(Box::new(
+                Aes128Gcm::new_from_slice(key16).expect("16-byte key"),
+            )),
             SECURITY_CHACHA20_POLY1305 => {
                 let key32 = keys::chacha20_key_32(key16);
-                Self::Chacha20Poly1305(
+                Self::Chacha20Poly1305(Box::new(
                     ChaCha20Poly1305::new_from_slice(&key32).expect("32-byte key"),
-                )
+                ))
             }
             other => panic!("vmess payload security {other} not validated"),
         }

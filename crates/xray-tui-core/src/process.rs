@@ -64,7 +64,6 @@ impl CoreProcess {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 // Send SIGTERM for graceful shutdown
-                #[allow(clippy::cast_possible_wrap, reason = "PID always fits in i32")]
                 let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             }
             #[cfg(not(unix))]
@@ -294,7 +293,6 @@ impl RealCoreManager {
             .ok_or_else(|| ProcessError::Startup("No child PID".into()))?;
         #[cfg(unix)]
         {
-            #[allow(clippy::cast_possible_wrap, reason = "PID fits in i32")]
             unsafe {
                 if libc::kill(pid as i32, libc::SIGHUP) != 0 {
                     let err = std::io::Error::last_os_error();

@@ -29,7 +29,6 @@ pub struct BackendUpdateStatus {
     pub error: Option<String>,
 }
 
-#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Profiles,

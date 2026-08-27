@@ -34,13 +34,11 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
     // shared across endpoints (identity dedup excludes host/port), so
     // first-owner resolution would probe and update the wrong server when two
     // endpoints share the same config.
-    let row = if let Some(r) = state
+    let Some(row) = state
         .endpoints
         .iter()
         .find(|r| r.endpoint.id.get() == endpoint_id)
-    {
-        r
-    } else {
+    else {
         state.log_trace("error", "tui::ops::ping", "Endpoint not found for TCP ping");
         return;
     };

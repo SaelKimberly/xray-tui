@@ -341,9 +341,10 @@ mod tests {
         // `varint_len(n)` returns the varint BYTES, so its len() is the
         // encoded width.
         let hunk_len = 1 + varint_len(payload.len()).len() + payload.len();
-        // Casts are deliberate: gRPC prefix bytes are u8 by spec (hunk_len ≤ 2^32).
-        // Statement-level (not fn-level): rstest's retained original fn loses fn attrs.
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "gRPC frame-prefix bytes are u8 by wire spec; rstest clears fn-level attrs from the retained source fn, so the allow must be statement-level"
+        )]
         let prefix = [0, 0, 0, (hunk_len >> 8) as u8, hunk_len as u8];
         assert_eq!(&framed[..5], &prefix);
         assert_eq!(framed[5], 0x0A);

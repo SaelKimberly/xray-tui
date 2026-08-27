@@ -32,7 +32,6 @@ impl std::fmt::Display for PortSpec {
 }
 
 impl PortSpec {
-    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self {
             ports: Vec::new(),
@@ -110,7 +109,6 @@ impl PortSpec {
             match &arr[idx] {
                 PortDecl::Single(_) => length += 1,
                 PortDecl::Range(r) => {
-                    #[allow(clippy::cast_lossless)]
                     let range_len = (r.end as u32 - r.start as u32 + 1) as usize;
                     length += range_len;
                 }
@@ -195,7 +193,10 @@ impl Iterator for PortSpecIter<'_> {
                 let port = u32::from(r.start) + self.inner_idx;
                 if port <= u32::from(r.end) {
                     self.inner_idx += 1;
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "port <= r.end <= u16::MAX by this branch"
+                    )]
                     let port = port as u16;
                     Some(port)
                 } else {

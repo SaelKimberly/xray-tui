@@ -817,7 +817,7 @@ mod roster {
             .any(|e| matches!(e, ExtensionSpec::Raw { ty: 0xfe0d, .. }))
     }
 
-    #[allow(clippy::struct_excessive_bools)] // verdict flags, one per check
+    #[allow(clippy::struct_excessive_bools, reason = "one bool per verdict check")]
     struct EntryResult {
         name: &'static str,
         family: &'static str,

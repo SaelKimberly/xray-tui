@@ -1,8 +1,3 @@
-#![allow(
-    clippy::must_use_candidate,
-    clippy::missing_const_for_fn,
-    clippy::module_name_repetitions
-)]
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -56,13 +51,13 @@ impl<'a> Column<'a> {
     }
 
     #[must_use]
-    pub fn alignment(mut self, alignment: Alignment) -> Self {
+    pub const fn alignment(mut self, alignment: Alignment) -> Self {
         self.alignment = alignment;
         self
     }
 
     #[must_use]
-    pub fn style(mut self, style: Style) -> Self {
+    pub const fn style(mut self, style: Style) -> Self {
         self.style = style;
         self
     }
@@ -146,26 +141,26 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
     }
 
     #[must_use]
-    pub fn highlight_style(mut self, style: Style) -> Self {
+    pub const fn highlight_style(mut self, style: Style) -> Self {
         self.highlight_style = style;
         self
     }
 
     #[must_use]
-    pub fn selection_style(mut self, style: Style) -> Self {
+    pub const fn selection_style(mut self, style: Style) -> Self {
         self.selection_style = style;
         self
     }
 
     #[must_use]
-    pub fn sort_column(mut self, col: Option<usize>, dir: SortDirection) -> Self {
+    pub const fn sort_column(mut self, col: Option<usize>, dir: SortDirection) -> Self {
         self.sort_column = col;
         self.sort_direction = dir;
         self
     }
 
     #[must_use]
-    pub fn column_spacing(mut self, spacing: u16) -> Self {
+    pub const fn column_spacing(mut self, spacing: u16) -> Self {
         self.column_spacing = spacing;
         self
     }
@@ -177,13 +172,13 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
     }
 
     #[must_use]
-    pub fn header_divider(mut self, ch: char) -> Self {
+    pub const fn header_divider(mut self, ch: char) -> Self {
         self.header_divider = Some(ch);
         self
     }
 
     #[must_use]
-    pub fn scrollbar(mut self, thumb_style: Style, track_style: Style) -> Self {
+    pub const fn scrollbar(mut self, thumb_style: Style, track_style: Style) -> Self {
         self.show_scrollbar = true;
         self.scrollbar_thumb_style = thumb_style;
         self.scrollbar_track_style = track_style;

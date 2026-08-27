@@ -27,7 +27,7 @@ impl Database {
     /// Opens existing DB or creates fresh. Recovers from corruption by recreating.
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "driver is moved into try_open_db; clippy's drop suggestion is a false positive"
+        reason = "the Turso driver temporaries are consumed by try_open_db in the very next statement; clippy attributes their drop to the whole fn through the generic await"
     )]
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         // Tag for databases created by this 7-table schema. toasty 0.9's

@@ -31,23 +31,19 @@ pub struct StreamingDecoder {
     state: EncodingState,
     pending_input: [MaybeUninit<u8>; 4],
     pending_input_len: usize,
-    carry_over: Box<[MaybeUninit<u8>; CARRY_OVER_SIZE]>,
+    carry_over: Box<[MaybeUninit<u8>]>,
     carry_over_len: usize,
 }
 
 impl StreamingDecoder {
     /// Create a new decoder.
     #[must_use]
-    #[allow(
-        clippy::large_stack_arrays,
-        reason = "carry_over is heap-allocated via Box, stack is just temporary during Box::new"
-    )]
     pub fn new() -> Self {
         Self {
             state: EncodingState::Unknown,
             pending_input: [MaybeUninit::uninit(); 4],
             pending_input_len: 0,
-            carry_over: Box::new([MaybeUninit::uninit(); CARRY_OVER_SIZE]),
+            carry_over: vec![MaybeUninit::uninit(); CARRY_OVER_SIZE].into_boxed_slice(),
             carry_over_len: 0,
         }
     }
@@ -84,22 +80,21 @@ impl StreamingDecoder {
         }
 
         let total_len = self.pending_input_len + chunk.len();
-        #[allow(
-            clippy::large_stack_arrays,
-            reason = "hot-path decoder needs fixed-size work buffer; heap alloc on every feed call too expensive"
-        )]
-        let mut work: [MaybeUninit<u8>; INPUT_CHUNK_SIZE + 4] =
-            [MaybeUninit::uninit(); INPUT_CHUNK_SIZE + 4];
+        let mut work = vec![MaybeUninit::<u8>::uninit(); INPUT_CHUNK_SIZE + 4];
         // Prepend pending bytes
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..self.pending_input_len {
-            work[i] = MaybeUninit::new(unsafe { self.pending_input[i].assume_init() });
+        for (w, p) in work[..self.pending_input_len]
+            .iter_mut()
+            .zip(self.pending_input.iter())
+        {
+            *w = MaybeUninit::new(unsafe { p.assume_init() });
         }
 
         // Copy chunk bytes into remaining work area
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..chunk.len() {
-            work[self.pending_input_len + i] = MaybeUninit::new(chunk[i]);
+        for (w, c) in work[self.pending_input_len..total_len]
+            .iter_mut()
+            .zip(chunk)
+        {
+            *w = MaybeUninit::new(*c);
         }
         self.pending_input_len = 0;
 
@@ -108,7 +103,6 @@ impl StreamingDecoder {
         let remainder = total_len - aligned_len;
 
         // Save trailing bytes as pending for next call
-        #[allow(clippy::needless_range_loop)]
         for i in 0..remainder {
             self.pending_input[i] =
                 MaybeUninit::new(unsafe { work[aligned_len + i].assume_init() });
@@ -134,9 +128,11 @@ impl StreamingDecoder {
         // Process leftover pending_input bytes (may be < 4)
         if self.pending_input_len > 0 {
             let mut buf = [0u8; 4];
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..self.pending_input_len {
-                buf[i] = unsafe { self.pending_input[i].assume_init() };
+            for (b, p) in buf[..self.pending_input_len]
+                .iter_mut()
+                .zip(self.pending_input.iter())
+            {
+                *b = unsafe { p.assume_init() };
             }
             let decoded = self.process_aligned(&buf[..self.pending_input_len])?;
             self.pending_input_len = 0;

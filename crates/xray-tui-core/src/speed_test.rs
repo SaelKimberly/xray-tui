@@ -188,10 +188,6 @@ pub async fn real_ping(
     while let Some(result) = stream.next().await {
         match result {
             Ok(resp) if resp.status().is_success() => {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "elapsed ms fits in u64 (max ~584M years)"
-                )]
                 let elapsed = start.elapsed().as_millis() as u64;
                 match best_latency {
                     None => best_latency = Some(elapsed),

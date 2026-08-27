@@ -30,9 +30,11 @@ use crate::types::{
     SortColumn, SplitRightPane, Tab,
 };
 
-/// Global UI/connection state. The many `bool` fields are orthogonal flags
-/// (one per independent UI behavior); a state machine would obscure them.
-#[allow(clippy::struct_excessive_bools)]
+/// Global UI/connection state.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "fields are orthogonal UI flags (one per independent behavior); a state machine would obscure them"
+)]
 pub struct AppState {
     pub db: Arc<Database>,
     pub config: AppConfig,
@@ -593,10 +595,6 @@ impl AppState {
     pub fn log_trace(&mut self, level: &str, target: &str, message: &str) {
         use std::time::SystemTime;
 
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "nanos since epoch fits u64 (584yr range)"
-        )]
         let timestamp_nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()

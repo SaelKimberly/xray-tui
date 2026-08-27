@@ -43,9 +43,7 @@ const IV: [u32; 8] = [
 
 const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
-#[allow(clippy::many_single_char_names)]
-#[allow(clippy::missing_const_for_fn)] // iterator/indexing not const-stable
-fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+const fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
     state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
     state[d] = (state[d] ^ state[a]).rotate_right(16);
     state[c] = state[c].wrapping_add(state[d]);
@@ -56,8 +54,7 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
-#[allow(clippy::missing_const_for_fn)]
-fn round(state: &mut [u32; 16], m: &[u32; 16]) {
+const fn round(state: &mut [u32; 16], m: &[u32; 16]) {
     // Mix the columns.
     g(state, 0, 4, 8, 12, m[0], m[1]);
     g(state, 1, 5, 9, 13, m[2], m[3]);
@@ -70,7 +67,6 @@ fn round(state: &mut [u32; 16], m: &[u32; 16]) {
     g(state, 3, 4, 9, 14, m[14], m[15]);
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn permute(m: &mut [u32; 16]) {
     let mut permuted = [0; 16];
     for (i, &pi) in MSG_PERMUTATION.iter().enumerate() {
@@ -79,7 +75,10 @@ fn permute(m: &mut [u32; 16]) {
     *m = permuted;
 }
 
-#[allow(clippy::cast_possible_truncation)] // counter low/high words are u32 by spec
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "BLAKE3 counter enters the state words as two u32 halves by spec"
+)]
 fn compress(
     chaining_value: &[u32; 8],
     block_words: &[u32; 16],
@@ -126,14 +125,12 @@ fn compress(
     state
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn first_8_words(compression_output: [u32; 16]) -> [u32; 8] {
     let mut out = [0; 8];
     out.copy_from_slice(&compression_output[..8]);
     out
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn words_from_le_bytes(bytes: &[u8; 32]) -> [u32; 8] {
     let mut out = [0; 8];
     for (i, word) in out.iter_mut().enumerate() {
@@ -255,7 +252,6 @@ impl ChunkState {
         BLOCK_LEN * self.blocks_compressed as usize + self.block_len as usize
     }
 
-    #[allow(clippy::cast_lossless)] // u32::from is not const-stable
     const fn start_flag(&self) -> u32 {
         if self.blocks_compressed == 0 {
             CHUNK_START as u32
@@ -361,7 +357,6 @@ impl Output {
     }
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn parent_cv(
     left_child: [u32; 8],
     right_child: [u32; 8],

@@ -446,28 +446,20 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 let status = state.update_status.entry(core_type).or_default();
                 status.current_version.clone_from(&current_version);
                 status.latest_version.clone_from(&latest_version);
-                status.update_available = {
-                    #[allow(
-                        clippy::option_if_let_else,
-                        reason = "business logic with nested version comparison clearer as match"
-                    )]
-                    match &current_version {
-                        // Not installed but latest known → install available
-                        None => latest_version.is_some(),
-                        // Both known → compare versions
-                        Some(cur_str) => match &latest_version {
-                            Some(latest_str) => {
-                                let cur = xray_tui_core::updater::parse_version(cur_str);
-                                let latest = xray_tui_core::updater::parse_version(latest_str);
-                                match (cur, latest) {
-                                    (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
-                                    _ => false,
-                                }
+                status.update_available = current_version.as_ref().map_or_else(
+                    // Not installed but latest known → install available
+                    || latest_version.is_some(),
+                    |cur_str| {
+                        latest_version.as_ref().is_some_and(|latest_str| {
+                            let cur = xray_tui_core::updater::parse_version(cur_str);
+                            let latest = xray_tui_core::updater::parse_version(latest_str);
+                            match (cur, latest) {
+                                (Some(c), Some(l)) => xray_tui_core::updater::is_newer(&c, &l),
+                                _ => false,
                             }
-                            None => false,
-                        },
-                    }
-                };
+                        })
+                    },
+                );
                 status.error = error;
                 if let Some(ref ver) = latest_version {
                     match core_type {
@@ -792,9 +784,8 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
     let mut touched: Vec<ProfileStats> = Vec::new();
     let mut non_stats: Vec<CoreEvent> = Vec::new();
     while let Some(rx) = state.core_event_rx.as_mut() {
-        let event = match rx.try_recv() {
-            Ok(ev) => ev,
-            Err(_) => break,
+        let Ok(event) = rx.try_recv() else {
+            break;
         };
         match event {
             CoreEvent::StatsUpdate {

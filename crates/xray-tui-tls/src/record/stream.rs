@@ -56,8 +56,7 @@ pub struct AppKeys {
 /// semantic; a `close_notify` is still honored as EOF when present.
 #[allow(
     clippy::struct_excessive_bools,
-    // four per-stream state flags (direct write/read, EOF-closed, PQ
-    // negotiated); packing them into a bitmask saves nothing readable.
+    reason = "TLS record-layer I/O state is a handful of independent mode booleans; sub-structuring would spread every access across structs"
 )]
 pub struct TlsStream<S> {
     inner: S,

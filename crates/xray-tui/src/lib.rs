@@ -3,12 +3,11 @@
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
-    reason = "TUI display domain: ports validated to u16, timestamps fit i64 for billions of years, list indices < u16 for rendering, display precision loss acceptable"
+    reason = "TUI display domain: ports validated to u16, timestamps fit i64, list indices bounded by rendered rows; converting each cast adds unwrap noise with no correctness gain"
 )]
 #![allow(
     clippy::future_not_send,
-    clippy::manual_let_else,
-    reason = "single-threaded TUI, futures never sent across threads; manual let-else where match is clearer"
+    reason = "single-threaded TUI: futures are spawned onto one local runtime and never cross threads"
 )]
 
 pub mod ops;

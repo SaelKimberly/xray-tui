@@ -683,13 +683,11 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         _ => return,
     };
 
-    let row = if let Ok(Some(r)) = state
+    let Ok(Some(row)) = state
         .db
         .get_endpoint(endpoint_id_from_raw(endpoint_id))
         .await
-    {
-        r
-    } else {
+    else {
         state.log_trace("error", "tui::ops::profiles", "Profile not found for edit");
         return;
     };
@@ -907,16 +905,16 @@ pub async fn confirm_batch_import(state: &mut AppState) {
 }
 
 pub fn move_profile_up(state: &mut AppState) {
-    let id = match selected_profile_id(state) {
-        Some(id) => id,
-        None => return,
+    let Some(id) = selected_profile_id(state) else {
+        return;
     };
     let filtered: Vec<&EndpointRow> = filtered_profiles(state).collect();
-    let idx = filtered.iter().position(|r| r.endpoint.id.get() == id);
-    let _idx = match idx {
-        Some(i) if i > 0 => i,
-        _ => return,
+    let Some(idx) = filtered.iter().position(|r| r.endpoint.id.get() == id) else {
+        return;
     };
+    if idx == 0 {
+        return;
+    }
     drop(filtered);
     state.log_trace("info", "tui::ops::profiles", "Profile moved up");
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
@@ -924,15 +922,16 @@ pub fn move_profile_up(state: &mut AppState) {
 }
 
 pub fn move_profile_down(state: &mut AppState) {
-    let id = match selected_profile_id(state) {
-        Some(id) => id,
-        None => return,
+    let Some(id) = selected_profile_id(state) else {
+        return;
     };
     let filtered: Vec<&EndpointRow> = filtered_profiles(state).collect();
-    let _idx = match filtered.iter().position(|r| r.endpoint.id.get() == id) {
-        Some(i) if i < filtered.len() - 1 => i,
-        _ => return,
+    let Some(idx) = filtered.iter().position(|r| r.endpoint.id.get() == id) else {
+        return;
     };
+    if idx >= filtered.len() - 1 {
+        return;
+    }
     drop(filtered);
     state.log_trace("info", "tui::ops::profiles", "Profile moved down");
     state.endpoints_gen = state.endpoints_gen.wrapping_add(1);

@@ -149,10 +149,6 @@ pub async fn create_stats_provider() -> Result<Box<dyn StatsProvider>, GrpcError
 #[must_use]
 pub fn format_bytes(bytes: i64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "display formatting, ~9 PB before precision loss"
-    )]
     let mut b = bytes as f64;
     for unit in UNITS {
         if b < 1024.0 {

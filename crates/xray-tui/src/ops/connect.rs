@@ -218,13 +218,15 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             };
 
         // 2. Find binary
-        let bin_path = if let Some(p) = find_binary(core_type, &bin_dir) {
-            p
-        } else {
-            try_send_or_warn(&tx, CoreEvent::Error(
-                "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
-                    .to_string(),
-            ), "binary_not_found");
+        let Some(bin_path) = find_binary(core_type, &bin_dir) else {
+            try_send_or_warn(
+                &tx,
+                CoreEvent::Error(
+                    "Core binary not found. Place it in ~/.config/xray-tui/bin/ or install in PATH."
+                        .to_string(),
+                ),
+                "binary_not_found",
+            );
             return;
         };
         // 3. Start core

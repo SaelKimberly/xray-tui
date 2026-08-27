@@ -6,11 +6,6 @@
 //! machinery (ping sessions, extensions, server stats) has no tests here —
 //! Task 24 rewrites the suite properly.
 
-#![allow(
-    clippy::significant_drop_tightening,
-    reason = "test db lifetime is the function scope"
-)]
-
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_db::Database;

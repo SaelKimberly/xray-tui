@@ -7,14 +7,10 @@
 //! timestamps, deferred JSON config blobs — and every read in
 //! [`crate::database`] goes through the typed query API.
 
-// allow(clippy::used_underscore_binding): toasty-macros synthesizes `_0`-named
-// parameters in the `Update` builder setters for unnamed tuple fields
-// (`EndpointId`, `ProtocolId`) and uses them. The binding names are generated
-// by the third-party derive with the field's span, so a struct-level allow
-// cannot reach them (the generated impls are sibling items); the lint level
-// must be set at this module. No handwritten code here uses underscore-
-// prefixed bindings.
-#![allow(clippy::used_underscore_binding)]
+#![allow(
+    clippy::used_underscore_binding,
+    reason = "toasty-macros synthesizes `_0`-named parameters in the Update builder setters for unnamed tuple fields (`EndpointId`, `ProtocolId`) and uses them; the generated impls carry the field's span so no narrower scope reaches them, and no handwritten code here uses underscore-prefixed bindings"
+)]
 
 use std::collections::HashMap;
 

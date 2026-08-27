@@ -58,14 +58,13 @@ where
             return;
         }
 
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "nanos since epoch fits u64 (584yr range)"
-        )]
-        let timestamp_nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let timestamp_nanos = u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
 
         // Optional file log — write JSON line when enabled
         if let Some(ref file_mutex) = self.log_file {
@@ -110,10 +109,6 @@ fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-#[allow(
-    clippy::significant_drop_tightening,
-    reason = "trivial drop timing differences, adding explicit drops adds noise"
-)]
 #[tokio::main]
 async fn main() -> Result<()> {
     // 0. Install rustls CryptoProvider first — every later TLS consumer
@@ -275,15 +270,14 @@ async fn main() -> Result<()> {
             if ttl_dur.is_zero() {
                 continue; // 0 = keep forever
             }
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "nanos since epoch fits u64 (584yr range)"
-            )]
-            let cutoff = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64
-                - (ttl_dur.as_nanos() as u64);
+            let now_nanos = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX);
+            let cutoff = now_nanos.saturating_sub(u64::try_from(ttl_dur.as_nanos()).unwrap_or(0));
             // Spawn_blocking for heed delete operation
             let h = ttl_heed.clone();
             tokio::task::spawn_blocking(move || {

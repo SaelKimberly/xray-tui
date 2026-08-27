@@ -104,7 +104,6 @@ impl VmessConfig {
     /// Decodes the base64 userinfo → parses lenient JSON with abbreviated v2rayN keys.
     /// Trailing non-base64 annotation (Telegram emoji, Persian text, etc.) is stripped
     /// by `decode_base64` before JSON parsing. Empty/null string fields are filtered.
-    #[allow(clippy::too_many_lines)]
     pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         // VMess userinfo is base64-encoded JSON (v2rayN VmessQRCode format).
         // decode_base64 handles trailing annotation text/emoji and stray backticks.

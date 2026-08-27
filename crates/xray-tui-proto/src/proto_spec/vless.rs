@@ -100,7 +100,6 @@ impl VlessConfig {
     ///
     /// Supports combined `userinfo@hostport` or separate hostport components.
     /// UUID validated via `uuid::Uuid::parse_str`.
-    #[allow(clippy::too_many_lines)]
     pub fn try_parse_proto(raw: &RawUrlX<'_>) -> Result<ParsedProto, ParseError> {
         let (username, hostport) = if let Some(hostport) = raw.hostport {
             (raw.userinfo, hostport)
@@ -280,7 +279,6 @@ impl VlessConfig {
     /// essentials. Endpoint host/port come from `endpoint`; every protocol
     /// parameter (including explicit transport/security host fields) is taken
     /// from the config.
-    #[allow(clippy::too_many_lines)]
     pub fn reconstruct_proto(&self, endpoint: &EndpointEssentials) -> Result<String, ParseError> {
         let endpoint_host = endpoint.host.as_str();
         let hostport = if endpoint_host.contains(':') {

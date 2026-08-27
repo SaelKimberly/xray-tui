@@ -172,13 +172,10 @@ pub async fn confirm_edit_group(state: &mut AppState) {
         } => (group_id.clone(), fields.clone()),
         _ => return,
     };
-    let group_id = match group_id_opt {
-        Some(id) => id,
-        None => return,
+    let Some(group_id) = group_id_opt else {
+        return;
     };
-    let mut group = if let Some(g) = state.groups.iter().find(|g| g.id == group_id) {
-        g.clone()
-    } else {
+    let Some(mut group) = state.groups.iter().find(|g| g.id == group_id).cloned() else {
         state.log_trace("error", "tui::ops::subscriptions", "Group not found");
         return;
     };
@@ -442,9 +439,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            let due_groups = if let Ok(g) = db.get_groups_due_update().await {
-                g
-            } else {
+            let Ok(due_groups) = db.get_groups_due_update().await else {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_mins(1)) => {},
                     () = async { while !shutdown.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_millis(100)).await; } } => return,

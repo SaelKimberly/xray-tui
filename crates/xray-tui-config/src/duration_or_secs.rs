@@ -59,14 +59,9 @@ impl<'de> Deserialize<'de> for DurationOrSecs {
             }
 
             fn visit_i64<E: de::Error>(self, secs: i64) -> Result<DurationOrSecs, E> {
-                if secs < 0 {
-                    return Err(de::Error::custom("negative duration not supported"));
-                }
-                #[allow(
-                    clippy::cast_sign_loss,
-                    reason = "secs >= 0 enforced by check on line 62-64"
-                )]
-                Ok(DurationOrSecs(Duration::from_secs(secs as u64)))
+                let secs = u64::try_from(secs)
+                    .map_err(|_| de::Error::custom("negative duration not supported"))?;
+                Ok(DurationOrSecs(Duration::from_secs(secs)))
             }
 
             fn visit_str<E: de::Error>(self, s: &str) -> Result<DurationOrSecs, E> {

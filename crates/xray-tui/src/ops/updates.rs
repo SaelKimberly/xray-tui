@@ -61,13 +61,12 @@ pub fn spawn_update_download(state: &mut AppState, core_type: CoreType) {
         return;
     }
 
-    let latest = match state
+    let Some(latest) = state
         .update_status
         .get(&core_type)
         .and_then(|s| s.latest_version.clone())
-    {
-        Some(v) => v,
-        None => return,
+    else {
+        return;
     };
     let old_version = state
         .update_status

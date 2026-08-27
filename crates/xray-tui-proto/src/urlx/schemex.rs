@@ -5,7 +5,10 @@ use aho_corasick::AhoCorasick;
 use super::TinyText;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[allow(clippy::upper_case_acronyms, clippy::unsafe_derive_deserialize)]
+#[allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "unsafe is confined to constructor/accessor methods; it never runs during deserialization"
+)]
 pub enum SchemeX {
     Vless,
     Vmess,
@@ -72,7 +75,6 @@ impl SchemeX {
         }
     }
 
-    #[allow(clippy::missing_panics_doc, reason = "no panic expected")]
     pub fn slice_input(s: &str) -> Vec<(Self, Cow<'_, str>)> {
         static SCHEMA_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
             AhoCorasick::builder()

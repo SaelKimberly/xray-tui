@@ -605,11 +605,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
     /// its target is the first packet's destination, so the first
     /// [`UdpSession::send_to`] writes it (with the `GlobalID`, spec §4.1 —
     /// deviation 3). Fails when the tunnel is dead.
-    // `async` per the SP3 plan interface — the caller (connect_udp, the
-    // XUDP path) awaits it; the body is sync because no eager New frame
-    // is sent.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub(crate) async fn open_udp_session(&self, global_id: [u8; 8]) -> io::Result<UdpSession> {
+    // Sync body: no eager `New` frame is sent — the first packet's
+    // destination becomes the session target.
+    pub(crate) fn open_udp_session(&self, global_id: [u8; 8]) -> io::Result<UdpSession> {
         if self.dead.load(Ordering::Acquire) {
             return Err(tunnel_closed());
         }
@@ -640,8 +638,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
 
 /// `BrokenPipe`-style error for a dead tunnel, shared by the session write
 /// path and `open_session`.
-// `io::Error::new` is not const (clippy's const-checker thinks it is).
-#[allow(clippy::missing_const_for_fn)]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "`io::Error::new` is not const-stable"
+)]
 fn tunnel_closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "vless mux tunnel is closed")
 }
@@ -753,7 +753,6 @@ async fn route(frame: Frame, sessions: &Mutex<HashMap<u16, mpsc::Sender<SessionE
 }
 
 /// The error surfaced on a session whose peer sent the `Error` option.
-#[allow(clippy::missing_const_for_fn)] // `io::Error::new` is not const
 fn session_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionReset,
@@ -1780,7 +1779,7 @@ mod tests {
     async fn udp_session_new_frame_bytes() {
         let (client, mut peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
-        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let session = mux.open_udp_session([0xAA; 8]).unwrap();
         session
             .send_to("127.0.0.1:8080".parse().unwrap(), b"hi")
             .await
@@ -1818,7 +1817,7 @@ mod tests {
     async fn udp_session_per_packet_dests() {
         let (client, mut peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
-        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let session = mux.open_udp_session([0xAA; 8]).unwrap();
         session
             .send_to("127.0.0.1:8080".parse().unwrap(), b"p1")
             .await
@@ -1858,7 +1857,7 @@ mod tests {
     async fn udp_session_recv_returns_dest() {
         let (client, mut peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
-        let mut session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let mut session = mux.open_udp_session([0xAA; 8]).unwrap();
         session
             .send_to("127.0.0.1:8080".parse().unwrap(), b"hello")
             .await
@@ -1896,7 +1895,7 @@ mod tests {
     async fn udp_session_eof_on_end() {
         let (client, mut peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
-        let mut session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let mut session = mux.open_udp_session([0xAA; 8]).unwrap();
         session
             .send_to("127.0.0.1:8080".parse().unwrap(), b"ping")
             .await
@@ -1925,7 +1924,7 @@ mod tests {
     async fn udp_session_tunnel_death() {
         let (client, peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
-        let mut session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let mut session = mux.open_udp_session([0xAA; 8]).unwrap();
         session
             .send_to("127.0.0.1:8080".parse().unwrap(), b"ping")
             .await
@@ -1952,7 +1951,7 @@ mod tests {
         let e = err.expect("send_to fails once the tunnel is dead");
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
         // The client itself is dead: no new sessions.
-        assert!(mux.open_udp_session([0xAA; 8]).await.is_err());
+        assert!(mux.open_udp_session([0xAA; 8]).is_err());
         assert!(mux.open_session(echo_target()).await.is_err());
     }
 
@@ -1964,7 +1963,7 @@ mod tests {
         // `write_frame` would fail mid-write and kill the whole tunnel.
         let (client, mut peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
-        let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+        let session = mux.open_udp_session([0xAA; 8]).unwrap();
         let big = vec![0u8; u16::MAX as usize + 1];
         let err = session
             .send_to("127.0.0.1:8080".parse().unwrap(), &big)
@@ -2361,7 +2360,10 @@ mod tests {
         let mut a = mux.open_session(echo_target()).await.unwrap();
         let _new_a = read_frame(&mut peer).await.unwrap().unwrap();
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i % 97 < 97 fits u8 (test data generator)"
+        )]
         let data: Vec<u8> = (0..(CHUNK_SIZE * 2 + 4096))
             .map(|i| (i % 97) as u8)
             .collect();
@@ -2606,7 +2608,11 @@ mod tests {
         let (client, mut peer) = tokio::io::duplex(8192);
         let mux = MuxClient::new(client);
         let mut a = mux.open_session(echo_target()).await.unwrap();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "i % 251 < 251 fits u8 (test data generator)"
+        )]
         let big: Vec<u8> = (0..(300 * 1024)).map(|i| (i % 251) as u8).collect();
         let big_len = big.len();
 
@@ -3298,7 +3304,7 @@ mod tests {
             let wrapped = security::wrap(&ctx, Box::new(sock)).await.unwrap();
             let mux = connect_mux(&ctx, wrapped, &cfg).await.unwrap();
             // A fixed GlobalID drives the byte-exact wire assertion above.
-            let session = mux.open_udp_session([0xAA; 8]).await.unwrap();
+            let session = mux.open_udp_session([0xAA; 8]).unwrap();
             // XUdp holds no stream, so S is unconstrained — pin it for
             // the test (production pins it via connect_udp's return type).
             let mut conn: PacketConn<crate::BoxStream> = PacketConn::xudp(session);

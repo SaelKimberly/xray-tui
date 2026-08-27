@@ -1,12 +1,3 @@
-#![allow(
-    clippy::option_if_let_else,
-    reason = "code clarity decisions override style lints"
-)]
-#![allow(
-    clippy::derive_partial_eq_without_eq,
-    reason = "prost-generated code, Eq not in default derive set"
-)]
-
 pub mod bin_manager;
 pub mod config_builder;
 pub mod core_type;

@@ -428,7 +428,6 @@ mod tests {
 /// in `hand_selected.rs` are themselves `spec!` declarations, so the macro
 /// is exercised in production code as well as here).
 #[cfg(test)]
-#[allow(clippy::redundant_pub_crate)] // spec! emits pub(crate) fn; the test module is private
 mod macro_tests {
     spec! {
         kitchen_sink,
