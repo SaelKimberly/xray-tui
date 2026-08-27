@@ -14,8 +14,7 @@ pub enum NetHost {
 impl NetHost {
     /// Infers IP vs domain: parses as `IpAddr` first, falls back to domain.
     pub fn new(host: &str) -> Self {
-        host
-            .parse::<IpAddr>()
+        host.parse::<IpAddr>()
             .map_or_else(|_| Self::Domain(host.to_owned()), Self::Ip)
     }
 
@@ -97,8 +96,7 @@ impl Cidr {
 /// Byte-wise inclusive prefix comparison over octet arrays.
 pub(crate) fn prefix_match(a: &[u8], b: &[u8], bits: u8) -> bool {
     let (full, rem) = ((bits / 8) as usize, bits % 8);
-    a[..full] == b[..full]
-        && (rem == 0 || a[full] >> (8 - rem) == b[full] >> (8 - rem))
+    a[..full] == b[..full] && (rem == 0 || a[full] >> (8 - rem) == b[full] >> (8 - rem))
 }
 
 /// An inclusive TCP/UDP port range `[start, end]`.
@@ -136,11 +134,17 @@ mod tests {
     }
     #[test]
     fn cidr_rejects_bad_input() {
-        assert!(matches!(Cidr::parse("300.1.1.1/8"), Err(RouteError::Parse { .. })));
+        assert!(matches!(
+            Cidr::parse("300.1.1.1/8"),
+            Err(RouteError::Parse { .. })
+        ));
     }
     #[test]
     fn port_range_inclusive() {
-        let r = PortRange { start: 1000, end: 2000 };
+        let r = PortRange {
+            start: 1000,
+            end: 2000,
+        };
         assert!(r.contains(1000) && r.contains(2000) && !r.contains(999));
     }
 }

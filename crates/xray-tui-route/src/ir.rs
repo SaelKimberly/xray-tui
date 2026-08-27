@@ -1,7 +1,6 @@
 //! Typed rule-set intermediate representation consumed by compilers, merge,
 //! and the evaluation engine.
 
-
 use crate::addr::{Cidr, NetAddr, PortRange};
 use serde::{Deserialize, Serialize};
 
@@ -97,7 +96,7 @@ pub enum Action {
     HijackDns,
 }
 
- /// How a rejected connection is disposed of.
+/// How a rejected connection is disposed of.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectMethod {
@@ -149,9 +148,15 @@ pub struct NetworkMask {
 
 impl NetworkMask {
     /// TCP only.
-    pub const TCP: Self = Self { tcp: true, udp: false };
+    pub const TCP: Self = Self {
+        tcp: true,
+        udp: false,
+    };
     /// UDP only.
-    pub const UDP: Self = Self { tcp: false, udp: true };
+    pub const UDP: Self = Self {
+        tcp: false,
+        udp: true,
+    };
 
     /// Bit-subset check: `self` contains `other` when every transport set in
     /// `other` is also set in `self`.
@@ -181,7 +186,10 @@ mod tests {
                             regexes: vec![r"^ads\.".to_owned()],
                         },
                         MatchItem::IpCidr {
-                            cidrs: vec![Cidr::parse("10.0.0.0/8").unwrap(), Cidr::parse("fc00::/7").unwrap()],
+                            cidrs: vec![
+                                Cidr::parse("10.0.0.0/8").unwrap(),
+                                Cidr::parse("fc00::/7").unwrap(),
+                            ],
                             private: true,
                             geo_country: vec!["cn".to_owned()],
                         },
@@ -190,16 +198,29 @@ mod tests {
                             private: false,
                             geo_country: vec![],
                         },
-                        MatchItem::Ports(vec![PortRange { start: 80, end: 443 }]),
-                        MatchItem::SourcePorts(vec![PortRange { start: 1000, end: 1000 }]),
+                        MatchItem::Ports(vec![PortRange {
+                            start: 80,
+                            end: 443,
+                        }]),
+                        MatchItem::SourcePorts(vec![PortRange {
+                            start: 1000,
+                            end: 1000,
+                        }]),
                         MatchItem::Network(NetworkMask::TCP),
                         MatchItem::Protocol(SniffedProtocol::Http),
-                        MatchItem::InboundTag { tags: vec!["in-1".to_owned()] },
-                        MatchItem::OutboundTag { tags: vec!["out-1".to_owned()] },
+                        MatchItem::InboundTag {
+                            tags: vec!["in-1".to_owned()],
+                        },
+                        MatchItem::OutboundTag {
+                            tags: vec!["out-1".to_owned()],
+                        },
                     ]),
                     action: Action::Route {
                         tag: "proxy".to_owned(),
-                        override_addr: Some(NetAddr { host: NetHost::Domain("relay.example.org".to_owned()), port: 8443 }),
+                        override_addr: Some(NetAddr {
+                            host: NetHost::Domain("relay.example.org".to_owned()),
+                            port: 8443,
+                        }),
                     },
                 },
                 // Anonymous rule, nested Any/Invert cond, Reject action.
@@ -212,21 +233,34 @@ mod tests {
                         ]))),
                         Cond::All(vec![MatchItem::Protocol(SniffedProtocol::Tls)]),
                     ]),
-                    action: Action::Reject { method: RejectMethod::Drop },
+                    action: Action::Reject {
+                        method: RejectMethod::Drop,
+                    },
                 },
                 // HijackDns + RejectMethod::DefaultReply coverage.
                 Rule {
                     name: Some("dns-hijack".to_owned()),
                     cond: Cond::All(vec![
                         MatchItem::Ports(vec![PortRange { start: 53, end: 53 }]),
-                        MatchItem::Network(NetworkMask { tcp: false, udp: true }),
-                        MatchItem::Network(NetworkMask { tcp: true, udp: true }),
-                        MatchItem::Network(NetworkMask { tcp: false, udp: false }),
+                        MatchItem::Network(NetworkMask {
+                            tcp: false,
+                            udp: true,
+                        }),
+                        MatchItem::Network(NetworkMask {
+                            tcp: true,
+                            udp: true,
+                        }),
+                        MatchItem::Network(NetworkMask {
+                            tcp: false,
+                            udp: false,
+                        }),
                     ]),
                     action: Action::HijackDns,
                 },
             ],
-            default: DefaultRoute::Reject { method: RejectMethod::DefaultReply },
+            default: DefaultRoute::Reject {
+                method: RejectMethod::DefaultReply,
+            },
             resolve_strategy: ResolveStrategy::IfNonMatch,
             probes: vec!["probe.example.com".to_owned()],
         }
@@ -242,7 +276,9 @@ mod tests {
 
     #[test]
     fn default_route_route_variant_roundtrips() {
-        let route = DefaultRoute::Route { tag: "direct".to_owned() };
+        let route = DefaultRoute::Route {
+            tag: "direct".to_owned(),
+        };
         let json = serde_json::to_string(&route).expect("serialize");
         let back: DefaultRoute = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(route, back);
@@ -250,10 +286,16 @@ mod tests {
 
     #[test]
     fn network_mask_contains_truth_rows() {
-        let none = NetworkMask { tcp: false, udp: false };
+        let none = NetworkMask {
+            tcp: false,
+            udp: false,
+        };
         let tcp = NetworkMask::TCP;
         let udp = NetworkMask::UDP;
-        let both = NetworkMask { tcp: true, udp: true };
+        let both = NetworkMask {
+            tcp: true,
+            udp: true,
+        };
         // self ⊇ other rows
         assert!(none.contains(none));
         assert!(tcp.contains(tcp));

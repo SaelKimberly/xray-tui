@@ -60,12 +60,11 @@ impl CompiledDomain {
             suffix.insert(format!(".{s}"));
         }
         let keyword_pats = lower_all(&spec.keywords);
-        let keywords =
-            AhoCorasick::new(&keyword_pats).map_err(|e| RouteError::Parse {
-                rule_index: 0,
-                field: "keyword",
-                message: e.to_string(),
-            })?;
+        let keywords = AhoCorasick::new(&keyword_pats).map_err(|e| RouteError::Parse {
+            rule_index: 0,
+            field: "keyword",
+            message: e.to_string(),
+        })?;
         let regex_pats = lower_all(&spec.regexes);
         let regexes = RegexSet::new(&regex_pats).map_err(|e| RouteError::Parse {
             rule_index: 0,
@@ -106,7 +105,6 @@ impl CompiledDomain {
         self.n_rules == 0
     }
 }
-
 
 /// Correctness-first CIDR prefix storage; radix/prefix trie explicitly deferred.
 #[derive(Debug, Clone, Default)]
@@ -211,10 +209,11 @@ fn mask_octets<const N: usize>(octets: [u8; N], bits: u8) -> [u8; N] {
             break;
         }
         let nb = (bits as usize - shift).min(8);
-        m[i] = byte & match nb {
-            8 => u8::MAX,
-            _ => !(u8::MAX >> nb),
-        };
+        m[i] = byte
+            & match nb {
+                8 => u8::MAX,
+                _ => !(u8::MAX >> nb),
+            };
     }
     m
 }
@@ -328,7 +327,10 @@ mod tests {
                 suffix: vec!["..".into()],
                 ..empty_spec()
             }),
-            Err(RouteError::Parse { field: "suffix", .. })
+            Err(RouteError::Parse {
+                field: "suffix",
+                ..
+            })
         ));
     }
 }
