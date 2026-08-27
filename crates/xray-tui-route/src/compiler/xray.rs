@@ -84,18 +84,7 @@ pub fn compile_xray(json_text: &str) -> Result<CompileOutput, RouteError> {
                 .as_object()
                 .ok_or_else(|| parse_err(i, "rule", "rule must be an object"))?;
             for (key, val) in obj {
-                const KNOWN: [&str; 9] = [
-                    "type",
-                    "outboundTag",
-                    "domain",
-                    "ip",
-                    "ports",
-                    "sourcePorts",
-                    "network",
-                    "inboundTag",
-                    "protocol",
-                ];
-                if !KNOWN.contains(&key.as_str()) {
+                if !KNOWN_RULE_KEYS.contains(&key.as_str()) {
                     warnings.push((i, format!("ignored unknown key `{key}`: {val}")));
                 }
             }
@@ -195,19 +184,42 @@ pub fn compile_xray(json_text: &str) -> Result<CompileOutput, RouteError> {
             if !inbound_tags.is_empty() {
                 items.push(MatchItem::InboundTag { tags: inbound_tags });
             }
-            for p in protocols {
-                items.push(MatchItem::Protocol(p));
-            }
-
-            if items.is_empty() {
+            if items.is_empty() && protocols.is_empty() {
                 warnings.push((i, "rule has no matchable condition; skipped".to_owned()));
                 continue;
             }
-            rules.push(Rule {
-                name: None,
-                cond: Cond::All(items),
-                action,
-            });
+            // A multi-protocol whitelist is an OR over sniff results while
+            // every other item is an AND. `Cond::All` only holds
+            // `MatchItem`s (and today's engine rejects `Cond::Any`), so the
+            // conjunction is expanded distributively — (A∧B∧p) ∨ (A∧B∧q) —
+            // into one flat rule per protocol value sharing this action;
+            // first-match semantics are preserved.
+            match protocols.len() {
+                0 => rules.push(Rule {
+                    name: None,
+                    cond: Cond::All(items),
+                    action,
+                }),
+                1 => {
+                    items.push(MatchItem::Protocol(protocols[0]));
+                    rules.push(Rule {
+                        name: None,
+                        cond: Cond::All(items),
+                        action,
+                    });
+                }
+                _ => {
+                    for p in protocols {
+                        let mut sub = items.clone();
+                        sub.push(MatchItem::Protocol(p));
+                        rules.push(Rule {
+                            name: None,
+                            cond: Cond::All(sub),
+                            action: action.clone(),
+                        });
+                    }
+                }
+            }
         }
     } else {
         warnings.push((
@@ -241,6 +253,19 @@ fn parse_err(rule_index: usize, field: &'static str, message: impl Into<String>)
         message: message.into(),
     }
 }
+
+/// Keys understood on an xray `field` rule; anything else warns but passes.
+const KNOWN_RULE_KEYS: [&str; 9] = [
+    "type",
+    "outboundTag",
+    "domain",
+    "ip",
+    "ports",
+    "sourcePorts",
+    "network",
+    "inboundTag",
+    "protocol",
+];
 
 struct DomainBucket {
     exact: Vec<String>,
@@ -340,13 +365,6 @@ fn parse_ports(v: &Value, i: usize, field: &'static str) -> Result<Vec<PortRange
         let end: u16 = end
             .parse()
             .map_err(|_| parse_err(i, field, format!("invalid port range `{part}`")))?;
-        if start > end {
-            return Err(parse_err(
-                i,
-                field,
-                format!("port range start > end in `{part}`"),
-            ));
-        }
         ranges.push(PortRange { start, end });
     }
     Ok(ranges)
@@ -359,6 +377,9 @@ fn parse_network(v: &Value, i: usize) -> Result<NetworkMask, RouteError> {
     };
     for tok in field_strings(v, i, "network")?.join(",").split(',') {
         let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
         if tok.eq_ignore_ascii_case("tcp") && !mask.tcp {
             mask.tcp = true;
         } else if tok.eq_ignore_ascii_case("udp") && !mask.udp {
@@ -373,7 +394,6 @@ fn parse_network(v: &Value, i: usize) -> Result<NetworkMask, RouteError> {
     }
     Ok(mask)
 }
-
 fn collect_protocols(
     v: &Value,
     i: usize,
@@ -399,6 +419,7 @@ fn collect_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Decision;
 
     const FIXTURE: &str = include_str!("../../tests/fixtures/xray_sample.json");
 
@@ -565,31 +586,105 @@ mod tests {
              "network":"udp","inboundTag":["tun","dokodemo"],
              "protocol":["http","dns","tls"]}]}}"#;
         let out = compile_xray(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 3, "one flat rule per protocol");
+        let shared = [
+            MatchItem::SourcePorts(vec![
+                PortRange { start: 53, end: 64 },
+                PortRange {
+                    start: 9050,
+                    end: 9050
+                },
+            ]),
+            MatchItem::Network(NetworkMask {
+                tcp: false,
+                udp: true
+            }),
+            MatchItem::InboundTag {
+                tags: vec!["tun".into(), "dokodemo".into()]
+            },
+        ];
+        for (rule, proto) in out
+            .ruleset
+            .rules
+            .iter()
+            .zip([SniffedProtocol::Http, SniffedProtocol::Dns, SniffedProtocol::Tls])
+        {
+            let Cond::All(items) = &rule.cond else {
+                panic!("expanded rule cond must stay All");
+            };
+            let mut expected = shared.to_vec();
+            expected.push(MatchItem::Protocol(proto));
+            assert_eq!(items[..], expected[..]);
+            assert_eq!(
+                rule.action,
+                Action::Route { tag: "b".into(), override_addr: None }
+            );
+        }
+    }
+
+    #[test]
+    fn multi_protocol_whitelist_routes_on_any_sniffed_value() {
+        // Regression: a multi-value `protocol` array used to emit one Protocol
+        // leaf per value inside the same AND-cond — unsatisfiable. It now
+        // expands to one flat rule per value; each is buildable and exactly
+        // one matches per sniff result.
+        let txt = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"sniffed",
+             "domain":["keyword:example"],"protocol":["http","tls"]}]}}"#;
+        let out = compile_xray(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 2);
+        let engine = crate::Engine::build(out.ruleset).unwrap();
+        let routed_to =
+            |d: &Decision, tag: &str| matches!(d, Decision::Route { tag: t, .. } if t == tag);
+        let mut http = conn("api.example.com", 80, NetworkMask::TCP);
+        http.sniffed = Some(SniffedProtocol::Http);
+
+        let mut tls = conn("api.example.com", 443, NetworkMask::TCP);
+        tls.sniffed = Some(SniffedProtocol::Tls);
+        assert!(routed_to(&engine.decide(&mut tls), "sniffed"));
+
+        let mut dns = conn("api.example.com", 53, NetworkMask::UDP);
+        dns.sniffed = Some(SniffedProtocol::Dns);
+        assert!(!routed_to(&engine.decide(&mut dns), "sniffed"));
+
+        // No sniff agreement at all falls through to the default route.
+        assert!(!routed_to(
+            &engine.decide(&mut conn("api.example.com", 443, NetworkMask::TCP)),
+            "sniffed"
+        ));
+    }
+
+    #[test]
+    fn network_trailing_comma_is_tolerated_like_ports() {
+        let out = compile_xray(
+            r#"{"routing":{"rules":[
+                {"type":"field","outboundTag":"a","network":"tcp,udp,"}]}}"#,
+        )
+        .unwrap();
         let Cond::All(items) = &out.ruleset.rules[0].cond else {
-            panic!();
+            panic!()
         };
         assert_eq!(
-            items[..],
-            [
-                MatchItem::SourcePorts(vec![
-                    PortRange { start: 53, end: 64 },
-                    PortRange {
-                        start: 9050,
-                        end: 9050
-                    },
-                ]),
-                MatchItem::Network(NetworkMask {
-                    tcp: false,
-                    udp: true
-                }),
-                MatchItem::InboundTag {
-                    tags: vec!["tun".into(), "dokodemo".into()]
-                },
-                MatchItem::Protocol(SniffedProtocol::Http),
-                MatchItem::Protocol(SniffedProtocol::Dns),
-                MatchItem::Protocol(SniffedProtocol::Tls),
-            ][..]
+            items[0],
+            MatchItem::Network(NetworkMask { tcp: true, udp: true })
         );
+    }
+
+    /// Minimal engine-test fixture mirroring `ConnMeta` construction.
+    fn conn(host: &str, port: u16, network: NetworkMask) -> crate::ConnMeta {
+        crate::ConnMeta {
+            target: crate::NetAddr {
+                host: crate::NetHost::new(host),
+                port,
+            },
+            network,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            resolved_host_ips: vec![],
+        }
     }
 
     #[test]
