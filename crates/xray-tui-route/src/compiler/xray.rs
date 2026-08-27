@@ -1,0 +1,662 @@
+//! Xray-core routing JSON compiler.
+//!
+//! Vocabulary mapping (spec §4, xray rules):
+//!
+//! | xray token / field            | IR target                                  |
+//! |-------------------------------|--------------------------------------------|
+//! | bare host in `domain`         | `Domain.exact` AND `Domain.suffix` pair    |
+//! | `domain:x`                    | suffix + exact pair (`x`, `x`)             |
+//! | `keyword:x`                   | `Domain.keywords`                          |
+//! | `regexp:x`                    | `Domain.regexes`                           |
+//! | `ext:`                        | [`RouteError::Parse`] (file lists deferred)|
+//! | `geosite:`                    | [`RouteError::Parse`] (.dat loader deferred)|
+//! | CIDR entry in `ip`            | `IpCidr.cidrs`                             |
+//! | `geoip:private`               | `IpCidr.private = true`                    |
+//! | `geoip:<cc>`                  | `IpCidr.geo_country` (inert until Engine)  |
+//! | `ports` `"80,443,1000-2000"`  | `Ports`                                    |
+//! | `protocol` http/tls/dns only  | `Protocol`; anything else is unsupported   |
+//! | `outboundTag`                 | `Action::Route { tag }`                    |
+//!
+//! A rule whose item set ends up empty is skipped (no matchable condition)
+//! with a warning. Unknown object keys are tolerated as warnings; unknown
+//! *values* abort with positional [`RouteError::Parse`]. With no fallback
+//! key present, `ruleset.default` is the documented constant
+//! [`DEFAULT_FALLBACK_TAG`].
+
+use crate::addr::{Cidr, PortRange};
+use crate::error::RouteError;
+use crate::ir::{
+    Action, Cond, DefaultRoute, MatchItem, NetworkMask, ResolveStrategy, Rule, RuleSet,
+    SniffedProtocol,
+};
+
+use super::{CompileOutput, field_strings};
+
+/// Fallback tag when the config has no default/fallback routing key.
+pub const DEFAULT_FALLBACK_TAG: &str = "proxy";
+
+/// Compiles an Xray-core `routing` JSON document into IR.
+///
+/// Configuration-level warnings (no rules key, unknown strategy, unknown
+/// config keys) are reported under rule index [`CONFIG_WARNING_INDEX`].
+pub fn compile_xray(json_text: &str) -> Result<CompileOutput, RouteError> {
+    let root: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| parse_err(CONFIG_WARNING_INDEX, "root", e.to_string()))?;
+    let routing = root
+        .get("routing")
+        .ok_or_else(|| parse_err(CONFIG_WARNING_INDEX, "routing", "missing routing block"))?
+        .as_object()
+        .ok_or_else(|| parse_err(CONFIG_WARNING_INDEX, "routing", "not an object"))?;
+
+    let mut warnings: Vec<(usize, String)> = Vec::new();
+    let resolve_strategy = match routing.get("domainStrategy").and_then(Value::as_str) {
+        None | Some("") => ResolveStrategy::AsIs,
+        Some(s) if s.eq_ignore_ascii_case("AsIs") => ResolveStrategy::AsIs,
+        // ponytail: IPOnDemand's eager-resolve-every-hop variant is folded
+        // into IfNonMatch; split it out only when a caller needs to tell.
+        Some(s) if s.eq_ignore_ascii_case("IPIfNonMatch") => ResolveStrategy::IfNonMatch,
+        Some(s) if s.eq_ignore_ascii_case("IPOnDemand") => {
+            warnings.push((
+                CONFIG_WARNING_INDEX,
+                format!(
+                    "domainStrategy {s}: compiled as IfNonMatch; eager on-demand \
+                         resolution distinction is deferred"
+                ),
+            ));
+            ResolveStrategy::IfNonMatch
+        }
+        Some(other) => {
+            return Err(parse_err(
+                CONFIG_WARNING_INDEX,
+                "domainStrategy",
+                format!("unknown strategy {other:?}"),
+            ));
+        }
+    };
+
+    let mut rules: Vec<Rule> = Vec::new();
+    if let Some(rules_v) = routing.get("rules") {
+        let arr = rules_v
+            .as_array()
+            .ok_or_else(|| parse_err(CONFIG_WARNING_INDEX, "rules", "rules must be an array"))?;
+        for (i, rv) in arr.iter().enumerate() {
+            let obj = rv
+                .as_object()
+                .ok_or_else(|| parse_err(i, "rule", "rule must be an object"))?;
+            for (key, val) in obj {
+                const KNOWN: [&str; 9] = [
+                    "type",
+                    "outboundTag",
+                    "domain",
+                    "ip",
+                    "ports",
+                    "sourcePorts",
+                    "network",
+                    "inboundTag",
+                    "protocol",
+                ];
+                if !KNOWN.contains(&key.as_str()) {
+                    warnings.push((i, format!("ignored unknown key `{key}`: {val}")));
+                }
+            }
+
+            let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            if ty != "field" {
+                return Err(parse_err(
+                    i,
+                    "type",
+                    format!("only \"field\" rules are supported, got {ty:?}"),
+                ));
+            }
+            let tag = obj
+                .get("outboundTag")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| parse_err(i, "outboundTag", "missing or empty outbound tag"))?;
+            let action = Action::Route {
+                tag: tag.to_owned(),
+                override_addr: None,
+            };
+
+            let mut domains = DomainBucket {
+                exact: vec![],
+                suffix: vec![],
+                keywords: vec![],
+                regexes: vec![],
+            };
+            let mut ip = IpCidr::default();
+            let mut ports: Vec<PortRange> = vec![];
+            let mut source_ports: Vec<PortRange> = vec![];
+            let mut network = NetworkMask {
+                tcp: false,
+                udp: false,
+            };
+            let mut inbound_tags: Vec<String> = vec![];
+            let mut protocols: Vec<SniffedProtocol> = vec![];
+
+            for (field, target) in [
+                ("domain", 0u8),
+                ("ip", 1),
+                ("ports", 2),
+                ("sourcePorts", 3),
+                ("network", 4),
+                ("inboundTag", 5),
+                ("protocol", 6),
+            ] {
+                let Some(v) = obj.get(field) else {
+                    continue;
+                };
+                match target {
+                    0 => collect_domain(v, i, &mut domains)?,
+                    1 => collect_ip(v, i, &mut ip)?,
+                    2 => ports = parse_ports(v, i, "ports")?,
+                    3 => source_ports = parse_ports(v, i, "sourcePorts")?,
+                    4 => network = parse_network(v, i)?,
+                    5 => inbound_tags = field_strings(v, i, "inboundTag")?,
+                    _ => collect_protocols(v, i, &mut protocols)?,
+                }
+            }
+
+            let mut items: Vec<MatchItem> = Vec::new();
+            if !domains.exact.is_empty()
+                || !domains.suffix.is_empty()
+                || !domains.keywords.is_empty()
+                || !domains.regexes.is_empty()
+            {
+                let DomainBucket {
+                    exact,
+                    suffix,
+                    keywords,
+                    regexes,
+                } = domains;
+                items.push(MatchItem::Domain {
+                    exact,
+                    suffix,
+                    keywords,
+                    regexes,
+                });
+            }
+            if !ip.cidrs.is_empty() || ip.private || !ip.geo_country.is_empty() {
+                items.push(MatchItem::IpCidr {
+                    cidrs: std::mem::take(&mut ip.cidrs),
+                    private: ip.private,
+                    geo_country: std::mem::take(&mut ip.geo_country),
+                });
+            }
+            if !ports.is_empty() {
+                items.push(MatchItem::Ports(ports));
+            }
+            if !source_ports.is_empty() {
+                items.push(MatchItem::SourcePorts(source_ports));
+            }
+            if network.tcp || network.udp {
+                items.push(MatchItem::Network(network));
+            }
+            if !inbound_tags.is_empty() {
+                items.push(MatchItem::InboundTag { tags: inbound_tags });
+            }
+            for p in protocols {
+                items.push(MatchItem::Protocol(p));
+            }
+
+            if items.is_empty() {
+                warnings.push((i, "rule has no matchable condition; skipped".to_owned()));
+                continue;
+            }
+            rules.push(Rule {
+                name: None,
+                cond: Cond::All(items),
+                action,
+            });
+        }
+    } else {
+        warnings.push((
+            CONFIG_WARNING_INDEX,
+            "routing block declares no rules".to_owned(),
+        ));
+    }
+
+    Ok(CompileOutput {
+        ruleset: RuleSet {
+            rules,
+            default: DefaultRoute::Route {
+                tag: DEFAULT_FALLBACK_TAG.to_owned(),
+            },
+            resolve_strategy,
+            probes: vec![],
+        },
+        warnings,
+    })
+}
+
+/// Rule index used for configuration-level (non-rule) warnings and errors.
+const CONFIG_WARNING_INDEX: usize = 0;
+
+type Value = serde_json::Value;
+
+fn parse_err(rule_index: usize, field: &'static str, message: impl Into<String>) -> RouteError {
+    RouteError::Parse {
+        rule_index,
+        field,
+        message: message.into(),
+    }
+}
+
+struct DomainBucket {
+    exact: Vec<String>,
+    suffix: Vec<String>,
+    keywords: Vec<String>,
+    regexes: Vec<String>,
+}
+
+#[derive(Default)]
+struct IpCidr {
+    cidrs: Vec<Cidr>,
+    private: bool,
+    geo_country: Vec<String>,
+}
+
+fn collect_domain(v: &Value, i: usize, d: &mut DomainBucket) -> Result<(), RouteError> {
+    for tok in field_strings(v, i, "domain")? {
+        if let Some(rest) = tok.strip_prefix("geosite:") {
+            return Err(parse_err(
+                i,
+                "domain",
+                format!("geosite lists (.dat loaders) are not supported yet: geosite:{rest}"),
+            ));
+        }
+        if let Some(rest) = tok.strip_prefix("ext:") {
+            return Err(parse_err(
+                i,
+                "domain",
+                format!("external file lists are not supported yet: ext:{rest}"),
+            ));
+        }
+        if let Some(kw) = tok.strip_prefix("keyword:") {
+            d.keywords.push(kw.to_owned());
+        } else if let Some(re) = tok.strip_prefix("regexp:") {
+            d.regexes.push(re.to_owned());
+        } else {
+            // Bare host or domain:x: upstream semantics self-match the bare
+            // domain too, so register BOTH suffix and exact entries.
+            let host = tok.strip_prefix("domain:").unwrap_or(&tok);
+            d.suffix.push(host.to_owned());
+            d.exact.push(host.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn collect_ip(v: &Value, i: usize, out: &mut IpCidr) -> Result<(), RouteError> {
+    for tok in field_strings(v, i, "ip")? {
+        if let Some(cc) = tok.strip_prefix("geoip:") {
+            if cc.eq_ignore_ascii_case("private") {
+                out.private = true;
+            } else {
+                out.geo_country.push(cc.to_owned());
+            }
+        } else {
+            // Single addresses have no prefix length; treat them as full hosts.
+            let spec = if tok.contains('/') {
+                tok.clone()
+            } else {
+                let bits = if tok.contains(':') { "/128" } else { "/32" };
+                format!("{tok}{bits}")
+            };
+            let cidr = Cidr::parse(&spec).map_err(|e| remap_rule(e, i, "ip"))?;
+            out.cidrs.push(cidr);
+        }
+    }
+    Ok(())
+}
+
+const fn remap_rule(mut e: RouteError, rule_index: usize, field: &'static str) -> RouteError {
+    if let RouteError::Parse {
+        rule_index: idx,
+        field: f,
+        ..
+    } = &mut e
+    {
+        *idx = rule_index;
+        *f = field;
+    }
+    e
+}
+
+fn parse_ports(v: &Value, i: usize, field: &'static str) -> Result<Vec<PortRange>, RouteError> {
+    let mut ranges = Vec::new();
+    for part in field_strings(v, i, field)?.join(",").split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (start, end) = match part.split_once('-') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => (part, part),
+        };
+        let start: u16 = start
+            .parse()
+            .map_err(|_| parse_err(i, field, format!("invalid port range `{part}`")))?;
+        let end: u16 = end
+            .parse()
+            .map_err(|_| parse_err(i, field, format!("invalid port range `{part}`")))?;
+        if start > end {
+            return Err(parse_err(
+                i,
+                field,
+                format!("port range start > end in `{part}`"),
+            ));
+        }
+        ranges.push(PortRange { start, end });
+    }
+    Ok(ranges)
+}
+
+fn parse_network(v: &Value, i: usize) -> Result<NetworkMask, RouteError> {
+    let mut mask = NetworkMask {
+        tcp: false,
+        udp: false,
+    };
+    for tok in field_strings(v, i, "network")?.join(",").split(',') {
+        let tok = tok.trim();
+        if tok.eq_ignore_ascii_case("tcp") && !mask.tcp {
+            mask.tcp = true;
+        } else if tok.eq_ignore_ascii_case("udp") && !mask.udp {
+            mask.udp = true;
+        } else {
+            return Err(parse_err(
+                i,
+                "network",
+                format!("unknown network token {tok:?}"),
+            ));
+        }
+    }
+    Ok(mask)
+}
+
+fn collect_protocols(
+    v: &Value,
+    i: usize,
+    out: &mut Vec<SniffedProtocol>,
+) -> Result<(), RouteError> {
+    for tok in field_strings(v, i, "protocol")? {
+        let p = if tok.eq_ignore_ascii_case("http") {
+            SniffedProtocol::Http
+        } else if tok.eq_ignore_ascii_case("tls") {
+            SniffedProtocol::Tls
+        } else if tok.eq_ignore_ascii_case("dns") {
+            SniffedProtocol::Dns
+        } else {
+            return Err(RouteError::Unsupported(
+                "sniffed protocol outside http/tls/dns",
+            ));
+        };
+        out.push(p);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../../tests/fixtures/xray_sample.json");
+
+    fn err_at(txt: &str, idx: usize) -> RouteError {
+        match compile_xray(txt) {
+            Err(e @ RouteError::Parse { rule_index, .. }) if rule_index == idx => e,
+            other => panic!("expected Parse at {idx}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixture_parses_to_golden_ir() {
+        let out = compile_xray(FIXTURE).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 3);
+        assert_eq!(out.warnings.len(), 0);
+        assert!(
+            matches!(&out.ruleset.default, DefaultRoute::Route { tag } if tag == DEFAULT_FALLBACK_TAG)
+        );
+        assert_eq!(out.ruleset.resolve_strategy, ResolveStrategy::AsIs);
+        assert_eq!(out.ruleset.probes.len(), 0);
+
+        // Rule 0: domain:doubleclick.net (suffix+exact pair), keyword:adservice.
+        let r0 = &out.ruleset.rules[0];
+        let Cond::All(items) = &r0.cond else {
+            panic!("rule 0 cond");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0],
+            MatchItem::Domain {
+                exact: vec!["doubleclick.net".into()],
+                suffix: vec!["doubleclick.net".into()],
+                keywords: vec!["adservice".into()],
+                regexes: vec![],
+            }
+        );
+        assert_eq!(
+            r0.action,
+            Action::Route {
+                tag: "block".into(),
+                override_addr: None
+            }
+        );
+
+        // Rule 1: geoip:private + 10.0.0.0/8; ports 80,443,1000-2000.
+        let r1 = &out.ruleset.rules[1];
+        let Cond::All(items) = &r1.cond else {
+            panic!("rule 1 cond");
+        };
+        assert_eq!(
+            items[0],
+            MatchItem::IpCidr {
+                cidrs: vec![Cidr::parse("10.0.0.0/8").unwrap()],
+                private: true,
+                geo_country: vec![],
+            }
+        );
+        assert_eq!(
+            items[1],
+            MatchItem::Ports(vec![
+                PortRange { start: 80, end: 80 },
+                PortRange {
+                    start: 443,
+                    end: 443
+                },
+                PortRange {
+                    start: 1000,
+                    end: 2000
+                },
+            ])
+        );
+        assert_eq!(
+            r1.action,
+            Action::Route {
+                tag: "direct".into(),
+                override_addr: None
+            }
+        );
+
+        // Rule 2: bare example.com is suffix+exact pair; network tcp,udp.
+        let r2 = &out.ruleset.rules[2];
+        let Cond::All(items) = &r2.cond else {
+            panic!("rule 2 cond");
+        };
+        assert_eq!(
+            items[0],
+            MatchItem::Domain {
+                exact: vec!["example.com".into()],
+                suffix: vec!["example.com".into()],
+                keywords: vec![],
+                regexes: vec![]
+            }
+        );
+        assert_eq!(
+            items[1],
+            MatchItem::Network(NetworkMask {
+                tcp: true,
+                udp: true
+            })
+        );
+        assert_eq!(
+            r2.action,
+            Action::Route {
+                tag: "proxy-a".into(),
+                override_addr: None
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_dat_geosite_is_positional_error() {
+        let txt = r#"{ "routing": { "rules": [{ "type":"field","outboundTag":"x",
+            "domain":["geosite:cn"] }] } }"#;
+        match compile_xray(txt) {
+            Err(RouteError::Parse { rule_index: 0, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ext_lists_are_positional_errors() {
+        let txt = r#"{ "routing": { "rules": [{ "type":"field","outboundTag":"x",
+            "domain":["ext:cn.dat:ad"] }] } }"#;
+        err_at(txt, 0);
+        let two_rules = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"a"},
+            {"type":"field","outboundTag":"x","domain":["ext:x.dat:spam"]}]}
+        }"#;
+        err_at(two_rules, 1);
+    }
+
+    #[test]
+    fn regexp_and_geoip_country_map_to_ir() {
+        let txt = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"a",
+             "domain":["regexp:^(?!.*\\bgoogle\\b)","regexp:www\\.example\\.[a-z]{2,3}$"],
+             "ip":["geoip:cn","2001:db8::/32"]}]}}"#;
+        let out = compile_xray(txt).unwrap();
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!();
+        };
+        assert_eq!(
+            items[0],
+            MatchItem::Domain {
+                exact: vec![],
+                suffix: vec![],
+                keywords: vec![],
+                regexes: vec![r"^(?!.*\bgoogle\b)", r"www\.example\.[a-z]{2,3}$"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            }
+        );
+        assert!(matches!(
+            &items[1],
+            MatchItem::IpCidr { geo_country, .. } if geo_country == &vec!["cn".to_string()]
+        ));
+    }
+
+    #[test]
+    fn source_ports_inbound_tags_protocol_network_map() {
+        let txt = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"b","sourcePorts":"53-64,9050",
+             "network":"udp","inboundTag":["tun","dokodemo"],
+             "protocol":["http","dns","tls"]}]}}"#;
+        let out = compile_xray(txt).unwrap();
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!();
+        };
+        assert_eq!(
+            items[..],
+            [
+                MatchItem::SourcePorts(vec![
+                    PortRange { start: 53, end: 64 },
+                    PortRange {
+                        start: 9050,
+                        end: 9050
+                    },
+                ]),
+                MatchItem::Network(NetworkMask {
+                    tcp: false,
+                    udp: true
+                }),
+                MatchItem::InboundTag {
+                    tags: vec!["tun".into(), "dokodemo".into()]
+                },
+                MatchItem::Protocol(SniffedProtocol::Http),
+                MatchItem::Protocol(SniffedProtocol::Dns),
+                MatchItem::Protocol(SniffedProtocol::Tls),
+            ][..]
+        );
+    }
+
+    #[test]
+    fn unknown_sniff_protocol_is_unsupported_error() {
+        let txt =
+            r#"{"routing":{"rules":[{"type":"field","outboundTag":"a","protocol":["quic"]}]}}"#;
+        assert!(matches!(compile_xray(txt), Err(RouteError::Unsupported(_))));
+    }
+
+    #[test]
+    fn malformed_values_are_positional_parse_errors() {
+        let bad_port = r#"{"routing":{"rules":[
+                {"type":"field","outboundTag":"s"},
+                {"type":"field","outboundTag":"s"},
+                {"type":"field","outboundTag":"s"},
+                {"type":"field","outboundTag":"a","ports":"http"}]}}"#;
+        err_at(bad_port, 3);
+        let bad_cidr = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"a","ip":["10.0.0.0/33"]}]}}"#;
+        err_at(bad_cidr, 0);
+        let no_outbound = r#"{"routing":{"rules":[{"type":"field","domain":["a.com"]}]}}"#;
+        err_at(no_outbound, 0);
+        let wrong_type = r#"{"routing":{"rules":[{"type":"proxy","outboundTag":"a"}]}}"#;
+        err_at(wrong_type, 0);
+    }
+
+    #[test]
+    fn empty_rule_is_skipped_with_warning() {
+        let txt = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"a"},
+            {"type":"field","outboundTag":"b","domain":["k.com"]}]}}"#;
+        let out = compile_xray(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        assert_eq!(out.warnings.len(), 1);
+        assert_eq!(out.warnings[0].0, 0);
+    }
+
+    #[test]
+    fn unknown_rule_key_is_tolerated_with_warning() {
+        let txt = r#"{"routing":{"rules":[
+            {"type":"field","outboundTag":"a","domain":["k.com"],"balancerTag":"bal"}]}}"#;
+        let out = compile_xray(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        assert_eq!(out.warnings.len(), 1);
+        assert!(out.warnings[0].1.contains("balancerTag"));
+    }
+
+    #[test]
+    fn domain_strategy_maps_all_three_variants() {
+        let mk = |s: &str| format!(r#"{{"routing":{{"domainStrategy":"{s}","rules":[]}}}}"#);
+        let as_is = compile_xray(&mk("AsIs")).unwrap();
+        assert_eq!(as_is.ruleset.resolve_strategy, ResolveStrategy::AsIs);
+        let if_non_match = compile_xray(&mk("IPIfNonMatch")).unwrap();
+        assert_eq!(
+            if_non_match.ruleset.resolve_strategy,
+            ResolveStrategy::IfNonMatch
+        );
+        let on_demand = compile_xray(&mk("IPOnDemand")).unwrap();
+        assert_eq!(
+            on_demand.ruleset.resolve_strategy,
+            ResolveStrategy::IfNonMatch
+        );
+        assert_eq!(on_demand.warnings.len(), 1);
+    }
+
+    #[test]
+    fn missing_routing_block_is_root_parse_error() {
+        err_at("{}", 0);
+    }
+}

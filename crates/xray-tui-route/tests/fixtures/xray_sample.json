@@ -1,0 +1,24 @@
+{
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "domain": ["domain:doubleclick.net", "keyword:adservice"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "ip": ["geoip:private", "10.0.0.0/8"],
+        "ports": "80,443,1000-2000"
+      },
+      {
+        "type": "field",
+        "outboundTag": "proxy-a",
+        "domain": ["example.com"],
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}
