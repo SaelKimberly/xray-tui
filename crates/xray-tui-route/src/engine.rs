@@ -177,9 +177,10 @@ const MAX_COND_DEPTH: u32 = 64;
 /// Interior nodes mirror [`Cond`]'s `All`/`Any`/`Invert` logic; leaves are
 /// [`ItemMatcher`]s. An empty `All` evaluates to `true` (vacuous
 /// conjunction, mirroring upstream's empty-rule catch-all); empty `Any` is
-/// `false`. Both are safe here because every compiler path (xray, sing-box,
-/// merge) skips condition-less rules, so a vacuous `All` only reaches the
-/// engine through a hand-built `RuleSet`.
+/// `false`. The vacuous `All` cannot arise from real configs: the xray and
+/// sing-box producers skip condition-less rules outright and `merge`
+/// synthesizes none — it passes existing rules through verbatim. Only a
+/// hand-built `RuleSet` can hand one to the engine.
 enum CompiledCond {
     All(Vec<ItemMatcher>),
     Any(Vec<Self>),
@@ -1044,9 +1045,10 @@ mod tests {
         let mut dns = meta("h", 443, NetworkMask::TCP);
         dns.sniffed = Some(SniffedProtocol::Dns);
         assert!(e.decide(&mut dns).is_routed_to("udp"));
-        // Sniffed DNS on plain TCP alone also fires (arm1 false, arm2 false).
+        // TCP 80 WITH sniffed DNS: arm1 is already true, so the rule is
+        // skipped regardless of the dns arm.
         let mut dns80 = meta("h", 80, NetworkMask::TCP);
-        // tcp-80 arm makes arm1 true, so no fire:
+        dns80.sniffed = Some(SniffedProtocol::Dns);
         assert!(!e.decide(&mut dns80).is_routed_to("udp"));
     }
 
@@ -1156,14 +1158,56 @@ mod tests {
     }
 
     #[test]
+    fn leaf_errors_inside_nested_conditions_carry_their_rule_index() {
+        // Regression guard: `CompiledCond::build` threads the rule position
+        // through recursion so parse errors deep inside Any/Invert trees
+        // still name the offending rule. Rule 1's bad regex must surface as
+        // `rule 1:`, not rule 0 or a placeholder.
+        let bad_item = MatchItem::Domain {
+            exact: vec![],
+            suffix: vec![],
+            keywords: vec![],
+            regexes: vec!["[".to_owned()],
+        };
+        let set = RuleSet {
+            rules: vec![
+                Rule {
+                    name: None,
+                    cond: Cond::All(vec![MatchItem::Network(NetworkMask::TCP)]),
+                    action: route("ok"),
+                },
+                Rule {
+                    name: None,
+                    cond: Cond::Any(vec![Cond::Invert(Box::new(Cond::All(vec![bad_item])))]),
+                    action: route("bad"),
+                },
+            ],
+            ..base_default()
+        };
+        let Err(e) = Engine::build(set) else {
+            panic!("rule 1's invalid regex must fail at build time");
+        };
+        assert!(
+            matches!(
+                e,
+                RouteError::Parse {
+                    rule_index: 1,
+                    field: "regex",
+                    ..
+                }
+            ),
+            "expected Parse error attributed to rule 1, got: {e}"
+        );
+    }
+
+    #[test]
     fn empty_all_is_vacuously_true_and_compiler_gating_keeps_it_unreachable() {
         // Engine semantics: an empty conjunction holds vacuously — the
         // standard logical meaning (empty AND is true, empty OR is false).
-        // That is safe here because every compiler path skips condition-less
-        // rules (xray.rs/singbox.rs "rule has no matchable condition" and
-        // logical_arms' empty-arm retain), so no compiled or merged config
-        // can hand the engine a catch-all `Cond::All([])` unless a RuleSet
-        // is built directly.
+        // That cannot arise from real configs: the xray and sing-box
+        // producers skip condition-less rules outright and `merge`
+        // synthesizes none, so only a hand-built `RuleSet` reaches the
+        // engine with a catch-all `Cond::All([])`.
         let mut set = base_default();
         set.rules.push(Rule {
             name: Some("catch".to_owned()),
