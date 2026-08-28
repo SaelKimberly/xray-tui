@@ -638,10 +638,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxClient<S> {
 
 /// `BrokenPipe`-style error for a dead tunnel, shared by the session write
 /// path and `open_session`.
-#[allow(
-    clippy::missing_const_for_fn,
-    reason = "`io::Error::new` is not const-stable"
-)]
 fn tunnel_closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "vless mux tunnel is closed")
 }
