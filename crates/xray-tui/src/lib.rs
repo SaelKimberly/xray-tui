@@ -29,7 +29,11 @@ use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig};
 
 /// Helper to send a `CoreEvent` with a warning on channel full.
 /// Prevents silent event loss.
-fn try_send_or_warn(tx: &mpsc::Sender<CoreEvent>, event: CoreEvent, label: &'static str) {
+pub(crate) fn try_send_or_warn(
+    tx: &mpsc::Sender<CoreEvent>,
+    event: CoreEvent,
+    label: &'static str,
+) {
     if let Err(_e) = tx.try_send(event) {
         warn!(target: "tui::events", "try_send dropped {label}: channel full");
     }

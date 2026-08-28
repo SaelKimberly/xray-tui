@@ -235,5 +235,6 @@ const fn status_bar_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Updates => " Settings > Updates",
         SettingsSection::Routing => " Settings > Routing",
         SettingsSection::Subscriptions => " Settings > Subscriptions",
+        SettingsSection::RouteProbes => " Settings > Route Probes",
     }
 }

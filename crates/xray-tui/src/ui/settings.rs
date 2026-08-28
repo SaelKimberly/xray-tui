@@ -76,6 +76,10 @@ const SETTINGS_TREE: &[SettingsTreeGroup] = &[
                 section: Some(SettingsSection::Routing),
             },
             SettingsTreeNode {
+                name: "Probe Hosts",
+                section: Some(SettingsSection::RouteProbes),
+            },
+            SettingsTreeNode {
                 name: "DNS",
                 section: Some(SettingsSection::Dns),
             },
@@ -342,7 +346,7 @@ async fn handle_split_key(state: &mut AppState, key: &KeyEvent) {
                 _ => return,
             };
             match pane_type {
-                1 => handle_form_key(state, key),
+                1 => handle_form_key(state, key).await,
                 2 => handle_routing_list_key(state, key).await,
                 3 => handle_routing_form_key(state, key).await,
                 4 => handle_update_form_key(state, key),
@@ -370,6 +374,7 @@ const fn form_title_for_section(section: SettingsSection) -> &'static str {
         SettingsSection::Logging => " Logging ",
         SettingsSection::Updates => " Updates ",
         SettingsSection::Routing => " Routing Rules ",
+        SettingsSection::RouteProbes => " Probe Hosts ",
     }
 }
 
@@ -602,6 +607,7 @@ fn form_field_defs_for_section(
             ("core_type", "Core Type", "Select:Auto,Xray,SingBox"),
         ],
         SettingsSection::Updates | SettingsSection::Routing => &[],
+        SettingsSection::RouteProbes => &[("probes", "Probes (comma-sep)", "Text")],
     }
 }
 const fn section_from_mode(mode: &SettingsMode) -> Option<SettingsSection> {
@@ -693,12 +699,11 @@ fn render_form_with_area(
         let field_height = 2 + has_error;
         let field_area = Rect::new(value_x, y, value_w, field_height.min(max_y - y));
         frame.render_stateful_widget(&input, field_area, &mut input_state);
-
         y += field_height;
     }
 }
 
-fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
+async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
     // Borrow mode to extract data, then work through mutable state
     let AppMode::Settings { mode } = &state.mode else {
         return;
@@ -809,7 +814,11 @@ fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
 
             if form_errors.is_empty() {
                 let saved_fields = fields.clone();
-                state.save_settings_form(section, &saved_fields);
+                if section == SettingsSection::RouteProbes {
+                    crate::ops::settings::save_route_probes(state, &saved_fields).await;
+                } else {
+                    state.save_settings_form(section, &saved_fields);
+                }
                 // In Split mode, return focus to tree after saving
                 if let AppMode::Settings {
                     mode: SettingsMode::Split { right, focus, .. },
@@ -2139,10 +2148,12 @@ mod tests {
         handle_form_key(
             &mut state,
             &KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
-        );
+        )
+        .await;
         handle_form_key(
             &mut state,
             &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
-        );
+        )
+        .await;
     }
 }

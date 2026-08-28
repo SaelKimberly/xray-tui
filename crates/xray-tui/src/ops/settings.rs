@@ -346,7 +346,9 @@ pub async fn build_settings_fields(
                 state.config.updates.check_on_startup.to_string(),
             )]
         }
-        Routing | Subscriptions => vec![],
+        // Routing/Subscriptions list panes build their own state; RouteProbes
+        // loads in build_right_pane (async db read can't live here).
+        Routing | Subscriptions | crate::SettingsSection::RouteProbes => vec![],
         Logging => {
             vec![
                 (
@@ -527,9 +529,8 @@ fn apply_settings_fields(
                 state.config.geo.update_interval_hours = v;
             }
         }
-        // Dns and Routing are handled separately (DB-backed)
-        Dns | Routing | Updates | Subscriptions => {}
-        // Dns and Routing are handled separately (DB-backed)
+        // Dns, Routing and RouteProbes are handled separately (DB-backed)
+        Dns | Routing | Updates | Subscriptions | crate::SettingsSection::RouteProbes => {}
         Logging => {
             if let Ok(d) = humantime::parse_duration(get_str("log_ttl_secs")) {
                 *state.config.logging.ttl_secs = d;
@@ -565,6 +566,15 @@ pub async fn build_right_pane(state: &mut AppState, section: SettingsSection) ->
             selected: 0,
             selected_mask: vec![false; state.groups.len()],
         },
+        SettingsSection::RouteProbes => {
+            let hosts = state.db.get_route_probes().await.unwrap_or_default();
+            SplitRightPane::Form {
+                section,
+                fields: vec![("probes".into(), hosts.join(", "))],
+                focus_index: 0,
+                form_errors: HashMap::new(),
+            }
+        }
         _ => SplitRightPane::Form {
             section,
             fields,
@@ -713,6 +723,29 @@ pub async fn save_routing_rule(
     state.reload_routing_rules().await;
 }
 
+/// Persist the probes editor: split the comma-separated field, drop empties,
+/// and wholesale-replace the singleton row (the db dedupes).
+pub async fn save_route_probes(state: &mut AppState, fields: &[(String, String)]) {
+    let raw = fields
+        .iter()
+        .find(|(k, _)| k == "probes")
+        .map_or("", |(_, v)| v.as_str());
+    let hosts: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    match state.db.upsert_route_probes(hosts).await {
+        Ok(()) => state.log_trace("info", "tui::ops::settings", "Probe hosts saved"),
+        Err(e) => state.log_trace(
+            "error",
+            "tui::ops::settings",
+            &format!("Failed to save probe hosts: {e}"),
+        ),
+    }
+}
+
 pub async fn save_dns_settings(state: &mut AppState, fields: &[(String, String)]) {
     let id = state
         .db
@@ -814,6 +847,8 @@ fn protocol_core_form_fields(overrides: &HashMap<String, String>) -> Vec<(String
 #[cfg(test)]
 mod tests {
     use super::protocol_core_form_fields;
+    use super::save_route_probes;
+    use crate::AppState;
     use crate::ui::settings::PROTOCOL_CORE_DEFS;
     use std::collections::HashMap;
 
@@ -839,5 +874,26 @@ mod tests {
         let fields = protocol_core_form_fields(&HashMap::new());
         assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
         assert!(fields.iter().all(|(_, v)| v == "Auto"));
+    }
+
+    #[tokio::test]
+    async fn save_route_probes_splits_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, xray_tui_config::AppConfig::default()).await;
+        let fields = vec![(
+            "probes".to_string(),
+            " a.example.com , b.example.com ,, ".to_string(),
+        )];
+        save_route_probes(&mut state, &fields).await;
+        let hosts = state.db.get_route_probes().await.unwrap();
+        assert_eq!(
+            hosts,
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
     }
 }

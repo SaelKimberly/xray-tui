@@ -172,6 +172,7 @@ pub enum SettingsSection {
     SpeedTest,
     Logging,
     Subscriptions,
+    RouteProbes,
 }
 
 impl std::fmt::Display for SettingsSection {
@@ -191,6 +192,7 @@ impl std::fmt::Display for SettingsSection {
             Self::SpeedTest => write!(f, "Speed Test"),
             Self::Logging => write!(f, "Logging"),
             Self::Subscriptions => write!(f, "Subscriptions"),
+            Self::RouteProbes => write!(f, "Route Probes"),
         }
     }
 }
@@ -367,6 +369,8 @@ pub enum CoreEvent {
         endpoint_id: i64,
         info: EndpointInfo,
     },
+    /// Native-core routing decision/probe event (surfaced in Actions Log).
+    Route(xray_tui_route::events::RouteEvent),
 }
 
 #[derive(Debug, Clone)]

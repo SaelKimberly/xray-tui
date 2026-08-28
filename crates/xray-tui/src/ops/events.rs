@@ -61,6 +61,72 @@ const fn err_kind_for(test_type: TestType) -> ProfileErr {
     }
 }
 
+/// Render a routing-engine event into an actions-log line.
+///
+/// Pure so the five variant renderings stay unit-testable without a channel
+/// or an `AppState`. `timestamp_nanos` comes from the event's `jiff` timestamp
+/// when the variant carries one (a nanosecond precision unix timestamp; the
+/// engine emits at least second precision), falling back to zero for
+/// `CompileWarning` which has no time field.
+#[must_use]
+pub fn render_route_event(ev: &xray_tui_route::RouteEvent) -> crate::LogLine {
+    use xray_tui_route::events::RouteEvent as Re;
+    let (msg, at) = match ev {
+        Re::DecisionApplied {
+            rule_name,
+            tag,
+            sni,
+            at,
+        } => (
+            format!(
+                "route: {} → {}{} ({at})",
+                rule_name.as_deref().unwrap_or("<rule>"),
+                tag.as_deref().unwrap_or("<default>"),
+                sni.as_deref()
+                    .map_or_else(String::new, |s| format!(" sni={s}"))
+            ),
+            *at,
+        ),
+        Re::Resolved { host, ips, at } => (format!("route: resolved {host} → {ips:?} ({at})"), *at),
+        Re::NetworkBreakdown { failed_probe, at } => (
+            format!("route: NETWORK BREAKDOWN probe {failed_probe} ({at})"),
+            *at,
+        ),
+        Re::ProbeRecovered { probe, at } => (format!("route: probe recovered {probe} ({at})"), *at),
+        Re::CompileWarning {
+            rule_index,
+            message,
+        } => (
+            format!("route: compile warning rule#{rule_index}: {message}"),
+            jiff::Timestamp::UNIX_EPOCH,
+        ),
+    };
+    crate::LogLine {
+        level: "info".into(),
+        target: "route".into(),
+        message: msg,
+        timestamp_nanos: at.as_second() * 1_000_000_000 + i64::from(at.subsec_nanosecond()),
+    }
+}
+
+/// Forward routing-engine events into the TUI core-event channel.
+///
+/// Mirrors the connect.rs stderr log pump: a recv loop converting each
+/// `RouteEvent` into a `CoreEvent::Route`, dropped silently when the TUI is
+/// gone (the receiver disconnect ends the loop). Nobody constructs an
+/// [`xray_tui_route::Engine`] in the TUI yet — the native-connect service
+/// plugin will own the sender side; this is the receiving half.
+pub fn spawn_route_event_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<xray_tui_route::RouteEvent>,
+    core_event_tx: tokio::sync::mpsc::Sender<CoreEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            crate::try_send_or_warn(&core_event_tx, CoreEvent::Route(ev), "route_event");
+        }
+    });
+}
+
 /// Poll core event channel and update state accordingly.
 ///
 /// Returns `true` when anything was handled (an event consumed, or a finished
@@ -173,6 +239,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.system_stats = Some(sys_stats);
             }
             CoreEvent::LogLine { .. } => {}
+            CoreEvent::Route(ev) => {
+                let line = render_route_event(&ev);
+                state.log_cache.push_back(line);
+                if state.log_cache.len() > 10_000 {
+                    state.log_cache.pop_front();
+                }
+            }
             CoreEvent::TuiLog {
                 target,
                 level,
@@ -1772,5 +1845,124 @@ mod tests {
         .unwrap();
         assert!(state.poll_core_events().await);
         assert!(!state.speed_test_stop.load(Ordering::Relaxed));
+    }
+
+    fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(secs).unwrap()
+    }
+
+    #[test]
+    fn render_route_event_covers_all_five_variants() {
+        use xray_tui_route::events::RouteEvent as Re;
+
+        let line = render_route_event(&Re::DecisionApplied {
+            rule_name: Some("ads".into()),
+            tag: Some("proxy".into()),
+            sni: Some("example.com".into()),
+            at: ts(1_700_000_000),
+        });
+        assert_eq!(line.target, "route");
+        assert_eq!(line.level, "info");
+        assert_eq!(
+            line.message,
+            "route: ads → proxy sni=example.com (2023-11-14T22:13:20Z)"
+        );
+        assert_eq!(line.timestamp_nanos, 1_700_000_000_000_000_000);
+
+        // Default fall-through: no rule name, no tag, no sni.
+        let line = render_route_event(&Re::DecisionApplied {
+            rule_name: None,
+            tag: None,
+            sni: None,
+            at: ts(1),
+        });
+        assert_eq!(
+            line.message,
+            "route: <rule> → <default> (1970-01-01T00:00:01Z)"
+        );
+
+        let line = render_route_event(&Re::Resolved {
+            host: "example.com".into(),
+            ips: vec![
+                "1.2.3.4".parse::<std::net::IpAddr>().unwrap(),
+                "::1".parse::<std::net::IpAddr>().unwrap(),
+            ],
+            at: ts(2),
+        });
+        assert_eq!(line.target, "route");
+        assert_eq!(
+            line.message,
+            "route: resolved example.com → [1.2.3.4, ::1] (1970-01-01T00:00:02Z)"
+        );
+
+        let line = render_route_event(&Re::NetworkBreakdown {
+            failed_probe: "gstatic".into(),
+            at: ts(3),
+        });
+        assert_eq!(
+            line.message,
+            "route: NETWORK BREAKDOWN probe gstatic (1970-01-01T00:00:03Z)"
+        );
+
+        let line = render_route_event(&Re::ProbeRecovered {
+            probe: "gstatic".into(),
+            at: ts(4),
+        });
+        assert_eq!(
+            line.message,
+            "route: probe recovered gstatic (1970-01-01T00:00:04Z)"
+        );
+
+        let line = render_route_event(&Re::CompileWarning {
+            rule_index: 7,
+            message: "unknown key".into(),
+        });
+        assert_eq!(line.message, "route: compile warning rule#7: unknown key");
+        assert_eq!(line.timestamp_nanos, 0);
+    }
+
+    #[tokio::test]
+    async fn route_event_lands_in_log_cache() {
+        let (mut state, tx) = event_state().await;
+        tx.send(CoreEvent::Route(
+            xray_tui_route::events::RouteEvent::ProbeRecovered {
+                probe: "gstatic".into(),
+                at: ts(5),
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        let back = state.log_cache.back().expect("route line cached");
+        assert_eq!(back.target, "route");
+        assert_eq!(
+            back.message,
+            "route: probe recovered gstatic (1970-01-01T00:00:05Z)"
+        );
+        assert_eq!(back.timestamp_nanos, 5_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn spawn_route_event_forwarder_converts_events() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (core_tx, mut core_rx) = tokio::sync::mpsc::channel(16);
+        super::spawn_route_event_forwarder(rx, core_tx);
+        tx.send(xray_tui_route::events::RouteEvent::NetworkBreakdown {
+            failed_probe: "gstatic".into(),
+            at: ts(6),
+        })
+        .unwrap();
+        drop(tx); // close the route stream so the forwarder can exit later
+        let ev = core_rx.recv().await.expect("forwarded event");
+        match ev {
+            CoreEvent::Route(xray_tui_route::events::RouteEvent::NetworkBreakdown {
+                failed_probe,
+                at,
+            }) => {
+                assert_eq!(failed_probe, "gstatic");
+                assert_eq!(at, ts(6));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
