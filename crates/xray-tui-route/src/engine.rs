@@ -1,5 +1,5 @@
-//! Flat-rule routing engine: build-once compilation and synchronous pure
-//! evaluation (`Cond::All` first-match).
+//! Rule routing engine: build-once compilation of full `Cond` trees
+//! (`All`/`Any`/`Invert`) and synchronous pure first-match evaluation.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -152,16 +152,76 @@ fn private_contains(ip: &IpAddr) -> bool {
     PRIVATE.contains(ip)
 }
 
-/// One rule with its predicate pre-compiled into leaf matchers.
+/// One rule with its predicate pre-compiled into a condition tree.
 struct CompiledRule {
     name: Option<String>,
-    items: Vec<ItemMatcher>,
+    cond: CompiledCond,
     action: Action,
 }
 
 impl CompiledRule {
     fn matches(&self, meta: &ConnMeta) -> bool {
-        self.items.iter().all(|item| item.matches(meta))
+        self.cond.eval(meta)
+    }
+}
+
+/// Maximum condition-tree nesting accepted at build time.
+///
+/// Conditions originate in config files; a bound turns pathological nesting
+/// into a clean build error instead of unbounded recursion. 64 mirrors
+/// typical parser limits and is far above any real config.
+const MAX_COND_DEPTH: u32 = 64;
+
+/// A condition tree compiled once at build time.
+///
+/// Interior nodes mirror [`Cond`]'s `All`/`Any`/`Invert` logic; leaves are
+/// [`ItemMatcher`]s. An empty `All` evaluates to `true` (vacuous
+/// conjunction, mirroring upstream's empty-rule catch-all); empty `Any` is
+/// `false`. Both are safe here because every compiler path (xray, sing-box,
+/// merge) skips condition-less rules, so a vacuous `All` only reaches the
+/// engine through a hand-built `RuleSet`.
+enum CompiledCond {
+    All(Vec<ItemMatcher>),
+    Any(Vec<Self>),
+    Invert(Box<Self>),
+}
+
+impl CompiledCond {
+    /// Compiles a condition tree with a build-time depth guard. The root
+    /// sits at depth 1; a node deeper than [`MAX_COND_DEPTH`] is rejected.
+    /// `rule_idx` attributes leaf-matcher parse errors to their rule.
+    fn build(cond: crate::ir::Cond, rule_idx: usize, depth: u32) -> Result<Self, RouteError> {
+        if depth > MAX_COND_DEPTH {
+            return Err(RouteError::Unsupported("condition nesting deeper than 64"));
+        }
+        Ok(match cond {
+            Cond::All(items) => Self::All(
+                items
+                    .into_iter()
+                    .map(|item| compile_item(item, rule_idx))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Cond::Any(children) => Self::Any(
+                children
+                    .into_iter()
+                    .map(|c| Self::build(c, rule_idx, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Cond::Invert(inner) => {
+                Self::Invert(Box::new(Self::build(*inner, rule_idx, depth + 1)?))
+            }
+        })
+    }
+
+    /// Recursive evaluation: `All` = every leaf holds (vacuously true when
+    /// empty), `Any` = short-circuit on the first true child, `Invert` =
+    /// negation of the subtree.
+    fn eval(&self, meta: &ConnMeta) -> bool {
+        match self {
+            Self::All(items) => items.iter().all(|item| item.matches(meta)),
+            Self::Any(children) => children.iter().any(|c| c.eval(meta)),
+            Self::Invert(inner) => !inner.eval(meta),
+        }
     }
 }
 
@@ -178,29 +238,20 @@ impl Engine {
     /// Compiles a [`RuleSet`] into an evaluation-ready engine.
     ///
     /// Regexes and keyword automata compile once here; port ranges are
-    /// sanity-checked so evaluation cannot encounter inverted bounds.
+    /// sanity-checked so evaluation cannot encounter inverted bounds, and
+    /// the full `Cond` tree (`All`/`Any`/`Invert`) is lowered to
+    /// [`CompiledCond`]. Conditions nesting deeper than 64 levels are
+    /// rejected here at build time, never at evaluation time.
     ///
     /// # Errors
     /// Returns [`RouteError::Parse`] when any rule fails to compile, and
-    /// [`RouteError::Unsupported`] for conditions this engine does not yet
-    /// evaluate (`Cond::Any`, `Cond::Invert`).
+    /// [`RouteError::Unsupported`] when conditions nest deeper than 64.
     pub fn build(rs: crate::ir::RuleSet) -> Result<Self, RouteError> {
         let mut rules = Vec::with_capacity(rs.rules.len());
         for (idx, rule) in rs.rules.into_iter().enumerate() {
-            let items = match rule.cond {
-                Cond::All(items) => items
-                    .into_iter()
-                    .map(|item| compile_item(item, idx))
-                    .collect::<Result<Vec<_>, _>>()?,
-                Cond::Any(_) | Cond::Invert(_) => {
-                    return Err(RouteError::Unsupported(
-                        "Cond::Any/Invert not evaluated yet",
-                    ));
-                }
-            };
             rules.push(CompiledRule {
                 name: rule.name,
-                items,
+                cond: CompiledCond::build(rule.cond, idx, 1)?,
                 action: rule.action,
             });
         }
@@ -693,7 +744,10 @@ mod tests {
         );
         // Entries survive compilation verbatim (no silent erasure): a later
         // task's geoip feature finds them right where it needs them.
-        let ItemMatcher::IpCidr { geo_country, .. } = &geo.rules[0].items[0] else {
+        let CompiledCond::All(items) = &geo.rules[0].cond else {
+            panic!("expected compiled All condition");
+        };
+        let ItemMatcher::IpCidr { geo_country, .. } = &items[0] else {
             panic!("expected compiled IpCidr item");
         };
         assert_eq!(geo_country, &["CN".to_owned()]);
@@ -707,7 +761,10 @@ mod tests {
             route("de"),
         )]))
         .unwrap();
-        let ItemMatcher::SourceIpCidr { geo_country, .. } = &src_geo.rules[0].items[0] else {
+        let CompiledCond::All(items) = &src_geo.rules[0].cond else {
+            panic!("expected compiled All condition");
+        };
+        let ItemMatcher::SourceIpCidr { geo_country, .. } = &items[0] else {
             panic!("expected compiled SourceIpCidr item");
         };
         assert_eq!(geo_country, &["DE".to_owned()]);
@@ -867,20 +924,257 @@ mod tests {
             route("x"),
         )]));
         assert!(res.is_err(), "inverted port range must fail at build time");
+    }
 
-        // Cond variants beyond All are not supported by this engine yet.
-        let any_set = RuleSet {
+    #[test]
+    fn any_short_circuits_on_first_true_arm() {
+        let arm = |p: u16| Cond::All(vec![MatchItem::Ports(vec![PortRange { start: p, end: p }])]);
+        let e = Engine::build(RuleSet {
+            rules: vec![Rule {
+                name: Some("any".to_owned()),
+                cond: Cond::Any(vec![arm(80), arm(443), arm(8080)]),
+                action: route("any"),
+            }],
+            ..base_default()
+        })
+        .unwrap();
+        // Arms are pure, so short-circuiting is an evaluation-order guarantee
+        // rather than an observable side effect; first hit decides the rule.
+        assert!(
+            e.decide(&mut meta("h", 80, NetworkMask::TCP))
+                .is_routed_to("any")
+        );
+        assert!(
+            e.decide(&mut meta("h", 443, NetworkMask::UDP))
+                .is_routed_to("any")
+        );
+        // No arm true => the Any is false and the rule is skipped.
+        assert!(
+            !e.decide(&mut meta("h", 9000, NetworkMask::TCP))
+                .is_routed_to("any")
+        );
+    }
+
+    #[test]
+    fn invert_negates_subtree_result() {
+        let arm = |p: u16| Cond::All(vec![MatchItem::Ports(vec![PortRange { start: p, end: p }])]);
+        // Flat inversion: everything but port 80 lands in "elsewhere".
+        let e = Engine::build(RuleSet {
             rules: vec![Rule {
                 name: None,
-                cond: Cond::Any(vec![Cond::All(vec![])]),
+                cond: Cond::Invert(Box::new(arm(80))),
+                action: route("elsewhere"),
+            }],
+            ..base_default()
+        })
+        .unwrap();
+        assert!(
+            !e.decide(&mut meta("h", 80, NetworkMask::TCP))
+                .is_routed_to("elsewhere")
+        );
+        assert!(
+            e.decide(&mut meta("h", 443, NetworkMask::TCP))
+                .is_routed_to("elsewhere")
+        );
+
+        // Negation composes over Any: neither 80 nor 443 satisfies the
+        // inverted alternation.
+        let e2 = Engine::build(RuleSet {
+            rules: vec![Rule {
+                name: None,
+                cond: Cond::Invert(Box::new(Cond::Any(vec![arm(80), arm(443)]))),
+                action: route("rare"),
+            }],
+            ..base_default()
+        })
+        .unwrap();
+        assert!(
+            e2.decide(&mut meta("h", 8443, NetworkMask::TCP))
+                .is_routed_to("rare")
+        );
+        assert!(
+            !e2.decide(&mut meta("h", 443, NetworkMask::TCP))
+                .is_routed_to("rare")
+        );
+    }
+
+    #[test]
+    fn nested_any_inside_all_inside_invert_evaluates_correctly() {
+        // Deepest mixed tree the IR allows: `Cond::All` holds leaf
+        // `MatchItem`s only, so the nesting realized here is
+        // Invert(Any([All(...), Invert(All(...))])) — All leaves inside Any
+        // arms inside one Invert. Upstream semantics (xray
+        // route/rule/rule_abstract.go fires a rule when
+        // `condition.Match(...) == !invert`; sing-box logical rules AND/OR
+        // their children identically): the whole subtree's verdict is
+        // negated, so this rule fires when NOT ((tcp AND port 80) OR (NOT
+        // dns)) — i.e. exactly non-TCP/non-80 connections that sniff as DNS.
+        // All-leaves-in-Any-arms realizes the "Any inside All" conjunction
+        // context of the brief.
+        let e = Engine::build(RuleSet {
+            rules: vec![Rule {
+                name: Some("udp-non-dns".to_owned()),
+                cond: Cond::Invert(Box::new(Cond::Any(vec![
+                    Cond::All(vec![
+                        MatchItem::Network(NetworkMask::TCP),
+                        MatchItem::Ports(vec![PortRange { start: 80, end: 80 }]),
+                    ]),
+                    Cond::Invert(Box::new(Cond::All(vec![MatchItem::Protocol(
+                        SniffedProtocol::Dns,
+                    )]))),
+                ]))),
+                action: route("udp"),
+            }],
+            ..base_default()
+        })
+        .unwrap();
+        // UDP, un-sniffed: arm1 false (not tcp-80), NOT dns is true so arm2
+        // true => Any true => Invert false => rule skipped.
+        assert!(
+            !e.decide(&mut meta("h", 443, NetworkMask::UDP))
+                .is_routed_to("udp")
+        );
+        // TCP 80: arm1 true => Any true => Invert false => skipped.
+        assert!(
+            !e.decide(&mut meta("h", 80, NetworkMask::TCP))
+                .is_routed_to("udp")
+        );
+        // TCP 443: arm1 false; sniffed DNS makes NOT-dns false, arm2 false
+        // => Any false => Invert true => rule fires.
+        let mut dns = meta("h", 443, NetworkMask::TCP);
+        dns.sniffed = Some(SniffedProtocol::Dns);
+        assert!(e.decide(&mut dns).is_routed_to("udp"));
+        // Sniffed DNS on plain TCP alone also fires (arm1 false, arm2 false).
+        let mut dns80 = meta("h", 80, NetworkMask::TCP);
+        // tcp-80 arm makes arm1 true, so no fire:
+        assert!(!e.decide(&mut dns80).is_routed_to("udp"));
+    }
+
+    #[test]
+    fn flat_all_compiles_identically_to_before_task11() {
+        // Task 4's truth table, re-run against the tree evaluator: flat
+        // `Cond::All` rules must behave bit-identically.
+        let e = Engine::build(rs(vec![
+            (
+                MatchItem::Ports(vec![PortRange { start: 80, end: 80 }]),
+                route("a"),
+            ),
+            (MatchItem::Network(NetworkMask::TCP), route("b")),
+        ]))
+        .unwrap();
+        // First-match declaration order preserved.
+        assert!(
+            e.decide(&mut meta("example.com", 80, NetworkMask::TCP))
+                .is_routed_to("a")
+        );
+        assert!(
+            e.decide(&mut meta("example.com", 443, NetworkMask::TCP))
+                .is_routed_to("b")
+        );
+        assert!(
+            e.decide(&mut meta("example.com", 443, NetworkMask::UDP))
+                .is_routed_to("direct")
+        );
+
+        // Multi-item conjunction inside one flat rule.
+        let mut set = base_default();
+        set.rules.push(Rule {
+            name: None,
+            cond: Cond::All(vec![
+                MatchItem::Network(NetworkMask::TCP),
+                MatchItem::Ports(vec![PortRange {
+                    start: 443,
+                    end: 443,
+                }]),
+            ]),
+            action: route("tls"),
+        });
+        let e2 = Engine::build(set).unwrap();
+        assert!(
+            e2.decide(&mut meta("h", 443, NetworkMask::TCP))
+                .is_routed_to("tls")
+        );
+        assert!(
+            !e2.decide(&mut meta("h", 443, NetworkMask::UDP))
+                .is_routed_to("tls")
+        );
+        assert!(
+            !e2.decide(&mut meta("h", 80, NetworkMask::TCP))
+                .is_routed_to("tls")
+        );
+    }
+
+    #[test]
+    fn condition_nesting_deeper_than_64_is_rejected_at_build() {
+        // Conditions come from config files, so runaway nesting is rejected
+        // once at build time instead of risking runtime stack depth: 65
+        // nested Inverts put the innermost node at depth 65 > 64.
+        let deep = (0..65).fold(
+            Cond::All(vec![MatchItem::Network(NetworkMask::TCP)]),
+            |c, _| Cond::Invert(Box::new(c)),
+        );
+        let set = RuleSet {
+            rules: vec![Rule {
+                name: None,
+                cond: deep,
                 action: route("x"),
             }],
             ..base_default()
         };
-        assert!(matches!(
-            Engine::build(any_set),
-            Err(RouteError::Unsupported(_))
-        ));
+        assert!(
+            matches!(
+                Engine::build(set),
+                Err(RouteError::Unsupported("condition nesting deeper than 64"))
+            ),
+            "65 levels of nesting must fail at build time"
+        );
+
+        // Exactly at the boundary: 63 wraps put the innermost leaf at depth
+        // 64, which compiles. 63 negations are an odd count, so the TCP item
+        // decides inverted.
+        let ok = (0..63).fold(
+            Cond::All(vec![MatchItem::Network(NetworkMask::TCP)]),
+            |c, _| Cond::Invert(Box::new(c)),
+        );
+        let e = Engine::build(RuleSet {
+            rules: vec![Rule {
+                name: None,
+                cond: ok,
+                action: route("odd"),
+            }],
+            ..base_default()
+        })
+        .unwrap();
+        assert!(
+            e.decide(&mut meta("h", 1, NetworkMask::TCP))
+                .is_routed_to("direct")
+        );
+        assert!(
+            e.decide(&mut meta("h", 1, NetworkMask::UDP))
+                .is_routed_to("odd")
+        );
+    }
+
+    #[test]
+    fn empty_all_is_vacuously_true_and_compiler_gating_keeps_it_unreachable() {
+        // Engine semantics: an empty conjunction holds vacuously — the
+        // standard logical meaning (empty AND is true, empty OR is false).
+        // That is safe here because every compiler path skips condition-less
+        // rules (xray.rs/singbox.rs "rule has no matchable condition" and
+        // logical_arms' empty-arm retain), so no compiled or merged config
+        // can hand the engine a catch-all `Cond::All([])` unless a RuleSet
+        // is built directly.
+        let mut set = base_default();
+        set.rules.push(Rule {
+            name: Some("catch".to_owned()),
+            cond: Cond::All(vec![]),
+            action: route("catch"),
+        });
+        let e = Engine::build(set).unwrap();
+        assert!(
+            e.decide(&mut meta("anything.example", 1, NetworkMask::UDP))
+                .is_routed_to("catch")
+        );
     }
 
     /// Test-only helper naming which outbound a decision selects.
