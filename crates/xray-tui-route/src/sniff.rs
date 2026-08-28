@@ -128,8 +128,9 @@ fn probe_http(bytes: &[u8]) -> Option<SniffResult> {
     let _ = bytes.windows(4).position(|w| w == b"\r\n\r\n")?;
 
     // Scan header lines for `host:` (case-insensitive name match). The
-    // `\r\n\r\n` check above guarantees the loop terminates on a real
-    // request; a slice that ends mid-headers simply runs out.
+    // scan stops at the blank line that ends the header block: lines in
+    // the request BODY are never searched, so a body line like
+    // "host: attacker.com" cannot be mistaken for a header.
     let mut rest = &bytes[line_end + 1..];
     while !rest.is_empty() {
         let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
@@ -137,6 +138,10 @@ fn probe_http(bytes: &[u8]) -> Option<SniffResult> {
         };
         let line = rest[..nl].strip_suffix(b"\r").unwrap_or(&rest[..nl]);
         rest = &rest[nl + 1..];
+        if line.is_empty() {
+            // Blank line: end of headers; host not found in the block.
+            break;
+        }
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
         };

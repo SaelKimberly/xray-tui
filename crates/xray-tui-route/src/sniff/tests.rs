@@ -19,13 +19,16 @@ impl xray_tui_tls::SecureRandom for FixedRandom {
 /// Renders the `chrome_130` hand-profile hello to wire bytes via the
 /// `xray-tui-tls` public API and persists it as
 /// `tests/fixtures/tls_hello_chrome.bin` (commit alongside). Deterministic:
-/// fixed RNG material, fixed key share. The test fails loudly if the
-/// fixture is missing or stale — re-run with `RENDER_FIXTURE=1` to rewrite.
+/// fixed RNG material, fixed key share. The file is loaded when present;
+/// re-run any test with `RENDER_FIXTURE=1` to force a re-render and
+/// overwrite (provenance re-check: output must be byte-identical).
 fn fixture_bytes() -> Vec<u8> {
     use xray_tui_tls::hello::{BuildParams, build_hello};
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls_hello_chrome.bin");
-    if let Ok(existing) = std::fs::read(&path) {
+    if std::env::var_os("RENDER_FIXTURE").is_none()
+        && let Ok(existing) = std::fs::read(&path)
+    {
         return existing;
     }
     // Deterministic inputs: RNG bytes 0x42 (every GREASE draw lands on
@@ -67,12 +70,23 @@ fn tls_hello_yields_tls_with_sni_target_example_com() {
 #[test]
 fn sni_carries_wire_case() {
     // Case preservation from the wire: SNI bytes returned unmodified.
+    // Locate the host bytes by walking the hello (not raw searching),
+    // overwrite them with mixed case, and expect probe to return exactly
+    // the mixed-case string.
+    // Host byte offset in the fixture: record(5) + hs hdr(4) + ver(2) +
+    // random(32) + sid_len(1) + sid(32) + cs_len(2) + ciphers(32) +
+    // comp_len(1) + comp(1) + ext_len(2) = 113; first ext is GREASE
+    // (4 hdr + 1 val = 5); SNI ext: ty(2) len(2) list_len(2) + type(1) +
+    // host_len(2) = 9 → walk total 128 = host start, len 11 ("example.com").
+    const HOST_OFF: usize = 128;
     let mut hello = fixture_bytes();
-    // Find and overwrite the SNI hostname with mixed case: locate the
-    // server_name extension by walking (not searching raw bytes).
     let result = probe(&hello).expect("parses");
     assert_eq!(result.host.as_deref(), Some("example.com"));
-    let _ = &mut hello;
+
+    let mixed = b"ExAmPlE.COM";
+    hello[HOST_OFF..HOST_OFF + mixed.len()].copy_from_slice(mixed);
+    let result = probe(&hello).expect("mutated hello still parses");
+    assert_eq!(result.host.as_deref(), Some("ExAmPlE.COM"));
 }
 
 #[test]
@@ -98,12 +112,44 @@ fn garbage_returns_none() {
 }
 
 #[test]
+fn host_header_in_body_is_not_sniffed() {
+    // A request with no Host header whose BODY contains a "host:" line:
+    // the header scan must stop at the blank line, yielding None —
+    // never the attacker-controlled body line.
+    let req = b"POST /x HTTP/1.1\r\nContent-Length: 20\r\n\r\nhost: attacker.com\r\n";
+    assert_eq!(probe(req), None);
+    // Real header + decoy body line: header wins.
+    let req = b"POST /x HTTP/1.1\r\nHost: real.example\r\n\r\nhost: attacker.com\r\n";
+    let result = probe(req).expect("parses");
+    assert_eq!(result.host.as_deref(), Some("real.example"));
+}
+
+#[test]
 fn truncated_hello_returns_none() {
     let full = fixture_bytes();
     // Every prefix must return None, never panic.
     for cut in 1..full.len() {
         assert_eq!(probe(&full[..cut]), None, "prefix of {cut} bytes sniffed");
     }
+}
+
+#[test]
+fn hello_field_len_overrun_returns_none() {
+    // Valid outer hs_len, but a field length extends past the remaining
+    // bytes: the inner Reader takes must yield None (covers the
+    // take_len ?=>None arms the outer hs_end gate otherwise hides).
+    let mut hello = fixture_bytes();
+    // Extensions block length (u16 BE at 112, walked: 9 hdr + 2 ver +
+    // 32 random + 1 sid_len + 32 sid + 2 cs_len + 32 ciphers + 1 comp_len
+    // + 1 comp): blow it up past the remaining slice.
+    hello[112] = 0xFF;
+    hello[113] = 0xFF;
+    assert_eq!(probe(&hello), None);
+    // Same for the session-id length: valid header, sid claims 255 bytes
+    // where only 32 remain inside the handshake body.
+    let mut hello = fixture_bytes();
+    hello[43] = 0xFF;
+    assert_eq!(probe(&hello), None);
 }
 
 #[test]
@@ -124,8 +170,7 @@ fn oversized_slice_returns_none_early() {
 #[test]
 fn tls_record_wrong_version_returns_none() {
     let mut hello = fixture_bytes();
-    hello[2] = 0x00; // 0x0300 → wait, that's SSLv3 < 0x0301... use 0x0200
-    hello[1] = 0x02;
+    hello[1] = 0x02; // record version 0x0200 < 0x0301
     assert_eq!(probe(&hello), None);
 }
 
