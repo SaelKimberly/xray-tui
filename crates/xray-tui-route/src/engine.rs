@@ -402,6 +402,12 @@ impl Engine {
 ///   ALSO counts failed=true — breakdown probing measures reachability.
 /// - Resolver failures degrade silently per-connection (no Decision-level
 ///   error branch).
+///
+/// Interpretation note: probing is additionally gated on
+/// [`Engine::needs_sniff`] — a rule set declaring no `Protocol` item never
+/// spends the payload, so `meta.sniffed`/`meta.sni_host` stay `None` there
+/// and `DecisionApplied.sni` is `None`. Only rule sets that declare the
+/// intent to sniff get enrichment.
 pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
     // Sniff enrichment runs once per connection before the first pass: a
     // Protocol item in any rule means declared intent to look at payload.
@@ -411,10 +417,7 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
         && let Some(result) = sniff::probe(prefix)
     {
         meta.sni_host = result.host;
-        meta.sniffed = Some(match result.protocol {
-            sniff::SniffedProtocol::Tls => SniffedProtocol::Tls,
-            sniff::SniffedProtocol::Http => SniffedProtocol::Http,
-        });
+        meta.sniffed = Some(result.protocol.into());
     }
 
     let mut resolved_this_call = false;
@@ -437,10 +440,11 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
         let Some(resolver) = &engine.resolver else {
             break;
         };
-        let NetHost::Domain(host) = &meta.target.host else {
-            unreachable!("guarded above");
+        let host = match &meta.target.host {
+            NetHost::Domain(d) => d.clone(),
+            // Guarded above: only a domain target reaches the resolve pass.
+            NetHost::Ip(_) => break,
         };
-        let host = host.clone();
 
         // Cache-first: a fresh entry satisfies the pass without the sink.
         let now = jiff::Timestamp::now();
@@ -452,15 +456,18 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
             Some(ips) => Ok(ips),
             None => resolver.lookup_ip(host.clone()).await,
         };
-
-        // Success emits Resolved first; then ProbeTracker bookkeeping — the
-        // resolved host may itself be a probe target. Reachability
-        // semantics: empty-Ok and Err are both failure.
+        // Success emits Resolved first, fills the TTL cache (failures stay
+        // uncached), then ProbeTracker bookkeeping — the resolved host may
+        // itself be a probe target. Reachability semantics: empty-Ok and
+        // Err are both failure.
         if let Ok(ips) = &outcome
             && !ips.is_empty()
         {
             engine.emit_resolved(&host, ips);
             meta.resolved_host_ips.clone_from(ips);
+            if let Some(cache) = &engine.resolve_cache {
+                cache.lock().put(host.clone(), ips.clone(), now);
+            }
         }
         let failed = outcome.as_ref().map_or(true, std::vec::Vec::is_empty);
         engine.probe_tracker.lock().update(

@@ -14,6 +14,15 @@ pub enum SniffedProtocol {
     Http,
 }
 
+impl From<SniffedProtocol> for crate::ir::SniffedProtocol {
+    fn from(p: SniffedProtocol) -> Self {
+        match p {
+            SniffedProtocol::Tls => Self::Tls,
+            SniffedProtocol::Http => Self::Http,
+        }
+    }
+}
+
 /// Sniff outcome: protocol plus the host carried on the wire, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniffResult {

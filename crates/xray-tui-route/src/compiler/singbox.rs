@@ -241,11 +241,9 @@ fn check_rule(
     if obj.contains_key("dns-router") {
         return Err(RouteError::Unsupported("dns-router action awaits T9+"));
     }
-    if obj
-        .get("invert")
-        .and_then(Value::as_bool)
-        .is_some_and(|b| !b)
-    {
+    // `invert` is valid only as a JSON boolean; `invert: false` (common in
+    // real configs) compiles non-negated, a non-bool value is a Parse error.
+    if obj.get("invert").is_some_and(|v| v.as_bool().is_none()) {
         return Err(RouteError::Parse {
             rule_index: i,
             field: "invert",
@@ -1023,6 +1021,17 @@ mod tests {
     }
 
     #[test]
+    fn missing_action_is_parse_error() {
+        // Dispatch ruling: action missing ⇒ Parse error.
+        err_at(r#"{"route":{"rules":[{"domain_suffix":[".x.com"]}]}}"#, 0);
+    }
+
+    #[test]
+    fn route_action_without_outbound_is_parse_error() {
+        err_at(r#"{"route":{"rules":[{"action":"route"}]}}"#, 0);
+    }
+
+    #[test]
     fn unknown_action_is_unsupported() {
         let txt = r#"{"route":{"rules":[{"domain_suffix":[".x.com"],"action":"sniff"}]}}"#;
         assert!(matches!(
@@ -1049,7 +1058,6 @@ mod tests {
     fn invert_compiles_to_genuine_cond_invert() {
         let txt = r#"{"route":{"rules":[{"domain_suffix":[".x.com"],"invert":true,"action":"route","outbound":"o"}]}}"#;
         let out = compile_singbox(txt).unwrap();
-        assert_eq!(out.ruleset.rules.len(), 1);
         assert!(
             matches!(out.ruleset.rules[0].cond, Cond::Invert(_)),
             "flat invert:true wraps the rule condition in Cond::Invert"
@@ -1078,6 +1086,53 @@ mod tests {
         assert!(
             matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if tag == "o")
         );
+    }
+
+    #[test]
+    fn invert_false_compiles_without_invert_wrap() {
+        // `invert: false` is valid upstream (real configs carry it) and must
+        // compile to the child condition unwrapped.
+        let txt = r#"{"route":{"rules":[{"domain_suffix":[".x.com"],"invert":false,"action":"route","outbound":"o"}]}}"#;
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!("invert:false must NOT wrap in Cond::Invert")
+        };
+        assert_eq!(items.len(), 1);
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port: 443,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(
+            matches!(engine.decide(&meta("sub.x.com")), Decision::Route { tag, .. } if tag == "o")
+        );
+    }
+
+    #[test]
+    fn non_bool_invert_is_parse_error() {
+        // `invert: "yes"` is a type error upstream: positional Parse, never
+        // silently compiled non-negated.
+        let txt = r#"{"route":{"rules":[{"domain_suffix":[".x.com"],"invert":"yes","action":"route","outbound":"o"}]}}"#;
+        match compile_singbox(txt) {
+            Err(RouteError::Parse {
+                rule_index, field, ..
+            }) => {
+                assert_eq!(rule_index, 0);
+                assert_eq!(field, "invert");
+            }
+            other => panic!("non-bool invert must Parse, got {other:?}"),
+        }
     }
 
     #[test]

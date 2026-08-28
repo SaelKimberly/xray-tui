@@ -387,3 +387,67 @@ async fn invert_ip_rule_decides_first_pass_resolution_not_consumed() {
     );
     assert!(m.resolved_host_ips.is_empty());
 }
+
+#[tokio::test]
+async fn pre_sniffed_meta_is_not_reprobed() {
+    // Idempotence: `sniffed` already set ⇒ the payload is never probed and
+    // `sni_host` keeps the caller's value (here: None, proving no overwrite).
+    let fixture = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/tls_hello_chrome.bin"
+    ))
+    .expect("tls fixture present");
+    let set = if_non_match_set(
+        vec![Rule {
+            name: None,
+            cond: Cond::All(vec![MatchItem::Protocol(SniffedProtocol::Tls)]),
+            action: Action::Route {
+                tag: "tls-out".to_owned(),
+                override_addr: None,
+            },
+        }],
+        vec![],
+    );
+    let engine = Engine::build(set).unwrap();
+
+    let mut m = meta("1.2.3.4", 443);
+    m.payload_prefix = Some(fixture);
+    m.sniffed = Some(SniffedProtocol::Dns); // caller-pre-populated
+    let d = decide_async(&engine, &mut m).await;
+    // Protocol(Tls) evaluates against the PRE-EXISTING sniffed value, not
+    // a fresh probe of the TLS payload.
+    assert!(
+        matches!(d, Decision::Route { ref tag, .. } if tag == "direct"),
+        "no re-probe: pre-set sniffed (Dns) does not satisfy Protocol(Tls): {d:?}"
+    );
+    assert_eq!(m.sniffed, Some(SniffedProtocol::Dns), "sniffed untouched");
+    assert_eq!(m.sni_host, None, "sni_host never overwritten");
+}
+
+#[tokio::test]
+async fn second_connection_hits_resolve_cache_without_sink() {
+    // Conn 1 resolves via the sink and populates the TTL cache; conn 2 for
+    // the SAME host must be served from the cache — zero sink traffic.
+    let sink = seq_sink(vec![Ok(vec![
+        "93.184.216.34".parse::<std::net::IpAddr>().unwrap(),
+    ])]);
+    let engine = Engine::build(if_non_match_set(
+        vec![ip_rule("93.184.0.0/16", "example")],
+        vec![],
+    ))
+    .unwrap()
+    .with_resolver(sink.clone());
+
+    let mut m1 = meta("example.com", 443);
+    let d1 = decide_async(&engine, &mut m1).await;
+    assert!(matches!(d1, Decision::Route { ref tag, .. } if tag == "example"));
+    assert!(sink.results.lock().is_empty(), "first lookup drains queue");
+
+    let mut m2 = meta("example.com", 443);
+    let d2 = decide_async(&engine, &mut m2).await;
+    assert!(matches!(d2, Decision::Route { ref tag, .. } if tag == "example"));
+    assert_eq!(
+        m2.resolved_host_ips, m1.resolved_host_ips,
+        "cache hit supplies the same ips"
+    );
+}
