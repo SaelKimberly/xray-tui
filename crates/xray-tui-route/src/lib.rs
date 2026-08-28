@@ -10,6 +10,7 @@ pub mod events;
 pub mod ir;
 pub mod matchers;
 pub mod resolve;
+pub mod sniff;
 
 pub use addr::{Cidr, NetAddr, NetHost, PortRange};
 pub use compiler::{CompileOutput, compile_singbox, compile_xray};
@@ -19,3 +20,4 @@ pub use engine::{ConnMeta, Decision, Engine};
 pub use error::RouteError;
 pub use events::RouteEvent;
 pub use resolve::{DnsSink, ProbeTracker, ResolvedCache};
+pub use sniff::{SniffResult, SniffedProtocol, probe};
