@@ -1,5 +1,4 @@
 // Shared test fixtures for the routing-engine integration tests.
-#![allow(dead_code)]
 
 use parking_lot::Mutex;
 use std::{future::Future, pin::Pin};
@@ -26,4 +25,3 @@ impl DnsSink for SeqSink {
         Box::pin(async move { r })
     }
 }
-

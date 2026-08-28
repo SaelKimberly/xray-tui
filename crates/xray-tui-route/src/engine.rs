@@ -3,8 +3,10 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
+
+use parking_lot::Mutex;
 
 use crate::{
     addr::{NetAddr, NetHost, PortRange},
@@ -12,6 +14,8 @@ use crate::{
     events::RouteEvent,
     ir::{Action, Cond, DefaultRoute, NetworkMask, SniffedProtocol},
     matchers::{CidrSet, CidrSetBuilder, CompiledDomain, DomainRulesSpec},
+    resolve::{DnsSink, ProbeTracker, ResolvedCache},
+    sniff,
 };
 
 /// Metadata describing one connection to route.
@@ -30,6 +34,9 @@ pub struct ConnMeta {
     pub payload_prefix: Option<Vec<u8>>,
     /// Application protocol detected by sniffing, when available.
     pub sniffed: Option<SniffedProtocol>,
+    /// SNI host carried on the wire, stashed by the sniff-enrichment pass
+    /// (`decide_async`); the sync path only reads it.
+    pub sni_host: Option<String>,
     /// Filled by the `IfNonMatch` pass or pre-seeded by the caller.
     pub resolved_host_ips: Vec<IpAddr>,
 }
@@ -139,6 +146,12 @@ impl ItemMatcher {
             Self::OutboundTag => false,
         }
     }
+
+    /// True for matchers whose outcome can change once destination/source
+    /// IPs become known (used by [`Engine::needs_resolve`]).
+    const fn is_ip_bearing(&self) -> bool {
+        matches!(self, Self::IpCidr { .. } | Self::SourceIpCidr { .. })
+    }
 }
 
 /// CIDR or private-range membership for one candidate IP.
@@ -224,15 +237,35 @@ impl CompiledCond {
             Self::Invert(inner) => !inner.eval(meta),
         }
     }
+
+    /// Visits every leaf matcher in the tree, recursing through
+    /// `Any`/`Invert`. Short-circuits (stops) when `f` returns true.
+    fn walk_items(&self, f: &mut impl FnMut(&ItemMatcher) -> bool) -> bool {
+        match self {
+            Self::All(items) => items.iter().any(f),
+            Self::Any(children) => children.iter().any(|c| c.walk_items(f)),
+            Self::Invert(inner) => inner.walk_items(f),
+        }
+    }
 }
 
 /// First-match flat-rule routing engine.
 pub struct Engine {
     rules: Vec<CompiledRule>,
     default_route: DefaultRoute,
-    #[allow(dead_code)] // consulted by IfNonMatch resolution wiring (Task 9+)
     resolve_strategy: crate::ir::ResolveStrategy,
     event_sink: Option<tokio::sync::mpsc::UnboundedSender<RouteEvent>>,
+    /// DNS seam installed via [`Engine::with_resolver`]; absent ⇒ no
+    /// resolution ever happens.
+    resolver: Option<Arc<dyn DnsSink>>,
+    /// TTL cache fronting `resolver`; present iff `resolver` is. Fixed
+    /// 300-second TTL: `RuleSet` carries no TTL field this task.
+    resolve_cache: Option<Arc<Mutex<ResolvedCache>>>,
+    /// Consecutive-failure streaks for `probes`; emits
+    /// Breakdown/Recovered events per resolve attempt.
+    probe_tracker: Mutex<ProbeTracker>,
+    /// Probe hostnames from the rule set, consulted per resolve attempt.
+    probes: Vec<String>,
 }
 
 impl Engine {
@@ -261,26 +294,60 @@ impl Engine {
             default_route: rs.default,
             resolve_strategy: rs.resolve_strategy,
             event_sink: None,
+            resolver: None,
+            resolve_cache: None,
+            probe_tracker: Mutex::new(ProbeTracker::default()),
+            probes: rs.probes,
         })
     }
-
-    /// Synchronous pure evaluation against [`ConnMeta`]: first rule whose
-    /// every `Cond::All` item holds wins; otherwise the rule-set default.
+    /// Synchronous pure evaluation against [`ConnMeta`]: first matching
+    /// rule wins; otherwise the rule-set default.
     ///
-    /// No DNS resolution, sniffing side effects, or I/O happens here; `meta`
-    /// is reserved mutable for the Task 12 integration (DNS/SNI enrichment
-    /// pass mutates `resolved_host_ips`/`sniffed`; this allow must be removed
-    /// there once that lands).
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    pub fn decide(&self, meta: &mut ConnMeta) -> Decision {
+    /// Read-only: no DNS resolution, no sniffing side effects, no I/O. A
+    /// `Protocol` item evaluates false unless `meta.sniffed` is already
+    /// populated; IP items see only the literal target and whatever the
+    /// caller pre-seeded into `resolved_host_ips` / `source_resolved_ips`.
+    /// Use [`decide_async`] for lazy sniff/resolve enrichment.
+    pub fn decide(&self, meta: &ConnMeta) -> Decision {
         if let Some(rule) = self.rules.iter().find(|rule| rule.matches(meta)) {
             let decision = Decision::from(&rule.action);
-            self.emit_decision(&decision, rule.name.as_deref());
+            self.emit_decision(&decision, rule.name.as_deref(), meta.sni_host.as_deref());
             return decision;
         }
         let decision = Decision::from(&self.default_route);
-        self.emit_decision(&decision, None);
+        self.emit_decision(&decision, None, meta.sni_host.as_deref());
         decision
+    }
+
+    /// Installs the DNS seam and enables lazy `IfNonMatch` resolution +
+    /// probe tracking. A TTL [`ResolvedCache`] (fixed 300 s — the rule set
+    /// carries no TTL field) fronts the sink.
+    #[must_use]
+    pub fn with_resolver(mut self, sink: Arc<dyn DnsSink>) -> Self {
+        self.resolver = Some(sink);
+        self.resolve_cache = Some(Arc::new(Mutex::new(ResolvedCache::new(300))));
+        self
+    }
+
+    /// True when any rule carries a `Protocol` item needing
+    /// `payload_prefix` sniffing.
+    #[must_use]
+    pub fn needs_sniff(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.cond
+                .walk_items(&mut |m| matches!(m, ItemMatcher::Protocol(_)))
+        })
+    }
+
+    /// True when strategy == `IfNonMatch` OR any `IpCidr`/`SourceIpCidr`
+    /// leaf could need target/source resolution.
+    #[must_use]
+    pub fn needs_resolve(&self) -> bool {
+        self.resolve_strategy == crate::ir::ResolveStrategy::IfNonMatch
+            || self
+                .rules
+                .iter()
+                .any(|rule| rule.cond.walk_items(&mut |m| m.is_ip_bearing()))
     }
 
     /// Registers a sink receiving events after terminal decisions.
@@ -291,7 +358,7 @@ impl Engine {
     /// Emits `DecisionApplied` when a sink is registered; drops on send error
     /// (a closed receiver must never fail routing). Tag extraction happens
     /// only here so the sink-less hot path clones nothing.
-    fn emit_decision(&self, decision: &Decision, rule_name: Option<&str>) {
+    fn emit_decision(&self, decision: &Decision, rule_name: Option<&str>, sni: Option<&str>) {
         let Some(tx) = &self.event_sink else { return };
         let tag = match decision {
             Decision::Route { tag, .. } => Some(tag.clone()),
@@ -300,10 +367,116 @@ impl Engine {
         let _ = tx.send(RouteEvent::DecisionApplied {
             rule_name: rule_name.map(str::to_owned),
             tag,
-            sni: None,
+            sni: sni.map(str::to_owned),
             at: jiff::Timestamp::now(),
         });
     }
+
+    /// Emits a `Resolved` event for one successful lookup.
+    fn emit_resolved(&self, host: &str, ips: &[IpAddr]) {
+        if let Some(tx) = &self.event_sink {
+            let _ = tx.send(RouteEvent::Resolved {
+                host: host.to_owned(),
+                ips: ips.to_vec(),
+                at: jiff::Timestamp::now(),
+            });
+        }
+    }
+}
+
+/// Asynchronous enrichment pass: sniff + lazy resolve wired over an
+/// [`Engine`]'s pure [`Engine::decide`].
+///
+/// Locked semantics (plan §5 / spec):
+/// - `Protocol(item)`: if `meta.sniffed.is_none()` &&
+///   `meta.payload_prefix.is_some()` → run [`sniff::probe`] once per
+///   connection, stash protocol + SNI onto `meta`. Missing both ⇒ the item
+///   evaluates FALSE; sync [`Engine::decide`] remains fully usable sans
+///   prefix.
+/// - `IfNonMatch`: resolver Some + unresolved domain target ⇒ await resolve
+///   once, fill `resolved_host_ips`, retry the whole loop under a
+///   cycle-guard flag preventing further passes.
+/// - After EVERY resolve attempt run the [`ProbeTracker`] with combined
+///   result semantics: success only when `Ok(non-empty)`; `Ok(vec![])`
+///   (NXDOMAIN-style miss) counts failed=true; `Err(_)` (transport broke)
+///   ALSO counts failed=true — breakdown probing measures reachability.
+/// - Resolver failures degrade silently per-connection (no Decision-level
+///   error branch).
+pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
+    // Sniff enrichment runs once per connection before the first pass: a
+    // Protocol item in any rule means declared intent to look at payload.
+    if engine.needs_sniff()
+        && meta.sniffed.is_none()
+        && let Some(prefix) = meta.payload_prefix.as_deref()
+        && let Some(result) = sniff::probe(prefix)
+    {
+        meta.sni_host = result.host;
+        meta.sniffed = Some(match result.protocol {
+            sniff::SniffedProtocol::Tls => SniffedProtocol::Tls,
+            sniff::SniffedProtocol::Http => SniffedProtocol::Http,
+        });
+    }
+
+    let mut resolved_this_call = false;
+    loop {
+        if let Some(rule) = engine.rules.iter().find(|rule| rule.matches(meta)) {
+            let decision = Decision::from(&rule.action);
+            engine.emit_decision(&decision, rule.name.as_deref(), meta.sni_host.as_deref());
+            return decision;
+        }
+        // IfNonMatch retry: only when nothing matched, the target is a bare
+        // domain, a resolver is installed, and this connection has not
+        // already consumed its single resolution pass (cycle guard).
+        if resolved_this_call
+            || engine.resolve_strategy != crate::ir::ResolveStrategy::IfNonMatch
+            || !meta.resolved_host_ips.is_empty()
+            || !matches!(&meta.target.host, NetHost::Domain(_))
+        {
+            break;
+        }
+        let Some(resolver) = &engine.resolver else {
+            break;
+        };
+        let NetHost::Domain(host) = &meta.target.host else {
+            unreachable!("guarded above");
+        };
+        let host = host.clone();
+
+        // Cache-first: a fresh entry satisfies the pass without the sink.
+        let now = jiff::Timestamp::now();
+        let cached = engine
+            .resolve_cache
+            .as_ref()
+            .and_then(|c| c.lock().get_fresh(&host, now).map(<[IpAddr]>::to_vec));
+        let outcome = match cached {
+            Some(ips) => Ok(ips),
+            None => resolver.lookup_ip(host.clone()).await,
+        };
+
+        // Success emits Resolved first; then ProbeTracker bookkeeping — the
+        // resolved host may itself be a probe target. Reachability
+        // semantics: empty-Ok and Err are both failure.
+        if let Ok(ips) = &outcome
+            && !ips.is_empty()
+        {
+            engine.emit_resolved(&host, ips);
+            meta.resolved_host_ips.clone_from(ips);
+        }
+        let failed = outcome.as_ref().map_or(true, std::vec::Vec::is_empty);
+        engine.probe_tracker.lock().update(
+            &engine.probes,
+            failed,
+            Some((failed, Some(host.as_str()))),
+            &engine.event_sink,
+        );
+
+        // Errors and empty results degrade silently: nothing stashed, the
+        // loop re-evaluates once and falls through to default.
+        resolved_this_call = true;
+    }
+    let decision = Decision::from(&engine.default_route);
+    engine.emit_decision(&decision, None, meta.sni_host.as_deref());
+    decision
 }
 
 impl From<&Action> for Decision {
@@ -468,6 +641,7 @@ mod tests {
             source_resolved_ips: vec![],
             payload_prefix: None,
             sniffed: None,
+            sni_host: None,
             resolved_host_ips: vec![],
         }
     }
@@ -499,7 +673,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            e.decide(&mut meta("example.com", 80, NetworkMask::TCP)),
+            e.decide(&meta("example.com", 80, NetworkMask::TCP)),
             Decision::Route {
                 tag: "a".to_owned(),
                 override_addr: None
@@ -520,7 +694,7 @@ mod tests {
         });
         let e = Engine::build(set).unwrap();
         assert_eq!(
-            e.decide(&mut meta("example.com", 443, NetworkMask::UDP)),
+            e.decide(&meta("example.com", 443, NetworkMask::UDP)),
             Decision::Route {
                 tag: "direct".to_owned(),
                 override_addr: None
@@ -539,7 +713,7 @@ mod tests {
         )]))
         .unwrap();
         assert_eq!(
-            e.decide(&mut meta("example.org", 443, NetworkMask::TCP)),
+            e.decide(&meta("example.org", 443, NetworkMask::TCP)),
             Decision::Route {
                 tag: "direct".to_owned(),
                 override_addr: None
@@ -557,7 +731,7 @@ mod tests {
         )]))
         .unwrap();
         assert_eq!(
-            reject.decide(&mut meta("example.com", 443, NetworkMask::TCP)),
+            reject.decide(&meta("example.com", 443, NetworkMask::TCP)),
             Decision::Reject {
                 method: RejectMethod::Drop
             }
@@ -569,7 +743,7 @@ mod tests {
         )]))
         .unwrap();
         assert_eq!(
-            hijack.decide(&mut meta("dns.example.com", 53, NetworkMask::UDP)),
+            hijack.decide(&meta("dns.example.com", 53, NetworkMask::UDP)),
             Decision::HijackDns
         );
 
@@ -580,7 +754,7 @@ mod tests {
         };
         let default_reject = Engine::build(set).unwrap();
         assert_eq!(
-            default_reject.decide(&mut meta("example.com", 1234, NetworkMask::TCP)),
+            default_reject.decide(&meta("example.com", 1234, NetworkMask::TCP)),
             Decision::Reject {
                 method: RejectMethod::DefaultReply
             }
@@ -598,7 +772,7 @@ mod tests {
         let mut e = Engine::build(rules).unwrap();
         e.set_event_sink(tx);
 
-        let d = e.decide(&mut meta("block.example.net", 80, NetworkMask::TCP));
+        let d = e.decide(&meta("block.example.net", 80, NetworkMask::TCP));
         assert_eq!(
             d,
             Decision::Route {
@@ -630,7 +804,7 @@ mod tests {
     fn no_sink_means_no_event_and_decisions_still_flow() {
         let e = Engine::build(rs(vec![(MatchItem::Ports(vec![ALL_PORTS]), route("a"))])).unwrap();
         assert!(
-            e.decide(&mut meta("h.example", 1, NetworkMask::UDP))
+            e.decide(&meta("h.example", 1, NetworkMask::UDP))
                 .is_routed_to("a")
         );
     }
@@ -643,21 +817,21 @@ mod tests {
         )]))
         .unwrap();
         assert!(
-            e.decide(&mut meta("example.com", 80, NetworkMask::TCP))
+            e.decide(&meta("example.com", 80, NetworkMask::TCP))
                 .is_routed_to("d")
         );
         assert!(
-            e.decide(&mut meta("x.sub.CORP", 80, NetworkMask::TCP))
+            e.decide(&meta("x.sub.CORP", 80, NetworkMask::TCP))
                 .is_routed_to("d")
         );
         // Suffix requires a label boundary.
         assert!(
-            !e.decide(&mut meta("xfoo.com", 80, NetworkMask::TCP))
+            !e.decide(&meta("xfoo.com", 80, NetworkMask::TCP))
                 .is_routed_to("d")
         );
         // IP targets fail domain items this task (Task 12 wires enrichment).
         assert!(
-            !e.decide(&mut meta("93.184.216.34", 80, NetworkMask::TCP))
+            !e.decide(&meta("93.184.216.34", 80, NetworkMask::TCP))
                 .is_routed_to("d")
         );
     }
@@ -672,11 +846,11 @@ mod tests {
         };
         let e = Engine::build(rs(vec![(item, route("fast"))])).unwrap();
         assert!(
-            e.decide(&mut meta("img.cdn7.net", 443, NetworkMask::TCP))
+            e.decide(&meta("img.cdn7.net", 443, NetworkMask::TCP))
                 .is_routed_to("fast")
         );
         assert!(
-            !e.decide(&mut meta("plain.net", 443, NetworkMask::TCP))
+            !e.decide(&meta("plain.net", 443, NetworkMask::TCP))
                 .is_routed_to("fast")
         );
     }
@@ -695,17 +869,17 @@ mod tests {
         .unwrap();
         // Literal IP target.
         assert!(
-            e.decide(&mut meta("10.1.2.3", 8000, NetworkMask::TCP))
+            e.decide(&meta("10.1.2.3", 8000, NetworkMask::TCP))
                 .is_routed_to("lan")
         );
         assert!(
-            !e.decide(&mut meta("8.8.8.8", 8000, NetworkMask::TCP))
+            !e.decide(&meta("8.8.8.8", 8000, NetworkMask::TCP))
                 .is_routed_to("lan")
         );
         // Domain target resolved to a LAN IP counts as a hit.
         let mut m = meta("nas.home", 5000, NetworkMask::TCP);
         m.resolved_host_ips.push(IpAddr::from([10u8, 9, 9, 9]));
-        assert!(e.decide(&mut m).is_routed_to("lan"));
+        assert!(e.decide(&m).is_routed_to("lan"));
     }
 
     #[test]
@@ -720,11 +894,11 @@ mod tests {
         )]))
         .unwrap();
         assert!(
-            e.decide(&mut meta("192.168.1.5", 22, NetworkMask::TCP))
+            e.decide(&meta("192.168.1.5", 22, NetworkMask::TCP))
                 .is_routed_to("home")
         );
         assert!(
-            !e.decide(&mut meta("8.8.8.8", 22, NetworkMask::TCP))
+            !e.decide(&meta("8.8.8.8", 22, NetworkMask::TCP))
                 .is_routed_to("home")
         );
 
@@ -740,7 +914,7 @@ mod tests {
         )]))
         .unwrap();
         assert!(
-            !geo.decide(&mut meta("1.2.3.4", 80, NetworkMask::TCP))
+            !geo.decide(&meta("1.2.3.4", 80, NetworkMask::TCP))
                 .is_routed_to("cn")
         );
         // Entries survive compilation verbatim (no silent erasure): a later
@@ -777,13 +951,13 @@ mod tests {
         let e = Engine::build(rs(vec![(sp(5000), route("elevated"))])).unwrap();
         // Absent source => item false.
         assert!(
-            !e.decide(&mut meta("srv.example", 443, NetworkMask::TCP))
+            !e.decide(&meta("srv.example", 443, NetworkMask::TCP))
                 .is_routed_to("elevated")
         );
 
         let mut with_src = meta("srv.example", 443, NetworkMask::TCP);
         with_src.source = Some(SocketAddr::from(([127u8, 0, 0, 1], 5000)));
-        assert!(e.decide(&mut with_src).is_routed_to("elevated"));
+        assert!(e.decide(&with_src).is_routed_to("elevated"));
 
         // SourceIpCidr reads source_resolved_ips too.
         let sic = MatchItem::SourceIpCidr {
@@ -796,7 +970,7 @@ mod tests {
         via_resolved
             .source_resolved_ips
             .push(IpAddr::from([10u8, 77, 0, 1]));
-        assert!(e2.decide(&mut via_resolved).is_routed_to("corp-client"));
+        assert!(e2.decide(&via_resolved).is_routed_to("corp-client"));
     }
 
     #[test]
@@ -811,11 +985,11 @@ mod tests {
         )]))
         .unwrap();
         assert!(
-            both.decide(&mut meta("h", 1, NetworkMask::TCP))
+            both.decide(&meta("h", 1, NetworkMask::TCP))
                 .is_routed_to("any")
         );
         assert!(
-            both.decide(&mut meta("h", 1, NetworkMask::UDP))
+            both.decide(&meta("h", 1, NetworkMask::UDP))
                 .is_routed_to("any")
         );
 
@@ -825,7 +999,7 @@ mod tests {
             route("tcp"),
         )]))
         .unwrap();
-        let mut both_bits = meta(
+        let both_bits = meta(
             "h",
             1,
             NetworkMask {
@@ -833,7 +1007,7 @@ mod tests {
                 udp: true,
             },
         );
-        assert!(!tcp_only.decide(&mut both_bits).is_routed_to("tcp"));
+        assert!(!tcp_only.decide(&both_bits).is_routed_to("tcp"));
     }
 
     #[test]
@@ -844,15 +1018,15 @@ mod tests {
         )]))
         .unwrap();
         assert!(
-            !e.decide(&mut meta("a.b", 443, NetworkMask::TCP))
+            !e.decide(&meta("a.b", 443, NetworkMask::TCP))
                 .is_routed_to("tls-out")
         );
         let mut tls = meta("a.b", 443, NetworkMask::TCP);
         tls.sniffed = Some(crate::ir::SniffedProtocol::Tls);
-        assert!(e.decide(&mut tls).is_routed_to("tls-out"));
+        assert!(e.decide(&tls).is_routed_to("tls-out"));
         let mut dns = meta("a.b", 443, NetworkMask::TCP);
         dns.sniffed = Some(crate::ir::SniffedProtocol::Dns);
-        assert!(!e.decide(&mut dns).is_routed_to("tls-out"));
+        assert!(!e.decide(&dns).is_routed_to("tls-out"));
     }
 
     #[test]
@@ -863,10 +1037,10 @@ mod tests {
         let e = Engine::build(rs(vec![(ib, route("in"))])).unwrap();
         let mut tagged = meta("h", 1, NetworkMask::TCP);
         tagged.inbound_tag = Some("proxy-in".to_owned());
-        assert!(e.decide(&mut tagged).is_routed_to("in"));
+        assert!(e.decide(&tagged).is_routed_to("in"));
         let mut wrong = meta("h", 1, NetworkMask::TCP);
         wrong.inbound_tag = Some("other".to_owned());
-        assert!(!e.decide(&mut wrong).is_routed_to("in"));
+        assert!(!e.decide(&wrong).is_routed_to("in"));
 
         // No ConnMeta.outbound_tag field exists yet; the item never matches.
         let ob = MatchItem::OutboundTag {
@@ -874,7 +1048,7 @@ mod tests {
         };
         let e2 = Engine::build(rs(vec![(ob, route("out"))])).unwrap();
         assert!(
-            !e2.decide(&mut meta("h", 1, NetworkMask::TCP))
+            !e2.decide(&meta("h", 1, NetworkMask::TCP))
                 .is_routed_to("out")
         );
     }
@@ -942,16 +1116,16 @@ mod tests {
         // Arms are pure, so short-circuiting is an evaluation-order guarantee
         // rather than an observable side effect; first hit decides the rule.
         assert!(
-            e.decide(&mut meta("h", 80, NetworkMask::TCP))
+            e.decide(&meta("h", 80, NetworkMask::TCP))
                 .is_routed_to("any")
         );
         assert!(
-            e.decide(&mut meta("h", 443, NetworkMask::UDP))
+            e.decide(&meta("h", 443, NetworkMask::UDP))
                 .is_routed_to("any")
         );
         // No arm true => the Any is false and the rule is skipped.
         assert!(
-            !e.decide(&mut meta("h", 9000, NetworkMask::TCP))
+            !e.decide(&meta("h", 9000, NetworkMask::TCP))
                 .is_routed_to("any")
         );
     }
@@ -970,11 +1144,11 @@ mod tests {
         })
         .unwrap();
         assert!(
-            !e.decide(&mut meta("h", 80, NetworkMask::TCP))
+            !e.decide(&meta("h", 80, NetworkMask::TCP))
                 .is_routed_to("elsewhere")
         );
         assert!(
-            e.decide(&mut meta("h", 443, NetworkMask::TCP))
+            e.decide(&meta("h", 443, NetworkMask::TCP))
                 .is_routed_to("elsewhere")
         );
 
@@ -990,11 +1164,11 @@ mod tests {
         })
         .unwrap();
         assert!(
-            e2.decide(&mut meta("h", 8443, NetworkMask::TCP))
+            e2.decide(&meta("h", 8443, NetworkMask::TCP))
                 .is_routed_to("rare")
         );
         assert!(
-            !e2.decide(&mut meta("h", 443, NetworkMask::TCP))
+            !e2.decide(&meta("h", 443, NetworkMask::TCP))
                 .is_routed_to("rare")
         );
     }
@@ -1032,24 +1206,24 @@ mod tests {
         // UDP, un-sniffed: arm1 false (not tcp-80), NOT dns is true so arm2
         // true => Any true => Invert false => rule skipped.
         assert!(
-            !e.decide(&mut meta("h", 443, NetworkMask::UDP))
+            !e.decide(&meta("h", 443, NetworkMask::UDP))
                 .is_routed_to("udp")
         );
         // TCP 80: arm1 true => Any true => Invert false => skipped.
         assert!(
-            !e.decide(&mut meta("h", 80, NetworkMask::TCP))
+            !e.decide(&meta("h", 80, NetworkMask::TCP))
                 .is_routed_to("udp")
         );
         // TCP 443: arm1 false; sniffed DNS makes NOT-dns false, arm2 false
         // => Any false => Invert true => rule fires.
         let mut dns = meta("h", 443, NetworkMask::TCP);
         dns.sniffed = Some(SniffedProtocol::Dns);
-        assert!(e.decide(&mut dns).is_routed_to("udp"));
+        assert!(e.decide(&dns).is_routed_to("udp"));
         // TCP 80 WITH sniffed DNS: arm1 is already true, so the rule is
         // skipped regardless of the dns arm.
         let mut dns80 = meta("h", 80, NetworkMask::TCP);
         dns80.sniffed = Some(SniffedProtocol::Dns);
-        assert!(!e.decide(&mut dns80).is_routed_to("udp"));
+        assert!(!e.decide(&dns80).is_routed_to("udp"));
     }
 
     #[test]
@@ -1066,15 +1240,15 @@ mod tests {
         .unwrap();
         // First-match declaration order preserved.
         assert!(
-            e.decide(&mut meta("example.com", 80, NetworkMask::TCP))
+            e.decide(&meta("example.com", 80, NetworkMask::TCP))
                 .is_routed_to("a")
         );
         assert!(
-            e.decide(&mut meta("example.com", 443, NetworkMask::TCP))
+            e.decide(&meta("example.com", 443, NetworkMask::TCP))
                 .is_routed_to("b")
         );
         assert!(
-            e.decide(&mut meta("example.com", 443, NetworkMask::UDP))
+            e.decide(&meta("example.com", 443, NetworkMask::UDP))
                 .is_routed_to("direct")
         );
 
@@ -1093,15 +1267,15 @@ mod tests {
         });
         let e2 = Engine::build(set).unwrap();
         assert!(
-            e2.decide(&mut meta("h", 443, NetworkMask::TCP))
+            e2.decide(&meta("h", 443, NetworkMask::TCP))
                 .is_routed_to("tls")
         );
         assert!(
-            !e2.decide(&mut meta("h", 443, NetworkMask::UDP))
+            !e2.decide(&meta("h", 443, NetworkMask::UDP))
                 .is_routed_to("tls")
         );
         assert!(
-            !e2.decide(&mut meta("h", 80, NetworkMask::TCP))
+            !e2.decide(&meta("h", 80, NetworkMask::TCP))
                 .is_routed_to("tls")
         );
     }
@@ -1148,11 +1322,11 @@ mod tests {
         })
         .unwrap();
         assert!(
-            e.decide(&mut meta("h", 1, NetworkMask::TCP))
+            e.decide(&meta("h", 1, NetworkMask::TCP))
                 .is_routed_to("direct")
         );
         assert!(
-            e.decide(&mut meta("h", 1, NetworkMask::UDP))
+            e.decide(&meta("h", 1, NetworkMask::UDP))
                 .is_routed_to("odd")
         );
     }
@@ -1216,7 +1390,7 @@ mod tests {
         });
         let e = Engine::build(set).unwrap();
         assert!(
-            e.decide(&mut meta("anything.example", 1, NetworkMask::UDP))
+            e.decide(&meta("anything.example", 1, NetworkMask::UDP))
                 .is_routed_to("catch")
         );
     }

@@ -643,15 +643,15 @@ mod tests {
 
         let mut tls = conn("api.example.com", 443, NetworkMask::TCP);
         tls.sniffed = Some(SniffedProtocol::Tls);
-        assert!(routed_to(&engine.decide(&mut tls), "sniffed"));
+        assert!(routed_to(&engine.decide(&tls), "sniffed"));
 
         let mut dns = conn("api.example.com", 53, NetworkMask::UDP);
         dns.sniffed = Some(SniffedProtocol::Dns);
-        assert!(!routed_to(&engine.decide(&mut dns), "sniffed"));
+        assert!(!routed_to(&engine.decide(&dns), "sniffed"));
 
         // No sniff agreement at all falls through to the default route.
         assert!(!routed_to(
-            &engine.decide(&mut conn("api.example.com", 443, NetworkMask::TCP)),
+            &engine.decide(&conn("api.example.com", 443, NetworkMask::TCP)),
             "sniffed"
         ));
     }
@@ -688,6 +688,7 @@ mod tests {
             source_resolved_ips: vec![],
             payload_prefix: None,
             sniffed: None,
+            sni_host: None,
             resolved_host_ips: vec![],
         }
     }

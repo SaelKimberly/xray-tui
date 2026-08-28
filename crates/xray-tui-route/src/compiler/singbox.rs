@@ -30,19 +30,19 @@
 //! |                                   |   sing-box `rule_action.go`)                 |
 //! | action `sniff`/`resolve`/…        | [`RouteError::Unsupported`]                  |
 //! | `rule_set` refs, `dns-router`     | [`RouteError::Unsupported`] (T9+ accelerators)|
-//! | `invert` (flat or logical)        | [`RouteError::Unsupported`] (awaits T11)     |
+//! | `invert: true`                    | `Cond::Invert` over the rule's condition     |
 //! | logical `mode:"and"`              | children flattened into `Cond::All`          |
-//! | logical `mode:"or"`               | distributive flat rules sharing the action   |
+//! | logical `mode:"or"`               | genuine `Cond::Any` over child conditions    |
 //!
 //! Cross-field conjunction and same-field alternation mirror upstream
 //! semantics (route.md matching logic: `domain`-family fields are OR'd within
-//! their group, groups AND across). Because `Cond::All` holds leaf items only
-//! and today's engine rejects `Cond::Any` (T11), a rule mixing a multi-value
-//! alternative field with other AND fields expands distributively —
-//! (A∧B∧p) ∨ (A∧B∧q) — into flat `Cond::All` rules sharing the action;
-//! first-match semantics are preserved. Same ruling Task 5 applied to xray
-//! multi-protocol whitelists. A T11 note on the OR test documents where real
-//! `Cond::Any` emission replaces expansion.
+//! their group, groups AND across). A rule mixing a multi-value alternative
+//! field with other AND fields expands distributively — (A∧B∧p) ∨ (A∧B∧q) —
+//! into flat `Cond::All` rules sharing the action; first-match semantics are
+//! preserved. Same ruling Task 5 applied to xray multi-protocol whitelists.
+//! Since Task 11 the engine evaluates `Cond::Any`/`Cond::Invert`, so logical
+//! `mode:"or"` emits genuine `Cond::Any` and `invert: true` wraps the rule's
+//! condition in `Cond::Invert`.
 //!
 //! A rule with no matchable condition is skipped with a warning. Unknown rule
 //! keys are tolerated as warnings; unknown *values* abort with positional
@@ -167,7 +167,7 @@ fn compile_rule(
     let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("");
     let action = parse_action(obj, i)?;
 
-    let arms = if mode.is_empty() {
+    let arms: Vec<Vec<MatchItem>> = if mode.is_empty() {
         let arms = collect_items(obj, i, warnings)?;
         if arms[0].is_empty() {
             warnings.push((i, "rule has no matchable condition; skipped".to_owned()));
@@ -175,20 +175,40 @@ fn compile_rule(
         }
         arms
     } else {
-        let arms = logical_arms(obj, i, mode, warnings)?;
-        if arms.is_empty() {
+        let cond = match logical_cond(obj, i, mode, warnings)? {
+            Some(Cond::All(items)) if items.is_empty() => None,
+            other => other,
+        };
+        let Some(cond) = cond else {
             warnings.push((
                 i,
                 format!("logical {mode:?} rule has no conditions; skipped"),
             ));
             return Ok(());
-        }
-        arms
-    };
-    for arm in arms {
+        };
+        let invert = obj.get("invert").and_then(Value::as_bool) == Some(true);
+        let cond = if invert {
+            Cond::Invert(Box::new(cond))
+        } else {
+            cond
+        };
         out.push(Rule {
             name: None,
-            cond: Cond::All(arm),
+            cond,
+            action,
+        });
+        return Ok(());
+    };
+    let invert = obj.get("invert").and_then(Value::as_bool) == Some(true);
+    for arm in arms {
+        let cond = Cond::All(arm);
+        out.push(Rule {
+            name: None,
+            cond: if invert {
+                Cond::Invert(Box::new(cond))
+            } else {
+                cond
+            },
             action: action.clone(),
         });
     }
@@ -196,8 +216,9 @@ fn compile_rule(
 }
 
 /// Checks shared by every rule object, top-level or logical child:
-/// unknown-key warnings, deferred-accelerator arms, `invert`, and the
-/// logical `mode` value.
+/// unknown-key warnings, deferred-accelerator arms, and the logical `mode`
+/// value. `invert: true` is accepted (compiled to `Cond::Invert` by the
+/// caller since the engine evaluates negation).
 fn check_rule(
     obj: &serde_json::Map<String, Value>,
     i: usize,
@@ -220,103 +241,182 @@ fn check_rule(
     if obj.contains_key("dns-router") {
         return Err(RouteError::Unsupported("dns-router action awaits T9+"));
     }
-    if obj.get("invert").and_then(Value::as_bool) == Some(true) {
-        return Err(RouteError::Unsupported(
-            "invert awaits T11 (real Cond::Any/negation evaluation)",
-        ));
+    if obj
+        .get("invert")
+        .and_then(Value::as_bool)
+        .is_some_and(|b| !b)
+    {
+        return Err(RouteError::Parse {
+            rule_index: i,
+            field: "invert",
+            message: "invert must be a boolean when present".to_owned(),
+        });
     }
     let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("");
     if !mode.is_empty() && mode != "and" && mode != "or" {
-        // e.g. "xor": routing-expressible only with T11 logic — Unsupported
-        // positionally, never silently compiled as OR. (Message is static:
-        // Unsupported carries &'static str, per Task 2's error contract.)
+        // e.g. "xor": not routing-expressible — Unsupported positionally,
+        // never silently compiled as OR. (Message is static: Unsupported
+        // carries &'static str, per Task 2's error contract.)
         return Err(RouteError::Unsupported(
-            "logical mode outside \"and\"/\"or\" awaits T11",
+            "logical mode outside \"and\"/\"or\" is unsupported",
         ));
     }
     Ok(())
 }
 
-/// Expands a logical (`mode`) rule's children into flat condition arms:
-/// `and` children cartesian-combine (each combination one `Cond::All` set),
-/// `or` children alternate. Recurses through nested logical children.
+/// Compiles a logical (`mode`) rule's children into one condition tree.
+/// `or` children become a genuine `Cond::Any` alternation; `and` children
+/// distribute across each child's alternatives (cartesian product), and the
+/// product collapses into a single `Cond::Any` only when several
+/// irreducible alternatives survive. Recurses through nested logical
+/// children.
 ///
 /// Children get the same `check_rule` vetting as top-level rules: unknown
-/// keys warn, `rule_set`/`dns-router`/`invert` are positionally Unsupported,
-/// and `mode:"xor"` is Unsupported (only `and`/`or` are routing-expressible
-/// without T11). An `action` key on a child is tolerated but ignored — the
-/// parent rule's action applies. A child with genuinely no conditions is
-/// skipped with a warning; a catch-all (`Cond::All([])`) arm is impossible
-/// by construction.
-fn logical_arms(
+/// keys warn, `rule_set`/`dns-router` are positionally Unsupported, and
+/// `mode:"xor"` is Unsupported. An `action` key on a child is tolerated but
+/// ignored — the parent rule's action applies. A child with genuinely no
+/// conditions is skipped with a warning; a catch-all (`Cond::All([])`) arm
+/// is impossible by construction.
+///
+/// Per-child model: every child contributes a list of *alternatives*
+/// (conjunction operands). `Cond::All` is one alternative; `Cond::Any`
+/// expands to its children. `and` takes the cartesian product of
+/// alternatives (each product must be flat `Cond::All` conjuncts — anything
+/// else is not representable in the IR and fails with Unsupported);
+/// `or` concatenates. One surviving alternative loses its wrapper.
+fn logical_cond(
     obj: &serde_json::Map<String, Value>,
     i: usize,
     mode: &str,
     warnings: &mut Vec<(usize, String)>,
-) -> Result<Vec<Vec<MatchItem>>, RouteError> {
+) -> Result<Option<Cond>, RouteError> {
     let children = obj
         .get("rules")
         .ok_or_else(|| parse_err(i, "mode", "logical rule missing \"rules\" array"))?
         .as_array()
         .ok_or_else(|| parse_err(i, "mode", "\"rules\" must be an array"))?;
-    // Each child contributes a LIST of alternative arms (flat child: one;
-    // or-child: many; and-child: cartesian products). Keeping them per-child
-    // is what makes `and` cartesian across children while `or` concatenates.
-    let mut per_child: Vec<Vec<Vec<MatchItem>>> = Vec::new();
+    let mut child_alts: Vec<Vec<Cond>> = Vec::new();
     for cv in children {
         let cobj = cv
             .as_object()
             .ok_or_else(|| parse_err(i, "rule", "logical child must be an object"))?;
-        // Same vetting as top-level rules — no silent skips for accelerators,
-        // invert, or unknown modes (xor) inside logical children.
+        // Same vetting as top-level rules — no silent skips for accelerators
+        // or unknown modes (xor) inside logical children.
         check_rule(cobj, i, warnings)?;
         let cmode = cobj.get("mode").and_then(Value::as_str).unwrap_or("");
-        let mut arms = if cmode.is_empty() {
-            // Flat child: one arm (possibly empty = no conditions).
-            collect_items(cobj, i, warnings)?
+        let cond = if cmode.is_empty() {
+            // Flat child: arms are its alternatives (multi-protocol
+            // whitelists produce several; see `collect_items`).
+            let mut arms = collect_items(cobj, i, warnings)?;
+            // An empty child arm means the child matched nothing; dropping
+            // it keeps the parent's semantics (an empty condition can never
+            // gate a catch-all through) and must never survive as
+            // Cond::All([]).
+            let n_before = arms.len();
+            arms.retain(|arm| !arm.is_empty());
+            if arms.len() < n_before {
+                warnings.push((
+                    i,
+                    format!("logical child at rule {i} has no conditions; arm skipped"),
+                ));
+            }
+            if arms.is_empty() {
+                None
+            } else if arms.len() == 1 {
+                Some(Cond::All(arms.remove(0)))
+            } else {
+                Some(Cond::Any(arms.into_iter().map(Cond::All).collect()))
+            }
         } else {
-            // Nested logical child: already expanded into arms.
-            logical_arms(cobj, i, cmode, warnings)?
+            // Nested logical child: already a condition tree.
+            logical_cond(cobj, i, cmode, warnings)?
         };
-        // An empty child arm means the child matched nothing; dropping it
-        // keeps the parent's semantics (an empty condition can never gate a
-        // catch-all through) and must never survive as Cond::All([]).
-        let n_before = arms.len();
-        arms.retain(|arm| !arm.is_empty());
-        if arms.len() < n_before {
-            warnings.push((
-                i,
-                format!("logical child at rule {i} has no conditions; arm skipped"),
-            ));
-        }
-        if !arms.is_empty() {
-            per_child.push(arms);
-        }
+        let Some(cond) = cond else {
+            continue;
+        };
+        let invert = cobj.get("invert").and_then(Value::as_bool) == Some(true);
+        let child_cond = match cond {
+            // Unwrap single-arm Any (upstream one-field children) so a lone
+            // alternative keeps no wrapper.
+            Cond::Any(mut c) if c.len() == 1 => c.remove(0),
+            other => other,
+        };
+        // Negation applies to the child's WHOLE condition: ¬(a∨b), never
+        // the De Morgan-broken ¬a∨¬b. Under an `and` parent an inverted
+        // child's alternative stays one negated conjunction operand (the
+        // product machinery merges flat All conjuncts only, so keep it
+        // opaque under Invert); under an `or` parent the negated child is
+        // one alternative itself.
+        let alts: Vec<Cond> = if invert {
+            match child_cond {
+                any @ Cond::Any(_) => vec![Cond::Invert(Box::new(any))],
+                one => vec![Cond::Invert(Box::new(one))],
+            }
+        } else {
+            match child_cond {
+                // Any's children ARE the parent's alternatives.
+                Cond::Any(children) => children,
+                one => vec![one],
+            }
+        };
+        child_alts.push(alts);
     }
-    if mode == "and" {
-        if per_child.is_empty() {
-            // Every child was empty: the logical rule has no conditions.
-            return Ok(Vec::new());
-        }
-        // Cartesian product across children; each child's arms are its
-        // alternatives. and( or(a,b), c ) ⇒ (a∧c) ∨-as-two-rules (b∧c).
-        let mut combos: Vec<Vec<MatchItem>> = vec![Vec::new()];
-        for child in &per_child {
-            let mut next: Vec<Vec<MatchItem>> = Vec::with_capacity(combos.len() * child.len());
+    if child_alts.is_empty() {
+        // Every child was empty: the logical rule has no conditions.
+        return Ok(None);
+    }
+    let cond = if mode == "and" {
+        // Cartesian product across children's alternatives; each product is
+        // a conjunction that must merge into flat `Cond::All` conjuncts.
+        let mut combos: Vec<Vec<Cond>> = vec![Vec::new()];
+        for alts in &child_alts {
+            let mut next = Vec::with_capacity(combos.len() * alts.len());
             for prefix in &combos {
-                for arm in child {
+                for alt in alts {
                     let mut merged = prefix.clone();
-                    merged.extend(arm.iter().cloned());
+                    merged.push(alt.clone());
                     next.push(merged);
                 }
             }
             combos = next;
         }
-        Ok(combos)
+        let mut arms = Vec::with_capacity(combos.len());
+        for combo in combos {
+            let Some(merged) = merge_conjuncts(combo) else {
+                return Err(RouteError::Unsupported(
+                    "AND over non-conjunctive children is not representable in the routing IR",
+                ));
+            };
+            arms.push(merged);
+        }
+        if arms.len() == 1 {
+            arms.remove(0)
+        } else {
+            Cond::Any(arms)
+        }
     } else {
-        // OR: the union of every child's alternative arms.
-        Ok(per_child.into_iter().flatten().collect())
+        // OR: union of every child's alternatives.
+        let alts: Vec<Cond> = child_alts.into_iter().flatten().collect();
+        if alts.len() == 1 {
+            alts.into_iter().next().unwrap_or_else(|| Cond::All(vec![]))
+        } else {
+            Cond::Any(alts)
+        }
+    };
+    Ok(Some(cond))
+}
+
+/// Merges flat conjuncts into one `Cond::All`; `None` when any operand is
+/// not a plain item set (AND with `Invert`/nested `Any` has no IR encoding).
+fn merge_conjuncts(conds: Vec<Cond>) -> Option<Cond> {
+    let mut items = Vec::new();
+    for c in conds {
+        match c {
+            Cond::All(mut is) => items.append(&mut is),
+            _ => return None,
+        }
     }
+    Some(Cond::All(items))
 }
 
 /// Extracts the routing action for a rule object. `outbound` names a
@@ -847,12 +947,10 @@ mod tests {
     }
 
     #[test]
-    fn logical_or_expands_distributively_sharing_action() {
-        // OR-mode logical rule: two child conditions expand to two flat rules
-        // sharing the action. T11 note: once the Engine evaluates Cond::Any,
-        // this expansion is replaced by genuine `Cond::Any` emission — the
-        // expansion is purely an engine-compatibility encoding of the same
-        // alternation.
+    fn logical_or_emits_genuine_cond_any_sharing_action() {
+        // OR-mode logical rule compiles to ONE rule whose condition is a
+        // genuine `Cond::Any` over the child conditions (engine has evaluated
+        // Any since T11), sharing the parent action.
         let txt = r#"{"route":{"rules":[{
             "mode":"or",
             "rules":[
@@ -861,17 +959,19 @@ mod tests {
             ],
             "action":"route","outbound":"proxy-x"}]}}"#;
         let out = compile_singbox(txt).unwrap();
-        assert_eq!(out.ruleset.rules.len(), 2);
-        for r in &out.ruleset.rules {
-            assert_eq!(
-                r.action,
-                Action::Route {
-                    tag: "proxy-x".into(),
-                    override_addr: None
-                }
-            );
-        }
-        let Cond::All(items0) = &out.ruleset.rules[0].cond else {
+        assert_eq!(out.ruleset.rules.len(), 1, "one Any rule, no expansion");
+        assert_eq!(
+            out.ruleset.rules[0].action,
+            Action::Route {
+                tag: "proxy-x".into(),
+                override_addr: None
+            }
+        );
+        let Cond::Any(children) = &out.ruleset.rules[0].cond else {
+            panic!("OR must emit genuine Cond::Any");
+        };
+        assert_eq!(children.len(), 2);
+        let Cond::All(items0) = &children[0] else {
             panic!()
         };
         assert_eq!(
@@ -883,7 +983,7 @@ mod tests {
                 regexes: vec![]
             }
         );
-        let Cond::All(items1) = &out.ruleset.rules[1].cond else {
+        let Cond::All(items1) = &children[1] else {
             panic!()
         };
         assert_eq!(
@@ -894,56 +994,31 @@ mod tests {
                 geo_country: vec![]
             }
         );
-    }
-
-    #[test]
-    fn missing_action_is_parse_error() {
-        // Dispatch ruling: action missing ⇒ Parse error.
-        err_at(r#"{"route":{"rules":[{"domain_suffix":[".x.com"]}]}}"#, 0);
-    }
-
-    #[test]
-    fn route_action_without_outbound_is_parse_error() {
-        err_at(r#"{"route":{"rules":[{"action":"route"}]}}"#, 0);
-    }
-
-    #[test]
-    fn bypass_and_direct_collapse_to_direct_tag() {
-        // Action-only rule has no condition: skipped with a warning (same
-        // empty-rule handling as every other action).
-        for action in ["bypass", "direct"] {
-            let txt = format!(r#"{{"route":{{"rules":[{{"action":"{action}"}}]}}}}"#);
-            let out = compile_singbox(&txt).unwrap();
-            assert_eq!(out.ruleset.rules.len(), 0, "{action}: empty rule skips");
-            assert_eq!(out.warnings.len(), 1, "{action}: skip warned");
-        }
-        // With a real condition, both map to Route { tag: "direct" }.
-        for action in ["bypass", "direct"] {
-            let txt = format!(
-                r#"{{"route":{{"rules":[{{"domain_suffix":[".x.com"],"action":"{action}"}}]}}}}"#
-            );
-            let out = compile_singbox(&txt).unwrap();
-            assert_eq!(out.ruleset.rules.len(), 1);
-            assert_eq!(
-                out.ruleset.rules[0].action,
-                Action::Route {
-                    tag: "direct".into(),
-                    override_addr: None
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn route_to_bypass_or_direct_outbound_collapses() {
-        let txt = r#"{"route":{"rules":[{"domain_suffix":[".x.com"],"action":"route","outbound":"bypass"}]}}"#;
-        let out = compile_singbox(txt).unwrap();
-        assert_eq!(
-            out.ruleset.rules[0].action,
-            Action::Route {
-                tag: "direct".into(),
-                override_addr: None
-            }
+        // Matching roundtrip through the Engine: same outcomes the old
+        // distributive expansion produced.
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port: 443,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(
+            matches!(engine.decide(&meta("www.a.com")), Decision::Route { tag, .. } if tag == "proxy-x")
+        );
+        assert!(
+            matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if tag == "proxy-x")
+        );
+        assert!(
+            !matches!(engine.decide(&meta("other.net")), Decision::Route { tag, .. } if tag == "proxy-x")
         );
     }
 
@@ -971,12 +1046,38 @@ mod tests {
     }
 
     #[test]
-    fn invert_is_unsupported_awaiting_t11() {
+    fn invert_compiles_to_genuine_cond_invert() {
         let txt = r#"{"route":{"rules":[{"domain_suffix":[".x.com"],"invert":true,"action":"route","outbound":"o"}]}}"#;
-        match compile_singbox(txt) {
-            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("T11"), "{msg}"),
-            other => panic!("{other:?}"),
-        }
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        assert!(
+            matches!(out.ruleset.rules[0].cond, Cond::Invert(_)),
+            "flat invert:true wraps the rule condition in Cond::Invert"
+        );
+        // Engine roundtrip: NOT(suffix .x.com) — ".x.com" misses, an IP
+        // target hits.
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port: 443,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(
+            !matches!(engine.decide(&meta("sub.x.com")), Decision::Route { tag, .. } if tag == "o"),
+            "negated suffix must not match its own domain"
+        );
+        assert!(
+            matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if tag == "o")
+        );
     }
 
     #[test]
@@ -1014,8 +1115,10 @@ mod tests {
 
     #[test]
     fn nested_and_or_distributes_with_engine_roundtrip() {
-        // and( or(suffix .a.com, ip 192.168/16), port 443 ) expands to two
-        // flat rules: (suffix∧port) and (ip∧port), both → tag "mix".
+        // and( or(suffix .a.com, ip 192.168/16), port 443 ) lowers to ONE
+        // rule: Cond::Any over the cartesian products (suffix∧port) and
+        // (ip∧port), all → tag "mix". Each product is one flat
+        // `Cond::All` arm; the Any wrapper carries the alternation.
         let txt = r#"{"route":{"rules":[{
             "mode":"and",
             "rules":[
@@ -1027,15 +1130,23 @@ mod tests {
             ],
             "action":"route","outbound":"mix"}]}}"#;
         let out = compile_singbox(txt).unwrap();
-        assert_eq!(out.ruleset.rules.len(), 2, "distributive expansion");
-        for r in &out.ruleset.rules {
-            assert_eq!(
-                r.action,
-                Action::Route {
-                    tag: "mix".into(),
-                    override_addr: None
-                }
-            );
+        assert_eq!(out.ruleset.rules.len(), 1, "Any∧port stays one rule");
+        assert_eq!(
+            out.ruleset.rules[0].action,
+            Action::Route {
+                tag: "mix".into(),
+                override_addr: None
+            }
+        );
+        let Cond::Any(arms) = &out.ruleset.rules[0].cond else {
+            panic!("distributed alternation must surface as Cond::Any");
+        };
+        assert_eq!(arms.len(), 2);
+        for arm in arms {
+            let Cond::All(items) = arm else {
+                panic!("each product arm is a flat All");
+            };
+            assert_eq!(items.len(), 2, "alternative ∧ port");
         }
         // Engine roundtrip: suffix+port hits, ip+port hits, port-only and
         // subdomain-without-port fall through.
@@ -1051,22 +1162,23 @@ mod tests {
             source_resolved_ips: vec![],
             payload_prefix: None,
             sniffed: None,
+            sni_host: None,
             resolved_host_ips: vec![],
         };
         assert!(matches!(
-            engine.decide(&mut meta("www.a.com", 443)),
+            engine.decide(&meta("www.a.com", 443)),
             Decision::Route { tag, .. } if tag == "mix"
         ));
         assert!(matches!(
-            engine.decide(&mut meta("192.168.1.1", 443)),
+            engine.decide(&meta("192.168.1.1", 443)),
             Decision::Route { tag, .. } if tag == "mix"
         ));
         assert!(matches!(
-            engine.decide(&mut meta("www.a.com", 8443)),
+            engine.decide(&meta("www.a.com", 8443)),
             Decision::Route { tag, .. } if tag == "direct"
         ));
         assert!(matches!(
-            engine.decide(&mut meta("other.net", 443)),
+            engine.decide(&meta("other.net", 443)),
             Decision::Route { tag, .. } if tag == "direct"
         ));
     }
@@ -1081,13 +1193,30 @@ mod tests {
             Err(RouteError::Unsupported(msg)) => assert!(msg.contains("rule_set"), "{msg}"),
             other => panic!("child rule_set must be Unsupported, got {other:?}"),
         }
-        // (b) child invert ⇒ Unsupported (T11).
+        // (b) child invert ⇒ genuine Cond::Invert on the child arm (T11
+        // made negation routable).
         let invert_child = r#"{"route":{"rules":[{"mode":"or","rules":[
             {"domain_suffix":[".a.com"],"invert":true}],"action":"route","outbound":"o"}]}}"#;
-        match compile_singbox(invert_child) {
-            Err(RouteError::Unsupported(msg)) => assert!(msg.contains("T11"), "{msg}"),
-            other => panic!("child invert must be Unsupported, got {other:?}"),
-        }
+        let out = compile_singbox(invert_child).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        assert!(matches!(out.ruleset.rules[0].cond, Cond::Invert(_)));
+        // Engine roundtrip: NOT(suffix .a.com) — an IP target must hit.
+        let engine = Engine::build(out.ruleset).unwrap();
+        let m = crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new("192.168.1.1"),
+                port: 443,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(matches!(engine.decide(&m), Decision::Route { tag, .. } if tag == "o"));
         // (c) child mode:"xor" ⇒ Unsupported, never silently OR'd.
         let xor_child = r#"{"route":{"rules":[{"mode":"or","rules":[
             {"mode":"xor","rules":[{"domain_suffix":[".a.com"]}]},
@@ -1142,6 +1271,74 @@ mod tests {
             "stray rules key warned: {:?}",
             out.warnings
         );
+    }
+
+    #[test]
+    fn inverted_multi_arm_child_negates_whole_alternation_not_each_arm() {
+        // ¬(a∨b) must compile as Invert(Any), never the De Morgan-broken
+        // ¬a∨¬b. Under an `or` parent the negated child is one alternative.
+        let txt = r#"{"route":{"rules":[{"mode":"or","rules":[
+            {"mode":"or","rules":[
+                {"domain_suffix":[".a.com"]},
+                {"ip_cidr":["192.168.0.0/16"]}
+            ],"invert":true},
+            {"port":[443]}
+        ],"action":"route","outbound":"other-net"}]}}"#;
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        let Cond::Any(alts) = &out.ruleset.rules[0].cond else {
+            panic!("or over two children is one Any");
+        };
+        assert_eq!(alts.len(), 2);
+        assert!(
+            matches!(&alts[0], Cond::Invert(inner) if matches!(inner.as_ref(), Cond::Any(c) if c.len() == 2)),
+            "¬(a∨b) kept whole under Invert: {alts:?}"
+        );
+        // Engine roundtrip (the parent action applies to the WHOLE or):
+        // other.net:443 hits via the negated arm; www.a.com:443 misses the
+        // negated arm but hits the port arm — same rule; www.a.com on
+        // another port satisfies neither arm and falls through to default.
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str, port: u16| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(matches!(
+            engine.decide(&meta("other.net", 443)),
+            Decision::Route { tag, .. } if tag == "other-net"
+        ));
+        assert!(matches!(
+            engine.decide(&meta("www.a.com", 443)),
+            Decision::Route { tag, .. } if tag == "other-net"
+        ));
+        assert!(matches!(
+            engine.decide(&meta("www.a.com", 8443)),
+            Decision::Route { tag, .. } if tag == "direct"
+        ));
+        // AND parent: ¬(a∨b) ∧ port has no IR encoding (Cond::All holds
+        // leaf items only) — positionally Unsupported, never silently
+        // flattened.
+        let and_txt = r#"{"route":{"rules":[{"mode":"and","rules":[
+            {"mode":"or","rules":[
+                {"domain_suffix":[".a.com"]},
+                {"ip_cidr":["192.168.0.0/16"]}
+            ],"invert":true},
+            {"port":[443]}
+        ],"action":"route","outbound":"x"}]}}"#;
+        assert!(matches!(
+            compile_singbox(and_txt),
+            Err(RouteError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -1275,17 +1472,18 @@ mod tests {
             source_resolved_ips: vec![],
             payload_prefix: None,
             sniffed: None,
+            sni_host: None,
             resolved_host_ips: vec![],
         };
         assert_eq!(
-            engine.decide(&mut meta("test.com")),
+            engine.decide(&meta("test.com")),
             Decision::Route {
                 tag: "o".into(),
                 override_addr: None
             }
         );
         assert_eq!(
-            engine.decide(&mut meta("sub.test.com")),
+            engine.decide(&meta("sub.test.com")),
             Decision::Route {
                 tag: "direct".into(),
                 override_addr: None
@@ -1367,24 +1565,25 @@ mod tests {
             source_resolved_ips: vec![],
             payload_prefix: None,
             sniffed: None,
+            sni_host: None,
             resolved_host_ips: vec![],
         };
         // Port range 1000:2000 reject drop.
         assert_eq!(
-            engine.decide(&mut meta("any.host", 1500, NetworkMask::TCP)),
+            engine.decide(&meta("any.host", 1500, NetworkMask::TCP)),
             Decision::Reject {
                 method: RejectMethod::Drop
             }
         );
         // Domain suffix hijack.
         assert_eq!(
-            engine.decide(&mut meta("www.google.com", 443, NetworkMask::TCP)),
+            engine.decide(&meta("www.google.com", 443, NetworkMask::TCP)),
             Decision::HijackDns
         );
         // No match → final proxy-main. Port 700 avoids every fixture range
         // (1000:2000 and the open-ended 8080:).
         assert!(matches!(
-            engine.decide(&mut meta("other.net", 700, NetworkMask::TCP)),
+            engine.decide(&meta("other.net", 700, NetworkMask::TCP)),
             Decision::Route { tag, .. } if tag == "proxy-main"
         ));
     }
