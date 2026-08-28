@@ -11,7 +11,7 @@ use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
 use crate::models_toasty::{
     DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, Group, HostType, ProfileStats,
-    Protocol, ProtocolId, RoutingRule, TrafficStats,
+    Protocol, ProtocolId, RouteProbes, RoutingRule, TrafficStats,
 };
 use crate::retry_on_busy;
 
@@ -35,7 +35,7 @@ impl Database {
         // only run on a database that has no tables yet; the tag lets reopen
         // skip it. Any other tag is a pre-T8 9-table database (incompatible
         // with the typed models) and is recreated from scratch.
-        const SCHEMA_VERSION: i64 = 5;
+        const SCHEMA_VERSION: i64 = 6;
 
         let path_str = path
             .as_ref()
@@ -122,7 +122,8 @@ impl Database {
                 EndpointGroup,
                 Group,
                 RoutingRule,
-                DnsSetting
+                DnsSetting,
+                RouteProbes
             ))
             .build(driver)
             .await?;
@@ -159,7 +160,8 @@ impl Database {
                 EndpointGroup,
                 Group,
                 RoutingRule,
-                DnsSetting
+                DnsSetting,
+                RouteProbes
             ))
             .build(driver)
             .await?;
@@ -997,6 +999,33 @@ impl Database {
         Ok(count)
     }
 }
+// ── Route probes (singleton settings row) ───────────────────────────────
+
+impl Database {
+    /// The global probe-hostname list; an absent row yields an empty vec.
+    pub async fn get_route_probes(&self) -> Result<Vec<String>> {
+        let mut conn = self.conn().await?;
+        let rows: Vec<RouteProbes> = RouteProbes::all().exec(&mut conn).await?;
+        Ok(rows.into_iter().next().map(|r| r.hosts).unwrap_or_default())
+    }
+
+    /// Replace the global probe-hostname list (singleton `id == "global"`).
+    /// Deduped case-insensitively, first spelling kept — same policy as
+    /// merge's probe union.
+    pub async fn upsert_route_probes(&self, hosts: Vec<String>) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<String> = hosts
+            .into_iter()
+            .filter(|h| seen.insert(h.to_lowercase()))
+            .collect();
+        let mut conn = self.conn().await?;
+        RouteProbes::upsert_by_id("global".to_string())
+            .hosts(deduped)
+            .exec(&mut conn)
+            .await?;
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1546,6 +1575,65 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].domains, vec!["example.com".to_string()]);
         assert_eq!(rules[0].ports, vec![443]);
+    }
+
+    #[tokio::test]
+    async fn route_probes_roundtrip_and_dedupe() {
+        let db = Database::in_memory().await.expect("in-memory db");
+
+        // Absent row ⇒ empty vec, not an error.
+        assert!(db.get_route_probes().await.expect("absent").is_empty());
+
+        // Create path: case-insensitive dedupe keeps the first spelling.
+        db.upsert_route_probes(vec![
+            "A.example.com".to_string(),
+            "b.Example.com".to_string(),
+            "a.EXAMPLE.com".to_string(),
+        ])
+        .await
+        .expect("upsert create");
+        assert_eq!(
+            db.get_route_probes().await.expect("probes"),
+            vec!["A.example.com".to_string(), "b.Example.com".to_string(),],
+            "deduped case-insensitively, first spelling kept"
+        );
+
+        // Update path: wholesale replacement of the singleton row.
+        db.upsert_route_probes(vec!["c.example.com".to_string()])
+            .await
+            .expect("upsert update");
+        assert_eq!(
+            db.get_route_probes().await.expect("probes"),
+            vec!["c.example.com".to_string()],
+        );
+
+        // Singleton: both upserts hit the same row.
+        let mut conn = db.connection().await.expect("connection");
+        let count = RouteProbes::all()
+            .count()
+            .exec(&mut conn)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn route_probes_survive_reopen_via_schema_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("probes.db");
+
+        let db = Database::open(&path).await.expect("open");
+        db.upsert_route_probes(vec!["probe.example.com".to_string()])
+            .await
+            .expect("upsert");
+        drop(db);
+
+        // Reopen must NOT wipe (schema tag skips push_schema).
+        let db2 = Database::open(&path).await.expect("reopen");
+        assert_eq!(
+            db2.get_route_probes().await.expect("probes"),
+            vec!["probe.example.com".to_string()],
+        );
     }
 
     /// `EndpointRow.active_link` respects a manual protocol override.

@@ -343,6 +343,15 @@ pub struct DnsSetting {
     pub cache_ttl_secs: Option<i64>,
 }
 
+/// Must-resolve probe hostnames, one global singleton row (`id == "global"`).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "route_probes"]
+pub struct RouteProbes {
+    #[key]
+    pub id: String,
+    pub hosts: Vec<String>,
+}
+
 // ── Data-transfer types ──────────────────────────────────────────────────
 
 /// An endpoint with its per-pair links and their protocols, as loaded by the
