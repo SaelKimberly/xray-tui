@@ -7864,6 +7864,7 @@ dependencies = [
  "xray-tui-hakari",
  "xray-tui-host-features",
  "xray-tui-proto",
+ "xray-tui-route",
 ]
 
 [[package]]
@@ -8175,6 +8176,24 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xray-tui-hakari",
+]
+
+[[package]]
+name = "xray-tui-route"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "jiff",
+ "parking_lot",
+ "regex",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "xray-tui-dns",
+ "xray-tui-geoip",
+ "xray-tui-tls",
 ]
 
 [[package]]
