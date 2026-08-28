@@ -1,6 +1,6 @@
 //! Routing engine event stream.
 //!
-//! Resolved / `NetworkBreakdown` / `ProbeRecovered` variants arrive in Task 9.
+//! Emitted during configuration compilation and connection decisions.
 
 /// Events emitted by the routing engine during configuration compilation and
 /// connection decisions.
@@ -23,5 +23,28 @@ pub enum RouteEvent {
         rule_index: usize,
         /// Human-readable description of the issue.
         message: String,
+    },
+    /// A DNS resolution completed for a host.
+    Resolved {
+        /// The hostname that was resolved.
+        host: String,
+        /// All resolved addresses.
+        ips: Vec<std::net::IpAddr>,
+        /// Wall-clock time of the resolution.
+        at: jiff::Timestamp,
+    },
+    /// A probe target stopped answering (first failure of a streak).
+    NetworkBreakdown {
+        /// The probe that failed.
+        failed_probe: String,
+        /// Wall-clock time of the failure.
+        at: jiff::Timestamp,
+    },
+    /// A previously failed probe answered again (streak reset).
+    ProbeRecovered {
+        /// The probe that recovered.
+        probe: String,
+        /// Wall-clock time of the recovery.
+        at: jiff::Timestamp,
     },
 }

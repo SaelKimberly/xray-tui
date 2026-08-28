@@ -15,8 +15,8 @@ thiserror.workspace = true
 # ============ Text / Search / Hash ============
 aho-corasick.workspace = true
 regex = "1.11"
+parking_lot = "0.12"
 tokio = { workspace = true, features = ["sync"] }
-
 
 # ============ Time / Duration Parsing ============
 jiff.workspace = true
