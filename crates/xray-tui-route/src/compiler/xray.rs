@@ -123,11 +123,17 @@ pub fn compile_xray(json_text: &str) -> Result<CompileOutput, RouteError> {
             let mut inbound_tags: Vec<String> = vec![];
             let mut protocols: Vec<SniffedProtocol> = vec![];
 
+            // Upstream Xray accepts camelCase AND a few legacy snake_case
+            // spellings (`port`/`sourcePort` predate `ports`/`sourcePorts`;
+            // `domains` mirrors `domain`). Unknown keys warn but pass.
             for (field, target) in [
                 ("domain", 0u8),
+                ("domains", 0),
                 ("ip", 1),
                 ("ports", 2),
+                ("port", 2),
                 ("sourcePorts", 3),
+                ("sourcePort", 3),
                 ("network", 4),
                 ("inboundTag", 5),
                 ("protocol", 6),
@@ -255,13 +261,18 @@ fn parse_err(rule_index: usize, field: &'static str, message: impl Into<String>)
 }
 
 /// Keys understood on an xray `field` rule; anything else warns but passes.
-const KNOWN_RULE_KEYS: [&str; 9] = [
+/// `port`/`sourcePort` are legacy aliases of `ports`/`sourcePorts`;
+/// `domains` mirrors `domain` (both spellings appear in upstream configs).
+const KNOWN_RULE_KEYS: [&str; 12] = [
     "type",
     "outboundTag",
     "domain",
+    "domains",
     "ip",
     "ports",
+    "port",
     "sourcePorts",
+    "sourcePort",
     "network",
     "inboundTag",
     "protocol",
@@ -348,9 +359,33 @@ const fn remap_rule(mut e: RouteError, rule_index: usize, field: &'static str) -
     e
 }
 
+/// Port field values: string, bare JSON number, or arrays thereof (upstream
+/// router.go `IntList`/`PortList` accepts both shapes). Numbers stringify;
+/// anything else falls through to the string-array error.
+fn port_strings(
+    v: &serde_json::Value,
+    rule_index: usize,
+    field: &'static str,
+) -> Result<Vec<String>, RouteError> {
+    match v {
+        serde_json::Value::Number(n) => Ok(vec![n.to_string()]),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    serde_json::Value::Number(n) => out.push(n.to_string()),
+                    other => out.extend(field_strings(other, rule_index, field)?),
+                }
+            }
+            Ok(out)
+        }
+        other => field_strings(other, rule_index, field),
+    }
+}
+
 fn parse_ports(v: &Value, i: usize, field: &'static str) -> Result<Vec<PortRange>, RouteError> {
     let mut ranges = Vec::new();
-    for part in field_strings(v, i, field)?.join(",").split(',') {
+    for part in port_strings(v, i, field)?.join(",").split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -527,6 +562,90 @@ mod tests {
                 override_addr: None
             }
         );
+    }
+
+    #[test]
+    fn upstream_port_spellings_and_domains_key_compile() {
+        // Mirrors upstream app/router/router_test.go shapes: `"port": 123`
+        // (bare JSON number), `"port": "53, 443, 1000-2000"` (comma string),
+        // and the `domains`/`sourcePort` alias spellings. All must compile —
+        // an unknown-key rejection here would silently drop the port
+        // condition and widen the rule.
+        let txt = r#"{
+          "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+              {
+                "type": "field",
+                "outboundTag": "num",
+                "domains": ["example.com"],
+                "port": 123
+              },
+              {
+                "type": "field",
+                "outboundTag": "csv",
+                "port": "53, 443, 1000-2000",
+                "sourcePort": "9050"
+              },
+              {
+                "type": "field",
+                "outboundTag": "arr",
+                "port": [80, "81-82"],
+                "domains": ["regexp:^a\\.com$"]
+              }
+            ]
+          }
+        }"#;
+        let out = compile_xray(txt).unwrap();
+        assert_eq!(
+            out.warnings.len(),
+            0,
+            "alias keys are KNOWN: {:?}",
+            out.warnings
+        );
+        assert_eq!(out.ruleset.rules.len(), 3);
+        let port_ranges = |idx: usize| match &out.ruleset.rules[idx].cond {
+            Cond::All(items) => items.iter().find_map(|it| match it {
+                MatchItem::Ports(r) => Some(r.clone()),
+                _ => None,
+            }),
+            _ => panic!("rule {idx} must be flat All"),
+        };
+        assert_eq!(
+            port_ranges(0),
+            Some(vec![PortRange {
+                start: 123,
+                end: 123
+            }])
+        );
+        assert_eq!(
+            port_ranges(1),
+            Some(vec![
+                PortRange { start: 53, end: 53 },
+                PortRange {
+                    start: 443,
+                    end: 443
+                },
+                PortRange {
+                    start: 1000,
+                    end: 2000
+                },
+            ])
+        );
+        assert_eq!(
+            port_ranges(2),
+            Some(vec![
+                PortRange { start: 80, end: 80 },
+                PortRange { start: 81, end: 82 },
+            ])
+        );
+        // sourcePort alias landed on the source side.
+        match &out.ruleset.rules[1].cond {
+            Cond::All(items) => assert!(items.iter().any(
+                |it| matches!(it, MatchItem::SourcePorts(r) if r.len() == 1 && r[0].start == 9050)
+            )),
+            _ => panic!(),
+        }
     }
 
     #[test]

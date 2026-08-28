@@ -562,6 +562,17 @@ fn collect_items(
 
     let mut items: Vec<MatchItem> = Vec::new();
     if !domains.is_empty() {
+        // Upstream sing domain.Matcher registers a NON-dot suffix via
+        // rootLabel matching the domain itself AND its subdomains
+        // (matcher.go); a leading-dot suffix stays subdomain-only. Mirror
+        // that by pairing each dot-less suffix with an exact self-entry.
+        let self_exacts: Vec<String> = domains
+            .suffix
+            .iter()
+            .filter(|s| !s.starts_with('.'))
+            .cloned()
+            .collect();
+        domains.exact.extend(self_exacts);
         items.push(MatchItem::Domain {
             exact: domains.exact,
             suffix: domains.suffix,
@@ -1543,6 +1554,64 @@ mod tests {
                 tag: "direct".into(),
                 override_addr: None
             }
+        );
+    }
+
+    #[test]
+    fn dotless_domain_suffix_self_matches_and_subdomains() {
+        // Upstream sing domain.Matcher: a NON-dot suffix ("sagernet.org")
+        // matches the domain itself AND its subdomains (matcher_test.go
+        // asserts Match("sagernet.org") == true). Mirror that via the exact
+        // self-entry pairing; a leading-dot suffix stays subdomain-only.
+        let txt = r#"{"route":{"rules":[{"domain_suffix":["sagernet.org",".google.com"],"action":"route","outbound":"o"}]}}"#;
+        let out = compile_singbox(txt).unwrap();
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!()
+        };
+        let MatchItem::Domain {
+            exact,
+            suffix,
+            keywords: _,
+            regexes: _,
+        } = &items[0]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            suffix,
+            &vec!["sagernet.org".to_owned(), ".google.com".to_owned()]
+        );
+        assert_eq!(exact, &vec!["sagernet.org".to_owned()], "self-entry added");
+
+        // Engine roundtrip: sagernet.org (self), sing-box.sagernet.org
+        // (subdomain) hit; www.google.com hits via the dotted suffix and
+        // google.com does NOT (dot requires the subdomain boundary).
+        let engine = Engine::build(out.ruleset).unwrap();
+        let meta = |host: &str| crate::ConnMeta {
+            target: NetAddr {
+                host: NetHost::new(host),
+                port: 443,
+            },
+            network: NetworkMask::TCP,
+            inbound_tag: None,
+            source: None,
+            source_resolved_ips: vec![],
+            payload_prefix: None,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: vec![],
+        };
+        assert!(
+            matches!(engine.decide(&meta("sagernet.org")), Decision::Route { tag, .. } if tag == "o")
+        );
+        assert!(
+            matches!(engine.decide(&meta("sing-box.sagernet.org")), Decision::Route { tag, .. } if tag == "o")
+        );
+        assert!(
+            matches!(engine.decide(&meta("www.google.com")), Decision::Route { tag, .. } if tag == "o")
+        );
+        assert!(
+            !matches!(engine.decide(&meta("google.com")), Decision::Route { tag, .. } if tag == "o")
         );
     }
 

@@ -51,21 +51,52 @@ pub fn rule_from_row(row: &RoutingRule, index: usize) -> Result<Rule, RouteError
             message: "rule has match conditions but no outbound_tag".to_owned(),
         });
     };
-    if items.is_empty() {
-        return Err(RouteError::Parse {
-            rule_index: index,
-            field: "row",
-            message: "rule has no match conditions (bare catch-all rejected)".to_owned(),
-        });
-    }
+    let cond = match split_protocol_alternation(items) {
+        Ok(any) => any,
+        Err(items) => Cond::All(items),
+    };
     Ok(Rule {
         name: Some(row.id.clone()),
-        cond: Cond::All(items),
+        cond,
         action: Action::Route {
             tag,
             override_addr: None,
         },
     })
+}
+
+/// Splits AND-ed `Protocol` leaves into a genuine `Cond::Any` over
+/// per-protocol `Cond::All` arms (the engine evaluates Any since T11): a
+/// multi-protocol whitelist is an OR, and AND-ing the leaves would make the
+/// rule unsatisfiable. [`Err`] hands the items back untouched when there is
+/// nothing to split (fewer than two `Protocol` items). Other items are shared
+/// into every arm.
+fn split_protocol_alternation(items: Vec<MatchItem>) -> Result<Cond, Vec<MatchItem>> {
+    let mut protocols: Vec<SniffedProtocol> = items
+        .iter()
+        .filter_map(|it| match it {
+            MatchItem::Protocol(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    if protocols.len() < 2 {
+        return Err(items);
+    }
+    protocols.dedup();
+    let shared: Vec<MatchItem> = items
+        .into_iter()
+        .filter(|it| !matches!(it, MatchItem::Protocol(_)))
+        .collect();
+    Ok(Cond::Any(
+        protocols
+            .into_iter()
+            .map(|p| {
+                let mut arm = shared.clone();
+                arm.push(MatchItem::Protocol(p));
+                Cond::All(arm)
+            })
+            .collect(),
+    ))
 }
 
 /// Caller-visible warnings for one row (never silently dropped):
@@ -289,6 +320,36 @@ mod tests {
         items
     }
 
+    /// Shared non-Protocol items of a multi-protocol row's per-protocol arms.
+    fn shared_items_of(rule: &Rule) -> Vec<MatchItem> {
+        let Cond::Any(arms) = &rule.cond else {
+            panic!("expected Cond::Any, got {:?}", rule.cond);
+        };
+        let Cond::All(items) = &arms[0] else {
+            panic!("each arm must be Cond::All");
+        };
+        items
+            .iter()
+            .filter(|it| !matches!(it, MatchItem::Protocol(_)))
+            .cloned()
+            .collect()
+    }
+
+    fn arm_protocols(rule: &Rule) -> Vec<SniffedProtocol> {
+        let Cond::Any(arms) = &rule.cond else {
+            panic!("expected Cond::Any, got {:?}", rule.cond);
+        };
+        arms.iter()
+            .filter_map(|arm| match arm {
+                Cond::All(items) => items.iter().find_map(|it| match it {
+                    MatchItem::Protocol(p) => Some(*p),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn full_row_maps_every_column() {
         let r = full_row();
@@ -301,9 +362,20 @@ mod tests {
                 override_addr: None
             }
         );
+        // Multi-protocol row: genuine Cond::Any over per-protocol arms
+        // sharing every other item (ANDing the leaves would be
+        // unsatisfiable). "quic" warns and drops.
         assert_eq!(
-            items_of(&rule),
-            &vec![
+            arm_protocols(&rule),
+            vec![
+                SniffedProtocol::Http,
+                SniffedProtocol::Tls,
+                SniffedProtocol::Dns
+            ]
+        );
+        assert_eq!(
+            shared_items_of(&rule),
+            vec![
                 MatchItem::Domain {
                     exact: vec!["a.com".to_string()],
                     suffix: vec![],
@@ -330,9 +402,6 @@ mod tests {
                     tcp: true,
                     udp: true
                 }),
-                MatchItem::Protocol(SniffedProtocol::Http),
-                MatchItem::Protocol(SniffedProtocol::Tls),
-                MatchItem::Protocol(SniffedProtocol::Dns),
                 MatchItem::InboundTag {
                     tags: vec!["socks-in".to_string()],
                 },
