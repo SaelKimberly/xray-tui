@@ -8,7 +8,7 @@ description = "ring-based TLS 1.3 client with browser fingerprint mimicry + REAL
 
 [dependencies]
 # crypto (workspace standard: ring)
-ring = "0.17"
+ring.workspace = true
 # REALITY's ephemeral keypair must agree TWICE (auth with the static pbk,
 # TLS with the server's ephemeral keyshare) — ring 0.17's
 # EphemeralPrivateKey is single-use and cannot be serialized, so the

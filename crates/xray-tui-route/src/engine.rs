@@ -416,8 +416,13 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
         && let Some(prefix) = meta.payload_prefix.as_deref()
         && let Some(result) = sniff::probe(prefix)
     {
-        meta.sni_host = result.host;
-        meta.sniffed = Some(result.protocol.into());
+        // QUIC is UDP-only (RFC 9000): a QUIC sniff on a non-UDP
+        // connection is rejected — prevents the decrypt path from
+        // running on TCP binary handshakes (VMess, VLESS, etc.).
+        if result.protocol != sniff::SniffedProtocol::Quic || meta.network == NetworkMask::UDP {
+            meta.sni_host = result.host;
+            meta.sniffed = Some(result.protocol.into());
+        }
     }
 
     let mut resolved_this_call = false;

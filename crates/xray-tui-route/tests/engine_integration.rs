@@ -451,3 +451,81 @@ async fn second_connection_hits_resolve_cache_without_sink() {
         "cache hit supplies the same ips"
     );
 }
+
+#[tokio::test]
+async fn quic_protocol_item_consumes_payload_prefix_sniff() {
+    // Real quic-go `Initial` packet carrying a ClientHello with SNI
+    // `www.google.com` (fixture from xray sniff_test.go). A Protocol(Quic)
+    // rule must be satisfied by sniffing the payload prefix, exactly like
+    // the TLS row above.
+    let fixture = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/quic_initial_google.bin"
+    ))
+    .expect("quic fixture present");
+    let set = if_non_match_set(
+        vec![Rule {
+            name: Some("quic".to_owned()),
+            cond: Cond::All(vec![MatchItem::Protocol(SniffedProtocol::Quic)]),
+            action: Action::Route {
+                tag: "quic-out".to_owned(),
+                override_addr: None,
+            },
+        }],
+        vec![],
+    );
+    let engine = Engine::build(set.clone()).unwrap();
+
+    // QUIC is UDP-only; the sniff must be adopted only on UDP.
+    let mut m = meta("1.2.3.4", 443);
+    m.network = NetworkMask::UDP;
+    m.payload_prefix = Some(fixture.clone());
+    let d = decide_async(&engine, &mut m).await;
+    assert!(
+        matches!(d, Decision::Route { ref tag, .. } if tag == "quic-out"),
+        "sniffed QUIC must satisfy the Protocol item: {d:?}"
+    );
+    assert_eq!(
+        m.sniffed,
+        Some(SniffedProtocol::Quic),
+        "sniff result stashed onto meta"
+    );
+    assert_eq!(
+        m.sni_host.as_deref(),
+        Some("www.google.com"),
+        "SNI host stashed onto meta"
+    );
+
+    // On TCP the same payload must be ignored: the QUIC decrypt path is
+    // gated off non-UDP, so the rule cannot fire.
+    let engine_tcp = Engine::build(set).unwrap();
+    let mut tcp = meta("1.2.3.4", 443);
+    tcp.payload_prefix = Some(fixture.clone());
+    let dt = decide_async(&engine_tcp, &mut tcp).await;
+    assert!(
+        matches!(dt, Decision::Route { ref tag, .. } if tag == "direct"),
+        "QUIC sniff must be rejected on TCP: {dt:?}"
+    );
+    assert_eq!(tcp.sniffed, None, "no sniff result on TCP");
+
+    // Sync decide stays fully usable without prefix: the same ruleset with
+    // no payload must fall through to default.
+    let set2 = if_non_match_set(
+        vec![Rule {
+            name: None,
+            cond: Cond::All(vec![MatchItem::Protocol(SniffedProtocol::Quic)]),
+            action: Action::Route {
+                tag: "quic-out".to_owned(),
+                override_addr: None,
+            },
+        }],
+        vec![],
+    );
+    let engine2 = Engine::build(set2).unwrap();
+    let mut plain = meta("1.2.3.4", 443);
+    let d2 = decide_async(&engine2, &mut plain).await;
+    assert!(
+        matches!(d2, Decision::Route { ref tag, .. } if tag == "direct"),
+        "no payload -> no sniff -> default route: {d2:?}"
+    );
+}

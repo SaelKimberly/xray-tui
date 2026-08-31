@@ -8212,6 +8212,7 @@ dependencies = [
 name = "xray-tui-route"
 version = "0.1.0"
 dependencies = [
+ "aes 0.9.2",
  "aho-corasick",
  "jiff",
  "parking_lot",

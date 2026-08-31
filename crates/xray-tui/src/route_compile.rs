@@ -19,7 +19,7 @@ use xray_tui_route::ir::{Action, Cond, MatchItem, NetworkMask, Rule, SniffedProt
 ///   reported by [`warnings_from_row`].
 /// - `ports`/`source_ports` ⇒ `Ports`/`SourcePorts` (one `PortRange` per
 ///   port); `network` comma-able `"tcp,udp"` ⇒ one `NetworkMask` item;
-///   IANA `http`/`tls`/`dns` protocols ⇒ AND-ed `Protocol` items;
+///   IANA `http`/`tls`/`dns`/`quic` protocols ⇒ AND-ed `Protocol` items;
 ///   `inbound_tags` ⇒ `InboundTag`; `outbound_tag` ⇒ `Action::Route`.
 ///
 /// # Errors
@@ -101,7 +101,7 @@ fn split_protocol_alternation(items: Vec<MatchItem>) -> Result<Cond, Vec<MatchIt
 
 /// Caller-visible warnings for one row (never silently dropped):
 /// - unparseable `ips` entries that are neither CIDRs nor `geoip:` prefixes;
-/// - `protocols` names outside IANA `http`/`tls`/`dns`;
+/// - `protocols` names outside IANA `http`/`tls`/`dns`/`quic`;
 /// - `network` tokens outside `tcp`/`udp`;
 /// - legacy per-row `domain_strategy` (xray noise; ignored);
 /// - `rule_set_file`/`rule_set_url` ruleset references (no native
@@ -116,7 +116,7 @@ pub fn warnings_from_row(row: &RoutingRule) -> Vec<String> {
     }
     for p in &row.protocols {
         if sniffed(p).is_none() {
-            out.push(format!("protocol `{p}` is not http/tls/dns"));
+            out.push(format!("protocol `{p}` is not http/tls/dns/quic"));
         }
     }
     for tok in row
@@ -247,6 +247,7 @@ fn sniffed(p: &str) -> Option<SniffedProtocol> {
         "http" => Some(SniffedProtocol::Http),
         "tls" => Some(SniffedProtocol::Tls),
         "dns" => Some(SniffedProtocol::Dns),
+        "quic" => Some(SniffedProtocol::Quic),
         _ => None,
     }
 }
@@ -364,13 +365,14 @@ mod tests {
         );
         // Multi-protocol row: genuine Cond::Any over per-protocol arms
         // sharing every other item (ANDing the leaves would be
-        // unsatisfiable). "quic" warns and drops.
+        // unsatisfiable).
         assert_eq!(
             arm_protocols(&rule),
             vec![
                 SniffedProtocol::Http,
                 SniffedProtocol::Tls,
-                SniffedProtocol::Dns
+                SniffedProtocol::Dns,
+                SniffedProtocol::Quic,
             ]
         );
         assert_eq!(

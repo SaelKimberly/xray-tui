@@ -26,7 +26,7 @@ rustls = { workspace = true, features = ["ring"] }
 webpki-roots = "1"
 
 # VMess wire crypto (mandatory for any VMess client — not feature-gated)
-aes = "0.9"
+aes.workspace = true
 aes-gcm = "0.11"
 chacha20poly1305 = "0.11"
 ctr = "0.10"
@@ -38,7 +38,7 @@ blake2 = "0.11"
 wide = "1.7.0"
 
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
-ring = "0.17"
+ring.workspace = true
 
 # WebSocket transport framing (RFC 6455) over the engine stream — no TLS
 tokio-tungstenite = "0.30"

@@ -14,7 +14,7 @@
 //! | `geoip:private`               | `IpCidr.private = true`                    |
 //! | `geoip:<cc>`                  | `IpCidr.geo_country` (inert until Engine)  |
 //! | `ports` `"80,443,1000-2000"`  | `Ports`                                    |
-//! | `protocol` http/tls/dns only  | `Protocol`; anything else is unsupported   |
+//! | `protocol` http/tls/dns/quic| `Protocol`; anything else is unsupported   |
 //! | `outboundTag`                 | `Action::Route { tag }`                    |
 //!
 //! A rule whose item set ends up empty is skipped (no matchable condition)
@@ -441,9 +441,11 @@ fn collect_protocols(
             SniffedProtocol::Tls
         } else if tok.eq_ignore_ascii_case("dns") {
             SniffedProtocol::Dns
+        } else if tok.eq_ignore_ascii_case("quic") {
+            SniffedProtocol::Quic
         } else {
             return Err(RouteError::Unsupported(
-                "sniffed protocol outside http/tls/dns",
+                "sniffed protocol outside http/tls/dns/quic",
             ));
         };
         out.push(p);
@@ -813,10 +815,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_sniff_protocol_is_unsupported_error() {
+    fn quic_sniff_protocol_is_accepted() {
         let txt =
             r#"{"routing":{"rules":[{"type":"field","outboundTag":"a","protocol":["quic"]}]}}"#;
-        assert!(matches!(compile_xray(txt), Err(RouteError::Unsupported(_))));
+        let out = compile_xray(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!("cond must be All");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], MatchItem::Protocol(SniffedProtocol::Quic));
     }
 
     #[test]

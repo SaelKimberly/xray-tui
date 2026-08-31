@@ -134,6 +134,8 @@ pub enum SniffedProtocol {
     Http,
     Tls,
     Dns,
+    /// QUIC (`Initial` packet carrying a TLS `ClientHello`).
+    Quic,
 }
 
 /// Transport-protocol mask used against `ConnMeta.network`.

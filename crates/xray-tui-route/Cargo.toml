@@ -18,6 +18,10 @@ regex = "1.11"
 parking_lot = "0.12"
 tokio = { workspace = true, features = ["sync"] }
 
+# ============ Sniffing (QUIC Initial packet decryption) ============
+aes.workspace = true
+ring.workspace = true
+
 # ============ Time / Duration Parsing ============
 jiff.workspace = true
 
@@ -39,7 +43,6 @@ optional = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 xray-tui-tls = { version = "0.1", path = "../xray-tui-tls" }
-ring = "0.17"
 
 [lints]
 workspace = true

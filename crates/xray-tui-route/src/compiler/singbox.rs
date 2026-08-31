@@ -20,7 +20,7 @@
 //! | `network` tcp/udp tokens          | `Network(NetworkMask)`                       |
 //! | `inbound`                         | `InboundTag.tags`                            |
 //! | `outbound`                        | `OutboundTag.tags`                           |
-//! | `protocol` http/tls/dns only      | `Protocol`; anything else Unsupported        |
+//! | `protocol` http/tls/dns/quic     | `Protocol`; anything else Unsupported        |
 //! | no `action` key                   | [`RouteError::Parse`] per dispatch ruling    |
 //! | action `route` + `outbound`       | `Action::Route { tag }`                      |
 //! | action `route` w/o `outbound`     | [`RouteError::Parse`]                        |
@@ -731,7 +731,7 @@ fn parse_network(v: &Value, i: usize) -> Result<NetworkMask, RouteError> {
     Ok(mask)
 }
 
-/// Maps sniffed-protocol tokens onto the IR whitelist (http/tls/dns only).
+/// Maps sniffed-protocol tokens onto the IR whitelist (http/tls/dns/quic).
 fn collect_protocols(
     v: &Value,
     i: usize,
@@ -744,9 +744,11 @@ fn collect_protocols(
             SniffedProtocol::Tls
         } else if tok.eq_ignore_ascii_case("dns") {
             SniffedProtocol::Dns
+        } else if tok.eq_ignore_ascii_case("quic") {
+            SniffedProtocol::Quic
         } else {
             return Err(RouteError::Unsupported(
-                "sniffed protocol outside http/tls/dns",
+                "sniffed protocol outside http/tls/dns/quic",
             ));
         };
         out.push(p);
@@ -1633,12 +1635,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_sniff_protocol_is_unsupported() {
+    fn quic_sniff_protocol_is_accepted() {
         let txt = r#"{"route":{"rules":[{"protocol":["quic"],"action":"route","outbound":"o"}]}}"#;
-        assert!(matches!(
-            compile_singbox(txt),
-            Err(RouteError::Unsupported(_))
-        ));
+        let out = compile_singbox(txt).unwrap();
+        assert_eq!(out.ruleset.rules.len(), 1);
+        let Cond::All(items) = &out.ruleset.rules[0].cond else {
+            panic!("cond must be All");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], MatchItem::Protocol(SniffedProtocol::Quic));
     }
 
     #[test]

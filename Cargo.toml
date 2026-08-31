@@ -85,6 +85,13 @@ rstest = "0.26.1"
 # `cargo tree -i aws-lc-rs` after any dependency change).
 rustls = { version = "0.23", default-features = false }
 
+# ============ Crypto ============
+# Shared by xray-tui-tls / xray-tui-native / xray-tui-route (ring) and
+# xray-tui-native / xray-tui-route (aes). Single-crate crypto deps stay in
+# the crate manifest; these crossed the 2-crate threshold.
+ring = "0.17"
+aes = "0.9"
+
 # ============ TUI ============
 ratatui-themes = "0.2"
 

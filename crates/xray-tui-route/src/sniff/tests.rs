@@ -249,3 +249,184 @@ fn sniff_result_is_debug_clone_eq() {
     assert_eq!(r, r2);
     assert!(format!("{r:?}").contains("Http"));
 }
+
+/// Loads one of the real-traffic QUIC `Initial` fixtures (captured from
+/// quic-go, ported from xray's `common/protocol/quic/sniff_test.go`).
+fn quic_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("read quic fixture {name}: {e}"))
+}
+
+#[test]
+fn quic_initial_yields_quic_with_sni_target_www_google_com() {
+    // Real quic-go client `Initial` packet carrying a TLS ClientHello with
+    // SNI `www.google.com` (xray sniff_test.go fixture).
+    let pkt = quic_fixture("quic_initial_google.bin");
+    let r = probe(&pkt).expect("real quic packet must sniff as QUIC");
+    assert_eq!(r.protocol, SniffedProtocol::Quic);
+    assert_eq!(r.host.as_deref(), Some("www.google.com"));
+}
+
+#[test]
+fn quic_incomplete_hello_returns_none() {
+    // The `play.google.com` hello spans two coalesced `Initial` packets; the
+    // first packet alone does not carry the whole ClientHello (the SNI host
+    // is split mid-name), so it must be indeterminate — never a truncated
+    // host.
+    let pkt = quic_fixture("quic_initial_play_part1.bin");
+    assert_eq!(probe(&pkt), None, "partial hello must not yield a host");
+}
+
+#[test]
+fn quic_hello_split_across_packets_assembles_sni() {
+    // Both coalesced `Initial` packets carry the complete ClientHello; the
+    // CRYPTO stream reassembled across them yields the full SNI.
+    let pkt = quic_fixture("quic_initial_play_full.bin");
+    let r = probe(&pkt).expect("coalesced quic packets must sniff");
+    assert_eq!(r.protocol, SniffedProtocol::Quic);
+    assert_eq!(r.host.as_deref(), Some("play.google.com"));
+}
+
+#[test]
+fn quic_garbage_and_short_slices_return_none() {
+    // Not a long-header packet: indeterminate.
+    assert_eq!(probe(b"\x00\x01\x02\x03"), None);
+    assert_eq!(
+        probe(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap()
+            .protocol,
+        SniffedProtocol::Http
+    );
+    // A real packet truncated mid-header is indeterminate, not a panic.
+    let pkt = quic_fixture("quic_initial_google.bin");
+    assert_eq!(probe(&pkt[..3]), None);
+    assert_eq!(probe(&pkt[..8]), None);
+    // Unsupported version (e.g. a future QUIC version byte) is indeterminate.
+    let mut bad = pkt;
+    bad[1..5].copy_from_slice(&0xfeed_faceu32.to_be_bytes());
+    assert_eq!(probe(&bad), None);
+}
+
+#[test]
+fn quic_scid_length_overflow_returns_none_not_panic() {
+    // Long-header Initial with an SCID length byte that exceeds the
+    // remaining slice.  The unchecked `p[1 + scid_len..]` slice used to
+    // panic here (regression: sniff.rs:230); the DCID of the same shape was
+    // already bounds-checked.  Must be indeterminate, never a panic.
+    let pkt = [0xc3, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff];
+    assert_eq!(probe(&pkt), None);
+    let pkt = [0xc3, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x11, 0x22];
+    assert_eq!(probe(&pkt), None);
+}
+
+/// Forges a valid QUIC v1 client `Initial` packet whose single `CRYPTO`
+/// frame declares `offset` with 1 data byte (padded + protected + sealed,
+/// keys derived from the fixed DCID — same recipe as xray's `sniff_test.go`
+/// fixtures).  Lets the test reach the reassembly path with an
+/// attacker-chosen offset.
+fn forge_initial_with_crypto_offset(offset: u64) -> Vec<u8> {
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+    const SALT: [u8; 20] = [
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
+        0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    ];
+    fn expand_label(secret: &[u8], label: &[u8], out: &mut [u8]) {
+        let mut info = Vec::new();
+        info.extend_from_slice(&u16::try_from(out.len()).expect("small").to_be_bytes());
+        info.push(u8::try_from(6 + label.len()).expect("small"));
+        info.extend_from_slice(b"tls13 ");
+        info.extend_from_slice(label);
+        info.push(0);
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+        let mut ctx = ring::hmac::Context::with_key(&key);
+        ctx.update(&info);
+        ctx.update(&[1]);
+        let tag = ctx.sign();
+        out.copy_from_slice(&tag.as_ref()[..out.len()]);
+    }
+    fn varint8(v: u64) -> [u8; 8] {
+        let mut b = v.to_be_bytes();
+        b[0] |= 0xc0;
+        b
+    }
+
+    let dcid = [0u8; 8];
+    let initial_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &SALT);
+    let initial_secret = ring::hmac::sign(&initial_key, &dcid);
+    let mut cs = [0u8; 32];
+    expand_label(initial_secret.as_ref(), b"client in", &mut cs);
+    let mut key = [0u8; 16];
+    expand_label(&cs, b"quic key", &mut key);
+    let mut iv = [0u8; 12];
+    expand_label(&cs, b"quic iv", &mut iv);
+    let mut hp = [0u8; 16];
+    expand_label(&cs, b"quic hp", &mut hp);
+
+    let mut frames = vec![0x06u8]; // CRYPTO
+    frames.extend_from_slice(&varint8(offset));
+    frames.push(0x01); // length = 1
+    frames.push(0x01); // 1 byte of "crypto data"
+    frames.resize(frames.len() + 32, 0x00); // PADDING
+
+    let pn_len = 4usize;
+    let length = pn_len + frames.len() + 16; // pn + ciphertext + tag
+    let mut hdr = vec![0xc3u8]; // long, fixed bit, Initial, 4-byte pn
+    hdr.extend_from_slice(&1u32.to_be_bytes());
+    hdr.push(8);
+    hdr.extend_from_slice(&dcid);
+    hdr.push(0); // scid len
+    hdr.push(0); // token len varint = 0
+    hdr.extend_from_slice(&(u16::try_from(length).expect("small") | 0x4000).to_be_bytes());
+    let pn_off = hdr.len();
+    hdr.extend_from_slice(&[0u8; 4]); // packet number 0
+
+    let mut payload = frames;
+    let aead = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key).unwrap(),
+    );
+    aead.seal_in_place_append_tag(
+        ring::aead::Nonce::assume_unique_for_key(iv),
+        ring::aead::Aad::from(&hdr),
+        &mut payload,
+    )
+    .unwrap();
+
+    let mut pkt = hdr;
+    pkt.extend_from_slice(&payload);
+    // Header protection.
+    let sample: [u8; 16] = pkt[pn_off + 4..pn_off + 20].try_into().unwrap();
+    let mut mask = [0u8; 16];
+    aes::Aes128::new_from_slice(&hp)
+        .unwrap()
+        .encrypt_block_b2b((&sample).into(), (&mut mask).into());
+    pkt[0] ^= mask[0] & 0x0f;
+    for i in 0..pn_len {
+        pkt[pn_off + i] ^= mask[1 + i];
+    }
+    pkt
+}
+
+#[test]
+fn quic_crypto_offset_is_capped_not_allocated() {
+    // A CRYPTO frame with a huge offset used to `crypto.resize(end)` an
+    // attacker-chosen size — a 1 TiB allocation aborts the process
+    // (regression: sniff.rs:346-350).  The reassembly span must be capped
+    // at MAX_CRYPTO_LEN and reported indeterminate.
+    for offset in [1u64 << 20, 1u64 << 40, (1u64 << 62) - 1] {
+        let pkt = forge_initial_with_crypto_offset(offset);
+        assert_eq!(
+            probe(&pkt),
+            None,
+            "offset {offset} must be refused, not allocated"
+        );
+    }
+    // Sanity: the forged packet is well-formed — a small offset decrypts
+    // and is accepted into the (incomplete) hello, still yielding None.
+    let pkt = forge_initial_with_crypto_offset(64);
+    assert_eq!(probe(&pkt), None);
+}
