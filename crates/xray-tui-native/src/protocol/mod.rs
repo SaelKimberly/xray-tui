@@ -46,7 +46,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     match &ctx.params.protocol {
         ProtocolConfig::Vless(cfg) => vless::connect(ctx, stream, cfg).await,
         ProtocolConfig::Vmess(cfg) => vmess::connect(ctx, stream, cfg).await,
-        ProtocolConfig::Trojan(_) => not_impl("trojan"),
+        ProtocolConfig::Trojan(cfg) => trojan::connect(ctx, stream, cfg).await,
         ProtocolConfig::Hysteria2(_) => not_impl("hysteria2"),
         ProtocolConfig::Ss(_) => not_impl("shadowsocks"),
         ProtocolConfig::Ssr(_) => not_impl("shadowsocksr"),
@@ -64,6 +64,35 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         ProtocolConfig::Redirect(_) => not_impl("redirect (outbound-only kind)"),
         ProtocolConfig::TProxy(_) => not_impl("tproxy (outbound-only kind)"),
         ProtocolConfig::Mixed(_) => not_impl("mixed (outbound-only kind)"),
+    }
+}
+
+/// True when the link's protocol is a QUIC-family proxy (Hysteria2 /
+/// Hysteria1 / TUIC) whose dial replaces the TCP dial + security + upgrade
+/// chain entirely (shape.rs `ConnectShape::Quic`). The chain dispatches
+/// these to [`connect_quic`] instead of the uniform transport pipeline.
+#[must_use]
+pub(crate) const fn is_quic_link(ctx: &LinkContext) -> bool {
+    matches!(
+        ctx.params.protocol,
+        ProtocolConfig::Hysteria2(_) | ProtocolConfig::Hysteria1(_) | ProtocolConfig::Tuic(_)
+    )
+}
+
+/// Run the QUIC protocol phase: a fresh QUIC dial (dial + security +
+/// upgrade REPLACED by the QUIC connection — spec §5.2), then the protocol's
+/// own handshake over a QUIC stream.
+///
+/// The only implemented member is Hysteria2; Hysteria1 and TUIC stay
+/// `NotImplemented` until their modules land.
+pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
+    match &ctx.params.protocol {
+        ProtocolConfig::Hysteria2(cfg) => hysteria2::connect(ctx, cfg).await,
+        ProtocolConfig::Hysteria1(_) => not_impl("hysteria1 (QUIC)"),
+        ProtocolConfig::Tuic(_) => not_impl("tuic (QUIC)"),
+        _ => Err(NativeError::Config(
+            "connect_quic requires a QUIC-family protocol (Hysteria2/Hysteria1/Tuic)".into(),
+        )),
     }
 }
 

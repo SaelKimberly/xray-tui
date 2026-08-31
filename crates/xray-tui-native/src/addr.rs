@@ -102,6 +102,47 @@ pub fn encode_addr(target: &TargetAddr) -> Result<Vec<u8>, NativeError> {
     Ok(out)
 }
 
+// Trojan / SOCKS5-ATYP family bytes. Distinct from the VLESS/VMess wire
+// family ([`ADDR_TYPE_*`]): trojan's address parser uses the classic
+// SOCKS5 address types (xray-core `proxy/trojan/protocol.go`
+// `AddressFamilyByte(0x01,IPv4)/(0x04,IPv6)/(0x03,Domain)`; sing-box's
+// `SocksaddrSerializer` is byte-identical).
+pub const TROJAN_ATYP_IPV4: u8 = 0x01;
+pub const TROJAN_ATYP_DOMAIN: u8 = 0x03;
+pub const TROJAN_ATYP_IPV6: u8 = 0x04;
+
+/// Encode a destination in **port-last** order with the **trojan** family
+/// bytes: address (SOCKS5-ATYP type byte + payload), then port BE2.
+///
+/// Trojan's address parser is built without the `PortFirst()` option
+/// (xray-core `proxy/trojan/protocol.go` `NewAddressParser`), so the wire
+/// order is `ATYP | addr | port` — the reverse of VLESS/VMess
+/// ([`encode_addr`]) — and the family bytes are the SOCKS5 set
+/// (`0x01`/`0x03`/`0x04`), NOT the VLESS/VMess `ADDR_TYPE_*` (1/2/3).
+pub fn encode_addr_port_last(target: &TargetAddr) -> Result<Vec<u8>, NativeError> {
+    let mut out = Vec::with_capacity(1 + 16 + 2);
+    match &target.host {
+        Host::Ip(IpAddr::V4(ip)) => {
+            out.push(TROJAN_ATYP_IPV4);
+            out.extend_from_slice(&ip.octets());
+        }
+        Host::Ip(IpAddr::V6(ip)) => {
+            out.push(TROJAN_ATYP_IPV6);
+            out.extend_from_slice(&ip.octets());
+        }
+        Host::Domain(domain) => {
+            out.push(TROJAN_ATYP_DOMAIN);
+            let len = u8::try_from(domain.len()).map_err(|_| {
+                NativeError::Config(format!("domain longer than 255 bytes: {domain}"))
+            })?;
+            out.push(len);
+            out.extend_from_slice(domain.as_bytes());
+        }
+    }
+    out.extend_from_slice(&target.port.to_be_bytes());
+    Ok(out)
+}
+
 /// Decode one wire address; returns the address plus the unconsumed tail.
 #[must_use]
 pub fn decode_addr(bytes: &[u8]) -> Option<(TargetAddr, &[u8])> {

@@ -52,11 +52,13 @@ pub const fn pick(cores: &(CoreUnderTest, CoreUnderTest), kind: CoreKind) -> &Co
 /// TLS-variant builders — keep the `#[case]` rows one-liners (shared by the
 /// vless + vmess matrices; `StandardTls` is `CaseSpec`'s default, no builder).
 #[must_use]
+#[allow(dead_code)] // shared across test binaries; each uses a subset
 pub fn fp(id: &'static str) -> Box<dyn TlsVariant> {
     Box::new(FingerprintTls(id))
 }
 
 #[must_use]
+#[allow(dead_code)] // shared across test binaries; each uses a subset
 pub fn reality() -> Box<dyn TlsVariant> {
     Box::new(RealityTls::fresh())
 }
@@ -66,6 +68,7 @@ pub fn reality() -> Box<dyn TlsVariant> {
 /// accepts nothing else — a green row is a negotiated ML-KEM-768 exchange
 /// (SP7 spec §7.3).
 #[must_use]
+#[allow(dead_code)] // shared across test binaries; each uses a subset
 pub fn pq_tls() -> Box<dyn TlsVariant> {
     Box::new(PqTls)
 }

@@ -138,10 +138,10 @@ hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`
 | `chain.rs` | `connect_chain`: fold the layer stack |
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
-| `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp) **or the QUIC h3 dial** (xhttp + exactly-one `h3` ALPN → `connect_quic`: a quinn Endpoint over UDP; the dial REPLACES dial + security + upgrade — `is_self_contained`, quinn/rustls TLS is internal, webpki-roots default verify with the harness-CA override in test/e2e builds); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS — the h3 mode is the `connect` QUIC dial above, not an upgrade step; the v3 protocol (session open, GET download, POST uploads, pacing) is written once over the `V3Send` seam shared by h1/h2/h3, and h3 requests use absolute-URI form (`:scheme`/`:authority` per RFC 9114 §4.3.1 — the interop fix)) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts. QUIC/HTTP-3 is quinn 0.11 (rustls-ring) + h3 0.0.8 + h3-quinn 0.0.10 + webpki-roots (the h3 arm's default trust store); rustls (ring) is a mandatory native dep (was native-e2e-gated optional) — the h3 arm's quinn TLS config + the unit/e2e server double |
+| `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp) **or the QUIC dial** (`quic.rs` — the shared quinn endpoint + rustls/TLS-verify + 0-RTT helpers used by BOTH the xhttp h3 arm and the hysteria2 client; xhttp + exactly-one `h3` ALPN → `connect_quic` and hysteria2 are `is_self_contained` — the dial REPLACES dial + security + upgrade, quinn/rustls TLS is internal, webpki-roots default verify with the harness-CA override in test/e2e builds); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS — the h3 mode is the `connect` QUIC dial above, not an upgrade step; the v3 protocol (session open, GET download, POST uploads, pacing) is written once over the `V3Send` seam shared by h1/h2/h3, and h3 requests use absolute-URI form (`:scheme`/`:authority` per RFC 9114 §4.3.1 — the interop fix)) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts. QUIC/HTTP-3 is quinn 0.11 (rustls-ring) + h3 0.0.8 + h3-quinn 0.0.10 + webpki-roots (the h3 arm's default trust store); rustls (ring) is a mandatory native dep (was native-e2e-gated optional) — the h3 arm's quinn TLS config + the unit/e2e server double |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `Fingerprint`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
-| `protocol/` | 20 protocol modules; only `vless` + `vmess` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT) |
-| `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream/salamander stubs) |
+| `protocol/` | 20 protocol modules; `vless` + `vmess` + `trojan` + `hysteria2` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT) |
+| `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream) + `salamander.rs` (Hysteria2 Salamander packet obfuscation: salt + BLAKE2b-256 keyed-XOR, datagram transform) |
 | `shape.rs` | `ConnectShape`: uniform vs divergent connect paths |
 | `e2e/` (feature `native-e2e`) | case/config/core/harness/variant — real-core scenarios |
 
@@ -210,7 +210,7 @@ X25519/P256/P384, hybrid key share) now works end-to-end.
 
 ## E2E coverage (tier 3)
 
-The suite has nine subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
+The suite has eleven subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
 VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/XHTTP-h3(QUIC) × serving core(s) — 136
 tests = 130 green + 6 documented ignored (vless 78+6, vmess 52; ignored: the 4 ws/grpc
 plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (ML-KEM axis,
@@ -227,6 +227,17 @@ itself, so the spider's bytes never reach a dest (`spider_reaches_dest()`
 false). Rows 1-3, 6 and 8-11 probe HTTP through an established tunnel; the
 two fallback cases (rows 4-5, wrong pbk / wrong sid) expect `connect()` to fail
 with the fallback error and skip the probe.
+
+**Trojan axis** (`tests/trojan.rs`): 12 rows — the TCP-stream trojan (password header + raw relay) ×
+network {tcp, ws, grpc} × TLS {tls-standard, tls-chrome fingerprint} × core {xray, sing-box}. The
+wire protocol is identical on either core; the transport + security ride the uniform pipeline the
+vless/vmess rows exercise.
+
+**Hysteria2 axis** (`tests/hysteria2.rs`): 2 rows — the QUIC-family hysteria2 (\`ConnectShape::Quic\`,
+fresh quinn dial + ALPN \`h3\` + HTTP/3 auth) against a sing-box hysteria2 inbound (xray-core has no
+hysteria2 server): {default cert-TLS} × {salamander-obfs}. QUIC TLS is rustls-internal, so no
+fingerprint row exists. TCP tunnels use raw QUIC streams + the \`TCPRequest\`/\`TCPResponse\` frames;
+hysteria2 UDP datagram sessions are out of scope (\`connect_udp\` is VLESS-only).
 
 **VLESS vision flow axis** (spec §7.4): 8 rows — `flow = xtls-rprx-vision`,
 tcp network, × core {xray, sing-box} × outer {tls, reality} × app {plain,
@@ -385,13 +396,13 @@ REALITY compatibility (any resolvable identity via
 |----------|:---------:|:--------:|:-------------:|:----------:|:-------:|:---:|
 | VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Trojan | ✅ | ✅ | 📋 | ✅ | ✅ | 📋 |
+| Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Shadowsocks | ✅ | ✅ | 📋 | — | — | 📋 |
 | ShadowsocksR | ⛔ | ✅ | 📋 | — | — | 📋 |
 | SOCKS | ✅ | ✅ | 📋 | — | — | 📋 |
 | HTTP | ✅ | ✅ | 📋 | — | — | 📋 |
 | WireGuard | ✅ | ✅ | 📋 | — | — | 📋 |
-| Hysteria2 | ✅ | ✅ | 📋 | 🔒 QUIC | — | 📋 |
+| Hysteria2 | ✅ | ✅ | ✅ | 🔒 QUIC | — | ✅ |
 | Hysteria1 | ⛔ | ✅ | 📋 | 🔒 QUIC | — | 📋 |
 | TUIC | ⛔ | ✅ | 📋 | 🔒 QUIC | — | 📋 |
 | Naïve | ⛔ | ✅ | 📋 | ✅ | — | 📋 |
@@ -445,14 +456,16 @@ Notes on the matrix:
 | Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2 (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP ✅ + XHTTP-h3 via the shared xhttp h3 dial (e2e covered by the vless row; XHTTP stream-one ✅ (SP6))
 | Status | Native client complete + e2e (aes-128-gcm, chacha20-poly1305, tls-firefox, reality, tls-pq) × both cores, full transport matrix e2e (kcp rows run via the shared transport; e2e coverage is the vless kcp rows; the SP7 tls-pq row pins X25519MLKEM768 on both ends and asserts negotiated-hybrid). Legacy ciphers ⛔. Deferred: HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux/reuse pooling, browser-masquerade header set, v2rayhttp no-TLS h1 arm, the general QUIC client transport (quinn landed for xhttp h3, SP5). |
 
-**Trojan** — 📋 native
+**Trojan** — ✅ native
 | Capability | Detail |
 |------------|--------|
 | Encryption | none — plaintext after TLS; security is the TLS layer |
-| Auth | password (SHA-224-derived key in the header) |
-| Obfuscation | none (REALITY can carry it) |
-| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP only 📋 |
-| Status | Simple: TLS + password header + raw tunnel. TLS engine ✅. |
+| Auth | password: 56-byte lowercase `hex(sha224(password))` in the request header (`protocol/trojan/auth_key`, xray `hexSha224`) |
+| Obfuscation | none (REALITY can carry it via the engine) |
+| Transports | TCP, WS, gRPC, h2, QUIC (xray-core); TCP/WS/gRPC/h2/QUIC (sing-box) — native: TCP/WS/gRPC/HTTPUpgrade ride the uniform pipeline ✅ |
+| Wire | request `key(56) || CRLF || command(1) || ATYP+addr+port-BE2 (port-LAST — trojan's `NewAddressParser` has no `PortFirst`, sing-box's `SocksaddrSerializer` is port-last too) || CRLF`; **no server response header** (xray + sing-box relay raw after the request) — the tunnel is pure passthrough |
+| UDP | command 3 (`cmd 0x03`) per-datagram `[addr][2B len][CRLF][payload]` — NOT implemented: `protocol::connect_udp` is VLESS-only (VMess precedent) |
+| Status | Native client complete + e2e (`tests/trojan.rs`): {tcp, ws, grpc} × {tls-standard, tls-chrome} × both cores. TLS engine path reuses the existing security stack exactly. |
 
 **Shadowsocks** — 📋 native
 | Capability | Detail |
@@ -499,14 +512,15 @@ Notes on the matrix:
 | Transports | UDP device tunnel |
 | Status | 🔒 needs TUN/device abstraction or userspace UDP socket tunnel. `ConnectShape` divergent. |
 
-**Hysteria2** — 📋 native
+**Hysteria2** — ✅ native
 | Capability | Detail |
 |------------|--------|
-| Encryption | TLS 1.3 inside QUIC (standard + fingerprint TLS ✅ via engine) |
-| Auth | password in QUIC 0-RTT |
-| Obfuscation | `salamander` obfs (crypto/ `salamander.rs` scaffolding) |
-| Transports | QUIC (UDP) — 🔒 no QUIC transport yet |
-| Status | Client needs a QUIC stack; out of scope until `quic` transport 📋. |
+| Encryption | TLS 1.3 inside QUIC (quinn/rustls internal — spec §5.2; ALPN `h3`, `insecure` honored, webpki-roots default, harness-CA override in test/e2e) |
+| Auth | HTTP/3 POST `https://hysteria/auth` with `hysteria-auth` header (auth token); status **233** = OK (`protocol/hysteria2` `runtime_auth`) |
+| Obfuscation | `salamander` obfs ✅ (`crypto/salamander.rs`: 8-byte random salt + payload XOR `blake2b-256(psk||salt)`; a `quinn::AsyncUdpSocket` wrapper (`SalamanderSocket`) transforms every QUIC datagram) |
+| Transports | QUIC (`ConnectShape::Quic` — a fresh quinn dial replaces dial + security + upgrade; `protocol/hysteria2/quic.rs` shared endpoint/TLS/0-RTT helpers via `transport/quic.rs`). TCP tunnel = a RAW quinn bidi stream with `TCPRequest` frame (`varint 0x401 | addrLen | addr | padLen | padding`) + `TCPResponse` (status 0 = OK), then the `H2Stream` relay. **The h3 session must outlive the tunnel**: the server runs the h3 `StreamDispatcher` (quic-go `http3.Server`) over the SAME quinn connection that carried the auth, so dropping the last `SendRequest` clone after auth closes the session and tears the connection down (the `H3Keepalive` RAII guard in `H2Stream` holds it) |
+| UDP | datagram sessions (QUIC datagrams + `UDPMessage` framing) — NOT implemented: `protocol::connect_udp` is VLESS-only |
+| Status | Native client complete + e2e (`tests/hysteria2.rs`, sing-box single-core — xray-core has no hysteria2 inbound): {default-tls, salamander-obfs}. No fingerprint row (QUIC ClientHellos are rustls-internal). |
 
 **Hysteria1** — 📋 native
 | Capability | Detail |

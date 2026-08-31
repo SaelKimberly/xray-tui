@@ -34,6 +34,8 @@ hmac = "0.13"
 sha2 = "0.11"
 crc32fast = "1"
 md-5 = "0.11"
+blake2 = "0.11"
+wide = "1.7.0"
 
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
 ring = "0.17"

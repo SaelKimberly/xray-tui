@@ -51,6 +51,26 @@ pub async fn connect_chain(
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
+        if protocol::is_quic_link(&ctx) {
+            // QUIC-family protocols (Hysteria2/Hysteria1/TUIC) are a
+            // divergent dial: `protocol::connect_quic` performs the QUIC dial
+            // (replacing dial + security + upgrade — spec §5.2) and must be
+            // the LAST link (a QUIC connection cannot ride an existing TCP
+            // tunnel).
+            if i + 1 != links.len() {
+                return Err(NativeError::Config(
+                    "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) must be the last link"
+                        .into(),
+                ));
+            }
+            if base.is_some() {
+                return Err(NativeError::Config(
+                    "a QUIC-family protocol cannot reuse a base tunnel (fresh QUIC dial)".into(),
+                ));
+            }
+            base = Some(protocol::connect_quic(&ctx).await?);
+            continue;
+        }
         let dialed = transport::connect(&ctx, base).await?;
         let upgraded = secured_upgraded(&ctx, dialed).await?;
         base = Some(protocol::connect(&ctx, upgraded).await?);
@@ -74,6 +94,11 @@ pub async fn connect_chain_udp(
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
+        if protocol::is_quic_link(&ctx) {
+            return Err(NativeError::Config(
+                "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) is not supported by the                  UDP tunnel path".into(),
+            ));
+        }
         let dialed = transport::connect(&ctx, base).await?;
         let upgraded = secured_upgraded(&ctx, dialed).await?;
         if i + 1 == links.len() {
@@ -101,6 +126,11 @@ pub async fn connect_chain_mux(
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
+        if protocol::is_quic_link(&ctx) {
+            return Err(NativeError::Config(
+                "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) is not supported by the                  mux tunnel path".into(),
+            ));
+        }
         let dialed = transport::connect(&ctx, base).await?;
         let upgraded = secured_upgraded(&ctx, dialed).await?;
         if i + 1 == links.len() {

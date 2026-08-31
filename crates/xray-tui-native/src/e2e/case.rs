@@ -17,6 +17,8 @@ use crate::protocol::vless::PacketMode;
 pub enum ProtocolKind {
     Vless,
     Vmess,
+    Trojan,
+    Hysteria2,
 }
 
 /// VLESS flow control: `xtls-rprx-vision` (`Vision`) or the XUDP variant
@@ -121,6 +123,11 @@ pub struct CaseSpec {
     /// (post-quantum) key share — a PQ row that silently fell back to
     /// classical fails instead of passing.
     pq_assert: bool,
+    /// Hysteria2 Salamander obfuscation PSK (`Some` enables it).
+    obfs: Option<&'static str>,
+    /// Single-core gate: `Some(kind)` restricts the row to that core only
+    /// (hysteria2 is sing-box-only — xray-core has no hysteria2 inbound).
+    single_core: Option<CoreKind>,
 }
 
 impl CaseSpec {
@@ -138,6 +145,8 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
+            obfs: None,
+            single_core: None,
         }
     }
 
@@ -155,6 +164,50 @@ impl CaseSpec {
             udp: None,
             vless_enc: None,
             pq_assert: false,
+            obfs: None,
+            single_core: None,
+        }
+    }
+
+    /// A trojan case: password + transport, cert-TLS or fingerprint
+    /// security via [`CaseSpec::with_tls`].
+    #[must_use]
+    pub fn trojan() -> Self {
+        Self {
+            protocol: ProtocolKind::Trojan,
+            security: None,
+            tls: None,
+            network: "tcp",
+            xhttp_mode: None,
+            flow: None,
+            app: AppKind::Plain,
+            mux: false,
+            udp: None,
+            vless_enc: None,
+            pq_assert: false,
+            obfs: None,
+            single_core: None,
+        }
+    }
+
+    /// A hysteria2 case (QUIC dial): always single-core sing-box (xray-core
+    /// has no hysteria2 inbound). `obfs` enables Salamander obfuscation.
+    #[must_use]
+    pub fn hysteria2(obfs: Option<&'static str>) -> Self {
+        Self {
+            protocol: ProtocolKind::Hysteria2,
+            security: None,
+            tls: None,
+            network: "tcp",
+            xhttp_mode: None,
+            flow: None,
+            app: AppKind::Plain,
+            mux: false,
+            udp: None,
+            vless_enc: None,
+            pq_assert: false,
+            obfs,
+            single_core: Some(CoreKind::SingBox),
         }
     }
 
@@ -266,6 +319,12 @@ impl CaseSpec {
     /// Cores this case runs against (variant gate; no security → both).
     #[must_use]
     pub fn cores(&self) -> &'static [CoreKind] {
+        if let Some(kind) = self.single_core {
+            return match kind {
+                CoreKind::Xray => &[CoreKind::Xray],
+                CoreKind::SingBox => &[CoreKind::SingBox],
+            };
+        }
         if self.vless_enc.is_some() {
             // VLESS account encryption: sing-box has no decryption support.
             return &[CoreKind::Xray];
@@ -274,6 +333,14 @@ impl CaseSpec {
             .as_ref()
             .map_or(&[CoreKind::Xray, CoreKind::SingBox], |s| s.cores())
     }
+
+    /// True when the row's server listens on UDP (a QUIC/QUIC-family
+    /// listener — hysteria2) and the readiness probe must be a bound UDP
+    /// socket rather than a TCP accept.
+    #[must_use]
+    pub const fn is_udp_listener(&self) -> bool {
+        matches!(self.protocol, ProtocolKind::Hysteria2)
+    }
 }
 
 impl E2eCase for CaseSpec {
@@ -281,6 +348,8 @@ impl E2eCase for CaseSpec {
         let proto = match self.protocol {
             ProtocolKind::Vless => "vless",
             ProtocolKind::Vmess => "vmess",
+            ProtocolKind::Trojan => "trojan",
+            ProtocolKind::Hysteria2 => "hysteria2",
         };
         let flow = self
             .flow
@@ -303,6 +372,11 @@ impl E2eCase for CaseSpec {
             ),
         };
         let mux = if self.mux() { "/mux" } else { "" };
+        let obfs = if self.obfs.is_some() {
+            "/obfs-salamander"
+        } else {
+            ""
+        };
         let pq = if self.pq_assert { "/pq" } else { "" };
         let enc = if self.vless_enc.is_some() {
             "/pq-enc"
@@ -310,7 +384,7 @@ impl E2eCase for CaseSpec {
             ""
         };
         format!(
-            "{proto}/{flow}{}/{tls}{sec}{app}{mux}{pq}{enc}",
+            "{proto}/{flow}{}/{tls}{sec}{app}{mux}{obfs}{pq}{enc}",
             self.network
         )
     }
@@ -329,6 +403,8 @@ impl E2eCase for CaseSpec {
                 let security = self.security.as_ref().and_then(|s| s.server_security(core));
                 config::vmess_inbound(core, env, security, self.tls(), self.network)
             }
+            ProtocolKind::Trojan => config::trojan_inbound(core, env, self.network),
+            ProtocolKind::Hysteria2 => config::hysteria2_inbound(env, self.obfs),
         }
     }
 
@@ -357,6 +433,10 @@ impl E2eCase for CaseSpec {
                     self.xhttp_mode,
                 )
             }
+            ProtocolKind::Trojan => {
+                config::client_params_trojan(port, target, self.tls(), self.network)
+            }
+            ProtocolKind::Hysteria2 => config::client_params_hysteria2(port, target, self.obfs),
         };
         // pq-enc rows: the VLESS outbound carries the mlkem768x25519plus
         // account `encryption` (the client-side PUBLIC key segments).

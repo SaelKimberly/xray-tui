@@ -520,8 +520,9 @@ and returns the next.
   `FingerprintConnector` over `xray-tui-tls`); `Reality` →
   `security/reality.rs` (`RealityConnector`). Trust: `insecure` / `pin_sha256`
   (pin replaces chain walk + SAN but never the CertificateVerify signature).
-- `protocol/` — 20 protocol modules; only `vless` + `vmess` are implemented.
-  Every other kind returns `NativeError::NotImplemented` naming the feature.
+- `protocol/` — 20 protocol modules; `vless`, `vmess`, `trojan` + `hysteria2` are implemented
+  (trojan = TCP-stream family via the uniform pipeline; hysteria2 = `ConnectShape::Quic`
+  fresh quinn dial). Every other kind returns `NativeError::NotImplemented` naming the feature.
   `shape.rs` `ConnectShape` marks the divergent paths (device tunnels:
   WireGuard/Tailscale; own-handshake: SSH; outbound-only kinds: Redirect/TProxy/
   Mixed).

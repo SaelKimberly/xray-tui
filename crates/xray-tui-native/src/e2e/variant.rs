@@ -121,7 +121,7 @@ impl TlsVariant for StandardTls {
         crate::security::fingerprint::set_test_ca(&certs.ca_der);
         // The h3 (QUIC) arm's rustls is quinn-internal — the engine verifier
         // never sees it, so the harness CA needs its own hook (SP5 T4).
-        crate::transport::xhttp::set_test_ca(&certs.ca_der);
+        crate::transport::quic::set_test_ca(&certs.ca_der);
     }
 }
 
@@ -146,7 +146,7 @@ impl TlsVariant for PqTls {
     fn client_trust(&self, certs: &Certs) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         crate::security::fingerprint::set_test_ca(&certs.ca_der);
-        crate::transport::xhttp::set_test_ca(&certs.ca_der);
+        crate::transport::quic::set_test_ca(&certs.ca_der);
     }
 }
 

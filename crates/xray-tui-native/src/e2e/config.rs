@@ -786,6 +786,174 @@ pub fn client_params_vless(
     )
 }
 
+/// The trojan outbound password shared by the serve-side configs and the
+/// client params.
+pub const TROJAN_PASSWORD: &str = "trojan-test-password";
+/// The hysteria2 auth password shared by the server config and client params.
+pub const HYSTERIA2_AUTH: &str = "hy2-test-auth-token";
+/// The salamander obfuscation PSK (≥4 bytes) for the obfs row.
+pub const HYSTERIA2_OBFS_PSK: &str = "obfs-shared-secret";
+
+/// Trojan inbound JSON for `core` (`protocol`/`type` "trojan", password
+/// `clients[0]`/`users[0]`, `tls`/`streamSettings` per dialect).
+#[must_use]
+pub fn trojan_inbound(core: CoreKind, env: &ServerEnv, network: &str) -> String {
+    let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
+    let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    let alpn = match network {
+        "grpc" => serde_json::json!(["h2"]),
+        _ => serde_json::json!(["http/1.1"]),
+    };
+    let json = match core {
+        CoreKind::Xray => {
+            let mut stream = serde_json::json!({
+                "network": network,
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [
+                        { "certificateFile": cert_path, "keyFile": key_path }
+                    ],
+                    "alpn": alpn
+                }
+            });
+            match network {
+                "ws" => {
+                    stream["wsSettings"] = serde_json::json!({ "path": "/ws" });
+                }
+                "grpc" => {
+                    stream["grpcSettings"] = serde_json::json!({ "serviceName": "gun" });
+                }
+                "httpupgrade" => {
+                    stream["httpupgradeSettings"] =
+                        serde_json::json!({ "path": "/hu", "host": "localhost" });
+                }
+                _ => {}
+            }
+            serde_json::json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1", "port": env.port, "protocol": "trojan",
+                    "settings": { "clients": [{ "password": TROJAN_PASSWORD }] },
+                    "streamSettings": stream
+                }],
+                "outbounds": [{ "protocol": "freedom" }]
+            })
+        }
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "trojan", "listen": "127.0.0.1", "listen_port": env.port,
+                "users": [{ "password": TROJAN_PASSWORD }],
+                "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path,
+                    "alpn": alpn }
+            });
+            match network {
+                "ws" => {
+                    inbound["transport"] = serde_json::json!({ "type": "ws", "path": "/ws" });
+                }
+                "grpc" => {
+                    inbound["transport"] =
+                        serde_json::json!({ "type": "grpc", "service_name": "gun" });
+                }
+                "httpupgrade" => {
+                    inbound["transport"] = serde_json::json!({
+                        "type": "httpupgrade", "path": "/hu", "host": "localhost"
+                    });
+                }
+                _ => {}
+            }
+            serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            })
+        }
+    };
+    serde_json::to_string(&json).expect("trojan server config serializes")
+}
+
+/// Native client params dialing a Trojan listener (TCP stream family; the
+/// transport + security ride the uniform pipeline).
+#[must_use]
+pub fn client_params_trojan(
+    port: u16,
+    target: SocketAddr,
+    tls: &dyn TlsVariant,
+    network: &str,
+) -> NativeConnectParams {
+    let transport = match network {
+        "ws" => serde_json::json!({ "type": "ws", "path": "/ws" }),
+        "grpc" => serde_json::json!({ "type": "grpc", "service_name": "gun" }),
+        "httpupgrade" => {
+            serde_json::json!({ "type": "http_upgrade", "path": "/hu", "host": "localhost" })
+        }
+        _ => serde_json::json!({ "type": "tcp" }),
+    };
+    let mut protocol_value = serde_json::json!({
+        "schema": "Trojan",
+        "password": TROJAN_PASSWORD,
+        "transport": transport
+    });
+    if tls.tls_enabled() {
+        protocol_value["security"] = client_security(tls, network);
+    }
+    let protocol: ProtocolConfig =
+        serde_json::from_value(protocol_value).expect("trojan client config parses");
+    let server = EndpointEssentials::new("127.0.0.1", port);
+    NativeConnectParams::new(
+        protocol,
+        server,
+        TargetAddr::new(Host::Ip(target.ip()), target.port()),
+    )
+}
+
+/// Hysteria2 inbound JSON — sing-box only (xray-core has no hysteria2
+/// inbound). `obfs` enables Salamander when `Some(password)`.
+#[must_use]
+pub fn hysteria2_inbound(env: &ServerEnv, obfs: Option<&str>) -> String {
+    let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
+    let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    let mut inbound = serde_json::json!({
+        "type": "hysteria2", "listen": "127.0.0.1", "listen_port": env.port,
+        "users": [{ "password": HYSTERIA2_AUTH }],
+        "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path }
+    });
+    if let Some(psk) = obfs {
+        inbound["obfs"] = serde_json::json!({ "type": "salamander", "password": psk });
+    }
+    let json = serde_json::json!({
+        "log": { "level": "warn" },
+        "inbounds": [inbound],
+        "outbounds": [{ "type": "direct" }]
+    });
+    serde_json::to_string(&json).expect("hysteria2 server config serializes")
+}
+
+/// Native client params dialing a Hysteria2 listener (QUIC dial; requires
+/// TLS — hysteria2 has no no-TLS mode). `obfs` enables Salamander.
+#[must_use]
+pub fn client_params_hysteria2(
+    port: u16,
+    target: SocketAddr,
+    obfs: Option<&'static str>,
+) -> NativeConnectParams {
+    let mut protocol_value = serde_json::json!({
+        "schema": "Hysteria2",
+        "auth": HYSTERIA2_AUTH,
+        "security": { "tls": { "enabled": true, "insecure": false } }
+    });
+    if let Some(psk) = obfs {
+        protocol_value["obfs"] = serde_json::json!("salamander");
+        protocol_value["obfs_password"] = serde_json::json!(psk);
+    }
+    let protocol: ProtocolConfig =
+        serde_json::from_value(protocol_value).expect("hysteria2 client config parses");
+    let server = EndpointEssentials::new("127.0.0.1", port);
+    NativeConnectParams::new(
+        protocol,
+        server,
+        TargetAddr::new(Host::Ip(target.ip()), target.port()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::harness::generate_certs;

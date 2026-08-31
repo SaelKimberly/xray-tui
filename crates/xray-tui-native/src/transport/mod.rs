@@ -15,6 +15,7 @@ pub mod grpc;
 pub mod http;
 pub mod httpupgrade;
 pub mod kcp;
+pub mod quic;
 pub mod tcp;
 pub mod v2rayhttp;
 pub mod ws;

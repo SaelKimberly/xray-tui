@@ -182,7 +182,7 @@ pub async fn run_against(
             core.kind,
             &config_path,
             port,
-            matches!(case.network(), "kcp" | "xhttp3"),
+            matches!(case.network(), "kcp" | "xhttp3") || case.is_udp_listener(),
         );
 
         case.client_trust(certs);

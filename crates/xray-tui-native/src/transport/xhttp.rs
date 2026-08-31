@@ -12,7 +12,6 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context as TaskCx, Poll, ready};
 use std::time::{Duration, Instant};
 
@@ -737,107 +736,6 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     }
 }
 
-/// rustls `ServerCertVerifier` for the `insecure` TLS option: skips the
-/// certificate chain walk but still verifies the handshake signatures (xray
-/// `allowInsecure` semantics — the QUIC session stays sound, only the
-/// identity check is dropped).
-#[derive(Debug)]
-struct SkipServerVerify {
-    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
-}
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
-}
-
-// Test/e2e override: a QUIC-dial trust anchor trusting exactly one CA (the
-// harness CA) — the counterpart of `security::fingerprint::set_test_ca` for
-// quinn's internal rustls (the engine verifier never sees QUIC; spec §5.2).
-// Thread-local: each `#[tokio::test]` runs on its own OS thread with its own
-// harness CA, so parallel e2e cases can't clobber each other's trust store.
-// Production builds use webpki-roots and carry no test state.
-#[doc(hidden)]
-#[cfg(any(test, feature = "native-e2e"))]
-std::thread_local! {
-    static TEST_CA: std::cell::RefCell<Option<rustls::pki_types::CertificateDer<'static>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Install a test-only QUIC trust anchor trusting exactly `ca_der`
-/// (test/e2e harness).
-#[doc(hidden)]
-#[cfg(any(test, feature = "native-e2e"))]
-pub fn set_test_ca(ca_der: &[u8]) {
-    let der = rustls::pki_types::CertificateDer::from(ca_der.to_vec());
-    TEST_CA.with(|c| *c.borrow_mut() = Some(der));
-}
-
-/// rustls client config for the QUIC dial: ALPN `h3` (the trigger — spec
-/// §4.1), early data enabled (0-RTT), and cert verification mirroring the
-/// TLS opts (`insecure` → skip the chain walk; default → webpki-roots). The
-/// engine TLS + fingerprint machinery does not apply to QUIC (spec §5.2) —
-/// quinn's rustls is internal. The default (webpki) branch still runs the
-/// full chain walk; the harness CA merely replaces the trust anchor in
-/// test/e2e builds (mirror of `fingerprint::verifier_for`).
-fn quic_tls_config(ctx: &LinkContext) -> Result<rustls::ClientConfig, NativeError> {
-    let insecure = ctx.tls_opts()?.and_then(|o| o.insecure).unwrap_or(false);
-    let mut tls = if insecure {
-        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerify { algorithms }))
-            .with_no_client_auth()
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        #[cfg(any(test, feature = "native-e2e"))]
-        match TEST_CA.with(|c| c.borrow().clone()) {
-            Some(ca) => roots
-                .add(ca)
-                .map_err(|e| NativeError::Config(format!("xhttp h3 test CA: {e}")))?,
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
-        #[cfg(not(any(test, feature = "native-e2e")))]
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    };
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    tls.enable_early_data = true;
-    Ok(tls)
-}
-
 /// The HTTP/3 arm (xhttp + [`http_version`] == `"3"` → QUIC dial).
 ///
 /// A quinn Endpoint over UDP with ALPN `h3`, replacing the dial + security +
@@ -850,46 +748,17 @@ fn quic_tls_config(ctx: &LinkContext) -> Result<rustls::ClientConfig, NativeErro
 pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
     let mode = xhttp_mode(ctx)?;
     let server_addr = ctx.server_socket().await?;
-    // Bind the same address family as the server (quinn needs one socket).
-    let bind: std::net::SocketAddr = if server_addr.is_ipv6() {
-        "[::]:0".parse().expect("static ipv6 bind addr")
-    } else {
-        "0.0.0.0:0".parse().expect("static ipv4 bind addr")
-    };
-    let endpoint = quinn::Endpoint::client(bind)?;
-    let tls = quic_tls_config(ctx)?;
-    let mut quic_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-            .map_err(|e| NativeError::Config(format!("xhttp h3 tls config: {e}")))?,
-    ));
-    // Spec §4.2: xray `ConnIdleTimeout` = 300s + `QuicgoH3KeepAlivePeriod` =
-    // 10s. quinn's defaults (30s idle, no keepalive) would kill an idle h3
-    // tunnel mid-session where xray survives (the e2e wouldn't catch it:
-    // xray's server keepalives reset the client's idle timer).
-    let mut transport = quinn::TransportConfig::default();
-    transport
-        .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(Duration::from_mins(5))
-                .expect("300s idle timeout fits a VarInt"),
-        ))
-        .keep_alive_interval(Some(Duration::from_secs(10)));
-    quic_config.transport_config(Arc::new(transport));
-    let connecting = endpoint
-        .connect_with(quic_config, server_addr, &ctx.server_name())
-        .map_err(|e| NativeError::Dial(format!("xhttp h3 connect: {e}")))?;
-    let conn = match connecting.into_0rtt() {
-        Ok((conn, _accepted)) => conn,
-        Err(connecting) => {
-            let limit = timeouts::DIAL;
-            tokio::time::timeout(limit, connecting)
-                .await
-                .map_err(|_| NativeError::Timeout {
-                    step: "xhttp h3 handshake",
-                    limit,
-                })?
-                .map_err(|e| NativeError::Dial(format!("xhttp h3 handshake: {e}")))?
-        }
-    };
+    let endpoint = crate::transport::quic::client_endpoint(server_addr);
+    let tls = crate::transport::quic::quic_tls_config(ctx, b"h3")?;
+    let quic_config = crate::transport::quic::quinn_client_config(tls);
+    let conn = crate::transport::quic::connect(
+        &endpoint,
+        quic_config,
+        server_addr,
+        &ctx.server_name(),
+        "xhttp h3",
+    )
+    .await?;
 
     // The h3 connection driver owns the endpoint + quinn connection: it
     // polls the connection-level state (control frames, settings) and lives
