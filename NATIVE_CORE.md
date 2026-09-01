@@ -20,9 +20,14 @@ uses. The TLS engine exists because stock rustls ClientHellos are instantly
 identifiable: browser-fingerprint mimicry (and REALITY) needs a client hello
 we fully control.
 
-Both crates are client-side only. Server-side protocol behavior remains the
-job of xray-core / sing-box; the e2e harness runs real cores as servers to
-prove wire compatibility.
+The native core is primarily a client (each `connect` dials a remote proxy);
+it also hosts a local **SOCKS5 inbound** (`inbound/`) — accept → route →
+outbound — so the crate can stand in for the whole subprocess path: a local
+SOCKS5 listener whose routing engine (`xray-tui-route`) forwards to
+direct/block/proxy outbounds, where the proxy outbound reuses the native
+client tunnel. Remote *server-side* protocol behavior remains the job of
+xray-core / sing-box; the e2e harness runs real cores as servers to prove
+wire compatibility.
 
 **Roadmap: engine-only TLS.** The native client path is engine-only — every
 TLS/REALITY connect runs through `xray-tui-tls`. The rustls *client* path was
@@ -138,6 +143,7 @@ hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`
 | `chain.rs` | `connect_chain`: fold the layer stack |
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
+| `inbound/` | local SOCKS5 server (`Socks5Inbound`, RFC 1928 + RFC 1929 auth): accept → `xray-tui-route` `Engine` → tagged outbound (`Outbound`/`OutboundKind` — Direct / Block / Proxy, the proxy reusing `crate::connect`). TCP CONNECT only; BIND/UDP-ASSOCIATE refused `0x07`, `HijackDns` refused `0x02`. Hermetic tier-1: codec units + full-flow integration (echo relay, block/reject rules, domain routing, `override_addr` rewrite, auth, unknown tag) |
 | `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp) **or the QUIC dial** (`quic.rs` — the shared quinn endpoint + rustls/TLS-verify + 0-RTT helpers used by BOTH the xhttp h3 arm and the hysteria2 client; xhttp + exactly-one `h3` ALPN → `connect_quic` and hysteria2 are `is_self_contained` — the dial REPLACES dial + security + upgrade, quinn/rustls TLS is internal, webpki-roots default verify with the harness-CA override in test/e2e builds); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS — the h3 mode is the `connect` QUIC dial above, not an upgrade step; the v3 protocol (session open, GET download, POST uploads, pacing) is written once over the `V3Send` seam shared by h1/h2/h3, and h3 requests use absolute-URI form (`:scheme`/`:authority` per RFC 9114 §4.3.1 — the interop fix)) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts. QUIC/HTTP-3 is quinn 0.11 (rustls-ring) + h3 0.0.8 + h3-quinn 0.0.10 + webpki-roots (the h3 arm's default trust store); rustls (ring) is a mandatory native dep (was native-e2e-gated optional) — the h3 arm's quinn TLS config + the unit/e2e server double |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `Fingerprint`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; `vless` + `vmess` + `trojan` + `hysteria2` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT) |
@@ -648,7 +654,9 @@ Notes on the matrix:
 3. **Wire in the TUI**: a per-profile "native" toggle (or auto-fallback when a
    core binary is missing) — the unified `xray_tui_tls::client::connect` /
    `TlsConfig` engine API already proves the integration point.
-4. **Outbound-only kinds + routing** via native (redirect dial for
+4. **Routing + outbound-only kinds** via native — the SOCKS5 inbound
+   (`inbound/`, accept → route → direct/block/proxy outbound) is done; the
+   remaining piece is the outbound-only kinds (redirect dial for
    split-tunnel rules).
 5. **TLS 1.2 engine support** — the engine is TLS 1.3-only today; legacy
    (TLS 1.2-only) servers become reachable only after the engine learns

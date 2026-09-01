@@ -12,6 +12,9 @@ xray-tui-proto.workspace = true
 # TLS 1.3 fingerprint-mimicry engine (custom `TlsConnector` + REALITY provisioners)
 xray-tui-tls.workspace = true
 
+# routing engine for the SOCKS5 inbound (RuleSet → Decision; tag-based outbound dispatch)
+xray-tui-route = { path = "../xray-tui-route" }
+
 # async runtime
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 

@@ -8180,6 +8180,7 @@ dependencies = [
  "x25519-dalek",
  "xray-tui-hakari",
  "xray-tui-proto",
+ "xray-tui-route",
  "xray-tui-tls",
 ]
 

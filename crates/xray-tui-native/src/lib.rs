@@ -1,6 +1,7 @@
-//! Native proxy core — client-side, in-process implementations of the proxy
-//! protocols xray-tui otherwise obtains by spawning xray-core / sing-box
-//! subprocesses.
+//! Native proxy core — in-process implementations of the proxy protocols
+//! xray-tui otherwise obtains by spawning xray-core / sing-box subprocesses.
+//! Client face: [`connect`] and friends dial a remote proxy. Server face:
+//! [`inbound`] provides the local SOCKS5 inbound (accept → route → outbound).
 //!
 //! # Layering
 //!
@@ -46,6 +47,7 @@ pub mod crypto;
 pub mod e2e;
 pub mod error;
 pub mod headers;
+pub mod inbound;
 pub mod protocol;
 pub mod security;
 pub mod shape;
@@ -54,6 +56,7 @@ pub mod transport;
 pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
+pub use inbound::{Outbound, OutboundKind, ProxyOutbound, Socks5Inbound, Socks5InboundConfig};
 pub use protocol::vless::{
     MuxClient, MuxTarget, PacketConn, PacketMode, SessionStream, UdpSession,
 };
