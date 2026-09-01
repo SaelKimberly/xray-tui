@@ -409,13 +409,11 @@ mod tests {
                 },
             ]
         );
-        // Metadata columns (group_id, r#type, sort_order) are tolerated.
-        // Warnings: "nope" ip, "quic" protocol, domain_strategy, rule_set_file,
-        // rule_set_url.
+        // Warnings: "nope" ip, domain_strategy, rule_set_file, rule_set_url.
+        // "quic" is a valid sniffed protocol (no warning since T-QUIC).
         let ws = warnings_from_row(&r);
-        assert_eq!(ws.len(), 5, "warnings: {ws:?}");
+        assert_eq!(ws.len(), 4, "warnings: {ws:?}");
         assert!(ws.iter().any(|w| w.contains("nope")));
-        assert!(ws.iter().any(|w| w.contains("quic")));
         assert!(ws.iter().any(|w| w.contains("AsIs")));
         assert!(ws.iter().any(|w| w.contains("/etc/geosite.dat")));
         assert!(ws.iter().any(|w| w.contains("https://example.com/rs.json")));
