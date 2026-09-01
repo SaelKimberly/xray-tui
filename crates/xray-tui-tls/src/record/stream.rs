@@ -22,25 +22,178 @@ use crate::error::{Result, TlsError};
 
 /// TLS record content types (RFC 8446 §5.1).
 use super::{
-    CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET,
-    MAX_RECORD_PAYLOAD, TlsRecord, aead_aad, make_app_data_record,
+    AEAD_TAG_LEN, CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_CHANGE_CIPHER_SPEC,
+    CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET, MAX_RECORD_PAYLOAD, TlsRecord, aead_aad, aead_aad_12,
+    make_app_data_record, make_record_12,
 };
 
 /// Maximum plaintext bytes per TLS 1.3 record: 2^14 (RFC 8446 §5.2).
 const MAX_RECORD_PLAINTEXT: usize = 16_384;
 
-/// AEAD tag length for the TLS 1.3 AEADs in this engine (AES-GCM and
-/// ChaCha20-Poly1305 both use 16-byte tags).
-const AEAD_TAG_LEN: usize = 16;
-
 /// Key material plus per-direction sequence counters for a TLS 1.3
-/// connection.
-#[derive(Clone)]
+/// or TLS 1.2 connection.
+///
+/// Deliberately NOT `Clone`: the TLS 1.2 record nonce is derived from
+/// `write_seq`, so two streams sharing cloned keys would seal distinct
+/// plaintexts under the same (key, nonce) pair — catastrophic for both
+/// AES-GCM and ChaCha20-Poly1305.
 pub struct AppKeys {
-    pub read_key: AeadKey,
-    pub write_key: AeadKey,
+    pub read: RecordCipher,
+    pub write: RecordCipher,
     pub read_seq: u64,
     pub write_seq: u64,
+}
+
+impl AppKeys {
+    /// TLS 1.3 record keys (implicit `IV XOR seq` nonce).
+    #[must_use]
+    pub const fn tls13(read_key: AeadKey, write_key: AeadKey) -> Self {
+        Self {
+            read: RecordCipher::Tls13(read_key),
+            write: RecordCipher::Tls13(write_key),
+            read_seq: 0,
+            write_seq: 0,
+        }
+    }
+
+    /// TLS 1.2 record keys. `read_aead` and `write_aead` carry the
+    /// per-direction fixed IVs.
+    #[must_use]
+    pub const fn tls12(
+        read_key: AeadKey,
+        write_key: AeadKey,
+        read_aead: Tls12Aead,
+        write_aead: Tls12Aead,
+    ) -> Self {
+        // The TLS 1.2 handshake already consumed sequence number 0 in both
+        // directions (the encrypted Finished records), so application data
+        // starts at seq 1 — unlike TLS 1.3, where `AppKeys` are created
+        // before any encrypted record and start at 0.
+        Self {
+            read: RecordCipher::Tls12(read_key, read_aead),
+            write: RecordCipher::Tls12(write_key, write_aead),
+            read_seq: 1,
+            write_seq: 1,
+        }
+    }
+}
+
+/// Advance a record sequence number, refusing to wrap.
+///
+/// TLS has no automatic rekey in either version supported here, so a
+/// wrapped counter would reuse a nonce under the same key (RFC 8446 §5.5
+/// requires terminating the connection instead).
+fn advance_seq(seq: &mut u64) -> io::Result<u64> {
+    let current = *seq;
+    *seq = current.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS record sequence number exhausted — refusing to reuse a nonce",
+        )
+    })?;
+    Ok(current)
+}
+
+/// The record-protection cipher for a connection direction.
+pub enum RecordCipher {
+    /// TLS 1.3: implicit nonce = IV XOR seq, padded inner plaintext.
+    Tls13(AeadKey),
+    /// TLS 1.2 AEAD: per-suite nonce construction (see [`Tls12Aead`]).
+    Tls12(AeadKey, Tls12Aead),
+}
+
+impl RecordCipher {
+    /// Whether this cipher is TLS 1.3 (the plain-text alert and
+    /// non-application-data skip logic applies).
+    #[must_use]
+    pub const fn is_tls13(&self) -> bool {
+        matches!(self, Self::Tls13(_))
+    }
+}
+
+/// TLS 1.2 AEAD nonce construction. Sole owner of the per-record nonce
+/// geometry; the matching key-block geometry lives in
+/// [`crate::crypto::tls12::Tls12Suite::fixed_iv_len`].
+#[derive(Debug, Clone, Copy)]
+pub enum Tls12Aead {
+    /// AES-GCM (RFC 5288 §3): 4-byte fixed IV plus an 8-byte explicit
+    /// nonce carried in every record.
+    AesGcm { fixed_iv: [u8; 4] },
+    /// ChaCha20-Poly1305 (RFC 7905 §2): 12-byte fixed IV XOR the padded
+    /// 64-bit sequence number, with NO explicit nonce on the wire — the
+    /// same construction TLS 1.3 uses.
+    Chacha20Poly1305 { fixed_iv: [u8; 12] },
+}
+
+/// The explicit nonce bytes a TLS 1.2 record carries: at most 8 (AES-GCM),
+/// none for ChaCha20-Poly1305. Fixed-size to keep the record loop
+/// allocation-free and length mismatches unrepresentable.
+pub(crate) struct ExplicitNonce {
+    bytes: [u8; 8],
+    len: usize,
+}
+
+impl ExplicitNonce {
+    /// The bytes to place in (or read from) the record.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Tls12Aead {
+    /// Explicit nonce length in bytes: 8 for AES-GCM, 0 for `ChaCha`.
+    #[must_use]
+    pub const fn explicit_nonce_len(self) -> usize {
+        match self {
+            Self::AesGcm { .. } => 8,
+            Self::Chacha20Poly1305 { .. } => 0,
+        }
+    }
+
+    /// The explicit nonce this scheme puts on the wire for record `seq`.
+    ///
+    /// RFC 5288 §3 permits any unique value; the sequence number is the
+    /// standard choice (and what OpenSSL/rustls emit), which keeps the
+    /// on-wire nonce and the AAD sequence number in lockstep by
+    /// construction rather than by a second counter.
+    pub(crate) const fn explicit_nonce(self, seq: u64) -> ExplicitNonce {
+        ExplicitNonce {
+            bytes: seq.to_be_bytes(),
+            len: self.explicit_nonce_len(),
+        }
+    }
+
+    /// Build the 12-byte AEAD nonce for record `seq`.
+    ///
+    /// AES-GCM: `fixed_iv(4) || explicit(8)` — the fixed IV FIRST. RFC 5288
+    /// §3 writes the formula as `explicit_nonce || fixed_iv`, but the
+    /// interoperable wire order (OpenSSL, rustls) is fixed-iv-first.
+    /// ChaCha20-Poly1305: `fixed_iv(12) XOR left-padded seq` (RFC 7905 §2).
+    ///
+    /// `explicit` must be exactly [`Self::explicit_nonce_len`] bytes; a
+    /// mismatch is a caller bug and is reported, never panicked on.
+    pub(crate) fn nonce(self, seq: u64, explicit: &[u8]) -> io::Result<[u8; 12]> {
+        if explicit.len() != self.explicit_nonce_len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.2 explicit nonce length mismatch",
+            ));
+        }
+        let mut n = [0u8; 12];
+        match self {
+            Self::AesGcm { fixed_iv } => {
+                n[..4].copy_from_slice(&fixed_iv);
+                n[4..].copy_from_slice(explicit);
+            }
+            Self::Chacha20Poly1305 { fixed_iv } => {
+                n = fixed_iv;
+                for (dst, src) in n[4..].iter_mut().zip(seq.to_be_bytes()) {
+                    *dst ^= src;
+                }
+            }
+        }
+        Ok(n)
+    }
 }
 
 /// A TLS 1.3 application-data stream: decrypts records on read, encrypts and
@@ -242,60 +395,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
         }
     }
 
-    /// Decrypt one record and dispatch on its inner content type.
+    /// Dispatch a raw record to the version-specific process path.
     ///
-    /// Returns the plaintext for `CONTENT_APPLICATION_DATA`, `CloseNotify`
-    /// for `close_notify`, `Skip` for `NewSessionTicket` records, and an
-    /// error for alerts other than `close_notify`, other handshake records
-    /// (no renegotiation) and unknown content types.
-    fn process_record(&mut self, mut rec: TlsRecord) -> io::Result<DecryptedRecord> {
-        let plaintext = self
-            .keys
-            .read_key
-            .open(
-                self.keys.read_seq,
-                &aead_aad(rec.payload.len()),
-                &mut rec.payload,
-            )
-            .map_err(to_io_error)?;
-        self.keys.read_seq += 1;
-        let (inner_type, content) = strip_padding(&plaintext).map_err(to_io_error)?;
-        match inner_type {
-            CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(content.to_vec())),
-            CONTENT_ALERT => {
-                if content.len() >= 2 && content[1] == 0 {
-                    // close_notify: clean EOF.
-                    Ok(DecryptedRecord::CloseNotify)
-                } else {
-                    let level = content.first().copied().unwrap_or(2);
-                    let desc = content.get(1).copied().unwrap_or(0);
-                    Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("TLS alert: level {level} description {desc}"),
-                    ))
-                }
-            }
-            CONTENT_HANDSHAKE => {
-                // NewSessionTicket (0x04) legitimately follows the server
-                // Finished as an encrypted handshake record; drop it. Any
-                // other handshake message post-handshake is a protocol
-                // violation — TLS 1.3 has no renegotiation.
-                match content.first() {
-                    Some(&HS_NEW_SESSION_TICKET) => Ok(DecryptedRecord::Skip),
-                    Some(&msg_type) => Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected handshake message type {msg_type} after handshake"),
-                    )),
-                    None => Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "empty handshake record during application data",
-                    )),
-                }
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected inner TLS content type {other:#04x}"),
-            )),
+    /// The key is borrowed, never cloned: cloning a `RecordCipher` copies a
+    /// ring `LessSafeKey` (expanded AES key schedule + GHASH tables) per
+    /// record and duplicates key material on the heap.
+    fn process_record(&mut self, rec: TlsRecord) -> io::Result<DecryptedRecord> {
+        let AppKeys { read, read_seq, .. } = &mut self.keys;
+        match read {
+            RecordCipher::Tls13(key) => process_record_13(key, read_seq, rec),
+            RecordCipher::Tls12(key, aead) => process_record_12(key, *aead, read_seq, rec),
         }
     }
 
@@ -313,6 +422,105 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
             }
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+/// TLS 1.3: decrypt an `Application Data` record (inner content type at
+/// the end of the padded plaintext, RFC 8446 §5.4).
+fn process_record_13(
+    key: &AeadKey,
+    seq: &mut u64,
+    mut rec: TlsRecord,
+) -> io::Result<DecryptedRecord> {
+    let n = advance_seq(seq)?;
+    let plaintext = key
+        .open(n, &aead_aad(rec.payload.len()), &mut rec.payload)
+        .map_err(to_io_error)?;
+    let (inner_type, content) = strip_padding(&plaintext).map_err(to_io_error)?;
+    match inner_type {
+        CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(content.to_vec())),
+        CONTENT_ALERT => alert_to_record(content),
+        CONTENT_HANDSHAKE => post_handshake_message(content),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected inner TLS content type {other:#04x}"),
+        )),
+    }
+}
+
+/// TLS 1.2: decrypt a record (content type in the outer record header,
+/// explicit nonce, no padding, RFC 5246 §6.2.3.3).
+fn process_record_12(
+    key: &AeadKey,
+    aead: Tls12Aead,
+    seq: &mut u64,
+    mut rec: TlsRecord,
+) -> io::Result<DecryptedRecord> {
+    // Every post-handshake record is AEAD-protected. A plaintext
+    // ChangeCipherSpec here is an injected record (RFC 5246 §7.4.1 makes it
+    // `unexpected_message`): accepting it would let any off-path party feed
+    // the read loop records that never yield application bytes.
+    if rec.content_type == CONTENT_CHANGE_CIPHER_SPEC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unauthenticated ChangeCipherSpec record after the TLS 1.2 handshake",
+        ));
+    }
+    let explicit_len = aead.explicit_nonce_len();
+    if rec.payload.len() < explicit_len + AEAD_TAG_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS 1.2 record too short for explicit nonce + tag",
+        ));
+    }
+    let mut explicit = [0u8; 8];
+    explicit[..explicit_len].copy_from_slice(&rec.payload[..explicit_len]);
+    let n = advance_seq(seq)?;
+    let nonce = aead.nonce(n, &explicit[..explicit_len])?;
+    let ct = &mut rec.payload[explicit_len..];
+    let plaintext_len = ct.len() - AEAD_TAG_LEN;
+    let additional = aead_aad_12(n, rec.content_type, plaintext_len);
+    let plaintext = key
+        .open_with_nonce(nonce, &additional, ct)
+        .map_err(to_io_error)?;
+    match rec.content_type {
+        CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(plaintext)),
+        CONTENT_ALERT => alert_to_record(&plaintext),
+        CONTENT_HANDSHAKE => post_handshake_message(&plaintext),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected TLS content type {other:#04x}"),
+        )),
+    }
+}
+
+/// Map an authenticated alert body to a stream event: `close_notify` is a
+/// clean EOF, anything else terminates the stream (RFC 8446 §6).
+fn alert_to_record(body: &[u8]) -> io::Result<DecryptedRecord> {
+    if body.len() >= 2 && body[1] == 0 {
+        return Ok(DecryptedRecord::CloseNotify);
+    }
+    let level = body.first().copied().unwrap_or(2);
+    let desc = body.get(1).copied().unwrap_or(0);
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        format!("TLS alert: level {level} description {desc}"),
+    ))
+}
+
+/// Classify an authenticated handshake record seen after the handshake:
+/// only `NewSessionTicket` is legal (no renegotiation in either version).
+fn post_handshake_message(body: &[u8]) -> io::Result<DecryptedRecord> {
+    match body.first() {
+        Some(&HS_NEW_SESSION_TICKET) => Ok(DecryptedRecord::Skip),
+        Some(&msg_type) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected handshake message type {msg_type} after handshake"),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty handshake record during application data",
+        )),
     }
 }
 
@@ -352,29 +560,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
                 }
                 Poll::Ready(Ok(Some(rec))) => rec,
             };
-            // Raw records other than application data are invalid post
-            // handshake (TLS 1.3 §5.4) — but mirror `read_record`'s
-            // leniency for CCS middlebox-compat records: skip them. Alerts
-            // are exactly 2 bytes (`level || description`, RFC 8446 §6); a
+            // TLS 1.3 (RFC 8446 §5.4): raw records other than application data
+            // are invalid post handshake — but mirror `read_record`'s
+            // leniency for CCS middlebox-compat records (skip). Alerts are
+            // exactly 2 bytes (`level || description`, RFC 8446 §6); a
             // truncated raw alert is a protocol error, never silently
-            // skipped.
-            if rec.content_type == CONTENT_ALERT {
-                if rec.payload.len() >= 2 {
+            // skipped. TLS 1.2 protects every record type (alerts/handshake/
+            // CCS) and dispatches them inside `process_record`.
+            if this.keys.read.is_tls13() {
+                if rec.content_type == CONTENT_ALERT {
+                    if rec.payload.len() >= 2 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("TLS alert: {} {}", rec.payload[0], rec.payload[1]),
+                        )));
+                    }
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("TLS alert: {} {}", rec.payload[0], rec.payload[1]),
+                        format!(
+                            "truncated TLS alert record ({} payload byte(s))",
+                            rec.payload.len()
+                        ),
                     )));
                 }
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "truncated TLS alert record ({} payload byte(s))",
-                        rec.payload.len()
-                    ),
-                )));
-            }
-            if rec.content_type != CONTENT_APPLICATION_DATA {
-                continue;
+                if rec.content_type != CONTENT_APPLICATION_DATA {
+                    continue;
+                }
             }
             match this.process_record(rec) {
                 Ok(DecryptedRecord::Data(plaintext)) => {
@@ -415,22 +626,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
             return Poll::Ready(Ok(0));
         }
         // Split at 2^14 plaintext bytes (RFC 8446 §5.2); the inner content
-        // type byte rides at the end of the TLSInnerPlaintext.
+        // type byte rides at the end of the TLSInnerPlaintext (TLS 1.3).
+        // TLS 1.2 frames the plaintext directly, with the explicit nonce
+        // (AES-GCM) or nothing (ChaCha20-Poly1305) ahead of the ciphertext.
         let take = buf.len().min(MAX_RECORD_PLAINTEXT);
-        let mut tls_inner = Vec::with_capacity(take + 1);
-        tls_inner.extend_from_slice(&buf[..take]);
-        tls_inner.push(CONTENT_APPLICATION_DATA);
-        let ciphertext = this
-            .keys
-            .write_key
-            .seal(
-                this.keys.write_seq,
-                &aead_aad(tls_inner.len() + AEAD_TAG_LEN),
-                &tls_inner,
-            )
-            .map_err(to_io_error)?;
-        this.keys.write_seq += 1;
-        this.pending = make_app_data_record(&ciphertext);
+        let plaintext = &buf[..take];
+        let AppKeys {
+            write, write_seq, ..
+        } = &mut this.keys;
+        // The sequence number is advanced only after a successful seal:
+        // a failed seal must not leave the counter — and therefore the
+        // next record's nonce — ahead of the AAD the peer will reconstruct.
+        let framed = match write {
+            RecordCipher::Tls13(key) => {
+                let mut tls_inner = Vec::with_capacity(take + 1);
+                tls_inner.extend_from_slice(plaintext);
+                tls_inner.push(CONTENT_APPLICATION_DATA);
+                let ciphertext = key
+                    .seal(
+                        *write_seq,
+                        &aead_aad(tls_inner.len() + AEAD_TAG_LEN),
+                        &tls_inner,
+                    )
+                    .map_err(to_io_error)?;
+                advance_seq(write_seq)?;
+                make_app_data_record(&ciphertext)
+            }
+            RecordCipher::Tls12(key, aead) => {
+                let seq = *write_seq;
+                let explicit = aead.explicit_nonce(seq);
+                let nonce = aead.nonce(seq, explicit.as_slice())?;
+                let additional = aead_aad_12(seq, CONTENT_APPLICATION_DATA, plaintext.len());
+                let ciphertext = key
+                    .seal_with_nonce(nonce, &additional, plaintext)
+                    .map_err(to_io_error)?;
+                advance_seq(write_seq)?;
+                make_record_12(CONTENT_APPLICATION_DATA, explicit.as_slice(), &ciphertext)
+            }
+        };
+        this.pending = framed;
         match this.flush_pending(cx) {
             // Data stays buffered in `pending`; a later poll drains it.
             Poll::Pending | Poll::Ready(Ok(())) => {}
@@ -510,6 +744,27 @@ fn to_io_error(e: TlsError) -> io::Error {
 }
 
 #[cfg(test)]
+impl AppKeys {
+    /// Duplicate the key state for a two-endpoint test over one `duplex`.
+    ///
+    /// Test-only on purpose: two live writers sharing key material would
+    /// reuse nonces (see the type-level note on `Clone`). Tests drive the
+    /// two halves in lockstep, so the duplication is safe there.
+    fn duplicate(&self) -> Self {
+        let dup = |c: &RecordCipher| match c {
+            RecordCipher::Tls13(k) => RecordCipher::Tls13(k.clone_key()),
+            RecordCipher::Tls12(k, a) => RecordCipher::Tls12(k.clone_key(), *a),
+        };
+        Self {
+            read: dup(&self.read),
+            write: dup(&self.write),
+            read_seq: self.read_seq,
+            write_seq: self.write_seq,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -517,14 +772,17 @@ mod tests {
     use crate::crypto::CipherSuiteId;
     use crate::record::{aead_aad, make_app_data_record, read_record};
 
+    /// Extract the inner `AeadKey` from a TLS 1.3 `AppKeys` (test helper).
+    fn tls13_key(key: &RecordCipher) -> &AeadKey {
+        match key {
+            RecordCipher::Tls13(k) => k,
+            RecordCipher::Tls12(..) => panic!("not a TLS 1.3 key"),
+        }
+    }
+
     fn test_keys() -> AppKeys {
         let key = AeadKey::new(CipherSuiteId::Aes128GcmSha256, &[0x11; 16]).unwrap();
-        AppKeys {
-            read_key: key.clone_key(),
-            write_key: key.clone_key(),
-            read_seq: 0,
-            write_seq: 0,
-        }
+        AppKeys::tls13(key.clone_key(), key.clone_key())
     }
 
     /// Build a raw application-data record whose `TLSInnerPlaintext` is
@@ -532,8 +790,7 @@ mod tests {
     fn raw_record(keys: &AppKeys, seq: u64, inner_type: u8, content: &[u8]) -> Vec<u8> {
         let mut inner = content.to_vec();
         inner.push(inner_type);
-        let ct = keys
-            .read_key
+        let ct = tls13_key(&keys.read)
             .seal(seq, &aead_aad(inner.len() + AEAD_TAG_LEN), &inner)
             .unwrap();
         make_app_data_record(&ct)
@@ -543,13 +800,8 @@ mod tests {
     async fn encrypted_duplex_roundtrip() {
         let (a, b) = tokio::io::duplex(4096);
         let key = AeadKey::new(CipherSuiteId::Aes128GcmSha256, &[0x11; 16]).unwrap();
-        let keys = AppKeys {
-            read_key: key.clone_key(),
-            write_key: key.clone_key(),
-            read_seq: 0,
-            write_seq: 0,
-        };
-        let mut client = TlsStream::new(a, keys.clone());
+        let keys = AppKeys::tls13(key.clone_key(), key.clone_key());
+        let mut client = TlsStream::new(a, keys.duplicate());
         let mut server = TlsStream::new(b, keys);
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -569,13 +821,8 @@ mod tests {
         let (a, b) = duplex(4096);
         let key =
             AeadKey::from_key_iv(CipherSuiteId::Aes128GcmSha256, &[0x22; 16], [0x01; 12]).unwrap();
-        let keys = AppKeys {
-            read_key: key.clone_key(),
-            write_key: key.clone_key(),
-            read_seq: 0,
-            write_seq: 0,
-        };
-        let mut client = TlsStream::new(a, keys.clone());
+        let keys = AppKeys::tls13(key.clone_key(), key.clone_key());
+        let mut client = TlsStream::new(a, keys.duplicate());
         let mut server = TlsStream::new(b, keys);
         client.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
@@ -589,7 +836,7 @@ mod tests {
         // must present them as one continuous byte stream.
         let (a, b) = duplex(4096);
         let keys = test_keys();
-        let mut writer = TlsStream::new(a, keys.clone());
+        let mut writer = TlsStream::new(a, keys.duplicate());
         let mut reader = TlsStream::new(b, keys);
         writer.write_all(b"hello").await.unwrap();
         writer.write_all(b" world").await.unwrap();
@@ -706,7 +953,7 @@ mod tests {
         let (a, mut b) = duplex(1 << 16);
         let keys = test_keys();
         let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-        let mut writer = TlsStream::new(a, keys.clone());
+        let mut writer = TlsStream::new(a, keys.duplicate());
         writer.write_all(&payload).await.unwrap();
         drop(writer);
 
@@ -717,8 +964,7 @@ mod tests {
             let rec = read_record(&mut b).await.unwrap();
             assert_eq!(rec.content_type, CONTENT_APPLICATION_DATA);
             let mut ct = rec.payload;
-            let pt = read_keys
-                .read_key
+            let pt = tls13_key(&read_keys.read)
                 .open(read_keys.read_seq, &aead_aad(ct.len()), &mut ct)
                 .unwrap();
             read_keys.read_seq += 1;
@@ -740,7 +986,7 @@ mod tests {
         // directly observable.
         let (a, mut b) = duplex(4096);
         let keys = test_keys();
-        let mut client = TlsStream::new(a, keys.clone());
+        let mut client = TlsStream::new(a, keys.duplicate());
 
         // 1. Encrypted phase: the client's write leaves the wire as a real
         // TLS record; decrypt it manually on the raw side.
@@ -748,8 +994,7 @@ mod tests {
         let rec = read_record(&mut b).await.unwrap();
         assert_eq!(rec.content_type, CONTENT_APPLICATION_DATA);
         let mut ct = rec.payload;
-        let pt = keys
-            .read_key
+        let pt = tls13_key(&keys.read)
             .open(keys.read_seq, &aead_aad(ct.len()), &mut ct)
             .unwrap();
         let (inner_type, content) = strip_padding(&pt).unwrap();
@@ -776,7 +1021,7 @@ mod tests {
         // record first, then, after the client switches, literal bytes.
         let (a, mut b) = duplex(4096);
         let keys = test_keys();
-        let mut client = TlsStream::new(a, keys.clone());
+        let mut client = TlsStream::new(a, keys.duplicate());
 
         // 1. Encrypted phase: "hello" arrives as a record and the client's
         // record layer decrypts it.
@@ -800,7 +1045,7 @@ mod tests {
     async fn direct_transition_at_record_boundary_loses_nothing() {
         let (a, b) = duplex(4096);
         let keys = test_keys();
-        let mut client = TlsStream::new(a, keys.clone());
+        let mut client = TlsStream::new(a, keys.duplicate());
         let mut server = TlsStream::new(b, keys);
 
         // Encrypted record, then a raw payload pipelined immediately behind
@@ -830,7 +1075,7 @@ mod tests {
         // start, or the raw bytes would overtake the unflushed record.
         let (a, mut b) = duplex(256);
         let mut keys = test_keys();
-        let mut client = TlsStream::new(a, keys.clone());
+        let mut client = TlsStream::new(a, keys.duplicate());
         let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
 
         // Drain the raw server side concurrently so the client's large
@@ -842,8 +1087,7 @@ mod tests {
                 let rec = read_record(&mut b).await.unwrap();
                 assert_eq!(rec.content_type, CONTENT_APPLICATION_DATA);
                 let mut ct = rec.payload;
-                let pt = keys
-                    .read_key
+                let pt = tls13_key(&keys.read)
                     .open(keys.read_seq, &aead_aad(ct.len()), &mut ct)
                     .unwrap();
                 keys.read_seq += 1;

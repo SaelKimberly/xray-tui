@@ -31,6 +31,10 @@ pub const HS_FINISHED: u8 = 0x14;
 /// 16,656 is the largest legal ciphertext for a full-size record.
 pub(crate) const MAX_RECORD_PAYLOAD: usize = 16_384 + 272;
 
+/// AEAD tag length for every AEAD in this engine (AES-GCM and
+/// ChaCha20-Poly1305 both use 16-byte tags), in bytes.
+pub const AEAD_TAG_LEN: usize = 16;
+
 /// A raw TLS record off the wire.
 #[derive(Debug)]
 pub struct TlsRecord {
@@ -154,6 +158,59 @@ pub fn aead_aad(ciphertext_len: usize) -> [u8; 5] {
     let len = u16::try_from(ciphertext_len).unwrap_or(u16::MAX);
     let bytes = len.to_be_bytes();
     [CONTENT_APPLICATION_DATA, 0x03, 0x03, bytes[0], bytes[1]]
+}
+
+/// Build the TLS 1.2 AEAD additional data (RFC 5246 §6.2.3.3, RFC 5288 §3,
+/// RFC 7905 §2).
+///
+/// Layout `seq_num(8) || type(1) || version(2) || length(2)`, where `length`
+/// is the *plaintext* (`TLSCompressed.fragment`) length.
+///
+/// # Panics
+///
+/// Debug-asserts that `plaintext_len` fits a TLS record. A longer fragment
+/// would produce AAD that disagrees with the record body and surface at the
+/// peer as an authentication failure (indistinguishable from a MITM), so
+/// callers must split first; the release path saturates rather than wraps.
+#[must_use]
+pub fn aead_aad_12(seq: u64, content_type: u8, plaintext_len: usize) -> [u8; 13] {
+    debug_assert!(
+        u16::try_from(plaintext_len).is_ok(),
+        "TLS 1.2 AAD plaintext length {plaintext_len} exceeds a record"
+    );
+    let mut aad = [0u8; 13];
+    aad[..8].copy_from_slice(&seq.to_be_bytes());
+    aad[8] = content_type;
+    aad[9] = 0x03;
+    aad[10] = 0x03;
+    let len = u16::try_from(plaintext_len).unwrap_or(u16::MAX);
+    aad[11..13].copy_from_slice(&len.to_be_bytes());
+    aad
+}
+
+/// Frame ciphertext as a TLS 1.2 AEAD record (RFC 5246 §6.2.3.3):
+/// `content_type(1) || 0x0303(2) || length(2) || explicit_nonce ||
+/// ciphertext`, where `length` covers `explicit_nonce + ciphertext + tag`.
+///
+/// # Panics
+///
+/// Debug-asserts that the framed body fits a record length field; see
+/// [`aead_aad_12`].
+#[must_use]
+pub fn make_record_12(content_type: u8, explicit_nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let body_len = explicit_nonce.len() + ciphertext.len();
+    debug_assert!(
+        u16::try_from(body_len).is_ok(),
+        "TLS 1.2 record body {body_len} exceeds the record length field"
+    );
+    let mut rec = Vec::with_capacity(5 + body_len);
+    rec.push(content_type);
+    rec.extend_from_slice(&0x0303u16.to_be_bytes());
+    let len = u16::try_from(body_len).unwrap_or(u16::MAX);
+    rec.extend_from_slice(&len.to_be_bytes());
+    rec.extend_from_slice(explicit_nonce);
+    rec.extend_from_slice(ciphertext);
+    rec
 }
 
 #[cfg(test)]

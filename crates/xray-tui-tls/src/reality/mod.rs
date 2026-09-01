@@ -793,7 +793,11 @@ mod tests {
             kse.extend_from_slice(&1120u16.to_be_bytes());
             kse.extend_from_slice(ct.as_bytes());
             kse.extend_from_slice(&tls_kp.public_key());
-            sh_body.extend_from_slice(&u16::try_from(kse.len()).unwrap().to_be_bytes());
+            // ext_list_len = supported_versions(6) + key_share.
+            sh_body.extend_from_slice(&u16::try_from(6 + kse.len()).unwrap().to_be_bytes());
+            sh_body.extend_from_slice(&0x002bu16.to_be_bytes());
+            sh_body.extend_from_slice(&0x0002u16.to_be_bytes());
+            sh_body.extend_from_slice(&0x0304u16.to_be_bytes());
             sh_body.extend_from_slice(&kse);
             let sh_msg = make_hs_msg(HS_SERVER_HELLO, &sh_body);
             let mut rec = vec![0x16, 0x03, 0x03];

@@ -10,6 +10,7 @@
 
 pub mod fingerprint;
 pub mod mlkem;
+pub mod tls12;
 
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey},
@@ -160,9 +161,18 @@ impl X25519KeyPair {
 
     /// Computes the 32-byte ECDHE shared secret with `peer`. Repeatable —
     /// REALITY agrees with the static `pbk` and the server keyshare.
+    ///
+    /// An all-zero output means the peer sent a low-order point (RFC 7748
+    /// §6.1); such a "shared" secret is public, so it is refused rather
+    /// than fed into a key schedule.
     pub fn agree(&self, peer: &[u8; 32]) -> Result<[u8; 32]> {
         let peer = x25519_dalek::PublicKey::from(*peer);
         let shared = self.private.diffie_hellman(&peer);
+        if !shared.was_contributory() {
+            return Err(TlsError::Crypto(
+                "X25519 peer key is a low-order point: shared secret is all zero".to_string(),
+            ));
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(shared.as_bytes());
         Ok(out)
@@ -409,6 +419,41 @@ impl AeadKey {
     /// Decrypts and authenticates `ciphertext` under `(seq, aad)`.
     pub fn open(&self, seq: u64, aad: &[u8], ciphertext: &mut [u8]) -> Result<Vec<u8>> {
         let nonce = Nonce::assume_unique_for_key(self.make_nonce(seq));
+        let plaintext = self
+            .key
+            .open_in_place(nonce, Aad::from(aad), ciphertext)
+            .map_err(|_| {
+                TlsError::Crypto("AEAD open failed — wrong key or corrupted record".into())
+            })?;
+        Ok(plaintext.to_vec())
+    }
+
+    /// Encrypts `plaintext` with an explicit 12-byte nonce, appending the
+    /// AEAD tag. TLS 1.2 uses an explicit nonce carried in the record
+    /// (RFC 5246 §6.2.3.3), unlike TLS 1.3's `IV XOR seq` construction.
+    pub fn seal_with_nonce(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let nonce = Nonce::assume_unique_for_key(nonce);
+        let mut in_out = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| TlsError::Crypto("AEAD seal failed".into()))?;
+        Ok(in_out)
+    }
+
+    /// Decrypts and authenticates `ciphertext` with an explicit 12-byte
+    /// nonce (TLS 1.2 record protection).
+    pub fn open_with_nonce(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        ciphertext: &mut [u8],
+    ) -> Result<Vec<u8>> {
+        let nonce = Nonce::assume_unique_for_key(nonce);
         let plaintext = self
             .key
             .open_in_place(nonce, Aad::from(aad), ciphertext)

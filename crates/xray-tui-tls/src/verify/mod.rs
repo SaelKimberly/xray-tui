@@ -27,7 +27,7 @@ use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime};
 use webpki::{EndEntityCert, KeyUsage};
 
 use crate::error::{Result, TlsError};
-use crate::handshake::{ServerVerifier, VerifyContext};
+use crate::handshake::{ServerVerifier, TlsVersion, VerifyContext};
 
 /// RFC 8446 §4.4.3 server context label, NUL-terminated. The signed message
 /// is `64*0x20 || SERVER_CV_CONTEXT || transcript_hash` — the literal 64
@@ -159,67 +159,136 @@ impl ServerVerifier for WebPkiVerifier {
 
 // ── CertificateVerify signature ────────────────────────────────────────────
 
-/// Verifies the server's `CertificateVerify` signature over the transcript.
+/// Verifies the server's handshake signature (TLS 1.3 `CertificateVerify`
+/// or TLS 1.2 `ServerKeyExchange` signature) over the signed data provided
+/// by the context.
 ///
-/// RFC 8446 §4.4.3: the digital signature input is
+/// TLS 1.3 (RFC 8446 §4.4.3): the signed message is
+/// `64*0x20 || "TLS 1.3, server CertificateVerify\x00" || Transcript-Hash(transcript)`
+/// where `transcript` = `ClientHello .. Certificate` (the `CertificateVerify`
+/// message itself is excluded). The context's `signed_data` carries this
+/// transcript prefix.
 ///
-/// ```text
-/// 64*0x20 || "TLS 1.3, server CertificateVerify\x00" || Transcript-Hash
-/// ```
-///
-/// where `Transcript-Hash` is `Hash(ClientHello .. Certificate)` with the
-/// suite's hash — the `CertificateVerify` message itself is *excluded*
-/// (interop-verified against rustls: the transcript hash is taken before
-/// `CertificateVerify` is emitted). The handshake passes the raw handshake
-/// messages up to (excluding) `CertificateVerify`, so only the suite-hash
-/// step is needed here.
+/// TLS 1.2 (RFC 5246 §7.4.3, RFC 4492 §5.4): the signed message is the raw
+/// `client_random || server_random || ServerECDHParams` — no hash prefix,
+/// no context string. The context's `signed_data` carries these bytes.
 fn verify_certificate_verify(
     end_entity: &EndEntityCert<'_>,
     ctx: &VerifyContext<'_>,
 ) -> Result<()> {
-    // TLS 1.3 SignatureScheme → webpki verification algorithm. The webpki
-    // ring provider handles the per-algorithm public-key encoding internally
-    // (raw point for ECDSA, SPKI for RSA/Ed25519) and checks that the
-    // certificate's key type matches the algorithm.
-    let algorithm: &dyn rustls_pki_types::SignatureVerificationAlgorithm =
-        match ctx.signature_scheme {
-            0x0403 => webpki::ring::ECDSA_P256_SHA256,
-            0x0503 => webpki::ring::ECDSA_P384_SHA384,
-            0x0804 => webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
-            0x0805 => webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
-            0x0806 => webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
-            0x0807 => webpki::ring::ED25519,
-            other => {
-                return Err(TlsError::Verify(format!(
-                    "unsupported CertificateVerify signature scheme 0x{other:04X}"
-                )));
-            }
-        };
-
-    // Body layout: signature_scheme(2) || signature_len(2) || signature.
-    let body = ctx.cert_verify_body;
-    if body.len() < 4 {
+    let signature = ctx.signature;
+    if signature.is_empty() {
         return Err(TlsError::Verify(
-            "CertificateVerify body too short".to_string(),
+            "server handshake signature is empty".to_string(),
         ));
     }
-    let signature = &body[4..];
+    match ctx.version {
+        TlsVersion::Tls13 => {
+            let algorithm = tls13_algorithm(ctx.signature_scheme)?;
+            let transcript_hash = ring::digest::digest(ctx.suite.digest(), ctx.signed_data);
+            let mut signed = Vec::with_capacity(64 + SERVER_CV_CONTEXT.len() + 32);
+            signed.resize(64, 0x20);
+            signed.extend_from_slice(SERVER_CV_CONTEXT);
+            signed.extend_from_slice(transcript_hash.as_ref());
+            end_entity
+                .verify_signature(algorithm, &signed, signature)
+                .map_err(|e| {
+                    TlsError::Verify(format!(
+                        "CertificateVerify signature verification failed: {e}"
+                    ))
+                })
+        }
+        TlsVersion::Tls12 => {
+            // Any of the scheme's candidate algorithms may match: see
+            // `tls12_algorithms`.
+            let mut last = None;
+            for algorithm in tls12_algorithms(ctx.signature_scheme)? {
+                match end_entity.verify_signature(*algorithm, ctx.signed_data, signature) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = Some(e),
+                }
+            }
+            Err(TlsError::Verify(format!(
+                "ServerKeyExchange signature verification failed: {}",
+                last.map_or_else(|| "no candidate algorithm".to_string(), |e| e.to_string())
+            )))
+        }
+    }
+}
 
-    let transcript_hash = ring::digest::digest(ctx.suite.digest(), ctx.transcript);
+/// TLS 1.3 `CertificateVerify` signature scheme → webpki algorithm.
+///
+/// TLS 1.3 code points name the curve (RFC 8446 §4.2.3), so each maps to
+/// exactly one algorithm. SHA-1, MD5, RSA-PKCS1 and anonymous schemes are
+/// absent by design — TLS 1.3 forbids them for `CertificateVerify`.
+fn tls13_algorithm(
+    scheme: u16,
+) -> Result<&'static dyn rustls_pki_types::SignatureVerificationAlgorithm> {
+    match scheme {
+        0x0403 => Ok(webpki::ring::ECDSA_P256_SHA256),
+        0x0503 => Ok(webpki::ring::ECDSA_P384_SHA384),
+        0x0804 => Ok(webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY),
+        0x0805 => Ok(webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY),
+        0x0806 => Ok(webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY),
+        0x0807 => Ok(webpki::ring::ED25519),
+        other => Err(TlsError::Verify(format!(
+            "unsupported TLS 1.3 CertificateVerify signature scheme 0x{other:04X}"
+        ))),
+    }
+}
 
-    // RFC 8446 §4.4.3 signed-message structure.
-    let mut signed = Vec::with_capacity(64 + SERVER_CV_CONTEXT.len() + 32);
-    signed.resize(64, 0x20);
-    signed.extend_from_slice(SERVER_CV_CONTEXT);
-    signed.extend_from_slice(transcript_hash.as_ref());
-
-    end_entity
-        .verify_signature(algorithm, &signed, signature)
-        .map_err(|e| {
-            TlsError::Verify(format!(
-                "CertificateVerify signature verification failed: {e}"
-            ))
-        })
+/// TLS 1.2 `ServerKeyExchange` signature scheme → candidate webpki
+/// algorithms.
+///
+/// A TLS 1.2 `SignatureAndHashAlgorithm` is `(hash, signature_type)` and
+/// does NOT name a curve (RFC 5246 §7.4.1.4.1, RFC 8422 §5.1.3), even though
+/// the wire values coincide with TLS 1.3's curve-bound code points. Binding
+/// 0x0403 to P-256 would reject a legal P-384 leaf that signs with SHA-256,
+/// so each ECDSA scheme yields one candidate per curve and the caller tries
+/// them in turn (webpki matches the certificate's public-key algorithm, so
+/// at most one can succeed — this is not a downgrade of the hash).
+///
+/// Weak schemes stay unreachable: MD5 (0x01xx), SHA-1 (0x02xx), SHA-224
+/// (0x03xx), DSA and anonymous code points all fall through to the error.
+fn tls12_algorithms(
+    scheme: u16,
+) -> Result<&'static [&'static dyn rustls_pki_types::SignatureVerificationAlgorithm]> {
+    const ECDSA_SHA256: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] = &[
+        webpki::ring::ECDSA_P256_SHA256,
+        webpki::ring::ECDSA_P384_SHA256,
+    ];
+    const ECDSA_SHA384: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] = &[
+        webpki::ring::ECDSA_P384_SHA384,
+        webpki::ring::ECDSA_P256_SHA384,
+    ];
+    const RSA_PKCS1_SHA256: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::RSA_PKCS1_2048_8192_SHA256];
+    const RSA_PKCS1_SHA384: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::RSA_PKCS1_2048_8192_SHA384];
+    const RSA_PKCS1_SHA512: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::RSA_PKCS1_2048_8192_SHA512];
+    const RSA_PSS_SHA256: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY];
+    const RSA_PSS_SHA384: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY];
+    const RSA_PSS_SHA512: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY];
+    const ED25519: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] =
+        &[webpki::ring::ED25519];
+    match scheme {
+        0x0401 => Ok(RSA_PKCS1_SHA256),
+        0x0501 => Ok(RSA_PKCS1_SHA384),
+        0x0601 => Ok(RSA_PKCS1_SHA512),
+        0x0403 => Ok(ECDSA_SHA256),
+        0x0503 => Ok(ECDSA_SHA384),
+        0x0804 => Ok(RSA_PSS_SHA256),
+        0x0805 => Ok(RSA_PSS_SHA384),
+        0x0806 => Ok(RSA_PSS_SHA512),
+        0x0807 => Ok(ED25519),
+        other => Err(TlsError::Verify(format!(
+            "unsupported TLS 1.2 ServerKeyExchange signature scheme 0x{other:04X}"
+        ))),
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -234,7 +303,7 @@ mod tests {
     use super::{WebPkiVerifier, verify_certificate_verify};
     use crate::crypto::CipherSuiteId;
     use crate::error::{Result, TlsError};
-    use crate::handshake::{HandshakeParams, ServerVerifier, VerifyContext, connect};
+    use crate::handshake::{HandshakeParams, ServerVerifier, TlsVersion, VerifyContext, connect};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
     use rcgen::PublicKeyData;
 
@@ -524,10 +593,11 @@ mod tests {
         let ctx = VerifyContext {
             chain: &[leaf_cert.der().to_vec()],
             sni: "localhost",
-            signature_scheme: 0x0403,
-            cert_verify_body: &body,
-            transcript,
+            version: TlsVersion::Tls13,
             suite: CipherSuiteId::Aes128GcmSha256,
+            signature_scheme: 0x0403,
+            signature: &body[4..],
+            signed_data: transcript,
         };
 
         let verifier = WebPkiVerifier::from_roots(Vec::new()).with_pin(pin);
@@ -556,10 +626,11 @@ mod tests {
         let ctx = VerifyContext {
             chain: &[],
             sni: "localhost",
-            signature_scheme: 0x1234,
-            cert_verify_body: &[0x12, 0x34, 0x00, 0x00],
-            transcript: &[],
+            version: TlsVersion::Tls13,
             suite: CipherSuiteId::Aes128GcmSha256,
+            signature_scheme: 0x1234,
+            signature: &[],
+            signed_data: &[],
         };
         let err = verify_certificate_verify(&ee, &ctx).unwrap_err();
         assert!(matches!(err, TlsError::Verify(_)), "got: {err}");

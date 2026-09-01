@@ -23,9 +23,11 @@
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+pub mod tls12;
+
 use crate::SecureRandom;
 use crate::crypto::mlkem::{Mlkem768, SecretKey as MlkemSecretKey};
-use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair};
+use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair, tls12::Tls12Suite};
 use crate::error::{Result, TlsError};
 use crate::hello::{BuildParams, build_hello, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
@@ -53,20 +55,36 @@ pub trait ServerVerifier: Send + Sync {
     fn verify(&self, ctx: &VerifyContext<'_>) -> Result<()>;
 }
 
+/// The negotiated TLS version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersion {
+    /// TLS 1.3 (RFC 8446).
+    Tls13,
+    /// TLS 1.2 (RFC 5246).
+    Tls12,
+}
+
 /// Everything a verifier needs to authenticate the server.
 pub struct VerifyContext<'a> {
     /// DER-encoded certificate chain, leaf first.
     pub chain: &'a [Vec<u8>],
     /// The `server_name` the client offered.
     pub sni: &'a str,
-    /// The `signature_scheme` from `CertificateVerify` (RFC 8446 §4.2.3).
-    pub signature_scheme: u16,
-    /// The raw `CertificateVerify` body (scheme + signature).
-    pub cert_verify_body: &'a [u8],
-    /// The transcript up to (excluding) the `CertificateVerify`.
-    pub transcript: &'a [u8],
-    /// The cipher suite the server selected.
+    /// The negotiated TLS version.
+    pub version: TlsVersion,
+    /// Cipher suite the server selected; only meaningful for TLS 1.3
+    /// (its digest feeds the transcript hash for the `CertificateVerify`
+    /// signature — TLS 1.2 signs raw data without a hash prefix).
     pub suite: CipherSuiteId,
+    /// The `SignatureScheme` / `SignatureAndHashAlgorithm`.
+    pub signature_scheme: u16,
+    /// The raw signature bytes (TLS 1.3 `CertificateVerify` or TLS 1.2
+    /// `ServerKeyExchange` signature).
+    pub signature: &'a [u8],
+    /// The data covered by the signature: for TLS 1.3, the transcript
+    /// up to (excluding) `CertificateVerify`; for TLS 1.2, the raw
+    /// `client_random || server_random || ServerECDHParams`.
+    pub signed_data: &'a [u8],
 }
 
 /// Test-only verifier: accepts any server.
@@ -120,7 +138,7 @@ const AEAD_TAG_LEN: usize = 16;
 /// length(3) + a uint24 body, RFC 8446 §4), so this cap admits every legal
 /// message while bounding cross-record accumulation (RFC 8446 §5.1) against
 /// unbounded growth.
-const MAX_FLIGHT_BUFFER: usize = 4 + 0xFF_FFFF;
+pub(crate) const MAX_FLIGHT_BUFFER: usize = 4 + 0xFF_FFFF;
 
 // ── Handshake driver ───────────────────────────────────────────────────────
 
@@ -185,8 +203,43 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut stream = stream;
     stream.write_all(&to_record(hello)).await?;
 
-    let server_hello = read_server_hello(&mut stream, offered_session_id).await?;
-    let classical_shared = keypair.agree(&server_hello.peer_key)?;
+    let mut server_hello = read_server_hello(&mut stream, offered_session_id).await?;
+    // TLS 1.2: dispatch to the separate 1.2 handshake driver.
+    // REALITY (ServerAuth::Reality) is TLS 1.3 only — error if a REALITY
+    // server negotiates 1.2.
+    if server_hello.version == TlsVersion::Tls12 {
+        match auth {
+            ServerAuth::Reality { .. } => {
+                // REALITY's whole authentication surface (sealed session id,
+                // dual X25519 agreement, Ed25519 CertificateVerify) is TLS
+                // 1.3-only, so 1.2 can never authenticate. A 1.2 ServerHello
+                // to a REALITY hello is exactly the "real certificate"
+                // situation the fallback exists for (transparent proxy or
+                // redirected fronting host), so report it as such rather than
+                // as a generic handshake error — the caller then runs the
+                // Spider-X fallback instead of failing the dial.
+                return Err(TlsError::RealityFallback);
+            }
+            ServerAuth::Verifier(verifier) => {
+                let client_random: [u8; 32] = hello[6..38].try_into().expect("32 bytes");
+                let pre_buffer = std::mem::take(&mut server_hello.pre_buffer);
+                return tls12::drive12(
+                    stream,
+                    hello,
+                    &client_random,
+                    &server_hello,
+                    pre_buffer,
+                    &keypair,
+                    server_name,
+                    verifier,
+                )
+                .await;
+            }
+        }
+    }
+    let classical_shared = keypair.agree(&server_hello.peer_key.ok_or_else(|| {
+        TlsError::Handshake("TLS 1.3 ServerHello has no key_share extension".into())
+    })?)?;
 
     // Hybrid key exchange (Go crypto/tls X25519MLKEM768): the key-schedule
     // IKM is `mlkem_shared || classical_shared` — Go's
@@ -230,13 +283,22 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let outcome = match auth {
         ServerAuth::Verifier(verifier) => {
+            // `CertificateVerify` body = scheme(2) || sig_len(2) || sig. The
+            // flight reader tolerates a missing CertificateVerify (empty
+            // body), so slice fallibly: an on-path party that completes the
+            // unauthenticated ECDH could otherwise panic the record loop.
+            let signature = flight.cert_verify_body.get(4..).ok_or_else(|| {
+                TlsError::Verify("server sent no CertificateVerify signature".into())
+            })?;
+            ensure_offered_sigalg(hello, flight.signature_scheme)?;
             verifier.verify(&VerifyContext {
                 chain: &flight.chain,
                 sni: server_name,
-                signature_scheme: flight.signature_scheme,
-                cert_verify_body: &flight.cert_verify_body,
-                transcript: &transcript,
+                version: TlsVersion::Tls13,
                 suite: server_hello.suite,
+                signature_scheme: flight.signature_scheme,
+                signature,
+                signed_data: &transcript,
             })?;
             AuthOutcome::Ok
         }
@@ -289,15 +351,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master)?;
     let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts)?;
     let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts)?;
-    let mut tls = TlsStream::new(
-        stream,
-        AppKeys {
-            read_key: server_app_key,
-            write_key: client_app_key,
-            read_seq: 0,
-            write_seq: 0,
-        },
-    );
+    let mut tls = TlsStream::new(stream, AppKeys::tls13(server_app_key, client_app_key));
     tls.set_negotiated_hybrid(server_hello.mlkem_ciphertext.is_some());
     Ok((tls, outcome))
 }
@@ -373,25 +427,41 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
 // ── ServerHello ────────────────────────────────────────────────────────────
 
-/// A parsed `ServerHello`.
+/// A parsed `ServerHello` — carries fields for both TLS 1.3 and 1.2.
 pub(crate) struct ServerHelloData {
     /// The raw handshake message (type + length + body), for the transcript.
     pub(crate) raw: Vec<u8>,
-    /// The server's classical (X25519) public key from `key_share`.
-    pub(crate) peer_key: [u8; 32],
-    /// The ML-KEM ciphertext from the server's hybrid key share
-    /// (`Some` only when a hybrid group was selected).
+    /// Handshake bytes after the `ServerHello` in the same record (valid in
+    /// TLS 1.2, RFC 5246 §6.2.1 — a server may pack `ServerHello` + the rest
+    /// of the flight into one record). Consumed by the TLS 1.2 flight
+    /// reader; empty for TLS 1.3 (`ServerHello` is always alone).
+    pub(crate) pre_buffer: Vec<u8>,
+    /// The negotiated version.
+    pub(crate) version: TlsVersion,
+    /// The server's 32-byte random.
+    pub(crate) server_random: [u8; 32],
+    /// The server's classical (X25519) public key from `key_share` (TLS 1.3).
+    pub(crate) peer_key: Option<[u8; 32]>,
+    /// The ML-KEM ciphertext from the server's hybrid key share (TLS 1.3).
     pub(crate) mlkem_ciphertext: Option<Vec<u8>>,
-    /// The cipher suite the server selected.
+    /// The cipher suite the server selected (TLS 1.3).
     pub(crate) suite: CipherSuiteId,
+    /// The cipher suite the server selected (TLS 1.2).
+    pub(crate) suite12: Option<Tls12Suite>,
+    /// Whether the server echoed `extended_master_secret` (TLS 1.2).
+    pub(crate) ems: bool,
 }
 
 /// The `ServerHello` body fields the engine needs.
 #[derive(Debug)]
 struct ParsedServerHello {
+    version: TlsVersion,
+    server_random: [u8; 32],
     suite: CipherSuiteId,
-    peer_key: [u8; 32],
+    suite12: Option<Tls12Suite>,
+    peer_key: Option<[u8; 32]>,
     mlkem_ciphertext: Option<Vec<u8>>,
+    ems: bool,
 }
 
 /// Read and parse the `ServerHello` record, skipping CCS records. The
@@ -421,12 +491,78 @@ where
         )));
     }
     let parsed = parse_server_hello(&body, offered_session_id)?;
+    // TLS 1.2 may pack subsequent handshake messages after the ServerHello
+    // in the same record; preserve those bytes for the flight reader.
+    let first_total = 4 + body.len();
+    let pre_buffer = rec.payload[first_total..].to_vec();
     Ok(ServerHelloData {
         raw: make_hs_msg(HS_SERVER_HELLO, &body),
+        pre_buffer,
+        version: parsed.version,
+        server_random: parsed.server_random,
         peer_key: parsed.peer_key,
         mlkem_ciphertext: parsed.mlkem_ciphertext,
         suite: parsed.suite,
+        suite12: parsed.suite12,
+        ems: parsed.ems,
     })
+}
+
+// ── ClientHello introspection ──────────────────────────────────────────────
+
+/// Locate an extension body in the `ClientHello` handshake message `hello`.
+///
+/// The engine builds its own hello, so this is a read-back of what was
+/// offered — the only way a server's choice can be checked against the
+/// client's advertisement (RFC 5246 §7.4.3, RFC 8446 §4.4.3) without
+/// threading every spec field through the driver. Returns `None` when the
+/// hello is malformed, which callers treat as "nothing offered".
+pub(crate) fn client_hello_extension(hello: &[u8], ty: u16) -> Option<&[u8]> {
+    // type(1) len(3) legacy_version(2) random(32) session_id_len(1)
+    let mut pos = 4 + 2 + 32;
+    let sid_len = usize::from(*hello.get(pos)?);
+    pos += 1 + sid_len;
+    let cs_len = usize::from(u16::from_be_bytes([*hello.get(pos)?, *hello.get(pos + 1)?]));
+    pos += 2 + cs_len;
+    let comp_len = usize::from(*hello.get(pos)?);
+    pos += 1 + comp_len;
+    let ext_len = usize::from(u16::from_be_bytes([*hello.get(pos)?, *hello.get(pos + 1)?]));
+    pos += 2;
+    let exts = hello.get(pos..pos + ext_len)?;
+
+    let mut at = 0usize;
+    while at + 4 <= exts.len() {
+        let ext_ty = u16::from_be_bytes([exts[at], exts[at + 1]]);
+        let len = usize::from(u16::from_be_bytes([exts[at + 2], exts[at + 3]]));
+        at += 4;
+        let body = exts.get(at..at + len)?;
+        if ext_ty == ty {
+            return Some(body);
+        }
+        at += len;
+    }
+    None
+}
+
+/// Reject a server signature algorithm the `ClientHello` never offered.
+///
+/// RFC 5246 §7.4.3 and RFC 8446 §4.4.3 both require the server to sign with
+/// a scheme from the client's `signature_algorithms`; accepting others also
+/// breaks fingerprint fidelity (the profiles differ in what they advertise).
+/// A hello without the extension imposes no constraint.
+pub(crate) fn ensure_offered_sigalg(hello: &[u8], scheme: u16) -> Result<()> {
+    let Some(body) = client_hello_extension(hello, 0x000D) else {
+        return Ok(());
+    };
+    // `signature_algorithms`: list_len(2) || scheme(2)*
+    let offered = body.get(2..).unwrap_or_default();
+    let wanted = scheme.to_be_bytes();
+    if offered.as_chunks::<2>().0.contains(&wanted) {
+        return Ok(());
+    }
+    Err(TlsError::Verify(format!(
+        "server signed with scheme 0x{scheme:04X}, which the `ClientHello` did not offer"
+    )))
 }
 
 /// Parse a `ServerHello` body:
@@ -445,8 +581,8 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
             "ServerHello legacy_version is 0x{legacy_version:04X}, expected 0x0303"
         )));
     }
-    let mut random = [0u8; 32];
-    random.copy_from_slice(&body[2..34]);
+    let mut server_random = [0u8; 32];
+    server_random.copy_from_slice(&body[2..34]);
 
     let session_id_len = usize::from(body[34]);
     let mut pos = 35 + session_id_len;
@@ -456,31 +592,21 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
         ));
     }
 
-    // RFC 8446 §4.1.4: a HelloRetryRequest is a ServerHello whose random is
-    // the magic value; it carries no key_share for the rejected group, so
-    // the check must precede extension parsing. HRR is rejected outright
-    // (this engine does not implement it), so the session-id echo check
-    // below guards the real ServerHello path only.
-    if random == HRR_RANDOM {
-        return Err(TlsError::HelloRetryRequest);
-    }
-
-    // RFC 8446 §4.1.3: the server's `legacy_session_id` must echo the one
-    // the client offered (a random 32-byte id, a REALITY auth payload, or
-    // none).
-    if &body[35..pos] != offered_session_id {
-        return Err(TlsError::Handshake(
-            "ServerHello session id does not echo the offered one".into(),
-        ));
-    }
+    // Parse the session id — TLS 1.3 requires an exact echo (RFC 8446
+    // §4.1.3), but TLS 1.2 servers may echo a different id or send an
+    // empty one (RFC 5246 §7.4.1.2). The echo check runs after the version
+    // is determined below.
+    let session_id = &body[35..pos];
 
     let suite_wire = u16::from_be_bytes([body[pos], body[pos + 1]]);
     pos += 3; // cipher suite (2) + compression method (1)
-    let suite = CipherSuiteId::from_u16(suite_wire).ok_or_else(|| {
-        TlsError::Handshake(format!(
-            "server selected unsupported cipher suite 0x{suite_wire:04X}"
-        ))
-    })?;
+    // Compression method must be 0x00 (null) for both versions.
+    if body[pos - 1] != 0x00 {
+        return Err(TlsError::Handshake(format!(
+            "ServerHello compression method is 0x{:02X}, expected 0x00",
+            body[pos - 1]
+        )));
+    }
 
     if pos + 2 > body.len() {
         return Err(TlsError::Handshake("ServerHello: no extensions".into()));
@@ -494,69 +620,149 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
         ));
     }
 
+    // Parse extensions to determine version: TLS 1.3 servers include a
+    // `supported_versions` extension with value 0x0304. TLS 1.2 servers
+    // do not send this extension (it is a TLS 1.3-only extension).
+    // First pass: find supported_versions and key_share.
+    let mut has_supported_versions = false;
+    let mut version_negotiated = 0u16;
     let mut peer_key = None;
     let mut mlkem_ciphertext = None;
-    while pos + 4 <= ext_end {
-        let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
-        let ext_len = usize::from(u16::from_be_bytes([body[pos + 2], body[pos + 3]]));
-        pos += 4;
-        if pos + ext_len > ext_end {
+    let mut ems = false;
+
+    // Scan the extension list body (relative to `pos`, which already points
+    // past the 2-byte list-length field).
+    let mut scan_pos = 0usize;
+    while scan_pos + 4 <= ext_list_len {
+        let ext_type = u16::from_be_bytes([body[pos + scan_pos], body[pos + scan_pos + 1]]);
+        let ext_len = usize::from(u16::from_be_bytes([
+            body[pos + scan_pos + 2],
+            body[pos + scan_pos + 3],
+        ]));
+        scan_pos += 4;
+        if scan_pos + ext_len > ext_list_len {
             return Err(TlsError::Handshake(
                 "ServerHello extension overruns list".into(),
             ));
         }
-        let ext_data = &body[pos..pos + ext_len];
-        pos += ext_len;
-        if ext_type == EXT_KEY_SHARE {
-            // ServerHello key_share: NamedGroup(2) + key_len(2) + key
-            // (RFC 8446 §4.2.8). X25519MLKEM768 (0x11EC) carries 1120
-            // bytes in the Go crypto/tls wire order (the reality/utls
-            // client splits `data[:1088]` as the ML-KEM ciphertext and
-            // `data[1088:]` as the X25519 public key):
-            // `ML-KEM-768 ciphertext (1088) || X25519 pub (32)`. Any other
-            // group or malformed length is a protocol error rather than a
-            // silently-missing keyshare.
-            if ext_data.len() < 4 {
-                return Err(TlsError::Handshake(
-                    "ServerHello key_share extension too short".into(),
-                ));
+        let ext_data = &body[pos + scan_pos..pos + scan_pos + ext_len];
+        scan_pos += ext_len;
+        match ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                if ext_data.len() == 2 {
+                    version_negotiated = u16::from_be_bytes([ext_data[0], ext_data[1]]);
+                    has_supported_versions = true;
+                }
             }
-            let group = u16::from_be_bytes([ext_data[0], ext_data[1]]);
-            let key_len = usize::from(u16::from_be_bytes([ext_data[2], ext_data[3]]));
-            match (group, key_len, ext_data.len()) {
-                (0x001D, 32, n) if n == 4 + key_len => {
-                    peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
-                }
-                (0x11EC, 1120, n) if n == 4 + key_len => {
-                    mlkem_ciphertext = Some(ext_data[4..4 + 1088].to_vec());
-                    peer_key = Some(ext_data[4 + 1088..].try_into().expect("32 bytes"));
-                }
-                (0x11EB | 0x11ED, ..) => {
+            EXT_KEY_SHARE => {
+                if ext_data.len() < 4 {
                     return Err(TlsError::Handshake(
-                        "ServerHello selected SecP256r1MLKEM768/SecP384r1MLKEM1024: no P-256/P-384 key exchange in this engine".into(),
+                        "ServerHello key_share extension too short".into(),
                     ));
                 }
-                _ => {
-                    return Err(TlsError::Handshake(format!(
-                        "ServerHello key_share: group 0x{group:04X} key length {key_len}"
-                    )));
+                let group = u16::from_be_bytes([ext_data[0], ext_data[1]]);
+                let key_len = usize::from(u16::from_be_bytes([ext_data[2], ext_data[3]]));
+                match (group, key_len, ext_data.len()) {
+                    (0x001D, 32, n) if n == 4 + key_len => {
+                        peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
+                    }
+                    (0x11EC, 1120, n) if n == 4 + key_len => {
+                        mlkem_ciphertext = Some(ext_data[4..4 + 1088].to_vec());
+                        peer_key = Some(ext_data[4 + 1088..].try_into().expect("32 bytes"));
+                    }
+                    (0x11EB | 0x11ED, ..) => {
+                        return Err(TlsError::Handshake(
+                            "ServerHello selected SecP256r1MLKEM768/SecP384r1MLKEM1024: no P-256/P-384 key exchange in this engine".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(TlsError::Handshake(format!(
+                            "ServerHello key_share: group 0x{group:04X} key length {key_len}"
+                        )));
+                    }
                 }
             }
+            0x0017 => {
+                // extended_master_secret (RFC 7627 §5.1): the extension_data
+                // is EMPTY in both ClientHello and ServerHello — presence is
+                // the server's agreement, not content.
+                if !ext_data.is_empty() {
+                    return Err(TlsError::Handshake(
+                        "ServerHello extended_master_secret must have an empty body".into(),
+                    ));
+                }
+                ems = true;
+            }
+            _ => {}
         }
     }
 
-    if pos != ext_end {
+    if scan_pos != ext_list_len {
         return Err(TlsError::Handshake(
             "trailing garbage in ServerHello extension list".into(),
         ));
     }
 
-    let peer_key = peer_key
-        .ok_or_else(|| TlsError::Handshake("ServerHello has no key_share extension".into()))?;
+    // Determine version from the supported_versions extension.
+    if has_supported_versions && version_negotiated == 0x0304 {
+        // TLS 1.3: verify the HRR magic and enforce session-id echo.
+        if server_random == HRR_RANDOM {
+            return Err(TlsError::HelloRetryRequest);
+        }
+        if session_id != offered_session_id {
+            return Err(TlsError::Handshake(
+                "ServerHello session id does not echo the offered one".into(),
+            ));
+        }
+        let suite = CipherSuiteId::from_u16(suite_wire).ok_or_else(|| {
+            TlsError::Handshake(format!(
+                "server selected unsupported cipher suite 0x{suite_wire:04X}"
+            ))
+        })?;
+        let peer_key = peer_key
+            .ok_or_else(|| TlsError::Handshake("ServerHello has no key_share extension".into()))?;
+        return Ok(ParsedServerHello {
+            version: TlsVersion::Tls13,
+            server_random,
+            suite,
+            suite12: None,
+            peer_key: Some(peer_key),
+            mlkem_ciphertext,
+            ems: false,
+        });
+    }
+    // TLS 1.2: no supported_versions, or one naming a pre-1.3 version.
+    if has_supported_versions && version_negotiated != 0x0303 {
+        return Err(TlsError::Handshake(format!(
+            "ServerHello negotiated version 0x{version_negotiated:04X}: only TLS 1.3 and TLS 1.2 are supported"
+        )));
+    }
+    // RFC 8446 §4.1.3 downgrade protection: a TLS 1.3-capable server that
+    // ends up negotiating 1.2 or below MUST set this sentinel in the last 8
+    // bytes of its random, so a client that offered 1.3 can detect a forced
+    // version drop. Every profile in this engine offers 1.3.
+    if server_random[24..32] == *b"DOWNGRD\x01" || server_random[24..32] == *b"DOWNGRD\x00" {
+        return Err(TlsError::Handshake(
+            "ServerHello carries the RFC 8446 §4.1.3 downgrade sentinel: TLS 1.3 was suppressed"
+                .into(),
+        ));
+    }
+    // The cipher suite must be a TLS 1.2 AEAD suite. Session-id echo is
+    // relaxed (TLS 1.2 servers may echo a different id or send none,
+    // RFC 5246 §7.4.1.2).
+    let suite12 = Tls12Suite::from_u16(suite_wire).ok_or_else(|| {
+        TlsError::Handshake(format!(
+            "TLS 1.2 server selected cipher suite 0x{suite_wire:04X}: only AEAD suites (ECDHE + AES-GCM/ChaCha20-Poly1305) are supported, CBC suites are not"
+        ))
+    })?;
     Ok(ParsedServerHello {
-        suite,
-        peer_key,
-        mlkem_ciphertext,
+        version: TlsVersion::Tls12,
+        server_random,
+        suite: CipherSuiteId::Aes128GcmSha256, // placeholder, unused for 1.2
+        suite12: Some(suite12),
+        peer_key: None,
+        mlkem_ciphertext: None,
+        ems,
     })
 }
 
@@ -961,14 +1167,16 @@ mod tests {
     use super::{
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
         HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
-        HandshakeParams, connect, decompress_cert, is_der_cert, make_hs_msg,
-        parse_certificate_message, parse_certificate_verify, parse_encrypted_extensions,
-        parse_server_hello, read_server_hs_messages,
+        HandshakeParams, TlsVersion, connect, decompress_cert, ensure_offered_sigalg, is_der_cert,
+        make_hs_msg, parse_certificate_message, parse_certificate_verify,
+        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
+    use crate::hello::{BuildParams, build_hello};
     use crate::record::{CONTENT_HANDSHAKE, aead_aad, make_app_data_record};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
+    use crate::verify::WebPkiVerifier;
 
     // ── helpers ────────────────────────────────────────────────────────────
 
@@ -1049,9 +1257,6 @@ mod tests {
 
         let server = tokio::task::spawn_blocking(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let timeout = std::time::Duration::from_secs(15);
-            sock.set_read_timeout(Some(timeout)).unwrap();
-            sock.set_write_timeout(Some(timeout)).unwrap();
             let mut conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
             while conn.is_handshaking() {
                 conn.complete_io(&mut sock).unwrap();
@@ -1108,7 +1313,11 @@ mod tests {
         body.push(0); // session id length
         body.extend_from_slice(&0x1301u16.to_be_bytes());
         body.push(0); // compression method
-        body.extend_from_slice(&0x0000u16.to_be_bytes()); // no extensions
+        // supported_versions = 0x0304 (a real HRR carries this)
+        body.extend_from_slice(&0x0006u16.to_be_bytes()); // list length 6
+        body.extend_from_slice(&0x002bu16.to_be_bytes());
+        body.extend_from_slice(&0x0002u16.to_be_bytes());
+        body.extend_from_slice(&0x0304u16.to_be_bytes());
         let mut sh_msg = vec![HS_SERVER_HELLO];
         let len = u32::try_from(body.len()).unwrap();
         sh_msg.extend_from_slice(&len.to_be_bytes()[1..]);
@@ -1182,7 +1391,7 @@ mod tests {
             decode_hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")
                 .try_into()
                 .unwrap();
-        assert_eq!(sh.peer_key, expected);
+        assert_eq!(sh.peer_key, Some(expected));
 
         // A non-0x0303 legacy_version is rejected by the parser itself.
         let mut bad = msg[4..].to_vec();
@@ -1194,16 +1403,19 @@ mod tests {
     fn parse_server_hello_rejects_hrr_magic() {
         let mut body = vec![0x03, 0x03];
         body.extend_from_slice(&HRR_RANDOM);
-        body.extend_from_slice(&[0x00, 0x13, 0x01, 0x00, 0x00, 0x00]);
+        body.extend_from_slice(&[
+            0x00, 0x13, 0x01, 0x00, 0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04,
+        ]);
         let Err(err) = parse_server_hello(&body, &[]) else {
             panic!("expected HelloRetryRequest, got a parsed ServerHello");
         };
         assert!(matches!(err, TlsError::HelloRetryRequest));
     }
 
-    /// A minimal `ServerHello` body: TLS 1.3 legacy version, 32 zero random
-    /// bytes, no session id, AES-128-GCM, no compression, the given raw
-    /// extension bytes.
+    /// A minimal TLS 1.3 `ServerHello` body: TLS 1.3 legacy version, 32
+    /// `0xAB` random bytes, no session id, AES-128-GCM, no compression, a
+    /// `supported_versions` extension (= 0x0304) and the given raw extension
+    /// bytes.
     fn minimal_server_hello(exts: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&0x0303u16.to_be_bytes());
@@ -1211,7 +1423,13 @@ mod tests {
         body.push(0); // session id length
         body.extend_from_slice(&0x1301u16.to_be_bytes());
         body.push(0); // compression method
-        body.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
+        let mut supported_versions = Vec::new();
+        supported_versions.extend_from_slice(&0x002bu16.to_be_bytes());
+        supported_versions.extend_from_slice(&0x0002u16.to_be_bytes());
+        supported_versions.extend_from_slice(&0x0304u16.to_be_bytes());
+        let total = supported_versions.len() + exts.len();
+        body.extend_from_slice(&u16::try_from(total).unwrap().to_be_bytes());
+        body.extend_from_slice(&supported_versions);
         body.extend_from_slice(exts);
         body
     }
@@ -1231,7 +1449,7 @@ mod tests {
     fn parse_server_hello_enforces_conformance_guards() {
         let key = [0x44u8; 32];
         let body = minimal_server_hello(&x25519_keyshare_ext(&key));
-        assert_eq!(parse_server_hello(&body, &[]).unwrap().peer_key, key);
+        assert_eq!(parse_server_hello(&body, &[]).unwrap().peer_key, Some(key));
 
         // A keyshare for a group other than X25519 is rejected outright.
         let mut wrong_group = x25519_keyshare_ext(&key);
@@ -1251,7 +1469,7 @@ mod tests {
         sid_body.splice(35..35, std::iter::repeat_n(0x11u8, 32));
         assert_eq!(
             parse_server_hello(&sid_body, &[0x11; 32]).unwrap().peer_key,
-            key
+            Some(key)
         );
         assert!(parse_server_hello(&sid_body, &[0x22; 32]).is_err());
 
@@ -1486,6 +1704,34 @@ mod tests {
         assert_eq!(parsed.sf_verify_data, vec![0xBB; 32]);
     }
 
+    /// A server flight without `CertificateVerify` must not panic: the
+    /// reader leaves `cert_verify_body` empty and [`drive`] slices it
+    /// fallibly. The body is only reachable through unauthenticated ECDHE
+    /// handshake keys, so an on-path party could otherwise abort the task
+    /// (denial of service) before any MAC check runs.
+    #[tokio::test]
+    async fn server_flight_without_certificate_verify_yields_empty_signature() {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let key = AeadKey::from_key_bytes(suite, &[0x11; 16]).unwrap();
+        let ee_msg = make_hs_msg(HS_ENCRYPTED_EXTENSIONS, &[0x00, 0x00]);
+        let cert_msg = make_hs_msg(HS_CERTIFICATE, &[0x00, 0x00, 0x00, 0x00]);
+        let finished_msg = make_hs_msg(HS_FINISHED, &[0xBB; 32]);
+        let mut raw_flight = ee_msg;
+        raw_flight.extend_from_slice(&cert_msg);
+        raw_flight.extend_from_slice(&finished_msg);
+
+        let (mut client_stream, mut server_side) = tokio::io::duplex(8 * 1024);
+        write_encrypted_flight_chunk(&mut server_side, &key, 0, &raw_flight).await;
+        let parsed = read_server_hs_messages(&mut client_stream, &key, &[])
+            .await
+            .unwrap();
+        assert!(parsed.cert_verify_body.is_empty());
+        assert!(
+            parsed.cert_verify_body.get(4..).is_none(),
+            "the caller must find no signature instead of panicking on [4..]"
+        );
+    }
+
     // ── hybrid X25519MLKEM768 handshake (fake PQ server double) ───────────
 
     /// A loopback server double that negotiates X25519MLKEM768: it
@@ -1547,7 +1793,12 @@ mod tests {
             // Go wire order: ct (1088) first, X25519 pub (32) last.
             kse.extend_from_slice(ct.as_bytes());
             kse.extend_from_slice(&server_kp.public_key());
-            sh_body.extend_from_slice(&u16::try_from(kse.len()).unwrap().to_be_bytes());
+            // ext_list_len first, then extensions in order:
+            // supported_versions (6 bytes) + key_share (kse).
+            sh_body.extend_from_slice(&u16::try_from(6 + kse.len()).unwrap().to_be_bytes());
+            sh_body.extend_from_slice(&0x002bu16.to_be_bytes());
+            sh_body.extend_from_slice(&0x0002u16.to_be_bytes());
+            sh_body.extend_from_slice(&0x0304u16.to_be_bytes());
             sh_body.extend_from_slice(&kse);
             let sh_msg = make_hs_msg(HS_SERVER_HELLO, &sh_body);
             let mut rec = vec![0x16, 0x03, 0x03];
@@ -1644,5 +1895,337 @@ mod tests {
         tls.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
         server.await.unwrap();
+    }
+
+    // ── TLS 1.2 interop (rustls server restricted to TLS 1.2) ────────────
+
+    /// A spec offering both TLS 1.2 and 1.3 suites and versions — what a
+    /// real browser sends, including the two extensions that change the
+    /// TLS 1.2 wire flow: `extended_master_secret` (RFC 7627, empty body —
+    /// changes the master-secret derivation) and `status_request` (which
+    /// makes a stapling server insert `CertificateStatus` into the flight,
+    /// so the transcript must hash messages the client does not interpret).
+    fn tls12_spec() -> ClientHelloSpec {
+        ClientHelloSpec {
+            legacy_version: 0x0303,
+            cipher_suites: vec![
+                0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8,
+            ],
+            compression_methods: vec![0x00],
+            session_id: SessionIdSpec::Random32,
+            extensions: vec![
+                ExtensionSpec::ServerName,
+                ExtensionSpec::Raw {
+                    ty: 0x0017,
+                    data: Vec::new(),
+                },
+                ExtensionSpec::SupportedGroups(vec![0x001D]),
+                ExtensionSpec::KeyShare(vec![KeyShareGroup::X25519]),
+                ExtensionSpec::SupportedVersions(vec![0x0304, 0x0303]),
+                ExtensionSpec::SignatureAlgorithms(vec![
+                    0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+                ]),
+                ExtensionSpec::Alpn(vec!["h2".into(), "http/1.1".into()]),
+                ExtensionSpec::StatusRequest,
+                ExtensionSpec::EcPointFormats,
+                ExtensionSpec::SessionTicket,
+                ExtensionSpec::PskKeyExchangeModes,
+            ],
+        }
+    }
+
+    /// A rustls `ServerConfig` restricted to TLS 1.2 only.
+    fn tls12_server_config(
+        cert: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+    ) -> rustls::ServerConfig {
+        tls12_server_config_with(cert, key, None, false)
+    }
+
+    /// A TLS-1.2-only rustls server, optionally restricted to a single
+    /// cipher suite and optionally issuing session tickets.
+    ///
+    /// Both knobs exercise wire shapes the default config hides: a
+    /// ChaCha20-Poly1305 suite uses the RFC 7905 nonce construction (12-byte
+    /// implicit IV, no explicit nonce), and a ticketer makes the server send
+    /// a PLAINTEXT `NewSessionTicket` before its `ChangeCipherSpec`.
+    fn tls12_server_config_with(
+        cert: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+        suite: Option<rustls::SupportedCipherSuite>,
+        tickets: bool,
+    ) -> rustls::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut provider = rustls::crypto::ring::default_provider();
+        if let Some(suite) = suite {
+            provider.cipher_suites = vec![suite];
+        }
+        let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        if tickets {
+            cfg.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+        }
+        cfg
+    }
+
+    /// Drive a rustls `ServerConnection` to completion over an async tokio
+    /// stream, then echo the first 4 plaintext bytes back. Rustls is a
+    /// push/pull API (feed bytes via `read_tls`, drain via `write_tls`), so
+    /// the loop flushes output, reads input, and processes until the echo is
+    /// written. This handles TLS 1.2's multi-round-trip handshake (`ClientHello`
+    /// → flight → CKE → Finished) without blocking I/O.
+    async fn rustls_server_echo(mut stream: tokio::net::TcpStream, conn: rustls::ServerConnection) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut conn = conn;
+        let mut plain: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            // Flush any TLS output rustls has queued.
+            let mut out = Vec::new();
+            conn.write_tls(&mut out).unwrap();
+            if !out.is_empty() {
+                stream.write_all(&out).await.unwrap();
+            }
+            // The echo is the last thing this server does, so one shot is
+            // enough — no "already echoed" state to track.
+            if plain.len() >= 4 {
+                let echo = plain[..4].to_vec();
+                conn.writer().write_all(&echo).unwrap();
+                let mut o2 = Vec::new();
+                conn.write_tls(&mut o2).unwrap();
+                if !o2.is_empty() {
+                    stream.write_all(&o2).await.unwrap();
+                }
+                return;
+            }
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            conn.read_tls(&mut std::io::Cursor::new(&buf[..n])).unwrap();
+            let state = conn.process_new_packets().unwrap();
+            if state.plaintext_bytes_to_read() > 0 {
+                let mut p = vec![0u8; state.plaintext_bytes_to_read()];
+                conn.reader().read_exact(&mut p).unwrap();
+                plain.extend_from_slice(&p);
+            }
+        }
+    }
+
+    /// The engine's TLS 1.2 client must complete a full handshake against a
+    /// real rustls TLS-1.2-only server and round-trip application bytes.
+    /// This exercises the TLS 1.2 PRF, key block, AEAD record layer, and
+    /// Finished verification end-to-end.
+    #[tokio::test]
+    async fn tls12_handshake_completes_against_rustls_server() {
+        // rcgen defaults to an ECDSA P-256 key, so rustls selects
+        // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (0xC02B) with an
+        // ecdsa_secp256r1_sha256 ServerKeyExchange signature.
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let cfg = tls12_server_config(&certified.cert, &certified.signing_key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            rustls_server_echo(stream, conn).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let mut tls = connect(
+            stream,
+            HandshakeParams {
+                spec: &tls12_spec(),
+                server_name: "localhost",
+                alpn: Some(&["http/1.1"]),
+                verifier: &AcceptAll,
+                rng: &rng,
+            },
+        )
+        .await
+        .unwrap();
+
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.await.unwrap();
+    }
+
+    /// TLS 1.2 with real certificate verification: the `WebPkiVerifier` must
+    /// validate the chain AND the `ServerKeyExchange` ECDSA signature (an
+    /// actual rustls ECDSA P-256 signature over
+    /// `client_random || server_random || ServerECDHParams`). This fails if
+    /// the TLS 1.2 signature path is wrong.
+    #[tokio::test]
+    async fn tls12_handshake_verifies_server_signature() {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let cfg = tls12_server_config(&certified.cert, &certified.signing_key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            rustls_server_echo(stream, conn).await;
+        });
+
+        // Trust the self-signed cert as a root: chain + SKE signature check.
+        let verifier = WebPkiVerifier::from_ca_der(certified.cert.der()).unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let mut tls = connect(
+            stream,
+            HandshakeParams {
+                spec: &tls12_spec(),
+                server_name: "localhost",
+                alpn: Some(&["http/1.1"]),
+                verifier: &verifier,
+                rng: &rng,
+            },
+        )
+        .await
+        .unwrap();
+
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.await.unwrap();
+    }
+
+    /// Run one TLS 1.2 echo handshake against a rustls server built with
+    /// `suite`/`tickets`, returning nothing but panicking on any failure.
+    async fn tls12_echo_roundtrip(suite: Option<rustls::SupportedCipherSuite>, tickets: bool) {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let cfg = tls12_server_config_with(&certified.cert, &certified.signing_key, suite, tickets);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            rustls_server_echo(stream, conn).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let mut tls = connect(
+            stream,
+            HandshakeParams {
+                spec: &tls12_spec(),
+                server_name: "localhost",
+                alpn: Some(&["http/1.1"]),
+                verifier: &AcceptAll,
+                rng: &rng,
+            },
+        )
+        .await
+        .unwrap();
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.await.unwrap();
+    }
+
+    /// RFC 7905: the ChaCha20-Poly1305 suites carry a 12-byte implicit IV
+    /// and NO explicit per-record nonce. Modelling them like AES-GCM
+    /// (explicit nonce, no IV) derives a short key block and prefixes every
+    /// record with 12 bytes the peer reads as ciphertext, so this handshake
+    /// is the regression test for the nonce geometry.
+    #[tokio::test]
+    async fn tls12_chacha20_poly1305_roundtrip() {
+        tls12_echo_roundtrip(
+            Some(rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256),
+            false,
+        )
+        .await;
+    }
+
+    /// RFC 5077 §3.3: in TLS 1.2 `NewSessionTicket` is a PLAINTEXT handshake
+    /// record sent BEFORE the server's `ChangeCipherSpec`, and it is covered
+    /// by both `Finished` MACs. Treating it as the encrypted Finished (or
+    /// omitting it from the transcript) breaks the handshake against any
+    /// ticket-issuing server — the default for nginx and most CDNs.
+    #[tokio::test]
+    async fn tls12_handshake_with_session_ticket() {
+        tls12_echo_roundtrip(None, true).await;
+    }
+
+    /// RFC 8446 §4.1.3: a `ServerHello` that negotiates TLS 1.2 while carrying
+    /// the `DOWNGRD` sentinel in the last 8 bytes of its random means a
+    /// TLS 1.3-capable server was forced down; the client must abort.
+    #[test]
+    fn tls12_downgrade_sentinel_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        let mut random = [0x11u8; 32];
+        random[24..].copy_from_slice(b"DOWNGRD\x01");
+        body.extend_from_slice(&random);
+        body.push(0); // empty session id
+        body.extend_from_slice(&0xc02bu16.to_be_bytes()); // ECDHE_ECDSA_AES128_GCM
+        body.push(0); // null compression
+        body.extend_from_slice(&0u16.to_be_bytes()); // no extensions
+        let err = parse_server_hello(&body, &[]).unwrap_err();
+        assert!(
+            matches!(&err, TlsError::Handshake(m) if m.contains("downgrade sentinel")),
+            "expected downgrade rejection, got {err:?}"
+        );
+    }
+
+    /// RFC 7627 §5.1: the `ServerHello` `extended_master_secret` body is empty
+    /// and its mere presence is the acknowledgement. Requiring a non-empty
+    /// body silently selects the legacy master secret and breaks every
+    /// handshake with a conforming server.
+    #[test]
+    fn empty_extended_master_secret_extension_is_an_ack() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x22u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&0xc02bu16.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&4u16.to_be_bytes()); // one empty extension
+        body.extend_from_slice(&0x0017u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let parsed = parse_server_hello(&body, &[]).unwrap();
+        assert_eq!(parsed.version, TlsVersion::Tls12);
+        assert!(parsed.ems, "empty EMS extension must be read as an ack");
+    }
+
+    /// A server signature scheme the `ClientHello` never offered must be
+    /// refused (RFC 5246 §7.4.3, RFC 8446 §4.4.3).
+    #[test]
+    fn unoffered_signature_scheme_is_rejected() {
+        let rng = ring::rand::SystemRandom::new();
+        let hello = build_hello(
+            &tls12_spec(),
+            &BuildParams {
+                server_name: "localhost",
+                alpn: None,
+                x25519_pub: &[0x33u8; 32],
+                mlkem768_pub: None,
+                rng: &rng,
+            },
+        )
+        .unwrap();
+        // 0x0403 is in tls12_spec's signature_algorithms; 0x0203 (SHA-1) is not.
+        ensure_offered_sigalg(&hello.handshake_bytes, 0x0403).unwrap();
+        assert!(ensure_offered_sigalg(&hello.handshake_bytes, 0x0203).is_err());
     }
 }

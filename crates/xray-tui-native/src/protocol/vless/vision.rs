@@ -1544,12 +1544,7 @@ mod tests {
         use xray_tui_tls::record::stream::{AppKeys, TlsStream};
         let (a, b) = tokio::io::duplex(4096);
         let key = AeadKey::new(CipherSuiteId::Aes128GcmSha256, &[0x11; 16]).unwrap();
-        let keys = AppKeys {
-            read_key: key.clone_key(),
-            write_key: key.clone_key(),
-            read_seq: 0,
-            write_seq: 0,
-        };
+        let keys = AppKeys::tls13(key.clone_key(), key.clone_key());
         let transport: BoxStream = Box::new(a);
         let tls: BoxStream = Box::new(TlsStream::new(transport, keys));
         (tls, b)
