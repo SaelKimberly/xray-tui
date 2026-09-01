@@ -17,7 +17,8 @@ crates/
 ├── xray-tui-geoip/    # Library: country/city lookup by IP (GeoLite2-City mmdb)
 ├── xray-tui-host-features/ # Library: SNI/exact-IP/CIDR whitelist membership checks (fastbloom)
 	├── xray-tui-native/   # Library: in-process proxy core (subprocess-free tunnels; VLESS+VMess, TLS engine-backed)
-	├── xray-tui-tls/      # Library: ring-based TLS 1.3 client, browser fingerprint mimicry, REALITY client
+	├── xray-tui-tls/      # Library: ring-based TLS client (1.3 + 1.2 fallback), browser fingerprint mimicry, REALITY client
+	├── xray-tui-route/    # Library: first-match routing engine + TLS/HTTP/QUIC sniffer (native inbound)
 	├── xray-tui-hakari/   # Generated feature-unification crate (cargo-hakari); every member depends on it
 	thirdparty/
 ├── sing-box/          # Source of truth for sing-box protocols, config format, and API
@@ -93,7 +94,7 @@ AGENTS.md
 - **Theme system**: `ThemeStyles` (in `theme.rs`) replaces hardcoded `Style` constants with static methods taking `&Palette`. `Palette` comes from `ratatui_themes::ThemeName` → `Theme` → `palette_bridge::current_palette()`. Every screen uses `state.current_palette()` and `ThemeStyles::*` instead of bare `Color` values. New dependencies: `ratatui-cheese` (form widgets, `Palette`), `ratatui-themes` (theme definitions), `tui-popup` (overlays), `tui-scrollbar`. New modules: `palette_bridge`, `widgets/` (reusable `DataTable`).
 - **Protocols in scope**: Everything supported natively by either Xray-core or Sing-box. No third binary backends.
 - **Native in-process core** (`xray-tui-native`): client-side protocol implementations that remove the subprocess dependency for the tunnel itself. Xray composition order (`dial → transport → security → protocol → tunnel`); config source of truth is `xray-tui-proto` typed models (`NativeConnectParams`). VLESS, VMess, Trojan + Hysteria2 implemented; every other kind has a dispatch arm returning `NativeError::NotImplemented` — no silent fallback. Feature `native-e2e` runs 14 real-core cases (trojan {tcp,ws,grpc} x {tls-standard,chrome-fp} x both cores + hysteria2 {tls-plain,obfs-salamander} x sing-box) against real xray-core 26.3.27 + sing-box 1.13.16 servers (version-pinned, hard-fail on mismatch). See `NATIVE_CORE.md`.
-- **TLS fingerprint engine** (`xray-tui-tls`): ring-only TLS 1.3 client (no aws-lc-rs/rand/unsafe) with browser ClientHello mimicry (12 profiles as declarative spec data, GREASE pairing, 512-byte record padding) + a REALITY client (x25519-dalek for the dual agreement — the one documented crypto exception). JA3/JA4 encoders; `WebPkiVerifier` with `insecure`/`pin_sha256` trust modes (pin replaces chain walk but never the CertificateVerify signature). Consumed by native's security phase: `fp` value or `TlsProvider::Custom` routes to the fingerprint engine, `reality` config to the RealityConnector.
+- **TLS fingerprint engine** (`xray-tui-tls`): ring-only TLS client (TLS 1.3, plus a TLS 1.2 ECDHE+AEAD path on a 1.2 ServerHello; no aws-lc-rs/rand/unsafe) with browser ClientHello mimicry (two-tier profile roster, GREASE pairing, 512-byte record padding) + a REALITY client (x25519-dalek for the dual agreement — the one documented crypto exception; REALITY stays 1.3-only). JA3/JA4 encoders; `WebPkiVerifier` with `insecure`/`pin_sha256` trust modes (pin replaces chain walk but never the CertificateVerify signature). Engine-only client path — every TLS/REALITY connect runs through `xray_tui_tls::client::connect` (the `TlsProvider` plug is gone; the `fp` profile selects the fingerprint, `reality` config selects `TlsMode::Reality`).
 - **Verification tiers**: tier 1 offline unit/integration (RFC 8448 vectors, JA3/JA4 goldens, Go VMess vectors, rustls-server interop, multi-record reassembly); tier 2 live tls.peet.ws grader (`examples/grader.rs` + `#[ignore]`d test); tier 3 real-core e2e (feature + `XRAY_TUI_CORE_BIN_DIR`). No implicit network in the usual test run.
 
 ## Key source files
@@ -116,8 +117,8 @@ AGENTS.md
 - `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing → hickory-resolver 0.26 config, cached resolver list, panic-free async init
 - `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup
 - `crates/xray-tui-host-features/src/lib.rs` — HostFeaturesChecker: SNI/exact-IP/CIDR whitelist checks, download-if-missing from hxehex/russia-mobile-internet-whitelist
-- `crates/xray-tui-native/src/` — in-process proxy core: `chain.rs` (connect_chain), `context.rs` (LinkContext/NativeConnectParams), `security/` (tls.rs, fingerprint.rs, reality.rs, tls_provider.rs), `protocol/` (vless.rs + vmess.rs implemented; 18 kinds NotImplemented), `e2e/` (feature-gated real-core harness). Roadmap: `NATIVE_CORE.md`
-- `crates/xray-tui-tls/src/` — ring TLS 1.3 client: `spec/` + `profiles/` (12 browser fingerprints), `hello/` (builder + parser), `crypto/` (key schedule + JA3/JA4), `record/` (TlsStream), `handshake/` + `verify/` (WebPkiVerifier), `reality/` (HelloProvisioner + 9-step wire contract), `http2/` (grader-minimal)
+- `crates/xray-tui-native/src/` — in-process proxy core: `chain.rs` (connect_chain), `context.rs` (LinkContext/NativeConnectParams), `security/` (wrap → `xray_tui_tls::client::connect`; fingerprint.rs, reality.rs), `inbound/` (SOCKS5 listener → `xray-tui-route` `Engine` → Direct/Block/Proxy outbound), `protocol/` (vless/vmess/trojan/hysteria2 implemented; 16 kinds NotImplemented), `e2e/` (feature-gated real-core harness). Roadmap: `NATIVE_CORE.md`
+- `crates/xray-tui-tls/src/` — ring TLS client (1.3 + 1.2 fallback): `spec/` + `profiles/` (two-tier roster), `hello/` (builder + parser), `crypto/` (key schedule + TLS 1.2 key block + JA3/JA4), `record/` (TlsStream + 1.2 record protection), `handshake/` + `verify/` (WebPkiVerifier), `reality/` (HelloProvisioner + 9-step wire contract), `http2/` (grader-minimal)
 
 ## Key Differences from v2rayN
 

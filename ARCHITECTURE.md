@@ -18,8 +18,9 @@ xray-tui (bin)
 	wired into the binary — verified standalone via its e2e harness):
 
 	```
-	xray-tui-native     (in-process proxy core — VLESS + VMess tunnels, security phase)
-	  ├── xray-tui-tls   (ring TLS 1.3 client, browser fingerprints, REALITY client)
+	xray-tui-native     (in-process proxy core — VLESS/VMess/Trojan/Hysteria2 tunnels, SOCKS5 inbound, security phase)
+	  ├── xray-tui-tls   (ring TLS 1.3 + TLS 1.2-fallback client, browser fingerprints, REALITY client)
+	  ├── xray-tui-route (first-match routing engine for the SOCKS5 inbound — TLS/HTTP/QUIC sniffing)
 	  └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
 	```
 
@@ -513,31 +514,37 @@ Layering follows Xray composition order, folded by `connect_chain`:
 previous phase's `BoxStream` (the `Stream` seam: AsyncRead+AsyncWrite+Unpin+Send)
 and returns the next.
 
-- `transport/` — TCP dial (the only implemented transport).
-- `security/` — `wrap()` dispatch on the profile's `TlsConfig`: `Tls` with no
-  `fp` + `TlsProvider::Standard` → standard rustls (`tls.rs`); `Tls` with any
-  `fp` value or `TlsProvider::Custom` → fingerprint engine (`fingerprint.rs`
-  `FingerprintConnector` over `xray-tui-tls`); `Reality` →
-  `security/reality.rs` (`RealityConnector`). Trust: `insecure` / `pin_sha256`
-  (pin replaces chain walk + SAN but never the CertificateVerify signature).
+- `transport/` — TCP dial, ws/grpc/httpupgrade/xhttp/v2rayhttp upgrade framing, fresh-UDP mKCP dial, and the QUIC dial (`connect_quic` — quinn/rustls internal to QUIC, shared by the xhttp h3 arm and the hysteria2 client).
+- `security/` — `wrap()` builds an engine `TlsConfig` from the profile's
+  security config and runs `xray_tui_tls::client::connect` (`TlsMode::Plain` |
+  `TlsMode::Reality`) — the rustls client path is gone; rustls remains only
+  as the server-side test double + quinn's internal QUIC TLS. Trust:
+  `insecure` / `pin_sha256` (pin replaces chain walk + SAN but never the
+  CertificateVerify signature).
 - `protocol/` — 20 protocol modules; `vless`, `vmess`, `trojan` + `hysteria2` are implemented
   (trojan = TCP-stream family via the uniform pipeline; hysteria2 = `ConnectShape::Quic`
   fresh quinn dial). Every other kind returns `NativeError::NotImplemented` naming the feature.
   `shape.rs` `ConnectShape` marks the divergent paths (device tunnels:
   WireGuard/Tailscale; own-handshake: SSH; outbound-only kinds: Redirect/TProxy/
   Mixed).
+- `inbound/` — local SOCKS5 server (`Socks5Inbound`): accept → `xray-tui-route`
+  `Engine` (`decide_async`) → tagged `Outbound` (Direct / Block / Proxy, the proxy
+  reusing `crate::connect`). TCP CONNECT only; BIND/UDP-ASSOCIATE refused.
 - `e2e/` (feature `native-e2e`) — real-core scenarios: spawns xray-core
   26.3.27 / sing-box 1.13.16 server inbounds, dials with the native client,
-  probes HTTP through the tunnel. 7 cases (VLESS tls-standard/tls-chrome/reality,
-  VMess aes-128-gcm/chacha20-poly1305/tls-firefox/reality) × both cores.
+  probes HTTP through the tunnel. Transport matrix (VLESS/VMess ×
+  TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/QUIC × TLS variants) + Trojan +
+  Hysteria2 axes; 136 tests = 130 green + 6 documented ignored.
   Version-pinned: a core binary version mismatch is a hard fail, not a skip.
 
 Per-protocol roadmap and capability tables: `NATIVE_CORE.md`.
 
 ### xray-tui-tls (library crate)
 
-`crates/xray-tui-tls/src/lib.rs` — ring-based TLS 1.3 client with browser
-fingerprint mimicry + a REALITY client. ring-only (no aws-lc-rs/rand/unsafe);
+`crates/xray-tui-tls/src/lib.rs` — ring-based TLS client (TLS 1.3, plus a
+TLS 1.2 ECDHE+AEAD client path reached on a 1.2 ServerHello) with browser
+fingerprint mimicry + a REALITY client (REALITY stays 1.3-only). ring-only
+(no aws-lc-rs/rand/unsafe);
 CSPRNG via the crate-local `SecureRandom` seam (blanket impl for
 `ring::rand::SecureRandom`). One documented exception: x25519-dalek for the
 REALITY keypair, because ring's `EphemeralPrivateKey` is single-use and cannot
@@ -551,11 +558,12 @@ serialize — REALITY must agree twice with the same scalar.
   the deterministic `select_roster` kept subset of the 1825-entry ja4db manifest.
 - `hello/` — `build_hello`/`to_record` (GREASE pairing, 512-byte record
   padding), `parse_hello`.
-- `crypto/` — TLS 1.3 key schedule (RFC 8448-verified), AEAD record keys
+- `crypto/` — TLS 1.3 key schedule (RFC 8448-verified) + TLS 1.2 key block, AEAD record keys
   (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs.
 - `record/` — record framing, `read_record`, `TlsStream<S>`.
 - `handshake/` — client handshake (HRR detection, `ServerVerifier` seam,
-  multi-record flight reassembly).
+  multi-record flight reassembly); TLS 1.2 fallback driver in `handshake/tls12.rs`
+  reached on a 1.2 ServerHello.
 - `verify/` — `WebPkiVerifier` (roots / CA DER / `insecure` / `pin_sha256`).
 - `reality/` — `HelloProvisioner` + 9-step wire contract, `FixedChrome133`,
   auth-key/session-seal/server-auth.

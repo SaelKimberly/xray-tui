@@ -2,8 +2,9 @@
 
 Status and roadmap for the two crates that remove the subprocess dependency for
 the tunnel itself: **`xray-tui-native`** (in-process client-side protocol
-implementations) and **`xray-tui-tls`** (the ring-based TLS 1.3 client that
-backs the fingerprint/REALITY security paths).
+implementations) and **`xray-tui-tls`** (the ring-based TLS client — TLS 1.3,
+plus a TLS 1.2 ECDHE+AEAD fallback — that backs the fingerprint/REALITY
+security paths).
 
 Sibling docs: `AGENTS.md` (agent guide), `ARCHITECTURE.md` (whole-system
 architecture), `CONTEXT.md` (domain glossary + decisions), `docs/protocols.md`
@@ -34,9 +35,12 @@ TLS/REALITY connect runs through `xray-tui-tls`. The rustls *client* path was
 removed; rustls client usage is now limited to the server-side test double
 (unit tests + the e2e `tls_echo` dest) and quinn's internal QUIC TLS for the
 xhttp h3 dial (spec §5.2 — a mandatory native dep) — the engine remains the
-only client-facing TLS path. The engine is TLS 1.3-only: TLS 1.2 engine
-support is a future task, so legacy (TLS 1.2-only) servers are not yet
-reachable.
+only client-facing TLS path. The engine negotiates TLS 1.3 by default and
+runs a TLS 1.2 client path (ECDHE + AEAD only — no CBC, no static RSA)
+when the ServerHello picks 1.2, so legacy TLS 1.2-only servers are
+reachable. REALITY stays 1.3-only: a 1.2 ServerHello surfaces
+`TlsError::RealityFallback` and the caller runs Spider-X instead of failing
+the dial.
 
 ## Principles
 
@@ -80,7 +84,7 @@ reachable.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session), xhttp h3 (the `decideHTTPVersion` dispatch rule — single `h3` ALPN → QUIC, `http/1.1` → h1, 0/2+ or other → h2; the shared v3 protocol over the `V3Send` seam; hermetic h3 server double over loopback QUIC; ML-KEM-768 primitives (liboqs roundtrips + size pins), TLS hybrid curves (X25519MLKEM768 key-share encode/parse, `pq || classical` key schedule, fake-PQ-server handshake), VLESS `mlkem768x25519plus` encryption (parser, relay/AEAD chain, xor-mode masking, hermetic double), REALITY 4588 hybrid share (hermetic fake REALITY PQ server)) | 476 lib tests (142 tls + 334 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP))
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, TLS 1.2 client path (ECDHE + AEAD key block, explicit-nonce records, DOWNGRD-sentinel + RFC 7627 EMS guards), Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session), xhttp h3 (the `decideHTTPVersion` dispatch rule — single `h3` ALPN → QUIC, `http/1.1` → h1, 0/2+ or other → h2; the shared v3 protocol over the `V3Send` seam; hermetic h3 server double over loopback QUIC; ML-KEM-768 primitives (liboqs roundtrips + size pins), TLS hybrid curves (X25519MLKEM768 key-share encode/parse, `pq || classical` key schedule, fake-PQ-server handshake), VLESS `mlkem768x25519plus` encryption (parser, relay/AEAD chain, xor-mode masking, hermetic double), REALITY 4588 hybrid share (hermetic fake REALITY PQ server)) | 476 lib tests (142 tls + 334 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP))
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo run -p xray-tui-tls --example grader -- --roster [--family <name>] [--sample]`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox 128 resolves next-modern to the kept `firefox_139_windows_desktop` (JA3 `fdb1b23bd019c5596f46c8bf59f21968` + JA4 `t13d1516h2_8daaf6152771_02713d6af862`); kept 71-profile roster live sweep (71/71 both runs) + offline JA4 gate + Cloudflare amiabot report (see `docs/tls-fingerprint-roster.md`, `docs/amiabot-roster-report.md`) |
 | 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis, VLESS mKCP axis, VLESS XHTTP/3 axis, VLESS ML-KEM PQ axis | 136 tests = 130 green + 6 documented ignored (vless 78+6, vmess 52; ignored: the 4 ws/grpc plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (SP7 — see the ML-KEM axis below); single-core rows run only on the serving core: xhttp + xhttp-h3 + kcp + pq-enc on xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on sing-box)
 
@@ -160,10 +164,10 @@ hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`
 | `fingerprints/` | identity selector: `Fingerprint { browser, version?, os?, device? }` → **next-modern** table resolution over the 71-row two-tier table (smallest kept major `>= v` within the os/device-compatible group; above-newest / below-oldest refuse) with **cross-triple os-drop** fallback (exact triple miss → retry os-dropped — desktop hellos are OS-independent within a family); never a different browser, never older than requested; unknown combos error listing what IS resolvable; `FingerprintBuilder` overrides (ciphers/extensions/curves/ALPN/signature-algs, `GreasePolicy::Keep|Strip`); generated JA4 catalog (`catalog/catalog_data.rs`, from the frozen ja4db-export snapshot 2026-05-15 via ua-parser — rerun `gen.py`, never hand-edit) as evidence (`Resolved::in_catalog`); full-JA4 oracle in `crypto/fingerprint/ja4.rs` (final FoxIO scheme, peet.ws-validated) |
 | `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
-| `crypto/` | key schedule (RFC 8448-verified; hybrid input = `pq ‖ classical` shared secrets), AEAD record keys (IV XOR seq), `X25519KeyPair`, `mlkem.rs` ML-KEM-768 primitives via liboqs (`oqs`, vendored — pk 1184 / sk 2400 / ct 1088 / ss 32), `fingerprint/` JA3 + JA4 encoders |
-| `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF; per-direction direct mode `set_write_direct`/`set_read_direct` — raw record-layer bypass that hands the socket to the tunnel, backing the vision Direct splice) |
-| `handshake/` | TLS 1.3 client handshake, `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY; hybrid-curve key exchange (curve 4588 selected → decapsulate the ServerHello's 1088-B ML-KEM ciphertext, feed `pq ‖ classical` to the key schedule) |
-| `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked) |
+| `crypto/` | key schedule (RFC 8448-verified; hybrid input = `pq ‖ classical` shared secrets), AEAD record keys (IV XOR seq), TLS 1.2 key block (`tls12.rs` — X25519 ECDHE + AES-GCM/ChaCha20-Poly1305 explicit-nonce AEAD via `seal_with_nonce`/`open_with_nonce`), `X25519KeyPair` (low-order peer points refused per RFC 7748 §6.1), `mlkem.rs` ML-KEM-768 primitives via liboqs (`oqs`, vendored — pk 1184 / sk 2400 / ct 1088 / ss 32), `fingerprint/` JA3 + JA4 encoders |
+| `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF; per-direction direct mode `set_write_direct`/`set_read_direct` — raw record-layer bypass that hands the socket to the tunnel, backing the vision Direct splice). TLS 1.2 record protection (`aead_aad_12` plaintext-length AAD, explicit nonce, one write counter advanced only after a successful seal, `AppKeys` deliberately not `Clone`; a plaintext CCS after the handshake is `unexpected_message`, not a skip) |
+| `handshake/` | TLS 1.3 client handshake + TLS 1.2 fallback driver (`handshake/tls12.rs`, ECDHE + AEAD — reached from the shared `drive()` on a 1.2 ServerHello; REALITY over 1.2 surfaces `RealityFallback`), `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY; hybrid-curve key exchange (curve 4588 selected → decapsulate the ServerHello's 1088-B ML-KEM ciphertext, feed `pq ‖ classical` to the key schedule) |
+| `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked — the server sigalg is checked against the ClientHello offer on both versions; TLS 1.2 ECDSA schemes name no curve (RFC 8422 §5.1.3), so one candidate per curve is tried) |
 | `reality/` | `HelloProvisioner` + `SpecProvisioner` (`From<&Fingerprint>` — any resolvable identity over the 71-row two-tier table) + 9-step wire contract, `FixedChrome133` (the surviving wire-exact chrome_130 spec + the X25519MLKEM768 hybrid share — the Chrome-133 hand profile was dropped in the roster reduction), auth-key/session-seal/server-auth, REALITY over the `X25519MLKEM768` share (curve 4588 — xray `reality.go:79` / sing-box `reality_client.go:136`), `SpiderConfig` + `spider.rs` (Spider-X h2 fallback) |
 | `http2/` | minimal h2 layer (tls.peet.ws grading + Spider-X fallback GETs) |
 | `error.rs` | `TlsError`/`Result` (thiserror) |
@@ -425,8 +429,9 @@ Notes on the matrix:
 - **TLS engine / REALITY columns** are "✅" only for the TCP-stream family
   where the security phase applies. QUIC-family protocols (Hysteria1/2, TUIC)
   carry TLS inside QUIC and need a QUIC transport first — 🔒.
-- **TLS 1.2**: the engine is TLS 1.3-only. TLS 1.2 engine support is a future
-  task — legacy (TLS 1.2-only) servers are not yet reachable.
+- **TLS 1.2**: the engine has a TLS 1.2 fallback path (ECDHE + AEAD only),
+  reached on a 1.2 ServerHello — legacy TLS 1.2-only servers are reachable.
+  REALITY stays 1.3-only (a 1.2 ServerHello → `RealityFallback` → Spider-X).
 - **Shadowsocks** gets no TLS column (plain TCP + AEAD; obfuscation comes from
   plugins, which are 📋 transport work). `ss` method whitelists live in
   `proto_spec/core_mapping.rs`.
@@ -658,6 +663,6 @@ Notes on the matrix:
    (`inbound/`, accept → route → direct/block/proxy outbound) is done; the
    remaining piece is the outbound-only kinds (redirect dial for
    split-tunnel rules).
-5. **TLS 1.2 engine support** — the engine is TLS 1.3-only today; legacy
-   (TLS 1.2-only) servers become reachable only after the engine learns
-   TLS 1.2.
+5. **TLS 1.2 CBC / static-RSA suites** — the engine's TLS 1.2 path is ECDHE +
+   AEAD only; servers that require CBC encryption or RSA key exchange remain
+   unreachable.
