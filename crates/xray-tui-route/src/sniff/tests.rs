@@ -1,4 +1,7 @@
-use super::{SniffResult, SniffedProtocol, probe};
+use super::{
+    QUIC_VERSION_V1, QUIC_VERSION_V2, QuicSniffProgress, QuicSniffer, SniffResult, SniffedProtocol,
+    probe,
+};
 use std::path::Path;
 
 /// Deterministic RNG feeding back a fixed byte sequence (same shape as the
@@ -323,18 +326,43 @@ fn quic_scid_length_overflow_returns_none_not_panic() {
     assert_eq!(probe(&pkt), None);
 }
 
-/// Forges a valid QUIC v1 client `Initial` packet whose single `CRYPTO`
-/// frame declares `offset` with 1 data byte (padded + protected + sealed,
-/// keys derived from the fixed DCID — same recipe as xray's `sniff_test.go`
-/// fixtures).  Lets the test reach the reassembly path with an
-/// attacker-chosen offset.
-fn forge_initial_with_crypto_offset(offset: u64) -> Vec<u8> {
+/// Forges a single-packet QUIC `Initial` datagram for any version the
+/// sniffer supports: one `CRYPTO` frame carrying `crypto_data` at
+/// `crypto_offset`, PADDING to a plausible size, keys derived from `dcid`
+/// with the version's salt + labels, HP-protected and AEAD-sealed. Same
+/// recipe as xray's `sniff_test.go` fixtures.
+fn forge_initial(version: u32, dcid: &[u8], crypto_offset: u64, crypto_data: &[u8]) -> Vec<u8> {
+    let params = super::version_params(version).expect("test version must be supported");
+    forge_initial_with(
+        version,
+        params.salt,
+        params.key_label,
+        params.iv_label,
+        params.hp_label,
+        params.initial_type,
+        dcid,
+        crypto_offset,
+        crypto_data,
+    )
+}
+
+/// Forges a single-packet QUIC `Initial` datagram with explicit
+/// version-derived parameters. v2 tests pass RFC 9369 literals here so a
+/// drift in the production [`super::version_params`] table fails decryption
+/// instead of passing self-consistently.
+fn forge_initial_with(
+    version: u32,
+    salt: &[u8; 20],
+    key_label: &[u8],
+    iv_label: &[u8],
+    hp_label: &[u8],
+    initial_type: u8,
+    dcid: &[u8],
+    crypto_offset: u64,
+    crypto_data: &[u8],
+) -> Vec<u8> {
     use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
-    const SALT: [u8; 20] = [
-        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
-        0xad, 0xcc, 0xbb, 0x7f, 0x0a,
-    ];
     fn expand_label(secret: &[u8], label: &[u8], out: &mut [u8]) {
         let mut info = Vec::new();
         info.extend_from_slice(&u16::try_from(out.len()).expect("small").to_be_bytes());
@@ -355,30 +383,29 @@ fn forge_initial_with_crypto_offset(offset: u64) -> Vec<u8> {
         b
     }
 
-    let dcid = [0u8; 8];
-    let initial_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &SALT);
-    let initial_secret = ring::hmac::sign(&initial_key, &dcid);
+    let initial_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, salt);
+    let initial_secret = ring::hmac::sign(&initial_key, dcid);
     let mut cs = [0u8; 32];
     expand_label(initial_secret.as_ref(), b"client in", &mut cs);
     let mut key = [0u8; 16];
-    expand_label(&cs, b"quic key", &mut key);
+    expand_label(&cs, key_label, &mut key);
     let mut iv = [0u8; 12];
-    expand_label(&cs, b"quic iv", &mut iv);
+    expand_label(&cs, iv_label, &mut iv);
     let mut hp = [0u8; 16];
-    expand_label(&cs, b"quic hp", &mut hp);
+    expand_label(&cs, hp_label, &mut hp);
 
     let mut frames = vec![0x06u8]; // CRYPTO
-    frames.extend_from_slice(&varint8(offset));
-    frames.push(0x01); // length = 1
-    frames.push(0x01); // 1 byte of "crypto data"
+    frames.extend_from_slice(&varint8(crypto_offset));
+    frames.extend_from_slice(&varint8(u64::try_from(crypto_data.len()).expect("small")));
+    frames.extend_from_slice(crypto_data);
     frames.resize(frames.len() + 32, 0x00); // PADDING
 
     let pn_len = 4usize;
     let length = pn_len + frames.len() + 16; // pn + ciphertext + tag
-    let mut hdr = vec![0xc3u8]; // long, fixed bit, Initial, 4-byte pn
-    hdr.extend_from_slice(&1u32.to_be_bytes());
-    hdr.push(8);
-    hdr.extend_from_slice(&dcid);
+    let mut hdr = vec![0xc0 | (initial_type << 4) | 0x03]; // long, fixed, Initial, 4-byte pn
+    hdr.extend_from_slice(&version.to_be_bytes());
+    hdr.push(u8::try_from(dcid.len()).expect("dcid <= 255"));
+    hdr.extend_from_slice(dcid);
     hdr.push(0); // scid len
     hdr.push(0); // token len varint = 0
     hdr.extend_from_slice(&(u16::try_from(length).expect("small") | 0x4000).to_be_bytes());
@@ -411,14 +438,66 @@ fn forge_initial_with_crypto_offset(offset: u64) -> Vec<u8> {
     pkt
 }
 
+/// Builds a minimal TLS 1.3 `ClientHello` handshake message (raw, no TLS
+/// record header — the QUIC CRYPTO stream shape) carrying the given SNI.
+fn minimal_client_hello(sni: &str) -> Vec<u8> {
+    let mut sni_ext = 0x0000u16.to_be_bytes().to_vec(); // server_name
+    sni_ext.extend_from_slice(&u16::try_from(5 + sni.len()).unwrap().to_be_bytes()); // ext len
+    sni_ext.extend_from_slice(&u16::try_from(1 + 2 + sni.len()).unwrap().to_be_bytes()); // list len
+    sni_ext.push(0x00); // host_name
+    sni_ext.extend_from_slice(&u16::try_from(sni.len()).unwrap().to_be_bytes());
+    sni_ext.extend_from_slice(sni.as_bytes());
+
+    let mut body = vec![0x03, 0x03]; // legacy_version
+    body.extend_from_slice(&[0x00; 32]); // random
+    body.push(0x00); // session id len
+    body.extend_from_slice(&0x0002u16.to_be_bytes()); // ciphers len
+    body.extend_from_slice(&0x1301u16.to_be_bytes()); // one cipher
+    body.push(0x01); // compression len
+    body.push(0x00); // null
+    body.extend_from_slice(&u16::try_from(sni_ext.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&sni_ext);
+
+    let mut hello = vec![0x01]; // ClientHello
+    hello.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]); // 3-byte len
+    hello.extend_from_slice(&body);
+    hello
+}
+
+/// RFC 9369 §3.3.1 initial salt — hardcoded independently of the production
+/// table so a typo in [`super::QUIC_SALT_V2`] fails the v2 sniff tests
+/// instead of passing self-consistently.
+const V2_SALT: [u8; 20] = [
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
+];
+
+/// Forges a v2 `Initial` datagram with RFC 9369 literals (v2 salt, quicv2
+/// labels, Initial type 0b01) — independent of the production
+/// `version_params` table, so a production drift fails decryption.
+fn forge_v2_initial(dcid: &[u8], crypto_offset: u64, crypto_data: &[u8]) -> Vec<u8> {
+    forge_initial_with(
+        QUIC_VERSION_V2,
+        &V2_SALT,
+        b"quicv2 key",
+        b"quicv2 iv",
+        b"quicv2 hp",
+        1,
+        dcid,
+        crypto_offset,
+        crypto_data,
+    )
+}
+
 #[test]
 fn quic_crypto_offset_is_capped_not_allocated() {
     // A CRYPTO frame with a huge offset used to `crypto.resize(end)` an
     // attacker-chosen size — a 1 TiB allocation aborts the process
-    // (regression: sniff.rs:346-350).  The reassembly span must be capped
-    // at MAX_CRYPTO_LEN and reported indeterminate.
+    // (regression: the cap now lives in `decrypt_initial_packet` before the
+    // resize).  The reassembly span must be capped at MAX_CRYPTO_LEN and
+    // reported indeterminate.
     for offset in [1u64 << 20, 1u64 << 40, (1u64 << 62) - 1] {
-        let pkt = forge_initial_with_crypto_offset(offset);
+        let pkt = forge_initial(QUIC_VERSION_V1, &[0u8; 8], offset, &[0x01]);
         assert_eq!(
             probe(&pkt),
             None,
@@ -427,6 +506,214 @@ fn quic_crypto_offset_is_capped_not_allocated() {
     }
     // Sanity: the forged packet is well-formed — a small offset decrypts
     // and is accepted into the (incomplete) hello, still yielding None.
-    let pkt = forge_initial_with_crypto_offset(64);
+    let pkt = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 64, &[0x01]);
     assert_eq!(probe(&pkt), None);
+}
+
+#[test]
+fn quic_v2_initial_yields_quic_with_sni() {
+    // RFC 9369: version 0x6b3343cf, v2 salt, "quicv2 *" HKDF labels, and an
+    // Initial packet type of 0b01 (v1 uses 0b00). Forged with RFC literals
+    // independent of the production table — a production drift fails here.
+    let hello = minimal_client_hello("example.com");
+    let d = forge_v2_initial(&[0u8; 8], 0, &hello);
+    let r = probe(&d).expect("v2 Initial must sniff as QUIC");
+    assert_eq!(r.protocol, SniffedProtocol::Quic);
+    assert_eq!(r.host.as_deref(), Some("example.com"));
+}
+
+#[test]
+fn quic_version_mismatch_returns_none() {
+    // The version field is load-bearing: it selects the Initial packet type
+    // (RFC 9369 §3.2) and the salt/labels (§3.3), so a packet forged for one
+    // version is indeterminate under the other (either a non-Initial type or
+    // a failed decrypt).
+    let hello = minimal_client_hello("example.com");
+    let mut v1 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, &hello);
+    v1[1..5].copy_from_slice(&QUIC_VERSION_V2.to_be_bytes());
+    assert_eq!(probe(&v1), None);
+    let mut v2 = forge_v2_initial(&[0u8; 8], 0, &hello);
+    v2[1..5].copy_from_slice(&QUIC_VERSION_V1.to_be_bytes());
+    assert_eq!(probe(&v2), None);
+}
+
+#[test]
+fn quic_hello_split_across_datagrams_assembles_sni() {
+    // The ClientHello split across TWO v1 datagrams: the stateful sniffer
+    // accumulates CRYPTO across feeds and resolves once the handshake
+    // message is complete. The single-shot `probe` on the partial datagram
+    // stays indeterminate.
+    let hello = minimal_client_hello("example.com");
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let d1 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, a);
+    let d2 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], a.len() as u64, b);
+    assert_eq!(probe(&d1), None, "partial hello must not yield a host");
+
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&d1), QuicSniffProgress::NeedMore);
+    match s.feed(&d2) {
+        QuicSniffProgress::Done(r) => {
+            assert_eq!(r.protocol, SniffedProtocol::Quic);
+            assert_eq!(r.host.as_deref(), Some("example.com"));
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn quic_v2_hello_split_across_datagrams_assembles_sni() {
+    // Same split over the v2 wire format.
+    let hello = minimal_client_hello("example.com");
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let d1 = forge_v2_initial(&[0u8; 8], 0, a);
+    let d2 = forge_v2_initial(&[0u8; 8], a.len() as u64, b);
+
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&d1), QuicSniffProgress::NeedMore);
+    match s.feed(&d2) {
+        QuicSniffProgress::Done(r) => {
+            assert_eq!(r.protocol, SniffedProtocol::Quic);
+            assert_eq!(r.host.as_deref(), Some("example.com"));
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn quic_sniffer_rejects_version_switch() {
+    // A datagram with a different version than the first is a different
+    // connection — the reassembly must not mix it in.
+    let hello = minimal_client_hello("example.com");
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let d1 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, a);
+    let d2 = forge_v2_initial(&[0u8; 8], a.len() as u64, b);
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&d1), QuicSniffProgress::NeedMore);
+    assert_eq!(s.feed(&d2), QuicSniffProgress::Indeterminate);
+}
+
+#[test]
+fn quic_sniffer_rejects_dcid_switch() {
+    // A datagram with a different DCID is a different connection (5-tuple
+    // reuse) — rejected rather than merged into the reassembly.
+    let hello = minimal_client_hello("example.com");
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let d1 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, a);
+    let d2 = forge_initial(QUIC_VERSION_V1, &[0x42; 8], a.len() as u64, b);
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&d1), QuicSniffProgress::NeedMore);
+    assert_eq!(s.feed(&d2), QuicSniffProgress::Indeterminate);
+}
+
+#[test]
+fn quic_sniffer_garbage_or_empty_first_datagram_is_indeterminate() {
+    // A flow that never opens with an Initial packet is not a sniffable
+    // QUIC start: garbage and empty datagrams are indeterminate, never
+    // NeedMore (which would keep a dead flow feeding forever).
+    let mut s = QuicSniffer::new();
+    assert_eq!(
+        s.feed(b"\x00\x01\x02\x03"),
+        QuicSniffProgress::Indeterminate
+    );
+    assert_eq!(s.feed(b""), QuicSniffProgress::Indeterminate);
+    // Oversize datagrams are refused outright.
+    let big = vec![0x00u8; 64 * 1024 + 1];
+    assert_eq!(s.feed(&big), QuicSniffProgress::Indeterminate);
+}
+
+#[test]
+fn quic_v2_constants_match_rfc9369() {
+    // Independent pin on the production v2 table: a typo in QUIC_SALT_V2,
+    // the quicv2 labels, or the Initial type would otherwise pass every
+    // sniff test (the forge and the sniffer would drift together).
+    let p = super::version_params(QUIC_VERSION_V2).expect("v2 supported");
+    assert_eq!(*p.salt, V2_SALT);
+    assert_eq!(p.key_label, b"quicv2 key");
+    assert_eq!(p.iv_label, b"quicv2 iv");
+    assert_eq!(p.hp_label, b"quicv2 hp");
+    assert_eq!(p.initial_type, 1);
+    // v1/draft-29 keep the v1 labels and Initial type 0b00.
+    let v1 = super::version_params(QUIC_VERSION_V1).expect("v1 supported");
+    assert_eq!(v1.key_label, b"quic key");
+    assert_eq!(v1.iv_label, b"quic iv");
+    assert_eq!(v1.hp_label, b"quic hp");
+    assert_eq!(v1.initial_type, 0);
+}
+
+/// Minimal TLS 1.3 `ClientHello` (raw handshake bytes) with no extensions —
+/// a complete hello whose SNI is absent.
+fn minimal_client_hello_no_sni() -> Vec<u8> {
+    let mut body = vec![0x03, 0x03]; // legacy_version
+    body.extend_from_slice(&[0x00; 32]); // random
+    body.push(0x00); // session id len
+    body.extend_from_slice(&0x0002u16.to_be_bytes()); // ciphers len
+    body.extend_from_slice(&0x1301u16.to_be_bytes()); // one cipher
+    body.push(0x01); // compression len
+    body.push(0x00); // null
+    body.extend_from_slice(&0x0000u16.to_be_bytes()); // empty extensions
+    let mut hello = vec![0x01]; // ClientHello
+    hello.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]); // 3-byte len
+    hello.extend_from_slice(&body);
+    hello
+}
+
+#[test]
+fn quic_hello_without_sni_split_across_datagrams_resolves_no_host() {
+    // A complete hello with no SNI extension split across datagrams must
+    // end Done with host None (not linger NeedMore forever).
+    let hello = minimal_client_hello_no_sni();
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let d1 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, a);
+    let d2 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], a.len() as u64, b);
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&d1), QuicSniffProgress::NeedMore);
+    match s.feed(&d2) {
+        QuicSniffProgress::Done(r) => {
+            assert_eq!(r.protocol, SniffedProtocol::Quic);
+            assert_eq!(r.host, None);
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn quic_out_of_order_crypto_offsets_are_reassembled() {
+    // CRYPTO frames may arrive tail-first: the reassembly fills offset
+    // holes with zeros and completes once the hello is exact-filled.
+    let hello = minimal_client_hello("example.com");
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let tail = forge_initial(QUIC_VERSION_V1, &[0u8; 8], a.len() as u64, b);
+    let head = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, a);
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&tail), QuicSniffProgress::NeedMore);
+    match s.feed(&head) {
+        QuicSniffProgress::Done(r) => assert_eq!(r.host.as_deref(), Some("example.com")),
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn quic_sniffer_stays_done_after_refeed() {
+    // Completion is sticky: a later datagram whose CRYPTO extends past the
+    // hello must keep the resolved answer, never un-complete to NeedMore.
+    let hello = minimal_client_hello("example.com");
+    let (a, b) = hello.split_at(hello.len() / 2);
+    let d1 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], 0, a);
+    let d2 = forge_initial(QUIC_VERSION_V1, &[0u8; 8], a.len() as u64, b);
+    let extra = forge_initial(
+        QUIC_VERSION_V1,
+        &[0u8; 8],
+        hello.len() as u64,
+        &[0xde, 0xad],
+    );
+    let mut s = QuicSniffer::new();
+    assert_eq!(s.feed(&d1), QuicSniffProgress::NeedMore);
+    let QuicSniffProgress::Done(first) = s.feed(&d2) else {
+        panic!("expected Done");
+    };
+    assert_eq!(first.host.as_deref(), Some("example.com"));
+    match s.feed(&extra) {
+        QuicSniffProgress::Done(r) => assert_eq!(r.host.as_deref(), Some("example.com")),
+        other => panic!("post-Done feed must stay Done, got {other:?}"),
+    }
 }

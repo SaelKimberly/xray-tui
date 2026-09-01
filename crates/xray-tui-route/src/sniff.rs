@@ -1,5 +1,8 @@
 //! Payload sniffer: TLS `ClientHello` SNI + HTTP `Host` + QUIC `Initial`
-//! `ClientHello` SNI over a bounded leading slice.
+//! `ClientHello` SNI, plus a stateful multi-datagram QUIC sniffer.
+//!
+//! [`QuicSniffer`] reassembles the `ClientHello` across a connection's UDP
+//! datagrams.
 //!
 //! `probe` returns `None` for anything indeterminate — garbage, truncated
 //! wire data, an HTTP response, an unsupported QUIC version, or an oversize
@@ -44,10 +47,10 @@ const MAX_SNIFF_LEN: usize = 64 * 1024;
 /// generous.
 const MAX_CRYPTO_LEN: usize = 32767;
 
-/// Cap on `Initial` packets walked per `probe_quic` call: the key schedule
-/// is derived per packet from its DCID (identical across a datagram), so a
-/// hostile multi-thousand-packet prefix must not amortize unbounded
-/// AES/HKDF work and per-packet allocations into the decision hot path.
+/// Cap on long-header packets walked per datagram in the QUIC arm: the key
+/// schedule is derived per Initial packet from its DCID, so a hostile
+/// multi-thousand-packet prefix must not amortize unbounded AES/HKDF work
+/// and per-packet allocations into the decision hot path.
 const MAX_INITIALS: usize = 8;
 
 /// Sniffs a leading payload slice for a TLS `ClientHello` SNI, an HTTP
@@ -67,6 +70,90 @@ pub fn probe(bytes: &[u8]) -> Option<SniffResult> {
         Some(&b) if b & 0xC0 == 0xC0 => probe_quic(bytes),
         Some(b) if b.is_ascii_alphabetic() => probe_http(bytes),
         _ => None,
+    }
+}
+
+/// Progress of a stateful multi-datagram QUIC sniff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuicSniffProgress {
+    /// The `ClientHello` is not complete yet — feed the next datagram.
+    NeedMore,
+    /// The `ClientHello` completed; the result carries the SNI.
+    Done(SniffResult),
+    /// Not QUIC / unsupported version / inconsistent connection identity /
+    /// oversize datagram — the flow is not sniffable; stop feeding.
+    Indeterminate,
+}
+
+/// Stateful QUIC `Initial` sniffer that reassembles the `ClientHello`
+/// CRYPTO stream across a connection's UDP datagrams.
+///
+/// A `ClientHello` commonly spans several `Initial` packets (coalesced in
+/// one datagram) and, when the handshake is split across UDP packets,
+/// several datagrams. Feed each inbound datagram of one UDP flow through
+/// [`QuicSniffer::feed`] and stop at the first non-[`QuicSniffProgress::NeedMore`]
+/// outcome.
+///
+/// The sniffer keys on the first-seen version + destination connection ID:
+/// a later `Initial` packet with a different identity (a new connection
+/// reusing the 5-tuple) is rejected as indeterminate rather than mixed into
+/// the reassembly. Non-`Initial` packets never touch the gate — a
+/// foreign-version Handshake/0-RTT packet is skipped, not rejected. One
+/// consequence: a server `Retry` (RFC 9000 §8.1) that makes the client
+/// restart its `Initial` with a new DCID mid-hello is treated as a new
+/// connection and the sniff is abandoned — acceptable, since
+/// single-datagram hellos (the common case) resolve before any `Retry`. The
+/// caller owns one sniffer per UDP flow and stops at the first
+/// non-[`QuicSniffProgress::NeedMore`] outcome.
+#[derive(Debug, Default)]
+pub struct QuicSniffer {
+    /// Reassembled CRYPTO stream (the `ClientHello`) across datagrams.
+    crypto: Vec<u8>,
+    /// Version of the first Initial packet seen (`None` before the first).
+    version: Option<u32>,
+    /// DCID of the first Initial packet seen (`None` before the first).
+    dcid: Option<Vec<u8>>,
+    /// Terminal result once the `ClientHello` resolves. Completion is
+    /// sticky: a later datagram whose CRYPTO extends past the hello must
+    /// not un-complete the sniff.
+    done: Option<SniffResult>,
+}
+
+impl QuicSniffer {
+    /// Creates an empty sniffer for one UDP flow.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one UDP datagram. See [`QuicSniffProgress`] for the outcomes.
+    pub fn feed(&mut self, datagram: &[u8]) -> QuicSniffProgress {
+        if datagram.len() > MAX_SNIFF_LEN {
+            return QuicSniffProgress::Indeterminate;
+        }
+        // Completion is sticky: once the hello resolves, any further
+        // datagram of the flow keeps the answer (the caller is expected to
+        // stop at the first non-NeedMore outcome).
+        if let Some(result) = &self.done {
+            return QuicSniffProgress::Done(result.clone());
+        }
+        match walk_quic_datagram(
+            datagram,
+            &mut self.crypto,
+            &mut self.version,
+            &mut self.dcid,
+        ) {
+            Ok(Some(result)) => {
+                self.done = Some(result.clone());
+                QuicSniffProgress::Done(result)
+            }
+            // The datagram parsed cleanly but the hello is incomplete. Only
+            // "need more" once a connection identity was established — a
+            // clean walk that never saw an Initial packet (padding-only,
+            // 0-RTT/Handshake-only, or garbage) is not a QUIC flow start.
+            Ok(None) if self.version.is_some() => QuicSniffProgress::NeedMore,
+            Ok(None) | Err(()) => QuicSniffProgress::Indeterminate,
+        }
     }
 }
 
@@ -230,223 +317,279 @@ fn sni_from_hello_body(body: &[u8]) -> HelloSni {
     HelloSni::NoSni
 }
 
-/// QUIC arm: walk the long-header packets coalesced in the slice (RFC 9000
-/// §12.2), skip non-Initial packets, and for each `Initial` packet derive
-/// the RFC 9001 §5.2 initial keys from the destination connection ID,
-/// remove header protection (RFC 9001 §5.4.2), decrypt the payload (RFC
-/// 9001 §5.3), and walk its frames collecting `CRYPTO` data — the TLS
-/// `ClientHello`. Once the hello is complete, read the SNI.
+/// QUIC arm: walk the long-header packets coalesced in one datagram (RFC
+/// 9000 §12.2), skip non-Initial packets, and for each `Initial` packet
+/// derive the initial keys (RFC 9001 §5.2 / RFC 9369 §3.3), remove header
+/// protection (RFC 9001 §5.4.2), decrypt the payload (RFC 9001 §5.3), and
+/// walk its frames collecting `CRYPTO` data — the TLS `ClientHello`. Once
+/// the hello is complete, read the SNI.
 ///
 /// `None` = indeterminate (not QUIC, non-Initial only, unsupported version,
 /// truncated, or the hello split across datagrams we don't hold).
 fn probe_quic(bytes: &[u8]) -> Option<SniffResult> {
-    let mut buf = bytes;
-    // Reassembled CRYPTO stream (the ClientHello) across frames/packets.
-    let mut crypto: Vec<u8> = Vec::new();
-    let mut initials = 0usize;
+    let mut crypto = Vec::new();
+    let mut version = None;
+    let mut dcid = None;
+    walk_quic_datagram(bytes, &mut crypto, &mut version, &mut dcid)
+        .ok()
+        .flatten()
+}
+
+/// Walks one UDP datagram's long-header packets (RFC 9000 §12.2), skipping
+/// non-Initial packets, and for each `Initial` packet derives the initial
+/// keys, removes header protection, decrypts the payload, and merges its
+/// `CRYPTO` data into the persistent `crypto` stream (the `ClientHello`).
+///
+/// `version`/`dcid` carry the connection identity across datagrams: the
+/// first Initial packet establishes them; a later packet with a different
+/// version or DCID is a different connection (5-tuple reuse, version
+/// mismatch) and is rejected.
+///
+/// Returns:
+/// - `Ok(Some(result))` — the reassembled stream holds a complete
+///   `ClientHello`; the result carries the SNI.
+/// - `Ok(None)` — the datagram parsed cleanly (possibly padding only) but
+///   the hello is still assembling.
+/// - `Err(())` — hard failure: not QUIC, unsupported version, inconsistent
+///   identity, or malformed/oversized data. The caller should stop.
+fn walk_quic_datagram(
+    datagram: &[u8],
+    crypto: &mut Vec<u8>,
+    version: &mut Option<u32>,
+    dcid: &mut Option<Vec<u8>>,
+) -> Result<Option<SniffResult>, ()> {
+    let mut buf = datagram;
+    let mut packets = 0usize;
     while !buf.is_empty() {
         // Zero padding after the final packet (RFC 9000 §12.2) ends the
         // walk; any other trailing byte is not QUIC.
         if buf[0] == 0 {
             break;
         }
-        let first = *buf.first()?;
-        if initials >= MAX_INITIALS {
-            return None;
+        let first = *buf.first().ok_or(())?;
+        if packets >= MAX_INITIALS {
+            return Err(());
         }
-        initials += 1;
+        packets += 1;
         // Long-header form with the fixed bit set (RFC 9000 §17.2).
         if first & 0xC0 != 0xC0 {
-            return None;
+            return Err(());
         }
         if buf.len() < 5 {
-            return None;
+            return Err(());
         }
-        let version = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
-        let salt: &[u8] = match version {
-            // QUIC v1 (RFC 9000).
-            0x0000_0001 => &QUIC_SALT_V1,
-            // draft-29 initial salt.
-            0xff00_001d => &QUIC_SALT_DRAFT29,
-            _ => return None,
-        };
-        // Packet type: bits 5-4 of the first byte; 0 = Initial.
+        let ver = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        let params = version_params(ver).ok_or(())?;
+        // Packet type: bits 5-4 of the first byte; the value identifying an
+        // `Initial` packet is version-dependent (RFC 9369 §3.2).
         let packet_type = (first >> 4) & 0x03;
+        let is_initial = packet_type == params.initial_type;
         let mut p = &buf[5..];
         // DCID: u8 length + bytes.
-        let dcid_len = usize::from(*p.first()?);
-        let dcid = p.get(1..1 + dcid_len)?;
-        p = &p[1 + dcid_len..];
+        let dcid_len = usize::from(*p.first().ok_or(())?);
+        let this_dcid = p.get(1..1 + dcid_len).ok_or(())?;
+        p = p.get(1 + dcid_len..).ok_or(())?;
         // SCID: u8 length + bytes.
-        let scid_len = usize::from(*p.first()?);
-        p = p.get(1 + scid_len..)?;
+        let scid_len = usize::from(*p.first().ok_or(())?);
+        p = p.get(1 + scid_len..).ok_or(())?;
         // Initial-only token: varint length + bytes.
-        if packet_type == 0 {
-            let token_len = usize::try_from(read_varint(&mut p)?).ok()?;
-            p = p.get(token_len..)?;
+        if is_initial {
+            let token_len = usize::try_from(read_varint(&mut p).ok_or(())?).map_err(|_| ())?;
+            p = p.get(token_len..).ok_or(())?;
         }
         // Packet length (RFC 9000 §17.2.3): varint, covers pn + payload.
-        let packet_len = usize::try_from(read_varint(&mut p)?).ok()?;
+        let packet_len = usize::try_from(read_varint(&mut p).ok_or(())?).map_err(|_| ())?;
         // An Initial packet carries ≥1 pn byte + a 16-byte AEAD tag, so a
         // shorter length cannot decrypt (the sample/tag checks below are the
         // real floor; this is the earliest cheap rejection).
         if packet_len < 17 {
-            return None;
+            return Err(());
         }
         let pn_off = buf.len() - p.len(); // header length up to the pn field
         let ext_len = pn_off + packet_len; // full packet (pn + payload)
         if ext_len > buf.len() {
-            return None; // truncated packet in the datagram
+            return Err(()); // truncated packet in the datagram
         }
         let rest = &buf[ext_len..];
 
-        if packet_type != 0 {
+        if !is_initial {
             // 0-RTT / Handshake / Retry: no ClientHello CRYPTO here; keep
             // walking the coalesced packets.
             buf = rest;
             continue;
         }
 
+        // Connection identity: the first Initial establishes it; later
+        // packets must match (coalesced packets in one datagram, and every
+        // datagram of one flow, share the version + DCID).
+        let established = match (version.as_ref(), dcid.as_ref()) {
+            (None, None) => false,
+            (Some(v), Some(d)) if *v == ver && d.as_slice() == this_dcid => true,
+            _ => return Err(()),
+        };
+        if !established {
+            *version = Some(ver);
+            *dcid = Some(this_dcid.to_vec());
+        }
+
         let mut pkt = buf[..ext_len].to_vec();
-
-        // --- Key schedule (RFC 9001 §5.2) ---
-        // initial_secret = HKDF-Extract(salt, client_dcid)
-        // secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
-        // key/iv/hp = HKDF-Expand-Label(secret, "quic key"/"quic iv"/"quic hp", …, len)
-        let initial_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, salt);
-        let initial_secret = ring::hmac::sign(&initial_key, dcid);
-        let mut client_secret = [0u8; 32];
-        hkdf_expand_label(
-            initial_secret.as_ref(),
-            b"client in",
-            b"",
-            &mut client_secret,
-        )?;
-        let mut key_bytes = [0u8; 16];
-        hkdf_expand_label(&client_secret, b"quic key", b"", &mut key_bytes)?;
-        let mut iv = [0u8; 12];
-        hkdf_expand_label(&client_secret, b"quic iv", b"", &mut iv)?;
-        let mut hp_key = [0u8; 16];
-        hkdf_expand_label(&client_secret, b"quic hp", b"", &mut hp_key)?;
-
-        // --- Header protection removal (RFC 9001 §5.4.2) ---
-        // Sample: 16 bytes starting 4 bytes after the packet number field;
-        // always inside the payload because pn ≤ 4 bytes. AES-ECB(hp, sample)
-        // is the AES-GCM mask (RFC 9001 §5.4.3).
-        if pkt.len() < pn_off + 4 + 16 {
-            return None;
-        }
-        let sample: [u8; 16] = pkt[pn_off + 4..pn_off + 4 + 16].try_into().ok()?;
-        let mut mask = [0u8; 16];
-        let hp = aes::Aes128::new_from_slice(&hp_key).ok()?;
-        hp.encrypt_block_b2b((&sample).into(), (&mut mask).into());
-        // Long header: the low 4 bits (pn length + 2 reserved) are masked.
-        pkt[0] ^= mask[0] & 0x0f;
-        let pn_len = usize::from(pkt[0] & 0x03) + 1;
-        for (i, b) in pkt[pn_off..pn_off + pn_len].iter_mut().enumerate() {
-            *b ^= mask[1 + i];
-        }
-
-        // --- Payload decryption (RFC 9001 §5.3) ---
-        // nonce = IV XOR (0^pn_len || pn); AAD = full header incl. pn.
-        let pn = &pkt[pn_off..pn_off + pn_len];
-        let ext_hdr_len = pn_off + pn_len;
-        if pkt.len() < ext_hdr_len + 16 {
-            return None; // no room for the AEAD tag
-        }
-        let mut payload = pkt[ext_hdr_len..].to_vec();
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&iv);
-        for (i, b) in pn.iter().enumerate() {
-            nonce[12 - pn_len + i] ^= b;
-        }
-        let aead = ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key_bytes).ok()?;
-        let aead = ring::aead::LessSafeKey::new(aead);
-        let plain = aead
-            .open_in_place(
-                ring::aead::Nonce::assume_unique_for_key(nonce),
-                ring::aead::Aad::from(&pkt[..ext_hdr_len]),
-                &mut payload,
-            )
-            .ok()?;
-
-        // --- Frame walk (RFC 9000 §17.2.2: only the listed frames are
-        // permitted in an Initial packet) ---
-        let mut f: &[u8] = plain;
-        while !f.is_empty() {
-            let ft = f[0];
-            f = &f[1..];
-            match ft {
-                // PADDING / PING: no fields.
-                0x00 | 0x01 => {}
-                0x02 | 0x03 => {
-                    // ACK: Largest Acknowledged, ACK Delay, ACK Range Count,
-                    // First ACK Range, then per-range Gap + ACK Range Length;
-                    // type 0x03 appends ECN Counts.
-                    let _ = read_varint(&mut f)?;
-                    let _ = read_varint(&mut f)?;
-                    let range_count = read_varint(&mut f)?;
-                    let _ = read_varint(&mut f)?;
-                    for _ in 0..range_count {
-                        let _ = read_varint(&mut f)?;
-                        let _ = read_varint(&mut f)?;
-                    }
-                    if ft == 0x03 {
-                        let _ = read_varint(&mut f)?;
-                        let _ = read_varint(&mut f)?;
-                        let _ = read_varint(&mut f)?;
-                    }
-                }
-                0x06 => {
-                    // CRYPTO: offset, length, then the data (the ClientHello).
-                    // `offset` is an attacker-chosen varint — clamp the
-                    // reassembly span so a forged frame cannot force a huge
-                    // `resize` (process abort / OOM).  xray applies the same
-                    // cap via `io.ErrShortBuffer` (`sniff.go:227`).
-                    let offset = usize::try_from(read_varint(&mut f)?).ok()?;
-                    let length = usize::try_from(read_varint(&mut f)?).ok()?;
-                    let data = f.get(..length)?;
-                    f = &f[length..];
-                    let end = offset.checked_add(length)?;
-                    if end > MAX_CRYPTO_LEN {
-                        return None;
-                    }
-                    if end > crypto.len() {
-                        crypto.resize(end, 0);
-                    }
-                    crypto[offset..end].copy_from_slice(data);
-                }
-                0x1c => {
-                    // CONNECTION_CLOSE: Error Code, Frame Type, Reason Length.
-                    let _ = read_varint(&mut f)?;
-                    let _ = read_varint(&mut f)?;
-                    let reason_len = usize::try_from(read_varint(&mut f)?).ok()?;
-                    f = f.get(reason_len..)?;
-                }
-                _ => return None, // not a valid Initial frame set
-            }
-        }
-
-        // The ClientHello may span several Initial packets: attempt the
-        // parse each time, keep walking if still assembling.
-        match hello_sni(&crypto) {
+        match decrypt_initial_packet(&mut pkt, pn_off, &params, this_dcid, crypto)? {
             HelloSni::Host(host) => {
-                return Some(SniffResult {
+                return Ok(Some(SniffResult {
                     protocol: SniffedProtocol::Quic,
                     host: Some(host),
-                });
+                }));
             }
             HelloSni::NoSni => {
-                return Some(SniffResult {
+                return Ok(Some(SniffResult {
                     protocol: SniffedProtocol::Quic,
                     host: None,
-                });
+                }));
             }
             HelloSni::Malformed => {}
         }
         buf = rest;
     }
-    None
+    Ok(None)
+}
+
+/// Decrypts one `Initial` packet (RFC 9001 §5.2-5.4, version-dependent
+/// labels per RFC 9369 §3.3.2) and merges its `CRYPTO` frame data into
+/// `crypto`.
+///
+/// Returns the hello-parse outcome: [`HelloSni::Host`]/[`HelloSni::NoSni`]
+/// when the reassembled stream holds a complete `ClientHello`;
+/// [`HelloSni::Malformed`] while it is still assembling. `Err` = the
+/// packet failed to decrypt, was truncated, or carried an invalid Initial
+/// frame set.
+fn decrypt_initial_packet(
+    pkt: &mut [u8],
+    pn_off: usize,
+    params: &QuicVersionParams,
+    dcid: &[u8],
+    crypto: &mut Vec<u8>,
+) -> Result<HelloSni, ()> {
+    // --- Key schedule (RFC 9001 §5.2 / RFC 9369 §3.3.2) ---
+    // initial_secret = HKDF-Extract(salt, client_dcid)
+    // secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
+    // key/iv/hp = HKDF-Expand-Label(secret, <version label>, "", len)
+    let initial_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, params.salt);
+    let initial_secret = ring::hmac::sign(&initial_key, dcid);
+    let mut client_secret = [0u8; 32];
+    hkdf_expand_label(
+        initial_secret.as_ref(),
+        b"client in",
+        b"",
+        &mut client_secret,
+    )
+    .ok_or(())?;
+    let mut key_bytes = [0u8; 16];
+    hkdf_expand_label(&client_secret, params.key_label, b"", &mut key_bytes).ok_or(())?;
+    let mut iv = [0u8; 12];
+    hkdf_expand_label(&client_secret, params.iv_label, b"", &mut iv).ok_or(())?;
+    let mut hp_key = [0u8; 16];
+    hkdf_expand_label(&client_secret, params.hp_label, b"", &mut hp_key).ok_or(())?;
+
+    // --- Header protection removal (RFC 9001 §5.4.2) ---
+    // Sample: 16 bytes starting 4 bytes after the packet number field;
+    // always inside the payload because pn ≤ 4 bytes. AES-ECB(hp, sample)
+    // is the AES-GCM mask (RFC 9001 §5.4.3).
+    if pkt.len() < pn_off + 4 + 16 {
+        return Err(());
+    }
+    let sample: [u8; 16] = pkt[pn_off + 4..pn_off + 4 + 16]
+        .try_into()
+        .map_err(|_| ())?;
+    let mut mask = [0u8; 16];
+    let hp = aes::Aes128::new_from_slice(&hp_key).map_err(|_| ())?;
+    hp.encrypt_block_b2b((&sample).into(), (&mut mask).into());
+    // Long header: the low 4 bits (pn length + 2 reserved) are masked.
+    pkt[0] ^= mask[0] & 0x0f;
+    let pn_len = usize::from(pkt[0] & 0x03) + 1;
+    for (i, b) in pkt[pn_off..pn_off + pn_len].iter_mut().enumerate() {
+        *b ^= mask[1 + i];
+    }
+
+    // --- Payload decryption (RFC 9001 §5.3) ---
+    // nonce = IV XOR (0^pn_len || pn); AAD = full header incl. pn.
+    let pn = &pkt[pn_off..pn_off + pn_len];
+    let ext_hdr_len = pn_off + pn_len;
+    if pkt.len() < ext_hdr_len + 16 {
+        return Err(()); // no room for the AEAD tag
+    }
+    let mut payload = pkt[ext_hdr_len..].to_vec();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&iv);
+    for (i, b) in pn.iter().enumerate() {
+        nonce[12 - pn_len + i] ^= b;
+    }
+    let aead = ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key_bytes).map_err(|_| ())?;
+    let aead = ring::aead::LessSafeKey::new(aead);
+    let plain = aead
+        .open_in_place(
+            ring::aead::Nonce::assume_unique_for_key(nonce),
+            ring::aead::Aad::from(&pkt[..ext_hdr_len]),
+            &mut payload,
+        )
+        .map_err(|_| ())?;
+
+    // --- Frame walk (RFC 9000 §17.2.2: only the listed frames are
+    // permitted in an Initial packet) ---
+    let mut f: &[u8] = plain;
+    while !f.is_empty() {
+        let ft = f[0];
+        f = &f[1..];
+        match ft {
+            // PADDING / PING: no fields.
+            0x00 | 0x01 => {}
+            0x02 | 0x03 => {
+                // ACK: Largest Acknowledged, ACK Delay, ACK Range Count,
+                // First ACK Range, then per-range Gap + ACK Range Length;
+                // type 0x03 appends ECN Counts.
+                let _ = read_varint(&mut f).ok_or(())?;
+                let _ = read_varint(&mut f).ok_or(())?;
+                let range_count = read_varint(&mut f).ok_or(())?;
+                let _ = read_varint(&mut f).ok_or(())?;
+                for _ in 0..range_count {
+                    let _ = read_varint(&mut f).ok_or(())?;
+                    let _ = read_varint(&mut f).ok_or(())?;
+                }
+                if ft == 0x03 {
+                    let _ = read_varint(&mut f).ok_or(())?;
+                    let _ = read_varint(&mut f).ok_or(())?;
+                    let _ = read_varint(&mut f).ok_or(())?;
+                }
+            }
+            0x06 => {
+                // CRYPTO: offset, length, then the data (the ClientHello).
+                // `offset` is an attacker-chosen varint — clamp the
+                // reassembly span so a forged frame cannot force a huge
+                // `resize` (process abort / OOM).  xray applies the same
+                // cap via `io.ErrShortBuffer` (`sniff.go:227`).
+                let offset = usize::try_from(read_varint(&mut f).ok_or(())?).map_err(|_| ())?;
+                let length = usize::try_from(read_varint(&mut f).ok_or(())?).map_err(|_| ())?;
+                let data = f.get(..length).ok_or(())?;
+                f = &f[length..];
+                let end = offset.checked_add(length).ok_or(())?;
+                if end > MAX_CRYPTO_LEN {
+                    return Err(());
+                }
+                if end > crypto.len() {
+                    crypto.resize(end, 0);
+                }
+                crypto[offset..end].copy_from_slice(data);
+            }
+            0x1c => {
+                // CONNECTION_CLOSE: Error Code, Frame Type, Reason Length.
+                let _ = read_varint(&mut f).ok_or(())?;
+                let _ = read_varint(&mut f).ok_or(())?;
+                let reason_len = usize::try_from(read_varint(&mut f).ok_or(())?).map_err(|_| ())?;
+                f = f.get(reason_len..).ok_or(())?;
+            }
+            _ => return Err(()), // not a valid Initial frame set
+        }
+    }
+    Ok(hello_sni(crypto))
 }
 
 /// Parse a TLS handshake message assembled from `CRYPTO` frames: the first
@@ -487,6 +630,61 @@ const QUIC_SALT_DRAFT29: [u8; 20] = [
     0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0,
     0x43, 0x90, 0xa8, 0x99,
 ];
+
+/// Initial salt for QUIC v2 (RFC 9369 §3.3.1).
+const QUIC_SALT_V2: [u8; 20] = [
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
+];
+
+/// QUIC v1 version (RFC 9000).
+const QUIC_VERSION_V1: u32 = 0x0000_0001;
+
+/// QUIC draft-29 version (draft-ietf-quic-tls, kept as `versionDraft29` in
+/// xray `sniff.go`).
+const QUIC_VERSION_DRAFT29: u32 = 0xff00_001d;
+
+/// QUIC v2 version (RFC 9369 §3.1).
+const QUIC_VERSION_V2: u32 = 0x6b33_43cf;
+
+/// Version-dependent QUIC `Initial` parameters: the initial salt, the
+/// HKDF-Expand-Label suffixes, and the long-header packet-type value
+/// identifying an `Initial` packet. v2 changes all three (RFC 9369 §3.2-3.3).
+#[derive(Clone, Copy)]
+struct QuicVersionParams {
+    salt: &'static [u8; 20],
+    key_label: &'static [u8],
+    iv_label: &'static [u8],
+    hp_label: &'static [u8],
+    initial_type: u8,
+}
+
+const fn version_params(version: u32) -> Option<QuicVersionParams> {
+    match version {
+        QUIC_VERSION_V1 => Some(QuicVersionParams {
+            salt: &QUIC_SALT_V1,
+            key_label: b"quic key",
+            iv_label: b"quic iv",
+            hp_label: b"quic hp",
+            initial_type: 0,
+        }),
+        QUIC_VERSION_DRAFT29 => Some(QuicVersionParams {
+            salt: &QUIC_SALT_DRAFT29,
+            key_label: b"quic key",
+            iv_label: b"quic iv",
+            hp_label: b"quic hp",
+            initial_type: 0,
+        }),
+        QUIC_VERSION_V2 => Some(QuicVersionParams {
+            salt: &QUIC_SALT_V2,
+            key_label: b"quicv2 key",
+            iv_label: b"quicv2 iv",
+            hp_label: b"quicv2 hp",
+            initial_type: 1,
+        }),
+        _ => None,
+    }
+}
 
 /// HKDF-Expand-Label (RFC 8446 §7.1 / RFC 9001 §5.2): HKDF-Expand with the
 /// `tls13 `-prefixed label struct. Only the first block is derived — every

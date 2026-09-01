@@ -20,4 +20,4 @@ pub use engine::{ConnMeta, Decision, Engine};
 pub use error::RouteError;
 pub use events::RouteEvent;
 pub use resolve::{DnsSink, ProbeTracker, ResolvedCache};
-pub use sniff::{SniffResult, SniffedProtocol, probe};
+pub use sniff::{QuicSniffProgress, QuicSniffer, SniffResult, SniffedProtocol, probe};
