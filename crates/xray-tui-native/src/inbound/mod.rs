@@ -289,9 +289,12 @@ async fn handle_connect(
 /// controlling TCP connection is the only lifetime authority (RFC 1928 §7).
 const UDP_PIN_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Minimum spacing between proxy-tunnel open attempts for one association, so
-/// a failing proxy cannot be re-dialled once per datagram.
-const PROXY_REOPEN_BACKOFF: Duration = Duration::from_secs(1);
+/// Minimum spacing between retries of a failed per-association resource: the
+/// proxy tunnel and the upstream socket binds. Without it a permanently
+/// unavailable resource — a dead proxy, or `[::]:0` on a host with IPv6
+/// disabled — is retried once per datagram, each costing a syscall and a
+/// persisted debug event.
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Queue depth per proxy leg. UDP has no delivery guarantee: a full queue
 /// drops the datagram rather than stalling the relay loop.
@@ -354,6 +357,7 @@ async fn run_udp_relay(
         dns_cache: Arc::new(Mutex::new(HashMap::new())),
         proxy: None,
         proxy_retry_at: None,
+        bind_retry_at: None,
         hijack_warned: false,
     };
 
@@ -474,6 +478,8 @@ struct UdpRelay {
     proxy: Option<ProxyLeg>,
     /// Earliest instant a new proxy leg may be opened after a failure.
     proxy_retry_at: Option<Instant>,
+    /// Earliest instant a failed upstream socket bind may be retried.
+    bind_retry_at: Option<Instant>,
     hijack_warned: bool,
 }
 
@@ -653,12 +659,22 @@ impl UdpRelay {
         }
     }
 
-    /// Bind the upstream sockets for BOTH families, once per association, on
-    /// the first direct datagram (a proxy-only association binds neither).
+    /// Bind the upstream sockets for BOTH families, on the first direct
+    /// datagram (a proxy-only association binds neither).
     ///
-    /// A family whose bind fails stays `None` — a host with IPv6 disabled
-    /// cannot bind `[::]:0`, which drops v6 datagrams, never the association.
+    /// A family whose bind fails stays `None`, which drops that family's
+    /// datagrams but never the association — a host with IPv6 disabled cannot
+    /// bind `[::]:0`. That failure is REMEMBERED for [`RETRY_BACKOFF`]:
+    /// retrying per datagram would cost a doomed syscall and a persisted
+    /// debug event on every packet an IPv4-only host sends.
     async fn ensure_direct_sockets(&mut self) {
+        if self.out_v4.is_some() && self.out_v6.is_some() {
+            return;
+        }
+        if self.bind_retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        let mut failed = false;
         for (slot, bind) in [
             (&mut self.out_v4, "0.0.0.0:0"),
             (&mut self.out_v6, "[::]:0"),
@@ -669,10 +685,15 @@ impl UdpRelay {
             match UdpSocket::bind(bind).await {
                 Ok(socket) => *slot = Some(Arc::new(socket)),
                 Err(error) => {
+                    failed = true;
                     tracing::debug!(%error, bind, "socks5 inbound: upstream udp bind failed");
                 }
             }
         }
+        // A transient failure (fd pressure) still recovers on the next
+        // datagram after the backoff; a permanent one costs one attempt per
+        // second, not one per packet.
+        self.bind_retry_at = failed.then(|| Instant::now() + RETRY_BACKOFF);
     }
 
     /// The upstream socket matching `addr`'s family.
@@ -745,7 +766,7 @@ impl UdpRelay {
                 // rest of the association.
                 tracing::debug!("socks5 inbound: proxy udp leg closed; will re-open");
                 self.proxy = None;
-                self.proxy_retry_at = Some(Instant::now() + PROXY_REOPEN_BACKOFF);
+                self.proxy_retry_at = Some(Instant::now() + RETRY_BACKOFF);
             }
         }
     }
