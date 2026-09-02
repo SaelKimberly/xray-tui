@@ -22,10 +22,12 @@
 use std::io;
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
 
 use crate::addr::{Host, TargetAddr};
-use crate::protocol::vmess::stream::{MAX_RECORD_PLAINTEXT, VmessClientStream};
+use crate::protocol::vmess::stream::{
+    MAX_RECORD_PLAINTEXT, VmessClientStream, VmessReadHalf, VmessWriteHalf,
+};
 
 /// Send cap — xray's CHUNK cap, not the u16 framing limit: the chunk sealer
 /// refuses a record whose full wire size overflows one 8192-byte buffer,
@@ -44,12 +46,39 @@ use crate::protocol::vmess::stream::{MAX_RECORD_PLAINTEXT, VmessClientStream};
 /// `MAX_UDP_PAYLOAD`.
 const MAX_SEND_PAYLOAD: usize = 8192 - 2 - 16;
 
-/// A `VMess` UDP connection over the AEAD record tunnel (command 0x02).
-///
-/// Datagrams are the record stream itself — no additional framing, no
-/// per-packet address (the header destination is the session target).
-pub struct PacketConn<S> {
-    inner: VmessClientStream<S>,
+/// Receive-direction state: the staging buffer one record's plaintext lands
+/// in, grown once to the record ceiling and reused — the caller gets an
+/// exact-size copy of the datagram, never a freshly zeroed 64 KiB buffer.
+struct RecvState {
+    scratch: Vec<u8>,
+}
+
+impl RecvState {
+    /// The ONE receive implementation, over the combined tunnel or its read
+    /// half: one record's plaintext per call, `Ok(None)` on a clean
+    /// end-of-stream (the record end markers or EOF — the tunnel reports both
+    /// as a 0-byte read). The destination is `None`: the header target is the
+    /// session destination (no per-packet address on the `VMess` UDP wire).
+    async fn recv_from<R: AsyncRead + Unpin>(
+        &mut self,
+        inner: &mut R,
+    ) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+        if self.scratch.is_empty() {
+            // Grown once, on the first datagram: a peer may legitimately
+            // fill a whole record, and one read serves exactly one record.
+            self.scratch.resize(MAX_RECORD_PLAINTEXT, 0);
+        }
+        let n = inner.read(&mut self.scratch).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some((None, self.scratch[..n].to_vec())))
+    }
+}
+
+/// Send-direction state: the destination every datagram of this session
+/// lands on.
+struct SendState {
     /// The request-header destination in comparable form: `Some(addr)` when
     /// the header carried an IP destination. A record carries no address, so
     /// that destination is the ONLY one this tunnel reaches and a `send`
@@ -57,39 +86,14 @@ pub struct PacketConn<S> {
     /// `None` when the header destination has no `SocketAddr` form (a domain
     /// target) — then there is nothing an explicit destination could match.
     header_dest: Option<SocketAddr>,
-    /// Receive staging, grown once to the record ceiling and reused: the
-    /// caller gets an exact-size copy of one record's plaintext, never a
-    /// freshly zeroed 64 KiB buffer per datagram.
-    scratch: Vec<u8>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
-    /// Wrap the record tunnel (the command-0x02 request header already
-    /// written and the AEAD response header peeled on first read by
-    /// [`super::stream::VmessClientStream`]). `header_dest` is the
-    /// destination that request header carried — the session target.
-    #[must_use]
-    pub const fn new(inner: VmessClientStream<S>, header_dest: &TargetAddr) -> Self {
-        Self {
-            inner,
-            header_dest: match &header_dest.host {
-                Host::Ip(ip) => Some(SocketAddr::new(*ip, header_dest.port)),
-                Host::Domain(_) => None,
-            },
-            scratch: Vec::new(),
-        }
-    }
-
-    /// Send one datagram: exactly one sealed record on the wire.
-    ///
-    /// `dest: None` names the request-header destination — where every
-    /// `VMess` UDP datagram lands, since the record carries no address.
-    /// `Some(addr)` is accepted only when it IS that destination, and refused
-    /// with `InvalidInput` otherwise (`check_dest`).
-    ///
-    /// The payload must fit xray's chunk cap (`MAX_SEND_PAYLOAD`); a larger
-    /// datagram is refused before a byte is written.
-    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+impl SendState {
+    /// Vet a datagram before a byte is sealed — the ONE send precondition,
+    /// shared by the combined conn and the write half: the destination must
+    /// be reachable (`check_dest`) and the payload must fit xray's chunk cap
+    /// (`MAX_SEND_PAYLOAD`).
+    fn check(&self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
         self.check_dest(dest)?;
         if payload.len() > MAX_SEND_PAYLOAD {
             return Err(io::Error::new(
@@ -100,10 +104,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
                 ),
             ));
         }
-        // One record = one datagram. `write_datagram` (not the `AsyncWrite`
-        // byte contract) reports success only for the record it sealed here,
-        // so a cancelled send cannot truncate this one.
-        self.inner.write_datagram(payload).await
+        Ok(())
     }
 
     /// Refuses a datagram bound for anything but the request-header
@@ -127,22 +128,125 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
             ),
         ))
     }
+}
+
+/// A `VMess` UDP connection over the AEAD record tunnel (command 0x02).
+///
+/// Datagrams are the record stream itself — no additional framing, no
+/// per-packet address (the header destination is the session target).
+pub struct PacketConn<S> {
+    inner: VmessClientStream<S>,
+    read: RecvState,
+    write: SendState,
+}
+
+/// The halves [`PacketConn::split`] hands out: the record decoder over the
+/// transport's read half, the record sealer over its write half.
+pub type SplitHalves<S> = (PacketReader<ReadHalf<S>>, PacketWriter<WriteHalf<S>>);
+
+impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
+    /// Wrap the record tunnel (the command-0x02 request header already
+    /// written and the AEAD response header peeled on first read by
+    /// [`super::stream::VmessClientStream`]). `header_dest` is the
+    /// destination that request header carried — the session target.
+    #[must_use]
+    pub const fn new(inner: VmessClientStream<S>, header_dest: &TargetAddr) -> Self {
+        Self {
+            inner,
+            read: RecvState {
+                scratch: Vec::new(),
+            },
+            write: SendState {
+                header_dest: match &header_dest.host {
+                    Host::Ip(ip) => Some(SocketAddr::new(*ip, header_dest.port)),
+                    Host::Domain(_) => None,
+                },
+            },
+        }
+    }
+
+    /// Send one datagram: exactly one sealed record on the wire.
+    ///
+    /// `dest: None` names the request-header destination — where every
+    /// `VMess` UDP datagram lands, since the record carries no address.
+    /// `Some(addr)` is accepted only when it IS that destination, and refused
+    /// with `InvalidInput` otherwise (`check_dest`).
+    ///
+    /// The payload must fit xray's chunk cap (`MAX_SEND_PAYLOAD`); a larger
+    /// datagram is refused before a byte is written.
+    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+        self.write.check(dest, payload)?;
+        // One record = one datagram. `write_datagram` (not the `AsyncWrite`
+        // byte contract) reports success only for the record it sealed here,
+        // so a cancelled send cannot truncate this one.
+        self.inner.write_datagram(payload).await
+    }
 
     /// Receive one datagram — one record's plaintext, copied out at exactly
     /// its size. `Ok(None)` on a clean end-of-stream (the record end markers
     /// or EOF). The destination is `None`: the header target is the session
     /// destination (no per-packet address on the `VMess` UDP wire).
     pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
-        if self.scratch.is_empty() {
-            // Grown once, on the first datagram: a peer may legitimately
-            // fill a whole record, and one read serves exactly one record.
-            self.scratch.resize(MAX_RECORD_PLAINTEXT, 0);
-        }
-        let n = self.inner.read(&mut self.scratch).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        Ok(Some((None, self.scratch[..n].to_vec())))
+        self.read.recv_from(&mut self.inner).await
+    }
+
+    /// Split into halves that may be used concurrently from separate tasks —
+    /// a dedicated reader task can hold a `recv` across polls while sends
+    /// keep going, which the combined conn cannot serve.
+    ///
+    /// Always `Ok` for `VMess`: the record tunnel has a counter, a cipher and
+    /// its own staging per direction, so the two directions separate without
+    /// sharing anything but the transport.
+    pub fn split(self) -> io::Result<SplitHalves<S>> {
+        let (read_half, write_half) = self.inner.split();
+        Ok((
+            PacketReader {
+                inner: read_half,
+                read: self.read,
+            },
+            PacketWriter {
+                inner: write_half,
+                write: self.write,
+            },
+        ))
+    }
+}
+
+/// The receive half of a split [`PacketConn`]: the record decoder over the
+/// read half of the transport, driven independently of any send.
+pub struct PacketReader<R> {
+    inner: VmessReadHalf<R>,
+    read: RecvState,
+}
+
+impl<R: AsyncRead + Unpin> PacketReader<R> {
+    /// Receive one datagram — identical to [`PacketConn::recv`]: one record's
+    /// plaintext at exactly its size, `Ok(None)` on a clean end-of-stream,
+    /// and `None` as the destination.
+    ///
+    /// Cancel-safe: every partial fill lives in the read half's state, so a
+    /// dropped `recv` future leaves a half-arrived record exactly where it
+    /// was and the next call finishes it.
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+        self.read.recv_from(&mut self.inner).await
+    }
+}
+
+/// The send half of a split [`PacketConn`]: the record sealer over the write
+/// half of the transport.
+pub struct PacketWriter<W> {
+    inner: VmessWriteHalf<W>,
+    write: SendState,
+}
+
+impl<W: AsyncWrite + Unpin> PacketWriter<W> {
+    /// Send one datagram — identical to [`PacketConn::send`]: the same
+    /// destination check, the same `MAX_SEND_PAYLOAD` refusal, and the same
+    /// datagram write path (never the `AsyncWrite` byte contract), so a
+    /// datagram cannot inherit a cancelled write's record.
+    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+        self.write.check(dest, payload)?;
+        self.inner.write_datagram(payload).await
     }
 }
 
@@ -562,5 +666,287 @@ mod tests {
         );
         assert_eq!(second, b"second");
         assert_eq!(used + used2, raw.len(), "two records, nothing duplicated");
+    }
+
+    /// The datagrams every split-vs-unsplit comparison replays.
+    const DATAGRAMS: [&[u8]; 3] = [b"one", b"two-two", b"three-three-three"];
+
+    /// The peer's whole response flight for [`DATAGRAMS`]: the AEAD response
+    /// header, then one record per datagram with incrementing counters.
+    fn response_flight(view: &Session) -> Vec<u8> {
+        let mut flight =
+            seal_response_header(&view.response_body_key, &view.response_body_iv, &[0x33, 0]);
+        for (counter, payload) in DATAGRAMS.iter().enumerate() {
+            flight.extend_from_slice(&seal_record(
+                &view.response_body_key,
+                &view.response_body_iv,
+                u16::try_from(counter).expect("three records"),
+                payload,
+            ));
+        }
+        flight
+    }
+
+    /// Every request record on `wire`, opened in counter order — the peer's
+    /// view of what a sender put out.
+    fn open_flight(view: &Session, wire: &[u8]) -> Vec<Vec<u8>> {
+        let mut rest = wire;
+        let mut counter = 0u16;
+        let mut records = Vec::new();
+        while !rest.is_empty() {
+            let (payload, used) =
+                open_record(&view.request_body_key, &view.request_body_iv, counter, rest);
+            records.push(payload);
+            rest = &rest[used..];
+            counter += 1;
+        }
+        records
+    }
+
+    #[tokio::test]
+    async fn split_halves_round_trip_like_the_unsplit_conn() {
+        // Reference run: the unsplit conn receives the flight and sends back.
+        let (mut conn, mut server, unsplit_view) = record_stream(8192);
+        server
+            .write_all(&response_flight(&unsplit_view))
+            .await
+            .unwrap();
+        let mut unsplit_recv = Vec::new();
+        for _ in DATAGRAMS {
+            unsplit_recv.push(conn.recv().await.unwrap().expect("a datagram"));
+        }
+        for payload in DATAGRAMS {
+            conn.send(None, payload).await.unwrap();
+        }
+        drop(conn);
+        let mut unsplit_wire = Vec::new();
+        server.read_to_end(&mut unsplit_wire).await.unwrap();
+
+        // The same traffic over the split halves.
+        let (conn, mut server, split_view) = record_stream(8192);
+        let (mut reader, mut writer) = conn.split().unwrap();
+        server
+            .write_all(&response_flight(&split_view))
+            .await
+            .unwrap();
+        let mut split_recv = Vec::new();
+        for _ in DATAGRAMS {
+            split_recv.push(reader.recv().await.unwrap().expect("a datagram"));
+        }
+        for payload in DATAGRAMS {
+            writer.send(None, payload).await.unwrap();
+        }
+        drop(writer);
+        drop(reader);
+        let mut split_wire = Vec::new();
+        server.read_to_end(&mut split_wire).await.unwrap();
+
+        // Identical payloads AND identical destinations, datagram for
+        // datagram — the halves are the same view of the record stream.
+        assert_eq!(split_recv, unsplit_recv);
+        assert_eq!(
+            split_recv
+                .iter()
+                .map(|(_, payload)| payload.as_slice())
+                .collect::<Vec<_>>(),
+            DATAGRAMS.to_vec()
+        );
+        // The sessions carry different random keys, so compare the records
+        // the peer opens rather than the ciphertext: same plaintexts, same
+        // counters, same framing sizes.
+        assert_eq!(
+            open_flight(&split_view, &split_wire),
+            open_flight(&unsplit_view, &unsplit_wire)
+        );
+        assert_eq!(split_wire.len(), unsplit_wire.len());
+    }
+
+    #[tokio::test]
+    async fn split_reader_receives_while_the_writer_sends() {
+        let (conn, mut server, view) = record_stream(4096);
+        let (mut reader, mut writer) = conn.split().unwrap();
+
+        // The reader parks on an empty wire, mid-peel: nothing has arrived.
+        let pending_recv = tokio::spawn(async move { reader.recv().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !pending_recv.is_finished(),
+            "the reader must be parked on the empty wire"
+        );
+
+        // A datagram goes out while that read is still pending — the case the
+        // unsplit conn cannot serve, since its `recv` future would have to be
+        // dropped to reach `send`.
+        writer.send(None, b"outbound").await.unwrap();
+        let mut sent = vec![0u8; 2 + b"outbound".len() + 16];
+        server.read_exact(&mut sent).await.unwrap();
+        let (payload, used) = open_record(&view.request_body_key, &view.request_body_iv, 0, &sent);
+        assert_eq!(payload, b"outbound");
+        assert_eq!(used, sent.len(), "one record, whole and alone");
+
+        // The peer answers: the read that was already pending completes.
+        let mut flight =
+            seal_response_header(&view.response_body_key, &view.response_body_iv, &[0x33, 0]);
+        flight.extend_from_slice(&seal_record(
+            &view.response_body_key,
+            &view.response_body_iv,
+            0,
+            b"inbound",
+        ));
+        server.write_all(&flight).await.unwrap();
+        let received = pending_recv
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the pending read completes");
+        assert_eq!(received, (None, b"inbound".to_vec()));
+    }
+
+    /// A transport that counts the bytes it has handed to the tunnel — the
+    /// evidence that a cancelled `recv` really did take a record's first
+    /// chunk off the wire (and therefore had to keep it to stay in sync).
+    struct CountingTransport {
+        inner: tokio::io::DuplexStream,
+        consumed: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingTransport {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if polled.is_ready() {
+                self.consumed
+                    .fetch_add(buf.filled().len() - before, Ordering::SeqCst);
+            }
+            polled
+        }
+    }
+
+    impl AsyncWrite for CountingTransport {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn split_reader_recv_is_cancel_safe_mid_record() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (session, view) = twin_session();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let transport = CountingTransport {
+            inner: client,
+            consumed: Arc::clone(&consumed),
+        };
+        let conn = PacketConn::new(
+            VmessClientStream::new(transport, session),
+            &session_target(),
+        );
+        let (mut reader, _writer) = conn.split().unwrap();
+
+        // The response header, then a record cut in half: the first chunk
+        // stops inside the record's ciphertext.
+        let mut first_chunk =
+            seal_response_header(&view.response_body_key, &view.response_body_iv, &[0x33, 0]);
+        let record = seal_record(
+            &view.response_body_key,
+            &view.response_body_iv,
+            0,
+            b"one datagram, two chunks",
+        );
+        let cut = record.len() / 2;
+        first_chunk.extend_from_slice(&record[..cut]);
+        server.write_all(&first_chunk).await.unwrap();
+
+        // Two cancelled `recv`s on the half-arrived record: each parks, so
+        // the zero timeout drops it mid-frame.
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::ZERO, reader.recv())
+                    .await
+                    .is_err(),
+                "an incomplete record must park the recv, so the timeout drops it"
+            );
+        }
+        // The dropped futures had already pulled the peel and the record's
+        // first chunk off the wire — those bytes are unrecoverable from the
+        // transport, so only the read half's own state can still hold them.
+        assert_eq!(
+            consumed.load(Ordering::SeqCst),
+            first_chunk.len(),
+            "the cancelled recvs consumed the whole first chunk"
+        );
+
+        // The rest arrives and the datagram comes back WHOLE — the regression
+        // the split exists to prevent (a mid-frame cancellation losing bytes
+        // and desynchronising the record stream).
+        server.write_all(&record[cut..]).await.unwrap();
+        let (dest, payload) = reader.recv().await.unwrap().expect("the whole datagram");
+        assert_eq!(dest, None);
+        assert_eq!(payload, b"one datagram, two chunks");
+        assert_eq!(
+            consumed.load(Ordering::SeqCst),
+            first_chunk.len() + record.len() - cut,
+            "the completing recv read only the remainder — nothing was re-read"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_reader_clean_eof_is_none() {
+        let (conn, mut server, view) = record_stream(4096);
+        let (mut reader, _writer) = conn.split().unwrap();
+        // The peer finishes the AEAD response header, then closes at the
+        // first record boundary.
+        let header =
+            seal_response_header(&view.response_body_key, &view.response_body_iv, &[0x33, 0]);
+        server.write_all(&header).await.unwrap();
+        drop(server);
+        assert!(reader.recv().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn split_writer_keeps_the_destination_and_cap_refusals() {
+        let (conn, mut server, view) = record_stream(4096);
+        let (reader, mut writer) = conn.split().unwrap();
+
+        let elsewhere = writer
+            .send(Some("10.0.0.1:1080".parse().unwrap()), b"nope")
+            .await
+            .unwrap_err();
+        assert_eq!(elsewhere.kind(), io::ErrorKind::InvalidInput);
+        let oversize = writer
+            .send(None, &vec![0u8; MAX_SEND_PAYLOAD + 1])
+            .await
+            .unwrap_err();
+        assert_eq!(oversize.kind(), io::ErrorKind::InvalidInput);
+
+        // The header destination spelled out is still accepted, and the
+        // refusals wrote nothing — this is still record 0.
+        writer
+            .send(Some(session_dest()), b"accepted")
+            .await
+            .unwrap();
+        drop(writer);
+        drop(reader);
+        let mut wire = Vec::new();
+        server.read_to_end(&mut wire).await.unwrap();
+        let (payload, used) = open_record(&view.request_body_key, &view.request_body_iv, 0, &wire);
+        assert_eq!(payload, b"accepted");
+        assert_eq!(used, wire.len(), "the refusals wrote nothing");
     }
 }

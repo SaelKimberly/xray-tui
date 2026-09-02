@@ -20,9 +20,17 @@
 //! one reusable per-session buffer (upstream's `SendBuf`,
 //! `core/client/udp.go:160`); inbound ones are owned (`UdpMessage`) because
 //! the defragmenter holds fragments until a message assembles.
+//!
+//! [`UdpConn::split`] hands the two directions out separately — quinn's
+//! datagram send and receive both take `&Connection`, so this is a real
+//! split of the session state, not a byte stream cut in half: the
+//! defragmenter goes with the reader, the send buffer and the `PacketID`
+//! counter with the writer, and the session guard is shared so neither half
+//! can tear the QUIC session down while the other lives.
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
 use quinn::{Connection, SendDatagramError};
@@ -40,6 +48,10 @@ const MAX_UDP_SIZE: usize = 4096;
 /// Fallback datagram budget when the peer does not advertise one
 /// (`MaxDatagramFrameSize`).
 const DEFAULT_DATAGRAM_BUDGET: usize = 1200;
+/// The client-chosen `sessionID` for this tunnel: hysteria starts at 1 and
+/// increments per session, and this client opens one session per tunnel
+/// (`core/client/udp.go`). Both directions filter/stamp with it.
+const SESSION_ID: u32 = 1;
 
 /// A `UDPMessage` on its way out: the header fields with the address and
 /// payload BORROWED — the send path serializes them straight into the
@@ -219,20 +231,54 @@ fn accept_datagram(
     Some((assembled.addr.parse().ok(), assembled.data))
 }
 
-/// A Hysteria2 UDP connection over QUIC datagrams (one UDP session).
-///
-/// Sends `UDPMessage` frames (with fragmentation on `DatagramTooLarge`);
-/// receives and defragments the server's replies for this session.
-pub struct UdpConn {
-    conn: Connection,
-    /// Keeps the h3 session (and the quinn connection) alive.
-    _h3: H3Keepalive,
+/// Read-direction state: the session filter and the defragmenter, which
+/// holds fragments until a message assembles. Whichever end reads owns it —
+/// the combined [`UdpConn`] or the split [`UdpReader`].
+struct ReadState {
+    session_id: u32,
+    defrag: Defragger,
+}
+
+impl ReadState {
+    const fn new(session_id: u32) -> Self {
+        Self {
+            session_id,
+            defrag: Defragger::new(),
+        }
+    }
+
+    /// The one receive implementation, with the connection as a parameter:
+    /// [`UdpConn::recv`] and [`UdpReader::recv`] are both exactly this.
+    ///
+    /// Cancellation-safe: quinn's `read_datagram` future carries no partial
+    /// state — each poll either takes a whole datagram off the connection's
+    /// queue or registers a waker — and the defragmenter lives in `self`
+    /// rather than in the future, so a `recv` dropped mid-message keeps
+    /// every fragment it has already accepted.
+    async fn recv_from(
+        &mut self,
+        conn: &Connection,
+    ) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+        loop {
+            let Ok(bytes) = conn.read_datagram().await else {
+                return Ok(None); // connection closed = clean EOF
+            };
+            if let Some(delivered) = accept_datagram(&mut self.defrag, self.session_id, &bytes) {
+                return Ok(Some(delivered));
+            }
+        }
+    }
+}
+
+/// Write-direction state: the session destination, the `PacketID` counter
+/// and the reusable serialization buffer. Whichever end writes owns it —
+/// the combined [`UdpConn`] or the split [`UdpWriter`].
+struct WriteState {
     session_id: u32,
     /// The session destination in hysteria's Socksaddr wire form (rendered
     /// once from `ctx.target`): the address a send without a per-packet
     /// destination carries.
     target: String,
-    defrag: Defragger,
     /// Next `PacketID` for fragmented sends (nonzero).
     next_packet_id: u16,
     /// Serialization scratch reused by every datagram: each message is split
@@ -241,29 +287,26 @@ pub struct UdpConn {
     send_buf: BytesMut,
 }
 
-impl UdpConn {
-    #[must_use]
-    pub(super) fn new(conn: Connection, keepalive: H3Keepalive, target: String) -> Self {
+impl WriteState {
+    fn new(session_id: u32, target: String) -> Self {
         Self {
-            conn,
-            _h3: keepalive,
-            session_id: 1,
+            session_id,
             target,
-            defrag: Defragger::new(),
             next_packet_id: 1,
             send_buf: BytesMut::with_capacity(MAX_UDP_SIZE),
         }
     }
 
-    /// Send one datagram to `dest`, or — with `dest: None` — to the session
-    /// destination this tunnel was opened for. Every `UDPMessage` carries an
-    /// address on the wire (upstream takes it per call, `udpConn.Send`,
-    /// `core/client/udp.go:52`), so `None` means "the session destination",
-    /// never "no address".
-    // quinn's datagram send is synchronous; `send` is async only to match
-    // the `PacketTunnel` datagram API (the stream-chain variants do await).
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+    /// The one send implementation, with the connection as a parameter:
+    /// [`UdpConn::send`] and [`UdpWriter::send`] are both exactly this.
+    /// Synchronous because quinn's datagram send is — the public wrappers
+    /// are `async` only to match the datagram API.
+    fn send_to(
+        &mut self,
+        conn: &Connection,
+        dest: Option<SocketAddr>,
+        payload: &[u8],
+    ) -> io::Result<()> {
         if payload.len() > MAX_UDP_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -276,17 +319,9 @@ impl UdpConn {
         // The per-packet address, rendered once per send: every fragment
         // borrows it instead of cloning.
         let per_packet = dest.map(sockaddr_string);
-        let Self {
-            conn,
-            session_id,
-            target,
-            next_packet_id,
-            send_buf,
-            ..
-        } = self;
-        let session_target = target.as_str();
+        let session_target = self.target.as_str();
         let msg = UdpMessageRef {
-            session_id: *session_id,
+            session_id: self.session_id,
             packet_id: 0,
             frag_id: 0,
             frag_count: 1,
@@ -296,17 +331,73 @@ impl UdpConn {
         };
         // Bound before the match so the buffer reborrow ends here: the
         // fragment path needs it again.
-        let unfragmented = send_datagram(conn, send_buf, &msg);
+        let unfragmented = send_datagram(conn, &mut self.send_buf, &msg);
         match unfragmented {
             Ok(()) => Ok(()),
             Err(SendDatagramError::TooLarge) => {
                 let budget = conn.max_datagram_size().unwrap_or(DEFAULT_DATAGRAM_BUDGET);
-                let packet_id = *next_packet_id;
-                *next_packet_id = next_packet_id.wrapping_add(1).max(1);
-                send_fragmented(conn, send_buf, &msg, packet_id, budget)
+                let packet_id = self.next_packet_id;
+                self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
+                send_fragmented(conn, &mut self.send_buf, &msg, packet_id, budget)
             }
             Err(e) => Err(io::Error::other(format!("hy2 udp send: {e}"))),
         }
+    }
+}
+
+/// The session's liveness guard, shared by both halves of a
+/// [`split`](UdpConn::split).
+///
+/// In production this is the h3 keep-alive from the auth exchange
+/// ([`H3Keepalive`]): dropping the last `SendRequest` clone closes the h3
+/// session, which tears the whole quinn connection down. Type-erased because
+/// nothing here ever *uses* it, only holds it, and shared because the
+/// session must outlive EITHER half — the guard unwinds when the last half
+/// goes away, never when the first one does (the tests hold a drop probe
+/// through it to prove exactly that).
+type SessionGuard = Arc<dyn Send + Sync>;
+
+/// A Hysteria2 UDP connection over QUIC datagrams (one UDP session).
+///
+/// Sends `UDPMessage` frames (with fragmentation on `DatagramTooLarge`);
+/// receives and defragments the server's replies for this session.
+/// [`split`](Self::split) hands the two directions out as independent halves.
+pub struct UdpConn {
+    conn: Connection,
+    /// Keeps the h3 session (and the quinn connection) alive.
+    session: SessionGuard,
+    read: ReadState,
+    write: WriteState,
+}
+
+impl UdpConn {
+    #[must_use]
+    pub(super) fn new(conn: Connection, keepalive: H3Keepalive, target: String) -> Self {
+        Self::with_session_guard(conn, Arc::new(keepalive), target)
+    }
+
+    /// [`new`](Self::new) with the session guard already erased and
+    /// shareable — the seam the tests open a session over without running an
+    /// h3 handshake.
+    fn with_session_guard(conn: Connection, session: SessionGuard, target: String) -> Self {
+        Self {
+            conn,
+            session,
+            read: ReadState::new(SESSION_ID),
+            write: WriteState::new(SESSION_ID, target),
+        }
+    }
+
+    /// Send one datagram to `dest`, or — with `dest: None` — to the session
+    /// destination this tunnel was opened for. Every `UDPMessage` carries an
+    /// address on the wire (upstream takes it per call, `udpConn.Send`,
+    /// `core/client/udp.go:52`), so `None` means "the session destination",
+    /// never "no address".
+    // quinn's datagram send is synchronous; `send` is async only to match
+    // the `PacketTunnel` datagram API (the stream-chain variants do await).
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+        self.write.send_to(&self.conn, dest, payload)
     }
 
     /// Receive one datagram. `Ok(None)` on a clean end-of-stream (the QUIC
@@ -317,14 +408,83 @@ impl UdpConn {
     /// (a domain): the datagram API has no other way to say "no per-packet
     /// address".
     pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
-        loop {
-            let Ok(bytes) = self.conn.read_datagram().await else {
-                return Ok(None); // connection closed = clean EOF
-            };
-            if let Some(delivered) = accept_datagram(&mut self.defrag, self.session_id, &bytes) {
-                return Ok(Some(delivered));
-            }
-        }
+        self.read.recv_from(&self.conn).await
+    }
+
+    /// Split the session into halves that may be used concurrently from
+    /// separate tasks — a reader parked in [`UdpReader::recv`] no longer
+    /// blocks [`UdpWriter::send`].
+    ///
+    /// A genuine split, not a byte-stream split: quinn's datagram send and
+    /// receive both take `&Connection` and the handle is `Clone`, so neither
+    /// half gains a lock. The reader takes the defragmenter, the writer takes
+    /// the send buffer and the `PacketID` counter, and both hold the session
+    /// guard so the QUIC session survives until the LAST half is dropped.
+    // Infallible for this carrier; the `io::Result` is the shared split
+    // contract (the stream carriers refuse some modes).
+    pub fn split(self) -> io::Result<(UdpReader, UdpWriter)> {
+        let Self {
+            conn,
+            session,
+            read,
+            write,
+        } = self;
+        Ok((
+            UdpReader {
+                conn: conn.clone(),
+                _session: Arc::clone(&session),
+                read,
+            },
+            UdpWriter {
+                conn,
+                _session: session,
+                write,
+            },
+        ))
+    }
+}
+
+/// The read half of a [`split`](UdpConn::split) session.
+///
+/// Owns the defragmenter and a handle on the QUIC connection. Independent of
+/// [`UdpWriter`], so a dedicated task may park in [`recv`](Self::recv) for
+/// the session's whole life.
+pub struct UdpReader {
+    conn: Connection,
+    /// Keeps the h3 session (and the quinn connection) alive.
+    _session: SessionGuard,
+    read: ReadState,
+}
+
+impl UdpReader {
+    /// Receive one datagram — [`UdpConn::recv`] exactly, same implementation
+    /// and same `Ok(None)` end-of-stream semantics.
+    ///
+    /// Cancellation-safe: quinn's `read_datagram` keeps no partial state and
+    /// the defragmenter lives in this half, so a dropped `recv` future loses
+    /// neither a datagram nor a fragment already accepted.
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+        self.read.recv_from(&self.conn).await
+    }
+}
+
+/// The write half of a [`split`](UdpConn::split) session: the serialization
+/// buffer, the `PacketID` counter and a handle on the QUIC connection.
+pub struct UdpWriter {
+    conn: Connection,
+    /// Keeps the h3 session (and the quinn connection) alive.
+    _session: SessionGuard,
+    write: WriteState,
+}
+
+impl UdpWriter {
+    /// Send one datagram — [`UdpConn::send`] exactly, same implementation
+    /// and same `dest: None` = session-destination meaning.
+    // Async only to match the datagram API; quinn's datagram send is
+    // synchronous.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+        self.write.send_to(&self.conn, dest, payload)
     }
 }
 
@@ -384,6 +544,12 @@ fn send_fragmented(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::{Pin, pin};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
 
     /// One outbound `UDPMessage` view (session 1, unfragmented).
     fn out<'a>(addr: &'a str, data: &'a [u8]) -> UdpMessageRef<'a> {
@@ -591,5 +757,432 @@ mod tests {
     fn sockaddr_string_forms() {
         assert_eq!(sockaddr_string("1.2.3.4:53".parse().unwrap()), "1.2.3.4:53");
         assert_eq!(sockaddr_string("[::1]:443".parse().unwrap()), "[::1]:443");
+    }
+
+    // ── split halves over a real loopback QUIC session ────────────────────
+
+    /// The session destination the tunnels under test are opened for: the
+    /// address a `send(None, …)` must put on the wire.
+    const SESSION_TARGET: &str = "9.9.9.9:53";
+    /// A per-packet destination.
+    const DEST: &str = "1.2.3.4:53";
+    /// The datagram sequence both shapes must put on the wire identically: a
+    /// per-packet IPv4 destination, the session destination, and a per-packet
+    /// IPv6 destination.
+    const EXCHANGE: [(Option<&str>, &[u8]); 3] = [
+        (Some(DEST), b"one"),
+        (None, b"two"),
+        (Some("[2001:db8::1]:5353"), b"three"),
+    ];
+
+    /// What the peer saw and what the carrier delivered for [`EXCHANGE`].
+    type Exchange = (Vec<Vec<u8>>, Vec<(Option<SocketAddr>, Vec<u8>)>);
+
+    /// One test destination in `SocketAddr` form.
+    fn sockaddr(spec: &str) -> SocketAddr {
+        spec.parse().expect("test destination parses")
+    }
+
+    /// One serialized `UDPMessage` fragment, as the server puts it on the
+    /// wire.
+    fn wire_frag(pkt: u16, id: u8, count: u8, addr: &str, data: &[u8]) -> BytesMut {
+        let msg = UdpMessageRef {
+            packet_id: pkt,
+            frag_id: id,
+            frag_count: count,
+            ..out(addr, data)
+        };
+        let mut buf = BytesMut::new();
+        msg.serialize_into(&mut buf);
+        buf
+    }
+
+    /// A session guard that records its own drop — the stand-in for the h3
+    /// keep-alive, which the halves must share rather than drop with the
+    /// first one to go.
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A session guard plus the flag it sets when it is finally released.
+    fn probe() -> (SessionGuard, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (Arc::new(DropProbe(Arc::clone(&flag))), flag)
+    }
+
+    /// A loopback QUIC pair with datagrams enabled (quinn's default):
+    /// `(client, server, client endpoint, server endpoint)`.
+    ///
+    /// The connections come out by value so the type under test can hold the
+    /// ONLY client-side handle — a spare handle here would keep the session
+    /// alive on its own and the lifetime assertions would prove nothing. The
+    /// endpoints come out because a dropped endpoint takes its driver with it.
+    async fn quic_pair() -> (Connection, Connection, quinn::Endpoint, quinn::Endpoint) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                .expect("key der");
+
+        let mut server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server tls");
+        server_tls.alpn_protocols = vec![super::super::ALPN_H3.to_vec()];
+        let server_ep = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)
+                    .expect("quic server config"),
+            )),
+            "127.0.0.1:0".parse().expect("bind addr"),
+        )
+        .expect("quic server endpoint");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        let accepting = {
+            let ep = server_ep.clone();
+            tokio::spawn(async move {
+                ep.accept()
+                    .await
+                    .expect("incoming conn")
+                    .await
+                    .expect("server handshake")
+            })
+        };
+
+        let mut client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates({
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(cert_der).expect("root add");
+                roots
+            })
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![super::super::ALPN_H3.to_vec()];
+        let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind addr"))
+            .expect("quic client endpoint");
+        let client = client_ep
+            .connect_with(
+                quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
+                        .expect("quic client config"),
+                )),
+                server_addr,
+                "localhost",
+            )
+            .expect("connect")
+            .await
+            .expect("client handshake");
+        let server = accepting.await.expect("accept task");
+        (client, server, client_ep, server_ep)
+    }
+
+    /// A tunnel over `conn` with a watchable session guard, opened for
+    /// [`SESSION_TARGET`].
+    fn conn_over(conn: Connection, session: SessionGuard) -> UdpConn {
+        UdpConn::with_session_guard(conn, session, SESSION_TARGET.to_string())
+    }
+
+    /// The server side: echo every datagram back verbatim (the hysteria2
+    /// server relaying replies for this session) until the session ends, and
+    /// log the raw bytes it saw so a test can compare wire images.
+    fn spawn_echo(server: Connection) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok(bytes) = server.read_datagram().await {
+                seen.lock().push(bytes.to_vec());
+                if server.send_datagram(bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        log
+    }
+
+    /// Poll `fut` exactly once, then let the caller drop it: one cancelled
+    /// step of a future.
+    fn poll_once<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
+        fut.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Poll a fresh `recv` once and drop it — a cancelled receive.
+    async fn cancelled_recv(reader: &mut UdpReader) {
+        assert!(
+            tokio::time::timeout(Duration::ZERO, reader.recv())
+                .await
+                .is_err(),
+            "the recv should have been cancelled, not completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_halves_round_trip_exactly_like_the_unsplit_conn() {
+        let unsplit: Exchange = {
+            let (client, server, _client_ep, _server_ep) = quic_pair().await;
+            let seen = spawn_echo(server);
+            let mut conn = conn_over(client, probe().0);
+            for (dest, payload) in EXCHANGE {
+                conn.send(dest.map(sockaddr), payload).await.expect("send");
+            }
+            let mut got = Vec::new();
+            for _ in 0..EXCHANGE.len() {
+                got.push(conn.recv().await.expect("recv").expect("datagram"));
+            }
+            (seen.lock().clone(), got)
+        };
+
+        let split: Exchange = {
+            let (client, server, _client_ep, _server_ep) = quic_pair().await;
+            let seen = spawn_echo(server);
+            let (mut reader, mut writer) = conn_over(client, probe().0).split().expect("split");
+            for (dest, payload) in EXCHANGE {
+                writer
+                    .send(dest.map(sockaddr), payload)
+                    .await
+                    .expect("send");
+            }
+            let mut got = Vec::new();
+            for _ in 0..EXCHANGE.len() {
+                got.push(reader.recv().await.expect("recv").expect("datagram"));
+            }
+            (seen.lock().clone(), got)
+        };
+
+        // Byte-for-byte the same `UDPMessage`s on the wire (session id,
+        // PacketID, address form) and the same delivered datagrams: the split
+        // moved state around, it changed no behaviour.
+        assert_eq!(split.0, unsplit.0, "same bytes on the wire");
+        assert_eq!(split.1, unsplit.1, "same delivered datagrams");
+        // ...and both delivered what we sent, with `dest: None` carrying the
+        // session destination (the reply address comes back parsed).
+        let expect: Vec<(Option<SocketAddr>, Vec<u8>)> = EXCHANGE
+            .iter()
+            .map(|(dest, payload)| {
+                (
+                    Some(sockaddr(dest.unwrap_or(SESSION_TARGET))),
+                    payload.to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(unsplit.1, expect);
+    }
+
+    #[tokio::test]
+    async fn both_shapes_reject_an_oversize_payload_identically() {
+        let (client, _server, _client_ep, _server_ep) = quic_pair().await;
+        let too_big = vec![0u8; MAX_UDP_SIZE + 1];
+        let mut conn = conn_over(client.clone(), probe().0);
+        let combined = conn.send(None, &too_big).await.expect_err("rejected");
+        let (_reader, mut writer) = conn_over(client, probe().0).split().expect("split");
+        let half = writer.send(None, &too_big).await.expect_err("rejected");
+        assert_eq!(combined.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(half.kind(), combined.kind());
+        assert_eq!(half.to_string(), combined.to_string());
+        assert_eq!(
+            combined.to_string(),
+            format!(
+                "hy2 udp datagram too large ({}, max {MAX_UDP_SIZE})",
+                too_big.len()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn split_halves_fragment_and_reassemble_an_oversize_datagram() {
+        let (client, server, _client_ep, _server_ep) = quic_pair().await;
+        let budget = client.max_datagram_size().expect("peer supports datagrams");
+        // Larger than one QUIC datagram but within `MAX_UDP_SIZE`: quinn
+        // answers `TooLarge` and the writer fragments (`frag.FragUDPMessage`).
+        let payload: Vec<u8> = (0..3000).map(|i| b"abcdefghij"[i % 10]).collect();
+        assert!(
+            payload.len() > budget,
+            "payload must not fit one datagram (budget {budget})"
+        );
+
+        let seen = spawn_echo(server);
+        let (mut reader, mut writer) = conn_over(client, probe().0).split().expect("split");
+        writer
+            .send(Some(sockaddr(DEST)), &payload)
+            .await
+            .expect("send");
+        // Every fragment echoes back and the reader's defragmenter puts the
+        // datagram together again.
+        let (dest, got) = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("recv completes")
+            .expect("recv")
+            .expect("assembled datagram");
+        assert_eq!(dest, Some(sockaddr(DEST)));
+        assert_eq!(got, payload);
+
+        // One `PacketID` for the whole message (the first fragmented send is
+        // 1), `FragID` 0..count in order, the address on every fragment.
+        let frags = seen.lock().clone();
+        assert!(frags.len() > 1, "the datagram must have been fragmented");
+        for (i, raw) in frags.iter().enumerate() {
+            let m = UdpMessage::parse(raw).expect("fragment parses");
+            assert_eq!(m.session_id, SESSION_ID);
+            assert_eq!(m.packet_id, 1, "one PacketID for the whole message");
+            assert_eq!(usize::from(m.frag_count), frags.len());
+            assert_eq!(usize::from(m.frag_id), i);
+            assert_eq!(m.addr, DEST);
+            assert!(raw.len() <= budget, "fragment fits the datagram budget");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_split_send_completes_while_the_reader_half_is_parked() {
+        let (client, server, _client_ep, _server_ep) = quic_pair().await;
+        let _seen = spawn_echo(server);
+        let (mut reader, mut writer) = conn_over(client, probe().0).split().expect("split");
+
+        // The reader parks inside `recv` in its own task — the shape the
+        // unsplit tunnel cannot serve, since its `recv` and `send` both need
+        // `&mut self`.
+        let reading = tokio::spawn(async move {
+            let got = reader.recv().await;
+            (reader, got)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        writer.send(None, b"parked").await.expect("send");
+        let (mut reader, got) = tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("reader completes")
+            .expect("reader task");
+        assert_eq!(
+            got.expect("recv").expect("datagram"),
+            (Some(sockaddr(SESSION_TARGET)), b"parked".to_vec())
+        );
+
+        // ...and the same thing without a task: an already-pending `recv`
+        // future stays alive across a `send` on the writer half.
+        let mut pending = pin!(reader.recv());
+        assert!(poll_once(pending.as_mut()).is_pending(), "recv is parked");
+        writer.send(None, b"second").await.expect("send");
+        let (dest, payload) = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("recv completes")
+            .expect("recv")
+            .expect("datagram");
+        assert_eq!(dest, Some(sockaddr(SESSION_TARGET)));
+        assert_eq!(payload, b"second");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_recv_keeps_the_fragments_it_accepted() {
+        let (client, server, _client_ep, _server_ep) = quic_pair().await;
+        let (mut reader, _writer) = conn_over(client, probe().0).split().expect("split");
+
+        // Cancelled with nothing queued: quinn's `read_datagram` future keeps
+        // no state of its own, so nothing is consumed.
+        cancelled_recv(&mut reader).await;
+
+        // Fragment 0 of a two-fragment message arrives, and the `recv` that
+        // accepts it is cancelled before the message can assemble — the point
+        // where the stream carriers lose bytes. The fragment survives because
+        // the defragmenter lives in the half, not in the future.
+        server
+            .send_datagram(wire_frag(4, 0, 2, DEST, b"hello").freeze())
+            .expect("frag 0");
+        for _ in 0..100 {
+            cancelled_recv(&mut reader).await;
+            if reader.read.defrag.count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(reader.read.defrag.count, 1, "fragment 0 was accepted");
+        assert_eq!(reader.read.defrag.pkt_id, 4, "...and kept, after the drop");
+
+        // The rest of the message arrives at a fresh `recv`: the datagram is
+        // delivered whole, nothing lost to the cancellations.
+        server
+            .send_datagram(wire_frag(4, 1, 2, DEST, b" world").freeze())
+            .expect("frag 1");
+        let (dest, got) = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("recv completes")
+            .expect("recv")
+            .expect("datagram");
+        assert_eq!(dest, Some(sockaddr(DEST)));
+        assert_eq!(got, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn the_reader_half_reports_eof_when_the_session_closes() {
+        let (client, server, _client_ep, _server_ep) = quic_pair().await;
+        let (mut reader, _writer) = conn_over(client, probe().0).split().expect("split");
+        // A clean close at a message boundary, nothing in flight.
+        server.close(0u32.into(), b"bye");
+        let got = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("recv completes")
+            .expect("a closed session is not an error");
+        assert!(got.is_none(), "clean end-of-stream is Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn the_reader_half_keeps_the_session_alive_after_the_writer_drops() {
+        let (client, server, _client_ep, _server_ep) = quic_pair().await;
+        let (guard, released) = probe();
+        // The halves hold the only client-side connection handle: if the
+        // session died with the writer, this `recv` would see EOF instead of
+        // the server's datagram.
+        let (mut reader, writer) = conn_over(client, guard).split().expect("split");
+        drop(writer);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "one half gone: the session guard stays"
+        );
+
+        server
+            .send_datagram(wire(SESSION_ID, DEST, b"still here").freeze())
+            .expect("server datagram");
+        let (dest, got) = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("recv completes")
+            .expect("recv")
+            .expect("datagram");
+        assert_eq!(dest, Some(sockaddr(DEST)));
+        assert_eq!(got, b"still here");
+
+        drop(reader);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "last half gone: the guard is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_writer_half_keeps_the_session_alive_after_the_reader_drops() {
+        let (client, server, _client_ep, _server_ep) = quic_pair().await;
+        let (guard, released) = probe();
+        let (reader, mut writer) = conn_over(client, guard).split().expect("split");
+        drop(reader);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "one half gone: the session guard stays"
+        );
+
+        writer.send(None, b"still here").await.expect("send");
+        let raw = tokio::time::timeout(Duration::from_secs(5), server.read_datagram())
+            .await
+            .expect("server datagram arrives")
+            .expect("server datagram");
+        let m = UdpMessage::parse(&raw).expect("parses");
+        assert_eq!(m.addr, SESSION_TARGET);
+        assert_eq!(m.data, b"still here");
+
+        drop(writer);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "last half gone: the guard is released"
+        );
     }
 }

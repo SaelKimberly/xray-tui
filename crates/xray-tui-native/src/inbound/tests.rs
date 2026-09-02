@@ -471,3 +471,495 @@ async fn bind_command_is_unsupported() {
 
     handle.abort();
 }
+
+// UDP ASSOCIATE tests
+// *****************************************************************************
+
+use std::time::Duration;
+use tokio::net::UdpSocket;
+
+use super::socks5;
+
+/// A UDP echo server; returns its bound address.
+async fn spawn_udp_echo() -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
+    let addr = sock.local_addr().expect("udp echo addr");
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = sock.send_to(&buf[..n], from).await;
+        }
+    });
+    addr
+}
+
+/// Open a no-auth SOCKS5 UDP ASSOCIATE with the inbound. Returns the
+/// controlling TCP stream and the reply (client-facing) UDP address.
+async fn udp_associate(inbound: SocketAddr) -> (TcpStream, SocketAddr) {
+    let mut stream = TcpStream::connect(inbound)
+        .await
+        .expect("connect to inbound");
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting");
+    let mut selection = [0u8; 2];
+    stream.read_exact(&mut selection).await.expect("selection");
+    assert_eq!(selection, [0x05, 0x00], "no-auth selected");
+    // UDP ASSOCIATE with an all-zero DST (the server ignores it).
+    stream
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("associate request");
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await.expect("reply head");
+    assert_eq!(head[0], 0x05, "reply version");
+    assert_eq!(head[1], 0x00, "associate succeeded");
+    assert_eq!(head[3], 0x01, "v4 bind address");
+    let mut bnd = [0u8; 6];
+    stream.read_exact(&mut bnd).await.expect("bnd addr");
+    let ip = IpAddr::V4(std::net::Ipv4Addr::new(bnd[0], bnd[1], bnd[2], bnd[3]));
+    let port = u16::from_be_bytes([bnd[4], bnd[5]]);
+    assert_ne!(port, 0, "BND.PORT is the bound relay port");
+    (stream, SocketAddr::new(ip, port))
+}
+
+/// The datagram wire bytes for one UDP datagram to `target`.
+fn udp_datagram(target: &TargetAddr, frag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = socks5::new_udp_header(target);
+    packet[2] = frag;
+    packet.extend_from_slice(payload);
+    packet
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_associate_relays_datagrams_direct() {
+    let echo = spawn_udp_echo().await;
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+    let packet = udp_datagram(&target, 0, b"ping udp");
+    sock.send_to(&packet, reply).await.expect("send datagram");
+
+    let mut buf = vec![0u8; 2048];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    let (frag, rtarget, payload) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+    assert_eq!(frag, 0);
+    assert_eq!(
+        rtarget.port,
+        echo.port(),
+        "reply header names the echo server"
+    );
+    assert_eq!(payload, b"ping udp");
+
+    drop(stream);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_fragmented_datagram_is_dropped() {
+    let echo = spawn_udp_echo().await;
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+
+    // A fragmented datagram must be discarded, not forwarded.
+    let packet = udp_datagram(&target, 1, b"drop me");
+    sock.send_to(&packet, reply)
+        .await
+        .expect("send frag datagram");
+    // Give a wrong-path forward time to surface; then a clean datagram still
+    // relays (association is unaffected by the dropped fragment).
+    let mut probe = vec![0u8; 64];
+    let wrong = tokio::time::timeout(Duration::from_millis(150), sock.recv_from(&mut probe)).await;
+    assert!(
+        wrong.is_err(),
+        "fragmented datagram must not produce a reply"
+    );
+
+    let clean = udp_datagram(&target, 0, b"ping");
+    sock.send_to(&clean, reply)
+        .await
+        .expect("send clean datagram");
+    let mut buf = vec![0u8; 2048];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    let (_, _, payload) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+    assert_eq!(payload, b"ping");
+
+    drop(stream);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_blocked_datagram_is_dropped_and_association_survives() {
+    let echo = spawn_udp_echo().await;
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(
+            vec![block_domain("blocked.example")],
+            route_default("direct"),
+        ),
+        vec![
+            Outbound {
+                tag: "direct".into(),
+                kind: OutboundKind::Direct,
+            },
+            Outbound {
+                tag: "block".into(),
+                kind: OutboundKind::Block,
+            },
+        ],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+
+    // A datagram to the blocked domain is dropped.
+    let blocked = TargetAddr::new(Host::Domain("blocked.example".into()), 53);
+    let packet = udp_datagram(&blocked, 0, b"blocked query");
+    sock.send_to(&packet, reply)
+        .await
+        .expect("send blocked datagram");
+    let mut probe = vec![0u8; 64];
+    let nothing =
+        tokio::time::timeout(Duration::from_millis(150), sock.recv_from(&mut probe)).await;
+    assert!(
+        nothing.is_err(),
+        "blocked datagram must not produce a reply"
+    );
+
+    // The association is still alive for a routed destination.
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    sock.send_to(&udp_datagram(&target, 0, b"ping"), reply)
+        .await
+        .expect("send datagram");
+    let mut buf = vec![0u8; 2048];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    let (_, _, payload) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+    assert_eq!(payload, b"ping");
+
+    drop(stream);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_associate_ends_when_control_connection_closes() {
+    let echo = spawn_udp_echo().await;
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+
+    // Sanity: the association relays before the control connection closes.
+    sock.send_to(&udp_datagram(&target, 0, b"ping"), reply)
+        .await
+        .expect("send datagram");
+    let mut buf = vec![0u8; 2048];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    let (_, _, payload) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+    assert_eq!(payload, b"ping");
+
+    // Close the controlling TCP connection: the relay must end and release
+    // its client-facing socket. Waiting for the port to become bindable is
+    // deterministic (no SO_REUSEADDR on a tokio `UdpSocket`) and a stronger
+    // claim than "no reply arrived within N ms".
+    drop(stream);
+    assert!(
+        wait_for_port_release(reply).await,
+        "relay must release its udp socket after the control connection closes"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_off_keeps_command_not_supported_refusal() {
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    config.udp = false;
+    let (addr, handle) = spawn_inbound(config).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect to inbound");
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting");
+    let mut selection = [0u8; 2];
+    stream.read_exact(&mut selection).await.expect("selection");
+    assert_eq!(selection, [0x05, 0x00]);
+    stream
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("associate request");
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await.expect("reply head");
+    assert_eq!(head[1], 0x07, "CommandNotSupported when udp is off");
+    skip_reply_addr(&mut stream, head[3]).await;
+
+    handle.abort();
+}
+
+/// Poll until `addr` can be bound again (the relay released it) or a deadline
+/// passes. `true` = released.
+async fn wait_for_port_release(addr: SocketAddr) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if UdpSocket::bind(addr).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// An association whose client never sends a datagram must still be released
+/// when the control connection closes — otherwise its TCP and UDP sockets leak
+/// per association until the process runs out of descriptors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_association_without_a_datagram_is_released_on_control_close() {
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+
+    // No datagram was ever sent; closing the control connection must end the
+    // relay anyway.
+    drop(stream);
+    assert!(
+        wait_for_port_release(reply).await,
+        "relay must not park waiting for a first datagram that never comes"
+    );
+
+    handle.abort();
+}
+
+/// Only the control connection's peer may drive the association: a datagram
+/// from another source is ignored, and it does not steal the pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_datagrams_from_other_sources_are_ignored() {
+    let echo = spawn_udp_echo().await;
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+
+    // Pin the association to this socket.
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+    client
+        .send_to(&udp_datagram(&target, 0, b"first"), reply)
+        .await
+        .expect("send datagram");
+    let mut buf = vec![0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    let (_, _, payload) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+    assert_eq!(payload, b"first");
+
+    // A different local socket (same host, different port) must be ignored.
+    let intruder = UdpSocket::bind("127.0.0.1:0").await.expect("intruder udp");
+    intruder
+        .send_to(&udp_datagram(&target, 0, b"intruder"), reply)
+        .await
+        .expect("send intruder datagram");
+    let mut probe = vec![0u8; 2048];
+    let stolen =
+        tokio::time::timeout(Duration::from_millis(200), intruder.recv_from(&mut probe)).await;
+    assert!(stolen.is_err(), "an unpinned source must get no reply");
+
+    // The pinned client still works.
+    client
+        .send_to(&udp_datagram(&target, 0, b"again"), reply)
+        .await
+        .expect("send datagram");
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    let (_, _, payload) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+    assert_eq!(payload, b"again");
+
+    drop(stream);
+    handle.abort();
+}
+
+/// One association fans out per datagram: two destinations both receive their
+/// traffic and both replies carry the right source address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_association_fans_out_to_multiple_destinations() {
+    let echo_a = spawn_udp_echo().await;
+    let echo_b = spawn_udp_echo().await;
+    let config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".into(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    let (addr, handle) = spawn_inbound(config).await;
+    let (stream, reply) = udp_associate(addr).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+
+    let mut seen = Vec::new();
+    for (echo, payload) in [(echo_a, b"to-a".as_slice()), (echo_b, b"to-b".as_slice())] {
+        let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+        client
+            .send_to(&udp_datagram(&target, 0, payload), reply)
+            .await
+            .expect("send datagram");
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("echo reply timed out")
+            .expect("recv reply");
+        let (_, src, body) = socks5::parse_udp_request(&buf[..n]).expect("reply header");
+        assert_eq!(body, payload);
+        seen.push(src.port);
+    }
+    assert_eq!(
+        seen,
+        vec![echo_a.port(), echo_b.port()],
+        "each reply names the destination it came from"
+    );
+
+    drop(stream);
+    handle.abort();
+}
+
+#[test]
+fn v4_mapped_reply_addresses_are_unmapped() {
+    let mapped: SocketAddr = "[::ffff:127.0.0.1]:53".parse().expect("mapped addr");
+    let unmapped = super::unmap_v6(mapped);
+    assert_eq!(unmapped, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
+    // A genuine v6 address is untouched.
+    let v6: SocketAddr = "[2001:db8::1]:53".parse().expect("v6 addr");
+    assert_eq!(super::unmap_v6(v6), v6);
+    // v4 passes through.
+    let v4: SocketAddr = "127.0.0.1:9".parse().expect("v4 addr");
+    assert_eq!(super::unmap_v6(v4), v4);
+}
+
+/// Every mapped kind, including the ones whose verdict is a judgement call:
+/// `0x02` is reserved for a policy refusal, so a reset or a local socket
+/// problem must NOT claim it.
+#[test]
+fn reply_code_maps_io_kinds() {
+    use crate::error::NativeError;
+    use socks5::ReplyCode;
+    use std::io::ErrorKind;
+
+    for (kind, want) in [
+        (ErrorKind::ConnectionRefused, ReplyCode::ConnectionRefused),
+        (ErrorKind::ConnectionReset, ReplyCode::ConnectionRefused),
+        (ErrorKind::PermissionDenied, ReplyCode::ConnectionNotAllowed),
+        (ErrorKind::NetworkUnreachable, ReplyCode::NetworkUnreachable),
+        (ErrorKind::HostUnreachable, ReplyCode::HostUnreachable),
+        (ErrorKind::TimedOut, ReplyCode::HostUnreachable),
+        (ErrorKind::AddrNotAvailable, ReplyCode::GeneralFailure),
+        (ErrorKind::NotConnected, ReplyCode::GeneralFailure),
+        (ErrorKind::Other, ReplyCode::GeneralFailure),
+    ] {
+        let error = NativeError::Io(std::io::Error::from(kind));
+        assert_eq!(super::reply_for(&error), want, "{kind:?}");
+    }
+
+    let dial = NativeError::Dial("boom".into());
+    assert_eq!(super::reply_for(&dial), ReplyCode::HostUnreachable);
+    let timeout = NativeError::Timeout {
+        step: "direct connect",
+        limit: Duration::from_secs(1),
+    };
+    assert_eq!(super::reply_for(&timeout), ReplyCode::HostUnreachable);
+    let unsupported = NativeError::NotImplemented {
+        feature: "socks5 udp".into(),
+    };
+    assert_eq!(
+        super::reply_for(&unsupported),
+        ReplyCode::CommandNotSupported
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_dial_disables_nagle() {
+    use std::any::Any;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+    let target = TargetAddr::new(Host::new("127.0.0.1"), addr.port());
+    let stream = super::outbound::dial(&OutboundKind::Direct, &target)
+        .await
+        .expect("dial direct");
+    let any = &*stream as &dyn Any;
+    let tcp = any
+        .downcast_ref::<TcpStream>()
+        .expect("direct dial returns a TcpStream");
+    assert!(tcp.nodelay().expect("nodelay getter"), "TCP_NODELAY set");
+    server.abort();
+}

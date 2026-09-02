@@ -523,13 +523,31 @@ and returns the next.
   CertificateVerify signature).
 - `protocol/` — 20 protocol modules; `vless`, `vmess`, `trojan` + `hysteria2` are implemented
   (trojan = TCP-stream family via the uniform pipeline; hysteria2 = `ConnectShape::Quic`
-  fresh quinn dial). Every other kind returns `NativeError::NotImplemented` naming the feature.
+  fresh quinn dial), plus the `socks` CLIENT handshake (RFC 1928/1929 greeting →
+  method → CONNECT over the `BoxStream` seam; its UDP side stays
+  `NotImplemented` — SOCKS5 datagrams need a raw UDP socket, not this stream).
+  Every other kind returns `NativeError::NotImplemented` naming the feature.
   `shape.rs` `ConnectShape` marks the divergent paths (device tunnels:
   WireGuard/Tailscale; own-handshake: SSH; outbound-only kinds: Redirect/TProxy/
   Mixed).
+  `PacketTunnel` (the UDP datagram tunnel) additionally exposes
+  `split() -> (PacketReader, PacketWriter)`: every carrier separates its
+  per-direction framing state from the transport, so a reader task and a writer
+  run concurrently. This is mandatory for any bidirectional relay — a stream
+  carrier's `recv` spans several awaits, so racing it in a `select!` would drop
+  a partial frame and desynchronise the tunnel. VLESS XUDP refuses to split
+  (its datagrams ride a shared mux tunnel, not a stream).
 - `inbound/` — local SOCKS5 server (`Socks5Inbound`): accept → `xray-tui-route`
   `Engine` (`decide_async`) → tagged `Outbound` (Direct / Block / Proxy, the proxy
-  reusing `crate::connect`). TCP CONNECT only; BIND/UDP-ASSOCIATE refused.
+  reusing `crate::connect`). TCP CONNECT plus UDP ASSOCIATE
+  (`Socks5InboundConfig::udp`, default on): one relay task per association
+  routes EVERY datagram through the engine (`NetworkMask::UDP`, whole-payload
+  sniffing gated on `Engine::needs_sniff`), so a single association can reach
+  direct and proxy outbounds at once. Direct traffic uses per-family upstream
+  sockets; proxy traffic goes to a leg task that owns the split tunnel. The
+  association pins to the control connection's peer, expires if no datagram
+  arrives, and ends on control-TCP EOF. BIND is refused `0x07`; `HijackDns`
+  drops the datagram (TCP: `0x02`).
 - `e2e/` (feature `native-e2e`) — real-core scenarios: spawns xray-core
   26.3.27 / sing-box 1.13.16 server inbounds, dials with the native client,
   probes HTTP through the tunnel. Transport matrix (VLESS/VMess ×

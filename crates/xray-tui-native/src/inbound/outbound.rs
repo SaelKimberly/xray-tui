@@ -72,6 +72,11 @@ pub(crate) async fn dial(
 }
 
 /// Dial `target` directly over TCP, resolving domains locally.
+///
+/// Failures keep BOTH halves of the diagnosis: the `io::ErrorKind` (which
+/// [`crate::inbound::reply_for`] maps to an RFC 1928 reply code) and the
+/// destination in the message. A bare `io::Error` would drop the address;
+/// [`NativeError::Dial`] would drop the kind.
 async fn dial_direct(target: &TargetAddr) -> Result<TcpStream, NativeError> {
     let addr = match &target.host {
         Host::Ip(ip) => SocketAddr::new(*ip, target.port),
@@ -85,19 +90,37 @@ async fn dial_direct(target: &TargetAddr) -> Result<TcpStream, NativeError> {
                 step: "direct dns lookup",
                 limit: timeouts::DIAL,
             })?
-            .map_err(|e| NativeError::Dial(format!("{domain}: {e}")))?;
-            addrs
-                .next()
-                .ok_or_else(|| NativeError::Dial(format!("{domain}: no addresses found")))?
+            // `getaddrinfo` failures surface as `ErrorKind::Uncategorized`,
+            // which would answer `0x01 General failure`; an unresolvable name
+            // is `0x04 Host unreachable` (RFC 1928 §6).
+            .map_err(|e| {
+                NativeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::HostUnreachable,
+                    format!("{domain}: {e}"),
+                ))
+            })?;
+            addrs.next().ok_or_else(|| {
+                NativeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::HostUnreachable,
+                    format!("{domain}: no addresses found"),
+                ))
+            })?
         }
     };
-    tokio::time::timeout(timeouts::DIAL, TcpStream::connect(addr))
+    let stream = tokio::time::timeout(timeouts::DIAL, TcpStream::connect(addr))
         .await
         .map_err(|_| NativeError::Timeout {
             step: "direct connect",
             limit: timeouts::DIAL,
         })?
-        .map_err(|e| NativeError::Dial(format!("{addr}: {e}")))
+        .map_err(|e| NativeError::Io(std::io::Error::new(e.kind(), format!("{addr}: {e}"))))?;
+    // Disable Nagle (Go cores set TCP_NODELAY by default); direct relays must
+    // not add ~200ms buffering latency to interactive traffic. A socket-option
+    // failure never invalidates a connection that is already up.
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%addr, %error, "direct outbound: set_nodelay failed");
+    }
+    Ok(stream)
 }
 
 /// Bidirectionally copy bytes between the client and the outbound stream,
@@ -176,7 +199,8 @@ mod tests {
         assert_eq!(params.server.host, "example.com");
         assert_eq!(params.server.port, 1080);
         assert_eq!(params.resolved_ip, Some("127.0.0.1:1080".parse().unwrap()));
-        assert!(params.udp.is_none(), "SOCKS5 inbound is TCP-only");
+        // proxy_params builds a TCP link; the UDP relay sets its own mode.
+        assert!(params.udp.is_none());
         assert!(!params.mux);
         let ProtocolConfig::Socks(config) = &params.protocol else {
             panic!("protocol must round-trip");

@@ -11,38 +11,110 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Reads one `[2B BE len][payload]` frame.
+/// Resumable `[2B BE len][payload]` frame-read state.
+///
+/// The framing progress — the partially filled length prefix and the
+/// partially filled payload — lives HERE instead of in a future's locals,
+/// so a read future dropped mid-frame (a cancelled `select!` branch, a
+/// timeout) loses nothing: the next call resumes the same frame at the
+/// exact byte it stopped on. `tokio`'s `read` is itself cancel-safe (a
+/// cancelled read consumed nothing), so a `FrameReader` outliving the
+/// future makes datagram reads cancel-safe end to end — the property the
+/// split [`super::packet::PacketReader`] rests on.
+pub struct FrameReader {
+    /// The 2-byte big-endian length prefix, filled across reads.
+    len: [u8; 2],
+    /// Length-prefix bytes already read; 2 once the length is complete.
+    len_filled: usize,
+    /// The current frame's payload: empty between frames, sized to the
+    /// length prefix once that is known.
+    payload: Vec<u8>,
+    /// Payload bytes already read.
+    payload_filled: usize,
+}
+
+impl FrameReader {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            len: [0; 2],
+            len_filled: 0,
+            payload: Vec::new(),
+            payload_filled: 0,
+        }
+    }
+
+    /// Reads one `[2B BE len][payload]` frame, resuming the frame a
+    /// previous (dropped) call left half-read.
+    ///
+    /// Returns `Ok(None)` on a clean EOF at a frame boundary (zero bytes
+    /// read for the length). Empty frames (len 0) are skipped. A truncated
+    /// frame — a partial length byte or a short payload at EOF — is
+    /// `UnexpectedEof`.
+    pub async fn read_frame<R: AsyncRead + Unpin>(
+        &mut self,
+        r: &mut R,
+    ) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            // Read the length byte-by-byte so a clean EOF (0 bytes) is
+            // distinguishable from a truncated length (1 byte then EOF).
+            while self.len_filled < self.len.len() {
+                match r.read(&mut self.len[self.len_filled..]).await {
+                    Ok(0) if self.len_filled == 0 => return Ok(None),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "vless udp frame truncated (partial length)",
+                        ));
+                    }
+                    Ok(n) => self.len_filled += n,
+                    Err(e) => return Err(e),
+                }
+            }
+            let n = usize::from(u16::from_be_bytes(self.len));
+            if n == 0 {
+                self.len_filled = 0;
+                continue; // skip empty frames
+            }
+            if self.payload.is_empty() {
+                self.payload = vec![0u8; n];
+            }
+            while self.payload_filled < n {
+                let got = r.read(&mut self.payload[self.payload_filled..]).await?;
+                if got == 0 {
+                    // Byte-identical to the `read_exact` this loop replaced
+                    // (kind AND text): a short payload at EOF is a
+                    // truncated frame, not a clean close.
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "early eof"));
+                }
+                self.payload_filled += got;
+            }
+            self.len_filled = 0;
+            self.payload_filled = 0;
+            return Ok(Some(std::mem::take(&mut self.payload)));
+        }
+    }
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reads one `[2B BE len][payload]` frame in one shot.
+///
+/// The FAKE-PEER side of the tests: a server double reads a whole frame off
+/// a duplex and is never cancelled, so it needs no framing state. The
+/// client reads through [`FrameReader`] instead — this one-shot form is NOT
+/// cancel-safe (a dropped future loses the bytes it consumed).
 ///
 /// Returns `Ok(None)` on a clean EOF at a frame boundary (zero bytes read
 /// for the length). Empty frames (len 0) are skipped. A truncated frame —
 /// a partial length byte or a short payload at EOF — is `UnexpectedEof`.
+#[cfg(test)]
 pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
-    loop {
-        let mut len = [0u8; 2];
-        // Read the length byte-by-byte so a clean EOF (0 bytes) is
-        // distinguishable from a truncated length (1 byte then EOF).
-        let mut filled = 0;
-        while filled < len.len() {
-            match r.read(&mut len[filled..]).await {
-                Ok(0) if filled == 0 => return Ok(None),
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "vless udp frame truncated (partial length)",
-                    ));
-                }
-                Ok(n) => filled += n,
-                Err(e) => return Err(e),
-            }
-        }
-        let n = usize::from(u16::from_be_bytes(len));
-        if n == 0 {
-            continue; // skip empty frames
-        }
-        let mut payload = vec![0u8; n];
-        r.read_exact(&mut payload).await?;
-        return Ok(Some(payload));
-    }
+    FrameReader::new().read_frame(r).await
 }
 
 /// Writes one `[2B BE len][payload]` frame.

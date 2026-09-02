@@ -24,7 +24,7 @@ pub(crate) mod udp;
 pub(crate) mod vision;
 
 pub use mux::{MuxClient, MuxTarget, SessionStream, UdpSession};
-pub use packet::{PacketConn, PacketMode};
+pub use packet::{PacketConn, PacketMode, PacketReader, PacketWriter, SplitHalves};
 
 /// Connect through a VLESS outbound over an already-secured stream.
 ///

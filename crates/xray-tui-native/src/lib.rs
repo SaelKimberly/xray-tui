@@ -1,7 +1,9 @@
 //! Native proxy core — in-process implementations of the proxy protocols
 //! xray-tui otherwise obtains by spawning xray-core / sing-box subprocesses.
-//! Client face: [`connect`] and friends dial a remote proxy. Server face:
-//! [`inbound`] provides the local SOCKS5 inbound (accept → route → outbound).
+//! Client face: [`connect`] and friends dial a remote proxy (TCP; SOCKS5's
+//! client handshake lives in [`protocol::socks`]). Server face: [`inbound`]
+//! provides the local SOCKS5 inbound (accept → route → outbound), with TCP
+//! CONNECT and, when enabled, per-datagram UDP ASSOCIATE relay.
 //!
 //! # Layering
 //!

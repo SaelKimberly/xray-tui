@@ -1,6 +1,5 @@
 use crate::BoxStream;
 use crate::error::{NativeError, timeouts};
-
 /// Dial the server's TCP socket directly (`base` is None) or pass through an
 /// existing tunnel (`base` is Some — a TCP "transport" over a tunnel is raw
 /// bytes, so this is the identity function).
@@ -20,10 +19,10 @@ pub async fn connect(
                 limit: timeout,
             })?
             .map_err(|e| NativeError::Dial(format!("{socket}: {e}")))?;
+        let _ = stream.set_nodelay(true);
         Ok(Box::new(stream))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;

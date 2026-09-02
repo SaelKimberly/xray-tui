@@ -53,7 +53,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         ProtocolConfig::Ssr(_) => not_impl("shadowsocksr"),
         ProtocolConfig::Tuic(_) => not_impl("tuic"),
         ProtocolConfig::Wireguard(_) => not_impl("wireguard"),
-        ProtocolConfig::Socks(_) => not_impl("socks5"),
+        ProtocolConfig::Socks(cfg) => socks::connect(ctx, stream, cfg).await,
         ProtocolConfig::Http(_) => not_impl("http"),
         ProtocolConfig::Naive(_) => not_impl("naive"),
         ProtocolConfig::AnyTls(_) => not_impl("anytls"),
@@ -158,6 +158,90 @@ impl PacketTunnel {
     }
 }
 
+/// The read half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
+pub enum PacketReader {
+    Vless(vless::PacketReader<tokio::io::ReadHalf<BoxStream>>),
+    Vmess(vmess::udp::PacketReader<tokio::io::ReadHalf<BoxStream>>),
+    Trojan(trojan::PacketReader<tokio::io::ReadHalf<BoxStream>>),
+    Hysteria2(hysteria2::udp::UdpReader),
+}
+
+/// The write half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
+pub enum PacketWriter {
+    Vless(vless::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
+    Vmess(vmess::udp::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
+    Trojan(trojan::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
+    Hysteria2(hysteria2::udp::UdpWriter),
+}
+
+impl PacketTunnel {
+    /// Split the tunnel into halves that may be used from separate tasks.
+    ///
+    /// A bidirectional relay needs this: [`Self::recv`] is a multi-step frame
+    /// read for the stream carriers, so racing it against a send in a
+    /// `tokio::select!` would drop a partially-read frame and desynchronise
+    /// the tunnel. With halves the reader lives in its own task and its
+    /// future is never cancelled.
+    ///
+    /// # Errors
+    /// Returns [`std::io::ErrorKind::InvalidInput`] for a carrier that has no
+    /// halves — the VLESS XUDP mode, whose datagrams ride a shared mux tunnel
+    /// rather than a stream.
+    pub fn split(self) -> std::io::Result<(PacketReader, PacketWriter)> {
+        match self {
+            Self::Vless(c) => {
+                let (r, w) = c.split()?;
+                Ok((PacketReader::Vless(r), PacketWriter::Vless(w)))
+            }
+            Self::Vmess(c) => {
+                let (r, w) = c.split()?;
+                Ok((PacketReader::Vmess(r), PacketWriter::Vmess(w)))
+            }
+            Self::Trojan(c) => {
+                let (r, w) = c.split()?;
+                Ok((PacketReader::Trojan(r), PacketWriter::Trojan(w)))
+            }
+            Self::Hysteria2(c) => {
+                let (r, w) = c.split()?;
+                Ok((PacketReader::Hysteria2(r), PacketWriter::Hysteria2(w)))
+            }
+        }
+    }
+}
+
+impl PacketReader {
+    /// Receive one datagram. `Ok(None)` on a clean end-of-stream.
+    ///
+    /// Cancellation-safe for every carrier: partial frame progress lives in
+    /// the reader, not in the future.
+    pub async fn recv(
+        &mut self,
+    ) -> std::io::Result<Option<(Option<std::net::SocketAddr>, Vec<u8>)>> {
+        match self {
+            Self::Vless(r) => r.recv().await,
+            Self::Vmess(r) => r.recv().await,
+            Self::Trojan(r) => r.recv().await,
+            Self::Hysteria2(r) => r.recv().await,
+        }
+    }
+}
+
+impl PacketWriter {
+    /// Send one datagram — the same contract as [`PacketTunnel::send`].
+    pub async fn send(
+        &mut self,
+        dest: Option<std::net::SocketAddr>,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Vless(w) => w.send(dest, payload).await,
+            Self::Vmess(w) => w.send(dest, payload).await,
+            Self::Trojan(w) => w.send(dest, payload).await,
+            Self::Hysteria2(w) => w.send(dest, payload).await,
+        }
+    }
+}
+
 /// Refuse the VLESS-only packet modes on a non-VLESS UDP link.
 ///
 /// [`PacketMode::PacketAddr`] (per-packet magic-address headers — spec §4.3)
@@ -209,6 +293,11 @@ pub async fn connect_udp(
             feature:
                 "hysteria2 udp over a stream chain (hy2 is a QUIC dial — use connect_chain_udp)"
                     .into(),
+        }),
+        // SOCKS5 UDP (ASSOCIATE) datagrams ride a raw UDP socket to the proxy,
+        // not this byte stream — a divergent shape with no PacketTunnel here.
+        ProtocolConfig::Socks(_) => Err(NativeError::NotImplemented {
+            feature: "socks5 udp (needs a raw UDP socket shape, not the stream tunnel)".into(),
         }),
         _ => Err(NativeError::NotImplemented {
             feature: "udp protocol connect (native UDP path: vless, vmess, trojan, hysteria2)"

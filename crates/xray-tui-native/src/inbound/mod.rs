@@ -7,18 +7,25 @@
 //! outbound tag resolved against [`Socks5InboundConfig::outbounds`]. The
 //! "proxy" outbound reuses [`crate::connect`] — see [`outbound`].
 //!
-//! Scope: TCP CONNECT only. BIND and UDP ASSOCIATE are refused with
-//! `0x07 Command not supported`; a `HijackDns` routing decision is refused
-//! with `0x02` (the inbound has no built-in DNS interceptor).
+//! Scope: TCP CONNECT plus UDP ASSOCIATE (when [`Socks5InboundConfig::udp`]
+//! is enabled) — each datagram is routed through the engine with its own
+//! destination, so a single association may reach direct, block, and proxy
+//! outbounds. BIND is refused with `0x07 Command not supported`; a
+//! `HijackDns` decision drops the datagram (the inbound has no built-in DNS
+//! interceptor) and refuses TCP connections with `0x02`.
 
 pub mod outbound;
 pub mod socks5;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 use xray_tui_route::engine::decide_async;
 use xray_tui_route::ir::NetworkMask;
 use xray_tui_route::{ConnMeta, Decision, Engine, NetAddr, NetHost};
@@ -52,10 +59,14 @@ pub struct Socks5InboundConfig {
     pub engine: Arc<Engine>,
     /// Tagged outbounds the router may select.
     pub outbounds: Vec<Outbound>,
+    /// Accept UDP ASSOCIATE (relayed per datagram through the router). Off
+    /// keeps the `0x07 Command not supported` refusal.
+    pub udp: bool,
 }
 
 impl Socks5InboundConfig {
-    /// Builds a config with no auth and the default inbound tag.
+    /// Builds a config with no auth, the default inbound tag, and UDP
+    /// ASSOCIATE enabled (sing-box socks inbounds default UDP on).
     #[must_use]
     pub fn new(listen: SocketAddr, engine: Arc<Engine>, outbounds: Vec<Outbound>) -> Self {
         Self {
@@ -64,6 +75,7 @@ impl Socks5InboundConfig {
             inbound_tag: DEFAULT_INBOUND_TAG.to_owned(),
             engine,
             outbounds,
+            udp: true,
         }
     }
 
@@ -124,19 +136,24 @@ impl Socks5Inbound {
     pub async fn serve(self) -> Result<(), NativeError> {
         loop {
             let (conn, peer) = self.listener.accept().await?;
+            // Disable Nagle: interactive traffic through a local proxy should
+            // not sit in the output buffer for up to 200ms (Go cores enable
+            // TCP_NODELAY by default).
+            if let Err(error) = conn.set_nodelay(true) {
+                tracing::debug!(%peer, %error, "socks5 inbound: set_nodelay failed");
+            }
             let config = Arc::clone(&self.config);
             tokio::spawn(async move {
-                if let Err(error) = Box::pin(handle_conn(&config, conn, peer)).await {
+                if let Err(error) = handle_conn(config, conn, peer).await {
                     tracing::debug!(%peer, %error, "socks5 inbound: connection closed");
                 }
             });
         }
     }
 }
-
-/// One connection: negotiate, route, dispatch, relay.
+/// One connection: negotiate, then dispatch by command.
 async fn handle_conn(
-    config: &Socks5InboundConfig,
+    config: Arc<Socks5InboundConfig>,
     mut conn: TcpStream,
     peer: SocketAddr,
 ) -> Result<(), NativeError> {
@@ -166,17 +183,30 @@ async fn handle_conn(
         })?
         .map_err(NativeError::from)?;
 
-    // Only CONNECT is supported; BIND and UDP ASSOCIATE get a clean refusal.
-    if request.cmd != socks5::Command::Connect {
-        socks5::write_reply(
-            &mut conn,
-            socks5::ReplyCode::CommandNotSupported,
-            &BIND_ZERO,
-        )
-        .await?;
-        return Ok(());
+    match request.cmd {
+        socks5::Command::Connect => handle_connect(&config, conn, peer, request).await,
+        // UDP ASSOCIATE only when the gate is on.
+        socks5::Command::UdpAssociate if config.udp => run_udp_associate(config, conn, peer).await,
+        // BIND is never supported; UDP ASSOCIATE with the gate off.
+        socks5::Command::Bind | socks5::Command::UdpAssociate => {
+            socks5::write_reply(
+                &mut conn,
+                socks5::ReplyCode::CommandNotSupported,
+                &BIND_ZERO,
+            )
+            .await?;
+            Ok(())
+        }
     }
+}
 
+/// Handle a TCP CONNECT: route the destination, dial the outbound, relay.
+async fn handle_connect(
+    config: &Socks5InboundConfig,
+    mut conn: TcpStream,
+    peer: SocketAddr,
+    request: socks5::Socks5Request,
+) -> Result<(), NativeError> {
     // Route the destination.
     let mut meta = ConnMeta {
         target: target_to_net(&request.target),
@@ -214,7 +244,12 @@ async fn handle_conn(
                     let upstream = match outbound::dial(kind, &target).await {
                         Ok(stream) => stream,
                         Err(error) => {
-                            tracing::warn!(%tag, %error, "socks5 inbound: outbound dial failed");
+                            tracing::warn!(
+                                %tag,
+                                ?target,
+                                %error,
+                                "socks5 inbound: outbound dial failed"
+                            );
                             socks5::write_reply(&mut conn, reply_for(&error), &BIND_ZERO).await?;
                             return Ok(());
                         }
@@ -249,18 +284,652 @@ async fn handle_conn(
     }
 }
 
-/// Map an outbound dial error to a SOCKS5 reply code.
+/// How long an association may wait for its FIRST client datagram before the
+/// relay gives up and releases its sockets. Once a datagram has arrived the
+/// controlling TCP connection is the only lifetime authority (RFC 1928 §7).
+const UDP_PIN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Minimum spacing between proxy-tunnel open attempts for one association, so
+/// a failing proxy cannot be re-dialled once per datagram.
+const PROXY_REOPEN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Queue depth per proxy leg. UDP has no delivery guarantee: a full queue
+/// drops the datagram rather than stalling the relay loop.
+const PROXY_QUEUE_DEPTH: usize = 256;
+
+/// Handle a UDP ASSOCIATE: reply with the bound client-facing UDP port, then
+/// relay datagrams until the controlling TCP connection closes (RFC 1928 §7).
+async fn run_udp_associate(
+    config: Arc<Socks5InboundConfig>,
+    mut conn: TcpStream,
+    peer: SocketAddr,
+) -> Result<(), NativeError> {
+    // Bind the client-facing socket on the concrete address the client
+    // reached (the accepted connection's local address), so replies are
+    // routable back even when the listener is on a wildcard address. The
+    // v4-mapped form of a dual-stack accept is unmapped first: an AF_INET
+    // client cannot send to `::ffff:a.b.c.d`, and `BND.ADDR` must name an
+    // address it can reach.
+    let listen_ip = unmap_v6(conn.local_addr().map_err(NativeError::Io)?).ip();
+    let client_udp = UdpSocket::bind(SocketAddr::new(listen_ip, 0)).await?;
+    let bind_port = client_udp.local_addr().map_err(NativeError::Io)?.port();
+    let bind = TargetAddr::new(Host::Ip(listen_ip), bind_port);
+    socks5::write_reply(&mut conn, socks5::ReplyCode::Succeeded, &bind).await?;
+    tracing::debug!(%peer, bind_port, "socks5 inbound: udp associate established");
+
+    // The relay owns the TCP stream (its read half signals association end)
+    // and the client-facing socket, so it outlives `handle_conn`.
+    tokio::spawn(async move {
+        if let Err(error) = run_udp_relay(config, conn, client_udp, peer).await {
+            tracing::debug!(%error, "socks5 inbound: udp relay closed");
+        }
+    });
+    Ok(())
+}
+
+/// Relay datagrams for one UDP ASSOCIATE until the controlling TCP connection
+/// closes.
+///
+/// The control connection is watched from the first poll: a client that
+/// associates and then disconnects without sending a datagram must not park
+/// this task (and its two sockets) forever. An association that never
+/// receives a datagram also expires after [`UDP_PIN_DEADLINE`].
+async fn run_udp_relay(
+    config: Arc<Socks5InboundConfig>,
+    conn: TcpStream,
+    client_udp: UdpSocket,
+    peer: SocketAddr,
+) -> Result<(), NativeError> {
+    // The write half stays alive so the control connection stays open; the
+    // client signals the end by closing its side (read half → EOF).
+    let (mut control, _control_w) = tokio::io::split(conn);
+
+    let mut relay = UdpRelay {
+        config,
+        peer,
+        source: None,
+        client_udp: Arc::new(client_udp),
+        out_v4: None,
+        out_v6: None,
+        dns_cache: Arc::new(Mutex::new(HashMap::new())),
+        proxy: None,
+        proxy_retry_at: None,
+        hijack_warned: false,
+    };
+
+    let mut client_buf = vec![0u8; 64 * 1024];
+    let mut out4_buf = vec![0u8; 64 * 1024];
+    let mut out6_buf = vec![0u8; 64 * 1024];
+    let mut control_byte = [0u8; 1];
+    let pin_deadline = tokio::time::sleep(UDP_PIN_DEADLINE);
+    tokio::pin!(pin_deadline);
+
+    loop {
+        tokio::select! {
+            // The controlling TCP connection closed or errored: the
+            // association ends (a received byte is protocol garbage too).
+            result = control.read(&mut control_byte) => {
+                match result {
+                    Ok(0) => tracing::trace!("socks5 inbound: udp control EOF"),
+                    Ok(_) => tracing::debug!("socks5 inbound: udp control garbage, closing"),
+                    Err(error) => tracing::debug!(%error, "socks5 inbound: udp control error"),
+                }
+                return Ok(());
+            }
+            // No client datagram ever arrived: release the association.
+            () = &mut pin_deadline, if relay.source.is_none() => {
+                tracing::debug!(
+                    %peer,
+                    "socks5 inbound: udp association expired before its first datagram"
+                );
+                return Ok(());
+            }
+            // A client datagram to forward.
+            result = relay.client_udp.recv_from(&mut client_buf) => {
+                let (len, from) = match result {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        tracing::debug!(%error, "socks5 inbound: udp client recv error");
+                        return Ok(());
+                    }
+                };
+                if !relay.accept_source(from) {
+                    continue;
+                }
+                relay.forward_client(&client_buf[..len]).await;
+            }
+            // A direct-outbound reply (IPv4 upstream).
+            result = recv_from_opt(relay.out_v4.as_deref(), &mut out4_buf),
+                if relay.out_v4.is_some() =>
+            {
+                if !relay.reply_to_client(result, &out4_buf).await {
+                    return Ok(());
+                }
+            }
+            // A direct-outbound reply (IPv6 upstream).
+            result = recv_from_opt(relay.out_v6.as_deref(), &mut out6_buf),
+                if relay.out_v6.is_some() =>
+            {
+                if !relay.reply_to_client(result, &out6_buf).await {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// `recv_from` on an optional socket. The `None` arm never resolves, so the
+/// branch is inert until its `if` guard sees a socket — no dead match arm and
+/// no immediately-ready branch that could spin the relay loop.
+async fn recv_from_opt(
+    sock: Option<&UdpSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match sock {
+        Some(sock) => sock.recv_from(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A datagram queued for the proxy leg. The destination is unresolved: the
+/// leg owns resolution so the relay loop never waits on DNS.
+struct ProxyDatagram {
+    dest: TargetAddr,
+    payload: Vec<u8>,
+}
+
+/// The proxy side of an association: a task owning the datagram tunnel, fed
+/// over a queue.
+///
+/// The tunnel is NEVER read from the relay's `select!`: a stream carrier's
+/// frame read spans several awaits, so a cancelled read would lose bytes and
+/// desynchronise the tunnel. The leg splits the tunnel
+/// ([`crate::PacketTunnel::split`]) and gives the reader its own task, where
+/// its future is never cancelled.
+struct ProxyLeg {
+    /// Routing tag this leg serves; a datagram routed to another proxy tag is
+    /// dropped (one association carries one tunnel).
+    tag: String,
+    queue: mpsc::Sender<ProxyDatagram>,
+}
+
+/// Per-association UDP relay state.
+struct UdpRelay {
+    config: Arc<Socks5InboundConfig>,
+    /// Peer of the controlling TCP connection: the only host allowed to drive
+    /// this association.
+    peer: SocketAddr,
+    /// Pinned client datagram source, set by the first accepted datagram.
+    source: Option<SocketAddr>,
+    /// Client-facing socket. Shared with the proxy leg, which writes replies
+    /// straight to the client.
+    client_udp: Arc<UdpSocket>,
+    /// Direct-outbound sockets, one per address family, created on demand.
+    out_v4: Option<Arc<UdpSocket>>,
+    out_v6: Option<Arc<UdpSocket>>,
+    /// Domain → address cache for the association lifetime, shared with the
+    /// spawned resolve-and-send tasks.
+    dns_cache: Arc<Mutex<HashMap<(String, u16), SocketAddr>>>,
+    /// The proxy leg, opened on the first proxy-routed datagram.
+    proxy: Option<ProxyLeg>,
+    /// Earliest instant a new proxy leg may be opened after a failure.
+    proxy_retry_at: Option<Instant>,
+    hijack_warned: bool,
+}
+
+impl UdpRelay {
+    /// Decide whether a datagram source may drive this association.
+    ///
+    /// The first datagram from the control connection's peer address pins the
+    /// association (RFC 1928 §7 permits limiting it). Datagrams from any
+    /// other host are dropped: without this check any local process — or any
+    /// LAN host, for a non-loopback listener — could race the real client,
+    /// have its traffic proxied under the client's routing identity, and
+    /// silently take the association over.
+    fn accept_source(&mut self, from: SocketAddr) -> bool {
+        match self.source {
+            Some(pinned) if pinned == from => true,
+            Some(_) => {
+                tracing::debug!(%from, "socks5 inbound: udp datagram from an unpinned source");
+                false
+            }
+            None => {
+                if from.ip() != self.peer.ip() {
+                    tracing::debug!(
+                        %from,
+                        peer = %self.peer,
+                        "socks5 inbound: udp datagram from a host other than the control peer"
+                    );
+                    return false;
+                }
+                tracing::debug!(%from, "socks5 inbound: udp association pinned");
+                self.source = Some(from);
+                true
+            }
+        }
+    }
+
+    /// Wrap an upstream reply and send it to the pinned client. Returns
+    /// `false` when the association must end.
+    async fn reply_to_client(
+        &self,
+        result: std::io::Result<(usize, SocketAddr)>,
+        buf: &[u8],
+    ) -> bool {
+        let (len, src) = match result {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::debug!(%error, "socks5 inbound: udp upstream recv error");
+                return false;
+            }
+        };
+        let Some(source) = self.source else {
+            // An upstream socket exists only after a client datagram, which
+            // pins the source.
+            return false;
+        };
+        let packet = reply_packet(src, &buf[..len]);
+        match self.client_udp.send_to(&packet, source).await {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::debug!(%error, "socks5 inbound: udp reply to client failed");
+                false
+            }
+        }
+    }
+
+    /// Forward one client datagram (SOCKS UDP header included) to whichever
+    /// outbound its destination routes to.
+    ///
+    /// Every per-datagram failure drops just that datagram: one unroutable
+    /// destination must not tear down the flows multiplexed beside it.
+    async fn forward_client(&mut self, datagram: &[u8]) {
+        let (frag, target, payload) = match socks5::parse_udp_request(datagram) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::debug!(%error, "socks5 inbound: malformed udp datagram dropped");
+                return;
+            }
+        };
+        if frag != 0 {
+            tracing::trace!(frag, "socks5 inbound: dropping fragmented datagram");
+            return;
+        }
+
+        // Route this datagram's destination. The sniffer needs the WHOLE
+        // payload: a QUIC Initial is padded to ≥1200 bytes and the QUIC arm
+        // rejects a truncated packet, so a prefix could never decrypt one.
+        // The copy is skipped entirely when no rule sniffs.
+        let payload_prefix = self.config.engine.needs_sniff().then(|| payload.to_vec());
+        let mut meta = ConnMeta {
+            target: target_to_net(&target),
+            network: NetworkMask::UDP,
+            inbound_tag: Some(self.config.inbound_tag.clone()),
+            source: self.source,
+            source_resolved_ips: Vec::new(),
+            payload_prefix,
+            sniffed: None,
+            sni_host: None,
+            resolved_host_ips: Vec::new(),
+        };
+        let decision = decide_async(&self.config.engine, &mut meta).await;
+
+        let (tag, override_addr) = match decision {
+            Decision::Route { tag, override_addr } => (tag, override_addr),
+            Decision::Reject { .. } => {
+                tracing::debug!("socks5 inbound: udp datagram rejected");
+                return;
+            }
+            Decision::HijackDns => {
+                if !self.hijack_warned {
+                    self.hijack_warned = true;
+                    tracing::warn!(
+                        "socks5 inbound: udp HijackDns decision drops datagram \
+                         (no built-in DNS interceptor)"
+                    );
+                }
+                return;
+            }
+        };
+
+        // Clone the config handle so the outbound lookup does not borrow
+        // `self` across the `&mut self` forwarding calls — no per-datagram
+        // clone of the proxy config.
+        let config = Arc::clone(&self.config);
+        let Some(outbound) = config.outbounds.iter().find(|o| o.tag == tag) else {
+            tracing::debug!(%tag, "socks5 inbound: udp decision named an unknown outbound");
+            return;
+        };
+        let dest = override_addr.map(net_to_target).unwrap_or(target);
+
+        match &outbound.kind {
+            OutboundKind::Block => {}
+            OutboundKind::Direct => self.forward_direct(dest, payload).await,
+            OutboundKind::Proxy(proxy) => self.forward_proxy(&tag, proxy, dest, payload),
+        }
+    }
+
+    /// Send a datagram straight to its destination.
+    ///
+    /// An IP destination is sent inline. A domain destination is resolved in a
+    /// spawned task — a cache miss costs a full DNS lookup, which must not
+    /// stall the other flows on this association — and that task receives BOTH
+    /// family sockets, so an `AAAA`-only name is reachable (guessing the
+    /// family before the lookup would drop every v6 answer).
+    async fn forward_direct(&mut self, dest: TargetAddr, payload: &[u8]) {
+        self.ensure_direct_sockets().await;
+        match dest.host {
+            Host::Ip(ip) => {
+                let addr = SocketAddr::new(ip, dest.port);
+                let Some(socket) = self.socket_for(addr) else {
+                    tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                    return;
+                };
+                if let Err(error) = socket.send_to(payload, addr).await {
+                    tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                }
+            }
+            Host::Domain(domain) => {
+                let cache = Arc::clone(&self.dns_cache);
+                let payload = payload.to_vec();
+                let port = dest.port;
+                let v4 = self.out_v4.clone();
+                let v6 = self.out_v6.clone();
+                tokio::spawn(async move {
+                    let Some(addr) = resolve_domain(&cache, &domain, port).await else {
+                        tracing::debug!(%domain, "socks5 inbound: direct udp dest unresolvable");
+                        return;
+                    };
+                    let socket = if addr.is_ipv4() { v4 } else { v6 };
+                    let Some(socket) = socket else {
+                        tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                        return;
+                    };
+                    if let Err(error) = socket.send_to(&payload, addr).await {
+                        tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Bind the upstream sockets for BOTH families, once per association, on
+    /// the first direct datagram (a proxy-only association binds neither).
+    ///
+    /// A family whose bind fails stays `None` — a host with IPv6 disabled
+    /// cannot bind `[::]:0`, which drops v6 datagrams, never the association.
+    async fn ensure_direct_sockets(&mut self) {
+        for (slot, bind) in [
+            (&mut self.out_v4, "0.0.0.0:0"),
+            (&mut self.out_v6, "[::]:0"),
+        ] {
+            if slot.is_some() {
+                continue;
+            }
+            match UdpSocket::bind(bind).await {
+                Ok(socket) => *slot = Some(Arc::new(socket)),
+                Err(error) => {
+                    tracing::debug!(%error, bind, "socks5 inbound: upstream udp bind failed");
+                }
+            }
+        }
+    }
+
+    /// The upstream socket matching `addr`'s family.
+    fn socket_for(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
+        if addr.is_ipv4() {
+            self.out_v4.clone()
+        } else {
+            self.out_v6.clone()
+        }
+    }
+
+    /// Queue a datagram for the proxy leg, opening the leg on first use.
+    ///
+    /// The destination stays a [`TargetAddr`]: resolution happens inside the
+    /// leg, so a cache miss cannot stall the relay loop (and thus control-EOF
+    /// detection). The tunnel keeps the ORIGINAL target, so a domain stays a
+    /// domain and the proxy resolves it.
+    fn forward_proxy(
+        &mut self,
+        tag: &str,
+        proxy: &ProxyOutbound,
+        dest: TargetAddr,
+        payload: &[u8],
+    ) {
+        if let Some(leg) = &self.proxy
+            && leg.tag != tag
+        {
+            tracing::debug!(
+                %tag,
+                leg = %leg.tag,
+                "socks5 inbound: one udp association carries one proxy tunnel; dropping"
+            );
+            return;
+        }
+        if self.proxy.is_none() {
+            if self.proxy_retry_at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
+            let Some(source) = self.source else {
+                return;
+            };
+            let (queue, rx) = mpsc::channel(PROXY_QUEUE_DEPTH);
+            tokio::spawn(run_proxy_leg(
+                proxy.clone(),
+                dest.clone(),
+                Arc::clone(&self.client_udp),
+                source,
+                Arc::clone(&self.dns_cache),
+                rx,
+            ));
+            self.proxy = Some(ProxyLeg {
+                tag: tag.to_owned(),
+                queue,
+            });
+        }
+        let leg = self.proxy.as_ref().expect("leg set above");
+        let datagram = ProxyDatagram {
+            dest,
+            payload: payload.to_vec(),
+        };
+        match leg.queue.try_send(datagram) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!("socks5 inbound: proxy udp queue full; dropping datagram");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // The leg ended (tunnel open failed, or the tunnel closed).
+                // Clear it so a later datagram re-opens, bounded by the
+                // backoff — a transient proxy failure must not blackhole the
+                // rest of the association.
+                tracing::debug!("socks5 inbound: proxy udp leg closed; will re-open");
+                self.proxy = None;
+                self.proxy_retry_at = Some(Instant::now() + PROXY_REOPEN_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Run one association's proxy leg: open the datagram tunnel, split it, read
+/// replies in a dedicated task, and write queued datagrams.
+///
+/// Returning drops the queue receiver, which is how the relay learns the leg
+/// is gone and that the next datagram may re-open it.
+async fn run_proxy_leg(
+    proxy: ProxyOutbound,
+    session_target: TargetAddr,
+    client_udp: Arc<UdpSocket>,
+    source: SocketAddr,
+    dns_cache: Arc<DnsCache>,
+    mut queue: mpsc::Receiver<ProxyDatagram>,
+) {
+    let params = outbound::proxy_params(&proxy, &session_target);
+    let tunnel = match crate::connect_udp(&params).await {
+        Ok(tunnel) => tunnel,
+        Err(error) => {
+            tracing::debug!(%error, "socks5 inbound: proxy udp tunnel open failed");
+            return;
+        }
+    };
+    let (mut reader, mut writer) = match tunnel.split() {
+        Ok(halves) => halves,
+        Err(error) => {
+            tracing::debug!(%error, "socks5 inbound: proxy udp tunnel cannot be split");
+            return;
+        }
+    };
+    // Resolved once, for reply headers from a carrier that reports no
+    // per-packet address. A domain that will not resolve costs only those
+    // replies (the tunnel itself carries the domain).
+    let session_addr = resolve_cached(&dns_cache, &session_target).await;
+
+    // The reader owns its half, so its multi-await frame read is never
+    // cancelled — the desync this split exists to prevent. The handle is kept
+    // and aborted below: the reader parks in `recv()` and would NOT wake when
+    // the relay drops the queue, so a forgotten handle leaks a task plus a
+    // tunnel per proxy association.
+    let replies = tokio::spawn(async move {
+        loop {
+            match reader.recv().await {
+                Ok(Some((dest, payload))) => {
+                    // A carrier without per-packet addresses reports `None`:
+                    // the datagram came from the session destination.
+                    let Some(src) = dest.or(session_addr) else {
+                        tracing::debug!(
+                            "socks5 inbound: proxy reply has no address and the session \
+                             destination did not resolve; dropping"
+                        );
+                        continue;
+                    };
+                    let packet = reply_packet(src, &payload);
+                    if let Err(error) = client_udp.send_to(&packet, source).await {
+                        tracing::debug!(%error, "socks5 inbound: proxy reply to client failed");
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!("socks5 inbound: proxy udp tunnel closed");
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "socks5 inbound: proxy udp tunnel read failed");
+                    return;
+                }
+            }
+        }
+    });
+
+    while let Some(datagram) = queue.recv().await {
+        // The session destination needs no address on the wire — and no DNS:
+        // comparing targets short-circuits the common single-destination case.
+        // Every carrier accepts `None`; only a DIFFERENT destination needs an
+        // explicit address, and the carriers without per-packet addresses
+        // refuse those rather than mis-route them.
+        let per_packet = if datagram.dest == session_target {
+            None
+        } else {
+            let Some(addr) = resolve_cached(&dns_cache, &datagram.dest).await else {
+                tracing::debug!(?datagram.dest, "socks5 inbound: proxy udp dest unresolvable");
+                continue;
+            };
+            Some(addr)
+        };
+        match writer.send(per_packet, &datagram.payload).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                tracing::debug!(
+                    %error,
+                    "socks5 inbound: proxy carrier refuses this per-packet destination; dropping"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, "socks5 inbound: proxy udp send failed");
+                break;
+            }
+        }
+    }
+    replies.abort();
+}
+
+/// The association's domain → address cache.
+type DnsCache = Mutex<HashMap<(String, u16), SocketAddr>>;
+
+/// Resolve a datagram destination. `None` = unresolvable.
+async fn resolve_cached(cache: &DnsCache, target: &TargetAddr) -> Option<SocketAddr> {
+    match &target.host {
+        Host::Ip(ip) => Some(SocketAddr::new(*ip, target.port)),
+        Host::Domain(domain) => resolve_domain(cache, domain, target.port).await,
+    }
+}
+
+/// Resolve a domain, caching the answer for the association's lifetime.
+async fn resolve_domain(cache: &DnsCache, domain: &str, port: u16) -> Option<SocketAddr> {
+    let key = (domain.to_owned(), port);
+    if let Some(cached) = cache.lock().expect("dns cache mutex").get(&key) {
+        return Some(*cached);
+    }
+    let addrs = tokio::time::timeout(timeouts::DIAL, tokio::net::lookup_host((domain, port)))
+        .await
+        .ok()?
+        .ok()?;
+    let addr = addrs.into_iter().next()?;
+    cache.lock().expect("dns cache mutex").insert(key, addr);
+    Some(addr)
+}
+
+/// Reverse an IPv4-mapped IPv6 address to plain IPv4 (clients do not expect
+/// v6-mapped addresses when they reach v4 peers).
 #[must_use]
-const fn reply_for(error: &NativeError) -> socks5::ReplyCode {
+const fn unmap_v6(src: SocketAddr) -> SocketAddr {
+    match src {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), src.port()),
+            None => src,
+        },
+        SocketAddr::V4(_) => src,
+    }
+}
+
+/// Build one reply datagram: a SOCKS UDP header naming `src`, then `payload`.
+#[must_use]
+fn reply_packet(src: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let src = unmap_v6(src);
+    let addr = TargetAddr::new(Host::Ip(src.ip()), src.port());
+    let mut out = socks5::new_udp_header(&addr);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Map an outbound dial error to a SOCKS5 reply code (RFC 1928 §6).
+///
+/// Only causes the client can act on are reported as such: `0x02` means "not
+/// allowed by ruleset", so a local policy refusal maps there while a network
+/// fault does not.
+#[must_use]
+fn reply_for(error: &NativeError) -> socks5::ReplyCode {
     match error {
         NativeError::Dial(_) | NativeError::Timeout { .. } => socks5::ReplyCode::HostUnreachable,
         NativeError::NotImplemented { .. } => socks5::ReplyCode::CommandNotSupported,
+        NativeError::Io(e) => match e.kind() {
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset => {
+                socks5::ReplyCode::ConnectionRefused
+            }
+            // EACCES/EPERM from a local firewall IS a policy refusal.
+            std::io::ErrorKind::PermissionDenied => socks5::ReplyCode::ConnectionNotAllowed,
+            std::io::ErrorKind::NetworkUnreachable => socks5::ReplyCode::NetworkUnreachable,
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::HostUnreachable => {
+                socks5::ReplyCode::HostUnreachable
+            }
+            // `AddrNotAvailable`/`NotConnected` are local socket problems, not
+            // routing verdicts: neither 0x02 nor 0x03 would be truthful.
+            _ => socks5::ReplyCode::GeneralFailure,
+        },
         NativeError::Config(_)
         | NativeError::Tls(_)
         | NativeError::Reality(_)
         | NativeError::Transport(_)
-        | NativeError::Protocol { .. }
-        | NativeError::Io(_) => socks5::ReplyCode::GeneralFailure,
+        | NativeError::Protocol { .. } => socks5::ReplyCode::GeneralFailure,
     }
 }
 
