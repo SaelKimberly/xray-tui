@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use http::Request;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -57,21 +57,43 @@ fn random_padding(min: usize, max: usize) -> String {
 
 // ── QUIC varint (RFC 9000 §16) ───────────────────────────────────────────
 
-/// Encode `value` as a QUIC varint: 1/2/4/8 bytes, 2-bit length prefix.
-/// The range guards below guarantee the value fits the cast target width.
+/// The wire width of `value` as a QUIC varint: 1/2/4/8 bytes by the same
+/// range table as [`put_varint`] (`quicvarint.Len`) — the sizing helper,
+/// so a header size never has to encode the value first.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
-fn varint(value: u64) -> Vec<u8> {
+pub(super) const fn varint_len(value: u64) -> usize {
     match value {
-        0..=63 => vec![value as u8],
-        64..=16_383 => (0x4000_u16 | value as u16).to_be_bytes().to_vec(),
-        16_384..=1_073_741_823 => (0x8000_0000_u32 | value as u32).to_be_bytes().to_vec(),
-        _ => (0xc000_0000_0000_0000_u64 | value).to_be_bytes().to_vec(),
+        0..=63 => 1,
+        64..=16_383 => 2,
+        16_384..=1_073_741_823 => 4,
+        _ => 8,
     }
 }
 
+/// Append `value` to `buf` as a QUIC varint: 1/2/4/8 bytes, 2-bit length
+/// prefix (hysteria `varintPut`, `internal/protocol/proxy.go:227`). The
+/// range guards guarantee the value fits the cast target width.
+#[allow(clippy::cast_possible_truncation)]
+pub(super) fn put_varint(buf: &mut impl BufMut, value: u64) {
+    match value {
+        0..=63 => buf.put_u8(value as u8),
+        64..=16_383 => buf.put_u16(0x4000 | value as u16),
+        16_384..=1_073_741_823 => buf.put_u32(0x8000_0000 | value as u32),
+        _ => buf.put_u64(0xc000_0000_0000_0000 | value),
+    }
+}
+
+/// Encode `value` as a QUIC varint into a fresh buffer — [`put_varint`] for
+/// the once-per-connection frame writers.
+#[must_use]
+fn varint(value: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(varint_len(value));
+    put_varint(&mut buf, value);
+    buf
+}
+
 /// Read one QUIC varint from `src`, returning `(value, remaining)`.
-fn read_varint(src: &[u8]) -> Option<(u64, &[u8])> {
+pub(super) fn read_varint(src: &[u8]) -> Option<(u64, &[u8])> {
     let first = *src.first()?;
     let len = match first >> 6 {
         0 => 1,
@@ -97,7 +119,7 @@ fn read_varint(src: &[u8]) -> Option<(u64, &[u8])> {
 
 /// A destination in the Socksaddr form hysteria2 uses on the wire
 /// (`M.Socksaddr.String()`): `host:port` / `[v6]:port`.
-fn target_string(target: &TargetAddr) -> String {
+pub(super) fn target_string(target: &TargetAddr) -> String {
     use crate::addr::Host;
     match &target.host {
         Host::Domain(d) => format!("{d}:{}", target.port),
@@ -123,11 +145,12 @@ pub(super) struct H3Keepalive(
 );
 
 /// Dial the hysteria2 server (QUIC, ALPN `h3`), run the auth exchange and
-/// return the live session (quinn connection + h3 keep-alive).
+/// return the live session (quinn connection + h3 keep-alive + the server's
+/// UDP-enabled flag).
 pub(super) async fn dial(
     ctx: &LinkContext,
     cfg: &Hysteria2Config,
-) -> Result<(quinn::Connection, H3Keepalive), NativeError> {
+) -> Result<(quinn::Connection, AuthInfo), NativeError> {
     let server_addr = ctx.server_socket().await?;
     let endpoint = client_endpoint(server_addr, cfg.obfs_password.as_deref())?;
     let tls = crate::transport::quic::quic_tls_config(ctx, ALPN_H3)?;
@@ -141,16 +164,37 @@ pub(super) async fn dial(
     )
     .await?;
 
-    let keepalive = runtime_auth(&conn, &endpoint, &cfg.auth).await?;
-    Ok((conn, keepalive))
+    let auth = runtime_auth(&conn, &endpoint, &cfg.auth, cc_rx_bps(cfg)).await?;
+    Ok((conn, auth))
 }
 
-/// The h3 auth exchange: login the connection, verify status 233.
+/// The h3 auth exchange result: the keep-alive guard plus the server's
+/// response headers (`Hysteria-UDP` — whether UDP relay is enabled).
+pub(super) struct AuthInfo {
+    /// Keeps the h3 session (and the quinn connection) alive.
+    pub keepalive: H3Keepalive,
+    /// `Hysteria-UDP` response header: the server enabled UDP relay.
+    pub udp_enabled: bool,
+}
+
+/// The client's max receive bandwidth (`hysteria-cc-rx`) in bytes/sec from
+/// the config's `down` bandwidth string — hysteria `AuthRequest.Rx`. `0`
+/// = unknown → the server runs bandwidth detection.
+fn cc_rx_bps(cfg: &Hysteria2Config) -> u64 {
+    cfg.down
+        .as_ref()
+        .and_then(|d| super::bandwidth_bps(d.as_str()))
+        .unwrap_or(0)
+}
+
+/// The h3 auth exchange: login the connection, verify status 233 and read
+/// the response headers.
 async fn runtime_auth(
     conn: &quinn::Connection,
     endpoint: &quinn::Endpoint,
     auth: &str,
-) -> Result<H3Keepalive, NativeError> {
+    cc_rx: u64,
+) -> Result<AuthInfo, NativeError> {
     let h3_quic = h3_quinn::Connection::new(conn.clone());
     let (mut h3_conn, mut sender) = {
         let limit = timeouts::TRANSPORT;
@@ -178,10 +222,10 @@ async fn runtime_auth(
         .method(http::method::Method::POST)
         .uri("https://hysteria/auth");
     req = req.header("hysteria-auth", auth);
-    // cc-rx: client's max receive bandwidth. Congestion control stays on
-    // quinn's defaults (no brutal/BBR port), so advertise 0 = "server runs
-    // bandwidth detection".
-    req = req.header("hysteria-cc-rx", "0");
+    // cc-rx: the client's max receive bandwidth in bytes/sec (0 = unknown →
+    // the server runs bandwidth detection). hysteria `AuthRequest.Rx`,
+    // sing-box `ReceiveBPS`.
+    req = req.header("hysteria-cc-rx", cc_rx.to_string());
     req = req.header("hysteria-padding", &random_padding(256, 2048));
     let request = req
         .body(())
@@ -208,10 +252,21 @@ async fn runtime_auth(
             detail: format!("authentication failed, status code: {status}"),
         });
     }
+    // `Hysteria-UDP`: the server announces UDP relay availability
+    // (`AuthResponse.UDPEnabled`, header value "true"/"false").
+    let udp_enabled = resp
+        .headers()
+        .get("hysteria-udp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
     // The h3 connection stays open only while a `SendRequest` clone is
     // alive: return one so the tunnel's lifetime keeps the session (and the
     // underlying quinn connection) alive.
-    Ok(H3Keepalive(sender))
+    Ok(AuthInfo {
+        keepalive: H3Keepalive(sender),
+        udp_enabled,
+    })
 }
 
 /// Bind the QUIC client endpoint. With `obfs_password` the UDP socket is
@@ -576,6 +631,25 @@ mod tests {
     }
 
     #[test]
+    fn varint_len_matches_encoded_width() {
+        // The sizing table must not drift from the encoder: a header sized
+        // with the wrong varint width writes the payload at the wrong offset.
+        for v in [
+            0u64,
+            1,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            0x3fff_ffff_ffff_ffff, // 2^62 - 1, the varint max
+        ] {
+            assert_eq!(varint_len(v), varint(v).len(), "width of {v}");
+        }
+    }
+
+    #[test]
     fn target_string_formats() {
         assert_eq!(
             target_string(&TargetAddr::new(Host::Domain("example.com".into()), 443)),
@@ -589,6 +663,25 @@ mod tests {
             target_string(&TargetAddr::new(Host::Ip("::1".parse().unwrap()), 443)),
             "[::1]:443"
         );
+    }
+
+    /// A minimal hysteria2 config; `down` is what feeds `hysteria-cc-rx`.
+    fn cfg_down(down: Option<&str>) -> Hysteria2Config {
+        let mut obj = serde_json::json!({ "auth": "pw" });
+        if let Some(d) = down {
+            obj["down"] = serde_json::json!(d);
+        }
+        serde_json::from_value(obj).expect("hysteria2 config parses")
+    }
+
+    #[test]
+    fn cc_rx_bps_from_down_bandwidth() {
+        // 100 mbps = 12.5 MB/s on the wire (`AuthRequest.Rx` is bytes/sec).
+        assert_eq!(cc_rx_bps(&cfg_down(Some("100mbps"))), 12_500_000);
+        // Absent or unparsable = unknown, which the wire spells 0 (the
+        // server then runs its own bandwidth detection).
+        assert_eq!(cc_rx_bps(&cfg_down(None)), 0);
+        assert_eq!(cc_rx_bps(&cfg_down(Some("fast"))), 0);
     }
 
     #[test]

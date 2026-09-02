@@ -39,6 +39,13 @@ const RESP_LEN_IV_SALT: &[u8] = b"AEAD Resp Header Len IV";
 const RESP_PAYLOAD_KEY_SALT: &[u8] = b"AEAD Resp Header Key";
 const RESP_PAYLOAD_IV_SALT: &[u8] = b"AEAD Resp Header IV";
 
+/// The largest plaintext ONE record can carry: the 2-byte BE field is the
+/// FULL wire size (plaintext + 16-byte GCM tag), so the u16 framing limit is
+/// `65535 - 16`. This is the ceiling a peer may legitimately fill — the send
+/// side is capped far lower by xray's chunk sealer (see
+/// `udp::MAX_SEND_PAYLOAD`).
+pub(super) const MAX_RECORD_PLAINTEXT: usize = u16::MAX as usize - 16;
+
 /// Read-side state machine (Copy so no borrow of `self` is held across
 /// awaits; buffers live on the struct, fill counters in the state).
 #[derive(Clone, Copy)]
@@ -97,8 +104,8 @@ impl Cipher {
 
 /// `VMess` client tunnel stream: response-header peel + record codec over the
 /// secured connection.
-pub struct VmessClientStream {
-    inner: BoxStream,
+pub struct VmessClientStream<S = BoxStream> {
+    inner: S,
     session: Session,
     // Read side.
     read_state: ReadState,
@@ -115,8 +122,10 @@ pub struct VmessClientStream {
     // Write side.
     write_pending: Option<Vec<u8>>,
     write_pos: usize,
-    /// Original caller length the pending record was sealed from — returned
-    /// once the record is fully flushed.
+    /// Original caller length the pending record was sealed from — the
+    /// byte-stream path's bookkeeping only: [`AsyncWrite::poll_write`]
+    /// reports it once the record has flushed, while the datagram path
+    /// ([`Self::write_datagram`]) never reports another payload's length.
     write_len: usize,
     /// Expanded per-direction record ciphers (selected by the payload
     /// security byte) so the record codec never re-derives a key schedule.
@@ -128,11 +137,11 @@ pub struct VmessClientStream {
     resp_counter: u16,
 }
 
-impl VmessClientStream {
+impl<S> VmessClientStream<S> {
     /// Wrap `inner` with a `VMess` session: peels the response header on the
     /// first read, then codes AEAD records.
     #[must_use]
-    pub fn new(inner: BoxStream, session: Session) -> Self {
+    pub fn new(inner: S, session: Session) -> Self {
         let mut req_nonce = [0u8; 12];
         req_nonce.copy_from_slice(&session.request_body_iv[..12]);
         let mut resp_nonce = [0u8; 12];
@@ -163,7 +172,7 @@ impl VmessClientStream {
     /// The secured connection behind the record codec (crate-internal; the
     /// e2e PQ assertion recovers the engine `TlsStream` through it).
     #[cfg_attr(not(feature = "native-e2e"), allow(dead_code))] // e2e PQ assertion only
-    pub(crate) fn inner(&self) -> &BoxStream {
+    pub(crate) const fn inner(&self) -> &S {
         &self.inner
     }
 
@@ -174,11 +183,46 @@ impl VmessClientStream {
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         nonce
     }
+    /// Seal `payload` into the pending-record slot: `[2B BE wire size][AEAD]`
+    /// under the request counter's nonce (Go
+    /// `AuthenticationWriter.seal`). The counter is consumed here, so the
+    /// caller MUST have cleared any previous record first.
+    fn seal_pending(&mut self, payload: &[u8]) -> io::Result<()> {
+        debug_assert!(
+            self.write_pending.is_none(),
+            "exactly one record is sealed at a time"
+        );
+        if payload.len() > MAX_RECORD_PLAINTEXT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("vmess record too large (max {MAX_RECORD_PLAINTEXT} bytes per record)"),
+            ));
+        }
+        let nonce = Self::record_nonce(&self.req_nonce, self.req_counter);
+        let Ok(ct) = self.req_cipher.encrypt(&nonce, payload) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vmess request record seal failed",
+            ));
+        };
+        let mut rec = Vec::with_capacity(2 + ct.len());
+        let field =
+            u16::try_from(payload.len() + 16).expect("record size bounded by the guard above");
+        rec.extend_from_slice(&field.to_be_bytes());
+        rec.extend_from_slice(&ct);
+        self.write_pending = Some(rec);
+        self.write_pos = 0;
+        self.req_counter = self.req_counter.wrapping_add(1);
+        Ok(())
+    }
+}
+
+impl<S: AsyncWrite + Unpin> VmessClientStream<S> {
     /// Flush the pending write record to `inner`. Takes the record, position
     /// and inner as separate mutable borrows so no borrow spans the awaits.
     /// Returns `Ok(())` once the record is fully written (and clears it).
     fn flush_pending(
-        inner: &mut BoxStream,
+        inner: &mut S,
         rec: &mut Option<Vec<u8>>,
         pos: &mut usize,
         cx: &mut Context<'_>,
@@ -202,9 +246,67 @@ impl VmessClientStream {
             *pos += n;
         }
     }
+
+    /// Seal `payload` into exactly ONE record and put that record on the
+    /// wire — the datagram entry point of the tunnel (`udp::PacketConn::send`
+    /// calls it instead of `write_all`), and unlike
+    /// [`AsyncWrite::poll_write`] it is CANCEL-SAFE at the record boundary.
+    ///
+    /// `poll_write` owes the byte-stream contract: it seals the caller's
+    /// buffer, then reports that buffer's ORIGINAL length once the record has
+    /// flushed, and a retry with the same buffer reuses the record already
+    /// sealed. Dropping a `write_all` future mid-flush therefore leaves both
+    /// the half-written record and the stale length behind, and the next,
+    /// unrelated buffer inherits them — a truncated datagram on the wire.
+    /// This method reports success only for the payload it sealed itself.
+    ///
+    /// Leftover resolution, when a previous `write_datagram` was dropped:
+    /// - bytes already on the wire (`write_pos > 0`): the peer is mid-record,
+    ///   so that record MUST be completed before a new one starts.
+    /// - nothing written yet: the record never reached the wire, so it is
+    ///   dropped and its counter given back (sealing is the counter's only
+    ///   consumer and at most one record is ever pending) — the abandoned
+    ///   datagram is not resurrected ahead of this one.
+    pub async fn write_datagram(&mut self, payload: &[u8]) -> io::Result<()> {
+        if payload.is_empty() {
+            // A record with no plaintext is xray's end-of-stream marker
+            // (field == 16, Go `size == auth.Overhead()`), never a datagram.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vmess udp: an empty record is the end-of-stream marker",
+            ));
+        }
+        let mut sealed = false;
+        std::future::poll_fn(move |cx| -> Poll<io::Result<()>> {
+            if !sealed {
+                if self.write_pos > 0 {
+                    ready!(Self::flush_pending(
+                        &mut self.inner,
+                        &mut self.write_pending,
+                        &mut self.write_pos,
+                        cx,
+                    ))?;
+                } else if self.write_pending.take().is_some() {
+                    self.req_counter = self.req_counter.wrapping_sub(1);
+                }
+                self.write_len = 0;
+                self.seal_pending(payload)?;
+                sealed = true;
+            }
+            let flushed = ready!(Self::flush_pending(
+                &mut self.inner,
+                &mut self.write_pending,
+                &mut self.write_pos,
+                cx,
+            ));
+            self.write_len = 0;
+            Poll::Ready(flushed)
+        })
+        .await
+    }
 }
 
-impl AsyncRead for VmessClientStream {
+impl<S: AsyncRead + Unpin> AsyncRead for VmessClientStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -410,7 +512,7 @@ impl AsyncRead for VmessClientStream {
     }
 }
 
-impl AsyncWrite for VmessClientStream {
+impl<S: AsyncWrite + Unpin> AsyncWrite for VmessClientStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -421,34 +523,14 @@ impl AsyncWrite for VmessClientStream {
             // Empty writes are skipped (mirror xray: no zero-length record).
             return Poll::Ready(Ok(0));
         }
-        // One record holds the whole buffer; the 2B field is the full wire
-        // size (plaintext + 16-byte GCM tag) and must fit in u16.
-        if buf.len() > u16::MAX as usize - 16 {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "vmess record too large (max 65519 bytes per write)",
-            )));
-        }
         // Seal the caller's buffer into a single record. If a previous record
         // is still being flushed, the caller is retrying with the same buffer
         // (tokio poll contract) — the pending record was built from it.
         if this.write_pending.is_none() {
-            let nonce = Self::record_nonce(&this.req_nonce, this.req_counter);
-            let Ok(ct) = this.req_cipher.encrypt(&nonce, buf) else {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "vmess request record seal failed",
-                )));
-            };
-            let mut rec = Vec::with_capacity(2 + ct.len());
-            let field =
-                u16::try_from(buf.len() + 16).expect("record size bounded by the u16 guard above");
-            rec.extend_from_slice(&field.to_be_bytes());
-            rec.extend_from_slice(&ct);
-            this.write_pending = Some(rec);
-            this.write_pos = 0;
+            if let Err(e) = this.seal_pending(buf) {
+                return Poll::Ready(Err(e));
+            }
             this.write_len = buf.len();
-            this.req_counter = this.req_counter.wrapping_add(1);
         }
         // Flush the pending record; return the ORIGINAL length once fully
         // written (partial inner writes resume on subsequent polls).

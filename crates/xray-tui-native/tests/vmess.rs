@@ -17,6 +17,8 @@ mod common;
 
 use common::{certs, cores, echo, fp, pick, pq_tls, reality, tls_echo};
 use rstest::rstest;
+use xray_tui_native::PacketMode;
+use xray_tui_native::e2e::AppKind;
 use xray_tui_native::e2e::{
     Aes128GcmVariant, CaseSpec, Certs, Chacha20Poly1305Variant, CoreKind, CoreUnderTest,
     EchoServer, SecurityVariant, TlsEchoServer, TlsVariant, run_against,
@@ -78,6 +80,12 @@ fn vmess_xhttp_tls(
 // exchange; the runner asserts the engine's negotiated-hybrid flag. Both
 // cores accept curve_preferences (sing-box 1.13.16 verified empirically).
 #[case::tcp_aes128gcm_tls_pq(vmess_tls(Aes128GcmVariant, "tcp", pq_tls()).with_pq_assert())]
+// VMess UDP (command 0x02): the AEAD-record datagram tunnel. The request
+// header carries the destination and one record IS one datagram, so
+// `PacketMode::Raw` — the header-dest mode — is the only mode vmess can
+// serve; the VLESS-only modes (packetaddr, XUDP) are refused by the shared
+// protocol mode gate, not by this row.
+#[case::tcp_aes128gcm_udp(vmess(Aes128GcmVariant, "tcp").with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
 #[tokio::test]
 async fn vmess_against_cores(
     #[case] case: CaseSpec,

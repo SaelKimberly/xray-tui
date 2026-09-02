@@ -14,6 +14,8 @@ mod common;
 
 use common::{certs, cores, echo, fp, pick, tls_echo};
 use rstest::rstest;
+use xray_tui_native::PacketMode;
+use xray_tui_native::e2e::AppKind;
 use xray_tui_native::e2e::{
     CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, run_against,
 };
@@ -33,6 +35,10 @@ fn trojan_chrome(net: &'static str) -> CaseSpec {
 #[case::ws_chrome(trojan_chrome("ws"))]
 #[case::grpc(trojan("grpc"))]
 #[case::grpc_chrome(trojan_chrome("grpc"))]
+// Trojan UDP (command 3): the address-framed datagram tunnel over the
+// stream — the `connect_udp` probe dispatches `PacketMode::Raw` to the
+// trojan `PacketConn`. Both cores relay trojan UDP natively.
+#[case::udp(trojan("tcp").with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
 #[tokio::test]
 async fn trojan_against_cores(
     #[case] case: CaseSpec,

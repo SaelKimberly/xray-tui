@@ -229,7 +229,9 @@ fn random_global_id() -> [u8; 8] {
 /// - RAW (`params.mux = false`, and not the udp443 flow): writes the
 ///   request header with `command = 0x02` and the UDP destination
 ///   (port-first, spec §4.1), then wraps the tunnel in the packet-framed
-///   [`PacketConn`] for the configured mode.
+///   [`PacketConn`] for the configured mode, carrying that header
+///   destination along — in `Raw` mode a send naming a different
+///   destination is refused ([`PacketConn::send`]).
 /// - XUDP (`params.mux`, or the udp443 flow which forces it): runs the
 ///   mux tunnel (`connect_mux`), opens one UDP session with a fresh
 ///   random `GlobalID`, and wraps it in the `XUdp` [`PacketConn`].
@@ -269,15 +271,15 @@ pub async fn connect_udp(
 }
 
 /// Plain UDP connect: request header without addons (`cmd = CMD_UDP`), then
-/// the packet-framed tunnel.
+/// the packet-framed tunnel over the same header destination.
 async fn connect_udp_plain(
     ctx: &LinkContext,
     stream: BoxStream,
     uuid: [u8; 16],
     mode: PacketMode,
 ) -> Result<PacketConn<BoxStream>, NativeError> {
-    let request =
-        header::encode_request(&uuid, &udp_header_target(ctx, mode)?, header::CMD_UDP, None)?;
+    let header_dest = udp_header_target(ctx, mode)?;
+    let request = header::encode_request(&uuid, &header_dest, header::CMD_UDP, None)?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;
     tokio::time::timeout(timeout, stream.write_all(&request))
@@ -287,7 +289,7 @@ async fn connect_udp_plain(
             limit: timeout,
         })??;
 
-    Ok(PacketConn::new(stream, mode))
+    Ok(PacketConn::new(stream, mode, &header_dest))
 }
 
 /// The header destination for the UDP command.

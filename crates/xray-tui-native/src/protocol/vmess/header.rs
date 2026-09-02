@@ -13,6 +13,8 @@ pub const VERSION: u8 = 1;
 pub const SECURITY_AES128_GCM: u8 = 3;
 pub const SECURITY_CHACHA20_POLY1305: u8 = 4;
 pub const COMMAND_TCP: u8 = 1;
+/// UDP command byte (`RequestCommandUDP`).
+pub const COMMAND_UDP: u8 = 2;
 
 /// Per-connection `VMess` session material (mirrors Go `ClientSession`).
 pub struct Session {
@@ -61,11 +63,11 @@ fn rand_bytes(out: &mut [u8]) {
     SystemRandom::new().fill(out).expect("rng failure");
 }
 
-/// Encode the sealed AEAD request header for a TCP command.
+/// Encode the sealed AEAD request header for `command` (1 = TCP, 2 = UDP).
 ///
 /// `entropy` supplies the 4-byte auth-rand and 8-byte connection nonce (fixed
 /// for tests). The header body (Go `EncodeRequestHeader`):
-/// version | IV | key | respHeader | option=0 | security={session.security} | 0 | cmd=1 |
+/// version | IV | key | respHeader | option=0 | security={session.security} | 0 | cmd |
 /// port BE2 | addrType | addr | fnv1a32. Wire (Go `SealVMessAEADHeader`):
 /// authID(16) | lenAEAD(18) | nonce(8) | payloadAEAD.
 ///
@@ -77,6 +79,7 @@ pub fn encode_request(
     cmd_key: &[u8; 16],
     session: &Session,
     target: &TargetAddr,
+    command: u8,
     auth_ts: i64,
     entropy: &mut impl FnMut(&mut [u8]),
 ) -> Result<Vec<u8>, NativeError> {
@@ -89,7 +92,7 @@ pub fn encode_request(
     body.push(0); // option (basic format; chunk-stream option is Task 6)
     body.push(session.security); // padding nibble 0 | security byte
     body.push(0); // reserved
-    body.push(COMMAND_TCP);
+    body.push(command);
     encode_address_port(&mut body, target)?;
     // padding: length 0 (we send the minimal body)
     let fnv = keys::fnv1a32(&body);
@@ -201,8 +204,15 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire =
-            encode_request(&ck, &s, &tgt, 0x6000_0000_0000_0000, &mut fixed_entropy).unwrap();
+        let wire = encode_request(
+            &ck,
+            &s,
+            &tgt,
+            COMMAND_TCP,
+            0x6000_0000_0000_0000,
+            &mut fixed_entropy,
+        )
+        .unwrap();
         // body = 38 fixed + port 2 + addr(1+4) + fnv 4 = 49; payloadAEAD = 49+16; lenAEAD 18; authID 16; nonce 8
         assert_eq!(wire.len(), 16 + 18 + 8 + 49 + 16);
         // authID golden (ts=0x6000000000000000, rand=aabbccdd, fixed cmdKey) —
@@ -217,9 +227,56 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy).unwrap();
+        let wire = encode_request(&ck, &s, &tgt, COMMAND_TCP, 42, &mut fixed_entropy).unwrap();
         assert!(!wire[..16].iter().any(|b| *b == 0x11 || *b == 0x22)); // authID is ciphertext
         assert_eq!(wire.len(), 16 + 18 + 8 + 49 + 16);
+    }
+
+    /// Unseal a request's payload AEAD and return the plaintext header body,
+    /// checking that the lenAEAD announces exactly that body. The key/nonce
+    /// derivation depends only on `ck`, the authID and the connection nonce —
+    /// all on the wire — so a test needs no session material to read a
+    /// sealed body back.
+    fn unseal_request_body(ck: &[u8; 16], wire: &[u8]) -> Vec<u8> {
+        let auth_id = &wire[..16];
+        let len_cipher = &wire[16..34];
+        let nonce = &wire[34..42];
+        let body_cipher = &wire[42..];
+
+        let len_key =
+            keys::kdf16_bytes_path(ck, &[b"VMess Header AEAD Key_Length", auth_id, nonce]);
+        let len_nonce =
+            keys::kdf_bytes_path(ck, &[b"VMess Header AEAD Nonce_Length", auth_id, nonce]);
+        let len_plain = Aes128Gcm::new_from_slice(&len_key)
+            .unwrap()
+            .decrypt(
+                (&len_nonce[..12]).try_into().unwrap(),
+                Payload {
+                    msg: len_cipher,
+                    aad: auth_id,
+                },
+            )
+            .unwrap();
+
+        let body_key = keys::kdf16_bytes_path(ck, &[b"VMess Header AEAD Key", auth_id, nonce]);
+        let body_nonce = keys::kdf_bytes_path(ck, &[b"VMess Header AEAD Nonce", auth_id, nonce]);
+        let body = Aes128Gcm::new_from_slice(&body_key)
+            .unwrap()
+            .decrypt(
+                (&body_nonce[..12]).try_into().unwrap(),
+                Payload {
+                    msg: body_cipher,
+                    aad: auth_id,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            len_plain,
+            u16::try_from(body.len()).unwrap().to_be_bytes(),
+            "the lenAEAD must announce the body it seals"
+        );
+        body
     }
 
     #[test]
@@ -230,54 +287,33 @@ mod tests {
         // header address is PORT FIRST, then type byte + bytes. Unseal the
         // payload AEAD and pin the exact plaintext layout, including the FNV
         // checksum over the port-first body.
+        //
+        // Both commands are pinned: the UDP path turns exactly one body byte
+        // on, and the FNV checksum runs over the body, so each command has
+        // its own golden — a wrong `COMMAND_UDP` (3, trojan's value) fails
+        // here instead of only against a live core. Upstream values:
+        // `RequestCommandTCP = 0x01`, `RequestCommandUDP = 0x02`
+        // (Xray-core `common/protocol/headers.go:15-16`).
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy).unwrap();
+        for (command, fnv) in [
+            (COMMAND_TCP, 0x273b_d20a_u32),
+            (COMMAND_UDP, 0x2139_6fa9_u32),
+        ] {
+            let wire = encode_request(&ck, &s, &tgt, command, 42, &mut fixed_entropy).unwrap();
+            let body = unseal_request_body(&ck, &wire);
 
-        let auth_id = &wire[..16];
-        let len_cipher = &wire[16..34];
-        let nonce = &wire[34..42];
-        let body_cipher = &wire[42..];
-
-        // lenAEAD plaintext is the BE body length (49 = 38 fixed + 2 port + 5 addr + 4 fnv).
-        let len_key =
-            keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key_Length", auth_id, nonce]);
-        let len_nonce =
-            keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce_Length", auth_id, nonce]);
-        let len_aead = Aes128Gcm::new_from_slice(&len_key).unwrap();
-        let len_plain = len_aead
-            .decrypt(
-                (&len_nonce[..12]).try_into().unwrap(),
-                Payload {
-                    msg: len_cipher,
-                    aad: auth_id,
-                },
-            )
-            .unwrap();
-        assert_eq!(len_plain, 49u16.to_be_bytes());
-
-        let body_key = keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key", auth_id, nonce]);
-        let body_nonce = keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce", auth_id, nonce]);
-        let body_aead = Aes128Gcm::new_from_slice(&body_key).unwrap();
-        let body = body_aead
-            .decrypt(
-                (&body_nonce[..12]).try_into().unwrap(),
-                Payload {
-                    msg: body_cipher,
-                    aad: auth_id,
-                },
-            )
-            .unwrap();
-
-        let mut expect = vec![VERSION];
-        expect.extend_from_slice(&[0x11; 16]);
-        expect.extend_from_slice(&[0x22; 16]);
-        expect.extend_from_slice(&[0x33, 0x00, 0x03, 0x00, COMMAND_TCP]);
-        expect.extend_from_slice(&80u16.to_be_bytes()); // port FIRST
-        expect.extend_from_slice(&[0x01, 127, 0, 0, 1]); // addrType IPv4 + 127.0.0.1
-        expect.extend_from_slice(&0x273b_d20a_u32.to_be_bytes()); // fnv1a32(port-first body)
-        assert_eq!(body, expect);
+            // 49 bytes: 38 fixed + 2 port + 5 addr + 4 fnv.
+            let mut expect = vec![VERSION];
+            expect.extend_from_slice(&[0x11; 16]);
+            expect.extend_from_slice(&[0x22; 16]);
+            expect.extend_from_slice(&[0x33, 0x00, 0x03, 0x00, command]);
+            expect.extend_from_slice(&80u16.to_be_bytes()); // port FIRST
+            expect.extend_from_slice(&[0x01, 127, 0, 0, 1]); // addrType IPv4 + 127.0.0.1
+            expect.extend_from_slice(&fnv.to_be_bytes()); // fnv1a32(port-first body)
+            assert_eq!(body, expect, "command {command}");
+        }
     }
 
     #[test]
@@ -291,7 +327,7 @@ mod tests {
         let ck = cmd_key(&[0; 16]);
         let tgt = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 80);
         let s = fixed_session();
-        let wire = encode_request(&ck, &s, &tgt, 42, &mut fixed_entropy).unwrap();
+        let wire = encode_request(&ck, &s, &tgt, COMMAND_TCP, 42, &mut fixed_entropy).unwrap();
         assert_eq!(
             hex_encode(&wire),
             "79d348cf6b4707cf6acbb494bf257f1de2d3f7fed70400fdc38997b98856e876eea6abababababababab988161deb14ca4eb23a17a1a8bef86e406b8fd0192d050514be96e66e75ebc4ac82dbbbe0fa3ef08d80e26f393f4dea4c96aee6878ba3a7d22cceba18a67028d7e"
@@ -309,49 +345,23 @@ mod tests {
         session.security = SECURITY_CHACHA20_POLY1305;
         let mut entropy = |out: &mut [u8]| out.fill(0x77);
         let target = TargetAddr::new(Host::Ip("127.0.0.1".parse().unwrap()), 8080);
-        let wire =
-            encode_request(&ck, &session, &target, 0x6000_0000_0000_0000, &mut entropy).unwrap();
+        let wire = encode_request(
+            &ck,
+            &session,
+            &target,
+            COMMAND_TCP,
+            0x6000_0000_0000_0000,
+            &mut entropy,
+        )
+        .unwrap();
         assert_eq!(wire.len(), peek_seal_len(49));
 
         // This test pins the task's central contract: `encode_request` must
         // write `session.security` (4 = chacha20-poly1305) at plaintext body
         // index 35 — NOT a hardcoded default. The security byte is inside the
-        // sealed payload, so decrypt the body AEAD reusing the sibling
-        // `request_plaintext_body_layout_is_port_first` pattern; the key/nonce
-        // derivation depends only on ck, auth_id, and nonce (all on the wire).
-        let auth_id = &wire[..16];
-        let len_cipher = &wire[16..34];
-        let nonce = &wire[34..42];
-        let body_cipher = &wire[42..];
-
-        let len_key =
-            keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key_Length", auth_id, nonce]);
-        let len_nonce =
-            keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce_Length", auth_id, nonce]);
-        let len_aead = Aes128Gcm::new_from_slice(&len_key).unwrap();
-        let len_plain = len_aead
-            .decrypt(
-                (&len_nonce[..12]).try_into().unwrap(),
-                Payload {
-                    msg: len_cipher,
-                    aad: auth_id,
-                },
-            )
-            .unwrap();
-        assert_eq!(len_plain, 49u16.to_be_bytes());
-
-        let body_key = keys::kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key", auth_id, nonce]);
-        let body_nonce = keys::kdf_bytes_path(&ck, &[b"VMess Header AEAD Nonce", auth_id, nonce]);
-        let body_aead = Aes128Gcm::new_from_slice(&body_key).unwrap();
-        let body = body_aead
-            .decrypt(
-                (&body_nonce[..12]).try_into().unwrap(),
-                Payload {
-                    msg: body_cipher,
-                    aad: auth_id,
-                },
-            )
-            .unwrap();
+        // sealed payload, so unseal the body AEAD (the shared
+        // `unseal_request_body` helper).
+        let body = unseal_request_body(&ck, &wire);
 
         // 35 = version(1) IV(16) key(16) respHdr(1) option(1).
         assert_eq!(body[35], SECURITY_CHACHA20_POLY1305);

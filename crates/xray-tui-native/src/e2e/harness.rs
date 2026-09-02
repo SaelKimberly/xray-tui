@@ -612,7 +612,7 @@ pub const UDP_PROBE_COUNT: usize = UDP_PROBE_PAYLOADS.len();
 /// cover that plus the datagram round-trips.
 const UDP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Probe the VLESS UDP path over a datagram tunnel.
+/// Probe the case protocol's UDP path over a datagram tunnel.
 ///
 /// Establishes the tunnel via [`crate::connect_udp`], sends
 /// [`UDP_PROBE_COUNT`] distinct payloads to the case target, and receives
@@ -624,7 +624,6 @@ const UDP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`UDP_PROBE_COUNT`]. Returns `(0, 0)` on a failed connect or a deadline
 /// expiry before any datagram was sent.
 pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
-    use crate::protocol::vless::PacketMode;
     let deadline = tokio::time::Instant::now() + UDP_PROBE_TIMEOUT;
     let mut conn = match tokio::time::timeout_at(deadline, crate::connect_udp(params)).await {
         Ok(Ok(c)) => c,
@@ -637,18 +636,18 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
             return (0, 0);
         }
     };
-    // Per-datagram destination for packetaddr mode (Raw mode encodes the
-    // target in the request header; send(None)). Domain targets only occur
-    // in Raw mode (packetaddr rejects them client-side), so a domain target
-    // yields None here.
-    let ip_target = match &params.target.host {
+    // The case target, for every packet mode: `None` means the session /
+    // header destination and `Some(d)` a per-packet destination, and every
+    // carrier accepts the session target named explicitly
+    // (`PacketTunnel::send`) — packetaddr and XUDP require a destination,
+    // the header-dest carriers (vless `Raw`, vmess) compare it against
+    // their session target, trojan and hysteria2 put it on the wire.
+    // A domain target has no `SocketAddr` form; those rows are Raw-only
+    // (packetaddr rejects domains client-side), so `None` — the header
+    // destination — is the right argument there.
+    let dest = match &params.target.host {
         crate::addr::Host::Ip(ip) => Some(SocketAddr::new(*ip, params.target.port)),
         crate::addr::Host::Domain(_) => None,
-    };
-    let dest = if params.udp == Some(PacketMode::PacketAddr) {
-        ip_target
-    } else {
-        None
     };
     udp_exchange(&mut conn, dest, deadline).await
 }
@@ -656,8 +655,8 @@ pub async fn probe_udp(params: &crate::NativeConnectParams) -> (usize, usize) {
 /// Probe the VLESS XUDP path — datagrams through the mux tunnel.
 ///
 /// Establishes the tunnel via [`crate::connect_udp`] with `params.mux`
-/// (the mux tunnel → one UDP session → the [`PacketMode::XUdp`]
-/// [`PacketConn`]; the `xtls-rprx-vision-udp443` flow forces the same
+/// (the mux tunnel → one UDP session → the [`crate::PacketMode::XUdp`]
+/// [`crate::PacketConn`]; the `xtls-rprx-vision-udp443` flow forces the same
 /// path), sends [`UDP_PROBE_COUNT`] distinct payloads to the case target,
 /// and receives until every echo arrives (matched by payload,
 /// order-independent) or the deadline expires. Fully bounded: the whole
@@ -696,7 +695,7 @@ pub async fn probe_udp_mux(params: &crate::NativeConnectParams) -> (usize, usize
 /// every echo arrives (matched by payload, order-independent) or the
 /// deadline expires. Returns `(sent, received)`.
 async fn udp_exchange(
-    conn: &mut crate::protocol::vless::PacketConn<crate::BoxStream>,
+    conn: &mut crate::PacketTunnel,
     dest: Option<SocketAddr>,
     deadline: tokio::time::Instant,
 ) -> (usize, usize) {
@@ -704,7 +703,14 @@ async fn udp_exchange(
     for payload in UDP_PROBE_PAYLOADS {
         match tokio::time::timeout_at(deadline, conn.send(dest, payload)).await {
             Ok(Ok(())) => sent += 1,
-            _ => break,
+            Ok(Err(e)) => {
+                eprintln!("udp probe send error: {e}");
+                break;
+            }
+            Err(_) => {
+                eprintln!("udp probe send timed out");
+                break;
+            }
         }
     }
     let mut received = 0;

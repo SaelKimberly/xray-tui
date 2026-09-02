@@ -22,13 +22,13 @@ pub enum Tls12Suite {
     EcdheRsaAes128GcmSha256,
     /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (0xC030).
     EcdheRsaAes256GcmSha384,
-    /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA9).
+    /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA8, RFC 7905 §2).
     EcdheRsaChacha20Poly1305Sha256,
     /// `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (0xC02B).
     EcdheEcdsaAes128GcmSha256,
     /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (0xC02C).
     EcdheEcdsaAes256GcmSha384,
-    /// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA8).
+    /// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA9, RFC 7905 §2).
     EcdheEcdsaChacha20Poly1305Sha256,
 }
 
@@ -39,10 +39,10 @@ impl Tls12Suite {
         match v {
             0xc02f => Some(Self::EcdheRsaAes128GcmSha256),
             0xc030 => Some(Self::EcdheRsaAes256GcmSha384),
-            0xcca9 => Some(Self::EcdheRsaChacha20Poly1305Sha256),
+            0xcca8 => Some(Self::EcdheRsaChacha20Poly1305Sha256),
             0xc02b => Some(Self::EcdheEcdsaAes128GcmSha256),
             0xc02c => Some(Self::EcdheEcdsaAes256GcmSha384),
-            0xcca8 => Some(Self::EcdheEcdsaChacha20Poly1305Sha256),
+            0xcca9 => Some(Self::EcdheEcdsaChacha20Poly1305Sha256),
             _ => None,
         }
     }
@@ -53,10 +53,10 @@ impl Tls12Suite {
         match self {
             Self::EcdheRsaAes128GcmSha256 => 0xc02f,
             Self::EcdheRsaAes256GcmSha384 => 0xc030,
-            Self::EcdheRsaChacha20Poly1305Sha256 => 0xcca9,
+            Self::EcdheRsaChacha20Poly1305Sha256 => 0xcca8,
             Self::EcdheEcdsaAes128GcmSha256 => 0xc02b,
             Self::EcdheEcdsaAes256GcmSha384 => 0xc02c,
-            Self::EcdheEcdsaChacha20Poly1305Sha256 => 0xcca8,
+            Self::EcdheEcdsaChacha20Poly1305Sha256 => 0xcca9,
         }
     }
 
@@ -97,10 +97,6 @@ impl Tls12Suite {
     /// 8-byte explicit nonce per record (RFC 5288 §3), and 12 for
     /// ChaCha20-Poly1305, which carries none — its nonce is the fixed IV
     /// XOR the padded sequence number (RFC 7905 §2, `record_iv_length = 0`).
-    ///
-    /// This is the only owner of the TLS 1.2 nonce geometry that the key
-    /// block depends on; the record layer's [`crate::record::stream::Tls12Aead`]
-    /// owns the per-record half.
     #[must_use]
     pub const fn fixed_iv_len(self) -> usize {
         match self {
@@ -113,7 +109,6 @@ impl Tls12Suite {
     }
 }
 
-/// HMAC-Sign `data` with `key_bytes` under the suite's PRF hash.
 fn hmac_sign(suite: Tls12Suite, key_bytes: &[u8], data: &[u8]) -> Vec<u8> {
     let key = hmac::Key::new(suite.prf_alg(), key_bytes);
     hmac::sign(&key, data).as_ref().to_vec()

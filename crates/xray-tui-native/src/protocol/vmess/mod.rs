@@ -21,6 +21,7 @@ use crate::protocol::vmess::stream::VmessClientStream;
 pub mod header;
 pub mod keys;
 pub mod stream;
+pub mod udp;
 
 /// Validate the `VMess` payload security the config requests.
 pub fn check_security(cfg: &VmessConfig) -> Result<(), NativeError> {
@@ -38,12 +39,17 @@ pub fn security_byte(cfg: &VmessConfig) -> Result<u8, NativeError> {
     }
 }
 
-/// Connect through a `VMess` outbound over an already-secured stream.
-pub async fn connect(
+/// Write the AEAD request header for `command` and wrap the stream in the
+/// record tunnel — the ONE `VMess` handshake, shared by [`connect`]
+/// (command 1) and [`connect_udp`] (command 2). `step` names the write for
+/// the timeout error.
+async fn handshake(
     ctx: &LinkContext,
     stream: BoxStream,
     cfg: &VmessConfig,
-) -> Result<BoxStream, NativeError> {
+    command: u8,
+    step: &'static str,
+) -> Result<VmessClientStream, NativeError> {
     check_security(cfg)?;
     let uuid = crate::protocol::vless::header::uuid_bytes(&cfg.uuid)?;
     let ck = cmd_key(&uuid);
@@ -59,17 +65,51 @@ pub async fn connect(
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0);
-    let request = encode_request(&ck, &session, &ctx.target, ts, &mut entropy)?;
+    let request = encode_request(&ck, &session, &ctx.target, command, ts, &mut entropy)?;
     let timeout = timeouts::PROTOCOL;
     let mut stream = stream;
     tokio::time::timeout(timeout, stream.write_all(&request))
         .await
         .map_err(|_| NativeError::Timeout {
-            step: "vmess request write",
+            step,
             limit: timeout,
         })??;
 
-    Ok(Box::new(VmessClientStream::new(stream, session)))
+    Ok(VmessClientStream::new(stream, session))
+}
+
+/// Connect through a `VMess` outbound over an already-secured stream.
+pub async fn connect(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    cfg: &VmessConfig,
+) -> Result<BoxStream, NativeError> {
+    let tunnel = handshake(ctx, stream, cfg, header::COMMAND_TCP, "vmess request write").await?;
+    Ok(Box::new(tunnel))
+}
+
+/// Connect through a `VMess` outbound with a UDP datagram tunnel (command
+/// 0x02).
+///
+/// The request header carries command `0x02` and the destination; each
+/// datagram is one AEAD record over the tunnel (no per-packet address) —
+/// the `udp::PacketConn` view over the [`VmessClientStream`], which keeps
+/// the header destination so a `send` naming a different one is refused
+/// rather than mis-routed.
+pub async fn connect_udp(
+    ctx: &LinkContext,
+    stream: BoxStream,
+    cfg: &VmessConfig,
+) -> Result<udp::PacketConn<BoxStream>, NativeError> {
+    let tunnel = handshake(
+        ctx,
+        stream,
+        cfg,
+        header::COMMAND_UDP,
+        "vmess udp request write",
+    )
+    .await?;
+    Ok(udp::PacketConn::new(tunnel, &ctx.target))
 }
 
 #[cfg(test)]

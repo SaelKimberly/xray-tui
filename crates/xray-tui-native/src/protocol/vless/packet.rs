@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::addr::{Host, TargetAddr};
 use crate::protocol::vless::mux::UdpSession;
 use crate::protocol::vless::packetaddr;
 use crate::protocol::vless::stream::Peel;
@@ -43,6 +44,14 @@ pub enum PacketMode {
 pub struct PacketConn<S> {
     inner: PacketInner<S>,
     mode: PacketMode,
+    /// The request-header destination in comparable form: `Some(addr)` when
+    /// the header carried an IP destination. In `Raw` mode that is the ONLY
+    /// place a datagram can land (the frame carries no address), so a `send`
+    /// naming a different one is refused instead of silently mis-routed.
+    /// `None` when the header destination has no `SocketAddr` form (a domain
+    /// target, the packetaddr magic fqdn) or does not exist at all (`XUdp` —
+    /// the mux command carries no destination).
+    header_dest: Option<SocketAddr>,
     peel: Peel,
 }
 
@@ -55,9 +64,11 @@ enum PacketInner<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// Wraps a tunnel stream in datagram framing for the given mode
-    /// (`Raw` or `PacketAddr`). `XUdp` mode is not constructible here —
-    /// the `XUdp` carrier is a [`UdpSession`], use [`PacketConn::xudp`].
-    pub const fn new(inner: S, mode: PacketMode) -> Self {
+    /// (`Raw` or `PacketAddr`). `header_dest` is the destination just
+    /// written in the request header — in `Raw` mode the only destination
+    /// the tunnel can reach. `XUdp` mode is not constructible here — the
+    /// `XUdp` carrier is a [`UdpSession`], use [`PacketConn::xudp`].
+    pub const fn new(inner: S, mode: PacketMode, header_dest: &TargetAddr) -> Self {
         debug_assert!(
             !matches!(mode, PacketMode::XUdp),
             "vless: XUdp mode requires PacketConn::xudp (a UdpSession)"
@@ -65,35 +76,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
         Self {
             inner: PacketInner::Stream(inner),
             mode,
+            header_dest: match &header_dest.host {
+                Host::Ip(ip) => Some(SocketAddr::new(*ip, header_dest.port)),
+                Host::Domain(_) => None,
+            },
             peel: Peel::new(),
         }
     }
 
     /// Wraps a mux UDP session in the `XUdp` datagram API: `send`/`recv`
     /// delegate to the session — no 2-byte framing, the mux frames carry
-    /// the length and the per-packet destination (spec §4.1, §5.2).
+    /// the length and the per-packet destination (spec §4.1, §5.2). The mux
+    /// command carries no header destination, so there is none to keep.
     pub(crate) const fn xudp(session: UdpSession) -> Self {
         Self {
             inner: PacketInner::XUdp(session),
             mode: PacketMode::XUdp,
+            header_dest: None,
             peel: Peel::new(),
         }
     }
 
     /// Sends one datagram.
     ///
-    /// Raw: one `[len][payload]` frame. `PacketAddr`: prepends the
-    /// per-packet address header (`atyp|addr|port`, spec §4.3) — header and
-    /// payload go
-    /// in ONE frame, mirroring the sing encoder which writes
-    /// `AddrPortLen + payload` in a single buffer; the destination is
-    /// required and the combined length must fit a u16 frame. Oversized
-    /// datagrams are rejected before any byte is written. `XUdp`:
-    /// `session.send_to(dest, payload)` — the destination is required (the
-    /// mux frame carries it per packet).
+    /// Raw: one `[len][payload]` frame. The frame carries no address, so
+    /// every datagram lands on the request-header destination: `None` names
+    /// exactly that (the normal argument) and an explicit destination is
+    /// accepted only when it IS the header destination, refused with
+    /// `InvalidInput` otherwise (`check_raw_dest`) rather than mis-routed.
+    ///
+    /// `PacketAddr`: prepends the per-packet address header
+    /// (`atyp|addr|port`, spec §4.3) — header and payload go in ONE frame,
+    /// mirroring the sing encoder which writes `AddrPortLen + payload` in a
+    /// single buffer; the destination is required and the combined length
+    /// must fit a u16 frame. Oversized datagrams are rejected before any
+    /// byte is written.
+    ///
+    /// `XUdp`: `session.send_to(dest, payload)` — the destination is
+    /// required (the mux frame carries it per packet).
     pub async fn send(&mut self, target: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
         match self.mode {
             PacketMode::Raw => {
+                self.check_raw_dest(target)?;
                 reject_oversized(payload.len())?;
                 write_packet(self.stream_mut()?, payload).await
             }
@@ -193,6 +217,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
             )),
         }
     }
+
+    /// Refuses a `Raw` datagram bound for anything but the request-header
+    /// destination.
+    ///
+    /// `Raw` frames carry no address (spec §4.2), so the header destination
+    /// is the only one reachable: `None` names it and always succeeds, and
+    /// an explicit `Some(dest)` is accepted only when it IS that
+    /// destination. A header destination with no `SocketAddr` form (a domain
+    /// target) has nothing to compare against, so any explicit destination
+    /// is refused — a visible `InvalidInput` beats a datagram silently
+    /// delivered to the header destination instead.
+    fn check_raw_dest(&self, dest: Option<SocketAddr>) -> io::Result<()> {
+        let Some(dest) = dest else { return Ok(()) };
+        if self.header_dest == Some(dest) {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "vless raw udp: destination {dest} is not the request-header destination (raw frames carry no per-packet address — use packetaddr or xudp for per-packet destinations)"
+            ),
+        ))
+    }
 }
 
 /// Rejects a frame payload that does not fit the 2-byte length field.
@@ -216,10 +263,16 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The request-header destination the stream-mode tests wrap: an IP
+    /// literal, so `Raw` can compare an explicit destination against it.
+    fn header_dest() -> TargetAddr {
+        TargetAddr::new(Host::new("1.2.3.4"), 53)
+    }
+
     #[tokio::test]
     async fn raw_send_recv() {
         let (client, mut server) = tokio::io::duplex(1024);
-        let mut conn = PacketConn::new(client, PacketMode::Raw);
+        let mut conn = PacketConn::new(client, PacketMode::Raw, &header_dest());
 
         // send(b"hi") → peer sees the exact frame [0x00,0x02,'h','i'].
         conn.send(None, b"hi").await.unwrap();
@@ -239,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn packetaddr_send_recv() {
         let (client, mut server) = tokio::io::duplex(1024);
-        let mut conn = PacketConn::new(client, PacketMode::PacketAddr);
+        let mut conn = PacketConn::new(client, PacketMode::PacketAddr, &header_dest());
 
         // send(Some(127.0.0.1:8080), b"p") → atyp(0x01) + addr + port + 'p'
         // (the per-packet address header; no magic in the frame).
@@ -268,7 +321,7 @@ mod tests {
         // Peer sends [0,0] (response header) then frames: the first recv()
         // consumes the header, both recvs return the frame payloads.
         let (client, mut server) = tokio::io::duplex(1024);
-        let mut conn = PacketConn::new(client, PacketMode::Raw);
+        let mut conn = PacketConn::new(client, PacketMode::Raw, &header_dest());
 
         server.write_all(&[0x00, 0x00]).await.unwrap();
         write_packet(&mut server, b"first").await.unwrap();
@@ -285,7 +338,7 @@ mod tests {
     async fn eof_returns_none() {
         // Peer sends the response header, then closes at a frame boundary.
         let (client, server) = tokio::io::duplex(1024);
-        let mut conn = PacketConn::new(client, PacketMode::Raw);
+        let mut conn = PacketConn::new(client, PacketMode::Raw, &header_dest());
         let mut server = server;
         server.write_all(&[0x00, 0x00]).await.unwrap();
         drop(server);
@@ -299,7 +352,7 @@ mod tests {
         let big = vec![0u8; 70_000];
 
         let (client, mut server) = tokio::io::duplex(65536);
-        let mut raw = PacketConn::new(client, PacketMode::Raw);
+        let mut raw = PacketConn::new(client, PacketMode::Raw, &header_dest());
         let err = raw.send(None, &big).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         drop(raw);
@@ -307,7 +360,7 @@ mod tests {
         assert!(read_packet(&mut server).await.unwrap().is_none());
 
         let (client, mut server) = tokio::io::duplex(65536);
-        let mut addr = PacketConn::new(client, PacketMode::PacketAddr);
+        let mut addr = PacketConn::new(client, PacketMode::PacketAddr, &header_dest());
         let err = addr
             .send(Some("127.0.0.1:1".parse().unwrap()), &big)
             .await
@@ -322,7 +375,7 @@ mod tests {
         // PacketAddr mode needs a per-datagram destination (spec §4.3);
         // send(None) must fail before any byte is written.
         let (client, mut server) = tokio::io::duplex(1024);
-        let mut conn = PacketConn::new(client, PacketMode::PacketAddr);
+        let mut conn = PacketConn::new(client, PacketMode::PacketAddr, &header_dest());
 
         let err = conn.send(None, b"p").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -337,7 +390,7 @@ mod tests {
         // exact size is accepted and delivered; 65536 is rejected before
         // any write.
         let (client, mut server) = tokio::io::duplex(1 << 17);
-        let mut conn = PacketConn::new(client, PacketMode::Raw);
+        let mut conn = PacketConn::new(client, PacketMode::Raw, &header_dest());
 
         let max = vec![0u8; MAX_FRAME];
         conn.send(None, &max).await.unwrap();
@@ -412,5 +465,59 @@ mod tests {
         let frame = read_frame(&mut server).await.unwrap().unwrap();
         assert_eq!(frame.status, STATUS_END);
         assert_eq!(frame.payload.as_ref(), b"");
+    }
+
+    #[tokio::test]
+    async fn raw_send_refuses_a_foreign_destination() {
+        // Raw frames carry no address: every datagram lands on the
+        // request-header destination. None names it, an equal explicit
+        // destination is accepted, a different one is refused — otherwise
+        // the datagram would silently reach the header destination instead.
+        let (client, mut server) = tokio::io::duplex(1024);
+        let dest: SocketAddr = "1.2.3.4:53".parse().unwrap();
+        let mut conn = PacketConn::new(client, PacketMode::Raw, &header_dest());
+
+        conn.send(None, b"a").await.unwrap();
+        conn.send(Some(dest), b"b").await.unwrap();
+        let err = conn
+            .send(Some("9.9.9.9:53".parse().unwrap()), b"c")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // A same-address, different-port destination is foreign too.
+        let err = conn
+            .send(Some("1.2.3.4:54".parse().unwrap()), b"c")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Both accepted sends are on the wire; the refused ones wrote nothing.
+        assert_eq!(read_packet(&mut server).await.unwrap().unwrap(), b"a");
+        assert_eq!(read_packet(&mut server).await.unwrap().unwrap(), b"b");
+        drop(conn);
+        assert!(read_packet(&mut server).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_send_with_a_domain_header_dest_refuses_any_destination() {
+        // A domain header destination has no SocketAddr form, so nothing an
+        // explicit destination could match: None still works, Some cannot.
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut conn = PacketConn::new(
+            client,
+            PacketMode::Raw,
+            &TargetAddr::new(Host::Domain("dns.example".into()), 53),
+        );
+
+        conn.send(None, b"a").await.unwrap();
+        let err = conn
+            .send(Some("1.2.3.4:53".parse().unwrap()), b"b")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        assert_eq!(read_packet(&mut server).await.unwrap().unwrap(), b"a");
+        drop(conn);
+        assert!(read_packet(&mut server).await.unwrap().is_none());
     }
 }

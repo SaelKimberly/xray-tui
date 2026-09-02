@@ -111,6 +111,26 @@ pub const TROJAN_ATYP_IPV4: u8 = 0x01;
 pub const TROJAN_ATYP_DOMAIN: u8 = 0x03;
 pub const TROJAN_ATYP_IPV6: u8 = 0x04;
 
+/// Bytes following the ATYP byte (and, for the domain family, following
+/// the domain length byte) of a port-last address: `addr || port BE2`.
+///
+/// The single owner of the port-last address layout: the trojan UDP frame
+/// reader sizes its read from it and [`decode_addr_port_last`] bounds-checks
+/// with it, so neither can drift from [`encode_addr_port_last`]. `None` for
+/// an unknown family byte. `domain_len` is ignored by the fixed-size
+/// families.
+#[must_use]
+pub const fn addr_port_last_tail_len(atyp: u8, domain_len: u8) -> Option<usize> {
+    match atyp {
+        TROJAN_ATYP_IPV4 => Some(4 + 2),
+        TROJAN_ATYP_IPV6 => Some(16 + 2),
+        // `as` (not `usize::from`): the `From` trait is not callable in a
+        // const fn.
+        TROJAN_ATYP_DOMAIN => Some(domain_len as usize + 2),
+        _ => None,
+    }
+}
+
 /// Encode a destination in **port-last** order with the **trojan** family
 /// bytes: address (SOCKS5-ATYP type byte + payload), then port BE2.
 ///
@@ -185,6 +205,46 @@ pub fn decode_addr(bytes: &[u8]) -> Option<(TargetAddr, &[u8])> {
         }
         _ => None,
     }
+}
+
+/// Decode one trojan-family (SOCKS5-ATYP, port-last) wire address; returns
+/// the address plus the unconsumed tail.
+///
+/// Mirrors the trojan address parsers (xray `NewAddressParser` without
+/// `PortFirst()`, sing-box `SocksaddrSerializer`): `ATYP | addr | port BE2`
+/// with the SOCKS5 family bytes (`0x01` IPv4 / `0x03` domain / `0x04`
+/// IPv6) — the reverse byte order and family set of [`decode_addr`].
+#[must_use]
+pub fn decode_addr_port_last(bytes: &[u8]) -> Option<(TargetAddr, &[u8])> {
+    let (&atyp, rest) = bytes.split_first()?;
+    // Only the domain family carries a length byte; the IP families have a
+    // fixed-size address.
+    let (domain_len, rest) = if atyp == TROJAN_ATYP_DOMAIN {
+        let (&len, after_len) = rest.split_first()?;
+        (len, after_len)
+    } else {
+        (0, rest)
+    };
+    let tail = addr_port_last_tail_len(atyp, domain_len)?;
+    if rest.len() < tail {
+        return None;
+    }
+    let (addr, port_be) = rest[..tail].split_at(tail - 2);
+    let port = u16::from_be_bytes([port_be[0], port_be[1]]);
+    let host = match atyp {
+        TROJAN_ATYP_IPV4 => Host::Ip(IpAddr::V4(Ipv4Addr::new(
+            addr[0], addr[1], addr[2], addr[3],
+        ))),
+        TROJAN_ATYP_IPV6 => {
+            let mut oct = [0u8; 16];
+            oct.copy_from_slice(addr);
+            Host::Ip(IpAddr::V6(Ipv6Addr::from(oct)))
+        }
+        // The domain family — the only other one `addr_port_last_tail_len`
+        // accepts.
+        _ => Host::Domain(std::str::from_utf8(addr).ok()?.to_string()),
+    };
+    Some((TargetAddr::new(host, port), &rest[tail..]))
 }
 
 #[cfg(test)]
@@ -262,5 +322,78 @@ mod tests {
         assert!(decode_addr(&[0x00, 0x50, 0x02]).is_none());
         assert!(decode_addr(&[0x00, 0x50, 0x02, 0x05, b'a']).is_none());
         assert!(decode_addr(&[0x00, 0x50, 0x09, 0x00]).is_none());
+    }
+
+    #[test]
+    fn encode_port_last_is_atyp_addr_port() {
+        // IPv4: ATYP 0x01 | 4-byte addr | port BE2 (port LAST — reverse of
+        // the v2ray wire).
+        let t = TargetAddr::new(Host::new("127.0.0.1"), 8080);
+        assert_eq!(
+            encode_addr_port_last(&t).unwrap(),
+            vec![0x01, 127, 0, 0, 1, 0x1f, 0x90]
+        );
+        // Domain: ATYP 0x03 | len | bytes | port BE2.
+        let d = TargetAddr::new(Host::Domain("x.io".into()), 9);
+        assert_eq!(
+            encode_addr_port_last(&d).unwrap(),
+            vec![0x03, 4, b'x', b'.', b'i', b'o', 0x00, 0x09]
+        );
+    }
+
+    #[test]
+    fn decode_port_last_roundtrip_all_types() {
+        for t in [
+            TargetAddr::new(Host::new("1.2.3.4"), 80),
+            TargetAddr::new(Host::Domain("sub.example.org".into()), 255),
+            TargetAddr::new(Host::new("2001:db8::1"), 443),
+        ] {
+            let encoded = encode_addr_port_last(&t).unwrap();
+            let (decoded, tail) = decode_addr_port_last(&encoded).expect("decode");
+            assert_eq!(decoded, t);
+            assert!(tail.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_port_last_truncated_and_unknown_atyp() {
+        assert!(decode_addr_port_last(&[]).is_none());
+        assert!(decode_addr_port_last(&[0x01, 1, 2, 3]).is_none()); // missing port
+        assert!(decode_addr_port_last(&[0x03, 5, b'a']).is_none()); // short domain
+        assert!(decode_addr_port_last(&[0x02, 1, 2, 3, 4, 0, 80]).is_none()); // unknown ATYP
+    }
+
+    #[test]
+    fn port_last_tail_len_matches_the_encoder() {
+        // The tail after the ATYP byte (and after the domain length byte):
+        // addr || port BE2.
+        assert_eq!(addr_port_last_tail_len(TROJAN_ATYP_IPV4, 0), Some(4 + 2));
+        assert_eq!(addr_port_last_tail_len(TROJAN_ATYP_IPV6, 0), Some(16 + 2));
+        assert_eq!(addr_port_last_tail_len(TROJAN_ATYP_DOMAIN, 7), Some(7 + 2));
+        // A domain length is meaningless for the fixed-size families.
+        assert_eq!(addr_port_last_tail_len(TROJAN_ATYP_IPV4, 200), Some(6));
+        // Unknown family (0x02 is the VLESS/VMess domain byte, not a
+        // SOCKS5-ATYP one).
+        assert_eq!(addr_port_last_tail_len(0x02, 4), None);
+
+        // Family for family, the helper sizes exactly what the encoder
+        // emitted after the type (and length) byte.
+        for t in [
+            TargetAddr::new(Host::new("1.2.3.4"), 80),
+            TargetAddr::new(Host::new("2001:db8::1"), 443),
+            TargetAddr::new(Host::Domain("sub.example.org".into()), 9),
+        ] {
+            let wire = encode_addr_port_last(&t).unwrap();
+            let (head, domain_len) = if wire[0] == TROJAN_ATYP_DOMAIN {
+                (2, wire[1])
+            } else {
+                (1, 0)
+            };
+            assert_eq!(
+                addr_port_last_tail_len(wire[0], domain_len),
+                Some(wire.len() - head),
+                "tail length must match the encoded form of {t:?}"
+            );
+        }
     }
 }

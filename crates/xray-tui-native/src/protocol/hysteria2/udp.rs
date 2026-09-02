@@ -1,0 +1,595 @@
+//! Hysteria2 UDP relay: QUIC DATAGRAM frames carrying the `UDPMessage`
+//! wire format, with fragmentation on `DatagramTooLarge` and per-session
+//! defragmentation.
+//!
+//! Wire contract: `thirdparty/hysteria/core/internal/protocol/proxy.go`
+//! (`UDPMessage`), sing-box via `sing-quic/hysteria2` (same wire). A UDP
+//! "session" is a client-chosen `sessionID` (hysteria starts at 1 and
+//! increments per session; this client opens one session per tunnel). Each
+//! datagram carries a full `UDPMessage`:
+//!
+//! ```text
+//! SessionID (uint32 BE) | PacketID (uint16 BE) | FragID (uint8) |
+//! FragCount (uint8) | AddrLen (QUIC varint) | Addr | Data...
+//! ```
+//!
+//! Oversized datagrams are fragmented (one `PacketID`, `FragID`/`FragCount`
+//! splitting the payload); the receiver reassembles by `PacketID`.
+//!
+//! Outbound messages are borrowed views (`UdpMessageRef`) serialized into
+//! one reusable per-session buffer (upstream's `SendBuf`,
+//! `core/client/udp.go:160`); inbound ones are owned (`UdpMessage`) because
+//! the defragmenter holds fragments until a message assembles.
+
+use std::io;
+use std::net::SocketAddr;
+
+use bytes::{BufMut, BytesMut};
+use quinn::{Connection, SendDatagramError};
+
+use super::quic::{H3Keepalive, put_varint, read_varint, varint_len};
+
+/// Max address bytes a `UDPMessage` may carry: `ParseUDPMessage` bounds the
+/// address by `MaxMessageLength`, not `MaxAddressLength`
+/// (`thirdparty/hysteria/core/internal/protocol/proxy.go:212`).
+const MAX_MESSAGE_LEN: usize = 2048;
+/// Max UDP payload per datagram (`MaxUDPSize`): the size of the per-session
+/// send buffer upstream (`core/client/udp.go:160`) and of the buffer the
+/// server relays replies from (`core/server/udp.go:182`).
+const MAX_UDP_SIZE: usize = 4096;
+/// Fallback datagram budget when the peer does not advertise one
+/// (`MaxDatagramFrameSize`).
+const DEFAULT_DATAGRAM_BUDGET: usize = 1200;
+
+/// A `UDPMessage` on its way out: the header fields with the address and
+/// payload BORROWED — the send path serializes them straight into the
+/// session buffer instead of copying them into an owned message.
+struct UdpMessageRef<'a> {
+    session_id: u32,
+    packet_id: u16,
+    frag_id: u8,
+    frag_count: u8,
+    /// The Socksaddr string form (`host:port` / `[v6]:port`).
+    addr: &'a str,
+    data: &'a [u8],
+}
+
+impl UdpMessageRef<'_> {
+    /// Bytes ahead of the payload (hysteria `UDPMessage.HeaderSize`).
+    const fn header_size(&self) -> usize {
+        4 + 2 + 1 + 1 + varint_len(self.addr.len() as u64) + self.addr.len()
+    }
+
+    const fn size(&self) -> usize {
+        self.header_size() + self.data.len()
+    }
+
+    /// Serialize into `buf` (hysteria `UDPMessage.Serialize`): one exact
+    /// reservation, then the header and the borrowed payload — no
+    /// intermediate buffer, no copy of `addr`/`data` into an owned message.
+    fn serialize_into(&self, buf: &mut BytesMut) {
+        buf.reserve(self.size());
+        buf.put_u32(self.session_id);
+        buf.put_u16(self.packet_id);
+        buf.put_u8(self.frag_id);
+        buf.put_u8(self.frag_count);
+        put_varint(buf, self.addr.len() as u64);
+        buf.put_slice(self.addr.as_bytes());
+        buf.put_slice(self.data);
+    }
+}
+
+/// A parsed inbound `UDPMessage` (hysteria `protocol.UDPMessage`) — owned
+/// because the defragmenter keeps fragments until the message assembles.
+struct UdpMessage {
+    session_id: u32,
+    packet_id: u16,
+    frag_id: u8,
+    frag_count: u8,
+    /// The Socksaddr string form (`host:port` / `[v6]:port`).
+    addr: String,
+    data: Vec<u8>,
+}
+
+impl UdpMessage {
+    fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 8 {
+            return None;
+        }
+        let session_id = u32::from_be_bytes(buf[0..4].try_into().ok()?);
+        let packet_id = u16::from_be_bytes(buf[4..6].try_into().ok()?);
+        let frag_id = buf[6];
+        let frag_count = buf[7];
+        let (addr_len, rest) = read_varint(&buf[8..])?;
+        let addr_len = usize::try_from(addr_len).ok()?;
+        // `rest.len() <= addr_len` mirrors upstream's guard: at least one
+        // payload byte must follow the address (`ParseUDPMessage`,
+        // `internal/protocol/proxy.go:216`). Such a datagram is dropped by
+        // the receive loop, never fatal.
+        if addr_len == 0 || addr_len > MAX_MESSAGE_LEN || rest.len() <= addr_len {
+            return None;
+        }
+        let addr = std::str::from_utf8(&rest[..addr_len]).ok()?.to_string();
+        let data = rest[addr_len..].to_vec();
+        Some(Self {
+            session_id,
+            packet_id,
+            frag_id,
+            frag_count,
+            addr,
+            data,
+        })
+    }
+}
+
+/// Per-session defragmentation (hysteria `frag.Defragger`): reassembles
+/// `FragCount` fragments sharing one `PacketID`; a new `PacketID` discards
+/// the previous partial message.
+struct Defragger {
+    pkt_id: u16,
+    frags: Vec<Option<UdpMessage>>,
+    count: usize,
+    size: usize,
+}
+
+impl Defragger {
+    const fn new() -> Self {
+        Self {
+            pkt_id: 0,
+            frags: Vec::new(),
+            count: 0,
+            size: 0,
+        }
+    }
+
+    /// Feed one fragment; returns the assembled message when complete.
+    fn feed(&mut self, m: UdpMessage) -> Option<UdpMessage> {
+        if m.frag_count <= 1 {
+            return Some(m);
+        }
+        if m.frag_id >= m.frag_count {
+            return None;
+        }
+        if m.packet_id != self.pkt_id || m.frag_count as usize != self.frags.len() {
+            // New message — discard the previous partial state.
+            self.pkt_id = m.packet_id;
+            self.frags = (0..m.frag_count as usize).map(|_| None).collect();
+            let data_len = m.data.len();
+            let slot = m.frag_id as usize;
+            self.frags[slot] = Some(m);
+            self.count = 1;
+            self.size = data_len;
+        } else if self.frags[m.frag_id as usize].is_none() {
+            let data_len = m.data.len();
+            let slot = m.frag_id as usize;
+            self.frags[slot] = Some(m);
+            self.count += 1;
+            self.size += data_len;
+            if self.count == self.frags.len() {
+                // All fragments present — assemble.
+                let mut data = Vec::with_capacity(self.size);
+                for frag in &self.frags {
+                    data.extend_from_slice(&frag.as_ref()?.data);
+                }
+                let first = self.frags.iter().flatten().next()?;
+                return Some(UdpMessage {
+                    session_id: first.session_id,
+                    packet_id: first.packet_id,
+                    frag_id: 0,
+                    frag_count: 1,
+                    addr: first.addr.clone(),
+                    data,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// The Socksaddr string form for an IP destination (`host:port` /
+/// `[v6]:port`).
+fn sockaddr_string(sa: SocketAddr) -> String {
+    match sa {
+        SocketAddr::V4(v4) => format!("{v4}"),
+        // SocketAddrV6's Display already brackets the address and appends
+        // the port (`[::1]:443`).
+        SocketAddr::V6(v6) => format!("{v6}"),
+    }
+}
+
+/// Decide one received datagram: `Some((dest, payload))` to deliver it,
+/// `None` to drop it and keep reading.
+///
+/// Dropped: another session's datagram, an unparsable `UDPMessage`
+/// (upstream does the same — "invalid message, this is fine - just wait for
+/// the next", `core/client/client.go:325`), and an incomplete fragment.
+/// `dest` is `None` when the reply address is not an IP form (a domain, or
+/// the server's address-override hook `core/server/udp.go:166`) — the
+/// datagram API has no other way to say "no per-packet address".
+fn accept_datagram(
+    defrag: &mut Defragger,
+    session_id: u32,
+    bytes: &[u8],
+) -> Option<(Option<SocketAddr>, Vec<u8>)> {
+    let msg = UdpMessage::parse(bytes)?;
+    if msg.session_id != session_id {
+        return None;
+    }
+    let assembled = defrag.feed(msg)?;
+    Some((assembled.addr.parse().ok(), assembled.data))
+}
+
+/// A Hysteria2 UDP connection over QUIC datagrams (one UDP session).
+///
+/// Sends `UDPMessage` frames (with fragmentation on `DatagramTooLarge`);
+/// receives and defragments the server's replies for this session.
+pub struct UdpConn {
+    conn: Connection,
+    /// Keeps the h3 session (and the quinn connection) alive.
+    _h3: H3Keepalive,
+    session_id: u32,
+    /// The session destination in hysteria's Socksaddr wire form (rendered
+    /// once from `ctx.target`): the address a send without a per-packet
+    /// destination carries.
+    target: String,
+    defrag: Defragger,
+    /// Next `PacketID` for fragmented sends (nonzero).
+    next_packet_id: u16,
+    /// Serialization scratch reused by every datagram: each message is split
+    /// off it and handed to quinn without a copy (upstream keeps one
+    /// per-session `SendBuf`, `core/client/udp.go:160`).
+    send_buf: BytesMut,
+}
+
+impl UdpConn {
+    #[must_use]
+    pub(super) fn new(conn: Connection, keepalive: H3Keepalive, target: String) -> Self {
+        Self {
+            conn,
+            _h3: keepalive,
+            session_id: 1,
+            target,
+            defrag: Defragger::new(),
+            next_packet_id: 1,
+            send_buf: BytesMut::with_capacity(MAX_UDP_SIZE),
+        }
+    }
+
+    /// Send one datagram to `dest`, or — with `dest: None` — to the session
+    /// destination this tunnel was opened for. Every `UDPMessage` carries an
+    /// address on the wire (upstream takes it per call, `udpConn.Send`,
+    /// `core/client/udp.go:52`), so `None` means "the session destination",
+    /// never "no address".
+    // quinn's datagram send is synchronous; `send` is async only to match
+    // the `PacketTunnel` datagram API (the stream-chain variants do await).
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> io::Result<()> {
+        if payload.len() > MAX_UDP_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "hy2 udp datagram too large ({}, max {MAX_UDP_SIZE})",
+                    payload.len()
+                ),
+            ));
+        }
+        // The per-packet address, rendered once per send: every fragment
+        // borrows it instead of cloning.
+        let per_packet = dest.map(sockaddr_string);
+        let Self {
+            conn,
+            session_id,
+            target,
+            next_packet_id,
+            send_buf,
+            ..
+        } = self;
+        let session_target = target.as_str();
+        let msg = UdpMessageRef {
+            session_id: *session_id,
+            packet_id: 0,
+            frag_id: 0,
+            frag_count: 1,
+            // `dest: None` = "the session destination", never "no address".
+            addr: per_packet.as_deref().unwrap_or(session_target),
+            data: payload,
+        };
+        // Bound before the match so the buffer reborrow ends here: the
+        // fragment path needs it again.
+        let unfragmented = send_datagram(conn, send_buf, &msg);
+        match unfragmented {
+            Ok(()) => Ok(()),
+            Err(SendDatagramError::TooLarge) => {
+                let budget = conn.max_datagram_size().unwrap_or(DEFAULT_DATAGRAM_BUDGET);
+                let packet_id = *next_packet_id;
+                *next_packet_id = next_packet_id.wrapping_add(1).max(1);
+                send_fragmented(conn, send_buf, &msg, packet_id, budget)
+            }
+            Err(e) => Err(io::Error::other(format!("hy2 udp send: {e}"))),
+        }
+    }
+
+    /// Receive one datagram. `Ok(None)` on a clean end-of-stream (the QUIC
+    /// connection closed). Undeliverable datagrams — another session's,
+    /// malformed, or an incomplete fragment — are dropped and the loop keeps
+    /// reading, exactly as upstream does (`core/client/client.go:325`). The
+    /// returned address is `None` when the reply carried a non-IP Socksaddr
+    /// (a domain): the datagram API has no other way to say "no per-packet
+    /// address".
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+        loop {
+            let Ok(bytes) = self.conn.read_datagram().await else {
+                return Ok(None); // connection closed = clean EOF
+            };
+            if let Some(delivered) = accept_datagram(&mut self.defrag, self.session_id, &bytes) {
+                return Ok(Some(delivered));
+            }
+        }
+    }
+}
+
+/// One unfragmented datagram send: serialize into the session buffer and
+/// hand quinn exactly those bytes — `split().freeze()` transfers the written
+/// range with no copy and leaves the tail for the next datagram.
+fn send_datagram(
+    conn: &Connection,
+    buf: &mut BytesMut,
+    msg: &UdpMessageRef<'_>,
+) -> Result<(), SendDatagramError> {
+    msg.serialize_into(buf);
+    conn.send_datagram(buf.split().freeze())
+}
+
+/// Fragment `msg` into `budget`-bounded datagrams sharing one `PacketID`
+/// (hysteria `frag.FragUDPMessage` on `DatagramTooLarge`). Every fragment
+/// borrows the original address and a slice of the original payload.
+#[allow(clippy::cast_possible_truncation)] // both casts are `frag_count`-bounded, checked below
+fn send_fragmented(
+    conn: &Connection,
+    buf: &mut BytesMut,
+    msg: &UdpMessageRef<'_>,
+    packet_id: u16,
+    budget: usize,
+) -> io::Result<()> {
+    let max_payload = budget.saturating_sub(msg.header_size());
+    if max_payload == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hy2 udp: datagram budget smaller than the message header",
+        ));
+    }
+    let frag_count = msg.data.len().div_ceil(max_payload);
+    if frag_count > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hy2 udp: datagram needs too many fragments",
+        ));
+    }
+    let frag_count = frag_count as u8;
+    for (i, chunk) in msg.data.chunks(max_payload).enumerate() {
+        let frag = UdpMessageRef {
+            session_id: msg.session_id,
+            packet_id,
+            frag_id: i as u8,
+            frag_count,
+            addr: msg.addr,
+            data: chunk,
+        };
+        send_datagram(conn, buf, &frag)
+            .map_err(|e| io::Error::other(format!("hy2 udp fragment: {e}")))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One outbound `UDPMessage` view (session 1, unfragmented).
+    fn out<'a>(addr: &'a str, data: &'a [u8]) -> UdpMessageRef<'a> {
+        UdpMessageRef {
+            session_id: 1,
+            packet_id: 0,
+            frag_id: 0,
+            frag_count: 1,
+            addr,
+            data,
+        }
+    }
+
+    /// One serialized `UDPMessage`, as the server puts it on the wire.
+    fn wire(session_id: u32, addr: &str, data: &[u8]) -> BytesMut {
+        let msg = UdpMessageRef {
+            session_id,
+            ..out(addr, data)
+        };
+        let mut buf = BytesMut::new();
+        msg.serialize_into(&mut buf);
+        buf
+    }
+
+    /// One inbound fragment of packet `pkt`.
+    fn frag(pkt: u16, id: u8, count: u8, data: &[u8]) -> UdpMessage {
+        UdpMessage {
+            session_id: 1,
+            packet_id: pkt,
+            frag_id: id,
+            frag_count: count,
+            addr: "8.8.8.8:53".into(),
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn udp_message_serialize_parse_roundtrip() {
+        let m = out("1.2.3.4:53", b"hello");
+        let mut buf = BytesMut::new();
+        m.serialize_into(&mut buf);
+        assert_eq!(buf.len(), m.size());
+        let parsed = UdpMessage::parse(&buf).expect("parses");
+        assert_eq!(parsed.session_id, 1);
+        assert_eq!(parsed.packet_id, 0);
+        assert_eq!(parsed.frag_id, 0);
+        assert_eq!(parsed.frag_count, 1);
+        assert_eq!(parsed.addr, "1.2.3.4:53");
+        assert_eq!(parsed.data, b"hello");
+    }
+
+    #[test]
+    fn udp_message_wire_layout_exact() {
+        // "1.2.3.4:53" is 10 bytes → 1-byte varint 0x0a. Fixed header 8B.
+        let m = out("1.2.3.4:53", b"hi");
+        let mut buf = BytesMut::new();
+        m.serialize_into(&mut buf);
+        let mut expect = vec![
+            0, 0, 0, 1, // session 1
+            0, 0,  // packet 0
+            0,  // frag 0
+            1,  // frag count 1
+            10, // addr len
+        ];
+        expect.extend_from_slice(b"1.2.3.4:53");
+        expect.extend_from_slice(b"hi");
+        assert_eq!(&buf[..], &expect[..]);
+    }
+
+    #[test]
+    fn addr_len_past_63_uses_the_two_byte_varint() {
+        // A 64-byte address leaves the 1-byte varint range (RFC 9000 §16):
+        // the prefix becomes `0x4000 | len`, and the header grows with it —
+        // sizing the header with a fixed 1-byte varint would truncate the
+        // payload.
+        let addr = format!("{}:53", "a".repeat(61));
+        assert_eq!(addr.len(), 64);
+        let m = out(&addr, b"x");
+        assert_eq!(m.header_size(), 8 + 2 + 64);
+        let mut buf = BytesMut::new();
+        m.serialize_into(&mut buf);
+        assert_eq!(buf.len(), m.size());
+        assert_eq!(&buf[8..10], &[0x40, 0x40]);
+        assert_eq!(&buf[10..74], addr.as_bytes());
+        assert_eq!(&buf[74..], b"x");
+        // ...and the reader consumes the same varint width.
+        let parsed = UdpMessage::parse(&buf).expect("parses");
+        assert_eq!(parsed.addr, addr);
+        assert_eq!(parsed.data, b"x");
+    }
+
+    #[test]
+    fn parse_rejects_truncated_or_empty() {
+        assert!(UdpMessage::parse(&[]).is_none());
+        assert!(UdpMessage::parse(&[0, 0, 0, 1, 0, 0, 0]).is_none());
+        // addr len 9 but only 3 bytes follow
+        let mut buf = vec![0u8; 8 + 3];
+        buf[3] = 1;
+        buf[7] = 1;
+        buf[8] = 9;
+        buf.extend_from_slice(b"1.2.3");
+        assert!(UdpMessage::parse(&buf[..8 + 3]).is_none());
+        // Address but no payload byte: upstream's parser rejects it too
+        // (`ParseUDPMessage`, `internal/protocol/proxy.go:216`).
+        let empty = wire(1, "1.2.3.4:53", b"");
+        assert!(UdpMessage::parse(&empty).is_none(), "no payload byte");
+    }
+
+    #[test]
+    fn accept_drops_undeliverable_datagrams() {
+        let mut d = Defragger::new();
+        // Truncated, another session's, and payload-less datagrams are all
+        // dropped — never an error, or one bad datagram would kill the
+        // session (`client.go:325`).
+        assert!(accept_datagram(&mut d, 1, &[0, 0, 0, 1]).is_none(), "short");
+        let foreign = wire(2, "1.2.3.4:53", b"x");
+        assert!(
+            accept_datagram(&mut d, 1, &foreign).is_none(),
+            "other session"
+        );
+        let empty = wire(1, "1.2.3.4:53", b"");
+        assert!(
+            accept_datagram(&mut d, 1, &empty).is_none(),
+            "empty payload"
+        );
+        // ...and the next good datagram still arrives.
+        let good = wire(1, "1.2.3.4:53", b"pong");
+        let (dest, data) = accept_datagram(&mut d, 1, &good).expect("delivered");
+        assert_eq!(dest, Some("1.2.3.4:53".parse().unwrap()));
+        assert_eq!(data, b"pong");
+    }
+
+    #[test]
+    fn accept_reports_no_address_for_non_ip_reply() {
+        // A domain reply address (the server's override hook,
+        // `core/server/udp.go:166`) is delivered with `dest: None`, not
+        // rejected — `Option<SocketAddr>` already encodes "no per-packet
+        // address".
+        let mut d = Defragger::new();
+        let msg = wire(1, "example.com:53", b"hi");
+        let (dest, data) = accept_datagram(&mut d, 1, &msg).expect("delivered");
+        assert_eq!(dest, None);
+        assert_eq!(data, b"hi");
+    }
+
+    #[test]
+    fn defragger_reassembles_in_order() {
+        let mut d = Defragger::new();
+        assert!(d.feed(frag(7, 0, 2, b"ab")).is_none());
+        let out = d.feed(frag(7, 1, 2, b"c")).expect("assembled");
+        assert_eq!(out.frag_count, 1);
+        assert_eq!(out.data, b"abc");
+    }
+
+    #[test]
+    fn defragger_reassembles_out_of_order() {
+        // Fragments arrive 1 then 0: the payload must land in `FragID`
+        // order, not arrival order.
+        let mut d = Defragger::new();
+        assert!(d.feed(frag(9, 1, 2, b"world")).is_none());
+        let out = d.feed(frag(9, 0, 2, b"hello ")).expect("assembled");
+        assert_eq!(out.data, b"hello world");
+    }
+
+    #[test]
+    fn defragger_new_packet_discards_partial() {
+        // Packet 7 never completes (1 of 3 fragments); packet 8 then
+        // arrives in full. Only packet 8 assembles, carrying only its own
+        // payload.
+        let mut d = Defragger::new();
+        assert!(d.feed(frag(7, 0, 3, b"seven")).is_none());
+        assert!(d.feed(frag(8, 0, 2, b"ei")).is_none());
+        let out = d.feed(frag(8, 1, 2, b"ght")).expect("packet 8 assembled");
+        assert_eq!(out.packet_id, 8);
+        assert_eq!(out.data, b"eight");
+    }
+
+    #[test]
+    fn defragger_ignores_duplicate_fragment() {
+        // A re-delivered fragment must not be counted twice: without the
+        // occupied-slot guard the duplicate would complete the message early
+        // and double its data.
+        let mut d = Defragger::new();
+        assert!(d.feed(frag(11, 0, 3, b"aa")).is_none());
+        assert!(d.feed(frag(11, 0, 3, b"aa")).is_none(), "duplicate frag 0");
+        assert!(d.feed(frag(11, 1, 3, b"bb")).is_none(), "still one short");
+        let out = d.feed(frag(11, 2, 3, b"cc")).expect("assembled");
+        assert_eq!(out.data, b"aabbcc");
+    }
+
+    #[test]
+    fn defragger_rejects_frag_id_past_count() {
+        // `FragID >= FragCount` is nonsense (`frag.Defragger.Feed`,
+        // `internal/frag/frag.go:51`): dropped without touching the slots,
+        // so the real fragments still assemble.
+        let mut d = Defragger::new();
+        assert!(d.feed(frag(13, 2, 2, b"x")).is_none());
+        assert!(d.feed(frag(13, 9, 2, b"y")).is_none());
+        assert!(d.feed(frag(13, 0, 2, b"ok")).is_none());
+        let out = d.feed(frag(13, 1, 2, b"!")).expect("assembled");
+        assert_eq!(out.data, b"ok!");
+    }
+
+    #[test]
+    fn sockaddr_string_forms() {
+        assert_eq!(sockaddr_string("1.2.3.4:53".parse().unwrap()), "1.2.3.4:53");
+        assert_eq!(sockaddr_string("[::1]:443".parse().unwrap()), "[::1]:443");
+    }
+}

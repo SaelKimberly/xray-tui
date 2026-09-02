@@ -11,6 +11,8 @@ mod common;
 
 use common::{certs, cores, echo, pick, tls_echo};
 use rstest::rstest;
+use xray_tui_native::PacketMode;
+use xray_tui_native::e2e::AppKind;
 use xray_tui_native::e2e::{
     CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, config,
     run_against,
@@ -19,6 +21,11 @@ use xray_tui_native::e2e::{
 #[rstest]
 #[case::tls_plain(CaseSpec::hysteria2(None))]
 #[case::obfs_salamander(CaseSpec::hysteria2(Some(config::HYSTERIA2_OBFS_PSK)))]
+// Hysteria2 UDP: QUIC DATAGRAM relay (`UDPMessage` framing) — the
+// `connect_udp` probe dispatches the QUIC dial + datagram tunnel (the
+// server's `Hysteria-UDP` response header must be true). sing-box single
+// core.
+#[case::udp(CaseSpec::hysteria2(None).with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
 #[tokio::test]
 async fn hysteria2_against_singbox(
     #[case] case: CaseSpec,

@@ -122,6 +122,11 @@ pub fn quic_tls_config(
 /// Convert the rustls config into a quinn `ClientConfig` with a long idle
 /// timeout + keepalive (hysteria2 and xray both keep idle QUIC tunnels alive
 /// ~300s — quinn's 30s default would kill them mid-session).
+///
+/// QUIC DATAGRAM frames (the hysteria2 UDP relay) ride quinn's own default
+/// `datagram_receive_buffer_size` — `Some(STREAM_RWND)` in
+/// `quinn-proto/src/config/transport.rs`, which is also what gates SENDING
+/// datagrams; clearing it would disable the relay in both directions.
 #[must_use]
 pub(crate) fn quinn_client_config(tls: rustls::ClientConfig) -> quinn::ClientConfig {
     let mut quic = quinn::ClientConfig::new(Arc::new(

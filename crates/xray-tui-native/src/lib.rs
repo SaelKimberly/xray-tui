@@ -57,6 +57,7 @@ pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
 pub use inbound::{Outbound, OutboundKind, ProxyOutbound, Socks5Inbound, Socks5InboundConfig};
+pub use protocol::PacketTunnel;
 pub use protocol::vless::{
     MuxClient, MuxTarget, PacketConn, PacketMode, SessionStream, UdpSession,
 };
@@ -68,22 +69,26 @@ pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, Native
 }
 
 /// Connect through a single proxy with a UDP datagram tunnel to
-/// `params.target` (`params.udp` selects the packet mode: `Raw` or
-/// `PacketAddr`).
+/// `params.target`.
+///
+/// `params.udp` selects the packet mode: [`PacketMode::Raw`] (the header
+/// destination — every protocol below) or the VLESS-only
+/// [`PacketMode::PacketAddr`] / [`PacketMode::XUdp`], which the non-VLESS
+/// protocols refuse.
 ///
 /// The same dial → security → transport chain as [`connect`] runs
-/// unchanged; only the protocol phase differs. Two tunnels:
-/// - RAW (default): VLESS command 0x02 + `[2B len]` datagram framing.
-/// - XUDP (`params.mux`, or the `xtls-rprx-vision-udp443` flow which
-///   forces it): the VLESS mux tunnel (command 0x03) with one UDP session
-///   carrying a random 8-byte `GlobalID`; the returned [`PacketConn`] is
-///   in [`PacketMode::XUdp`] and delegates to the session (per-packet
-///   destinations, no local framing).
+/// unchanged; only the protocol phase differs. The datagram carrier is
+/// protocol-specific ([`PacketTunnel`]):
+/// - **VLESS** command 0x02 + `[2B len]` framing; XUDP (`params.mux`, or
+///   the `xtls-rprx-vision-udp443` flow which forces it) rides the mux
+///   tunnel with a random 8-byte `GlobalID`.
+/// - **`VMess`** command 0x02 AEAD records (one record = one datagram).
+/// - **Trojan** command 3 address-prefixed frames.
+/// - **Hysteria2** a fresh QUIC dial + QUIC DATAGRAM `UDPMessage` frames
+///   (the QUIC-family protocol must be the only/last link).
 ///
-/// The returned [`PacketConn`] is a datagram API over the tunnel.
-pub async fn connect_udp(
-    params: &NativeConnectParams,
-) -> Result<PacketConn<BoxStream>, NativeError> {
+/// The returned [`PacketTunnel`] is a datagram API over the tunnel.
+pub async fn connect_udp(params: &NativeConnectParams) -> Result<PacketTunnel, NativeError> {
     let target = params.target.clone();
     connect_chain_udp(std::slice::from_ref(params), target).await
 }

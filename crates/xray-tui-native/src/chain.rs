@@ -10,11 +10,14 @@
 //! protocol, threading the resulting stream into the next link as its
 //! `base`.
 
+use xray_tui_proto::proto_spec::ProtocolKind;
+
 use crate::addr::TargetAddr;
 use crate::context::{LinkContext, NativeConnectParams};
 use crate::error::NativeError;
 use crate::protocol;
-use crate::protocol::vless::{MuxClient, PacketConn};
+use crate::protocol::PacketTunnel;
+use crate::protocol::vless::MuxClient;
 use crate::security;
 use crate::transport;
 use crate::{BoxStream, NativeTunnel};
@@ -26,6 +29,28 @@ fn next_target(links: &[NativeConnectParams], i: usize, target: &TargetAddr) -> 
         || target.clone(),
         |next| TargetAddr::new(next.server.host.as_str(), next.server.port),
     )
+}
+
+/// The QUIC-family placement rule, shared by every fold: a QUIC-family
+/// protocol (Hysteria2/Hysteria1/TUIC) dials its own connection, replacing
+/// dial + security + upgrade (spec §5.2), so it must be the LAST link and
+/// cannot ride an existing base tunnel.
+fn quic_guard(
+    links: &[NativeConnectParams],
+    i: usize,
+    base: Option<&BoxStream>,
+) -> Result<(), NativeError> {
+    if i + 1 != links.len() {
+        return Err(NativeError::Config(
+            "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) must be the last link".into(),
+        ));
+    }
+    if base.is_some() {
+        return Err(NativeError::Config(
+            "a QUIC-family protocol cannot reuse a base tunnel (fresh QUIC dial)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// One link's stream after the dial: security (TLS/REALITY) OUTERMOST, then
@@ -54,20 +79,9 @@ pub async fn connect_chain(
         if protocol::is_quic_link(&ctx) {
             // QUIC-family protocols (Hysteria2/Hysteria1/TUIC) are a
             // divergent dial: `protocol::connect_quic` performs the QUIC dial
-            // (replacing dial + security + upgrade — spec §5.2) and must be
-            // the LAST link (a QUIC connection cannot ride an existing TCP
-            // tunnel).
-            if i + 1 != links.len() {
-                return Err(NativeError::Config(
-                    "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) must be the last link"
-                        .into(),
-                ));
-            }
-            if base.is_some() {
-                return Err(NativeError::Config(
-                    "a QUIC-family protocol cannot reuse a base tunnel (fresh QUIC dial)".into(),
-                ));
-            }
+            // (replacing dial + security + upgrade — spec §5.2) and the
+            // placement rule applies (`quic_guard`).
+            quic_guard(links, i, base.as_ref())?;
             base = Some(protocol::connect_quic(&ctx).await?);
             continue;
         }
@@ -79,25 +93,42 @@ pub async fn connect_chain(
         .ok_or_else(|| NativeError::Config("empty chain".into()))
 }
 
-/// Connect through a chain of proxies to `target` with a VLESS UDP datagram
-/// tunnel (command 0x02).
+/// Connect through a chain of proxies to `target` with a protocol-generic
+/// UDP datagram tunnel.
 ///
 /// Identical to [`connect_chain`] except the LAST link runs the UDP
-/// protocol phase and the result is the packet-framed [`PacketConn`]
-/// instead of a byte tunnel. Intermediate links tunnel TCP as usual — they
-/// carry the UDP tunnel as a byte stream to the next hop.
+/// protocol phase and the result is the datagram [`PacketTunnel`] instead
+/// of a byte tunnel. The carrier is the last link's protocol: VLESS command
+/// 0x02 (`[2B len]` framing, packetaddr headers, or mux XUDP), `VMess`
+/// command 0x02 AEAD records, trojan command 3 address-prefixed frames, or
+/// hysteria2 QUIC DATAGRAM `UDPMessage` frames. Intermediate links tunnel
+/// TCP as usual — they carry the UDP tunnel as a byte stream to the next
+/// hop; hysteria2 dials its own QUIC connection and is therefore the only
+/// link (`quic_guard`).
 pub async fn connect_chain_udp(
     links: &[NativeConnectParams],
     target: TargetAddr,
-) -> Result<PacketConn<BoxStream>, NativeError> {
+) -> Result<PacketTunnel, NativeError> {
     let mut base: Option<BoxStream> = None;
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
         let ctx = LinkContext::new(link.clone(), to);
         if protocol::is_quic_link(&ctx) {
-            return Err(NativeError::Config(
-                "a QUIC-family protocol (Hysteria2/Hysteria1/TUIC) is not supported by the                  UDP tunnel path".into(),
-            ));
+            // QUIC-family protocols are a divergent dial: the hysteria2 UDP
+            // path dials a fresh QUIC connection and runs its own datagram
+            // relay, under the same placement rule (`quic_guard`).
+            quic_guard(links, i, base.as_ref())?;
+            return match &ctx.params.protocol {
+                xray_tui_proto::proto_spec::ProtocolConfig::Hysteria2(cfg) => {
+                    protocol::reject_vless_only_mode(&ctx, ProtocolKind::Hysteria2)?;
+                    Ok(PacketTunnel::Hysteria2(
+                        crate::protocol::hysteria2::connect_udp(&ctx, cfg).await?,
+                    ))
+                }
+                _ => Err(NativeError::NotImplemented {
+                    feature: "udp over a QUIC-family protocol (only hysteria2 implemented)".into(),
+                }),
+            };
         }
         let dialed = transport::connect(&ctx, base).await?;
         let upgraded = secured_upgraded(&ctx, dialed).await?;
@@ -177,6 +208,23 @@ mod tests {
             TargetAddr::new(Host::Domain("b.example".into()), 20)
         );
         assert_eq!(next_target(&links, 1, &final_target), final_target);
+    }
+
+    #[test]
+    fn quic_guard_allows_only_a_last_link_without_a_base() {
+        // The placement rule both folds share: a fresh QUIC dial cannot be
+        // an intermediate hop and cannot ride an existing tunnel.
+        let links = [params("a.example", 10), params("b.example", 20)];
+        quic_guard(&links, 1, None).expect("last link, no base tunnel");
+        assert!(matches!(
+            quic_guard(&links, 0, None),
+            Err(NativeError::Config(msg)) if msg.contains("must be the last link")
+        ));
+        let base: BoxStream = Box::new(tokio::io::duplex(1).0);
+        assert!(matches!(
+            quic_guard(&links, 1, Some(&base)),
+            Err(NativeError::Config(msg)) if msg.contains("cannot reuse a base tunnel")
+        ));
     }
 
     #[test]
