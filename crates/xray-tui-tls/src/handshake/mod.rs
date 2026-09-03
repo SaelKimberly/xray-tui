@@ -22,6 +22,7 @@
 //! derived over `ClientHello..server Finished` (RFC 8446 §4.4.4, §7.1).
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 pub mod tls12;
 
@@ -245,7 +246,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // IKM is `mlkem_shared || classical_shared` — Go's
     // handshake_client_tls13 appends the ECDH secret AFTER the ML-KEM
     // shared secret (`sharedKey = append(mlkemShared, sharedKey...)`).
-    let shared: Vec<u8> = match (mlkem_sk, server_hello.mlkem_ciphertext.as_deref()) {
+    let shared: Zeroizing<Vec<u8>> = match (mlkem_sk, server_hello.mlkem_ciphertext.as_deref()) {
         (Some(sk), Some(ct)) => {
             let pq_shared = Mlkem768::decapsulate(
                 sk,
@@ -253,12 +254,12 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     .map_err(|e| TlsError::Crypto(e.to_string()))?,
             )
             .map_err(|e| TlsError::Crypto(e.to_string()))?;
-            let mut combined = Vec::with_capacity(classical_shared.len() + 32);
+            let mut combined = Zeroizing::new(Vec::with_capacity(classical_shared.len() + 32));
             combined.extend_from_slice(pq_shared.as_bytes());
-            combined.extend_from_slice(&classical_shared);
+            combined.extend_from_slice(classical_shared.as_slice());
             combined
         }
-        _ => classical_shared.to_vec(),
+        _ => Zeroizing::new(classical_shared.to_vec()),
     };
 
     let mut ks = KeySchedule::new(server_hello.suite);
@@ -1808,7 +1809,7 @@ mod tests {
 
             // Key schedule over `pq || classical` — the Go hybrid contract.
             let mut combined = pq_ss.as_bytes().to_vec();
-            combined.extend_from_slice(&classical);
+            combined.extend_from_slice(classical.as_slice());
             assert_eq!(combined.len(), 64);
             let mut sk = KeySchedule::new(suite);
             sk.add_transcript(&ch);

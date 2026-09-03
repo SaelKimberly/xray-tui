@@ -28,17 +28,24 @@ rustls = { workspace = true, features = ["ring"] }
 # engine's `WebPkiVerifier::webpki_roots`).
 webpki-roots = "1"
 
-# VMess wire crypto (mandatory for any VMess client — not feature-gated)
-aes.workspace = true
-aes-gcm = "0.11"
-chacha20poly1305 = "0.11"
-ctr = "0.10"
-hmac = "0.13"
-sha2 = "0.11"
+# VMess wire crypto (mandatory for any VMess client — not feature-gated).
+# `zeroize` is NOT in any of these crates' default features: without it the
+# expanded AES round keys, the ChaCha state, and the HMAC/hasher blocks
+# (which hold the VMess cmd key and every KDF subkey) are dropped unwiped.
+aes = { workspace = true, features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+ctr = { version = "0.10", features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
+sha2 = { version = "0.11", features = ["zeroize"] }
 crc32fast = "1"
-md-5 = "0.11"
-blake2 = "0.11"
+md-5 = { version = "0.11", features = ["zeroize"] }
+blake2 = { version = "0.11", features = ["zeroize"] }
 wide = "1.7.0"
+
+# Secret wiping for the key material we own ourselves: VMess cmd/session
+# keys, VLESS UUIDs, Shadowsocks subkeys, the mlkem768x25519plus state.
+zeroize.workspace = true
 
 # CSPRNG for per-connection VMess session material (same provider rustls uses)
 ring.workspace = true
@@ -77,7 +84,7 @@ h3-quinn.workspace = true
 # needs the raw private key — x25519-dalek derives the public half from
 # arbitrary 32-byte seeds. The runtime tunnel never needs keygen: the client
 # only ECDHs with the server's `pbk`.
-x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"], optional = true }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"], optional = true }
 
 # errors
 thiserror.workspace = true

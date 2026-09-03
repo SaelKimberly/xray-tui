@@ -577,7 +577,13 @@ serialize — REALITY must agree twice with the same scalar.
 - `hello/` — `build_hello`/`to_record` (GREASE pairing, 512-byte record
   padding), `parse_hello`.
 - `crypto/` — TLS 1.3 key schedule (RFC 8448-verified) + TLS 1.2 key block, AEAD record keys
-  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs.
+  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs. Every secret-producing entry point returns
+  `Zeroizing<…>` (`hkdf_extract`/`hkdf_expand_label`/`derive_secret`/`master_secret`/
+  `finished_key`, the `TrafficSecrets` pair alias, `X25519KeyPair::agree`, the whole
+  `tls12` PRF chain) and `mlkem::SecretKey`/`SharedSecret` are `ZeroizeOnDrop` with
+  length-only `Debug`. Wire-visible outputs stay plain `Vec<u8>` (`transcript_hash`,
+  `finished_mac`), and the key bytes ring holds inside `LessSafeKey`/`Prk` are
+  unwipeable — the wipeable surface is the derivation buffers on either side.
 - `record/` — record framing, `read_record`, `TlsStream<S>`.
 - `handshake/` — client handshake (HRR detection, `ServerVerifier` seam,
   multi-record flight reassembly); TLS 1.2 fallback driver in `handshake/tls12.rs`
@@ -590,6 +596,12 @@ serialize — REALITY must agree twice with the same scalar.
 Tier-2 verification: `examples/grader.rs` + ignored `tests/tls_peet_ws.rs`
 (tls.peet.ws). Interop proof: unit tests handshake against a real rustls server
 (dev-dep).
+
+Secrets are wiped in the native crate the same way (VMess `Session`/`cmd_key`/KDF
+buffers, VLESS `mlkem768x25519plus` `nfs_key`/`united`, trojan auth token,
+`Salamander.psk`, the SOCKS5 credential frame). Both crates also carry the
+`zeroize` FEATURE on their crypto deps — it is off by default in the RustCrypto
+ciphers and stripped from `x25519-dalek` by `default-features = false`.
 
 ### xray-tui-db (library crate)
 

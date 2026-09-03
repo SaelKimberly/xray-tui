@@ -4,6 +4,7 @@
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf;
+use zeroize::Zeroizing;
 
 use crate::error::{Result, TlsError};
 
@@ -21,15 +22,23 @@ impl hkdf::KeyType for ExpandLen {
 ///
 /// The protocol fixes `salt` = `ClientHello.Random[0..20]` and `info` =
 /// `b"REALITY"`; HKDF itself accepts any salt length.
-pub fn derive_auth_key(shared_secret: &[u8; 32], salt: &[u8], info: &[u8]) -> Result<[u8; 32]> {
+///
+/// The key wipes on drop: it is the whole REALITY authentication secret for
+/// the connection (it both seals the `SessionId` and gates the server's
+/// `CertificateVerify` check).
+pub fn derive_auth_key(
+    shared_secret: &[u8; 32],
+    salt: &[u8],
+    info: &[u8],
+) -> Result<Zeroizing<[u8; 32]>> {
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt);
     let prk = salt.extract(shared_secret);
     let info_pieces = [info];
     let okm = prk
         .expand(&info_pieces, ExpandLen(32))
         .map_err(|_| TlsError::Crypto("REALITY auth_key HKDF expand failed".into()))?;
-    let mut auth_key = [0u8; 32];
-    okm.fill(&mut auth_key)
+    let mut auth_key = Zeroizing::new([0u8; 32]);
+    okm.fill(&mut *auth_key)
         .map_err(|_| TlsError::Crypto("REALITY auth_key fill failed".into()))?;
     Ok(auth_key)
 }
@@ -146,7 +155,7 @@ mod tests {
 
         let auth_key = derive_auth_key(&shared, &salt, b"REALITY").unwrap();
         assert_eq!(
-            hex(&auth_key),
+            hex(auth_key.as_slice()),
             "68e5a4d6fbfc0f93477d737fbdd45bd5f81578fbd172327b6db8e963e2ba4a3c"
         );
 

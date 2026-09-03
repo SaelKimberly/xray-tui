@@ -17,6 +17,7 @@
 //! socket-shape design.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::BoxStream;
 use crate::addr::{TargetAddr, encode_addr_port_last};
@@ -127,7 +128,8 @@ where
     let pass = password.as_bytes();
     // Credentials come from an unvalidated share URL, so an over-long one is
     // an error, never a panic.
-    let mut packet = Vec::with_capacity(3 + user.len() + pass.len());
+    // The frame carries the cleartext password; wipe the heap copy.
+    let mut packet = Zeroizing::new(Vec::with_capacity(3 + user.len() + pass.len()));
     packet.push(0x01);
     packet.push(u8::try_from(user.len()).map_err(|_| Socks5Error::CredentialTooLong)?);
     packet.extend_from_slice(user);

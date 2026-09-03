@@ -92,6 +92,13 @@ rustls = { version = "0.23", default-features = false }
 ring = "0.17"
 aes = "0.9"
 
+# Secret wiping (`Zeroizing<T>` / `#[derive(ZeroizeOnDrop)]`). Already in the
+# lockfile transitively (curve25519-dalek, the RustCrypto ciphers), so a
+# direct dep adds no tree entry. `derive` brings the `ZeroizeOnDrop` macro.
+# Shared by xray-tui-tls (key schedule, ML-KEM, REALITY auth) and
+# xray-tui-native (protocol key material).
+zeroize = { version = "1.9", features = ["derive"] }
+
 # ============ TUI ============
 ratatui-themes = "0.2"
 

@@ -10,6 +10,7 @@
 //! clear error rather than silently degraded.
 
 use ring::{digest, hmac};
+use zeroize::Zeroizing;
 
 /// The TLS 1.2 AEAD cipher suites this engine can speak.
 ///
@@ -109,21 +110,25 @@ impl Tls12Suite {
     }
 }
 
-fn hmac_sign(suite: Tls12Suite, key_bytes: &[u8], data: &[u8]) -> Vec<u8> {
+fn hmac_sign(suite: Tls12Suite, key_bytes: &[u8], data: &[u8]) -> Zeroizing<Vec<u8>> {
     let key = hmac::Key::new(suite.prf_alg(), key_bytes);
-    hmac::sign(&key, data).as_ref().to_vec()
+    Zeroizing::new(hmac::sign(&key, data).as_ref().to_vec())
 }
 
 /// `P_hash(secret, seed)` (RFC 5246 §5): iterated HMAC expansion.
-fn p_hash(suite: Tls12Suite, secret: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(out_len);
+///
+/// Every intermediate (`A(i)`, each block) and the output wipe on drop: this
+/// is the only expansion function in TLS 1.2, so it produces the master
+/// secret and the whole key block.
+fn p_hash(suite: Tls12Suite, secret: &[u8], seed: &[u8], out_len: usize) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(out_len));
     // A(0) = seed.
-    let mut a = seed.to_vec();
+    let mut a = Zeroizing::new(seed.to_vec());
     while out.len() < out_len {
         // A(i) = HMAC(secret, A(i-1)).
         a = hmac_sign(suite, secret, &a);
         // Block = HMAC(secret, A(i) || seed).
-        let mut block_in = Vec::with_capacity(a.len() + seed.len());
+        let mut block_in = Zeroizing::new(Vec::with_capacity(a.len() + seed.len()));
         block_in.extend_from_slice(&a);
         block_in.extend_from_slice(seed);
         let block = hmac_sign(suite, secret, &block_in);
@@ -135,7 +140,13 @@ fn p_hash(suite: Tls12Suite, secret: &[u8], seed: &[u8], out_len: usize) -> Vec<
 
 /// The TLS 1.2 PRF (RFC 5246 §5): `P_hash(secret, label || seed)`.
 #[must_use]
-pub fn prf(suite: Tls12Suite, secret: &[u8], label: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
+pub fn prf(
+    suite: Tls12Suite,
+    secret: &[u8],
+    label: &[u8],
+    seed: &[u8],
+    out_len: usize,
+) -> Zeroizing<Vec<u8>> {
     let mut s = Vec::with_capacity(label.len() + seed.len());
     s.extend_from_slice(label);
     s.extend_from_slice(seed);
@@ -150,7 +161,7 @@ pub fn master_secret(
     premaster: &[u8],
     client_random: &[u8],
     server_random: &[u8],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let mut seed = Vec::with_capacity(client_random.len() + server_random.len());
     seed.extend_from_slice(client_random);
     seed.extend_from_slice(server_random);
@@ -163,7 +174,11 @@ pub fn master_secret(
 /// `session_hash` is the hash of the handshake messages from `ClientHello`
 /// through `ClientKeyExchange`.
 #[must_use]
-pub fn master_secret_ems(suite: Tls12Suite, premaster: &[u8], session_hash: &[u8]) -> Vec<u8> {
+pub fn master_secret_ems(
+    suite: Tls12Suite,
+    premaster: &[u8],
+    session_hash: &[u8],
+) -> Zeroizing<Vec<u8>> {
     prf(
         suite,
         premaster,
@@ -184,7 +199,7 @@ pub fn key_block(
     master: &[u8],
     server_random: &[u8],
     client_random: &[u8],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let mut seed = Vec::with_capacity(server_random.len() + client_random.len());
     seed.extend_from_slice(server_random);
     seed.extend_from_slice(client_random);
@@ -200,7 +215,7 @@ pub fn finished_verify_data(
     master: &[u8],
     label: &[u8],
     handshake_hash: &[u8],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     prf(suite, master, label, handshake_hash, 12)
 }
 

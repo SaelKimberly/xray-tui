@@ -12,21 +12,40 @@
 //! - Shared secret: 32 bytes
 use oqs::kem::{Algorithm, Kem};
 use thiserror::Error;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 /// ML-KEM-768 public key (1184 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKey(Vec<u8>);
 
 /// ML-KEM-768 secret key (2400 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Wipes on drop: this is the decapsulation key, so a stale heap copy is
+/// enough to recover every shared secret negotiated with it. `Debug` prints
+/// the length only — the derive would dump the key into any log line.
+#[derive(Clone, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct SecretKey(Vec<u8>);
+
+impl core::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SecretKey(<{} bytes redacted>)", self.0.len())
+    }
+}
 
 /// ML-KEM-768 ciphertext (1088 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ciphertext(Vec<u8>);
 
 /// ML-KEM-768 shared secret (32 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Wipes on drop; `Debug` prints the length only.
+#[derive(Clone, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct SharedSecret([u8; 32]);
+
+impl core::fmt::Debug for SharedSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SharedSecret(<{} bytes redacted>)", self.0.len())
+    }
+}
 
 /// Errors from ML-KEM operations.
 #[derive(Debug, Error)]
@@ -166,9 +185,12 @@ impl Mlkem768 {
         let (ct, ss) = kem
             .encapsulate(oqs_pk)
             .map_err(|_| MlkemError::EncapsulateFailed)?;
+        // liboqs' own `SharedSecret` is a plain `Vec<u8>` with no `Drop`
+        // wipe; take ownership of the allocation so it is cleared here.
+        let ss = Zeroizing::new(ss.into_vec());
         Ok((
             Ciphertext(ct.into_vec()),
-            SharedSecret::from_bytes(ss.as_ref()).map_err(|_| MlkemError::EncapsulateFailed)?,
+            SharedSecret::from_bytes(&ss).map_err(|_| MlkemError::EncapsulateFailed)?,
         ))
     }
 
@@ -186,7 +208,9 @@ impl Mlkem768 {
         let ss = kem
             .decapsulate(oqs_sk, oqs_ct)
             .map_err(|_| MlkemError::DecapsulateFailed)?;
-        SharedSecret::from_bytes(ss.as_ref()).map_err(|_| MlkemError::DecapsulateFailed)
+        // Same as `encapsulate`: liboqs never wipes its own buffer.
+        let ss = Zeroizing::new(ss.into_vec());
+        SharedSecret::from_bytes(&ss).map_err(|_| MlkemError::DecapsulateFailed)
     }
 }
 #[cfg(test)]

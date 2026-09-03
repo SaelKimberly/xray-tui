@@ -58,6 +58,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -86,6 +87,7 @@ dependencies = [
  "ctr 0.10.1",
  "ctutils",
  "ghash 0.6.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -823,6 +825,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -835,6 +838,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -875,6 +879,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout 0.2.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1259,6 +1264,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2189,6 +2195,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -2554,6 +2561,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -4197,6 +4205,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.0",
  "universal-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -7811,6 +7820,7 @@ checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
  "curve25519-dalek",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -8004,6 +8014,7 @@ dependencies = [
 name = "xray-tui-hakari"
 version = "0.1.0"
 dependencies = [
+ "aes 0.9.2",
  "aho-corasick",
  "base64 0.22.1",
  "bit-set 0.11.1",
@@ -8035,8 +8046,8 @@ dependencies = [
  "h2",
  "hashbrown 0.16.1",
  "hashbrown 0.17.1",
- "hmac",
  "http-body-util",
+ "hybrid-array",
  "hyper",
  "hyper-util",
  "icu_locale_core",
@@ -8050,6 +8061,7 @@ dependencies = [
  "litemap",
  "lock_api",
  "log",
+ "md-5",
  "memchr",
  "miniz_oxide",
  "mio",
@@ -8079,6 +8091,7 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_core",
+ "sha2 0.11.0",
  "simd-adler32",
  "siphasher",
  "slab",
@@ -8182,6 +8195,7 @@ dependencies = [
  "xray-tui-proto",
  "xray-tui-route",
  "xray-tui-tls",
+ "zeroize",
 ]
 
 [[package]]
@@ -8251,6 +8265,7 @@ dependencies = [
  "webpki-roots",
  "x25519-dalek",
  "xray-tui-hakari",
+ "zeroize",
  "zstd",
 ]
 

@@ -69,7 +69,20 @@ the dial.
   because ring's `EphemeralPrivateKey` is single-use and cannot serialize —
   REALITY must agree twice with the same scalar. A second documented
   exception: `oqs` (vendored liboqs build, no system dep) for ML-KEM-768 —
-  ring has no post-quantum KEM (SP7).
+  ring has no post-quantum KEM (SP7). `zeroize` is NOT a third exception:
+  it supplies no algorithm and competes with nothing in ring — it is a
+  memory-hygiene dep, and both its own feature and the `zeroize` features
+  of the cipher crates are a separate contract (next bullet).
+- **Secrets are wiped, and the wipe is a dependency contract.** Every owned
+  key buffer in both crates is `Zeroizing`/`ZeroizeOnDrop` (key schedules,
+  X25519/ML-KEM shared secrets, the REALITY auth key, VMess/VLESS/trojan
+  protocol key material). The other half is invisible in the source: the
+  `zeroize` FEATURE is OFF by default in every RustCrypto cipher/hasher we
+  use and is STRIPPED from `x25519-dalek` by `default-features = false`, so
+  both manifests list it explicitly. After any crypto dependency edit,
+  re-check `cargo tree -p <crate> -e features | grep zeroize` — losing the
+  feature compiles clean and silently stops wiping. What is deliberately NOT
+  wiped, and why, is decision 19 in AGENTS.md.
 - **Explicit absence beats silent fallback.** Every protocol kind, transport,
   and security has a module and a dispatch arm. Unsupported combinations
   return `NativeError::NotImplemented` naming the missing feature — no stub

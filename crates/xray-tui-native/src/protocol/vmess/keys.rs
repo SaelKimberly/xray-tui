@@ -2,6 +2,7 @@
 use md5::Md5;
 use md5::digest::Digest as _;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 pub const VMESS_SALT: &str = "c48619fe-8f02-49e0-b9e9-edf763e17e21";
 const KDF_ROOT: &str = "VMess AEAD KDF";
@@ -9,12 +10,15 @@ const IPAD: u8 = 0x36;
 const OPAD: u8 = 0x5c;
 
 /// cmdKey = `md5(uuid_bytes ‖ VMESS_SALT)` — Go `protocol.NewID`.
+///
+/// Wipes on drop: every request-header key and the auth ID derive from it,
+/// so it is the account's long-term secret in derived form.
 #[must_use]
-pub fn cmd_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
+pub fn cmd_key(uuid_bytes: &[u8; 16]) -> Zeroizing<[u8; 16]> {
     let mut m = Md5::new();
     m.update(uuid_bytes);
     m.update(VMESS_SALT.as_bytes());
-    m.finalize().into()
+    Zeroizing::new(m.finalize().into())
 }
 
 /// 32-byte `chacha20poly1305` key for a 16-byte `VMess` session body key.
@@ -23,8 +27,8 @@ pub fn cmd_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
 /// `proxy/vmess/encoding/auth.go`, sing-vmess `protocol.go`):
 /// `md5(k) ‖ md5(md5(k))` — chained double md5, never zeros.
 #[must_use]
-pub fn chacha20_key_32(body_key: &[u8; 16]) -> [u8; 32] {
-    let mut key = [0u8; 32];
+pub fn chacha20_key_32(body_key: &[u8; 16]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
     let first: [u8; 16] = Md5::digest(body_key).into();
     key[..16].copy_from_slice(&first);
     let second: [u8; 16] = Md5::digest(&key[..16]).into();
@@ -58,13 +62,15 @@ pub fn kdf_bytes_path(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
             [] => hmac_sha256(KDF_ROOT.as_bytes(), id),
             [rest @ .., p] => {
                 let inner = {
-                    let mut msg = Vec::with_capacity(64 + id.len());
-                    msg.extend_from_slice(&pad_key(p, IPAD));
+                    // Holds `ipad(p) ‖ key` — the caller's key material on the
+                    // heap; wiped when the recursion unwinds.
+                    let mut msg = Zeroizing::new(Vec::with_capacity(64 + id.len()));
+                    msg.extend_from_slice(pad_key(p, IPAD).as_slice());
                     msg.extend_from_slice(id);
                     go(&msg, rest)
                 };
-                let mut msg = Vec::with_capacity(64 + inner.len());
-                msg.extend_from_slice(&pad_key(p, OPAD));
+                let mut msg = Zeroizing::new(Vec::with_capacity(64 + inner.len()));
+                msg.extend_from_slice(pad_key(p, OPAD).as_slice());
                 msg.extend_from_slice(&inner);
                 go(&msg, rest)
             }
@@ -101,8 +107,8 @@ pub fn kdf16_bytes_path(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
 
 /// 64-byte ipad/opad padding of an HMAC key (`VMess` keys are ≤ 64 bytes, so no
 /// long-key pre-hashing is needed — matches Go's `hmac.New` for short keys).
-fn pad_key(key: &[u8], xor: u8) -> [u8; 64] {
-    let mut out = [xor; 64];
+fn pad_key(key: &[u8], xor: u8) -> Zeroizing<[u8; 64]> {
+    let mut out = Zeroizing::new([xor; 64]);
     for (o, &b) in out.iter_mut().zip(key) {
         *o ^= b;
     }
@@ -169,7 +175,7 @@ mod tests {
     fn cmd_key_matches_go_id_new() {
         // Go: NewID(uuid.Zero) cmdKey (computed via md5(uuid ‖ const))
         assert_eq!(
-            hex(&cmd_key(&ZERO_UUID)),
+            hex(cmd_key(&ZERO_UUID).as_slice()),
             "5e20f3239545e3f48e0ff445aa7c4c3b"
         );
     }
@@ -180,12 +186,12 @@ mod tests {
         // Go aead.KDF16(ck, "AES Auth ID Encryption") — verified against the
         // vendored Xray-core proxy/vmess/aead package.
         assert_eq!(
-            hex(&kdf16(&ck, &["AES Auth ID Encryption"])),
+            hex(&kdf16(ck.as_slice(), &["AES Auth ID Encryption"])),
             "b39f4051224a1a3ce8aa8b1a2ab9f5ca"
         );
         // Go aead.KDF16(ck, "AEAD Resp Header Len Key")
         assert_eq!(
-            hex(&kdf16(&ck, &["AEAD Resp Header Len Key"])),
+            hex(&kdf16(ck.as_slice(), &["AEAD Resp Header Len Key"])),
             "e784d53ee0d812cd04762ebe91cab8d4"
         );
     }
@@ -198,7 +204,10 @@ mod tests {
         let ck = cmd_key(&ZERO_UUID);
         let auth_id = hex_decode("79d348cf6b4707cf6acbb494bf257f1d");
         let nonce = [0xab; 8];
-        let got = kdf16_bytes_path(&ck, &[b"VMess Header AEAD Key_Length", &auth_id, &nonce]);
+        let got = kdf16_bytes_path(
+            ck.as_slice(),
+            &[b"VMess Header AEAD Key_Length", &auth_id, &nonce],
+        );
         assert_eq!(hex(&got), "f6ce8d31a534f597ab191a35a335f27e");
     }
 
@@ -232,8 +241,14 @@ mod tests {
         let ck = cmd_key(&ZERO_UUID);
         let str_path = ["AES Auth ID Encryption", "aead", "salt"];
         let bytes_path: [&[u8]; 3] = [b"AES Auth ID Encryption", b"aead", b"salt"];
-        assert_eq!(kdf_bytes_path(&ck, &bytes_path), kdf(&ck, &str_path));
-        assert_eq!(kdf16_bytes_path(&ck, &bytes_path), kdf16(&ck, &str_path));
+        assert_eq!(
+            kdf_bytes_path(ck.as_slice(), &bytes_path),
+            kdf(ck.as_slice(), &str_path)
+        );
+        assert_eq!(
+            kdf16_bytes_path(ck.as_slice(), &bytes_path),
+            kdf16(ck.as_slice(), &str_path)
+        );
     }
 
     #[test]
@@ -241,7 +256,7 @@ mod tests {
         let k = [0x22u8; 16];
         let key = chacha20_key_32(&k);
         assert_eq!(
-            hex(&key),
+            hex(key.as_slice()),
             "fbc3cf71d993ca7bec2664357ccdac2bb270c6d264a3bfeab7ceea80762a13cc"
         );
     }

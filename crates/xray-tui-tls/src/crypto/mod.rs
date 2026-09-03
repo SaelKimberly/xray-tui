@@ -19,6 +19,7 @@ use ring::{
     hmac,
 };
 use x25519_dalek::StaticSecret;
+use zeroize::Zeroizing;
 
 use crate::error::{Result, TlsError};
 
@@ -165,7 +166,10 @@ impl X25519KeyPair {
     /// An all-zero output means the peer sent a low-order point (RFC 7748
     /// §6.1); such a "shared" secret is public, so it is refused rather
     /// than fed into a key schedule.
-    pub fn agree(&self, peer: &[u8; 32]) -> Result<[u8; 32]> {
+    ///
+    /// The returned copy wipes on drop; dalek's own `SharedSecret` wipes
+    /// itself (the crate's `zeroize` feature is enabled in our manifest).
+    pub fn agree(&self, peer: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
         let peer = x25519_dalek::PublicKey::from(*peer);
         let shared = self.private.diffie_hellman(&peer);
         if !shared.was_contributory() {
@@ -173,7 +177,7 @@ impl X25519KeyPair {
                 "X25519 peer key is a low-order point: shared secret is all zero".to_string(),
             ));
         }
-        let mut out = [0u8; 32];
+        let mut out = Zeroizing::new([0u8; 32]);
         out.copy_from_slice(shared.as_bytes());
         Ok(out)
     }
@@ -203,6 +207,10 @@ fn transcript_digest(suite: CipherSuiteId, data: &[u8]) -> Vec<u8> {
 }
 
 // ── TLS 1.3 key schedule ───────────────────────────────────────────────────
+
+/// One direction pair of TLS 1.3 traffic secrets, `(client, server)`. Both
+/// halves wipe on drop.
+pub type TrafficSecrets = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 
 /// Incremental TLS 1.3 key schedule.
 ///
@@ -241,9 +249,12 @@ impl KeySchedule {
     /// HKDF-Extract(salt, ikm) = HMAC(salt, ikm); ring's `Prk` hides its
     /// bytes, so the HMAC is computed directly — identical to what ring's
     /// `Salt::extract` does internally.
-    pub fn hkdf_extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// The returned PRK wipes on drop. ring's intermediate `hmac::Tag` is a
+    /// stack value with no wipe hook — the heap copy is what we own.
+    pub fn hkdf_extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let key = hmac::Key::new(self.suite.hmac_alg(), salt);
-        Ok(hmac::sign(&key, ikm).as_ref().to_vec())
+        Ok(Zeroizing::new(hmac::sign(&key, ikm).as_ref().to_vec()))
     }
 
     /// HKDF-Expand-Label(prk, label, ctx, len) per RFC 8446 §7.1.
@@ -253,7 +264,7 @@ impl KeySchedule {
         label: &str,
         ctx: &[u8],
         len: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Zeroizing<Vec<u8>>> {
         let len16 = u16::try_from(len)
             .map_err(|_| TlsError::Crypto("HKDF-Expand-Label length too large".into()))?;
         let full_label = format!("tls13 {label}");
@@ -280,7 +291,7 @@ impl KeySchedule {
         let okm = prk
             .expand(&info_arr, ExpandLen(len))
             .map_err(|_| TlsError::Crypto(format!("HKDF-Expand-Label({label}) failed")))?;
-        let mut out = vec![0u8; len];
+        let mut out = Zeroizing::new(vec![0u8; len]);
         okm.fill(&mut out)
             .map_err(|_| TlsError::Crypto("HKDF fill failed".into()))?;
         Ok(out)
@@ -288,14 +299,14 @@ impl KeySchedule {
 
     /// `Derive-Secret(prk, label)` = `HKDF-Expand-Label(prk, label,
     /// Hash(transcript), hash_len)`.
-    pub fn derive_secret(&self, prk: &[u8], label: &str) -> Result<Vec<u8>> {
+    pub fn derive_secret(&self, prk: &[u8], label: &str) -> Result<Zeroizing<Vec<u8>>> {
         let h = self.transcript_hash();
         self.hkdf_expand_label(prk, label, &h, self.suite.hash_len())
     }
 
     /// `handshake_secret` = `HKDF-Extract(Derive-Secret(early_secret,
     /// "derived", ""), shared_secret)`.
-    pub fn handshake_secret(&self, shared_secret: &[u8]) -> Result<Vec<u8>> {
+    pub fn handshake_secret(&self, shared_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let hash_len = self.suite.hash_len();
         let zeros = vec![0u8; hash_len];
         let early = self.hkdf_extract(&zeros, &zeros)?;
@@ -306,7 +317,7 @@ impl KeySchedule {
 
     /// `(c hs traffic, s hs traffic)` from the handshake secret and the
     /// accumulated CH..SH transcript.
-    pub fn handshake_traffic_secrets(&self, hs_secret: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn handshake_traffic_secrets(&self, hs_secret: &[u8]) -> Result<TrafficSecrets> {
         let c = self.derive_secret(hs_secret, "c hs traffic")?;
         let s = self.derive_secret(hs_secret, "s hs traffic")?;
         Ok((c, s))
@@ -314,7 +325,7 @@ impl KeySchedule {
 
     /// `master_secret` = `HKDF-Extract(Derive-Secret(hs_secret, "derived",
     /// ""), 0^hash_len)`.
-    pub fn master_secret(&self, hs_secret: &[u8]) -> Result<Vec<u8>> {
+    pub fn master_secret(&self, hs_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let hash_len = self.suite.hash_len();
         let derived =
             self.hkdf_expand_label(hs_secret, "derived", &empty_hash(self.suite), hash_len)?;
@@ -324,7 +335,7 @@ impl KeySchedule {
 
     /// `(c ap traffic, s ap traffic)` from the master secret and the
     /// accumulated CH..server Finished transcript.
-    pub fn app_traffic_secrets(&self, master: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn app_traffic_secrets(&self, master: &[u8]) -> Result<TrafficSecrets> {
         let c = self.derive_secret(master, "c ap traffic")?;
         let s = self.derive_secret(master, "s ap traffic")?;
         Ok((c, s))
@@ -332,7 +343,7 @@ impl KeySchedule {
 
     /// `Finished` key = `HKDF-Expand-Label(traffic_secret, "finished", "",
     /// hash_len)`.
-    pub fn finished_key(&self, traffic_secret: &[u8]) -> Result<Vec<u8>> {
+    pub fn finished_key(&self, traffic_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         self.hkdf_expand_label(traffic_secret, "finished", &[], self.suite.hash_len())
     }
 
@@ -362,6 +373,10 @@ impl AeadKey {
     /// `HKDF-Expand-Label(secret, "iv", "", 12)`.
     pub fn new(suite: CipherSuiteId, secret: &[u8]) -> Result<Self> {
         let ks = KeySchedule::new(suite);
+        // The key bytes end up inside ring's `LessSafeKey`, which exposes no
+        // wipe hook; what we own — and what `hkdf_expand_label` hands back as
+        // `Zeroizing` — are these derivation buffers. The write IV alone is
+        // not a secret without the key, so it stays a plain array.
         let key_bytes = ks.hkdf_expand_label(secret, "key", &[], suite.key_len())?;
         let iv_vec = ks.hkdf_expand_label(secret, "iv", &[], 12)?;
         let mut iv = [0u8; 12];

@@ -12,6 +12,7 @@
 use blake2::Blake2b256;
 use blake2::digest::Digest;
 use wide::u8x32;
+use zeroize::ZeroizeOnDrop;
 
 /// Salt length prepended to every obfuscated packet (`smSaltLen`).
 pub const SALT_LEN: usize = 8;
@@ -27,9 +28,20 @@ pub const PSK_MIN_LEN: usize = 4;
 /// `&self` — the keystream is derived per packet into an owned key, so no
 /// interior mutability or embedded RNG is needed (the caller supplies the
 /// salt via [`Self::obfuscate_into`], enabling deterministic tests).
-#[derive(Debug, Clone)]
+///
+/// The PSK wipes on drop, and `Debug` prints its length only — the derive
+/// would put the obfuscation pre-shared key into any log line.
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct Salamander {
     psk: Vec<u8>,
+}
+
+impl core::fmt::Debug for Salamander {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Salamander")
+            .field("psk", &format_args!("<{} bytes redacted>", self.psk.len()))
+            .finish()
+    }
 }
 
 impl Salamander {

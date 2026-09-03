@@ -808,7 +808,7 @@ mod tests {
             // Key schedule over `pq || classical` (Go hybrid contract) —
             // 64 bytes for X25519MLKEM768.
             let mut combined = pq_ss.as_bytes().to_vec();
-            combined.extend_from_slice(&classical);
+            combined.extend_from_slice(classical.as_slice());
             assert_eq!(combined.len(), 64);
             let mut sk = KeySchedule::new(suite);
             sk.add_transcript(&ch);
@@ -827,7 +827,7 @@ mod tests {
                 .unwrap()
                 .as_ptr() as usize
                 - cert_der.as_ptr() as usize;
-            let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, &auth_key);
+            let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, auth_key.as_slice());
             let tag = hmac::sign(&hmac_key, signing_key.public_key().as_ref());
             cert_der[sig_offset..sig_offset + 64].copy_from_slice(tag.as_ref());
 

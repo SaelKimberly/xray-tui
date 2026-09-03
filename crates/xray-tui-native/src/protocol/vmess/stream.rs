@@ -80,7 +80,7 @@ impl Cipher {
             SECURITY_CHACHA20_POLY1305 => {
                 let key32 = keys::chacha20_key_32(key16);
                 Self::Chacha20Poly1305(Box::new(
-                    ChaCha20Poly1305::new_from_slice(&key32).expect("32-byte key"),
+                    ChaCha20Poly1305::new_from_slice(key32.as_slice()).expect("32-byte key"),
                 ))
             }
             other => panic!("vmess payload security {other} not validated"),
@@ -770,7 +770,7 @@ mod tests {
         let mut nonce = *iv;
         nonce[..2].copy_from_slice(&counter.to_be_bytes());
         let key32 = keys::chacha20_key_32(key16);
-        let ct = ChaCha20Poly1305::new_from_slice(&key32)
+        let ct = ChaCha20Poly1305::new_from_slice(key32.as_slice())
             .unwrap()
             .encrypt((&nonce[..12]).try_into().unwrap(), data)
             .unwrap();

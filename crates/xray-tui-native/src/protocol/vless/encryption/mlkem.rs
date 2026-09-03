@@ -45,6 +45,7 @@ use aes::Aes256;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce as ChachaNonce};
 use ctr::Ctr128BE;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use zeroize::Zeroizing;
 
 use xray_tui_proto::proto_spec::MlkemEncryption;
 use xray_tui_proto::proto_spec::MlkemMode;
@@ -389,7 +390,9 @@ pub async fn handshake(
         .map_err(|_| NativeError::Config("rng failure".into()))?;
     let iv: [u8; 16] = hello[..IV_LEN].try_into().expect("iv slice");
 
-    let mut nfs_key = Vec::new();
+    // Every hop's shared secret lands here; the last one keys the NFS AEAD
+    // and is folded into `united`, so it must not outlive the handshake.
+    let mut nfs_key = Zeroizing::new(Vec::new());
     let mut last_ctr: Option<Ctr128BE<Aes256>> = None;
     let mut off = IV_LEN;
     for (j, key) in cfg.keys.iter().enumerate() {
@@ -398,10 +401,11 @@ pub async fn handshake(
                 let eph =
                     X25519KeyPair::generate(&rng).map_err(|e| NativeError::Tls(e.to_string()))?;
                 hello[off..off + X25519_LEN].copy_from_slice(&eph.public_key());
-                nfs_key = eph
-                    .agree(pk)
-                    .map_err(|e| NativeError::Tls(e.to_string()))?
-                    .to_vec();
+                nfs_key = Zeroizing::new(
+                    eph.agree(pk)
+                        .map_err(|e| NativeError::Tls(e.to_string()))?
+                        .to_vec(),
+                );
                 X25519_LEN
             }
             ServerKey::Mlkem(ek) => {
@@ -409,7 +413,7 @@ pub async fn handshake(
                 let (ct, ss) =
                     Mlkem768::encapsulate(&pk).map_err(|e| NativeError::Tls(e.to_string()))?;
                 hello[off..off + MLKEM_CT_LEN].copy_from_slice(ct.as_bytes());
-                nfs_key = ss.as_bytes().to_vec();
+                nfs_key = Zeroizing::new(ss.as_bytes().to_vec());
                 MLKEM_CT_LEN
             }
         };
@@ -503,9 +507,9 @@ pub async fn handshake(
         .map_err(|e| NativeError::Tls(e.to_string()))?;
 
     // united = pfs(64) || nfs(32); direction-specific AEAD contexts.
-    let mut united = Vec::with_capacity(96);
+    let mut united = Zeroizing::new(Vec::with_capacity(96));
     united.extend_from_slice(mlkem_key.as_bytes());
-    united.extend_from_slice(&x25519_key);
+    united.extend_from_slice(x25519_key.as_slice());
     united.extend_from_slice(&nfs_key);
 
     let self_aead = WireAead::new(&pfs_public, &united);
@@ -954,7 +958,7 @@ mod tests {
         let x_key = server_x.agree(&peer).expect("agree");
         let mut united = Vec::with_capacity(96);
         united.extend_from_slice(server_ss.as_bytes());
-        united.extend_from_slice(&x_key);
+        united.extend_from_slice(x_key.as_slice());
         united.extend_from_slice(&nfs_key);
 
         let mut server_pfs_public = Vec::with_capacity(MLKEM_CT_LEN + X25519_LEN);

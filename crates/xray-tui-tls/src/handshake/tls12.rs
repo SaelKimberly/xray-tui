@@ -328,9 +328,9 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     // 7. Master secret.
     let master = if ems {
-        master_secret_ems(suite, &premaster, &handshake_hash)
+        master_secret_ems(suite, premaster.as_slice(), &handshake_hash)
     } else {
-        master_secret(suite, &premaster, client_random, &server_random)
+        master_secret(suite, premaster.as_slice(), client_random, &server_random)
     };
 
     // 8. Key block → per-direction keys + fixed IVs. The IV width is
@@ -449,7 +449,7 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
             "TLS 1.2 expected server Finished (0x14), got 0x{sf_type:02X}"
         )));
     }
-    if sf_body != expected_sf {
+    if sf_body != expected_sf.as_slice() {
         return Err(TlsError::Handshake(
             "TLS 1.2 server Finished MAC mismatch — possible MITM or wrong key".into(),
         ));

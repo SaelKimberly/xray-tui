@@ -17,6 +17,10 @@ pub const COMMAND_TCP: u8 = 1;
 pub const COMMAND_UDP: u8 = 2;
 
 /// Per-connection `VMess` session material (mirrors Go `ClientSession`).
+///
+/// Wipes every field on drop: the request/response body keys protect the
+/// whole tunnel, and the struct lives as long as the connection does.
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct Session {
     pub request_body_iv: [u8; 16],
     pub request_body_key: [u8; 16],

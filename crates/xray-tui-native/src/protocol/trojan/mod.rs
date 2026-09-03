@@ -18,6 +18,7 @@
 
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use xray_tui_proto::proto_spec::TrojanConfig;
 
@@ -51,11 +52,14 @@ const MAX_WIRE_ADDR: usize = 1 + 1 + 255 + 2;
 const MAX_FRAME_HEAD: usize = MAX_WIRE_ADDR + 2 + 2;
 /// The 56-byte lowercase hex encoding of `sha224(password)` — the wire auth
 /// hash (`config.go` `hexSha224`).
+///
+/// Wipes on drop: it travels on the wire but is a replayable bearer
+/// credential, so a stale stack copy is as good as the password.
 #[must_use]
-pub fn auth_key(password: &str) -> [u8; 56] {
+pub fn auth_key(password: &str) -> Zeroizing<[u8; 56]> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha224::digest(password.as_bytes());
-    let mut out = [0u8; 56];
+    let mut out = Zeroizing::new([0u8; 56]);
     for (i, byte) in digest.iter().enumerate() {
         out[i * 2] = HEX[usize::from(byte >> 4)];
         out[i * 2 + 1] = HEX[usize::from(byte & 0x0f)];
@@ -588,7 +592,7 @@ mod tests {
         )
         .unwrap();
         let mut expect = Vec::new();
-        expect.extend_from_slice(&key);
+        expect.extend_from_slice(key.as_slice());
         expect.extend_from_slice(&CRLF);
         expect.push(1); // command TCP
         expect.push(crate::addr::TROJAN_ATYP_DOMAIN); // ATYP (SOCKS5 0x03)
@@ -608,7 +612,7 @@ mod tests {
         )
         .unwrap();
         let mut expect = Vec::new();
-        expect.extend_from_slice(&key);
+        expect.extend_from_slice(key.as_slice());
         expect.extend_from_slice(&CRLF);
         expect.push(3); // command UDP
         expect.push(crate::addr::TROJAN_ATYP_DOMAIN);
@@ -728,7 +732,7 @@ mod tests {
         let n = server.read(&mut got).await.unwrap();
         let key = auth_key("pw");
         let mut expect = Vec::new();
-        expect.extend_from_slice(&key);
+        expect.extend_from_slice(key.as_slice());
         expect.extend_from_slice(&CRLF);
         expect.push(3);
         expect.push(crate::addr::TROJAN_ATYP_DOMAIN);
