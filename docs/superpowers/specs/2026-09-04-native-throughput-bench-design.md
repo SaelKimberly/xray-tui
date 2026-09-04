@@ -48,9 +48,9 @@ Fixed server core per row — no core axis in v1:
 
 - `spawn_sink() -> SinkServer { addr, received: Arc<AtomicU64> }`:
   TCP listener on 127.0.0.1:ephemeral, per-conn read-discard loop.
-- `spawn_source(n: u64) -> SourceServer { addr }`: per-conn writes
-  exactly N bytes (zeros) then half-closes (shutdown write) so the
-  drain sees EOF.
+- `spawn_source() -> SourceServer { addr }`: per-conn INFINITE zeros
+  stream (never EOF/half-close). Client reads exactly N per iter —
+  tunnel stays reusable across iters.
 - Reuse `e2e::{config, harness}` builders for server configs +
   client params (no second config source). Targets point at sink /
   source addrs through the tunnel.
