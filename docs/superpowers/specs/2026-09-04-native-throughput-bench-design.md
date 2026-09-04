@@ -17,10 +17,12 @@ Fixed server core per row — no core axis in v1:
 - vless/ws/plain, vless/grpc/tls → xray
 - vmess/tcp/plain, vmess/ws/tls → xray
 - trojan/tcp/tls → xray
-- hysteria2/udp → sing-box only (xray has no hysteria2 server path
-  we bench; single-core row)
+- hysteria2/tcp → sing-box only (default `CaseSpec::hysteria2(None)`
+  TCP path via plain `connect`, same as e2e; the datagram `connect_udp`
+  shape is out of v1 scope — no byte-stream, needs its own
+  datagram-loop design)
 
-~11 configs × 2 directions ≈ 22 benches. `Throughput::Bytes(N)`.
+10 configs × 2 directions = 20 benches. `Throughput::Bytes(N)`.
 
 ## Method: bulk sink/source
 

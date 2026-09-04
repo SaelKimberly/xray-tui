@@ -17,9 +17,9 @@
 - Hysteria2 rows are sing-box-only (xray has no hysteria2 inbound); all TCP rows in v1 target xray.
 - Version pins: xray 26.3.27, sing-box 1.13.16 (`e2e::{XRAY_VERSION, SINGBOX_VERSION}`); missing `XRAY_TUI_CORE_BIN_DIR` → clean skip message.
 - Workspace lints apply (`[lints] workspace = true` in crate manifest); rustfmt max_width 100.
-- One shared tokio Runtime for all iters; never spawn/connect inside `b.iter`.
-- Source is an infinite-zeros stream; client reads exactly N per iter (no EOF), tunnel reusable.
-- Payload default 64 MB, override `XRAY_TUI_BENCH_MB` (u64 MB, fallback 64).
+- One shared tokio Runtime for all iters, `new_multi_thread` (sink/source
+  accept loops are spawned at setup outside `block_on`; current-thread
+  would never poll them); never spawn/connect inside `b.iter`.
 
 ---
 
@@ -279,7 +279,10 @@ fn bench_send(c: &mut Criterion, rt: &tokio::runtime::Runtime, n: u64) {
 }
 
 fn criterion_benches(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread: sink/source accept loops are `tokio::spawn`ed at
+    // setup (outside `block_on`) — a current-thread runtime would never
+    // poll them and the send goodput-gate would spin forever.
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("bench runtime");
