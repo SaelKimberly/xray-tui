@@ -516,51 +516,65 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
             }
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
-        // Serve previously unpadded content before touching the wire.
-        if !this.read_buf.is_empty() {
-            let n = this.read_buf.len().min(buf.remaining());
-            buf.put_slice(&this.read_buf[..n]);
-            this.read_buf.advance(n);
-            return Poll::Ready(Ok(()));
-        }
-        // Read a decrypted chunk from the record layer, unpad it, retry.
-        let mut chunk = [0u8; 16384];
-        let mut rb = ReadBuf::new(&mut chunk);
-        ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
-        let n = rb.filled().len();
-        if n == 0 {
-            return Poll::Ready(Ok(())); // EOF
-        }
-        let data = &chunk[..n];
-        if this.reader.unpad.plain_passthrough {
-            // Passthrough delivers everything unchanged (still sniffing).
-            this.filter.feed(data);
-            this.read_buf.extend_from_slice(data);
-        } else {
-            let mut content = Vec::with_capacity(data.len());
-            this.reader.unpad.feed(data, &mut content);
-            this.filter.feed(&content);
-            if this.reader.unpad.direct {
-                this.reader.direct = true;
-                this.reader.unpad.direct = false;
-                // Everything the unpadder produced after the Direct frame —
-                // its own payload plus any raw bytes that followed it in
-                // the same chunk — is the start of the raw stream.
-                this.raw_leftover.extend_from_slice(&content);
-                if this.directable {
-                    this.inner.set_read_direct();
-                }
-                let n = this.raw_leftover.len().min(buf.remaining());
-                buf.put_slice(&this.raw_leftover[..n]);
-                this.raw_leftover.advance(n);
+        // An unpad step can yield zero content bytes (a padding-only frame,
+        // a sub-21-byte chunk passing through uncommitted): an empty
+        // `Ready(Ok)` is EOF by the `AsyncRead` contract, so loop until
+        // bytes are buffered or the inner stream truly ends.
+        loop {
+            // Serve previously unpadded content before touching the wire.
+            if !this.read_buf.is_empty() {
+                let n = this.read_buf.len().min(buf.remaining());
+                buf.put_slice(&this.read_buf[..n]);
+                this.read_buf.advance(n);
                 return Poll::Ready(Ok(()));
             }
-            this.read_buf.extend_from_slice(&content);
+            // Read a decrypted chunk from the record layer, unpad it, retry.
+            let mut chunk = [0u8; 16384];
+            let mut rb = ReadBuf::new(&mut chunk);
+            ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+            let n = rb.filled().len();
+            if n == 0 {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            let data = &chunk[..n];
+            // Padding ended earlier (End seen, never Direct): the server
+            // sends the stream raw now — xray stops padding after End, so
+            // everything from here is content, never a frame.
+            if !this.reader.unpad.within_padding && !this.reader.direct {
+                this.filter.feed(data);
+                this.read_buf.extend_from_slice(data);
+                continue;
+            }
+            if this.reader.unpad.plain_passthrough {
+                // Passthrough delivers everything unchanged (still sniffing).
+                this.filter.feed(data);
+                this.read_buf.extend_from_slice(data);
+            } else {
+                let mut content = Vec::with_capacity(data.len());
+                this.reader.unpad.feed(data, &mut content);
+                this.filter.feed(&content);
+                if this.reader.unpad.direct {
+                    this.reader.direct = true;
+                    this.reader.unpad.direct = false;
+                    // Everything the unpadder produced after the Direct frame —
+                    // its own payload plus any raw bytes that followed it in
+                    // the same chunk — is the start of the raw stream.
+                    this.raw_leftover.extend_from_slice(&content);
+                    if this.directable {
+                        this.inner.set_read_direct();
+                    }
+                    if !this.raw_leftover.is_empty() {
+                        let n = this.raw_leftover.len().min(buf.remaining());
+                        buf.put_slice(&this.raw_leftover[..n]);
+                        this.raw_leftover.advance(n);
+                        return Poll::Ready(Ok(()));
+                    }
+                    // Empty Direct payload: fall through to raw reads.
+                    return Pin::new(&mut this.inner).poll_read(cx, buf);
+                }
+                this.read_buf.extend_from_slice(&content);
+            }
         }
-        let n = this.read_buf.len().min(buf.remaining());
-        buf.put_slice(&this.read_buf[..n]);
-        this.read_buf.advance(n);
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -1262,6 +1276,40 @@ mod tests {
         assert_eq!(&got[..n], b"world");
     }
 
+    /// Regression: after the server's End frame it stops padding — the
+    /// following bytes are raw stream, not frames. The reader must deliver
+    /// them as content, never swallow them as padding (the throughput
+    /// `vless/vision+reality/recv` bench hung in `read_exact` on exactly
+    /// this: padding-only frames yielded zero content bytes and `poll_read`
+    /// returned an empty `Ok`, which `AsyncRead` defines as EOF).
+    #[tokio::test]
+    async fn stream_end_then_raw_downlink() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut server, client) = tokio::io::duplex(16384);
+        let mut vs = test_stream(client);
+        // Continue frame, then End, then raw bytes (xray post-End wire).
+        server
+            .write_all(&encode_frame(Some(&UUID), CMD_CONTINUE, b"hi", 0))
+            .await
+            .unwrap();
+        server
+            .write_all(&encode_frame(None, CMD_END, b"bye", 0))
+            .await
+            .unwrap();
+        server.write_all(b"RAW-DOWN").await.unwrap();
+        let mut got = [0u8; 64];
+        let mut filled = 0;
+        while filled < b"hibyeRAW-DOWN".len() {
+            let n = vs.read(&mut got[filled..]).await.unwrap();
+            assert!(
+                n > 0,
+                "empty read is EOF by contract — must not happen mid-stream"
+            );
+            filled += n;
+        }
+        assert_eq!(&got[..filled], b"hibyeRAW-DOWN");
+    }
+
     #[tokio::test]
     async fn stream_direct_splices_both_directions() {
         let (mut server, client) = tokio::io::duplex(16384);
@@ -1934,9 +1982,10 @@ mod tests {
                     (890..=1389).contains(&plen),
                     "ClientHello long padding {plen}"
                 );
-                // Padded TLS 1.3 ServerHello — flips EnableXtls.
-                let sh_frame = encode_frame(Some(&UUID), CMD_CONTINUE, &sh, 0);
-                write_all_encrypted(conn, sock, &sh_frame)?;
+                // Padded TLS 1.3 ServerHello — flips EnableXtls. Sent RAW:
+                // after End the server stops padding (xray goes raw), so
+                // the client must sniff the bare record, not a frame.
+                write_all_encrypted(conn, sock, &sh)?;
                 // The client's inner app-data write: the Direct frame.
                 let (cmd, content, plen) = read_frame(conn, sock)?;
                 assert_eq!(cmd, CMD_DIRECT, "Direct frame command");
