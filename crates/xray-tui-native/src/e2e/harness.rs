@@ -859,7 +859,7 @@ pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
 /// A TCP discard target: every connection's bytes are read and dropped.
-/// The bench client writes N MB through the tunnel toward this address.
+///
 /// `received` counts cumulative bytes across all connections — send iters
 /// snapshot it pre-iter and wait for the delta INSIDE the timed section
 /// (`write_all` alone only measures local socket buffering).
@@ -953,11 +953,13 @@ pub fn spawn_source() -> SourceServer {
 
 #[cfg(test)]
 mod bench_helper_tests {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
     use super::{spawn_sink, spawn_source};
 
     #[tokio::test]
     async fn sink_discards_and_source_streams() {
-        use std::sync::atomic::Ordering;
         let sink = spawn_sink();
         let stream = tokio::net::TcpStream::connect(sink.addr).await.unwrap();
         let (mut rd, mut wr) = stream.into_split();
@@ -965,11 +967,9 @@ mod bench_helper_tests {
         let source = spawn_source();
         let mut stream = tokio::net::TcpStream::connect(source.addr).await.unwrap();
         let mut buf = vec![0u8; 1 << 20];
-        use tokio::io::AsyncReadExt as _;
         stream.read_exact(&mut buf).await.unwrap();
         assert!(buf.iter().all(|&b| b == 0));
         // Sink accepts a write AND counts it.
-        use tokio::io::AsyncWriteExt as _;
         wr.write_all(&buf[..4096]).await.unwrap();
         drop(wr);
         let _ = &mut rd;
