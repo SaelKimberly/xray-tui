@@ -14,27 +14,34 @@
 //! `HijackDns` decision drops the datagram (the inbound has no built-in DNS
 //! interceptor) and refuses TCP connections with `0x02`.
 
+pub mod http;
 pub mod outbound;
 pub mod socks5;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use xray_tui_route::engine::decide_async;
 use xray_tui_route::ir::NetworkMask;
 use xray_tui_route::{ConnMeta, Decision, Engine, NetAddr, NetHost};
 
+use crate::BoxStream;
 use crate::addr::{Host, TargetAddr};
 use crate::error::{NativeError, timeouts};
+use crate::telemetry::{Counted, Telemetry, TraceGuard, TraceKind, TraceSecurity};
 
+pub use http::{HttpInbound, HttpInboundConfig};
 pub use outbound::{Outbound, OutboundKind, ProxyOutbound};
-
+/// Inbound tag reported to the router when [`HttpInboundConfig`] doesn't
+/// override it.
+pub const DEFAULT_HTTP_INBOUND_TAG: &str = "http-in";
 /// Inbound tag reported to the router when [`Socks5InboundConfig`] doesn't
 /// override it.
 pub const DEFAULT_INBOUND_TAG: &str = "socks-in";
@@ -45,6 +52,23 @@ const BIND_ZERO: TargetAddr = TargetAddr {
     host: Host::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
     port: 0,
 };
+
+/// Telemetry context threaded into an inbound by [`crate::server`] (the
+/// connected-profile session). `None` on a config keeps the inbound
+/// telemetry-free — existing consumers and tests are untouched.
+#[derive(Clone)]
+pub struct TraceCtx {
+    /// Event sink.
+    pub telemetry: Telemetry,
+    /// Inbound leg kind stamped on every trace row.
+    pub kind: TraceKind,
+    /// Outbound protocol name (`"vless"`, …).
+    pub protocol: String,
+    /// Outbound transport name (`"tcp"`, `"ws"`, …).
+    pub transport: String,
+    /// Outbound security layer.
+    pub security: TraceSecurity,
+}
 
 /// Configuration for a [`Socks5Inbound`].
 #[derive(Clone)]
@@ -62,6 +86,11 @@ pub struct Socks5InboundConfig {
     /// Accept UDP ASSOCIATE (relayed per datagram through the router). Off
     /// keeps the `0x07 Command not supported` refusal.
     pub udp: bool,
+    /// Per-connection telemetry (trace rows + byte counting); `None` off.
+    pub trace: Option<TraceCtx>,
+    /// When set, `serve` stops accepting and in-flight connections abort
+    /// once the sender marks shutdown (`send(true)` or drop).
+    pub shutdown: Option<watch::Receiver<bool>>,
 }
 
 impl Socks5InboundConfig {
@@ -76,6 +105,8 @@ impl Socks5InboundConfig {
             engine,
             outbounds,
             udp: true,
+            trace: None,
+            shutdown: None,
         }
     }
 
@@ -94,6 +125,8 @@ impl fmt::Debug for Socks5InboundConfig {
             .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
             .field("inbound_tag", &self.inbound_tag)
             .field("outbounds", &self.outbounds)
+            .field("trace", &self.trace.is_some())
+            .field("shutdown", &self.shutdown.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -111,6 +144,7 @@ impl Socks5Inbound {
     /// Returns [`NativeError::Io`] when the listen address cannot be bound.
     pub async fn bind(config: Socks5InboundConfig) -> Result<Self, NativeError> {
         let listener = TcpListener::bind(config.listen).await?;
+        warn_if_open_relay(&listener, config.auth.is_some(), "socks5 inbound");
         Ok(Self {
             listener,
             config: Arc::new(config),
@@ -127,15 +161,37 @@ impl Socks5Inbound {
 
     /// Runs the accept loop forever, spawning one task per connection.
     ///
-    /// Returns only when the listener fails. Dropping the task running this
-    /// future aborts the accept loop; in-flight connections keep their own
-    /// tasks.
+    /// Returns when a configured `shutdown` receiver fires. When `shutdown` is
+    /// set, in-flight connection tasks abort with it (the future drop closes
+    /// their sockets).
+    ///
+    /// A failed `accept` never ends the loop: see [`absorb_accept_error`].
     ///
     /// # Errors
-    /// Returns [`NativeError::Io`] when the accept loop fails.
+    /// Never fails today — every `accept` error is absorbed and retried, so the
+    /// loop ends only on shutdown. The fallible signature stays for a listener
+    /// fault a future revision cannot absorb.
     pub async fn serve(self) -> Result<(), NativeError> {
         loop {
-            let (conn, peer) = self.listener.accept().await?;
+            let accept = self.listener.accept();
+            let accepted = match &self.config.shutdown {
+                Some(rx) => {
+                    let mut rx = rx.clone();
+                    tokio::select! {
+                        biased;
+                        _ = rx.changed() => return Ok(()),
+                        accepted = accept => accepted,
+                    }
+                }
+                None => accept.await,
+            };
+            let (conn, peer) = match accepted {
+                Ok(pair) => pair,
+                Err(error) => {
+                    absorb_accept_error(&error, "socks5 inbound").await;
+                    continue;
+                }
+            };
             // Disable Nagle: interactive traffic through a local proxy should
             // not sit in the output buffer for up to 200ms (Go cores enable
             // TCP_NODELAY by default).
@@ -143,14 +199,86 @@ impl Socks5Inbound {
                 tracing::debug!(%peer, %error, "socks5 inbound: set_nodelay failed");
             }
             let config = Arc::clone(&self.config);
+            let shutdown = config.shutdown.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_conn(config, conn, peer).await {
-                    tracing::debug!(%peer, %error, "socks5 inbound: connection closed");
+                let handle = handle_conn(config, conn, peer);
+                match shutdown {
+                    Some(rx) => {
+                        let mut rx = rx;
+                        tokio::select! {
+                            biased;
+                            _ = rx.changed() => {}
+                            result = handle => {
+                                if let Err(error) = result {
+                                    tracing::debug!(%peer, %error, "socks5 inbound: connection closed");
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if let Err(error) = handle.await {
+                            tracing::debug!(%peer, %error, "socks5 inbound: connection closed");
+                        }
+                    }
                 }
             });
         }
     }
 }
+
+/// Breather after an `accept` failure that is not the failed connection's own
+/// fault: descriptor or buffer exhaustion clears when live connections close,
+/// and spinning on it would burn a core for nothing.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Absorb an `accept` failure and keep the listener alive.
+///
+/// A dead accept loop is worse than a slow one: the TUI still reports
+/// Connected while nothing is listening. A fault belonging to the connection
+/// that failed (a client that vanished mid-handshake) retries immediately;
+/// anything else — `EMFILE`, `ENOBUFS`, a transient kernel refusal — waits out
+/// [`ACCEPT_BACKOFF`] first, because those clear only as live work drains.
+async fn absorb_accept_error(error: &std::io::Error, who: &str) {
+    use std::io::ErrorKind;
+
+    if matches!(
+        error.kind(),
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+    ) {
+        tracing::debug!(%error, "{who}: accept failed for one connection; continuing");
+        return;
+    }
+    tracing::warn!(%error, "{who}: accept failed; retrying after {ACCEPT_BACKOFF:?}");
+    tokio::time::sleep(ACCEPT_BACKOFF).await;
+}
+
+/// Warn once, at bind time, when an inbound is reachable beyond this host
+/// without credentials.
+///
+/// An inbound on a non-loopback address with no authentication is an open
+/// relay: every host that can route to it proxies through this profile, and
+/// the TUI's "listening" line does not say so.
+fn warn_if_open_relay(listener: &TcpListener, has_auth: bool, who: &str) {
+    if has_auth {
+        return;
+    }
+    let Ok(addr) = listener.local_addr() else {
+        return;
+    };
+    if addr.ip().is_loopback() {
+        return;
+    }
+    tracing::warn!(
+        %addr,
+        "{who}: listening on a non-loopback address with no authentication — \
+         every host that can reach it can proxy through this profile"
+    );
+}
+
 /// One connection: negotiate, then dispatch by command.
 async fn handle_conn(
     config: Arc<Socks5InboundConfig>,
@@ -256,7 +384,10 @@ async fn handle_connect(
                     };
                     socks5::write_reply(&mut conn, socks5::ReplyCode::Succeeded, &BIND_ZERO)
                         .await?;
-                    Box::pin(outbound::relay(conn, upstream)).await
+                    match &config.trace {
+                        Some(trace) => traced_relay(trace, conn, upstream, &target, &[]).await,
+                        None => Box::pin(outbound::relay(conn, upstream)).await,
+                    }
                 }
             }
         }
@@ -281,6 +412,75 @@ async fn handle_connect(
             .await?;
             Ok(())
         }
+    }
+}
+
+/// Relay a routed TCP leg with telemetry: per-connection up/down counters,
+/// one trace open/close pair, and the shared poller traffic deltas.
+///
+/// The upstream is wrapped TWICE: the inner [`Counted`] feeds this leg's own
+/// atomics (the totals the close row reports), the outer one feeds the shared
+/// telemetry counters, so the 3 s delta poller sees bytes AS THEY FLOW instead
+/// of one lump when the leg ends.
+///
+/// `prefix` is client payload that arrived together with the inbound's request
+/// head (an HTTP `CONNECT` client that pipelines its first TLS record): it goes
+/// upstream first, through the wrappers, so it is counted like every other
+/// client byte instead of vanishing with the parser's buffer.
+///
+/// The close row belongs to a [`TraceGuard`], so it fires even when this future
+/// is dropped mid-leg by the inbound's shutdown arm.
+async fn traced_relay(
+    trace: &TraceCtx,
+    conn: TcpStream,
+    upstream: BoxStream,
+    target: &TargetAddr,
+    prefix: &[u8],
+) -> Result<(), NativeError> {
+    let dest = dest_str(target);
+    let peer = conn
+        .peer_addr()
+        .map_or_else(|_| "unknown".into(), |a| a.to_string());
+    tracing::info!("accepted {:?} {peer} -> {dest}", trace.kind);
+    let conn_id = trace.telemetry.opened(
+        trace.kind,
+        dest.clone(),
+        trace.protocol.clone(),
+        trace.transport.clone(),
+        trace.security,
+    );
+    let (up, down) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let mut guard: TraceGuard = trace
+        .telemetry
+        .guard(conn_id, Arc::clone(&up), Arc::clone(&down));
+    let mut counted = trace.telemetry.counted(Counted::new(upstream, up, down));
+    if !prefix.is_empty()
+        && let Err(error) = counted.write_all(prefix).await
+    {
+        let error = NativeError::Io(error);
+        tracing::debug!(%error, "{peer} -> {dest}: replaying the pipelined head payload failed");
+        guard.finish(Some(error.to_string()));
+        return Err(error);
+    }
+    let result = Box::pin(outbound::relay(conn, Box::new(counted))).await;
+    let (up, down) = guard.bytes();
+    let elapsed_ms = guard.elapsed_ms();
+    if let Some(error) = result.as_ref().err() {
+        tracing::info!("closed {peer} -> {dest} error={error} up={up} down={down} {elapsed_ms}ms");
+    } else {
+        tracing::info!("closed {peer} -> {dest} up={up} down={down} {elapsed_ms}ms");
+    }
+    guard.finish(result.as_ref().err().map(ToString::to_string));
+    result
+}
+
+/// `host:port` display form for trace rows (IPv6 literals bracketed).
+#[must_use]
+fn dest_str(target: &TargetAddr) -> String {
+    match &target.host {
+        Host::Ip(IpAddr::V6(ip)) => format!("[{ip}]:{}", target.port),
+        Host::Ip(ip) => format!("{ip}:{}", target.port),
+        Host::Domain(domain) => format!("{domain}:{}", target.port),
     }
 }
 
@@ -337,6 +537,12 @@ async fn run_udp_associate(
 /// associates and then disconnects without sending a datagram must not park
 /// this task (and its two sockets) forever. An association that never
 /// receives a datagram also expires after [`UDP_PIN_DEADLINE`].
+///
+/// The inbound's `shutdown` signal ends the association too: this task is
+/// spawned by [`run_udp_associate`] and outlives the accept loop's
+/// per-connection future, so without an arm of its own a live association would
+/// keep forwarding datagrams through the PREVIOUS profile's tunnel after a
+/// disconnect.
 async fn run_udp_relay(
     config: Arc<Socks5InboundConfig>,
     conn: TcpStream,
@@ -346,6 +552,9 @@ async fn run_udp_relay(
     // The write half stays alive so the control connection stays open; the
     // client signals the end by closing its side (read half → EOF).
     let (mut control, _control_w) = tokio::io::split(conn);
+
+    // Cloned before `config` moves into the relay state below.
+    let mut shutdown = config.shutdown.clone();
 
     let mut relay = UdpRelay {
         config,
@@ -370,6 +579,13 @@ async fn run_udp_relay(
 
     loop {
         tokio::select! {
+            // The session ended (disconnect, profile switch): the association
+            // dies with it. Returning drops `relay`, which closes both sockets
+            // and aborts the proxy leg — and the leg's reply task with it.
+            () = shutdown_signal(shutdown.as_mut()) => {
+                tracing::debug!(%peer, "socks5 inbound: udp association ending on shutdown");
+                return Ok(());
+            }
             // The controlling TCP connection closed or errored: the
             // association ends (a received byte is protocol garbage too).
             result = control.read(&mut control_byte) => {
@@ -435,11 +651,40 @@ async fn recv_from_opt(
     }
 }
 
+/// Resolve when the inbound's shutdown signal fires (or its sender is dropped);
+/// never resolve when the inbound has no shutdown wired.
+///
+/// `watch::Receiver::changed` is cancel-safe, so this may sit in a `select!`
+/// arm inside a loop without missing a signal.
+async fn shutdown_signal(rx: Option<&mut watch::Receiver<bool>>) {
+    match rx {
+        // `Err` means every sender is gone, which is a shutdown too.
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// A datagram queued for the proxy leg. The destination is unresolved: the
 /// leg owns resolution so the relay loop never waits on DNS.
 struct ProxyDatagram {
     dest: TargetAddr,
     payload: Vec<u8>,
+}
+
+/// A spawned task aborted when this handle drops.
+///
+/// Dropping a bare [`tokio::task::JoinHandle`] only DETACHES its task, so a
+/// cancelled association would leave its reply reader parked on a dead tunnel
+/// forever, holding the tunnel half and the client socket. Every
+/// per-association task therefore travels in this wrapper.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The proxy side of an association: a task owning the datagram tunnel, fed
@@ -455,6 +700,10 @@ struct ProxyLeg {
     /// dropped (one association carries one tunnel).
     tag: String,
     queue: mpsc::Sender<ProxyDatagram>,
+    /// The leg task, aborted when the leg drops: an association that ends —
+    /// control EOF, shutdown, relay error — must take its tunnel down instead
+    /// of leaving it forwarding to the previous profile.
+    _task: AbortOnDrop,
 }
 
 /// Per-association UDP relay state.
@@ -736,17 +985,18 @@ impl UdpRelay {
                 return;
             };
             let (queue, rx) = mpsc::channel(PROXY_QUEUE_DEPTH);
-            tokio::spawn(run_proxy_leg(
+            let task = AbortOnDrop(tokio::spawn(run_proxy_leg(
                 proxy.clone(),
                 dest.clone(),
                 Arc::clone(&self.client_udp),
                 source,
                 Arc::clone(&self.dns_cache),
                 rx,
-            ));
+            )));
             self.proxy = Some(ProxyLeg {
                 tag: tag.to_owned(),
                 queue,
+                _task: task,
             });
         }
         let leg = self.proxy.as_ref().expect("leg set above");
@@ -806,11 +1056,11 @@ async fn run_proxy_leg(
     let session_addr = resolve_cached(&dns_cache, &session_target).await;
 
     // The reader owns its half, so its multi-await frame read is never
-    // cancelled — the desync this split exists to prevent. The handle is kept
-    // and aborted below: the reader parks in `recv()` and would NOT wake when
-    // the relay drops the queue, so a forgotten handle leaks a task plus a
-    // tunnel per proxy association.
-    let replies = tokio::spawn(async move {
+    // cancelled — the desync this split exists to prevent. The handle rides an
+    // `AbortOnDrop`: the reader parks in `recv()` and would NOT wake when the
+    // relay drops the queue, so a detached handle leaks a task plus a tunnel
+    // per proxy association — including when THIS task is itself aborted.
+    let _replies = AbortOnDrop(tokio::spawn(async move {
         loop {
             match reader.recv().await {
                 Ok(Some((dest, payload))) => {
@@ -839,7 +1089,7 @@ async fn run_proxy_leg(
                 }
             }
         }
-    });
+    }));
 
     while let Some(datagram) = queue.recv().await {
         // The session destination needs no address on the wire — and no DNS:
@@ -870,7 +1120,6 @@ async fn run_proxy_leg(
             }
         }
     }
-    replies.abort();
 }
 
 /// The association's domain → address cache.
@@ -956,7 +1205,7 @@ fn reply_for(error: &NativeError) -> socks5::ReplyCode {
 
 /// Convert a native wire target into the router's [`NetAddr`].
 #[must_use]
-fn target_to_net(target: &TargetAddr) -> NetAddr {
+pub(crate) fn target_to_net(target: &TargetAddr) -> NetAddr {
     NetAddr {
         host: match &target.host {
             Host::Ip(ip) => NetHost::Ip(*ip),
@@ -968,7 +1217,7 @@ fn target_to_net(target: &TargetAddr) -> NetAddr {
 
 /// Convert a router rewrite ([`NetAddr`]) back into a native wire target.
 #[must_use]
-fn net_to_target(addr: NetAddr) -> TargetAddr {
+pub(crate) fn net_to_target(addr: NetAddr) -> TargetAddr {
     TargetAddr {
         host: match addr.host {
             NetHost::Ip(ip) => Host::Ip(ip),

@@ -18,7 +18,7 @@ pub const fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo> {
             exe_names: &["sing-box-client", "sing-box"],
             args_template: "run -c {0}",
         }),
-        CoreType::Auto => None,
+        CoreType::Auto | CoreType::Native => None,
     }
 }
 
@@ -313,6 +313,11 @@ mod tests {
     #[test]
     fn get_core_info_auto_is_none() {
         assert!(get_core_info(CoreType::Auto).is_none());
+    }
+
+    #[test]
+    fn get_core_info_native_is_none() {
+        assert!(get_core_info(CoreType::Native).is_none());
     }
 
     #[test]

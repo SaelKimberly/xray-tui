@@ -6,6 +6,10 @@
 xray-tui (bin)
   ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder, process, log_heed)
   │     └── xray-tui-proto  (ProtocolConfig types, Proto identity container, URL parsing, Clash YAML)
+  ├── xray-tui-native   (in-process runtime backend — VLESS/VMess/Trojan/Hysteria2 tunnels, SOCKS5 + HTTP CONNECT inbounds, capability gate, telemetry)
+  │     ├── xray-tui-tls   (ring TLS 1.3 + TLS 1.2-fallback client, browser fingerprints, REALITY client)
+  │     ├── xray-tui-route (first-match routing engine for the local inbounds — TLS/HTTP/QUIC sniffing)
+  │     └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
   ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
   ├── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
   │     └── xray-tui-proto  (ProtocolConfig/Proto types for import/export round-trip)
@@ -14,15 +18,13 @@ xray-tui (bin)
   └── xray-tui-host-features  (SNI/IP/CIDR whitelist membership — enrichment pipeline)
 ```
 
-	Native stack (in-process tunnel alternative to the subprocess path; not yet
-	wired into the binary — verified standalone via its e2e harness):
-
-	```
-	xray-tui-native     (in-process proxy core — VLESS/VMess/Trojan/Hysteria2 tunnels, SOCKS5 inbound, security phase)
-	  ├── xray-tui-tls   (ring TLS 1.3 + TLS 1.2-fallback client, browser fingerprints, REALITY client)
-	  ├── xray-tui-route (first-match routing engine for the SOCKS5 inbound — TLS/HTTP/QUIC sniffing)
-	  └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
-	```
+`xray-tui → xray-tui-native` is an unconditional path dependency (no feature
+flag, `crates/xray-tui/Cargo.toml`): the native core is a **runtime backend**
+chosen per connect alongside the two subprocess backends, not a library-only
+tunnel implementation. Nothing native is persisted — the decision is recomputed
+on every connect (see "Data Flow: Connect to Proxy"), so no DB row, no
+generated core config and no share link ever names it. Design brief:
+`docs/native-core-integration.md`; per-protocol status: `NATIVE_CORE.md`.
 
 	Build tooling: `xray-tui-hakari` (crates/xray-tui-hakari/) is a cargo-hakari
 	generated feature-unification crate — every workspace member depends on it,
@@ -63,6 +65,7 @@ pub struct AppState {
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
+    pub native_activity: NativeActivityLog, // session-scoped native trace ring (2000 rows)
     pub log_cache: VecDeque<LogLine>,
     pub log_has_older: bool,
     pub log_seek_home: bool,
@@ -99,7 +102,7 @@ pub struct AppState {
     pub ping_status: HashMap<i64, EndpointPingStatus>, // per-endpoint ping rounds (fast/real), session-only; drives Test column [fast]/[real] labels
     pub dns_cache_ttl_secs: i64,                   // TTL for DNS-resolution cache; default 300
     pub shutdown_token: Arc<AtomicBool>,
-    pub core_task_handle: Option<JoinHandle<()>>,
+    pub core_task_handle: Option<JoinHandle<()>>, // running session task; disconnect() swaps in a bounded teardown waiter
     pub heed_storage: Option<Arc<HeedLogStorage>>,
     pub last_seen_log_ns: u64,
     pub known_targets: Vec<String>,
@@ -125,6 +128,7 @@ pub enum CoreEvent {
         total_down: i64,
     },
     SysStatsUpdate(grpc_client::SysStats),
+    NativeTrace(xray_tui_native::telemetry::TraceEvent),
     LogLine {
         level: String,
         target: String,
@@ -183,7 +187,8 @@ draining pending events and updating `AppState` fields (`connected_core`, `conne
 The `disconnect_tx` oneshot channel signals the running core task to stop gracefully.
 
 Methods previously in `lib.rs` extracted to `ops/` modules:
-- `ops/connect.rs` — connect_to_profile, disconnect
+- `ops/connect.rs` — connect_to_profile, disconnect, `resolve_runtime_core` (per-connect native-vs-subprocess decision)
+- `ops/native_connect.rs` — `run_native_session`: the in-process arm of connect_to_profile (binds the native server, forwards its telemetry as `CoreEvent`s, graceful `shutdown().await`)
 - `ops/ping.rs` — start_batch_ping, start_batch_then_real_ping, stop_speed_test
 - `ops/events.rs` — poll_core_events
 - `ops/subscriptions.rs` — update_group_subscriptions, do_update_subscription
@@ -198,6 +203,7 @@ Methods previously in `lib.rs` extracted to `ops/` modules:
 - `settings.rs` — Split-pane settings panel. Left: collapsible tree (SPLIT_SETTINGS_TREE) navigating by SettingsSection. Right: Form (SplitRightPane::Form), UpdateForm, or Empty. 14 sections: Core, GUI, Protocol Core, Inbound, Routing Rules, DNS, System Proxy, TUN, Mux/Fragment, Statistics, Updates, Speed Test, Logging, Subscriptions. Ctrl+W switches focus between tree and form panels. Routes/DNS persist to DB; all others to AppConfig JSON. Replaced per-section SettingsMode variants with unified Split { tree, focus, right } architecture.
 - `groups.rs` — Subscription group overlay (list + add/edit forms) with update/delete actions. Accessed via `g` key from Profiles tab.
 - `logs.rs` — Log viewer with source filtering (c/t toggles for core/TUI logs, v toggles validation/subscription logs)
+- `native_activity.rs` — Native Activity tab (`Tab::NativeActivity`): session totals plus one line per traced native-core connection from `AppState.native_activity`. Window-then-format render (only the visible slice of the ring is turned into `Line`s), scroll offset in a module-level atomic clamped to the ring length every frame, `reset_scroll()` on each new native session; Up/Down/PageUp/PageDown/Home/End only.
 - `actions_log.rs` — Live event log panel showing connection status, speed test results, core/TUI/app logs, traffic counters with color-coded levels. F1 toggles compact/full modes; auto-compacts on small terminals (<20 rows).
 - `theme.rs` — ThemeStyles struct with static methods returning Style from a &Palette (container_border, container_title, hint, warning, error, success, tab_selected, etc.)
 - `palette_bridge.rs` — Maps ratatui-themes ThemePalette (10 colors) to ratatui-cheese Palette (11 roles)
@@ -260,8 +266,19 @@ pub enum CoreType {
     Xray,
     SingBox,
     Auto,
+    Native,   // runtime-only: the in-process core. Never persisted, never in a core config.
 }
 ```
+`Display`/`as_str`/`FromStr` round-trip `Native` as `"native"`, so a
+`protocol_core_overrides` entry can ask for it. This is the RUNTIME enum; the
+persisted stamp is `xray_tui_proto::proto_spec::CoreType`, which stays
+`{Xray, SingBox}` — `resolve_core` still returns only those two. The split is
+load-bearing: the persisted enum is rendered by toasty as
+`TEXT ... CHECK ("core_type" IN ('xray','sing_box'))` frozen into every existing
+DB (a `PRAGMA user_version` mismatch makes `Database::open` delete the file, it
+is not a migration), and `core_type` is part of the identity-hashed
+`ProtocolEssentials`, so a third persisted value would re-key every
+`ProtocolId`.
 
 **`process.rs`** — Dual-backend subprocess lifecycle
 ```rust
@@ -325,12 +342,16 @@ pub struct CoreBinInfo {
 }
 
 pub fn find_binary(core_type: CoreType, bin_dir: &Path) -> Option<PathBuf>;
-pub fn get_core_info(core_type: CoreType) -> CoreBinInfo;
+pub const fn get_core_info(core_type: CoreType) -> Option<CoreBinInfo>;
 pub fn find_and_extract_archives(core_type: CoreType, bin_dir: &Path) -> Result<(), BinError>;
 ```
 `find_binary` checks `bin_dir`/`core_type` first (managed install), then falls back to `which`.
 `get_core_info` returns binary names (xray: `["xray"]`; sing-box: `["sing-box-client", "sing-box"]`)
-and archive patterns for automatic extraction in dev environments.
+and archive patterns for automatic extraction in dev environments. `Auto` and
+`Native` have no binary: `get_core_info` answers `None` and every `updater.rs`
+entry point (`get_current_version`, `get_latest_version`, `release_asset_url`,
+`install_binary`) refuses them — the in-process core is built into the binary, so
+there is nothing to discover, download or update.
 
 ---
 
@@ -505,9 +526,12 @@ Ports format parsing from v2rayN's `Handler/Fmt/*.cs` files plus sing-box URI fo
 ### xray-tui-native (library crate)
 
 `crates/xray-tui-native/src/lib.rs` — in-process proxy core: client-side protocol
-implementations that replace spawning xray-core / sing-box for the tunnel. Built
+implementations, the local inbounds in front of them, and the session lifecycle
+that lets the whole thing stand in for a spawned xray-core / sing-box. Built
 on the same `xray-tui-proto` typed configs (`NativeConnectParams` wraps
-`ProtocolConfig` + `EndpointEssentials`); no config model is defined here.
+`ProtocolConfig` + `EndpointEssentials`); no config model is defined here, and
+nothing here touches the DB or the app config — `xray-tui` passes the already
+resolved values in.
 
 Layering follows Xray composition order, folded by `connect_chain`:
 `dial → transport → security → protocol → tunnel`. Each phase consumes the
@@ -537,17 +561,72 @@ and returns the next.
   carrier's `recv` spans several awaits, so racing it in a `select!` would drop
   a partial frame and desynchronise the tunnel. VLESS XUDP refuses to split
   (its datagrams ride a shared mux tunnel, not a stream).
-- `inbound/` — local SOCKS5 server (`Socks5Inbound`): accept → `xray-tui-route`
-  `Engine` (`decide_async`) → tagged `Outbound` (Direct / Block / Proxy, the proxy
-  reusing `crate::connect`). TCP CONNECT plus UDP ASSOCIATE
-  (`Socks5InboundConfig::udp`, default on): one relay task per association
-  routes EVERY datagram through the engine (`NetworkMask::UDP`, whole-payload
-  sniffing gated on `Engine::needs_sniff`), so a single association can reach
-  direct and proxy outbounds at once. Direct traffic uses per-family upstream
-  sockets; proxy traffic goes to a leg task that owns the split tunnel. The
-  association pins to the control connection's peer, expires if no datagram
-  arrives, and ends on control-TCP EOF. BIND is refused `0x07`; `HijackDns`
-  drops the datagram (TCP: `0x02`).
+- `inbound/` — the local server side: `Socks5Inbound` (`inbound/socks5.rs`) and
+  `HttpInbound` (`inbound/http.rs`), both `accept → xray-tui-route Engine`
+  (`decide_async`) `→ tagged Outbound` (Direct / Block / Proxy, the proxy
+  reusing `crate::connect`). Shared in `inbound/mod.rs`: `TraceCtx` (telemetry
+  sink + the per-leg protocol/transport/security labels), `traced_relay`,
+  `warn_if_open_relay`, `absorb_accept_error`, and the
+  `shutdown: Option<watch::Receiver<bool>>` both configs carry — once the sender
+  marks shutdown the accept loop stops and in-flight connections abort.
+  - SOCKS5: TCP CONNECT plus UDP ASSOCIATE (`Socks5InboundConfig::udp`, default
+    on): one relay task per association routes EVERY datagram through the engine
+    (`NetworkMask::UDP`, whole-payload sniffing gated on `Engine::needs_sniff`),
+    so a single association can reach direct and proxy outbounds at once. Direct
+    traffic uses per-family upstream sockets; proxy traffic goes to a leg task
+    that owns the split tunnel. The association pins to the control connection's
+    peer, expires if no datagram arrives, and ends on control-TCP EOF. BIND is
+    refused `0x07`; `HijackDns` drops the datagram (TCP: `0x02`).
+  - HTTP: `CONNECT host:port` only. The head is scanned under a 16 KiB cap
+    (`MAX_HEAD_BYTES`) with a 3-byte overlap so a `\r\n\r\n` split across reads
+    is still found, and bytes the client pipelined behind the head (a
+    `ClientHello` in the same `write`) are replayed into the tunnel — through the
+    byte counters on the traced path, so they are attributed `up`. Every refusal
+    is framed (`Content-Length` + `Connection: close`) with a one-line reason, so
+    a client can tell a PROXY refusal from a destination failure: `400` (no
+    `host:port`), `403` (blocked route), `407` (missing/wrong credential, with a
+    `Proxy-Authenticate: Basic` challenge), `431` (over-long head), `501` (any
+    other method — absolute-form requests are not forwarded), `502` (failed
+    outbound dial); success is `200 Connection Established` then a raw
+    bidirectional relay. `Proxy-Authorization: Basic` is optional
+    (`HttpInboundConfig::with_auth`) and transient accept errors are absorbed.
+- `capability.rs` — the predicate that decides whether native may serve a row at
+  all. `NATIVE_KINDS` = `[Vless, Vmess, Trojan, Hysteria2]`;
+  `kind_supported(kind)` is the cheap config-blind gate (display/sort paths),
+  `supported(kind, config)` the config-aware one (connect). It mirrors the native
+  dispatch arms, not xray's feature set, and fails CLOSED — a row native serves
+  *worse* than the subprocess defers. Deferred: VLESS account `encryption`
+  (notably `mlkem768x25519plus`, where the native handshake diverges from real
+  xray) and any flow outside the vision pair, legacy VMess payload ciphers and a
+  non-zero `alter_id`, TLS fingerprint ids outside the five
+  `security::fingerprint::parse_fingerprint_id` parses (gating on the SAME parser
+  the dial uses keeps the lists from drifting), mKCP `seed`/`header_type` (wire
+  format, not pacing — including the share-link `path` seed carrier), and bare
+  `TransportConfig::Quic`. The transport match is a POSITIVE, wildcard-free
+  match: a new `TransportConfig` variant breaks it at compile time instead of
+  inheriting `true`.
+- `server/` — `NativeCoreServer`, the in-process equivalent of a spawned core.
+  `ServerConfig { socks, http: Option<SocketAddr>, proxy: ProxyOutbound,
+  telemetry, udp }`; `start()` compiles a proxy-all engine (no rules,
+  `DefaultRoute::Route { tag: "proxy" }`), binds the SOCKS5 listener plus the
+  optional HTTP one, and spawns their accept loops. Teardown is cooperative
+  through one `watch` channel: `stop()` fires the signal every listener and
+  in-flight connection selects on (closing live sockets exactly like killing a
+  subprocess would); `shutdown()` additionally awaits the accept loops and is the
+  ONLY teardown that guarantees the ports are free when it returns; `Drop`
+  signals and aborts the loops but cannot await them. Neither inbound
+  authenticates a client, so a non-loopback bind warns once at `start`.
+- `telemetry.rs` — the event seam to the TUI. `Telemetry::new(cap)` returns the
+  sink plus `NativeEvents`, with SEPARATE bounded log and trace queues (a log
+  burst can never starve trace rows; `recv` takes traces first). `NativeEvent` is
+  `Log` / `Trace` / `Traffic`; `TraceEvent` is `Opened(TraceOpened)` /
+  `Closed(TraceClosed)` keyed by `conn_id`. `Telemetry::guard` hands out a
+  `TraceGuard` that emits the `Closed` row on drop, so a cancelled leg (shutdown,
+  task abort) still ends its row instead of rendering live forever. `Counted<S>`
+  wraps a stream and counts into shared atomics as bytes move, which is what
+  makes traffic live rather than per-connection-final; `drain_traffic()` swaps the
+  totals out for the 3 s poll. A full queue drops the event and counts the drop —
+  drops are folded into one summary line per window, never per-event spam.
 - `e2e/` (feature `native-e2e`) — real-core scenarios: spawns xray-core
   26.3.27 / sing-box 1.13.16 server inbounds, dials with the native client,
   probes HTTP through the tunnel. Transport matrix (VLESS/VMess ×
@@ -555,7 +634,8 @@ and returns the next.
   Hysteria2 axes; 136 tests = 130 green + 6 documented ignored.
   Version-pinned: a core binary version mismatch is a hard fail, not a skip.
 
-Per-protocol roadmap and capability tables: `NATIVE_CORE.md`.
+Per-protocol roadmap and capability tables: `NATIVE_CORE.md`. Session wiring and
+the decision rules: `docs/native-core-integration.md`.
 
 ### xray-tui-tls (library crate)
 
@@ -708,33 +788,110 @@ crate-local dep (serde feature dropped — filters rebuilt from disk on `new()`)
 User selects profile → hits Enter
         │
         ▼
-resolve_core(protocol, profile_override, ss_method) → core_type   // Shadowsocks: cipher-aware (legacy ciphers → sing-box)
+connect_to_profile: signal the previous session to stop, hoist every config
+value the task needs, spawn the session task (kept in AppState.core_task_handle)
         │
         ▼
-[Profile + Groups + Routing + DNS]
+await the previous session task — PREV_SESSION_TEARDOWN = 5s, then abort it
+  // one core at a time, the in-process server included: the stop signal only
+  // ASKS, so binding without waiting races EADDRINUSE on the local ports
         │
         ▼
-match core_type {
-    Xray    → ConfigBuilderXray::build(profile, settings, routing, dns)
-    SingBox → ConfigBuilderSingBox::build(profile, settings, routing, dns)
-}
+load Protocol (deferred config) + DNS settings; routing rules come from state
         │
         ▼
-CoreManager::start(core_type, config)
-  → if running_core_type != core_type: stop current
-  → write JSON to temp file
-  → spawn `xray run -c <path>` or `sing-box run -c <path>`
-  → poll Child.status() every 500ms until running or timeout
+resolve_runtime_core(link_core, kind, forced, config, proxy_all_blocked)
+  link_core = the persisted stamp — always concrete (Xray | SingBox), written by
+              resolve_core at parse time (Shadowsocks: cipher-aware)
+  forced    = config.core.protocol_core_overrides[kind]
+  gates, in order:
+    1. asked for native at all? — the override says native/auto, OR there is no
+       xray/sing-box override and the stamp is Xray. Else → subprocess, silent
+    2. capability::kind_supported(kind)  // vless | vmess | trojan | hysteria2
+    3. proxy_all_blocked = any routing rule OR any DNS server/host
+    4. config actually loaded
+    5. capability::supported(kind, config)                       → CoreType::Native
+  every refusal warns once with host, kind, the core that runs instead, and the
+  rule / dns_servers / dns_hosts counts; an override of `native`/`auto` that lost
+  the gate earns a second "override NOT honored" line
         │
         ▼
-match core_type {
-    Xray | SingBox → GrpcStatsClient::connect(api_addr)
-}
+BuildParams { v2ray_api_enabled: core == Xray, clash_api_enabled: core == SingBox, … }
+  // built AFTER the decision so the api flags follow the core that really runs
+        │
+        ├── Native ─► ops/native_connect.rs::run_native_session
+        │      → NativeCoreServer::start(ServerConfig::new(socks, http, proxy, telemetry))
+        │      → CoreEvent::Connected(CoreType::Native)
+        │      → telemetry adapter: traces + logs live, traffic every 3s,
+        │        VmRSS from /proc/self/status every ~9s
+        │      → stop_rx → server.shutdown().await → CoreEvent::Disconnected
+        │      // never reaches ConfigBuilder::build or find_binary: no JSON
+        │      // config is generated and no binary is needed
+        │
+        └── Xray | SingBox ─► ConfigBuilder::build(endpoint, link, protocol, params, routing, dns)
+               → find_binary(core, bin_dir)
+               → CoreManager::start: write JSON to a temp file, spawn
+                 `xray run -c <path>` / `sing-box run -c <path>`, poll readiness
+               → create_stats_provider(core) on 127.0.0.1:62789, 3s stats poll
         │
         ▼
-UI updates: status_bar shows "Connected [xray|sing-box]",
+UI updates: status_bar shows "Connected [xray|sing-box|native]",
 log panel shows core output, stats panel receives traffic updates
 ```
+
+The persisted stamp never learns about native. `resolve_core` still answers only
+`Xray`/`SingBox`, and that stamp is what the subprocess arms dispatch on — a
+runtime core disagreeing with it would feed one core's JSON to the other's
+binary. The same rule holds outside connect: the JSON config builders and the
+real-ping temp cores dispatch on the link's concrete `core_type`, so there is no
+native real-ping path and a native-only install still fails real pings with
+"Binary not found".
+
+`disconnect()` mirrors the barrier: it signals the session task, then replaces
+`core_task_handle` with a bounded waiter (DISCONNECT_TEARDOWN = 3s) so the task
+runs its own tail — `server.shutdown()` and the closing `Disconnected` — instead
+of being aborted mid-teardown, while the UI thread returns immediately. A
+following connect serializes on that waiter; `ui::run`'s exit path awaits it
+(bounded, 3s) before leaving the alternate screen.
+
+## Data Flow: Native Telemetry → Native Activity
+
+```
+native inbound leg accepted (socks5 CONNECT / UDP ASSOCIATE, http CONNECT)
+  → Telemetry::opened(kind, dest, …) → conn_id + TraceEvent::Opened
+  → Counted<S> wraps the stream: shared AtomicU64 up/down tick as bytes move
+  → TraceGuard::finish(err) — or its Drop, for a cancelled leg → TraceEvent::Closed
+        │
+        ▼
+NativeEvents: two bounded queues, traces drained before logs; a full queue drops
+the event and counts it, folded into ONE summary line per window
+        │
+        ▼
+ops/native_connect.rs telemetry adapter (select! over the queue + a 3s ticker):
+  NativeEvent::Trace → CoreEvent::NativeTrace(TraceEvent)
+  NativeEvent::Log   → the heed LogMessage channel — the same sink the subprocess
+                       stderr lines use, so native logs land in the Logs tab
+  drain_traffic() every 3s → CoreEvent::StatsUpdate { protocol_id, … }
+  VmRSS (/proc/self/status) every 3rd tick → CoreEvent::SysStatsUpdate(SysStats)
+        │
+        ▼
+ops/events.rs poll_core_events (once per frame):
+  Connected(Native) → reset_native_activity(): ring cleared, scroll offset dropped
+  NativeTrace       → AppState.native_activity.record(&ev)
+                      NATIVE_TRACE_BUDGET = 512 traces per frame, then the drain
+                      returns so the frame can draw; the next pass resumes where
+                      it stopped (nothing is lost)
+  Disconnected      → close_out_open(): legs whose Closed event died with the
+                      session task are ended instead of rendering live forever
+        │
+        ▼
+ui/native_activity.rs renders the Native Activity tab from the ring
+```
+
+`NativeActivityLog` (`types.rs`) is a 2000-row `VecDeque` ring plus the session
+totals (`total_up`, `total_down`, `open_count`, `fail_count`). It is
+session-scoped and never persisted: every `Connected(CoreType::Native)` starts
+from an empty ring, and connecting a subprocess core leaves it untouched.
 
 ## Data Flow: Subscription Update
 ```
@@ -822,7 +979,7 @@ poll_core_events EndpointInfoUpdated handler: merge by field group into
 
 - **Process crashes**: Detected via `Child::try_wait()`. Auto-restart with backoff (1s, 2s, 4s, max 30s). UI shows error state with core type.
 - **Config errors**: Builder validates before writing. Core output parsed for config errors. Shown in log panel.
-- **Core binary not found**: Detection at startup and profile connect time. Profiles for the missing core show "binary not found" in connect UI.
+- **Core binary not found**: Detection at startup and profile connect time. Profiles for the missing core show "binary not found" in connect UI. A connect served by the native core needs no binary (`find_binary` is never reached), but real ping still spawns a temp subprocess core, so a native-only install fails real pings with "Binary not found".
 - **gRPC connection failure**: Retry with backoff. If core is running but API not responding, show degraded state (stats unavailable). Sing-box V2Ray API may be missing if built without `with_v2ray_api` tag.
 - **Network errors** (subscription download, speed test): Show timeout/failure per-server. Don't block UI.
 - **No running core**: Most screens (profiles, settings, routing, DNS) work fully offline.
@@ -834,5 +991,21 @@ Single tokio async runtime on the main thread for I/O. Ratatui rendering in a sy
 - Process monitor task → TUI: `process_event_tx` (Started, Stopped, Crashed(error))
 - Stats poll task → TUI: `stats_update_tx` (IndexId, TodayUp, TodayDown, etc.)
 - Log reader task → TUI: `log_line_tx` (timestamp, level, message)
-- Log persistence → heed (LMDB): `HeedLogStorage` stores entries synchronously via heed; no background worker or dedicated connection
+- Native session task → TUI: `core_event_tx` (`NativeTrace`, `StatsUpdate`, `SysStatsUpdate`) plus the shared heed log channel; the in-process core's own accept/relay tasks live inside `NativeCoreServer` and all select on one `watch` shutdown signal
+- Log persistence → heed (LMDB): a batched writer (up to 100 messages) owns the `std::sync::mpsc` receiver in a `spawn_blocking` task; async readers wrap LMDB reads in `spawn_blocking` too
 - TUI event loop: polls all channels + terminal events + renders frame
+
+**Shutdown.** `AppState::shutdown_token: Arc<AtomicBool>` is the one flag every
+background loop checks. `main` creates it, installs it on the state, stores `true`
+unconditionally after `ui::run` returns (before propagating any error), and the
+panic hook stores it as well. Both blocking tasks poll it in 200 ms slices instead
+of parking forever — `Runtime::drop` waits for in-flight `spawn_blocking` work, so
+a task that never returns hangs the process at quit:
+
+- terminal reader (`ui::run`) — `event::poll(200ms)` before `event::read()`
+- heed log batch writer (`main`) — `log_rx.recv_timeout(200ms)`, shutdown checked on each timeout
+
+Session teardown is ordered ahead of that flag: `ui::run` calls `disconnect()` and
+awaits the bounded teardown waiter it leaves in `core_task_handle` (3 s cap), so
+the native core's `server.shutdown()` and closing `Disconnected` run before the
+process leaves the alternate screen.

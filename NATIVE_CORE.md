@@ -161,6 +161,7 @@ hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`
 | `context.rs` | `LinkContext`, `NativeConnectParams` (wraps proto types) |
 | `addr.rs` | `TargetAddr` (domain/IP + port) encode/decode |
 | `inbound/` | local SOCKS5 server (`Socks5Inbound`, RFC 1928 + RFC 1929 auth): accept → `xray-tui-route` `Engine` → tagged outbound (`Outbound`/`OutboundKind` — Direct / Block / Proxy, the proxy reusing `crate::connect`). TCP CONNECT **plus UDP ASSOCIATE** (`Socks5InboundConfig::udp`, default on): per-datagram routing, per-family direct sockets, and a proxy leg task owning a split `PacketTunnel` (a stream carrier's `recv` must never be raced in a `select!`). Association pinned to the control peer, expiring without a first datagram, ending on control-TCP EOF; per-datagram failures drop the datagram only. BIND refused `0x07`, `HijackDns` drops the datagram (TCP `0x02`). Hermetic tier-1: codec units (greeting, command discriminants, UDP header round-trip + malformed inputs) + full-flow integration (echo relay, block/reject rules, domain routing, `override_addr` rewrite, auth, unknown tag, UDP echo, fragment drop, source pinning, multi-destination fan-out, teardown/port release) |
+| `inbound/http.rs` | local HTTP CONNECT proxy (`HttpInbound`, same `Engine` → tagged-outbound path as SOCKS5). **CONNECT-only v1**: absolute-form requests are not forwarded (`501`), CONNECT without `host:port` `400`, head over 16 KiB `431`, missing/malformed/wrong Basic credential `407` + `Proxy-Authenticate: Basic realm="xray-tui"`, Block/Reject `403`, unknown outbound tag or failed dial `502`, success a bare `200 Connection Established` (refusals framed with Content-Type/Content-Length/`Connection: close` + a one-line reason). Optional Basic auth (`HttpInboundConfig::with_auth`) — the TUI session has no credential source and relies on the loopback bind; both inbounds `warn` once at bind time on a non-loopback bind without auth. Post-head pipelined bytes are replayed into the tunnel; a failed `accept` retries instead of killing the listener |
 | `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp) **or the QUIC dial** (`quic.rs` — the shared quinn endpoint + rustls/TLS-verify + 0-RTT helpers used by BOTH the xhttp h3 arm and the hysteria2 client; xhttp + exactly-one `h3` ALPN → `connect_quic` and hysteria2 are `is_self_contained` — the dial REPLACES dial + security + upgrade, quinn/rustls TLS is internal, webpki-roots default verify with the harness-CA override in test/e2e builds); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS — the h3 mode is the `connect` QUIC dial above, not an upgrade step; the v3 protocol (session open, GET download, POST uploads, pacing) is written once over the `V3Send` seam shared by h1/h2/h3, and h3 requests use absolute-URI form (`:scheme`/`:authority` per RFC 9114 §4.3.1 — the interop fix)) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts. QUIC/HTTP-3 is quinn 0.11 (rustls-ring) + h3 0.0.8 + h3-quinn 0.0.10 + webpki-roots (the h3 arm's default trust store); rustls (ring) is a mandatory native dep (was native-e2e-gated optional) — the h3 arm's quinn TLS config + the unit/e2e server double |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `Fingerprint`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
 | `protocol/` | 20 protocol modules; `vless` + `vmess` + `trojan` + `hysteria2` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT) |
@@ -441,7 +442,9 @@ REALITY compatibility (any resolvable identity via
 Notes on the matrix:
 - **TLS engine / REALITY columns** are "✅" only for the TCP-stream family
   where the security phase applies. QUIC-family protocols (Hysteria1/2, TUIC)
-  carry TLS inside QUIC and need a QUIC transport first — 🔒.
+  carry TLS inside QUIC, so the engine's security phase never runs — 🔒. That
+  is orthogonal to the native column: Hysteria2 is native-complete because its
+  quinn dial owns TLS internally; Hysteria1 + TUIC still need a QUIC client.
 - **TLS 1.2**: the engine has a TLS 1.2 fallback path (ECDHE + AEAD only),
   reached on a 1.2 ServerHello — legacy TLS 1.2-only servers are reachable.
   REALITY stays 1.3-only (a 1.2 ServerHello → `RealityFallback` → Spider-X).
@@ -638,15 +641,16 @@ Notes on the matrix:
 | HTTPUpgrade | ✅ | `transport/httpupgrade.rs`; hyper http1 conn + RFC 7230 101 upgrade over the engine stream, `Connection: Upgrade`/`Upgrade: websocket` echo validated; ALPN `http/1.1`; e2e vs xray + sing-box |
 | XHTTP (splithttp) | ✅ | `transport/xhttp.rs`; v3 dialect (xray-only server): uuid session in path, GET-body download, raw POST uploads (seq + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks); **packet-up + stream-up + stream-one**; h1 when no TLS, h2 over TLS, **h3 over QUIC when the TLS ALPN is exactly `h3`** (mirror of xray `decideHTTPVersion`: reality → h2, no TLS → h1.1, single `h3` ALPN → QUIC, 0/2+ ALPNs → h2). **Mode auto-rule (mirrors xray): `""`/`auto` → packet-up; reality present → stream-one; reality + download_settings → stream-up.** The h3 dial **replaces** dial+security+upgrade (`connect_quic` — quinn/rustls internal, webpki-roots default verify; the engine TLS is not involved in QUIC); the v3 protocol is shared across h1/h2/h3 via the `V3Send` seam, and h3 requests use absolute-URI form (`:scheme`/`:authority`, RFC 9114 §4.3.1 — the interop fix). e2e vs xray (single-core: xhttp-h3/tls, xhttp-stream-one/tls, xhttp-stream-one/reality).
 | h2 (v2rayhttp) | ✅ | `transport/v2rayhttp.rs`; h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only (xray removed the h2 transport in 26.x); e2e vs sing-box (single-core) |
-| QUIC | 🚧 | quinn + h3 landed (SP5) as the xhttp h3 dial (`connect_quic`); a general QUIC client transport for Hysteria1/2 + TUIC clients remains 🔒 |
+| QUIC | 🚧 | quinn + h3 landed (SP5) as the xhttp h3 dial **and** the hysteria2 client dial (`connect_quic`; shared endpoint/TLS/0-RTT helpers in `transport/quic.rs`); a general QUIC client transport for the Hysteria1 + TUIC clients remains 🔒 |
 | KCP (mKCP) | ✅ | `transport/kcp/` — xray's KCP fork over UDP: wire codec + session (windows/retransmit/RTO/congestion) + stream; one segment per datagram, conv from a process-global counter; xray-only (sing-box has no kcp); e2e vs xray (plain no-TLS + chrome tls) |
 | obfs plugins (SS) | 📋 | plugin URL param already parsed by proto |
 
 ### Transport deferrals (documented, no stub)
 
 - **quic client transport** — the quinn+h3 stack landed (SP5) as the xhttp
-  h3 dial; a general QUIC client transport gating the Hysteria1/2 + TUIC
-  clients is still deferred.
+  h3 dial, and hysteria2 rides the same helpers for its own self-contained
+  dial (`protocol/hysteria2`, complete + e2e); a general QUIC client transport
+  gating the Hysteria1 + TUIC clients is still deferred.
 - **HTTPUpgrade `ed` early-data** — xray-only client flag; server sees a
   normal 101 exchange.
 - **h2 PING keepalive** — `idle_timeout`/`ping_timeout` in `HttpConfig` not
@@ -668,11 +672,17 @@ Notes on the matrix:
    AnyTLS, ShadowTLS, Naïve) — the TLS engine is done, the shapes are uniform.
 2. **Non-TCP transports** — the TCP-stream transport set is done
    (WS/gRPC/HTTPUpgrade/XHTTP/h2), mKCP landed (SP4, UDP), and the quinn
-   QUIC stack landed for the xhttp h3 dial (SP5); next is a general QUIC
-   client transport, which unlocks Hysteria1/2 + TUIC.
-3. **Wire in the TUI**: a per-profile "native" toggle (or auto-fallback when a
-   core binary is missing) — the unified `xray_tui_tls::client::connect` /
-   `TlsConfig` engine API already proves the integration point.
+   QUIC stack landed for the xhttp h3 dial (SP5) plus the hysteria2 client
+   dial (complete + e2e); next is a general QUIC client transport, which
+   unlocks Hysteria1 + TUIC.
+3. **Wire in the TUI** ✅ (2026-09-03, `docs/native-core-integration.md`): no
+   per-profile toggle and nothing native persisted — the connect-time gate
+   prefers the in-process core for the four e2e-verified protocols
+   (vless/vmess/trojan/hysteria2) via `capability::supported`, with loud
+   downgrade to xray-core for deferred configs. `NativeCoreServer` (SOCKS5 +
+   HTTP CONNECT inbounds, proxy-all engine, watch-shutdown) replaces the
+   subprocess arm in `ops/connect.rs`; telemetry (log/traffic/trace) feeds the
+   existing stats/logs screens plus the Native Activity tab.
 4. **Routing + outbound-only kinds** via native — the SOCKS5 inbound
    (`inbound/`, accept → route → direct/block/proxy outbound) is done; the
    remaining piece is the outbound-only kinds (redirect dial for

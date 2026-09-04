@@ -16,7 +16,7 @@ xray-tui-tls.workspace = true
 xray-tui-route = { path = "../xray-tui-route" }
 
 # async runtime
-tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
 
 # TLS (workspace standard: ring backend). The client path is the engine
 # (xray-tui-tls), but the xhttp h3 arm builds quinn's QUIC TLS config from

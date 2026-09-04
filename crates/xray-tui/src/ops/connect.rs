@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -8,7 +9,10 @@ use xray_tui_core::{
     config_builder::clash_mixin::parse_clash_mixin, find_binary,
 };
 use xray_tui_db::models::{DnsSetting, EndpointId, RoutingRule};
-use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
+use xray_tui_native::capability;
+use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ProtocolConfig, ProtocolKind};
+
+use super::native_connect;
 
 use crate::AppState;
 use crate::parse_core_log_line;
@@ -33,13 +37,88 @@ const fn clash_stats_event(protocol_id: i64, t: &ClashTraffic) -> CoreEvent {
     }
 }
 
+/// How long a new session waits for the previous session task to finish its
+/// teardown before it binds its own listeners.
+///
+/// AGENTS.md decision 3 — one core at a time, the in-process server included:
+/// the stop signal only *asks* the previous session to stop, so a new session
+/// that does not wait binds onto still-held ports (EADDRINUSE) and races the
+/// old task's closing `Disconnected`.
+const PREV_SESSION_TEARDOWN: Duration = Duration::from_secs(5);
+
+/// How long `disconnect` lets the session task run its own teardown
+/// (`server.shutdown()` + `Disconnected`) before aborting it.
+const DISCONNECT_TEARDOWN: Duration = Duration::from_secs(3);
+
+/// Loud downgrade lines: what refused the native core, and what runs instead.
+const REFUSED_KIND: &str =
+    "native core has no implementation for this protocol kind; using the subprocess core";
+const REFUSED_PROXY_ALL: &str =
+    "native core is proxy-all: routing rules / DNS settings need xray-core";
+const REFUSED_UNLOADED: &str = "profile config not loaded; native core skipped, using xray-core";
+const REFUSED_CAPABILITY: &str =
+    "native core does not support this profile config; using xray-core";
+
+/// True when a `protocol_core_overrides` value asks for the in-process core.
+///
+/// `auto` asks for it too: it is the config-level "prefer native" answer, and
+/// preferring native is exactly what the capability gate decides. Neither value
+/// bypasses that gate.
+const fn asks_native(forced: Option<CoreType>) -> bool {
+    matches!(forced, Some(CoreType::Native | CoreType::Auto))
+}
+
+/// Resolve the core that serves one connect, plus the gate that refused the
+/// native core when it was asked for.
+///
+/// `link_core` is the link's persisted stamp — always concrete — and the only
+/// legal *subprocess* answer: `ConfigBuilder::build` dispatches on
+/// `link.core_type`, so a runtime core that disagreed with the stamp would feed
+/// one core's JSON to the other's binary. A `protocol_core_overrides` value of
+/// `xray`/`sing-box` therefore only vetoes native; `native`/`auto` asks for
+/// native and still faces the capability gate.
+///
+/// Native is asked for by that override, or by an xray-stamped link on one of
+/// the four native kinds — the connect-time replacement for the old parse-time
+/// `Auto` stamp, so nothing native-specific is persisted.
+fn resolve_runtime_core(
+    link_core: CoreType,
+    kind: ProtocolKind,
+    forced: Option<CoreType>,
+    config: Option<&ProtocolConfig>,
+    proxy_all_blocked: bool,
+) -> (CoreType, Option<&'static str>) {
+    let forces_legacy = matches!(forced, Some(CoreType::Xray | CoreType::SingBox));
+    let asked_for_native = asks_native(forced) || (!forces_legacy && link_core == CoreType::Xray);
+    if !asked_for_native {
+        return (link_core, None);
+    }
+    if !capability::kind_supported(kind) {
+        // Every xray-stamped non-native kind lands here: for those the
+        // subprocess core *is* the expected answer, so only an explicit native
+        // override earns a line.
+        return (link_core, asks_native(forced).then_some(REFUSED_KIND));
+    }
+    if proxy_all_blocked {
+        return (link_core, Some(REFUSED_PROXY_ALL));
+    }
+    let Some(config) = config else {
+        return (link_core, Some(REFUSED_UNLOADED));
+    };
+    if capability::supported(kind, config) {
+        (CoreType::Native, None)
+    } else {
+        (link_core, Some(REFUSED_CAPABILITY))
+    }
+}
+
 /// Connect to a profile by starting the appropriate core (xray-core or sing-box).
 pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     if state.connecting {
         return;
     }
 
-    let (endpoint, link, protocol_id) = {
+    let (endpoint, link, protocol_id, proto_kind) = {
         let Some(row) = state
             .endpoints
             .iter()
@@ -52,7 +131,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             );
             return;
         };
-        let Some((link, _protocol)) = row.active_protocol() else {
+        let Some((link, protocol)) = row.active_protocol() else {
             // T8+9: linkless endpoints are valid rows — nothing to connect.
             state.log_trace(
                 "error",
@@ -61,12 +140,20 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             );
             return;
         };
-        (row.endpoint.clone(), link.clone(), link.protocol_id)
+        (
+            row.endpoint.clone(),
+            link.clone(),
+            link.protocol_id,
+            protocol.proto_kind,
+        )
     };
 
-    // The link's `core_type` is the per-pair override resolved at parse time
-    // (never Auto) — it drives both the backend build and the params flags.
-    let core_type = match link.core_type {
+    // The link's `core_type` is the persisted per-pair stamp, always concrete
+    // (`Xray`/`SingBox`), and it is also the only core the subprocess path may
+    // run (`ConfigBuilder::build` dispatches on it). Whether the in-process
+    // native core serves this connect instead is decided in the task (0.5),
+    // where the loaded config can face the capability gate.
+    let link_core = match link.core_type {
         ProtoCoreType::Xray => CoreType::Xray,
         ProtoCoreType::SingBox => CoreType::SingBox,
     };
@@ -124,33 +211,33 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         return;
     };
 
-    let params = BuildParams {
-        v2ray_api_enabled: matches!(link.core_type, ProtoCoreType::Xray),
-        clash_api_enabled: matches!(link.core_type, ProtoCoreType::SingBox),
-        log_level: state.config.core.log_level.clone(),
-        socks_port: state.config.inbound.socks_port,
-        http_port: state.config.inbound.http_port,
-        listen: state.config.inbound.listen.clone(),
-        sniffing: state.config.inbound.sniffing,
-        clash_api_port: state.config.clash_api_port,
-        mux: if state.config.mux.enabled {
-            Some(serde_json::json!({
-                "protocol": state.config.mux.protocol,
-                "max_connections": state.config.mux.max_connections,
-                "min_streams": state.config.mux.min_streams,
-                "max_streams": state.config.mux.max_streams,
-                "padding": state.config.mux.padding,
-            }))
-        } else {
-            None
-        },
-        clash_mixin: state
-            .config
-            .clash_mixin
-            .as_deref()
-            .and_then(parse_clash_mixin),
-        skip_cert_verify: state.config.core.skip_cert_verify,
+    // Runtime core selection needs the loaded config, so the task builds
+    // `BuildParams` itself from these hoisted values (flags follow the
+    // resolved core, not the stamped link value).
+    let param_log_level = state.config.core.log_level.clone();
+    let param_socks_port = state.config.inbound.socks_port;
+    let param_http_port = state.config.inbound.http_port;
+    let param_listen = state.config.inbound.listen.clone();
+    let param_sniffing = state.config.inbound.sniffing;
+    let param_clash_api_port = state.config.clash_api_port;
+    let param_mux = if state.config.mux.enabled {
+        Some(serde_json::json!({
+            "protocol": state.config.mux.protocol,
+            "max_connections": state.config.mux.max_connections,
+            "min_streams": state.config.mux.min_streams,
+            "max_streams": state.config.mux.max_streams,
+            "padding": state.config.mux.padding,
+        }))
+    } else {
+        None
     };
+    let param_clash_mixin = state
+        .config
+        .clash_mixin
+        .as_deref()
+        .and_then(parse_clash_mixin);
+    let param_skip_cert_verify = state.config.core.skip_cert_verify;
+    let param_core_overrides = state.config.core.protocol_core_overrides.clone();
 
     // Routing comes from the already-loaded rules; DNS settings are loaded
     // inside the task (async read) with a typed default fallback.
@@ -166,9 +253,35 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     // Create log forwarding channel
     let (log_line_tx, mut log_line_rx) = mpsc::channel::<String>(512);
     let state_log_sender = state.log_sender_tx.clone();
+
+    // One core at a time: hand the previous session's task to the new one so it
+    // can wait out that teardown before binding its own listeners.
+    let prev_task = state.core_task_handle.take();
     let handle = tokio::spawn(async move {
-        // 0. Load the Protocol row with config included (the EndpointRow
-        //    list ships unloaded deferred JSON).
+        // 0a. Wait out the previous session's teardown — the stop signal above
+        //     only asked it to stop. A wedged task is aborted so its listeners
+        //     are released either way.
+        if let Some(mut prev) = prev_task
+            && tokio::time::timeout(PREV_SESSION_TEARDOWN, &mut prev)
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                target: "tui::ops::connect",
+                secs = PREV_SESSION_TEARDOWN.as_secs(),
+                "previous core session did not finish teardown; aborting it"
+            );
+            prev.abort();
+        }
+        // Cancelled while waiting (disconnect, or another connect took over):
+        // bind nothing. This session never emitted `Connected`, so it must not
+        // emit `Disconnected` either.
+        if stop_rx.try_recv().is_ok() {
+            return;
+        }
+
+        // 0b. Load the Protocol row with config included (the EndpointRow
+        //     list ships unloaded deferred JSON).
         let protocol = match crate::state::load_protocol_with_config(&db, protocol_id).await {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -203,6 +316,79 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             },
         };
 
+        // 0.5. Runtime core. The link stamp is concrete and nothing native is
+        // persisted: native preference is decided here, per connect, because
+        // only here is the deferred config loaded and only here can the
+        // capability gate run.
+        let forced = param_core_overrides
+            .get(&proto_kind.to_string())
+            .and_then(|s| s.parse::<CoreType>().ok());
+        // The native core is proxy-all — no routing engine, no DNS server — so
+        // a profile with routing rules or non-default DNS keeps the subprocess
+        // core. Decided before the capability gate so the `BuildParams` api
+        // flags below follow the final runtime core.
+        let proxy_all_blocked =
+            !routing.is_empty() || !dns.servers.is_empty() || !dns.hosts.is_empty();
+        let loaded_config = if protocol.config.is_unloaded() {
+            None
+        } else {
+            Some(&protocol.config.get().0)
+        };
+        let (runtime_core, refused) = resolve_runtime_core(
+            link_core,
+            proto_kind,
+            forced,
+            loaded_config,
+            proxy_all_blocked,
+        );
+        if let Some(reason) = refused {
+            tracing::warn!(
+                target: "tui::ops::connect",
+                host = %endpoint.host,
+                kind = %proto_kind,
+                core = %runtime_core,
+                rules = routing.len(),
+                dns_servers = dns.servers.len(),
+                dns_hosts = dns.hosts.len(),
+                "{reason}"
+            );
+            if asks_native(forced) {
+                tracing::warn!(
+                    target: "tui::ops::connect",
+                    host = %endpoint.host,
+                    kind = %proto_kind,
+                    core = %runtime_core,
+                    "protocol_core_overrides asked for the native core: override NOT honored"
+                );
+            }
+        }
+        let params = BuildParams {
+            v2ray_api_enabled: runtime_core == CoreType::Xray,
+            clash_api_enabled: runtime_core == CoreType::SingBox,
+            log_level: param_log_level,
+            socks_port: param_socks_port,
+            http_port: param_http_port,
+            listen: param_listen,
+            sniffing: param_sniffing,
+            clash_api_port: param_clash_api_port,
+            mux: param_mux,
+            clash_mixin: param_clash_mixin,
+            skip_cert_verify: param_skip_cert_verify,
+        };
+        if runtime_core == CoreType::Native {
+            native_connect::run_native_session(
+                &params,
+                &endpoint,
+                &protocol,
+                &tx,
+                &state_log_sender,
+                stop_rx,
+                protocol_id.get(),
+            )
+            .await;
+            return;
+        }
+
         // 1. Build config
         let backend_config =
             match ConfigBuilder::build(&endpoint, &link, &protocol, &params, &routing, &dns) {
@@ -218,7 +404,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             };
 
         // 2. Find binary
-        let Some(bin_path) = find_binary(core_type, &bin_dir) else {
+        let Some(bin_path) = find_binary(runtime_core, &bin_dir) else {
             try_send_or_warn(
                 &tx,
                 CoreEvent::Error(
@@ -233,7 +419,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         let mut manager = RealCoreManager::new(bin_configs_dir, log_line_tx);
         if let Err(e) = manager
             .start(
-                core_type,
+                runtime_core,
                 &backend_config,
                 &bin_path,
                 params.clash_mixin.as_ref(),
@@ -264,14 +450,14 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         }
 
         // 4. Signal connected
-        try_send_or_warn(&tx, CoreEvent::Connected(core_type), "connected");
+        try_send_or_warn(&tx, CoreEvent::Connected(runtime_core), "connected");
 
         // Forward stderr log lines as CoreEvent::LogLine
         let log_tx = tx.clone();
         let log_sender = state_log_sender.clone();
         tokio::spawn(async move {
             while let Some(line) = log_line_rx.recv().await {
-                let (level, target, message, ts_nanos) = parse_core_log_line(&line, core_type);
+                let (level, target, message, ts_nanos) = parse_core_log_line(&line, runtime_core);
                 let timestamp_nanos = ts_nanos.unwrap_or_else(|| {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -303,7 +489,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
 
         let profile_id = protocol_id.get();
 
-        if core_type == CoreType::Xray {
+        if runtime_core == CoreType::Xray {
             // === gRPC polling loop (xray-core) ===
             let provider = match grpc_client::create_stats_provider().await {
                 Ok(p) => Some(p),
@@ -454,8 +640,25 @@ pub fn disconnect(state: &mut AppState) {
     if let Some(tx) = state.disconnect_tx.take() {
         let _ = tx.send(());
     }
-    if let Some(handle) = state.core_task_handle.take() {
-        handle.abort();
+    if let Some(mut handle) = state.core_task_handle.take() {
+        // Let the session task run its own teardown — the native core's
+        // `server.shutdown()` and the closing `Disconnected` live there — and
+        // abort only a wedged one. The waiter replaces the handle so a
+        // following connect still serializes on this teardown (those listeners
+        // must be gone before new ones bind), while the UI thread returns now.
+        state.core_task_handle = Some(tokio::spawn(async move {
+            if tokio::time::timeout(DISCONNECT_TEARDOWN, &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "tui::ops::connect",
+                    secs = DISCONNECT_TEARDOWN.as_secs(),
+                    "core session did not stop in time; aborting it"
+                );
+                handle.abort();
+            }
+        }));
     }
     state.connected_core = None;
     state.connected_protocol_id = None;
@@ -676,9 +879,13 @@ mod tests {
 
         state.disconnect();
 
-        // Pollers stopped: the stop signal was taken and the task aborted.
+        // Pollers stopped: the stop signal was consumed. No session task was
+        // registered in this test, so there is nothing left to wait on.
         assert!(state.disconnect_tx.is_none(), "stop signal consumed");
-        assert!(state.core_task_handle.is_none(), "core task aborted");
+        assert!(
+            state.core_task_handle.is_none(),
+            "no session task to tear down"
+        );
         // Session state cleared.
         assert_eq!(state.connected_core, None);
         assert_eq!(state.connected_protocol_id, None);
@@ -707,6 +914,52 @@ mod tests {
         // Disconnect left no stragglers: draining the channel post-disconnect
         // finds nothing (the flush consumed the pending tick).
         assert!(!state.poll_core_events().await);
+    }
+
+    /// `disconnect` fires the stop signal and then lets the session task run
+    /// its own teardown (for the native core, `server.shutdown()` and the
+    /// closing `Disconnected` live there) — never an immediate abort, and never
+    /// a blocked UI thread. The bounded waiter it leaves behind is what the
+    /// next connect serializes on.
+    #[tokio::test]
+    async fn disconnect_lets_the_session_task_run_its_own_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut state =
+            crate::ops::profiles::test_support::test_state(vec![fake_row(100, "h100.example", 1)])
+                .await;
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // `release` stands in for a teardown that takes a while: the task
+        // cannot finish until this test allows it, so "did the tail run?" is
+        // decided by ordering instead of by a sleep.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&torn_down);
+        state.disconnect_tx = Some(stop_tx);
+        state.core_task_handle = Some(tokio::spawn(async move {
+            stop_rx.await.expect("stop signal delivered by disconnect");
+            let _ = release_rx.await;
+            flag.store(true, Ordering::SeqCst);
+        }));
+
+        state.disconnect();
+
+        assert!(
+            !torn_down.load(Ordering::SeqCst),
+            "disconnect returns before the teardown finishes (the UI thread never blocks)"
+        );
+        let waiter = state
+            .core_task_handle
+            .take()
+            .expect("the bounded teardown waiter is kept for the next session");
+        release_tx
+            .send(())
+            .expect("teardown still running, not aborted");
+        waiter.await.expect("waiter joins cleanly");
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "the session task ran its own tail instead of being aborted"
+        );
     }
 
     #[test]
@@ -742,6 +995,144 @@ mod tests {
             fields,
             vec![(7, 100, 200, 100, 200), (7, 50, 75, 50, 75)],
             "each event carries only that line's delta"
+        );
+    }
+
+    // ── Runtime core resolution (connect-time native selection) ───────────
+
+    /// A VLESS row over the given transport. `Tcp` passes the capability gate;
+    /// `Quic` is the capability-deferred case (native has no bare-QUIC arm).
+    fn vless_config(transport: TransportConfig) -> ProtocolConfig {
+        ProtocolConfig::Vless(xray_tui_proto::proto_spec::VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            uuid_origin: None,
+            security: SecurityConfig::default(),
+            transport,
+            encryption: None,
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        })
+    }
+
+    fn resolve_vless(
+        link_core: CoreType,
+        forced: Option<CoreType>,
+        config: Option<&ProtocolConfig>,
+        proxy_all_blocked: bool,
+    ) -> (CoreType, Option<&'static str>) {
+        resolve_runtime_core(
+            link_core,
+            ProtocolKind::Vless,
+            forced,
+            config,
+            proxy_all_blocked,
+        )
+    }
+
+    #[test]
+    fn xray_stamped_native_kind_selects_the_in_process_core() {
+        let cfg = vless_config(TransportConfig::Tcp);
+        assert_eq!(
+            resolve_vless(CoreType::Xray, None, Some(&cfg), false),
+            (CoreType::Native, None),
+            "an xray-stamped native kind whose config passes the gate runs native"
+        );
+    }
+
+    #[test]
+    fn routing_rules_demote_native_to_the_link_core() {
+        let cfg = vless_config(TransportConfig::Tcp);
+        assert_eq!(
+            resolve_vless(CoreType::Xray, None, Some(&cfg), true),
+            (CoreType::Xray, Some(REFUSED_PROXY_ALL)),
+            "native is proxy-all: routing rules / custom DNS keep xray-core"
+        );
+    }
+
+    #[test]
+    fn capability_deferred_config_demotes_native() {
+        let cfg = vless_config(TransportConfig::Quic);
+        assert_eq!(
+            resolve_vless(CoreType::Xray, None, Some(&cfg), false),
+            (CoreType::Xray, Some(REFUSED_CAPABILITY)),
+            "a config native serves worse falls back to xray-core, loudly"
+        );
+    }
+
+    #[test]
+    fn unloaded_config_never_reaches_native() {
+        assert_eq!(
+            resolve_vless(CoreType::Xray, None, None, false),
+            (CoreType::Xray, Some(REFUSED_UNLOADED)),
+            "the capability gate cannot run on a deferred config"
+        );
+    }
+
+    #[test]
+    fn forced_native_and_auto_go_through_the_capability_gate() {
+        let ok = vless_config(TransportConfig::Tcp);
+        let deferred = vless_config(TransportConfig::Quic);
+        for forced in [CoreType::Native, CoreType::Auto] {
+            assert_eq!(
+                resolve_vless(CoreType::Xray, Some(forced), Some(&ok), false),
+                (CoreType::Native, None),
+                "{forced} override selects native when the gate passes"
+            );
+            assert_eq!(
+                resolve_vless(CoreType::Xray, Some(forced), Some(&deferred), false),
+                (CoreType::Xray, Some(REFUSED_CAPABILITY)),
+                "{forced} override is refused by the gate, never silently native"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_native_on_a_non_native_kind_reports_the_kind_gate() {
+        let got = resolve_runtime_core(
+            CoreType::Xray,
+            ProtocolKind::Shadowsocks,
+            Some(CoreType::Native),
+            None,
+            false,
+        );
+        assert_eq!(
+            got,
+            (CoreType::Xray, Some(REFUSED_KIND)),
+            "native cannot serve shadowsocks; the override is reported, not honored"
+        );
+    }
+
+    #[test]
+    fn forced_legacy_override_vetoes_native_and_keeps_the_stamp() {
+        let cfg = vless_config(TransportConfig::Tcp);
+        for forced in [CoreType::Xray, CoreType::SingBox] {
+            assert_eq!(
+                resolve_vless(CoreType::Xray, Some(forced), Some(&cfg), false),
+                (CoreType::Xray, None),
+                "{forced} override vetoes native; the stamp still builds the config"
+            );
+        }
+    }
+
+    #[test]
+    fn singbox_stamped_link_never_runs_native() {
+        let cfg = vless_config(TransportConfig::Tcp);
+        assert_eq!(
+            resolve_vless(CoreType::SingBox, None, Some(&cfg), false),
+            (CoreType::SingBox, None),
+            "a sing-box link stays on sing-box, native kind or not"
+        );
+    }
+
+    #[test]
+    fn non_native_kind_keeps_the_link_core_silently() {
+        let got = resolve_runtime_core(CoreType::Xray, ProtocolKind::Socks, None, None, false);
+        assert_eq!(
+            got,
+            (CoreType::Xray, None),
+            "kinds outside the native set resolve exactly as before, with no warn"
         );
     }
 }

@@ -151,6 +151,23 @@ connection status). Data sourced from the backend's gRPC/V2Ray API when availabl
 
 ---
 
+### Native Activity
+
+Live per-connection view for the in-process native core. Each accepted
+connection emits an open event; closing emits byte totals, lifetime, and an
+optional error. One line per connection:
+
+```
+[12] TCP example.com:443 [vless/tcp] [tls] ↑1.2KB ↓3.4KB 150ms
+```
+
+The header shows session totals (upload/download), the open-connection count,
+and the failed-connection count. Connections that close with an error are
+highlighted as failures. When no native session is active, or nothing has
+been recorded yet, the screen shows an empty-state message instead of the list.
+
+---
+
 ### Subscriptions (Settings)
 
 Group management lives in Settings → Subscriptions. Press `g` on the Profiles
@@ -283,7 +300,7 @@ delay, exit IP and country.
 
 Opened with `?` from any main screen. Rounded-border centered modal listing
 keyboard shortcuts grouped by current context (Profiles, Settings, Statistics,
-or Logs). `Esc` or `?` closes.
+Logs, or Native Activity). `Esc` or `?` closes.
 
 
 ### Actions Log
@@ -340,8 +357,15 @@ Tracing integration (backend logging):
 - TUI internals emit `tracing` events via `tracing-subscriber` with a
   custom `TuiLogLayer` that forwards events to the core event channel
 - Events carry a `target` field (`core`, `tui`, `speedtest`, `subscription`)
-- Viewable in the Actions Log panel and (if stderr is captured) in
-  `RUST_LOG=xray_tui=info stderr.log`
+- Viewable in the Actions Log panel, the Logs tab, and the configured log file
+  (`logging.log_to_file` / `logging.log_file_path`)
+- **Stderr mirror is opt-in via `XRAY_TUI_STDERR_LOG`** — set it to anything
+  other than empty/`0`/`false` to add a stderr `tracing` layer. `RUST_LOG`
+  alone does NOT enable it; it only supplies that layer's directives once the
+  mirror is on (default `xray_tui=info`). Only usable with stderr redirected —
+  unguarded stderr writes corrupt the alternate-screen TUI, so terminal
+  debugging is `XRAY_TUI_STDERR_LOG=1 xray-tui 2>stderr.log`. The Actions Log,
+  Logs tab and log file capture everything regardless
 - Key operations (connect, disconnect, speed test, subscription updates)
   emit tracing events for real-time visibility
 ---
@@ -378,14 +402,15 @@ appended when updates are available for installed backends.
 
 | Context                 | Hints                                    |
 | ----------------------- | ---------------------------------------- |
-| Profiles (disconnected) | `[F1] Actions Log  [Ctrl+Enter] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
-| Profiles (connecting)   | `[F1] Actions Log  [Tab] Next  [?] Help  [q/Ctrl+C] Quit`   |
- | Profiles (connected)    | `[F1] Actions Log  [Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
-| Settings menu           | `[↑↓] Navigate  [Enter] Open  [Esc] Close` |
-| Settings form           | `[Tab/Shift+Tab] Focus  [Enter] Save  [Esc] Cancel` |
+| Profiles (disconnected) | `[→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
+| Profiles (connecting)   | `[Tab] Next  [?] Help  [q/Ctrl+C] Quit`  |
+| Profiles (connected)    | `[Ctrl+D] Disconnect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit` |
+| Settings menu (tree)    | `[↑↓] Navigate  [←→] Collapse  [Enter] Open  [Ctrl+W] Focus Form  [Esc] Close` |
+| Settings form           | `[Tab/Shift+Tab] Focus  [Enter] Save  [Ctrl+W] Focus Tree  [Esc] Back` |
 | Speed test menu         | `[↑↓] Navigate  [Enter] Select  [Esc] Close` |
 | Help overlay            | `[Esc] Close help`                       |
-| Logs / Statistics       | `[F1] Actions Log  [?] Help  [q/Ctrl+C] Quit`               |
+| Native Activity         | `[F1] Actions Log  [?] Help  [q/Ctrl+C] Quit` |
+| Logs / Statistics       | `[q/Ctrl+C] Quit`                        |
 
 ## Keyboard Shortcuts — Full Reference
 
@@ -475,6 +500,18 @@ appended when updates are available for installed backends.
 
 | Key               | Action                              |
 | ----------------- | ----------------------------------- |
+| `Tab` / `Shift+Tab` | Cycle tabs                       |
+| `?`              | Toggle help overlay                 |
+| `q` / `Ctrl+C`   | Quit application                    |
+
+### Native Activity Tab
+
+| Key               | Action                              |
+| ----------------- | ----------------------------------- |
+| `↑` / `↓`        | Scroll connections                  |
+| `PgUp` / `PgDn`  | Page up/down                        |
+| `Home`           | Jump to oldest connection           |
+| `End`            | Jump to newest connection           |
 | `Tab` / `Shift+Tab` | Cycle tabs                       |
 | `?`              | Toggle help overlay                 |
 | `q` / `Ctrl+C`   | Quit application                    |

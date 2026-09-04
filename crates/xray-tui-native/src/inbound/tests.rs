@@ -963,3 +963,241 @@ async fn direct_dial_disables_nagle() {
     assert!(tcp.nodelay().expect("nodelay getter"), "TCP_NODELAY set");
     server.abort();
 }
+
+/// A TCP server that answers every connection with `reply`, whatever it was
+/// sent: the asymmetric counterpart to [`spawn_echo`], so a relayed leg has
+/// `up != down` and a swapped direction cannot pass as correct.
+async fn spawn_amplifier(reply: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind amplifier listener");
+    let addr = listener.local_addr().expect("amplifier addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                if sock.read(&mut buf).await.is_ok() {
+                    let _ = sock.write_all(reply).await;
+                    let _ = sock.flush().await;
+                }
+                // Stay open until the client hangs up, so the test can read
+                // the live counters while the leg is still running.
+                let _ = sock.read(&mut buf).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Telemetry: a relayed leg emits exactly one open/close trace pair, its close
+/// row carries this leg's own per-direction totals, and the shared traffic
+/// counters see those bytes AS THEY FLOW (not once the leg ends).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relayed_leg_emits_trace_events_and_traffic() {
+    use super::TraceCtx;
+    use crate::telemetry::{NativeEvent, Telemetry, TraceEvent, TraceKind, TraceSecurity};
+
+    /// Longer than the request, so up and down can never be confused.
+    const REPLY: &[u8] = b"asymmetric-reply-from-the-destination";
+
+    let dest = spawn_amplifier(REPLY).await;
+    let (telemetry, mut events) = Telemetry::new(64);
+
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".to_owned(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    config.trace = Some(TraceCtx {
+        telemetry: telemetry.clone(),
+        kind: TraceKind::Tcp,
+        protocol: "direct".to_owned(),
+        transport: "-".to_owned(),
+        security: TraceSecurity::Plain,
+    });
+    let (addr, handle) = spawn_inbound(config).await;
+
+    let target = TargetAddr::new(Host::new("127.0.0.1"), dest.port());
+    let ClientResult::Connected { code, mut stream } = client_connect(addr, None, &target).await
+    else {
+        panic!("connect refused");
+    };
+    assert_eq!(code, 0x00, "socks connect succeeds");
+    let payload = b"up";
+    stream.write_all(payload).await.expect("write payload");
+    let mut back = vec![0u8; REPLY.len()];
+    stream.read_exact(&mut back).await.expect("read reply");
+    assert_eq!(back, REPLY, "destination answered");
+
+    let opened = match events.recv().await.expect("event") {
+        NativeEvent::Trace(TraceEvent::Opened(o)) => {
+            assert_eq!(o.kind, TraceKind::Tcp);
+            assert_eq!(o.protocol, "direct");
+            assert!(o.dest.contains(&dest.port().to_string()));
+            o.conn_id
+        }
+        other => panic!("unexpected event before opened: {other:?}"),
+    };
+
+    // The leg is STILL OPEN: the shared counters must already hold both
+    // directions. The old trailing `add_traffic` reported nothing until close,
+    // so a long-running transfer looked idle for its whole lifetime.
+    let live = telemetry.drain_traffic();
+    assert_eq!(
+        live,
+        (payload.len() as u64, REPLY.len() as u64),
+        "shared counters see both directions mid-leg"
+    );
+
+    drop(stream);
+    match tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("closed row within 5s")
+        .expect("event")
+    {
+        NativeEvent::Trace(TraceEvent::Closed(c)) => {
+            assert_eq!(c.conn_id, opened);
+            assert!(c.error.is_none(), "relay succeeded: {:?}", c.error);
+            assert_eq!(
+                (c.up_bytes, c.down_bytes),
+                (payload.len() as u64, REPLY.len() as u64),
+                "the close row reports this leg's own asymmetric totals"
+            );
+        }
+        other => panic!("unexpected event before closed: {other:?}"),
+    }
+
+    // Exactly one pair per leg: the drop guard must not double-emit.
+    let extra = tokio::time::timeout(Duration::from_millis(200), events.recv()).await;
+    assert!(extra.is_err(), "channel is empty after the pair: {extra:?}");
+    // And the close row must not re-add the leg totals to the shared counters.
+    assert_eq!(
+        telemetry.drain_traffic(),
+        (0, 0),
+        "no second accounting of the same bytes"
+    );
+
+    handle.abort();
+}
+
+/// A leg cancelled by shutdown still reports its close row: an unmatched
+/// `Opened` would sit in the TUI's connection table forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_a_live_leg_emits_closed() {
+    use super::TraceCtx;
+    use crate::telemetry::{NativeEvent, Telemetry, TraceEvent, TraceKind, TraceSecurity};
+
+    let echo = spawn_echo().await;
+    let (telemetry, mut events) = Telemetry::new(64);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".to_owned(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    config.trace = Some(TraceCtx {
+        telemetry: telemetry.clone(),
+        kind: TraceKind::Tcp,
+        protocol: "direct".to_owned(),
+        transport: "-".to_owned(),
+        security: TraceSecurity::Plain,
+    });
+    config.shutdown = Some(shutdown_rx);
+    let (addr, handle) = spawn_inbound(config).await;
+
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let ClientResult::Connected { code, mut stream } = client_connect(addr, None, &target).await
+    else {
+        panic!("connect refused");
+    };
+    assert_eq!(code, 0x00, "socks connect succeeds");
+    stream.write_all(b"live").await.expect("write payload");
+    let mut back = [0u8; 4];
+    stream.read_exact(&mut back).await.expect("read echo");
+
+    let opened = match events.recv().await.expect("event") {
+        NativeEvent::Trace(TraceEvent::Opened(o)) => o.conn_id,
+        other => panic!("unexpected event before opened: {other:?}"),
+    };
+
+    // Both ends are still connected, so the relay is parked mid-leg: only the
+    // shutdown signal ends it, by DROPPING the relay future.
+    shutdown_tx.send(true).expect("shutdown");
+    match tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("closed row within 5s")
+        .expect("event")
+    {
+        NativeEvent::Trace(TraceEvent::Closed(c)) => {
+            assert_eq!(c.conn_id, opened);
+            assert_eq!(
+                c.error.as_deref(),
+                Some("cancelled"),
+                "the row says why the leg ended"
+            );
+            assert_eq!(
+                (c.up_bytes, c.down_bytes),
+                (4, 4),
+                "a cancelled leg still reports the bytes it moved"
+            );
+        }
+        other => panic!("expected the cancelled leg's Closed row: {other:?}"),
+    }
+
+    handle.abort();
+}
+
+/// Shutdown must end LIVE UDP associations. The association outlives its
+/// accept-loop future (`run_udp_associate` spawns the relay and returns), so
+/// without a shutdown arm of its own it kept forwarding datagrams through the
+/// previous profile's outbound after a disconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_ends_a_live_udp_association() {
+    let echo = spawn_udp_echo().await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let mut config = Socks5InboundConfig::new(
+        "127.0.0.1:0".parse().expect("listen addr"),
+        engine(Vec::new(), route_default("direct")),
+        vec![Outbound {
+            tag: "direct".to_owned(),
+            kind: OutboundKind::Direct,
+        }],
+    );
+    config.shutdown = Some(shutdown_rx);
+    let (addr, handle) = spawn_inbound(config).await;
+    let (control, reply) = udp_associate(addr).await;
+
+    // Pin the association with a real round-trip.
+    let target = TargetAddr::new(Host::new("127.0.0.1"), echo.port());
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("client udp");
+    sock.send_to(&udp_datagram(&target, 0, b"ping udp"), reply)
+        .await
+        .expect("send datagram");
+    let mut buf = vec![0u8; 2048];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("echo reply timed out")
+        .expect("recv reply");
+    assert!(n > 0, "the association is live");
+
+    // The control connection stays OPEN: only shutdown may end this.
+    shutdown_tx.send(true).expect("shutdown");
+    assert!(
+        wait_for_port_release(reply).await,
+        "shutdown must release the association's client-facing socket"
+    );
+
+    drop(control);
+    handle.abort();
+}

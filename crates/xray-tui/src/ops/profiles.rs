@@ -268,6 +268,7 @@ pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
         ProtoCoreType::SingBox => Some(CoreType::SingBox),
     }) {
         Some(CoreType::Auto) | None => None,
+        Some(CoreType::Native) => return CoreType::Native,
         Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
         Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
     };

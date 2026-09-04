@@ -127,6 +127,15 @@ pub fn spawn_route_event_forwarder(
     });
 }
 
+/// Native traces applied per [`poll_core_events`] pass.
+///
+/// A connection storm queues traces faster than the UI draws, and the ring
+/// only ever shows its newest rows, so a bounded slice per pass keeps the
+/// event loop from starving rendering. Leftovers stay in the channel
+/// (bounded, fed with `try_send`) and land on the next pass, which the
+/// caller runs immediately because this one reports work handled.
+const NATIVE_TRACE_BUDGET: usize = 512;
+
 /// Poll core event channel and update state accordingly.
 ///
 /// Returns `true` when anything was handled (an event consumed, or a finished
@@ -148,6 +157,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
     } else {
         false
     };
+    let mut trace_budget = NATIVE_TRACE_BUDGET;
     while let Some(rx) = state.core_event_rx.as_mut() {
         let event = match rx.try_recv() {
             Ok(event) => event,
@@ -159,6 +169,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
         handled = true;
         match event {
             CoreEvent::Connected(core_type) => {
+                // A native session starts from an empty ring: the session
+                // task is aborted on teardown and can swallow its own
+                // `Disconnected`, so the previous session's rows and totals
+                // would otherwise linger into this one.
+                if core_type == CoreType::Native {
+                    state.reset_native_activity();
+                }
                 state.connected_core = Some(core_type);
                 state.connecting = false;
                 state.connection_error = None;
@@ -167,6 +184,14 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
             CoreEvent::Disconnected => {
                 // Ignore stale Disconnected if already reconnecting
                 if !state.connecting {
+                    // Native session over: legs whose `Closed` trace died with
+                    // the session task must not render live. Deliberately not
+                    // gated on `connected_core`: `connect::disconnect` clears
+                    // it synchronously, well before the session task emits
+                    // this event, so a core-type guard would skip every
+                    // user-initiated stop. The ring only ever holds native
+                    // rows, and the call no-ops when none are open.
+                    state.native_activity.close_out_open();
                     state.connected_core = None;
                     state.connected_protocol_id = None;
                     // Session over: the actions-log traffic segment must not
@@ -239,6 +264,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.system_stats = Some(sys_stats);
             }
             CoreEvent::LogLine { .. } => {}
+            CoreEvent::NativeTrace(ev) => {
+                state.record_native_trace(&ev);
+                trace_budget = trace_budget.saturating_sub(1);
+                if trace_budget == 0 {
+                    break;
+                }
+            }
             CoreEvent::Route(ev) => {
                 let line = render_route_event(&ev);
                 state.log_cache.push_back(line);
@@ -542,7 +574,8 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         CoreType::SingBox => {
                             state.config.updates.sing_box_latest_known = Some(ver.clone());
                         }
-                        CoreType::Auto => {}
+                        // Native is in-process: no binary, no version check.
+                        CoreType::Auto | CoreType::Native => {}
                     }
                 }
                 // Refresh form snapshots if currently viewing the updates form
@@ -962,6 +995,104 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         state.core_event_rx = Some(rx);
         (state, tx)
+    }
+
+    /// A `TraceEvent::Opened` carrying the fields the activity ring reads.
+    fn opened(conn_id: u64) -> xray_tui_native::telemetry::TraceEvent {
+        use xray_tui_native::telemetry::{TraceEvent, TraceKind, TraceOpened, TraceSecurity};
+        TraceEvent::Opened(TraceOpened {
+            conn_id,
+            kind: TraceKind::Tcp,
+            dest: format!("h{conn_id}.example:443"),
+            protocol: "vless".to_string(),
+            transport: "tcp".to_string(),
+            security: TraceSecurity::Tls,
+        })
+    }
+
+    /// The matching `TraceEvent::Closed` (100 up / 200 down, no error).
+    fn closed(conn_id: u64) -> xray_tui_native::telemetry::TraceEvent {
+        use xray_tui_native::telemetry::{TraceClosed, TraceEvent};
+        TraceEvent::Closed(TraceClosed {
+            conn_id,
+            up_bytes: 100,
+            down_bytes: 200,
+            duration_ms: 5,
+            error: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn native_session_resets_the_ring_and_closes_out_open_rows() {
+        let (mut state, tx) = event_state().await;
+
+        // Session one: two legs open, one of them closes.
+        tx.send(CoreEvent::Connected(CoreType::Native))
+            .await
+            .unwrap();
+        tx.send(CoreEvent::NativeTrace(opened(1))).await.unwrap();
+        tx.send(CoreEvent::NativeTrace(opened(2))).await.unwrap();
+        tx.send(CoreEvent::NativeTrace(closed(1))).await.unwrap();
+        assert!(poll_core_events(&mut state).await);
+        assert_eq!(state.native_activity.entries.len(), 2);
+        assert_eq!(state.native_activity.open_count, 1);
+
+        // Disconnect: leg 2 never reported a close (its trace died with the
+        // session task) — it must still end up closed, count at 0. Mimic the
+        // real user-initiated order: `connect::disconnect` clears
+        // `connected_core` synchronously and the session task emits
+        // `Disconnected` afterwards, so the close-out must not depend on the
+        // core still being set.
+        state.connected_core = None;
+        tx.send(CoreEvent::Disconnected).await.unwrap();
+        poll_core_events(&mut state).await;
+        assert_eq!(state.native_activity.open_count, 0);
+        assert!(state.native_activity.entries.iter().all(|e| e.closed));
+        assert_eq!(state.native_activity.total_up, 100);
+
+        // Session two starts empty: no rows, no totals from session one.
+        tx.send(CoreEvent::Connected(CoreType::Native))
+            .await
+            .unwrap();
+        poll_core_events(&mut state).await;
+        assert!(state.native_activity.entries.is_empty());
+        assert_eq!(
+            (
+                state.native_activity.total_up,
+                state.native_activity.total_down,
+                state.native_activity.open_count,
+                state.native_activity.fail_count,
+            ),
+            (0, 0, 0, 0)
+        );
+
+        // Connecting a subprocess core leaves the native ring alone.
+        tx.send(CoreEvent::NativeTrace(opened(3))).await.unwrap();
+        tx.send(CoreEvent::Connected(CoreType::Xray)).await.unwrap();
+        poll_core_events(&mut state).await;
+        assert_eq!(state.native_activity.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_trace_drain_stops_at_the_per_pass_budget() {
+        let (mut state, _unused) = event_state().await;
+        // Wider channel than the fixture's: the storm must fit in the queue.
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        state.core_event_rx = Some(rx);
+
+        let over = NATIVE_TRACE_BUDGET + 40;
+        for i in 0..over {
+            tx.send(CoreEvent::NativeTrace(opened(i as u64)))
+                .await
+                .unwrap();
+        }
+        assert!(poll_core_events(&mut state).await);
+        // One pass applies exactly the budget and leaves the rest queued so
+        // the frame can draw.
+        assert_eq!(state.native_activity.entries.len(), NATIVE_TRACE_BUDGET);
+        // The next pass resumes where this one stopped — nothing is lost.
+        poll_core_events(&mut state).await;
+        assert_eq!(state.native_activity.entries.len(), over);
     }
 
     #[test]

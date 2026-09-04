@@ -26,8 +26,8 @@ use xray_tui_proto::proto_spec::{
 use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, scheduler, settings, subscriptions, updates};
 use crate::types::{
-    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, SettingsSection,
-    SortColumn, SplitRightPane, Tab,
+    AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, NativeActivityLog,
+    SettingsSection, SortColumn, SplitRightPane, Tab,
 };
 
 /// Global UI/connection state.
@@ -78,6 +78,8 @@ pub struct AppState {
     pub connected_core: Option<CoreType>,
     pub connecting: bool,
     pub system_stats: Option<grpc_client::SysStats>,
+    /// Session-only native-core trace log for the Native Activity tab.
+    pub native_activity: NativeActivityLog,
     /// Cached log entries for the Logs tab, newest at end.
     pub log_cache: VecDeque<LogLine>,
     /// Whether there may be older entries in the DB to load.
@@ -436,9 +438,10 @@ impl AppState {
             clipboard: None,
             confirmation: None,
             updating_groups: HashSet::new(),
+            native_activity: NativeActivityLog::new(2000),
+            system_stats: None,
             testing_profiles: HashSet::new(),
             testing_details: HashMap::new(),
-            system_stats: None,
             actions_compact: false,
             connected_protocol_id: None,
             last_test_tcp: None,
@@ -620,6 +623,18 @@ impl AppState {
                 message: message.to_string(),
             });
         }
+    }
+    /// Record one native-core trace event into the session activity log.
+    pub fn record_native_trace(&mut self, event: &xray_tui_native::telemetry::TraceEvent) {
+        self.native_activity.record(event);
+    }
+    /// Start a new native-core session: clear the trace ring and drop the
+    /// Native Activity tab's scroll offset, which is a distance from the
+    /// newest row and would otherwise pin the view into rows the new
+    /// session has not recorded.
+    pub fn reset_native_activity(&mut self) {
+        self.native_activity.reset();
+        crate::ui::native_activity::reset_scroll();
     }
     /// Resolve which core a profile row should use, considering (in order):
     ///   1. Per-pair override (`link.core_type` — resolved at parse time)

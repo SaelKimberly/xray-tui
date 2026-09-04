@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ratatui_cheese::tree::TreeState;
@@ -7,6 +8,7 @@ use xray_tui_config::import_export::{ParsedProfile, ValidationSummary};
 use xray_tui_core::CoreType;
 use xray_tui_core::grpc_client;
 use xray_tui_core::speed_test::TestType;
+use xray_tui_native::telemetry::{TraceEvent, TraceKind, TraceSecurity};
 
 /// Re-export `EndpointRow` as `EndpointRow` for backward compatibility.
 pub use xray_tui_db::models::EndpointRow;
@@ -29,12 +31,159 @@ pub struct BackendUpdateStatus {
     pub error: Option<String>,
 }
 
+/// One traced native-core connection leg, fed by `CoreEvent::NativeTrace`.
+#[derive(Debug, Clone)]
+pub struct NativeActivityEntry {
+    pub conn_id: u64,
+    pub opened_ms: i64,
+    pub kind: TraceKind,
+    pub dest: String,
+    pub protocol: String,
+    pub transport: String,
+    pub security: TraceSecurity,
+    pub up: u64,
+    pub down: u64,
+    pub closed: bool,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Session-only trace log (not persisted): open legs plus recent finished
+/// ones, with session totals. Capped — oldest entries fall off the front.
+#[derive(Debug, Clone)]
+pub struct NativeActivityLog {
+    pub entries: VecDeque<NativeActivityEntry>,
+    cap: usize,
+    pub total_up: u64,
+    pub total_down: u64,
+    pub open_count: usize,
+    pub fail_count: usize,
+}
+
+impl NativeActivityLog {
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            cap: cap.max(1),
+            total_up: 0,
+            total_down: 0,
+            open_count: 0,
+            fail_count: 0,
+        }
+    }
+
+    /// Record one trace event. `Opened` pushes a fresh row; `Closed` finds
+    /// the matching row from the back (conn ids are near-monotonic).
+    pub fn record(&mut self, event: &TraceEvent) {
+        match event {
+            TraceEvent::Opened(opened) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis().try_into().unwrap_or(i64::MAX));
+                self.entries.push_back(NativeActivityEntry {
+                    conn_id: opened.conn_id,
+                    opened_ms: now_ms,
+                    kind: opened.kind,
+                    dest: opened.dest.clone(),
+                    protocol: opened.protocol.clone(),
+                    transport: opened.transport.clone(),
+                    security: opened.security,
+                    up: 0,
+                    down: 0,
+                    closed: false,
+                    duration_ms: 0,
+                    error: None,
+                });
+                self.open_count += 1;
+            }
+            TraceEvent::Closed(closed) => {
+                let row = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.conn_id == closed.conn_id && !entry.closed);
+                match row {
+                    Some(entry) => {
+                        entry.up = closed.up_bytes;
+                        entry.down = closed.down_bytes;
+                        entry.duration_ms = closed.duration_ms;
+                        entry.error.clone_from(&closed.error);
+                        entry.closed = true;
+                        self.open_count = self.open_count.saturating_sub(1);
+                    }
+                    None => {
+                        // Close without a matching open (dropped open event):
+                        // keep a ghost closed row so the counters stay exact.
+                        self.entries.push_back(NativeActivityEntry {
+                            conn_id: closed.conn_id,
+                            opened_ms: 0,
+                            kind: TraceKind::Tcp,
+                            dest: String::new(),
+                            protocol: String::new(),
+                            transport: String::new(),
+                            security: TraceSecurity::Plain,
+                            up: closed.up_bytes,
+                            down: closed.down_bytes,
+                            closed: true,
+                            duration_ms: closed.duration_ms,
+                            error: closed.error.clone(),
+                        });
+                    }
+                }
+                self.total_up = self.total_up.saturating_add(closed.up_bytes);
+                self.total_down = self.total_down.saturating_add(closed.down_bytes);
+                if closed.error.is_some() {
+                    self.fail_count += 1;
+                }
+            }
+        }
+        while self.entries.len() > self.cap {
+            let dropped = self.entries.pop_front();
+            if dropped.is_some_and(|entry| !entry.closed) {
+                self.open_count = self.open_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Start a fresh native session: drop every row, zero every counter,
+    /// keep the configured cap.
+    ///
+    /// The native session task is aborted on disconnect, so its final
+    /// `Disconnected` can be lost; without an explicit reset the next
+    /// session would render the previous one's rows and session totals.
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.total_up = 0;
+        self.total_down = 0;
+        self.open_count = 0;
+        self.fail_count = 0;
+    }
+
+    /// Close out every still-open row: the session ended.
+    ///
+    /// A native shutdown can drop the in-flight `Closed` traces (the session
+    /// task is aborted mid-copy), which would leave those connections
+    /// rendered live forever. Byte totals stay as last observed — the close
+    /// event that would have carried them never arrived.
+    pub fn close_out_open(&mut self) {
+        if self.open_count == 0 {
+            return;
+        }
+        for entry in self.entries.iter_mut().filter(|entry| !entry.closed) {
+            entry.closed = true;
+        }
+        self.open_count = 0;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Profiles,
     Settings,
     Logs,
     Statistics,
+    NativeActivity,
     Actions,
 }
 
@@ -44,6 +193,7 @@ impl Tab {
         Self::Settings,
         Self::Logs,
         Self::Statistics,
+        Self::NativeActivity,
         Self::Actions,
     ];
 
@@ -53,7 +203,8 @@ impl Tab {
             Self::Profiles => Self::Settings,
             Self::Settings => Self::Logs,
             Self::Logs => Self::Statistics,
-            Self::Statistics => Self::Actions,
+            Self::Statistics => Self::NativeActivity,
+            Self::NativeActivity => Self::Actions,
             Self::Actions => Self::Profiles,
         }
     }
@@ -64,7 +215,8 @@ impl Tab {
             Self::Settings => Self::Profiles,
             Self::Logs => Self::Settings,
             Self::Statistics => Self::Logs,
-            Self::Actions => Self::Statistics,
+            Self::NativeActivity => Self::Statistics,
+            Self::Actions => Self::NativeActivity,
         }
     }
 }
@@ -293,6 +445,8 @@ pub enum CoreEvent {
     },
     /// System stats update from gRPC.
     SysStatsUpdate(grpc_client::SysStats),
+    /// A per-connection trace event from the in-process native core.
+    NativeTrace(TraceEvent),
     /// A log line from the core process stderr.
     LogLine {
         level: String,

@@ -9,6 +9,7 @@ pub enum CoreType {
     SingBox,
     #[default]
     Auto,
+    Native,
 }
 impl fmt::Display for CoreType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -16,6 +17,7 @@ impl fmt::Display for CoreType {
             Self::Xray => write!(f, "xray"),
             Self::SingBox => write!(f, "sing-box"),
             Self::Auto => write!(f, "auto"),
+            Self::Native => write!(f, "native"),
         }
     }
 }
@@ -27,6 +29,7 @@ impl CoreType {
             Self::Xray => "xray",
             Self::SingBox => "sing-box",
             Self::Auto => "auto",
+            Self::Native => "native",
         }
     }
 }
@@ -50,6 +53,8 @@ impl FromStr for CoreType {
             Ok(Self::SingBox)
         } else if s.eq_ignore_ascii_case("auto") {
             Ok(Self::Auto)
+        } else if s.eq_ignore_ascii_case("native") {
+            Ok(Self::Native)
         } else {
             Err(ParseCoreTypeError(s.to_owned()))
         }
@@ -66,7 +71,9 @@ mod tests {
             (CoreType::Xray, "xray"),
             (CoreType::SingBox, "sing-box"),
             (CoreType::Auto, "auto"),
+            (CoreType::Native, "native"),
         ] {
+            assert_eq!(variant.as_str(), expected);
             assert_eq!(variant.to_string(), expected);
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
@@ -75,7 +82,12 @@ mod tests {
 
     #[test]
     fn from_str_round_trip() {
-        for original in [CoreType::Xray, CoreType::SingBox, CoreType::Auto] {
+        for original in [
+            CoreType::Xray,
+            CoreType::SingBox,
+            CoreType::Auto,
+            CoreType::Native,
+        ] {
             let s = original.to_string();
             let parsed: CoreType = s.parse().unwrap();
             assert_eq!(parsed, original);

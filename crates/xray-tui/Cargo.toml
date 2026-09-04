@@ -13,6 +13,7 @@ xray-tui-route = { path = "../xray-tui-route", version = "0.1" }
 xray-tui-geoip = { path = "../xray-tui-geoip", version = "0.1.0" }
 xray-tui-dns = { path = "../xray-tui-dns", version = "0.1.0" }
 xray-tui-host-features = { path = "../xray-tui-host-features", version = "0.1.0" }
+xray-tui-native = { path = "../xray-tui-native", version = "0.1.0" }
 toasty = { workspace = true, features = ["serde"] }
 jiff.workspace = true
 

@@ -7901,6 +7901,7 @@ dependencies = [
  "xray-tui-geoip",
  "xray-tui-hakari",
  "xray-tui-host-features",
+ "xray-tui-native",
  "xray-tui-proto",
  "xray-tui-route",
 ]

@@ -42,6 +42,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> S
 pub type BoxStream = Box<dyn Stream>;
 
 pub mod addr;
+pub mod capability;
 pub mod chain;
 pub mod context;
 pub mod crypto;
@@ -52,7 +53,9 @@ pub mod headers;
 pub mod inbound;
 pub mod protocol;
 pub mod security;
+pub mod server;
 pub mod shape;
+pub mod telemetry;
 pub mod transport;
 
 pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};

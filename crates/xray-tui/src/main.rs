@@ -109,6 +109,14 @@ fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Whether the `XRAY_TUI_STDERR_LOG` value enables the stderr log mirror.
+///
+/// Being set is the switch; an inherited `0`, `false` or empty value reads as
+/// off so the mirror can be disabled without unsetting the variable.
+fn stderr_mirror_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 0. Install rustls CryptoProvider first — every later TLS consumer
@@ -134,17 +142,36 @@ async fn main() -> Result<()> {
     //     Uses unbounded std::sync::mpsc channel so TuiLogLayer::on_event never blocks.
     let (log_sender_tx, log_rx) = std::sync::mpsc::channel::<xray_tui_core::log_heed::LogMessage>();
 
+    // The writer cannot rely on the channel closing to exit: `TuiLogLayer` holds a
+    // `Sender` clone inside the GLOBAL tracing subscriber, which is never dropped, so
+    // a blocking `recv()` would park forever — and `Runtime::drop` waits for in-flight
+    // `spawn_blocking` work, which used to hang the process at quit. It polls the
+    // canonical shutdown flag instead (the same `AppState::shutdown_token` every other
+    // background loop checks — installed on the state below, so there is one owner).
+    let shutdown_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_shutdown = shutdown_token.clone();
     let writer_heed = heed.clone();
     let _writer_handle = tokio::task::spawn_blocking(move || {
+        /// Idle poll slice: the quit path waits at most this long for the writer.
+        const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
         let mut batch: Vec<xray_tui_core::log_heed::LogMessage> = Vec::with_capacity(100);
         loop {
-            // Wait for at least one message
-            let Ok(msg) = log_rx.recv() else {
-                // Channel closed (sender dropped) — flush and exit
-                if !batch.is_empty() {
-                    let _ = writer_heed.write_log_batch(&batch);
+            // Wait for at least one message, waking often enough to notice shutdown.
+            let msg = match log_rx.recv_timeout(IDLE_POLL) {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if writer_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    continue;
                 }
-                return;
+                // Channel closed (every sender dropped) — flush and exit.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if !batch.is_empty() {
+                        let _ = writer_heed.write_log_batch(&batch);
+                    }
+                    return;
+                }
             };
             let batch_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             batch.push(msg);
@@ -188,6 +215,10 @@ async fn main() -> Result<()> {
     };
 
     let mut state = AppState::new(Arc::new(db), config).await;
+    // One shutdown owner: the log writer above already holds a clone, and every
+    // background loop reads it off the state (`spawn_auto_update` and friends are
+    // started later, from `ui::run`, so this replacement is not racing them).
+    state.shutdown_token = shutdown_token;
     state.heed_storage = Some(heed.clone());
     state.log_sender_tx = Some(log_sender_tx.clone());
     // Create core process log channel (stdout/stderr lines from xray-core/sing-box subprocesses).
@@ -228,15 +259,28 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // The stderr mirror is opt-in via `XRAY_TUI_STDERR_LOG`, never `RUST_LOG`
+    // alone: an exported `RUST_LOG=debug` meant for some other tool would
+    // both switch this layer on and widen its filter, and unguarded stderr
+    // writes corrupt the alternate-screen TUI. The Logs tab and the log file
+    // (TuiLogLayer below) capture everything regardless, so terminal
+    // debugging is `XRAY_TUI_STDERR_LOG=1 xray-tui 2>stderr.log`. `RUST_LOG`
+    // still supplies this layer's directives when it is set.
+    let stderr_var = std::env::var("XRAY_TUI_STDERR_LOG").ok();
+    let stderr_log = stderr_mirror_enabled(stderr_var.as_deref()).then(|| {
+        let filter = std::env::var("RUST_LOG")
+            .ok()
+            .filter(|directives| !directives.trim().is_empty())
+            .map_or_else(
+                || tracing_subscriber::EnvFilter::new("xray_tui=info"),
+                tracing_subscriber::EnvFilter::new,
+            );
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter)
+    });
     if tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                // Only xray_tui-* targets reach stderr via the fmt layer.
-                // "log_worker" and "tui" targets reach TuiLogLayer (unfiltered)
-                // for the Logs tab and actions panel.
-                .with_filter(tracing_subscriber::EnvFilter::new("xray_tui=info")),
-        )
+        .with(stderr_log)
         .with(
             TuiLogLayer {
                 core_event_tx: state
@@ -293,7 +337,13 @@ async fn main() -> Result<()> {
     });
     // Panic hook to restore terminal on unexpected crashes
     let prev_hook = std::panic::take_hook();
+    // A panic unwinds past the store below (the workspace has no
+    // `panic = "abort"`), so the hook has to release the blocking terminal
+    // reader and log writer too — otherwise the message prints, the terminal
+    // is restored, and the runtime drop then parks on them forever.
+    let panic_shutdown = state.shutdown_token.clone();
     std::panic::set_hook(Box::new(move |panic_info| {
+        panic_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = std::panic::catch_unwind(|| {
             let _ = crossterm::terminal::disable_raw_mode();
         });
@@ -305,14 +355,23 @@ async fn main() -> Result<()> {
     }));
 
     // 6. Enter ratatui event loop
-    xray_tui::ui::run(&mut state).await?;
+    let outcome = xray_tui::ui::run(&mut state).await;
+    // Unconditional: `run` also exits through `?` (a failed draw, a failed
+    // terminal restore), and the blocking terminal reader + heed log writer only
+    // stop on this flag. Missing it parks them forever and the tokio runtime
+    // drop below never returns — the process would hang instead of reporting the
+    // error.
+    state
+        .shutdown_token
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    outcome?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::install_tls_provider;
+    use super::{install_tls_provider, stderr_mirror_enabled};
 
     /// Regression: release panic "Could not automatically determine the
     /// process-level `CryptoProvider` from Rustls crate" on Fast+Real ping.
@@ -329,5 +388,19 @@ mod tests {
         let _builder = rustls::ClientConfig::builder();
         // Idempotent: a second install returns Err, never panics.
         install_tls_provider();
+    }
+
+    /// The stderr mirror must never ride on `RUST_LOG` alone (it garbles the
+    /// alternate screen), and an inherited falsy value must read as off.
+    #[test]
+    fn stderr_mirror_gate_is_the_dedicated_variable() {
+        assert!(stderr_mirror_enabled(Some("1")));
+        assert!(stderr_mirror_enabled(Some("true")));
+        assert!(stderr_mirror_enabled(Some("xray_tui=debug")));
+        assert!(!stderr_mirror_enabled(None));
+        assert!(!stderr_mirror_enabled(Some("")));
+        assert!(!stderr_mirror_enabled(Some(" ")));
+        assert!(!stderr_mirror_enabled(Some("0")));
+        assert!(!stderr_mirror_enabled(Some("False")));
     }
 }

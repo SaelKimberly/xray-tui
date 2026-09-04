@@ -1,6 +1,7 @@
 pub mod actions_log;
 pub mod add_server;
 pub mod logs;
+pub mod native_activity;
 pub mod palette_bridge;
 pub mod profiles;
 pub mod settings;
@@ -72,10 +73,32 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     let ts = terminal.size().unwrap_or_default();
     state.actions_compact = ts.height < 20;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
+    // Terminal input runs on the blocking pool, and `Runtime::drop` (in `main`)
+    // waits for in-flight blocking work — a bare `event::read()` parks until the
+    // next keypress, which is why quitting used to leave the process alive with
+    // the runtime waiting on a reader nobody would ever feed again. Poll in
+    // slices and exit on the shutdown flag instead.
+    let reader_shutdown = state.shutdown_token.clone();
     tokio::task::spawn_blocking(move || {
-        while let Ok(ev) = event::read() {
-            if tx.blocking_send(ev).is_err() {
-                break;
+        /// Idle poll slice: the quit path waits at most this long for the reader.
+        const IDLE_POLL: Duration = Duration::from_millis(200);
+        loop {
+            match event::poll(IDLE_POLL) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.blocking_send(ev).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                },
+                // Idle slice elapsed: the only chance to notice the quit.
+                Ok(false) => {
+                    if reader_shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                Err(_) => return,
             }
         }
     });
@@ -172,9 +195,19 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         // Keep the cheap 16ms wakeup so events are serviced promptly.
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
-
-    // Signal background tasks to stop and disconnect core
+    // Signal background tasks to stop and disconnect core. `disconnect()`
+    // stores its bounded teardown waiter in `core_task_handle`; await it here
+    // (bounded, UI thread idle at exit) so the native core's graceful
+    // shutdown — `server.shutdown()`, the `Disconnected` event — runs before
+    // the process leaves the alternate screen. Unbounded wait would hang a
+    // wedged core, so the 3 s cap aborts instead.
     state.disconnect();
+    if let Some(handle) = state.core_task_handle.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+    }
+    // Stops the background loops, INCLUDING the blocking heed log writer — the
+    // tokio runtime drop in `main` waits for in-flight `spawn_blocking` work, so
+    // a writer that never noticed shutdown would hang the process at exit.
     state.shutdown_token.store(true, Ordering::Relaxed);
 
     disable_raw_mode()?;
@@ -449,6 +482,25 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         ) && !key.modifiers.contains(KeyModifiers::CONTROL);
         if is_logs_key {
             logs::handle_key(state, key).await;
+            return;
+        }
+        // else: fall through to main handler for quit/tab/help/etc.
+    }
+
+    // NativeActivity tab: route scroll keys to the screen handler
+    if state.current_tab == crate::Tab::NativeActivity && matches!(state.mode, crate::AppMode::List)
+    {
+        let is_native_activity_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        ) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_native_activity_key {
+            native_activity::handle_key(state, key);
             return;
         }
         // else: fall through to main handler for quit/tab/help/etc.
@@ -890,6 +942,7 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Tab::Settings => settings::render(frame, chunks[1], state),
                 Tab::Logs => logs::render(frame, chunks[1], state),
                 Tab::Statistics => statistics::render(frame, chunks[1], state),
+                Tab::NativeActivity => native_activity::render(frame, chunks[1], state),
                 Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
             }
             render_help_overlay(frame, chunks[1], state);
@@ -922,6 +975,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         Tab::Settings => settings::render(frame, chunks[1], state),
         Tab::Logs => logs::render(frame, chunks[1], state),
         Tab::Statistics => statistics::render(frame, chunks[1], state),
+        Tab::NativeActivity => native_activity::render(frame, chunks[1], state),
         Tab::Actions => crate::ui::actions_log::render(frame, chunks[1], state),
     }
     render_any_confirmation(frame, chunks[1], state);
@@ -979,6 +1033,14 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("q / Ctrl+C", "Quit"),
                 ],
                 Tab::Statistics | Tab::Actions => vec![
+                    ("Tab / Shift+Tab", "Cycle tabs"),
+                    ("?", "Toggle this help"),
+                    ("q / Ctrl+C", "Quit"),
+                ],
+                Tab::NativeActivity => vec![
+                    ("↑↓", "Scroll connections"),
+                    ("PgUp / PgDn", "Page up/down"),
+                    ("Home / End", "Jump to oldest/newest"),
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),
@@ -1114,6 +1176,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Tab::Settings => " Settings ",
                 Tab::Logs => " Logs ",
                 Tab::Statistics => " Statistics ",
+                Tab::NativeActivity => " Native Activity ",
                 Tab::Actions => " Actions ",
             };
             Line::from(Span::styled(

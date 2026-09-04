@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_cheese::fieldset::{Fieldset, FieldsetStyles};
-use xray_tui_core::{API_ENDPOINT, format_bytes, format_uptime};
+use xray_tui_core::{API_ENDPOINT, CoreType, format_bytes, format_uptime};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
@@ -108,8 +108,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         ThemeStyles::error(&palette)
     };
+    let api_line = match state.connected_core {
+        Some(CoreType::Native) => "  API endpoint:  in-process (event feed)".to_string(),
+        _ => format!("  API endpoint:  {API_ENDPOINT}"),
+    };
     let conn_lines = vec![
-        Line::from(format!("  API endpoint:  {API_ENDPOINT}")),
+        Line::from(api_line),
         Line::from(vec![
             Span::raw("  Status:       "),
             Span::styled("Connected", status_style),

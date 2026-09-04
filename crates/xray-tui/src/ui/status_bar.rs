@@ -62,7 +62,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             .map(|(ct, _)| match ct {
                 xray_tui_core::CoreType::Xray => "xray",
                 xray_tui_core::CoreType::SingBox => "sing-box",
-                xray_tui_core::CoreType::Auto => "",
+                // Auto never has a pending update row; native is in-process.
+                xray_tui_core::CoreType::Auto | xray_tui_core::CoreType::Native => "",
             })
             .filter(|s| !s.is_empty())
             .collect();
@@ -90,7 +91,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                 let name = match ct {
                     xray_tui_core::CoreType::Xray => "x",
                     xray_tui_core::CoreType::SingBox => "sb",
-                    xray_tui_core::CoreType::Auto => "",
+                    xray_tui_core::CoreType::Auto | xray_tui_core::CoreType::Native => "",
                 };
                 if let Some((done, total)) = s.download_progress {
                     let pct = if total > 0 {
@@ -213,6 +214,9 @@ const fn build_hints(state: &AppState) -> &'static str {
                         " [→] Expand  [↑↓] Variant  [Ctrl+Enter/Ctrl+G] Connect  [Tab] Next  [?] Help  [q/Ctrl+C] Quit "
                     }
                 }
+                // The tab's own keys are the six scroll keys (documented in
+                // its manual section); the hints name what else is live here.
+                crate::Tab::NativeActivity => " [F1] Actions Log  [?] Help  [q/Ctrl+C] Quit ",
                 _ => " [q/Ctrl+C] Quit ",
             }
         }

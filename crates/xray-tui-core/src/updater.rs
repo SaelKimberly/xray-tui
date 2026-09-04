@@ -42,7 +42,7 @@ pub async fn get_current_version(core_type: CoreType, bin_dir: &Path) -> Option<
     let exe = match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
-        CoreType::Auto => return None,
+        CoreType::Auto | CoreType::Native => return None,
     };
 
     // Try managed bin_dir first (inside per-core subdirectory), then PATH
@@ -90,7 +90,7 @@ pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
     let (owner, repo) = match core_type {
         CoreType::Xray => (XRAY_OWNER, XRAY_REPO),
         CoreType::SingBox => (SINGBOX_OWNER, SINGBOX_REPO),
-        CoreType::Auto => return None,
+        CoreType::Auto | CoreType::Native => return None,
     };
 
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
@@ -204,7 +204,7 @@ pub async fn install_binary(
     let _suffix = match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
-        CoreType::Auto => return Err(UpdateError::AutoCore),
+        CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
     };
     let bin_owned = bin_dir.to_path_buf();
     let archive_owned = archive.to_path_buf();
@@ -226,7 +226,7 @@ pub async fn install_binary(
         let exe_name = match core_type {
             CoreType::Xray => "xray",
             CoreType::SingBox => "sing-box",
-            CoreType::Auto => return Err(UpdateError::AutoCore),
+            CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
         };
         let binary = find_binary_in_dir(&temp_dir_clone, exe_name)?;
 
@@ -270,7 +270,7 @@ pub async fn install_binary(
     let core_bin_dir = bin_owned.join(match core_type {
         CoreType::Xray => "xray",
         CoreType::SingBox => "sing-box",
-        CoreType::Auto => return Err(UpdateError::AutoCore),
+        CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
     });
 
     tokio::task::spawn_blocking(move || {
@@ -333,7 +333,7 @@ pub fn release_asset_url(core_type: CoreType, version: &str) -> Result<String, U
         CoreType::SingBox => {
             format!("https://github.com/SagerNet/sing-box/releases/download/v{version}/{name}")
         }
-        CoreType::Auto => return Err(UpdateError::AutoCore),
+        CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
     };
 
     Ok(url)
@@ -351,12 +351,12 @@ fn asset_name(
         "x86_64" => match core_type {
             CoreType::Xray => "64",
             CoreType::SingBox => "amd64",
-            CoreType::Auto => return Err(UpdateError::AutoCore),
+            CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
         },
         "aarch64" => match core_type {
             CoreType::Xray => "arm64-v8a", // XTLS publishes arm64-v8a, not arm64
             CoreType::SingBox => "arm64",
-            CoreType::Auto => return Err(UpdateError::AutoCore),
+            CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
         },
         _ => {
             return Err(UpdateError::UnsupportedPlatform(arch, std::env::consts::OS));
@@ -365,7 +365,7 @@ fn asset_name(
     let name = match core_type {
         CoreType::Xray => format!("Xray-linux-{suffix}.zip"),
         CoreType::SingBox => format!("sing-box-{version}-linux-{suffix}.tar.gz"),
-        CoreType::Auto => return Err(UpdateError::AutoCore),
+        CoreType::Auto | CoreType::Native => return Err(UpdateError::AutoCore),
     };
     Ok(name)
 }
@@ -478,6 +478,14 @@ mod tests {
         );
         assert!(matches!(
             asset_name(CoreType::Auto, "1.8.0", "aarch64"),
+            Err(UpdateError::AutoCore)
+        ));
+        assert!(matches!(
+            asset_name(CoreType::Native, "1.8.0", "aarch64"),
+            Err(UpdateError::AutoCore)
+        ));
+        assert!(matches!(
+            release_asset_url(CoreType::Native, "v1.8.10"),
             Err(UpdateError::AutoCore)
         ));
     }
