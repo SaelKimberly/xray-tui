@@ -458,8 +458,11 @@ impl VmessWrite {
         }
     }
 
-    /// The ONE byte-stream write implementation: seal the caller's buffer
-    /// into a single record and report its ORIGINAL length once flushed.
+    /// The ONE byte-stream write implementation: seal up to one record's
+    /// worth of the caller's buffer and report the sealed length once
+    /// flushed (`write_all` loops for larger buffers — a single record tops
+    /// out at `MAX_RECORD_PLAINTEXT`, so sealing the whole buffer would
+    /// reject any write over ~64 KiB).
     fn poll_write<W: AsyncWrite + Unpin>(
         &mut self,
         inner: &mut W,
@@ -470,22 +473,23 @@ impl VmessWrite {
             // Empty writes are skipped (mirror xray: no zero-length record).
             return Poll::Ready(Ok(0));
         }
-        // Seal the caller's buffer into a single record. If a previous record
-        // is still being flushed, the caller is retrying with the same buffer
-        // (tokio poll contract) — the pending record was built from it.
+        // Seal at most one record. If a previous record is still being
+        // flushed, the caller is retrying with the same buffer (tokio poll
+        // contract) — the pending record was built from its prefix.
         if self.write_pending.is_none() {
-            if let Err(e) = self.seal_pending(buf) {
+            let take = buf.len().min(MAX_RECORD_PLAINTEXT);
+            if let Err(e) = self.seal_pending(&buf[..take]) {
                 return Poll::Ready(Err(e));
             }
-            self.write_len = buf.len();
+            self.write_len = take;
         }
-        // Flush the pending record; return the ORIGINAL length once fully
+        // Flush the pending record; return the sealed length once fully
         // written (partial inner writes resume on subsequent polls).
         match self.flush_pending(inner, cx) {
             Poll::Ready(Ok(())) => {
-                let original = self.write_len;
+                let sealed = self.write_len;
                 self.write_len = 0;
-                Poll::Ready(Ok(original))
+                Poll::Ready(Ok(sealed))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
@@ -1026,6 +1030,44 @@ mod tests {
             drop(tunnel);
 
             assert_eq!(reader.await.unwrap(), b"payload-larger-than-one-byte");
+        });
+    }
+
+    #[test]
+    fn write_chunks_buffers_over_record_ceiling() {
+        // Regression: a single write larger than one AEAD record must split
+        // across records (the throughput bench's 1 MiB `write_all` hit
+        // `InvalidInput: vmess record too large`). Counters advance per
+        // record; the reassembled payload is byte-identical.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client_side, mut server_side) = tokio::io::duplex(1 << 20);
+            let mut session = Session::new();
+            session.request_body_iv = [0x11; 16];
+            session.request_body_key = [0x22; 16];
+            session.response_header = 0x99;
+            session.response_body_key = sha256_first16(&session.request_body_key);
+            session.response_body_iv = sha256_first16(&session.request_body_iv);
+            let (req_key, req_iv) = (session.request_body_key, session.request_body_iv);
+
+            let mut tunnel = VmessClientStream::new(Box::new(client_side), session);
+            let payload: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+            tunnel.write_all(&payload).await.unwrap();
+            tunnel.flush().await.unwrap();
+            drop(tunnel);
+            let mut got = Vec::new();
+            let mut counter = 0u16;
+            while got.len() < payload.len() {
+                got.extend_from_slice(
+                    &read_record(&mut server_side, &req_key, &req_iv, counter).await,
+                );
+                counter = counter.wrapping_add(1);
+            }
+            assert_eq!(got, payload);
+            assert!(counter > 1, "oversize write must span several records");
         });
     }
 
