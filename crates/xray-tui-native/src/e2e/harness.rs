@@ -857,3 +857,129 @@ pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) 
 }
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+/// A TCP discard target: every connection's bytes are read and dropped.
+/// The bench client writes N MB through the tunnel toward this address.
+/// `received` counts cumulative bytes across all connections — send iters
+/// snapshot it pre-iter and wait for the delta INSIDE the timed section
+/// (`write_all` alone only measures local socket buffering).
+pub struct SinkServer {
+    pub addr: SocketAddr,
+    pub received: Arc<std::sync::atomic::AtomicU64>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SinkServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn a `tokio::net::TcpListener` sink on 127.0.0.1:ephemeral.
+///
+/// Synchronous (mirrors `spawn_udp_echo`): binds a std socket, flips
+/// nonblocking, converts to tokio.
+#[must_use]
+pub fn spawn_sink() -> SinkServer {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sink");
+    let addr = socket.local_addr().expect("sink addr");
+    socket.set_nonblocking(true).expect("sink nonblocking");
+    let listener = tokio::net::TcpListener::from_std(socket).expect("sink tokio");
+    let received = Arc::new(AtomicU64::new(0));
+    let received_loop = received.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let received = received_loop.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    received.fetch_add(n as u64, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    SinkServer {
+        addr,
+        received,
+        handle,
+    }
+}
+
+/// A TCP infinite-zeros target: every connection streams zeros forever
+/// (never EOF/half-close) so one bench tunnel stays reusable across
+/// iters — the client reads exactly N per iter.
+pub struct SourceServer {
+    pub addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SourceServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn a `tokio::net::TcpListener` zeros source on 127.0.0.1:ephemeral.
+#[must_use]
+pub fn spawn_source() -> SourceServer {
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind source");
+    let addr = socket.local_addr().expect("source addr");
+    socket.set_nonblocking(true).expect("source nonblocking");
+    let listener = tokio::net::TcpListener::from_std(socket).expect("source tokio");
+    let handle = tokio::spawn(async move {
+        let zeros = vec![0u8; 64 * 1024];
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let zeros = zeros.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                while sock.write_all(&zeros).await.is_ok() {}
+            });
+        }
+    });
+    SourceServer { addr, handle }
+}
+
+#[cfg(test)]
+mod bench_helper_tests {
+    use super::{spawn_sink, spawn_source};
+
+    #[tokio::test]
+    async fn sink_discards_and_source_streams() {
+        use std::sync::atomic::Ordering;
+        let sink = spawn_sink();
+        let stream = tokio::net::TcpStream::connect(sink.addr).await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        // Source streams infinite zeros: read 1 MiB, all zeros.
+        let source = spawn_source();
+        let mut stream = tokio::net::TcpStream::connect(source.addr).await.unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        use tokio::io::AsyncReadExt as _;
+        stream.read_exact(&mut buf).await.unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        // Sink accepts a write AND counts it.
+        use tokio::io::AsyncWriteExt as _;
+        wr.write_all(&buf[..4096]).await.unwrap();
+        drop(wr);
+        let _ = &mut rd;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sink.received.load(Ordering::SeqCst) < 4096 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sink never counted bytes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
