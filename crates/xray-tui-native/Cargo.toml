@@ -119,6 +119,14 @@ workspace = true
 [features]
 native-e2e = ["dep:serde_json", "dep:tempfile", "dep:rcgen", "dep:tiny_http", "dep:x25519-dalek", "dep:tokio-rustls"]
 
+# [[bench]] target: `harness = false` — criterion owns `main`. The bench
+# file itself is `#![cfg(feature = "native-e2e")]`-gated and
+# `required-features` keeps cargo from building it without the feature.
+[[bench]]
+name = "throughput"
+harness = false
+required-features = ["native-e2e"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by unit tests in security/transport/context/chain,
@@ -133,3 +141,7 @@ rstest.workspace = true
 blake3 = "1"
 # (rustls is a normal dependency now — the h3 arm's QUIC TLS config; the
 # server double reuses the same dep.)
+# Throughput benches (`benches/throughput.rs`, Task 2): criterion harness +
+# tempdir for the spawned core's on-disk config.
+criterion = { version = "0.8", features = ["async_tokio"] }
+tempfile = "3"
