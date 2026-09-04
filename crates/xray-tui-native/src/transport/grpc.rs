@@ -302,16 +302,16 @@ impl AsyncWrite for GrpcStream {
         Poll::Ready(Ok(take))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.send).poll_capacity(cx) {
-            Poll::Ready(Some(Ok(_))) => Poll::Ready(Ok(())),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "grpc send stream closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+        // `poll_write` hands every message to h2's connection buffer via
+        // `send_data` — there is no user-space buffer left to drain, so
+        // flush is immediately ready (like a TCP write: delivery to the
+        // transport, not to the peer; arrival pacing is the caller's job).
+        // Waiting for window capacity here would hang: once everything
+        // queued is transmitted, the windows sit empty with no new
+        // WINDOW_UPDATEs coming, and `poll_capacity` pends forever (bulk
+        // send over xray stalls at the first flush).
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
