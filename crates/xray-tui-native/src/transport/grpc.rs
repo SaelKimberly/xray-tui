@@ -251,7 +251,21 @@ impl AsyncRead for GrpcStream {
             }
             let recv = self.recv.as_mut().expect("recv set above");
             match Pin::new(recv).poll_data(cx) {
-                Poll::Ready(Some(Ok(chunk))) => self.read_buf.extend_from_slice(&chunk),
+                Poll::Ready(Some(Ok(chunk))) => {
+                    // h2 flow control: the receive window does NOT
+                    // auto-replenish — without release the server stops
+                    // after one window (64 KiB default) and bulk recv
+                    // stalls forever. We own these bytes now (buffered
+                    // in `read_buf`), so release the full chunk.
+                    let n = chunk.len();
+                    self.read_buf.extend_from_slice(&chunk);
+                    let _ = self
+                        .recv
+                        .as_mut()
+                        .expect("recv set above")
+                        .flow_control()
+                        .release_capacity(n);
+                }
                 Poll::Ready(Some(Err(e))) => {
                     // A reset with NO_ERROR (grpc-go closes streams that
                     // way) is a clean end: report EOF so `read_to_end`
