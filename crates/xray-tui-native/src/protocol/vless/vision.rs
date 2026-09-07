@@ -22,7 +22,7 @@ use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 
 use crate::protocol::vless::stream::VlessClientStream;
 
@@ -63,6 +63,11 @@ const FRAME_OVERHEAD: usize = 21;
 /// Downlink scratch size for padded reads: one full outer TLS record's
 /// plaintext, which is the most the record layer hands over per poll.
 const READ_CHUNK: usize = 16_384;
+/// `read_buf` hard cap: a pathological chunk burst never parks more than
+/// 64 KiB of unpadded content. Fully drained buffers over the cap shrink
+/// back to 8 KiB on idle.
+const READ_BUF_CAP: usize = 65536;
+const READ_BUF_IDLE: usize = 8192;
 /// Filter chunk budget (xray `NumberOfPacketToFilter`).
 const FILTER_BUDGET: i32 = 8;
 
@@ -239,10 +244,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
     /// Writer state machine (spec §4.3, sing-vmess model): pad each app
     /// chunk into vision frames. The Direct frame is the LAST padded frame;
     /// any trailing bytes of the chunk go out raw.
-    fn pad_chunk(&mut self, chunk: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>, bool) {
-        let mut out = Vec::new();
-        let mut raw_tail = Vec::new();
-        let mut direct = false;
+    ///
+    /// Frames (and the Direct-case raw tail) are encoded straight into
+    /// `write_buf` — no per-frame `Vec`s. Returns `(raw_len, direct)`:
+    /// `raw_len` trailing bytes are the raw tail (only when `direct`), the
+    /// rest is the frame part `poll_write` pushes through the record layer.
+    fn pad_chunk(&mut self, chunk: &[u8]) -> (usize, bool) {
         // Reshape chunks >= 8171 at the last 0x17 0x03 0x03 boundary
         // (ReshapeMultiBuffer, spec §4.3) so each piece keeps the frame cap.
         let pieces: Vec<&[u8]> = if chunk.len() >= MAX_FRAME - FRAME_OVERHEAD {
@@ -269,40 +276,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
                 } else {
                     (CMD_END, false)
                 };
-                out.push(encode_frame(
+                encode_frame_into(
+                    &mut self.write_buf,
                     None,
                     cmd,
                     piece,
                     padding_len(piece.len(), true),
-                ));
+                );
                 self.writer.is_padding = false;
                 if d {
-                    direct = true;
-                    raw_tail.extend_from_slice(&pieces[i + 1..].concat());
-                } else {
-                    // End: the remaining pieces stay inside the outer TLS,
-                    // unpadded — never dropped (sing-vmess writer model).
-                    for rest in &pieces[i + 1..] {
-                        out.push(rest.to_vec());
+                    let raw_start = self.write_buf.len();
+                    for p in &pieces[i + 1..] {
+                        self.write_buf.extend_from_slice(p);
                     }
+                    return (self.write_buf.len() - raw_start, true);
                 }
-                return (out, raw_tail, direct);
+                // End: the remaining pieces stay inside the outer TLS,
+                // unpadded — never dropped (sing-vmess writer model).
+                for rest in &pieces[i + 1..] {
+                    self.write_buf.extend_from_slice(rest);
+                }
+                return (0, false);
             }
             if !self.filter.is_tls12_or_above && self.filter.budget <= 1 {
                 // Non-TLS / TLS 1.2 early finish (the filter budget is
                 // exhausted before any ServerHello): End frame, the rest
                 // unpadded via the outer TLS.
-                out.push(encode_frame(
+                encode_frame_into(
+                    &mut self.write_buf,
                     None,
                     CMD_END,
                     piece,
                     padding_len(piece.len(), long_padding),
-                ));
+                );
                 self.writer.is_padding = false;
                 for rest in &pieces[i + 1..] {
-                    out.push(rest.to_vec());
+                    self.write_buf.extend_from_slice(rest);
                 }
-                return (out, raw_tail, direct);
+                return (0, false);
             }
             let cmd = if is_last && !self.writer.is_padding {
                 CMD_END
@@ -313,14 +324,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
             // return; this generic branch always runs while is_padding, so
             // cmd is CMD_CONTINUE — kept for parity with xray's command
             // selection.)
-            out.push(encode_frame(
+            encode_frame_into(
+                &mut self.write_buf,
                 None,
                 cmd,
                 piece,
                 padding_len(piece.len(), long_padding),
-            ));
+            );
         }
-        (out, raw_tail, direct)
+        (0, false)
     }
 
     /// Drain `write_buf` through `inner`. When the buffered bytes include a
@@ -403,48 +415,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncWrite for VisionStream
         if !this.writer.is_padding {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
-        let (frames, raw_tail, direct) = this.pad_chunk(buf);
-        // Write the frames through the record layer.
-        let mut pending = None;
-        'frames: for (i, f) in frames.iter().enumerate() {
-            let mut off = 0;
-            while off < f.len() {
-                match Pin::new(&mut this.inner).poll_write(cx, &f[off..]) {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "vision frame write returned 0",
-                        )));
-                    }
-                    Poll::Ready(Ok(n)) => off += n,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        pending = Some((i, off));
-                        break 'frames;
-                    }
+        // Encode the frames straight into the (empty) write buffer — no
+        // per-frame `Vec`s — then push the frame part through the record
+        // layer straight out of it.
+        debug_assert!(this.write_buf.is_empty());
+        let (raw_len, direct) = this.pad_chunk(buf);
+        let frame_bytes = this.write_buf.len() - raw_len;
+        let mut off = 0;
+        while off < frame_bytes {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[off..frame_bytes]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vision frame write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => off += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    // Everything unwritten is already staged: drop the
+                    // written prefix and let `poll_drain` finish the rest —
+                    // the splice happens once the boundary drains.
+                    this.write_buf.advance(off);
+                    this.direct_boundary = direct.then_some(frame_bytes - off);
+                    this.accepted = buf.len();
+                    return Poll::Pending;
                 }
             }
         }
-        if let Some((i, off)) = pending {
-            // Buffer everything unwritten — the current frame's remainder,
-            // the later frames, and the raw tail — so no byte is lost; the
-            // splice happens once the boundary drains.
-            let mut rest = Vec::with_capacity(
-                frames[i].len() - off
-                    + frames[i + 1..].iter().map(Vec::len).sum::<usize>()
-                    + raw_tail.len(),
-            );
-            for (j, f) in frames.iter().enumerate().skip(i) {
-                rest.extend_from_slice(if j == i { &f[off..] } else { f });
-            }
-            let frame_bytes = rest.len();
-            this.write_buf.clear();
-            this.write_buf.extend_from_slice(&rest);
-            this.write_buf.extend_from_slice(&raw_tail);
-            this.direct_boundary = direct.then_some(frame_bytes);
-            this.accepted = buf.len();
-            return Poll::Pending;
-        }
+        this.write_buf.advance(frame_bytes);
         // All frames written. If this chunk carried the Direct frame, flush
         // the record layer and splice the write side before the raw tail.
         if direct {
@@ -454,31 +453,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncWrite for VisionStream
             }
             this.writer.direct = true;
         }
-        if !raw_tail.is_empty() {
-            // The inner is raw now (Direct case): write the tail directly.
-            let mut off = 0;
-            loop {
-                match Pin::new(&mut this.inner).poll_write(cx, &raw_tail[off..]) {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "vision raw tail write returned 0",
-                        )));
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        off += n;
-                        if off == raw_tail.len() {
-                            break;
-                        }
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        this.write_buf.clear();
-                        this.write_buf.extend_from_slice(&raw_tail[off..]);
-                        this.direct_boundary = None;
-                        this.accepted = buf.len();
-                        return Poll::Pending;
-                    }
+        // The inner is raw now (Direct case): drain the staged tail.
+        while !this.write_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vision raw tail write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.write_buf.advance(n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    this.direct_boundary = None;
+                    this.accepted = buf.len();
+                    return Poll::Pending;
                 }
             }
         }
@@ -531,6 +522,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
                 let n = this.read_buf.len().min(buf.remaining());
                 buf.put_slice(&this.read_buf[..n]);
                 this.read_buf.advance(n);
+                if this.read_buf.is_empty() && this.read_buf.capacity() > READ_BUF_CAP {
+                    // Idle after a jumbo chunk: drop the oversized staging
+                    // allocation instead of carrying it for the connection.
+                    this.read_buf = BytesMut::with_capacity(READ_BUF_IDLE);
+                }
                 return Poll::Ready(Ok(()));
             }
             // Padding ended earlier (End seen, never Direct): the server
@@ -545,7 +541,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
                 }
                 return Poll::Ready(Ok(()));
             }
-            // Read a decrypted chunk from the record layer, unpad it, retry.
             // One scratch buffer per stream, grown once and reused.
             if this.scratch.len() < READ_CHUNK {
                 this.scratch.resize(READ_CHUNK, 0);
@@ -562,16 +557,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
                 this.filter.feed(data);
                 this.read_buf.extend_from_slice(data);
             } else {
-                let mut content = Vec::with_capacity(data.len());
-                this.reader.unpad.feed(data, &mut content);
-                this.filter.feed(&content);
+                // Unpad in place into the caller's staging buffer: no
+                // per-chunk content `Vec`.
+                let base = this.read_buf.len();
+                this.reader.unpad.feed(data, &mut this.read_buf);
+                if this.read_buf.len() > READ_BUF_CAP {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vision read buffer exceeded the 64 KiB cap",
+                    )));
+                }
+                this.filter.feed(&this.read_buf[base..]);
                 if this.reader.unpad.direct {
                     this.reader.direct = true;
                     this.reader.unpad.direct = false;
                     // Everything the unpadder produced after the Direct frame —
                     // its own payload plus any raw bytes that followed it in
-                    // the same chunk — is the start of the raw stream.
-                    this.raw_leftover.extend_from_slice(&content);
+                    // the same chunk — is the start of the raw stream. Move
+                    // it wholesale: read_buf held nothing else (the loop
+                    // serves before feeding).
+                    debug_assert_eq!(base, 0);
+                    std::mem::swap(&mut this.read_buf, &mut this.raw_leftover);
                     if this.directable {
                         this.inner.set_read_direct();
                     }
@@ -584,10 +590,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
                     // Empty Direct payload: fall through to raw reads.
                     return Pin::new(&mut this.inner).poll_read(cx, buf);
                 }
-                this.read_buf.extend_from_slice(&content);
+                // Content already staged in read_buf; the loop serves it.
             }
         }
     }
+}
+
+/// Encode one padded frame into `out`: `[uuid?][cmd][clen:2][plen:2][content][zeros]`.
+/// `uuid: Option<&[u8; 16]>` — `Some` only for the first frame of a
+/// direction.
+///
+/// Panics if `content.len() + 21 + pad_len > MAX_FRAME` — the caller must
+/// reshape chunks >= 8171 first (the writer's `reshape` guard).
+fn encode_frame_into(
+    out: &mut BytesMut,
+    uuid: Option<&[u8; 16]>,
+    cmd: u8,
+    content: &[u8],
+    pad_len: usize,
+) {
+    assert!(
+        content.len() + FRAME_OVERHEAD + pad_len <= MAX_FRAME,
+        "vision frame exceeds MAX_FRAME: content {} + overhead {FRAME_OVERHEAD} + pad {pad_len} > {MAX_FRAME}",
+        content.len()
+    );
+    out.reserve(content.len() + FRAME_OVERHEAD + pad_len);
+    if let Some(u) = uuid {
+        out.extend_from_slice(u);
+    }
+    let clen = u16::try_from(content.len()).expect("content fits u16 (frame cap)");
+    let plen = u16::try_from(pad_len).expect("pad fits u16 (frame cap)");
+    out.extend_from_slice(&[cmd]);
+    out.extend_from_slice(&clen.to_be_bytes());
+    out.extend_from_slice(&plen.to_be_bytes());
+    out.extend_from_slice(content);
+    out.resize(out.len() + pad_len, 0);
 }
 
 /// Encode one padded frame: `[uuid?][cmd][clen:2][plen:2][content][zeros]`.
@@ -597,23 +634,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
 /// Panics if `content.len() + 21 + pad_len > MAX_FRAME` — the caller must
 /// reshape chunks >= 8171 first (the writer's `reshape` guard).
 fn encode_frame(uuid: Option<&[u8; 16]>, cmd: u8, content: &[u8], pad_len: usize) -> Vec<u8> {
-    assert!(
-        content.len() + FRAME_OVERHEAD + pad_len <= MAX_FRAME,
-        "vision frame exceeds MAX_FRAME: content {} + overhead {FRAME_OVERHEAD} + pad {pad_len} > {MAX_FRAME}",
-        content.len()
-    );
-    let mut out = Vec::with_capacity(content.len() + FRAME_OVERHEAD + pad_len);
-    if let Some(u) = uuid {
-        out.extend_from_slice(u);
-    }
-    let clen = u16::try_from(content.len()).expect("content fits u16 (frame cap)");
-    let plen = u16::try_from(pad_len).expect("pad fits u16 (frame cap)");
-    out.push(cmd);
-    out.extend_from_slice(&clen.to_be_bytes());
-    out.extend_from_slice(&plen.to_be_bytes());
-    out.extend_from_slice(content);
-    out.resize(out.len() + pad_len, 0);
-    out
+    let mut out = BytesMut::with_capacity(content.len() + FRAME_OVERHEAD + pad_len);
+    encode_frame_into(&mut out, uuid, cmd, content, pad_len);
+    out.to_vec()
 }
 
 /// `XtlsPadding` port (spec §4.2): compute `pad_len` for the given content.
@@ -671,7 +694,7 @@ impl Unpadder {
     /// Feed one decrypted chunk; returns unpadded content (possibly empty).
     /// On `direct`, the caller must switch the stream to raw reads and stop
     /// feeding this unpadder (spec §4.4).
-    fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+    fn feed(&mut self, chunk: &[u8], out: &mut BytesMut) {
         if self.plain_passthrough {
             out.extend_from_slice(chunk);
             return;
@@ -1050,9 +1073,9 @@ mod tests {
     fn unpad_single_complete_frame() {
         let mut unpad = Unpadder::new(UUID);
         let frame = encode_frame(Some(&UUID), CMD_CONTINUE, b"abc", 2);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&frame, &mut out);
-        assert_eq!(out, b"abc");
+        assert_eq!(&out[..], b"abc");
         assert!(unpad.within_padding);
         assert!(!unpad.direct);
     }
@@ -1065,10 +1088,10 @@ mod tests {
         chunk.extend_from_slice(&encode_frame(None, CMD_CONTINUE, b"xy", 1));
         // Split mid-way through the first frame's content.
         let split = 16 + 5 + 2;
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&chunk[..split], &mut out);
         unpad.feed(&chunk[split..], &mut out);
-        assert_eq!(out, b"abcdxy");
+        assert_eq!(&out[..], b"abcdxy");
     }
 
     #[test]
@@ -1077,11 +1100,11 @@ mod tests {
         // first chunk must be >= 21 bytes for the UUID gate to engage.
         let frame = encode_frame(Some(&UUID), CMD_CONTINUE, b"0123456789", 4);
         let mut unpad = Unpadder::new(UUID);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&frame[..24], &mut out); // uuid + header + content head
         unpad.feed(&frame[24..30], &mut out); // content middle
         unpad.feed(&frame[30..], &mut out); // content tail + padding
-        assert_eq!(out, b"0123456789");
+        assert_eq!(&out[..], b"0123456789");
     }
 
     #[test]
@@ -1089,15 +1112,15 @@ mod tests {
         let mut unpad = Unpadder::new(UUID);
         let junk = b"no vision here at all, just plain bytes.......";
         assert!(junk.len() >= 21);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(junk, &mut out);
-        assert_eq!(out, junk);
+        assert_eq!(&out[..], &junk[..]);
         assert!(unpad.plain_passthrough);
         assert!(!unpad.within_padding);
         // ... and forever after.
-        let mut out2 = Vec::new();
+        let mut out2 = BytesMut::new();
         unpad.feed(b"more raw bytes", &mut out2);
-        assert_eq!(out2, b"more raw bytes");
+        assert_eq!(&out2[..], b"more raw bytes");
     }
 
     #[test]
@@ -1109,24 +1132,24 @@ mod tests {
         // the raw stream before the codec, so this is a defensive path —
         // a mis-composed caller.)
         let mut unpad = Unpadder::new(UUID);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&[0x00, 0x00], &mut out);
-        assert_eq!(out, [0x00, 0x00]);
+        assert_eq!(&out[..], [0x00, 0x00]);
         assert!(!unpad.plain_passthrough);
         assert!(unpad.within_padding);
         let frame = encode_frame(Some(&UUID), CMD_CONTINUE, b"hi", 0);
-        let mut out2 = Vec::new();
+        let mut out2 = BytesMut::new();
         unpad.feed(&frame, &mut out2);
-        assert_eq!(out2, b"hi");
+        assert_eq!(&out2[..], b"hi");
     }
 
     #[test]
     fn unpad_end_frame_stops_padding() {
         let mut unpad = Unpadder::new(UUID);
         let frame = encode_frame(Some(&UUID), CMD_END, b"bye", 0);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&frame, &mut out);
-        assert_eq!(out, b"bye");
+        assert_eq!(&out[..], b"bye");
         assert!(!unpad.within_padding);
         assert!(!unpad.direct);
     }
@@ -1135,9 +1158,9 @@ mod tests {
     fn unpad_direct_frame_flags_direct() {
         let mut unpad = Unpadder::new(UUID);
         let frame = encode_frame(Some(&UUID), CMD_DIRECT, b"raw", 0);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&frame, &mut out);
-        assert_eq!(out, b"raw");
+        assert_eq!(&out[..], b"raw");
         assert!(!unpad.within_padding);
         assert!(unpad.direct);
     }
@@ -1146,9 +1169,9 @@ mod tests {
     fn unpad_skips_padding_bytes() {
         let mut unpad = Unpadder::new(UUID);
         let frame = encode_frame(Some(&UUID), CMD_CONTINUE, b"payload", 7);
-        let mut out = Vec::new();
+        let mut out = BytesMut::new();
         unpad.feed(&frame, &mut out);
-        assert_eq!(out, b"payload");
+        assert_eq!(&out[..], b"payload");
     }
 
     // ---- Step 3: TLS filter ----
@@ -1237,7 +1260,7 @@ mod tests {
         let n = server.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &camo[..]);
         let mut unpad = Unpadder::new(UUID);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
         assert!(content.is_empty());
 
@@ -1248,9 +1271,9 @@ mod tests {
         assert_eq!(&buf[1..3], &[0x00, 0x05]);
         let plen = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
         assert_eq!(n, 5 + 5 + plen);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
-        assert_eq!(content, b"hello");
+        assert_eq!(&content[..], b"hello");
 
         // Server replies with a padded Continue frame carrying its UUID.
         let reply = encode_frame(Some(&UUID), CMD_CONTINUE, b"world", 0);
@@ -1305,7 +1328,7 @@ mod tests {
         let mut buf = [0u8; 8192];
         let n = server.read(&mut buf).await.unwrap();
         let mut unpad = Unpadder::new(UUID);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
         assert!(content.is_empty());
 
@@ -1314,9 +1337,9 @@ mod tests {
         let client_hello = b"\x16\x03\x03\x00\x05\x01\x00\x00\x01\x00";
         vs.write_all(client_hello).await.unwrap();
         let n = server.read(&mut buf).await.unwrap();
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
-        assert_eq!(content, client_hello);
+        assert_eq!(&content[..], client_hello);
         assert!(vs.filter.is_tls);
 
         // 2. Downlink TLS 1.3 ServerHello -> the filter enables XTLS.
@@ -1333,10 +1356,10 @@ mod tests {
         vs.write_all(app_data).await.unwrap();
         let n = server.read(&mut buf).await.unwrap();
         assert_eq!(buf[0], CMD_DIRECT);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
         assert!(unpad.direct);
-        assert_eq!(content, app_data);
+        assert_eq!(&content[..], app_data);
 
         // 4. The client's next write goes out raw.
         vs.write_all(b"RAW-NOW").await.unwrap();
@@ -1442,16 +1465,16 @@ mod tests {
         let mut buf = [0u8; 8192];
         let n = server.read(&mut buf).await.unwrap();
         let mut unpad = Unpadder::new(UUID);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
 
         // Inner ClientHello -> Continue frame (is_tls).
         let client_hello = b"\x16\x03\x03\x00\x05\x01\x00\x00\x01\x00";
         vs.write_all(client_hello).await.unwrap();
         let n = server.read(&mut buf).await.unwrap();
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
-        assert_eq!(content, client_hello);
+        assert_eq!(&content[..], client_hello);
 
         // Downlink TLS 1.2 ServerHello -> enable_xtls stays false.
         let sh = server_hello(0x1301, false);
@@ -1467,9 +1490,9 @@ mod tests {
         vs.write_all(app_data).await.unwrap();
         let n = server.read(&mut buf).await.unwrap();
         assert_eq!(buf[0], CMD_END);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
-        assert_eq!(content, app_data);
+        assert_eq!(&content[..], app_data);
         assert!(!unpad.direct);
 
         // Subsequent writes go unpadded through the outer TLS.
@@ -1489,7 +1512,7 @@ mod tests {
         let mut buf = [0u8; 8192];
         let n = server.read(&mut buf).await.unwrap();
         let mut unpad = Unpadder::new(UUID);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
 
         // Budget 8: the first 6 writes (budget 7..2) are Continue frames,
@@ -1501,16 +1524,16 @@ mod tests {
             vs.write_all(c).await.unwrap();
             let n = server.read(&mut buf).await.unwrap();
             assert_eq!(buf[0], CMD_CONTINUE);
-            let mut content = Vec::new();
+            let mut content = BytesMut::new();
             unpad.feed(&buf[..n], &mut content);
-            assert_eq!(content, c);
+            assert_eq!(&content[..], c);
         }
         vs.write_all(b"last").await.unwrap();
         let n = server.read(&mut buf).await.unwrap();
         assert_eq!(buf[0], CMD_END);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
-        assert_eq!(content, b"last");
+        assert_eq!(&content[..], b"last");
 
         // Everything after goes unpadded.
         vs.write_all(b"RAW").await.unwrap();
@@ -1529,7 +1552,7 @@ mod tests {
         let mut buf = [0u8; 16384];
         let n = server.read(&mut buf).await.unwrap();
         let mut unpad = Unpadder::new(UUID);
-        let mut content = Vec::new();
+        let mut content = BytesMut::new();
         unpad.feed(&buf[..n], &mut content);
 
         // A chunk larger than one frame is reshaped into Continue frames
@@ -1540,7 +1563,7 @@ mod tests {
         loop {
             let n = server.read(&mut buf).await.unwrap();
             assert!(n > 0);
-            let mut content = Vec::new();
+            let mut content = BytesMut::new();
             unpad.feed(&buf[..n], &mut content);
             got.extend_from_slice(&content);
             if got.len() >= big.len() {

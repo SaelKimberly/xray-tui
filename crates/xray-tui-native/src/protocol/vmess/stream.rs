@@ -23,7 +23,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, AeadInOut};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
@@ -87,21 +87,22 @@ impl Cipher {
         }
     }
 
-    fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, ()> {
-        match self {
-            Self::Aes128Gcm(c) => c.encrypt(nonce.into(), plaintext).map_err(|_| ()),
-            Self::Chacha20Poly1305(c) => c.encrypt(nonce.into(), plaintext).map_err(|_| ()),
-        }
+    fn encrypt_into(&self, nonce: &[u8; 12], buf: &mut Vec<u8>) -> Result<(), ()> {
+        let res = match self {
+            Self::Aes128Gcm(c) => c.encrypt_in_place(nonce.into(), b"", buf),
+            Self::Chacha20Poly1305(c) => c.encrypt_in_place(nonce.into(), b"", buf),
+        };
+        res.map_err(|_| ())
     }
 
-    fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
-        match self {
-            Self::Aes128Gcm(c) => c.decrypt(nonce.into(), ciphertext).map_err(|_| ()),
-            Self::Chacha20Poly1305(c) => c.decrypt(nonce.into(), ciphertext).map_err(|_| ()),
-        }
+    fn decrypt_inplace(&self, nonce: &[u8; 12], buf: &mut Vec<u8>) -> Result<(), ()> {
+        let res = match self {
+            Self::Aes128Gcm(c) => c.decrypt_in_place(nonce.into(), b"", buf),
+            Self::Chacha20Poly1305(c) => c.decrypt_in_place(nonce.into(), b"", buf),
+        };
+        res.map_err(|_| ())
     }
 }
-
 /// Record nonce: response/request IV with the first two bytes replaced by
 /// the BE counter (Go `GenerateChunkNonce`), truncated to 12 bytes.
 fn record_nonce(iv12: &[u8; 12], counter: u16) -> [u8; 12] {
@@ -349,8 +350,14 @@ impl VmessRead {
                     }
                     let nonce = record_nonce(&self.resp_nonce, self.resp_counter);
                     self.resp_counter = self.resp_counter.wrapping_add(1);
-                    if let Ok(pt) = self.resp_cipher.decrypt(&nonce, &self.pending[..total]) {
-                        self.pending = pt;
+                    // Decrypt in place: the staging buffer already holds the
+                    // full ciphertext, so the plaintext lands with no fresh
+                    // `Vec` — the tag is stripped by truncation.
+                    if self
+                        .resp_cipher
+                        .decrypt_inplace(&nonce, &mut self.pending)
+                        .is_ok()
+                    {
                         self.pending_pos = 0;
                         self.read_state = ReadState::RecordLen { filled: 0 };
                         continue;
@@ -368,9 +375,10 @@ impl VmessRead {
 
 /// Write-direction state: the one pending request record, its flush position
 /// and the request-direction AEAD progression. Never reads a byte, so it
-/// moves wholesale into the write half.
 struct VmessWrite {
-    write_pending: Option<Vec<u8>>,
+    /// The one pending request record: `[2B BE wire size][AEAD]`, sealed in
+    /// place into this reusable buffer. Empty = no pending record.
+    seal: Vec<u8>,
     write_pos: usize,
     /// Original caller length the pending record was sealed from — the
     /// byte-stream path's bookkeeping only: [`Self::poll_write`] reports it
@@ -389,7 +397,7 @@ impl VmessWrite {
         let mut req_nonce = [0u8; 12];
         req_nonce.copy_from_slice(&session.request_body_iv[..12]);
         Self {
-            write_pending: None,
+            seal: Vec::new(),
             write_pos: 0,
             write_len: 0,
             req_cipher: Cipher::new(session.security, &session.request_body_key),
@@ -404,7 +412,7 @@ impl VmessWrite {
     /// caller MUST have cleared any previous record first.
     fn seal_pending(&mut self, payload: &[u8]) -> io::Result<()> {
         debug_assert!(
-            self.write_pending.is_none(),
+            self.seal.is_empty(),
             "exactly one record is sealed at a time"
         );
         if payload.len() > MAX_RECORD_PLAINTEXT {
@@ -414,18 +422,25 @@ impl VmessWrite {
             ));
         }
         let nonce = record_nonce(&self.req_nonce, self.req_counter);
-        let Ok(ct) = self.req_cipher.encrypt(&nonce, payload) else {
+        // Seal in place into the reusable buffer: the plaintext goes in,
+        // the tag is appended — no per-record `Vec`s, only the AEAD's own
+        // internal block work.
+        self.seal.clear();
+        self.seal.extend_from_slice(payload);
+        if self
+            .req_cipher
+            .encrypt_into(&nonce, &mut self.seal)
+            .is_err()
+        {
+            self.seal.clear();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "vmess request record seal failed",
             ));
-        };
-        let mut rec = Vec::with_capacity(2 + ct.len());
+        }
         let field =
             u16::try_from(payload.len() + 16).expect("record size bounded by the guard above");
-        rec.extend_from_slice(&field.to_be_bytes());
-        rec.extend_from_slice(&ct);
-        self.write_pending = Some(rec);
+        self.seal.splice(0..0, field.to_be_bytes());
         self.write_pos = 0;
         self.req_counter = self.req_counter.wrapping_add(1);
         Ok(())
@@ -439,15 +454,17 @@ impl VmessWrite {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            let Some(rec) = self.write_pending.as_ref() else {
+            if self.seal.is_empty() {
                 return Poll::Ready(Ok(()));
-            };
-            if self.write_pos >= rec.len() {
-                self.write_pending = None;
+            }
+            if self.write_pos >= self.seal.len() {
+                // Record fully written: clear (keeping the allocation for
+                // the next record) instead of dropping the buffer.
+                self.seal.clear();
                 self.write_pos = 0;
                 return Poll::Ready(Ok(()));
             }
-            let n = ready!(Pin::new(&mut *inner).poll_write(cx, &rec[self.write_pos..]))?;
+            let n = ready!(Pin::new(&mut *inner).poll_write(cx, &self.seal[self.write_pos..]))?;
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -476,7 +493,7 @@ impl VmessWrite {
         // Seal at most one record. If a previous record is still being
         // flushed, the caller is retrying with the same buffer (tokio poll
         // contract) — the pending record was built from its prefix.
-        if self.write_pending.is_none() {
+        if self.seal.is_empty() {
             let take = buf.len().min(MAX_RECORD_PLAINTEXT);
             if let Err(e) = self.seal_pending(&buf[..take]) {
                 return Poll::Ready(Err(e));
@@ -535,7 +552,8 @@ impl VmessWrite {
             if !sealed {
                 if self.write_pos > 0 {
                     ready!(self.flush_pending(&mut *inner, cx))?;
-                } else if self.write_pending.take().is_some() {
+                } else if !self.seal.is_empty() {
+                    self.seal.clear();
                     self.req_counter = self.req_counter.wrapping_sub(1);
                 }
                 self.write_len = 0;

@@ -11,6 +11,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 use crate::addr::{Host, TargetAddr};
@@ -116,7 +117,7 @@ struct WriteState {
 }
 
 impl ReadState {
-    const fn new(mode: PacketMode) -> Self {
+    fn new(mode: PacketMode) -> Self {
         Self {
             mode,
             peel: Peel::new(),
@@ -139,7 +140,7 @@ impl ReadState {
     async fn recv_from<R: AsyncRead + Unpin>(
         &mut self,
         r: &mut R,
-    ) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+    ) -> io::Result<Option<(Option<SocketAddr>, Bytes)>> {
         if !self.peel.is_peeled() {
             self.peel.ensure_peeled(r).await?;
         }
@@ -158,7 +159,7 @@ impl ReadState {
             PacketMode::Raw => Ok(Some((None, frame))),
             PacketMode::PacketAddr => {
                 let (dest, payload) = packetaddr::decode_dest(&frame)?;
-                Ok(Some((Some(dest), payload.to_vec())))
+                Ok(Some((Some(dest), Bytes::copy_from_slice(payload))))
             }
             PacketMode::XUdp => unreachable!("XUdp rides the mux session, not the frame codec"),
         }
@@ -206,10 +207,11 @@ impl WriteState {
                 let encoded = packetaddr::encode_dest(dest);
                 let total = encoded.len() + payload.len();
                 reject_oversized(total)?;
-                let mut frame = Vec::with_capacity(total);
-                frame.extend_from_slice(&encoded);
-                frame.extend_from_slice(payload);
-                write_packet(w, &frame).await
+                // No combined frame `Vec`: the stack prefix plus the address
+                // header and payload go out as one vectored write.
+                let n = u16::try_from(total).expect("rejected oversized above");
+                let prefix = n.to_be_bytes();
+                super::udp::write_all_vectored(w, &[&prefix, &encoded, payload]).await
             }
             PacketMode::XUdp => unreachable!("XUdp rides the mux session, not the frame codec"),
         }
@@ -257,7 +259,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     /// a stream mode: the response-header peel before the first frame,
     /// `Ok(None)` on a clean end-of-stream, `(None, payload)` in Raw mode
     /// and the decoded per-packet address in `PacketAddr` mode.
-    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Bytes)>> {
         self.state.recv_from(&mut self.inner).await
     }
 }
@@ -291,7 +293,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// written in the request header — in `Raw` mode the only destination
     /// the tunnel can reach. `XUdp` mode is not constructible here — the
     /// `XUdp` carrier is a [`UdpSession`], use [`PacketConn::xudp`].
-    pub const fn new(inner: S, mode: PacketMode, header_dest: &TargetAddr) -> Self {
+    pub fn new(inner: S, mode: PacketMode, header_dest: &TargetAddr) -> Self {
         debug_assert!(
             !matches!(mode, PacketMode::XUdp),
             "vless: XUdp mode requires PacketConn::xudp (a UdpSession)"
@@ -313,7 +315,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// delegate to the session — no 2-byte framing, the mux frames carry
     /// the length and the per-packet destination (spec §4.1, §5.2). The mux
     /// command carries no header destination, so there is none to keep.
-    pub(crate) const fn xudp(session: UdpSession) -> Self {
+    pub(crate) fn xudp(session: UdpSession) -> Self {
         Self {
             inner: PacketInner::XUdp(session),
             read: ReadState::new(PacketMode::XUdp),
@@ -351,7 +353,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// `(None, payload)`, `PacketAddr` the validated per-packet address.
     /// `XUdp`: `session.recv_from()` → `(Some(dest), payload)` — the
     /// destination the server dispatched the packet to.
-    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Bytes)>> {
         // XUdp delegates entirely to the mux UDP session.
         if self.read.mode == PacketMode::XUdp {
             let session = self.inner.session_mut()?;
@@ -443,7 +445,7 @@ mod tests {
 
         let (dest, payload) = conn.recv().await.unwrap().unwrap();
         assert_eq!(dest, None);
-        assert_eq!(payload, b"yo");
+        assert_eq!(&payload[..], b"yo");
     }
 
     #[tokio::test]
@@ -470,7 +472,7 @@ mod tests {
 
         let (dest, payload) = conn.recv().await.unwrap().unwrap();
         assert_eq!(dest, Some(reply_dest));
-        assert_eq!(payload, b"ok");
+        assert_eq!(&payload[..], b"ok");
     }
 
     #[tokio::test]
@@ -486,9 +488,9 @@ mod tests {
 
         let (dest, payload) = conn.recv().await.unwrap().unwrap();
         assert_eq!(dest, None);
-        assert_eq!(payload, b"first");
+        assert_eq!(&payload[..], b"first");
         let (_, payload) = conn.recv().await.unwrap().unwrap();
-        assert_eq!(payload, b"second");
+        assert_eq!(&payload[..], b"second");
     }
 
     #[tokio::test]
@@ -602,7 +604,7 @@ mod tests {
 
         let (dest, payload) = conn.recv().await.unwrap().unwrap();
         assert_eq!(dest, Some(reply_dest));
-        assert_eq!(payload, b"yo");
+        assert_eq!(&payload[..], b"yo");
     }
 
     #[tokio::test]
@@ -649,8 +651,14 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         // Both accepted sends are on the wire; the refused ones wrote nothing.
-        assert_eq!(read_packet(&mut server).await.unwrap().unwrap(), b"a");
-        assert_eq!(read_packet(&mut server).await.unwrap().unwrap(), b"b");
+        assert_eq!(
+            read_packet(&mut server).await.unwrap().unwrap(),
+            Bytes::from_static(b"a")
+        );
+        assert_eq!(
+            read_packet(&mut server).await.unwrap().unwrap(),
+            Bytes::from_static(b"b")
+        );
         drop(conn);
         assert!(read_packet(&mut server).await.unwrap().is_none());
     }
@@ -673,7 +681,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-        assert_eq!(read_packet(&mut server).await.unwrap().unwrap(), b"a");
+        assert_eq!(
+            read_packet(&mut server).await.unwrap().unwrap(),
+            Bytes::from_static(b"a")
+        );
         drop(conn);
         assert!(read_packet(&mut server).await.unwrap().is_none());
     }
@@ -741,9 +752,9 @@ mod tests {
         assert_eq!(
             want,
             vec![
-                (None, b"one".to_vec()),
-                (None, b"two".to_vec()),
-                (None, b"three".to_vec()),
+                (None, Bytes::from_static(b"one")),
+                (None, Bytes::from_static(b"two")),
+                (None, Bytes::from_static(b"three")),
             ]
         );
         assert_eq!(got, want);
@@ -803,8 +814,8 @@ mod tests {
         assert_eq!(
             want,
             vec![
-                (Some(dests[0]), b"in".to_vec()),
-                (Some(dests[1]), b"in".to_vec()),
+                (Some(dests[0]), Bytes::from_static(b"in")),
+                (Some(dests[1]), Bytes::from_static(b"in")),
             ]
         );
         assert_eq!(got, want);
@@ -834,8 +845,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-        assert_eq!(read_packet(&mut peer).await.unwrap().unwrap(), b"a");
-        assert_eq!(read_packet(&mut peer).await.unwrap().unwrap(), b"b");
+        assert_eq!(
+            read_packet(&mut peer).await.unwrap().unwrap(),
+            Bytes::from_static(b"a")
+        );
+        assert_eq!(
+            read_packet(&mut peer).await.unwrap().unwrap(),
+            Bytes::from_static(b"b")
+        );
         // BOTH halves must go for the split stream to close (tokio::io::split
         // keeps the stream alive while either half lives).
         drop((reader, writer));
@@ -857,12 +874,15 @@ mod tests {
         );
 
         writer.send(None, b"ping").await.unwrap();
-        assert_eq!(read_packet(&mut peer).await.unwrap().unwrap(), b"ping");
+        assert_eq!(
+            read_packet(&mut peer).await.unwrap().unwrap(),
+            Bytes::from_static(b"ping")
+        );
         write_packet(&mut peer, b"pong").await.unwrap();
 
         let (dest, payload) = pending.await.unwrap().unwrap().unwrap();
         assert_eq!(dest, None);
-        assert_eq!(payload, b"pong");
+        assert_eq!(&payload[..], b"pong");
     }
 
     #[tokio::test]
@@ -891,7 +911,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dest, None);
-        assert_eq!(payload, b"hello");
+        assert_eq!(&payload[..], b"hello");
     }
 
     #[tokio::test]
@@ -917,7 +937,7 @@ mod tests {
             .expect("the resumed recv must not hang: the frame is complete")
             .unwrap()
             .unwrap();
-        assert_eq!(payload, b"hello");
+        assert_eq!(&payload[..], b"hello");
     }
 
     #[tokio::test]
@@ -931,7 +951,7 @@ mod tests {
 
         let (dest, payload) = reader.recv().await.unwrap().unwrap();
         assert_eq!(dest, None);
-        assert_eq!(payload, b"last");
+        assert_eq!(&payload[..], b"last");
         assert!(reader.recv().await.unwrap().is_none());
     }
 

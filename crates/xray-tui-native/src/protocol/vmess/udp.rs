@@ -22,6 +22,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
 
 use crate::addr::{Host, TargetAddr};
@@ -47,10 +48,11 @@ use crate::protocol::vmess::stream::{
 const MAX_SEND_PAYLOAD: usize = 8192 - 2 - 16;
 
 /// Receive-direction state: the staging buffer one record's plaintext lands
-/// in, grown once to the record ceiling and reused — the caller gets an
-/// exact-size copy of the datagram, never a freshly zeroed 64 KiB buffer.
+/// in, grown once to the record ceiling and reused — the caller gets a
+/// `Bytes` slice of the datagram, never a freshly zeroed 64 KiB buffer plus
+/// an exact-size copy.
 struct RecvState {
-    scratch: Vec<u8>,
+    scratch: BytesMut,
 }
 
 impl RecvState {
@@ -62,17 +64,19 @@ impl RecvState {
     async fn recv_from<R: AsyncRead + Unpin>(
         &mut self,
         inner: &mut R,
-    ) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
-        if self.scratch.is_empty() {
+    ) -> io::Result<Option<(Option<SocketAddr>, Bytes)>> {
+        if self.scratch.len() < MAX_RECORD_PLAINTEXT {
             // Grown once, on the first datagram: a peer may legitimately
             // fill a whole record, and one read serves exactly one record.
+            // The consumed prefix is re-zeroed here on regrow (memset, no
+            // allocation) — the buffer itself is never reallocated.
             self.scratch.resize(MAX_RECORD_PLAINTEXT, 0);
         }
         let n = inner.read(&mut self.scratch).await?;
         if n == 0 {
             return Ok(None);
         }
-        Ok(Some((None, self.scratch[..n].to_vec())))
+        Ok(Some((None, self.scratch.split_to(n).freeze())))
     }
 }
 
@@ -150,11 +154,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
     /// [`super::stream::VmessClientStream`]). `header_dest` is the
     /// destination that request header carried — the session target.
     #[must_use]
-    pub const fn new(inner: VmessClientStream<S>, header_dest: &TargetAddr) -> Self {
+    pub fn new(inner: VmessClientStream<S>, header_dest: &TargetAddr) -> Self {
         Self {
             inner,
             read: RecvState {
-                scratch: Vec::new(),
+                scratch: BytesMut::new(),
             },
             write: SendState {
                 header_dest: match &header_dest.host {
@@ -182,11 +186,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketConn<S> {
         self.inner.write_datagram(payload).await
     }
 
-    /// Receive one datagram — one record's plaintext, copied out at exactly
-    /// its size. `Ok(None)` on a clean end-of-stream (the record end markers
-    /// or EOF). The destination is `None`: the header target is the session
-    /// destination (no per-packet address on the `VMess` UDP wire).
-    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+    /// Receive one datagram — one record's plaintext, sliced out of the
+    /// reused staging buffer at exactly its size. `Ok(None)` on a clean
+    /// end-of-stream (the record end markers or EOF). The destination is
+    /// `None`: the header target is the session destination (no per-packet
+    /// address on the `VMess` UDP wire).
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Bytes)>> {
         self.read.recv_from(&mut self.inner).await
     }
 
@@ -227,7 +232,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     /// Cancel-safe: every partial fill lives in the read half's state, so a
     /// dropped `recv` future leaves a half-arrived record exactly where it
     /// was and the next call finishes it.
-    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> {
+    pub async fn recv(&mut self) -> io::Result<Option<(Option<SocketAddr>, Bytes)>> {
         self.read.recv_from(&mut self.inner).await
     }
 }
@@ -496,15 +501,13 @@ mod tests {
         // in one flight come back as two datagrams, never concatenated.
         let (dest, first) = conn.recv().await.unwrap().expect("the first datagram");
         assert_eq!(dest, None);
-        assert_eq!(first, b"hey");
-        assert_eq!(
-            first.capacity(),
-            first.len(),
-            "the caller gets an exact-size copy, not the reused staging buffer"
-        );
+        assert_eq!(&first[..], b"hey");
+        // No exact-size copy anymore: the datagram is a slice of the reused
+        // staging buffer, so capacity stays at the record ceiling.
+        assert_eq!(first.len(), b"hey".len());
         let (dest, second) = conn.recv().await.unwrap().expect("the second datagram");
         assert_eq!(dest, None);
-        assert_eq!(second, b"and again");
+        assert_eq!(&second[..], b"and again");
     }
 
     #[tokio::test]
@@ -747,7 +750,7 @@ mod tests {
         assert_eq!(
             split_recv
                 .iter()
-                .map(|(_, payload)| payload.as_slice())
+                .map(|(_, payload)| &payload[..])
                 .collect::<Vec<_>>(),
             DATAGRAMS.to_vec()
         );
@@ -799,7 +802,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .expect("the pending read completes");
-        assert_eq!(received, (None, b"inbound".to_vec()));
+        assert_eq!(received, (None, Bytes::from_static(b"inbound")));
     }
 
     /// A transport that counts the bytes it has handed to the tunnel — the
@@ -898,7 +901,7 @@ mod tests {
         server.write_all(&record[cut..]).await.unwrap();
         let (dest, payload) = reader.recv().await.unwrap().expect("the whole datagram");
         assert_eq!(dest, None);
-        assert_eq!(payload, b"one datagram, two chunks");
+        assert_eq!(&payload[..], b"one datagram, two chunks");
         assert_eq!(
             consumed.load(Ordering::SeqCst),
             first_chunk.len() + record.len() - cut,

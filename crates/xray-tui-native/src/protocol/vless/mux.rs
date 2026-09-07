@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context as TaskCx, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
@@ -312,13 +312,18 @@ fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
 /// plus `[2B data_len][payload]` when the Data option is set. The
 /// metadata (sid, status, option, frame target) is what `meta_len`
 /// covers; `writeMetaWithFrame` appends the data after it.
+///
+/// One `BytesMut` out, no `meta`/`out` `Vec`s: the fixed header goes on a
+/// `[u8; 4]` stack, the variable target bytes extend the output directly,
+/// and `meta_len` is patched into the reserved prefix once known.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Result<()> {
-    // sid(2) + status(1) + opt(1) + [net(1) + port(2) + atyp(1) + IPv6(16)
-    // + GlobalID(8)]
-    let mut meta = Vec::with_capacity(2 + 1 + 1 + 1 + 2 + 1 + 16 + 8);
-    meta.extend_from_slice(&f.session_id.to_be_bytes());
-    meta.push(f.status);
-    meta.push(f.option);
+    // meta worst case: sid(2) + status(1) + opt(1) + net(1) + port(2) +
+    // atyp(1) + domain(1+255) + GlobalID(8) = 272; data adds 2 + payload.
+    let mut out = BytesMut::with_capacity(2 + 272 + 2 + f.payload.len());
+    out.extend_from_slice(&[0, 0]); // meta_len placeholder
+    out.extend_from_slice(&f.session_id.to_be_bytes());
+    out.put_u8(f.status);
+    out.put_u8(f.option);
     if f.status == STATUS_NEW {
         let target = f.target.as_ref().ok_or_else(|| {
             io::Error::new(
@@ -326,7 +331,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
                 "vless mux new frame requires a target",
             )
         })?;
-        encode_target_meta(&mut meta, target)?;
+        encode_target_meta(&mut out, target)?;
         // UDP New frames carry the tunnel GlobalID after the target
         // (xray `frame.go` `WriteTo`: `b.Write(f.GlobalID[:])` for user
         // proxy requests — the client's TCP sessions have no per-packet
@@ -334,7 +339,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
         if matches!(target, MuxTarget::Udp(_))
             && let Some(gid) = f.global_id
         {
-            meta.extend_from_slice(&gid);
+            out.extend_from_slice(&gid);
         }
     } else if f.status == STATUS_KEEP {
         // UDP Keep frames carry the per-packet destination (xray
@@ -342,7 +347,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
         // target.
         if let Some(target) = &f.target {
             match target {
-                MuxTarget::Udp(_) => encode_target_meta(&mut meta, target)?,
+                MuxTarget::Udp(_) => encode_target_meta(&mut out, target)?,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -352,22 +357,20 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
             }
         }
     }
-    let meta_len = u16::try_from(meta.len()).map_err(|_| {
+    let meta_len = out.len() - 2;
+    let meta_len_u16 = u16::try_from(meta_len).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "vless mux metadata exceeds the 2-byte meta length",
         )
     })?;
-    if usize::from(meta_len) > MAX_META {
+    if meta_len > MAX_META {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("vless mux metadata exceeds the {MAX_META}-byte limit"),
         ));
     }
-
-    let mut out = Vec::with_capacity(2 + meta.len() + 2 + f.payload.len());
-    out.extend_from_slice(&meta_len.to_be_bytes());
-    out.extend_from_slice(&meta);
+    out[0..2].copy_from_slice(&meta_len_u16.to_be_bytes());
     if f.option & OPT_DATA != 0 {
         let data_len = u16::try_from(f.payload.len()).map_err(|_| {
             io::Error::new(
@@ -388,30 +391,27 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
     w.write_all(&out).await
 }
 
-/// Encodes a frame target as the port-first address bytes:
-/// `[2B port][atyp][addr]` (IPv4 4 / Domain 1+len / IPv6 16). The network
-/// byte (`NETWORK_TCP` / `NETWORK_UDP`) is written separately by
-/// [`encode_target_meta`]. A domain longer than the wire's 255-byte
-/// length field is `InvalidInput`.
-pub fn encode_new_target(t: &MuxTarget) -> io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(2 + 1 + 16);
+/// Writes a frame target as the port-first address bytes into any byte
+/// buffer: `[2B port][atyp][addr]` (IPv4 4 / Domain 1+len / IPv6 16). A
+/// domain longer than the wire's 255-byte length field is `InvalidInput`.
+fn write_target(out: &mut impl BufMut, t: &MuxTarget) -> io::Result<()> {
     match t {
         MuxTarget::Tcp(sa) | MuxTarget::Udp(sa) => {
-            out.extend_from_slice(&sa.port().to_be_bytes());
+            out.put_slice(&sa.port().to_be_bytes());
             match sa.ip() {
                 IpAddr::V4(v4) => {
-                    out.push(ADDR_TYPE_IPV4);
-                    out.extend_from_slice(&v4.octets());
+                    out.put_u8(ADDR_TYPE_IPV4);
+                    out.put_slice(&v4.octets());
                 }
                 IpAddr::V6(v6) => {
-                    out.push(ADDR_TYPE_IPV6);
-                    out.extend_from_slice(&v6.octets());
+                    out.put_u8(ADDR_TYPE_IPV6);
+                    out.put_slice(&v6.octets());
                 }
             }
         }
         MuxTarget::TcpDomain(domain, port) => {
-            out.extend_from_slice(&port.to_be_bytes());
-            out.push(ADDR_TYPE_DOMAIN);
+            out.put_slice(&port.to_be_bytes());
+            out.put_u8(ADDR_TYPE_DOMAIN);
             // The wire address caps domain length at 255. The VLESS header
             // encode rejects longer domains before a mux target is ever
             // built (addr.rs `encode_addr` → Config error), so this is
@@ -423,23 +423,24 @@ pub fn encode_new_target(t: &MuxTarget) -> io::Result<Vec<u8>> {
                     "vless mux target domain exceeds the 255-byte wire limit",
                 )
             })?;
-            out.push(len);
-            out.extend_from_slice(domain.as_bytes());
+            out.put_u8(len);
+            out.put_slice(domain.as_bytes());
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Appends a target's `[network byte][port-first addr]` to `meta` (the
-/// network byte and address both live inside the frame metadata).
-fn encode_target_meta(meta: &mut Vec<u8>, t: &MuxTarget) -> io::Result<()> {
+/// network byte and address both live inside the frame metadata). Generic
+/// over the buffer so `write_frame` extends its single `BytesMut` with no
+/// intermediate target `Vec`.
+fn encode_target_meta(meta: &mut impl BufMut, t: &MuxTarget) -> io::Result<()> {
     let network = match t {
         MuxTarget::Tcp(_) | MuxTarget::TcpDomain(..) => NETWORK_TCP,
         MuxTarget::Udp(_) => NETWORK_UDP,
     };
-    meta.push(network);
-    meta.extend_from_slice(&encode_new_target(t)?);
-    Ok(())
+    meta.put_u8(network);
+    write_target(meta, t)
 }
 
 // ---------------------------------------------------------------------
@@ -1285,7 +1286,7 @@ impl UdpSession {
     /// (`End` frame or the tunnel ending — spec §6). Each `recv` takes
     /// exactly one whole datagram, so cancelling it loses nothing (tokio
     /// `recv` is cancellation-safe).
-    pub(crate) async fn recv_from(&mut self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+    pub(crate) async fn recv_from(&mut self) -> io::Result<Option<(SocketAddr, Bytes)>> {
         loop {
             match self.rx.recv().await {
                 Some(SessionEvent::Data { dest, bytes }) => {
@@ -1301,7 +1302,7 @@ impl UdpSession {
                     if bytes.is_empty() {
                         continue; // empty datagrams carry nothing
                     }
-                    return Ok(Some((dest, bytes.to_vec())));
+                    return Ok(Some((dest, bytes)));
                 }
                 Some(SessionEvent::End) | None => return Ok(None),
                 Some(SessionEvent::Error(e)) => return Err(e),
@@ -1465,7 +1466,8 @@ mod tests {
     #[test]
     fn domain_target_encode() {
         // port-first: [port 0x01BB][atyp 0x02][len 0x0B][b"example.com"]
-        let bytes = encode_new_target(&MuxTarget::TcpDomain("example.com".into(), 443)).unwrap();
+        let mut bytes = Vec::with_capacity(2 + 1 + 16);
+        write_target(&mut bytes, &MuxTarget::TcpDomain("example.com".into(), 443)).unwrap();
         let mut expected = vec![0x01, 0xBB, 0x02, 0x0B];
         expected.extend_from_slice(b"example.com");
         assert_eq!(bytes, expected);
@@ -1479,7 +1481,8 @@ mod tests {
         // (defense-in-depth; the VLESS header encode rejects long domains
         // before a mux target is ever built).
         let long = "a".repeat(256);
-        let err = encode_new_target(&MuxTarget::TcpDomain(long, 443)).unwrap_err();
+        let mut bytes = Vec::new();
+        let err = write_target(&mut bytes, &MuxTarget::TcpDomain(long, 443)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("255"));
     }
@@ -1881,10 +1884,10 @@ mod tests {
         }
         let (dest, payload) = session.recv_from().await.unwrap().unwrap();
         assert_eq!(dest, "10.0.0.1:4000".parse::<SocketAddr>().unwrap());
-        assert_eq!(payload, b"a1");
+        assert_eq!(&payload[..], b"a1");
         let (dest, payload) = session.recv_from().await.unwrap().unwrap();
         assert_eq!(dest, "10.0.0.2:4001".parse::<SocketAddr>().unwrap());
-        assert_eq!(payload, b"b2");
+        assert_eq!(&payload[..], b"b2");
     }
 
     #[tokio::test]
@@ -3315,10 +3318,10 @@ mod tests {
             // The replies come back per dest, in order.
             let (dest, payload) = conn.recv().await.unwrap().expect("reply 1");
             assert_eq!(dest, Some("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
-            assert_eq!(payload, b"r1");
+            assert_eq!(&payload[..], b"r1");
             let (dest, payload) = conn.recv().await.unwrap().expect("reply 2");
             assert_eq!(dest, Some("192.0.2.7:53".parse::<SocketAddr>().unwrap()));
-            assert_eq!(payload, b"r2");
+            assert_eq!(&payload[..], b"r2");
             // The server's End: a sticky EOF on recv.
             assert!(conn.recv().await.unwrap().is_none());
             assert!(conn.recv().await.unwrap().is_none());

@@ -146,14 +146,18 @@ impl PacketTunnel {
     }
 
     /// Receive one datagram. `Ok(None)` on a clean end-of-stream.
+    ///
+    /// The payload is `Bytes`: carriers hand their staged buffer through
+    /// with no forward-path copy (`Bytes::from` reuses the allocation for
+    /// carriers that stage a `Vec`).
     pub async fn recv(
         &mut self,
-    ) -> std::io::Result<Option<(Option<std::net::SocketAddr>, Vec<u8>)>> {
+    ) -> std::io::Result<Option<(Option<std::net::SocketAddr>, bytes::Bytes)>> {
         match self {
             Self::Vless(c) => c.recv().await,
             Self::Vmess(c) => c.recv().await,
-            Self::Trojan(c) => c.recv().await,
-            Self::Hysteria2(c) => c.recv().await,
+            Self::Trojan(c) => to_bytes(c.recv().await),
+            Self::Hysteria2(c) => to_bytes(c.recv().await),
         }
     }
 }
@@ -213,17 +217,25 @@ impl PacketReader {
     /// Receive one datagram. `Ok(None)` on a clean end-of-stream.
     ///
     /// Cancellation-safe for every carrier: partial frame progress lives in
-    /// the reader, not in the future.
+    /// the reader, not in the future. See [`PacketTunnel::recv`] for the
+    /// `Bytes` convention.
     pub async fn recv(
         &mut self,
-    ) -> std::io::Result<Option<(Option<std::net::SocketAddr>, Vec<u8>)>> {
+    ) -> std::io::Result<Option<(Option<std::net::SocketAddr>, bytes::Bytes)>> {
         match self {
             Self::Vless(r) => r.recv().await,
             Self::Vmess(r) => r.recv().await,
-            Self::Trojan(r) => r.recv().await,
-            Self::Hysteria2(r) => r.recv().await,
+            Self::Trojan(r) => to_bytes(r.recv().await),
+            Self::Hysteria2(r) => to_bytes(r.recv().await),
         }
     }
+}
+
+/// Reuse a carrier-staged `Vec` payload as `Bytes` — no copy.
+fn to_bytes(
+    r: std::io::Result<Option<(Option<std::net::SocketAddr>, Vec<u8>)>>,
+) -> std::io::Result<Option<(Option<std::net::SocketAddr>, bytes::Bytes)>> {
+    r.map(|o| o.map(|(dest, payload)| (dest, bytes::Bytes::from(payload))))
 }
 
 impl PacketWriter {

@@ -9,6 +9,7 @@
 //! (dialer.go, client.go, config.go) — byte-identical to mihomo's xhttp
 //! client.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -36,9 +37,23 @@ const POST_INTERVAL: Duration = Duration::from_millis(30);
 /// `x_padding` length range (xray default `xPaddingBytes` 100..1000).
 const PAD_MIN: usize = 100;
 const PAD_MAX: usize = 1000;
-/// Write-side buffering cap before pushing into the upload channel (one
-/// packet-up chunk — the server 413s anything larger).
-const MAX_PENDING: usize = MAX_POST_BYTES;
+/// Static `x_padding` alphabet: 1000 `X` characters (X/Z are 8-bit HPACK
+/// huffman codes, so byte length == HPACK length — valid under every server
+/// validation path, incl. the tokenish huffman-length check). Slicing this
+/// per request replaces the per-request `"X".repeat(len)` allocation.
+static X_PAD: [u8; PAD_MAX] = [b'X'; PAD_MAX];
+
+/// Random `x_padding` value: a 100–1000 `X` slice of the static [`X_PAD`].
+fn x_padding() -> &'static str {
+    let mut buf = [0u8; 2];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .expect("ring CSPRNG fills");
+    // `PAD_MAX - PAD_MIN + 1` keeps the inclusive [100, 1000] range (xray's
+    // RangeConfig rand is inclusive).
+    let len = PAD_MIN + usize::from(u16::from_be_bytes(buf)) % (PAD_MAX - PAD_MIN + 1);
+    std::str::from_utf8(&X_PAD[..len]).expect("static pad is ASCII X")
+}
 
 /// Normalize a path to start with `/` and ensure a trailing `/` before
 /// appending session/seq (xray `appendToPath`).
@@ -54,25 +69,6 @@ fn normalize_path(path: &str) -> String {
 /// URL-safe session id (uuid v4).
 fn session_id() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-/// Random `x_padding` value: 100–1000 `X` characters (X/Z are 8-bit HPACK
-/// huffman codes, so byte length == HPACK length — valid under every server
-/// validation path, incl. the tokenish huffman-length check).
-fn x_padding() -> String {
-    let mut buf = [0u8; 2];
-    SystemRandom::new()
-        .fill(&mut buf)
-        .expect("ring CSPRNG fills");
-    // `PAD_MAX - PAD_MIN + 1` keeps the inclusive [100, 1000] range (xray's
-    // RangeConfig rand is inclusive).
-    let len = PAD_MIN + usize::from(u16::from_be_bytes(buf)) % (PAD_MAX - PAD_MIN + 1);
-    "X".repeat(len)
-}
-
-/// Referer header value: `{url}?x_padding={padding}` (xray query-in-header).
-fn referer(url: &str, padding: &str) -> String {
-    format!("{url}?x_padding={padding}")
 }
 
 /// Host for the HTTP requests: config `host` > endpoint host.
@@ -155,13 +151,20 @@ fn build_request(
     let padding = x_padding();
     // xray captures `RawURL` *before* appending session/seq, so the Referer
     // carries the base URL (`{scheme}://{host}{path}`), not the session path.
+    // One allocation for the whole value (`write!`, not chained `format!`).
     let scheme = if ctx.is_tls() { "https" } else { "http" };
-    let referer_url = format!("{scheme}://{host}{}", base_path(ctx));
+    let mut referer_value = String::with_capacity(32 + host.len() + url_path.len());
+    write!(
+        referer_value,
+        "{scheme}://{host}{}?x_padding={padding}",
+        base_path(ctx)
+    )
+    .expect("write! to String cannot fail");
     let mut builder = http::Request::builder()
         .method(method)
         .uri(url_path)
         .header(HOST, host)
-        .header("Referer", referer(&referer_url, &padding));
+        .header("Referer", referer_value);
     if let Some(headers) = ctx.transport_xhttp().and_then(|c| c.headers.as_ref()) {
         for (k, v) in headers {
             builder = builder.header(k.as_str(), v.as_str());
@@ -194,11 +197,6 @@ struct V3Response {
     status: StatusCode,
     reader: Box<dyn AsyncRead + Send + Unpin>,
 }
-
-/// One-request sender seam for the splithttp v3 protocol. Both the hyper
-/// `SendRequest`s (h1/h2) and the h3 `SendRequest` implement it, so the
-/// protocol logic (session open, GET download, POST uploads, pacing,
-/// packet-up/stream-up) is written once over this seam.
 trait V3Send {
     fn send_one(
         &mut self,
@@ -530,14 +528,11 @@ async fn send_200<S: V3Send>(
 async fn post_packet<S: V3Send>(
     sender: &mut S,
     ctx: &LinkContext,
-    session: &str,
     host: &str,
-    seq: u64,
+    url_path: &str,
     payload: Bytes,
 ) -> Result<(), NativeError> {
-    let seq_str = seq.to_string();
-    let url_path = path_with(ctx, session, Some(&seq_str));
-    let req = build_request(ctx, "POST", &url_path, host)?.map(|()| V3Body::Full(payload));
+    let req = build_request(ctx, "POST", url_path, host)?.map(|()| V3Body::Full(payload));
     let _resp = send_200(sender, req, "xhttp upload").await?;
     Ok(())
 }
@@ -557,6 +552,11 @@ async fn upload_loop_core<S: V3Send>(
     let mut chunk = BytesMut::new();
     let mut seq: u64 = 0;
     let mut last = Instant::now();
+    // The session-base path (`/x/{session}`) is built ONCE: every POST only
+    // re-appends `/{seq}` into this buffer (`clear` + `write!`, no `format!`
+    // and no `base_path` re-parse per request).
+    let session_base = path_with(ctx, session, None);
+    let mut url_path = String::with_capacity(session_base.len() + 20);
     loop {
         // Idle window: flush partial chunks on the timeout, or keep
         // accumulating until the size cap (xray `time.Sleep` before each
@@ -596,7 +596,9 @@ async fn upload_loop_core<S: V3Send>(
             last = Instant::now();
             let take = chunk.len().min(MAX_POST_BYTES);
             let payload = chunk.split_to(take).freeze();
-            if post_packet(sender, ctx, session, host, seq, payload)
+            url_path.clear();
+            write!(url_path, "{session_base}/{seq}").expect("write! to String cannot fail");
+            if post_packet(sender, ctx, host, &url_path, payload)
                 .await
                 .is_err()
             {
@@ -803,7 +805,7 @@ async fn packet_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let post_stream = crate::transport::tcp::connect(ctx, None).await?;
     let post_sender = h1_client(post_stream).await?;
 
-    let (tx, rx) = mpsc::channel::<Bytes>(4);
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
     let ctx = ctx.clone();
     let session_owned = session.clone();
     let host_owned = host.clone();
@@ -827,7 +829,7 @@ async fn packet_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let resp = send_200(&mut sender, get_req, "xhttp download GET").await?;
     let reader = resp.reader;
 
-    let (tx, rx) = mpsc::channel::<Bytes>(4);
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
     let ctx = ctx.clone();
     let session_owned = session.clone();
     let host_owned = host.clone();
@@ -848,7 +850,7 @@ async fn packet_up_h3(
     let resp = send_200(&mut sender, get_req, "xhttp h3 download GET").await?;
     let reader = resp.reader;
 
-    let (tx, rx) = mpsc::channel::<Bytes>(4);
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
     let ctx = ctx.clone();
     let session_owned = session.clone();
     let host_owned = host.clone();
@@ -871,7 +873,7 @@ async fn stream_up_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
 
     let post_stream = crate::transport::tcp::connect(ctx, None).await?;
     let mut post_sender = h1_client(post_stream).await?;
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));
     req.headers_mut().insert(
         "Content-Type",
@@ -891,7 +893,7 @@ async fn stream_up_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream,
     let resp = send_200(&mut sender, get_req, "xhttp stream-up GET").await?;
     let reader = resp.reader;
 
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));
     req.headers_mut().insert(
         "Content-Type",
@@ -914,7 +916,7 @@ async fn stream_up_h3(
     let resp = send_200(&mut sender, get_req, "xhttp h3 stream-up GET").await?;
     let reader = resp.reader;
 
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::Pipe(wrx));
     req.headers_mut().insert(
         "Content-Type",
@@ -937,7 +939,7 @@ async fn stream_one_h1(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream
     // The base path only — no session, no seq (dialer.go:454).
     let url = base_path(ctx);
     let mut sender = h1_client(stream).await?;
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
     req.headers_mut().insert(
         "Content-Type",
@@ -953,7 +955,7 @@ async fn stream_one_h2(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream
     let host = http_host(ctx);
     let url = base_path(ctx);
     let mut sender = h2_client(stream).await?;
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
     req.headers_mut().insert(
         "Content-Type",
@@ -971,7 +973,7 @@ async fn stream_one_h3(
 ) -> Result<BoxStream, NativeError> {
     let host = http_host(ctx);
     let url = base_path(ctx);
-    let (wt, wrx) = mpsc::channel::<Bytes>(4);
+    let (wt, wrx) = mpsc::channel::<Bytes>(16);
     let mut req = build_request(ctx, "POST", &url, &host)?.map(|()| V3Body::PipeFull(wrx));
     req.headers_mut().insert(
         "Content-Type",
@@ -988,17 +990,18 @@ type PendingSend = Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
 /// packet-up tunnel: read side = the GET download body; write side = a
 /// buffered channel to the upload task.
 ///
-/// The write path mirrors [`crate::transport::grpc::GrpcStream`]: accepted
-/// bytes sit in `pending` until delivered — `poll_write` never returns
-/// `WouldBlock` (the protocol write path treats it as fatal). `R` is the
-/// download reader: `IncomingReader` on the h1/h2 arms, an h3 body reader
-/// on the QUIC arm.
+/// The write path mirrors [`crate::transport::grpc::GrpcStream`]:
+/// write-through — each accepted write moves one `Bytes` into the channel
+/// (the depth-16 buffer absorbs bursts; the upload task batches the items
+/// and paces the POSTs itself). There is no staging `BytesMut`: `poll_write`
+/// never returns `WouldBlock` (the protocol write path treats it as fatal),
+/// so a full channel parks the write as an in-flight send instead. `R` is
+/// the download reader: `IncomingReader` on the h1/h2 arms, an h3 body
+/// reader on the QUIC arm.
 pub struct XhttpStream<R> {
     /// The GET download body (read side).
     reader: R,
     tx: mpsc::Sender<Bytes>,
-    /// Accepted-but-unsent bytes.
-    pending: BytesMut,
     /// An in-flight channel send (the channel was full when kicked).
     flushing: Option<PendingSend>,
 }
@@ -1009,28 +1012,7 @@ impl<R> XhttpStream<R> {
         Self {
             reader,
             tx,
-            pending: BytesMut::new(),
             flushing: None,
-        }
-    }
-
-    /// Push `pending` into the channel. Returns `false` when the uploader
-    /// has gone (channel closed) — the write side is then broken.
-    fn kick(&mut self) -> bool {
-        if self.pending.is_empty() {
-            return true;
-        }
-        let bytes = std::mem::take(&mut self.pending).freeze();
-        match self.tx.try_send(bytes) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(bytes)) => {
-                let tx = self.tx.clone();
-                self.flushing = Some(Box::pin(
-                    async move { tx.send(bytes).await.map_err(|_| ()) },
-                ));
-                true
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -1050,6 +1032,23 @@ impl<R> XhttpStream<R> {
             }
         }
         Poll::Ready(Ok(()))
+    }
+
+    /// Move `bytes` into the upload channel, parking an in-flight send when
+    /// the channel is full. Returns `false` when the uploader has gone
+    /// (channel closed) — the write side is then broken.
+    fn kick(&mut self, bytes: Bytes) -> bool {
+        match self.tx.try_send(bytes) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(bytes)) => {
+                let tx = self.tx.clone();
+                self.flushing = Some(Box::pin(
+                    async move { tx.send(bytes).await.map_err(|_| ()) },
+                ));
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 }
 
@@ -1077,42 +1076,27 @@ impl<R: AsyncRead + Unpin + Send> AsyncWrite for XhttpStream<R> {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        let take = buf
-            .len()
-            .min(MAX_PENDING.saturating_sub(self.pending.len()));
-        self.pending.extend_from_slice(&buf[..take]);
-        // Deliver on every write: `AsyncWriteExt::write_all` never calls
-        // `poll_flush`, so flush-only delivery would strand bytes (ws.rs
-        // mirrors this write-through choice). The upload task batches the
-        // channel items and paces the POSTs itself.
-        if !self.kick() {
+        // Write-through: one `Bytes` per write, delivered on every write
+        // (`AsyncWriteExt::write_all` never calls `poll_flush`, so
+        // flush-only delivery would strand bytes — ws.rs mirrors this
+        // choice). No staging buffer: the single copy into `Bytes` is the
+        // only per-write allocation.
+        if !self.kick(Bytes::copy_from_slice(buf)) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "xhttp uploader closed",
             )));
         }
-        Poll::Ready(Ok(take))
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
-        if !self.kick() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "xhttp uploader closed",
-            )));
-        }
         self.poll_flushing(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
-        // Flush the tail; dropping the stream then closes the channel (the
-        // upload task POSTs the tail and stops).
-        if !self.kick() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "xhttp uploader closed",
-            )));
-        }
+        // Nothing staged: dropping the stream closes the channel (the upload
+        // task POSTs the tail and stops).
         self.poll_flushing(cx)
     }
 }
@@ -1537,10 +1521,16 @@ mod tests {
 
     #[test]
     fn referer_appends_padding_query() {
-        assert_eq!(
-            referer("http://example.com/x/", "XXX"),
-            "http://example.com/x/?x_padding=XXX"
-        );
+        // The `referer()` helper is inlined into `build_request` (one
+        // allocation via `write!`), so the wire shape is asserted on the
+        // real path instead.
+        let ctx = ctx_at("127.0.0.1:1".parse().unwrap(), "packet-up");
+        let req = build_request(&ctx, "GET", "/x/sess", "example.com").unwrap();
+        let referer = req.headers()["referer"].to_str().unwrap();
+        let (url, pad) = referer.split_once("?x_padding=").unwrap();
+        assert_eq!(url, "http://example.com/x/");
+        assert!((100..=1000).contains(&pad.len()), "len {}", pad.len());
+        assert!(pad.bytes().all(|b| b == b'X'), "repeat-X only");
     }
 
     #[test]

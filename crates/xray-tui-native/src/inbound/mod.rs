@@ -61,10 +61,10 @@ pub struct TraceCtx {
     pub telemetry: Telemetry,
     /// Inbound leg kind stamped on every trace row.
     pub kind: TraceKind,
-    /// Outbound protocol name (`"vless"`, …).
-    pub protocol: String,
-    /// Outbound transport name (`"tcp"`, `"ws"`, …).
-    pub transport: String,
+    /// Outbound protocol name (`"vless"`, …) — shared across every leg.
+    pub protocol: Arc<str>,
+    /// Outbound transport name (`"tcp"`, `"ws"`, …) — shared across legs.
+    pub transport: Arc<str>,
     /// Outbound security layer.
     pub security: TraceSecurity,
 }
@@ -443,7 +443,7 @@ async fn traced_relay(
     tracing::info!("accepted {:?} {peer} -> {dest}", trace.kind);
     let conn_id = trace.telemetry.opened(
         trace.kind,
-        dest.clone(),
+        dest.as_str(),
         trace.protocol.clone(),
         trace.transport.clone(),
         trace.security,

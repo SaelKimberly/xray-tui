@@ -267,7 +267,7 @@ impl Drop for NativeCoreServer {
 ///
 /// Hysteria2 is a self-contained QUIC dial — no transport field; its TLS is
 /// QUIC-internal (quinn), reported as the `Tls` layer for the badge.
-fn trace_meta_of_protocol(cfg: &ProtocolConfig) -> (String, String, TraceSecurity) {
+fn trace_meta_of_protocol(cfg: &ProtocolConfig) -> (Arc<str>, Arc<str>, TraceSecurity) {
     let (name, transport, security) = match cfg {
         ProtocolConfig::Vless(c) => ("vless", Some(&c.transport), &c.security),
         ProtocolConfig::Vmess(c) => ("vmess", Some(&c.transport), &c.security),
@@ -290,7 +290,7 @@ fn trace_meta_of_protocol(cfg: &ProtocolConfig) -> (String, String, TraceSecurit
         Some(TlsConfig::Tls(_)) => TraceSecurity::Tls,
         Some(TlsConfig::Reality(_)) => TraceSecurity::Reality,
     };
-    (name.to_owned(), transport.to_owned(), security)
+    (name.into(), transport.into(), security)
 }
 
 #[cfg(test)]
@@ -318,8 +318,8 @@ mod tests {
             remarks: None,
         });
         let (name, transport, security) = trace_meta_of_protocol(&cfg);
-        assert_eq!(name, "vless");
-        assert_eq!(transport, "tcp");
+        assert_eq!(&name[..], "vless");
+        assert_eq!(&transport[..], "tcp");
         assert_eq!(security, TraceSecurity::Plain);
     }
 
@@ -337,8 +337,8 @@ mod tests {
             remarks: None,
         });
         let (name, transport, security) = trace_meta_of_protocol(&cfg);
-        assert_eq!(name, "hysteria2");
-        assert_eq!(transport, "quic");
+        assert_eq!(&name[..], "hysteria2");
+        assert_eq!(&transport[..], "quic");
         assert_eq!(security, TraceSecurity::Plain);
     }
 
@@ -352,8 +352,8 @@ mod tests {
             remarks: None,
         });
         let (name, transport, _) = trace_meta_of_protocol(&cfg);
-        assert_eq!(name, "trojan");
-        assert_eq!(transport, "tcp");
+        assert_eq!(&name[..], "trojan");
+        assert_eq!(&transport[..], "tcp");
     }
 
     /// A server config for teardown tests: the proxy outbound's protocol

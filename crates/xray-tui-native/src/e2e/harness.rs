@@ -718,7 +718,7 @@ async fn udp_exchange(
     while received < UDP_PROBE_COUNT && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline, conn.recv()).await {
             Ok(Ok(Some((_, payload)))) => {
-                let payload = payload.as_slice();
+                let payload = &payload[..];
                 if let Some(i) = UDP_PROBE_PAYLOADS.iter().position(|p| *p == payload)
                     && !seen[i]
                 {

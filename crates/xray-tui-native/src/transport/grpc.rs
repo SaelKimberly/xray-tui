@@ -2,11 +2,12 @@
 //! Single bidirectional stream (gun mode); 5-byte gRPC prefix framing per
 //! the xray-core/sing-box wire format.
 
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context as TaskCx, Poll};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use h2::RecvStream;
 use h2::SendStream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -39,42 +40,45 @@ fn grpc_path(cfg: &GrpcConfig, service: &str) -> String {
 /// `0x00 | BE32(hunk_len) | 0x0A | varint(data_len) | data`.
 /// (Verified: xray-core's `HunkConn.Recv` unmarshals the payload as Hunk —
 /// raw bytes fail with "cannot parse invalid wire-format data".
-fn varint_len(mut n: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2);
+/// Encode `n` as a base-128 varint into a stack buffer. Returns the bytes
+/// and their length — no heap allocation on the encode path.
+fn encode_varint_stack(mut n: usize) -> ([u8; 8], usize) {
+    let mut out = [0u8; 8];
+    let mut len = 0;
     loop {
         let mut b = u8::try_from(n & 0x7f).unwrap_or(0x7f);
         n >>= 7;
         if n != 0 {
             b |= 0x80;
         }
-        out.push(b);
+        out[len] = b;
+        len += 1;
         if n == 0 {
-            return out;
+            return (out, len);
         }
     }
 }
 
 /// Encode one VLESS byte chunk as a gRPC Hunk message. Pure, unit-tested.
 #[must_use]
-pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let hunk = {
-        let mut h = Vec::with_capacity(1 + 2 + payload.len());
-        h.push(0x0A); // field 1, wire type 2 (length-delimited)
-        h.extend_from_slice(&varint_len(payload.len()));
-        h.extend_from_slice(payload);
-        h
-    };
-    let mut out = Vec::with_capacity(5 + hunk.len());
-    out.push(0);
-    out.extend_from_slice(&u32::try_from(hunk.len()).unwrap_or(u32::MAX).to_be_bytes());
-    out.extend_from_slice(&hunk);
-    out
+pub fn encode_frame(payload: &[u8]) -> Bytes {
+    let (varint, varint_len) = encode_varint_stack(payload.len());
+    let hunk_len = 1 + varint_len + payload.len();
+    let mut hunk_header_stack = [0u8; 9];
+    hunk_header_stack[0] = 0x0A; // field 1, wire type 2 (length-delimited)
+    hunk_header_stack[1..1 + varint_len].copy_from_slice(&varint[..varint_len]);
+    let mut out = bytes::BytesMut::with_capacity(5 + 2 + payload.len());
+    out.extend_from_slice(&[0u8]);
+    out.extend_from_slice(&u32::try_from(hunk_len).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(&hunk_header_stack[..1 + varint_len]);
+    out.extend_from_slice(payload);
+    out.freeze()
 }
 
 /// Decode ONE gRPC Hunk message from the front of `buf`, consuming only
 /// complete messages. Returns `None` when fewer than a full message is
 /// available (partial prefix/payload stays in `buf`).
-pub fn decode_frame(buf: &mut BytesMut) -> Option<Vec<u8>> {
+pub fn decode_frame(buf: &mut BytesMut) -> Option<Bytes> {
     if buf.len() < 5 {
         return None;
     }
@@ -82,7 +86,7 @@ pub fn decode_frame(buf: &mut BytesMut) -> Option<Vec<u8>> {
     if buf.len() < 5 + len {
         return None;
     }
-    let msg = buf.split_to(5 + len);
+    let msg = buf.split_to(5 + len).freeze();
     let hunk = &msg[5..];
     // Hunk: 0x0A tag, then varint data length, then data.
     let tag = *hunk.first()?;
@@ -93,7 +97,7 @@ pub fn decode_frame(buf: &mut BytesMut) -> Option<Vec<u8>> {
     if 1 + dstart + dlen > hunk.len() {
         return None;
     }
-    Some(hunk[1 + dstart..1 + dstart + dlen].to_vec())
+    Some(msg.slice(5 + 1 + dstart..5 + 1 + dstart + dlen))
 }
 
 /// Decode a base-128 varint starting at `start`; returns (value, bytes).
@@ -189,7 +193,9 @@ pub struct GrpcStream {
     recv: Option<RecvStream>,
     response: Option<tokio::sync::oneshot::Receiver<Result<RecvStream, NativeError>>>,
     read_buf: BytesMut,
-    payload: BytesMut,
+    /// Decoded Hunk payloads awaiting the app: `decode_frame` slices the
+    /// frozen staging buffer, so queueing moves `Bytes` — no `to_vec`.
+    queued: VecDeque<Bytes>,
 }
 
 impl GrpcStream {
@@ -205,7 +211,7 @@ impl GrpcStream {
             recv: None,
             response: Some(response),
             read_buf: BytesMut::new(),
-            payload: BytesMut::new(),
+            queued: VecDeque::new(),
         }
     }
 }
@@ -217,13 +223,17 @@ impl AsyncRead for GrpcStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            if !self.payload.is_empty() {
-                let n = std::cmp::min(self.payload.len(), buf.remaining());
-                buf.put_slice(&self.payload.split_to(n));
+            if let Some(front) = self.queued.front_mut() {
+                let n = std::cmp::min(front.len(), buf.remaining());
+                buf.put_slice(&front[..n]);
+                front.advance(n);
+                if front.is_empty() {
+                    self.queued.pop_front();
+                }
                 return Poll::Ready(Ok(()));
             }
             if let Some(msg) = decode_frame(&mut self.read_buf) {
-                self.payload.extend_from_slice(&msg);
+                self.queued.push_back(msg);
                 continue;
             }
             if self.recv.is_none() {
@@ -310,7 +320,7 @@ impl AsyncWrite for GrpcStream {
             }
             Poll::Pending => return Poll::Pending,
         }
-        if let Err(e) = self.send.send_data(Bytes::from(framed), false) {
+        if let Err(e) = self.send.send_data(framed, false) {
             return Poll::Ready(Err(io::Error::other(e)));
         }
         Poll::Ready(Ok(take))
@@ -352,9 +362,9 @@ mod tests {
         let framed = encode_frame(&payload);
         // gRPC prefix (flag 0 + BE hunk byte-len) + Hunk protobuf:
         // tag 0x0A + varint(data_len) + data.
-        // `varint_len(n)` returns the varint BYTES, so its len() is the
-        // encoded width.
-        let hunk_len = 1 + varint_len(payload.len()).len() + payload.len();
+        // `encode_varint_stack(n)` returns the varint BYTES, so the second
+        // tuple element is the encoded width.
+        let hunk_len = 1 + encode_varint_stack(payload.len()).1 + payload.len();
         #[allow(
             clippy::cast_possible_truncation,
             reason = "gRPC frame-prefix bytes are u8 by wire spec; rstest clears fn-level attrs from the retained source fn, so the allow must be statement-level"
@@ -363,7 +373,7 @@ mod tests {
         assert_eq!(&framed[..5], &prefix);
         assert_eq!(framed[5], 0x0A);
         let mut buf = BytesMut::from(&framed[..]);
-        assert_eq!(decode_frame(&mut buf), Some(payload));
+        assert_eq!(decode_frame(&mut buf), Some(Bytes::from(payload)));
         assert!(buf.is_empty());
     }
 
@@ -380,7 +390,7 @@ mod tests {
         buf.extend_from_slice(&framed[..split]);
         assert_eq!(decode_frame(&mut buf), None); // partial frame
         buf.extend_from_slice(&framed[split..]);
-        assert_eq!(decode_frame(&mut buf), Some(payload));
+        assert_eq!(decode_frame(&mut buf), Some(Bytes::from(payload)));
     }
 
     #[test]
@@ -388,8 +398,8 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&encode_frame(b"one"));
         buf.extend_from_slice(&encode_frame(b"two"));
-        assert_eq!(decode_frame(&mut buf), Some(b"one".to_vec()));
-        assert_eq!(decode_frame(&mut buf), Some(b"two".to_vec()));
+        assert_eq!(decode_frame(&mut buf), Some(Bytes::from_static(b"one")));
+        assert_eq!(decode_frame(&mut buf), Some(Bytes::from_static(b"two")));
         assert!(buf.is_empty());
     }
 

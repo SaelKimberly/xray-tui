@@ -1003,9 +1003,9 @@ mod tests {
         TraceEvent::Opened(TraceOpened {
             conn_id,
             kind: TraceKind::Tcp,
-            dest: format!("h{conn_id}.example:443"),
-            protocol: "vless".to_string(),
-            transport: "tcp".to_string(),
+            dest: format!("h{conn_id}.example:443").into(),
+            protocol: "vless".into(),
+            transport: "tcp".into(),
             security: TraceSecurity::Tls,
         })
     }

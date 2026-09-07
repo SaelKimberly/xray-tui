@@ -7,9 +7,14 @@
 //! boundary is `Ok(None)`, and a truncated frame (partial length or short
 //! payload) is an `UnexpectedEof` error (spec §5.1/§6).
 
+use std::future::poll_fn;
 use std::io;
+use std::io::IoSlice;
+use std::pin::Pin;
+use std::task::Poll;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 /// Resumable `[2B BE len][payload]` frame-read state.
 ///
@@ -26,20 +31,21 @@ pub struct FrameReader {
     len: [u8; 2],
     /// Length-prefix bytes already read; 2 once the length is complete.
     len_filled: usize,
-    /// The current frame's payload: empty between frames, sized to the
-    /// length prefix once that is known.
-    payload: Vec<u8>,
+    /// The current frame's payload staging: a per-connection `BytesMut`
+    /// scratch buffer, `resize`d (never a fresh `vec!`) to the length prefix
+    /// once that is known. Empty between frames.
+    payload: BytesMut,
     /// Payload bytes already read.
     payload_filled: usize,
 }
 
 impl FrameReader {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             len: [0; 2],
             len_filled: 0,
-            payload: Vec::new(),
+            payload: BytesMut::new(),
             payload_filled: 0,
         }
     }
@@ -54,7 +60,7 @@ impl FrameReader {
     pub async fn read_frame<R: AsyncRead + Unpin>(
         &mut self,
         r: &mut R,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> io::Result<Option<Bytes>> {
         loop {
             // Read the length byte-by-byte so a clean EOF (0 bytes) is
             // distinguishable from a truncated length (1 byte then EOF).
@@ -76,8 +82,10 @@ impl FrameReader {
                 self.len_filled = 0;
                 continue; // skip empty frames
             }
-            if self.payload.is_empty() {
-                self.payload = vec![0u8; n];
+            // Reuse the scratch across frames: grow once, never a fresh
+            // `vec!` per datagram. `resize` keeps the existing allocation.
+            if self.payload.len() != n {
+                self.payload.resize(n, 0);
             }
             while self.payload_filled < n {
                 let got = r.read(&mut self.payload[self.payload_filled..]).await?;
@@ -91,7 +99,7 @@ impl FrameReader {
             }
             self.len_filled = 0;
             self.payload_filled = 0;
-            return Ok(Some(std::mem::take(&mut self.payload)));
+            return Ok(Some(self.payload.split_to(n).freeze()));
         }
     }
 }
@@ -113,16 +121,10 @@ impl Default for FrameReader {
 /// for the length). Empty frames (len 0) are skipped. A truncated frame —
 /// a partial length byte or a short payload at EOF — is `UnexpectedEof`.
 #[cfg(test)]
-pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
+pub async fn read_packet<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Bytes>> {
     FrameReader::new().read_frame(r).await
 }
 
-/// Writes one `[2B BE len][payload]` frame.
-///
-/// The payload must fit a u16 length (<= 65535); the caller (the
-/// `PacketConn`) rejects larger datagrams before reaching the codec, and
-/// the codec itself returns `InvalidInput` rather than panicking — an
-/// oversized datagram is a client error, never a crash (spec §6).
 pub async fn write_packet<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     let n = u16::try_from(payload.len()).map_err(|_| {
         io::Error::new(
@@ -130,10 +132,58 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> i
             "vless udp datagram exceeds the 2-byte frame length (65535)",
         )
     })?;
-    let mut frame = Vec::with_capacity(payload.len() + 2);
-    frame.extend_from_slice(&n.to_be_bytes());
-    frame.extend_from_slice(payload);
-    w.write_all(&frame).await
+    // No frame `Vec`: the stack length prefix and the payload go out as one
+    // vectored write.
+    let prefix = n.to_be_bytes();
+    write_all_vectored(w, &[&prefix, payload]).await
+}
+
+/// Write all of `bufs` out as vectored writes — no combined frame `Vec`.
+/// Shared by [`write_packet`] (prefix + payload) and the packetaddr sender
+/// (prefix + address header + payload).
+pub(crate) async fn write_all_vectored<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    bufs: &[&[u8]],
+) -> io::Result<()> {
+    let mut offs = [0usize; 4];
+    debug_assert!(bufs.len() <= offs.len(), "vectored write takes <= 4 parts");
+    let total: usize = bufs.iter().map(|b| b.len()).sum();
+    let mut done = 0usize;
+    poll_fn(|cx| {
+        let slices = [
+            IoSlice::new(&bufs[0][offs[0].min(bufs[0].len())..]),
+            IoSlice::new(bufs.get(1).map_or(&[][..], |b| &b[offs[1].min(b.len())..])),
+            IoSlice::new(bufs.get(2).map_or(&[][..], |b| &b[offs[2].min(b.len())..])),
+            IoSlice::new(bufs.get(3).map_or(&[][..], |b| &b[offs[3].min(b.len())..])),
+        ];
+        let n = match Pin::new(&mut *w).poll_write_vectored(cx, &slices[..bufs.len()]) {
+            Poll::Ready(Ok(n)) => n,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        };
+        if n == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "vless udp frame write returned 0",
+            )));
+        }
+        let mut left = n;
+        for (i, b) in bufs.iter().enumerate() {
+            let rem = b.len() - offs[i].min(b.len());
+            let take = left.min(rem);
+            offs[i] += take;
+            left -= take;
+        }
+        done += n;
+        if done >= total {
+            Poll::Ready(Ok(()))
+        } else {
+            // Partial vectored write: re-poll for the remainder.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -159,7 +209,10 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         write_packet(&mut a, b"hello").await.unwrap();
         drop(a);
-        assert_eq!(read_packet(&mut b).await.unwrap().unwrap(), b"hello");
+        assert_eq!(
+            read_packet(&mut b).await.unwrap().unwrap(),
+            Bytes::from_static(b"hello")
+        );
     }
 
     #[tokio::test]
@@ -199,7 +252,10 @@ mod tests {
         tokio::task::yield_now().await;
         a.write_all(&[0xBB, 0xCC, 0xDD]).await.unwrap();
         drop(a);
-        assert_eq!(reader.await.unwrap(), [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            reader.await.unwrap(),
+            Bytes::from_static(&[0xAA, 0xBB, 0xCC, 0xDD])
+        );
     }
 
     #[tokio::test]
@@ -218,7 +274,10 @@ mod tests {
             .await
             .unwrap();
         drop(a);
-        assert_eq!(read_packet(&mut b).await.unwrap().unwrap(), b"hi");
+        assert_eq!(
+            read_packet(&mut b).await.unwrap().unwrap(),
+            Bytes::from_static(b"hi")
+        );
     }
 
     #[tokio::test]
@@ -512,7 +571,7 @@ mod tests {
         .await
         .expect("hermetic udp flow timed out");
         assert_eq!(dest, None, "raw mode: no per-packet destination");
-        assert_eq!(payload, b"world", "client delivers the server frame");
+        assert_eq!(&payload[..], b"world", "client delivers the server frame");
         server.await.expect("fake udp server task failed");
     }
 
@@ -589,7 +648,7 @@ mod tests {
             Some("[::1]:53".parse().unwrap()),
             "per-packet dest decoded"
         );
-        assert_eq!(payload, b"ok", "client delivers the packetaddr frame");
+        assert_eq!(&payload[..], b"ok", "client delivers the packetaddr frame");
         server.await.expect("fake udp server task failed");
     }
 }

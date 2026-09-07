@@ -1017,8 +1017,8 @@ async fn relayed_leg_emits_trace_events_and_traffic() {
     config.trace = Some(TraceCtx {
         telemetry: telemetry.clone(),
         kind: TraceKind::Tcp,
-        protocol: "direct".to_owned(),
-        transport: "-".to_owned(),
+        protocol: "direct".into(),
+        transport: "-".into(),
         security: TraceSecurity::Plain,
     });
     let (addr, handle) = spawn_inbound(config).await;
@@ -1038,7 +1038,7 @@ async fn relayed_leg_emits_trace_events_and_traffic() {
     let opened = match events.recv().await.expect("event") {
         NativeEvent::Trace(TraceEvent::Opened(o)) => {
             assert_eq!(o.kind, TraceKind::Tcp);
-            assert_eq!(o.protocol, "direct");
+            assert_eq!(&o.protocol[..], "direct");
             assert!(o.dest.contains(&dest.port().to_string()));
             o.conn_id
         }
@@ -1108,8 +1108,8 @@ async fn shutdown_during_a_live_leg_emits_closed() {
     config.trace = Some(TraceCtx {
         telemetry: telemetry.clone(),
         kind: TraceKind::Tcp,
-        protocol: "direct".to_owned(),
-        transport: "-".to_owned(),
+        protocol: "direct".into(),
+        transport: "-".into(),
         security: TraceSecurity::Plain,
     });
     config.shutdown = Some(shutdown_rx);

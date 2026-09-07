@@ -27,8 +27,9 @@ use crate::types::CoreEvent;
 const STATS_INTERVAL_SECS: u64 = 3;
 /// Sys stats every Nth tick (~9 s, same as the xray poller).
 const SYS_EVERY_TICKS: u8 = 3;
-/// Telemetry channel depth: deltas + per-connection events with headroom.
-const TELEMETRY_CAP: usize = 1024;
+/// Telemetry channel depth (memory-diet Task 2): 16 events per queue — drops
+/// are counted, never blocking, so depth is backpressure policy, not safety.
+const TELEMETRY_CAP: usize = 16;
 
 /// Run the native server for one connected profile; returns after the stop
 /// signal (or a fatal error), having emitted `Disconnected`.

@@ -664,7 +664,7 @@ mod tests {
         peer.write_all(&[0x00, 0x02, b'o', b'k']).await.unwrap();
         let (dest, payload) = conn.recv().await.unwrap().unwrap();
         assert_eq!(dest, None);
-        assert_eq!(payload, b"ok");
+        assert_eq!(&payload[..], b"ok");
     }
 
     #[tokio::test]

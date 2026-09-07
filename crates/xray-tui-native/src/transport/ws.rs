@@ -2,11 +2,12 @@
 //! established stream — the engine TLS/REALITY session or raw TCP. The
 //! transport never owns TLS; it consumes `AsyncRead + AsyncWrite`.
 
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context as TaskCx, Poll};
 
-use bytes::BytesMut;
+use bytes::{Buf, Bytes};
 use futures_core::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -81,7 +82,10 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
 /// tungstenite); Close/EOF surfaces as `UnexpectedEof`.
 pub struct WsStream {
     inner: WebSocketStream<BoxStream>,
-    read_buf: BytesMut,
+    /// Decoded Binary payloads awaiting the app: queued as `Bytes` chunks
+    /// (zero-copy from tungstenite) and sliced on drain — no staging
+    /// `BytesMut` copy per message.
+    queued: VecDeque<Bytes>,
 }
 
 impl WsStream {
@@ -89,9 +93,24 @@ impl WsStream {
     pub fn new(inner: WebSocketStream<BoxStream>) -> Self {
         Self {
             inner,
-            read_buf: BytesMut::new(),
+            queued: VecDeque::new(),
         }
     }
+}
+
+/// Drain the front queued chunk into `buf`. Returns `true` when bytes were
+/// delivered (the caller reports `Ready`).
+fn drain_front(queued: &mut VecDeque<Bytes>, buf: &mut ReadBuf<'_>) -> bool {
+    let Some(front) = queued.front_mut() else {
+        return false;
+    };
+    let n = std::cmp::min(front.len(), buf.remaining());
+    buf.put_slice(&front[..n]);
+    front.advance(n);
+    if front.is_empty() {
+        queued.pop_front();
+    }
+    true
 }
 
 impl AsyncRead for WsStream {
@@ -101,14 +120,14 @@ impl AsyncRead for WsStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            if !self.read_buf.is_empty() {
-                let n = std::cmp::min(self.read_buf.len(), buf.remaining());
-                buf.put_slice(&self.read_buf.split_to(n));
+            if drain_front(&mut self.queued, buf) {
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(Message::Binary(b)))) => {
-                    self.read_buf.extend_from_slice(&b);
+                    if !b.is_empty() {
+                        self.queued.push_back(b);
+                    }
                 }
                 Poll::Ready(Some(Ok(Message::Close(_))) | None) => {
                     // Clean WS close: report EOF so `read_to_end` completes.
@@ -138,7 +157,9 @@ impl AsyncWrite for WsStream {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(Ok(())) => {}
         }
-        let msg = Message::Binary(buf.to_vec().into());
+        // `Bytes::copy_from_slice` moves one copy straight into the frame
+        // payload — no intermediate `Vec` allocation on the forward path.
+        let msg = Message::Binary(Bytes::copy_from_slice(buf));
         if let Err(e) = Pin::new(&mut self.inner).start_send(msg) {
             return Poll::Ready(Err(io::Error::other(e)));
         }

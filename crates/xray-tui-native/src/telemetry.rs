@@ -67,6 +67,10 @@ pub enum TraceSecurity {
 }
 
 /// A connection started: emitted once per accepted inbound leg.
+///
+/// `dest`/`protocol`/`transport` are `Arc<str>`: the profile-level names are
+/// shared across every leg of the session (one allocation per profile, not
+/// per connection), and only the per-connection `dest` string allocates.
 #[derive(Debug, Clone)]
 pub struct TraceOpened {
     /// Id assigned by [`Telemetry::opened`]; match with [`TraceClosed`].
@@ -74,16 +78,14 @@ pub struct TraceOpened {
     /// Which inbound leg this is.
     pub kind: TraceKind,
     /// Destination as `host:port`.
-    pub dest: String,
+    pub dest: Arc<str>,
     /// Outbound protocol name (e.g. `"vless"`).
-    pub protocol: String,
+    pub protocol: Arc<str>,
     /// Outbound transport name (e.g. `"tcp"`, `"ws"`).
-    pub transport: String,
+    pub transport: Arc<str>,
     /// Outbound security layer.
     pub security: TraceSecurity,
 }
-
-/// A connection finished: emitted once per closed leg.
 #[derive(Debug, Clone)]
 pub struct TraceClosed {
     /// Id from the matching [`TraceOpened`].
@@ -192,9 +194,9 @@ impl Telemetry {
     pub fn opened(
         &self,
         kind: TraceKind,
-        dest: impl Into<String>,
-        protocol: impl Into<String>,
-        transport: impl Into<String>,
+        dest: impl Into<Arc<str>>,
+        protocol: impl Into<Arc<str>>,
+        transport: impl Into<Arc<str>>,
         security: TraceSecurity,
     ) -> u64 {
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
@@ -584,9 +586,9 @@ mod tests {
                 NativeEvent::Trace(TraceEvent::Opened(o)) => {
                     assert_eq!(o.conn_id, conn_id);
                     assert_eq!(o.kind, TraceKind::Tcp);
-                    assert_eq!(o.dest, "example.com:443");
-                    assert_eq!(o.protocol, "vless");
-                    assert_eq!(o.transport, "tcp");
+                    assert_eq!(&o.dest[..], "example.com:443");
+                    assert_eq!(&o.protocol[..], "vless");
+                    assert_eq!(&o.transport[..], "tcp");
                     assert_eq!(o.security, TraceSecurity::Tls);
                     kinds.push("opened");
                 }

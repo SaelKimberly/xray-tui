@@ -773,8 +773,8 @@ mod tests {
         config.trace = Some(super::TraceCtx {
             telemetry: telemetry.clone(),
             kind: TraceKind::Http,
-            protocol: "direct".to_owned(),
-            transport: "-".to_owned(),
+            protocol: "direct".into(),
+            transport: "-".into(),
             security: TraceSecurity::Plain,
         });
         let (addr, handle) = spawn_inbound(config).await;
