@@ -199,15 +199,25 @@ pub fn verify_certificate_verify_signature(
             signature.len()
         )));
     }
-    let mut signed_content = Vec::with_capacity(64 + 34 + transcript_hash.len());
-    signed_content.extend_from_slice(&[0x20u8; 64]);
-    signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-    signed_content.push(0x00);
-    signed_content.extend_from_slice(transcript_hash);
+    // Stack-signed content: `64 spaces || "TLS 1.3, server CertificateVerify"
+    // || 0x00 || transcript_hash`. Sized to 64 + 33 + 1 + 48 so every suite
+    // fits (SHA-384's 48-byte hash is the max); the brief's 145 would
+    // truncate it, so this uses 146.
+    let mut signed_content = [0u8; 64 + 33 + 1 + 48];
+    signed_content[..64].copy_from_slice(&[0x20u8; 64]);
+    signed_content[64..64 + 33].copy_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed_content[64 + 33] = 0x00;
+    if transcript_hash.len() > 48 {
+        return Err(TlsError::Verify(
+            "transcript hash exceeds SHA-384 length".into(),
+        ));
+    }
+    let content_len = 64 + 33 + 1 + transcript_hash.len();
+    signed_content[64 + 33 + 1..content_len].copy_from_slice(transcript_hash);
 
     let public_key = signature::UnparsedPublicKey::new(&signature::ED25519, public_key);
     public_key
-        .verify(&signed_content, signature)
+        .verify(&signed_content[..content_len], signature)
         .map_err(|_| TlsError::Verify("CertificateVerify signature verification failed".into()))
 }
 
@@ -354,6 +364,17 @@ mod tests {
         message
     }
 
+    /// Builds the RFC 8446 §4.4.3 signed content over a 32-byte transcript
+    /// hash on the stack (test fixture signer).
+    fn signed_fixture(transcript_hash: &[u8; 32]) -> [u8; 64 + 33 + 1 + 32] {
+        let mut out = [0u8; 64 + 33 + 1 + 32];
+        out[..64].copy_from_slice(&[0x20u8; 64]);
+        out[64..64 + 33].copy_from_slice(b"TLS 1.3, server CertificateVerify");
+        out[64 + 33] = 0x00;
+        out[64 + 33 + 1..].copy_from_slice(transcript_hash);
+        out
+    }
+
     /// A self-signed Ed25519 certificate (rcgen) and its signing key pair.
     fn ed25519_cert() -> (Vec<u8>, Ed25519KeyPair) {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
@@ -462,11 +483,7 @@ mod tests {
         let public_key: [u8; 32] = key_pair.public_key().as_ref().try_into().unwrap();
         let transcript_hash = [0x42; 32];
 
-        let mut signed_content = Vec::new();
-        signed_content.extend_from_slice(&[0x20u8; 64]);
-        signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed_content.push(0x00);
-        signed_content.extend_from_slice(&transcript_hash);
+        let signed_content = signed_fixture(&transcript_hash);
         let signature = key_pair.sign(&signed_content);
 
         verify_certificate_verify_signature(&public_key, signature.as_ref(), &transcript_hash)
@@ -480,11 +497,7 @@ mod tests {
         let public_key2: [u8; 32] = key_pair2.public_key().as_ref().try_into().unwrap();
         let transcript_hash = [0x42; 32];
 
-        let mut signed_content = Vec::new();
-        signed_content.extend_from_slice(&[0x20u8; 64]);
-        signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed_content.push(0x00);
-        signed_content.extend_from_slice(&transcript_hash);
+        let signed_content = signed_fixture(&transcript_hash);
         let signature = key_pair1.sign(&signed_content);
 
         assert!(
@@ -499,11 +512,7 @@ mod tests {
         let public_key: [u8; 32] = key_pair.public_key().as_ref().try_into().unwrap();
         let transcript_hash1 = [0x42; 32];
 
-        let mut signed_content = Vec::new();
-        signed_content.extend_from_slice(&[0x20u8; 64]);
-        signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed_content.push(0x00);
-        signed_content.extend_from_slice(&transcript_hash1);
+        let signed_content = signed_fixture(&transcript_hash1);
         let signature = key_pair.sign(&signed_content);
 
         assert!(
@@ -537,11 +546,8 @@ mod tests {
         // A transcript and the CertificateVerify message over it.
         let transcript = b"ClientHello..Certificate bytes";
         let transcript_hash = digest::digest(&digest::SHA256, transcript);
-        let mut signed_content = Vec::new();
-        signed_content.extend_from_slice(&[0x20u8; 64]);
-        signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed_content.push(0x00);
-        signed_content.extend_from_slice(transcript_hash.as_ref());
+        let th: [u8; 32] = transcript_hash.as_ref().try_into().unwrap();
+        let signed_content = signed_fixture(&th);
         let signature = signing_key.sign(&signed_content);
         let mut cv = vec![0x0f, 0x00, 0x00, 0x44, 0x08, 0x07, 0x00, 0x40];
         cv.extend_from_slice(signature.as_ref());

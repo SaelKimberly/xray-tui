@@ -359,6 +359,17 @@ mod tests {
     use crate::http2;
     use parking_lot::Mutex;
 
+    /// Builds the RFC 8446 §4.4.3 signed content over a 32-byte transcript
+    /// hash on the stack (test fixture signer).
+    fn signed_content_fixture(transcript_hash: &[u8; 32]) -> [u8; 64 + 33 + 1 + 32] {
+        let mut out = [0u8; 64 + 33 + 1 + 32];
+        out[..64].copy_from_slice(&[0x20u8; 64]);
+        out[64..64 + 33].copy_from_slice(b"TLS 1.3, server CertificateVerify");
+        out[64 + 33] = 0x00;
+        out[64 + 33 + 1..].copy_from_slice(transcript_hash);
+        out
+    }
+
     /// The Chrome-133 provisioner lays out a valid `ClientHello` with a
     /// 32-byte zeroed `AuthPayload` slot at the reported range.
     #[test]
@@ -716,7 +727,7 @@ mod tests {
         use crate::handshake::make_hs_msg;
         use crate::record::{
             CONTENT_APPLICATION_DATA, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
-            HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, aead_aad, make_app_data_record,
+            HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, aead_aad,
         };
         use ring::hmac;
         use ring::signature::{Ed25519KeyPair, KeyPair as _};
@@ -814,8 +825,9 @@ mod tests {
             sk.add_transcript(&ch);
             sk.add_transcript(&sh_msg);
             let hs_secret = sk.handshake_secret(&combined).unwrap();
-            let (_client_hs_ts, server_hs_ts) = sk.handshake_traffic_secrets(&hs_secret).unwrap();
-            let server_hs_key = AeadKey::new(suite, &server_hs_ts).unwrap();
+            let (_client_hs_ts, server_hs_ts) =
+                sk.handshake_traffic_secrets(&hs_secret[..32]).unwrap();
+            let server_hs_key = AeadKey::new(suite, &server_hs_ts[..32]).unwrap();
 
             // A REAL Ed25519 certificate stamped with the REALITY HMAC.
             let rcgen_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -849,11 +861,8 @@ mod tests {
             transcript.extend_from_slice(&ee_msg);
             transcript.extend_from_slice(&cert_msg);
             let transcript_hash = ring::digest::digest(&ring::digest::SHA256, &transcript);
-            let mut signed_content = Vec::new();
-            signed_content.extend_from_slice(&[0x20u8; 64]);
-            signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-            signed_content.push(0x00);
-            signed_content.extend_from_slice(transcript_hash.as_ref());
+            let th: [u8; 32] = transcript_hash.as_ref().try_into().unwrap();
+            let signed_content = signed_content_fixture(&th);
             let cv_sig = signing_key.sign(&signed_content);
             let mut cv_body = Vec::new();
             cv_body.extend_from_slice(&0x0807u16.to_be_bytes());
@@ -864,25 +873,33 @@ mod tests {
             sk.add_transcript(&ee_msg);
             sk.add_transcript(&cert_msg);
             sk.add_transcript(&cv_msg);
-            let sf_key = sk.finished_key(&server_hs_ts).unwrap();
-            let sf_wire = make_hs_msg(HS_FINISHED, &sk.finished_mac(&sf_key));
-            let mut flight = Vec::new();
-            flight.extend_from_slice(&ee_msg);
-            flight.extend_from_slice(&cert_msg);
-            flight.extend_from_slice(&cv_msg);
-            flight.extend_from_slice(&sf_wire);
+            let sf_key = sk.finished_key(&server_hs_ts[..32]).unwrap();
+            let sf_wire = make_hs_msg(HS_FINISHED, &sk.finished_mac(&sf_key[..32]));
+            // Frame the encrypted flight in place: the record header goes
+            // first, then the flight plaintext, then `seal_in_place` turns
+            // the tail into ciphertext — one copy of the flight, no
+            // allocating twin, no `make_app_data_record` re-copy.
+            let mut flight_rec = Vec::with_capacity(
+                5 + ee_msg.len() + cert_msg.len() + cv_msg.len() + sf_wire.len() + 1 + AEAD_TAG_LEN,
+            );
+            flight_rec.extend_from_slice(&[0x17, 0x03, 0x03, 0, 0]);
+            flight_rec.extend_from_slice(&ee_msg);
+            flight_rec.extend_from_slice(&cert_msg);
+            flight_rec.extend_from_slice(&cv_msg);
+            flight_rec.extend_from_slice(&sf_wire);
             // The inner content type rides inside the AEAD plaintext
             // (RFC 8446 §5.2) — the record layer reads it from the last
             // plaintext byte.
-            flight.push(crate::record::CONTENT_HANDSHAKE);
+            flight_rec.push(crate::record::CONTENT_HANDSHAKE);
             sk.add_transcript(&sf_wire);
-            let inner_ct = server_hs_key
-                .seal(0, &aead_aad(flight.len() + AEAD_TAG_LEN), &flight)
+            let ct_len = flight_rec.len() - 5 + AEAD_TAG_LEN;
+            let flight_aad = aead_aad(ct_len);
+            flight_rec[3] = (ct_len >> 8) as u8;
+            flight_rec[4] = ct_len as u8;
+            server_hs_key
+                .seal_in_place(0, &flight_aad, &mut flight_rec, 5)
                 .unwrap();
-            server_side
-                .write_all(&make_app_data_record(&inner_ct))
-                .await
-                .unwrap();
+            server_side.write_all(&flight_rec).await.unwrap();
 
             // Client Finished record — skip.
             let mut fin_hdr = [0u8; 5];
@@ -891,29 +908,33 @@ mod tests {
             server_side.read_exact(&mut fin).await.unwrap();
 
             // App traffic secrets; decrypt and echo the client's ping.
-            let master = sk.master_secret(&hs_secret).unwrap();
-            let (client_app_ts, server_app_ts) = sk.app_traffic_secrets(&master).unwrap();
-            let client_app_key = AeadKey::new(suite, &client_app_ts).unwrap();
-            let server_app_key = AeadKey::new(suite, &server_app_ts).unwrap();
+            let master = sk.master_secret(&hs_secret[..32]).unwrap();
+            let (client_app_ts, server_app_ts) = sk.app_traffic_secrets(&master[..32]).unwrap();
+            let client_app_key = AeadKey::new(suite, &client_app_ts[..32]).unwrap();
+            let server_app_key = AeadKey::new(suite, &server_app_ts[..32]).unwrap();
 
             let mut ping_hdr = [0u8; 5];
             server_side.read_exact(&mut ping_hdr).await.unwrap();
             let mut ping_ct = vec![0u8; u16::from_be_bytes([ping_hdr[3], ping_hdr[4]]) as usize];
             server_side.read_exact(&mut ping_ct).await.unwrap();
-            let ping = client_app_key
-                .open(0, &aead_aad(ping_ct.len()), &mut ping_ct)
+            let plain_len = client_app_key
+                .open_in_place(0, &aead_aad(ping_ct.len()), &mut ping_ct)
                 .unwrap();
-            assert!(ping.starts_with(b"ping"));
+            assert!(ping_ct[..plain_len].starts_with(b"ping"));
 
             let mut inner = b"ping".to_vec();
             inner.push(CONTENT_APPLICATION_DATA);
-            let echo_ct = server_app_key
-                .seal(0, &aead_aad(inner.len() + AEAD_TAG_LEN), &inner)
+            let echo_aad = aead_aad(inner.len() + AEAD_TAG_LEN);
+            let mut echo_rec = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
+            echo_rec.extend_from_slice(&[0x17, 0x03, 0x03, 0, 0]);
+            echo_rec.extend_from_slice(&inner);
+            let echo_len = inner.len() + AEAD_TAG_LEN;
+            echo_rec[3] = (echo_len >> 8) as u8;
+            echo_rec[4] = echo_len as u8;
+            server_app_key
+                .seal_in_place(0, &echo_aad, &mut echo_rec, 5)
                 .unwrap();
-            server_side
-                .write_all(&make_app_data_record(&echo_ct))
-                .await
-                .unwrap();
+            server_side.write_all(&echo_rec).await.unwrap();
         });
 
         // Bounded waits throughout: a server-side panic or a wire

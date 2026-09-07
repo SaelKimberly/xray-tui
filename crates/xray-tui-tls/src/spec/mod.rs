@@ -16,7 +16,6 @@ use crate::error::TlsError;
 #[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeValues {
     pub server_name: String,
-    pub alpn: Vec<String>,
     pub x25519_pub: [u8; 32],
     /// ML-KEM-768 encapsulation key for hybrid key shares (1184 bytes;
     /// empty when the spec has no hybrid key-share entry).
@@ -30,7 +29,6 @@ impl Default for RuntimeValues {
     fn default() -> Self {
         Self {
             server_name: String::new(),
-            alpn: Vec::new(),
             x25519_pub: [0; 32],
             mlkem768_pub: Vec::new(),
             grease_a: 0x0A0A,
@@ -155,47 +153,44 @@ impl ExtensionSpec {
     ///
     /// The length field counts the bytes after itself.
     pub fn encode_body(&self, rt: &RuntimeValues) -> Result<Vec<u8>, TlsError> {
-        let (ty, body) = match self {
+        let mut out = Vec::new();
+        self.encode_body_into(rt, &mut out)?;
+        Ok(out)
+    }
+
+    /// Encodes the COMPLETE extension directly into `out` (type + length +
+    /// body), with no per-extension intermediate allocation.
+    ///
+    /// The allocation-free counterpart of [`Self::encode_body`]: the hello
+    /// builder feeds one extension buffer for the whole list, so N
+    /// extensions cost one growing buffer instead of N temp `Vec`s plus
+    /// the re-copy into the list buffer.
+    pub fn encode_body_into(&self, rt: &RuntimeValues, out: &mut Vec<u8>) -> Result<(), TlsError> {
+        match self {
             Self::ServerName => {
                 let host = rt.server_name.as_bytes();
                 let host_len = u16::try_from(host.len()).map_err(|_| {
                     TlsError::Spec("server_name host exceeds u16 length".to_string())
                 })?;
                 // RFC 6066: ServerNameList { list_length u16, name_type 00, host_name_length u16, host_name }
-                let mut body = Vec::with_capacity(3 + host.len());
-                body.extend_from_slice(&(1 + 2 + host_len).to_be_bytes());
-                body.push(0x00);
-                body.extend_from_slice(&host_len.to_be_bytes());
-                body.extend_from_slice(host);
-                (0x0000, body)
+                write_ext_header(out, 0x0000, 2 + 1 + 2 + host.len())?;
+                out.extend_from_slice(&(1 + 2 + host_len).to_be_bytes());
+                out.push(0x00);
+                out.extend_from_slice(&host_len.to_be_bytes());
+                out.extend_from_slice(host);
             }
-            Self::SupportedGroups(groups) => {
-                // RFC 8446 NamedGroupList: u16 byte-length + groups, no count field.
-                let byte_len = u16::try_from(groups.len() * 2).map_err(|_| {
-                    TlsError::Spec("supported_groups exceeds u16 length".to_string())
-                })?;
-                let mut body = Vec::with_capacity(2 + groups.len() * 2);
-                body.extend_from_slice(&byte_len.to_be_bytes());
-                for group in groups {
-                    body.extend_from_slice(&group.to_be_bytes());
-                }
-                (0x000a, body)
-            }
+            Self::SupportedGroups(groups) => encode_supported_groups_into(groups, out)?,
             Self::KeyShare(groups) => {
                 // RFC 8446 KeyShareClientHello: u16 list-length + entries.
-                let mut entries = Vec::with_capacity(groups.len() * 36);
+                // Entry sizes are known per group, so the list length is
+                // computed first and entries stream straight into `out`.
+                let mut entries_len = 0usize;
                 for group in groups {
-                    match group {
-                        KeyShareGroup::Grease => {
-                            // Entry: group (grease_a), key_exchange_length 00 01, key_exchange 00.
-                            entries.extend_from_slice(&rt.grease_a.to_be_bytes());
-                            entries.extend_from_slice(&[0x00, 0x01, 0x00]);
-                        }
-                        KeyShareGroup::X25519 => {
-                            // Entry: group 00 1d (x25519), key_exchange_length 00 20, raw public key.
-                            entries.extend_from_slice(&[0x00, 0x1d, 0x00, 0x20]);
-                            entries.extend_from_slice(&rt.x25519_pub);
-                        }
+                    entries_len += match group {
+                        // Entry: group (grease_a), key_exchange_length 00 01, key_exchange 00.
+                        KeyShareGroup::Grease => 5,
+                        // Entry: group 00 1d (x25519), key_exchange_length 00 20, raw public key.
+                        KeyShareGroup::X25519 => 4 + 32,
                         KeyShareGroup::X25519Mlkem768 => {
                             if rt.mlkem768_pub.len() != 1184 {
                                 return Err(TlsError::Spec(format!(
@@ -203,131 +198,240 @@ impl ExtensionSpec {
                                     rt.mlkem768_pub.len()
                                 )));
                             }
-                            // Entry: group 11 ec, key_exchange_length 04 c0 (1216).
-                            // Wire order per Go crypto/tls (the xray/reality
-                            // server splits `data[:1184]` as the ML-KEM
-                            // encapsulation key and `data[1184:]` as the
-                            // X25519 public key): ML-KEM-768 encap key (1184)
-                            // FIRST, then X25519 pub (32).
-                            entries.extend_from_slice(&[0x11, 0xec, 0x04, 0xc0]);
-                            entries.extend_from_slice(&rt.mlkem768_pub);
-                            entries.extend_from_slice(&rt.x25519_pub);
+                            // Entry: group 11 ec, key_exchange_length 04 c0 (1216):
+                            // ML-KEM-768 encap key (1184) FIRST, then X25519
+                            // pub (32) — Go crypto/tls wire order.
+                            4 + 1184 + 32
                         }
                         KeyShareGroup::Secp256r1Mlkem768 | KeyShareGroup::Secp384r1Mlkem1024 => {
                             return Err(TlsError::Spec(
                                 "SecP256r1MLKEM768/SecP384r1MLKEM1024 key shares are not supported: the engine implements no P-256/P-384 key exchange (xray's primary hybrid, X25519MLKEM768, is fully supported)".to_string(),
                             ));
                         }
-                    }
+                    };
                 }
-                let list_len = u16::try_from(entries.len()).map_err(|_| {
+                let list_len = u16::try_from(entries_len).map_err(|_| {
                     TlsError::Spec("key_share entries exceed u16 length".to_string())
                 })?;
-                let mut body = Vec::with_capacity(2 + entries.len());
-                body.extend_from_slice(&list_len.to_be_bytes());
-                body.extend_from_slice(&entries);
-                (0x0033, body)
-            }
-            Self::SupportedVersions(versions) => {
-                // RFC 8446: 1-byte length counts BYTES (n*2), not versions.
-                let byte_len = u8::try_from(versions.len() * 2).map_err(|_| {
-                    TlsError::Spec("supported_versions exceeds 255 bytes".to_string())
-                })?;
-                let mut body = Vec::with_capacity(1 + versions.len() * 2);
-                body.push(byte_len);
-                for version in versions {
-                    body.extend_from_slice(&version.to_be_bytes());
+                write_ext_header(out, 0x0033, 2 + entries_len)?;
+                out.extend_from_slice(&list_len.to_be_bytes());
+                for group in groups {
+                    match group {
+                        KeyShareGroup::Grease => {
+                            out.extend_from_slice(&rt.grease_a.to_be_bytes());
+                            out.extend_from_slice(&[0x00, 0x01, 0x00]);
+                        }
+                        KeyShareGroup::X25519 => {
+                            out.extend_from_slice(&[0x00, 0x1d, 0x00, 0x20]);
+                            out.extend_from_slice(&rt.x25519_pub);
+                        }
+                        KeyShareGroup::X25519Mlkem768 => {
+                            out.extend_from_slice(&[0x11, 0xec, 0x04, 0xc0]);
+                            out.extend_from_slice(&rt.mlkem768_pub);
+                            out.extend_from_slice(&rt.x25519_pub);
+                        }
+                        KeyShareGroup::Secp256r1Mlkem768 | KeyShareGroup::Secp384r1Mlkem1024 => {
+                            unreachable!("rejected while measuring entries_len")
+                        }
+                    }
                 }
-                (0x002b, body)
             }
+            Self::SupportedVersions(versions) => encode_supported_versions_into(versions, out)?,
             Self::SignatureAlgorithms(schemes) => {
                 // RFC 8446 SignatureSchemeList: u16 byte-length + schemes, no count field.
                 let byte_len = u16::try_from(schemes.len() * 2).map_err(|_| {
                     TlsError::Spec("signature_algorithms exceeds u16 length".to_string())
                 })?;
-                let mut body = Vec::with_capacity(2 + schemes.len() * 2);
-                body.extend_from_slice(&byte_len.to_be_bytes());
+                write_ext_header(out, 0x000d, 2 + schemes.len() * 2)?;
+                out.extend_from_slice(&byte_len.to_be_bytes());
                 for scheme in schemes {
-                    body.extend_from_slice(&scheme.to_be_bytes());
+                    out.extend_from_slice(&scheme.to_be_bytes());
                 }
-                (0x000d, body)
             }
-            Self::Alpn(protos) => (0x0010, prepend_list_len(&encode_alpn_list(protos)?)?),
-            Self::EcPointFormats => (0x000b, vec![0x01, 0x00]),
-            Self::SessionTicket => (0x0023, Vec::new()),
-            Self::PskKeyExchangeModes => (0x002d, vec![0x01, 0x01]),
-            Self::StatusRequest => (0x0005, vec![0x01, 0x00, 0x00, 0x00, 0x00]),
-            Self::SignedCertificateTimestamp => (0x0012, Vec::new()),
-            Self::RenegotiationInfo => (0xff01, vec![0x00]),
+            Self::Alpn(protos) => {
+                let entries_len = alpn_entries_len(protos)?;
+                let list_len = u16::try_from(entries_len)
+                    .map_err(|_| TlsError::Spec("protocol list exceeds u16 length".to_string()))?;
+                write_ext_header(out, 0x0010, 2 + entries_len)?;
+                out.extend_from_slice(&list_len.to_be_bytes());
+                write_alpn_entries(protos, out)?;
+            }
+            Self::EcPointFormats => {
+                write_ext_header(out, 0x000b, 2)?;
+                out.extend_from_slice(&[0x01, 0x00]);
+            }
+            Self::SessionTicket => {
+                write_ext_header(out, 0x0023, 0)?;
+            }
+            Self::PskKeyExchangeModes => {
+                write_ext_header(out, 0x002d, 2)?;
+                out.extend_from_slice(&[0x01, 0x01]);
+            }
+            Self::StatusRequest => {
+                write_ext_header(out, 0x0005, 5)?;
+                out.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00]);
+            }
+            Self::SignedCertificateTimestamp => {
+                write_ext_header(out, 0x0012, 0)?;
+            }
+            Self::RenegotiationInfo => {
+                write_ext_header(out, 0xff01, 1)?;
+                out.push(0x00);
+            }
             Self::CompressCertificate(algos) => {
                 // RFC 8871: 1-byte length counts BYTES + algos, no count field.
                 let byte_len = u8::try_from(algos.len() * 2).map_err(|_| {
                     TlsError::Spec("compress_certificate exceeds 255 bytes".to_string())
                 })?;
-                let mut body = Vec::with_capacity(1 + algos.len() * 2);
-                body.push(byte_len);
+                write_ext_header(out, 0x001b, 1 + algos.len() * 2)?;
+                out.push(byte_len);
                 for algo in algos {
-                    body.extend_from_slice(&algo.to_be_bytes());
+                    out.extend_from_slice(&algo.to_be_bytes());
                 }
-                (0x001b, body)
             }
             Self::ApplicationSettings(protos) => {
                 // ALPS (draft-ietf-tls-alps): 2-byte per-entry lengths (differs
                 // from ALPN), u16 list-length prefix.
-                (0x4469, prepend_list_len(&encode_alps_list(protos)?)?)
+                let entries_len = alps_entries_len(protos)?;
+                let list_len = u16::try_from(entries_len)
+                    .map_err(|_| TlsError::Spec("protocol list exceeds u16 length".to_string()))?;
+                write_ext_header(out, 0x4469, 2 + entries_len)?;
+                out.extend_from_slice(&list_len.to_be_bytes());
+                write_alps_entries(protos, out)?;
             }
-            Self::RecordSizeLimit(limit) => (0x001c, limit.to_be_bytes().to_vec()),
-            Self::Padding => (0x0015, vec![0u8; rt.padding_len]),
-            Self::Grease => (rt.grease_b, vec![0x00]),
-            Self::Raw { ty, data } => (*ty, data.clone()),
-        };
-        let len = u16::try_from(body.len())
-            .map_err(|_| TlsError::Spec("extension body exceeds u16 length".to_string()))?;
-        let mut out = Vec::with_capacity(4 + body.len());
-        out.extend_from_slice(&ty.to_be_bytes());
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+            Self::RecordSizeLimit(limit) => {
+                write_ext_header(out, 0x001c, 2)?;
+                out.extend_from_slice(&limit.to_be_bytes());
+            }
+            Self::Padding => {
+                write_ext_header(out, 0x0015, rt.padding_len)?;
+                out.resize(out.len() + rt.padding_len, 0);
+            }
+            Self::Grease => {
+                write_ext_header(out, rt.grease_b, 1)?;
+                out.push(0x00);
+            }
+            Self::Raw { ty, data } => {
+                write_ext_header(out, *ty, data.len())?;
+                out.extend_from_slice(data);
+            }
+        }
+        Ok(())
     }
 }
 
-/// Prefixes a protocol list with its u16 BE byte-length (the RFC vector
-/// shape shared by ALPN and ALPS).
-fn prepend_list_len(list: &[u8]) -> Result<Vec<u8>, TlsError> {
-    let list_len = u16::try_from(list.len())
-        .map_err(|_| TlsError::Spec("protocol list exceeds u16 length".to_string()))?;
-    let mut out = Vec::with_capacity(2 + list.len());
-    out.extend_from_slice(&list_len.to_be_bytes());
-    out.extend_from_slice(list);
-    Ok(out)
+/// Writes an extension type + u16 length prefix into `out`.
+fn write_ext_header(out: &mut Vec<u8>, ty: u16, body_len: usize) -> Result<(), TlsError> {
+    let len = u16::try_from(body_len)
+        .map_err(|_| TlsError::Spec("extension body exceeds u16 length".to_string()))?;
+    out.extend_from_slice(&ty.to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
+    Ok(())
 }
 
-/// Encodes an ALPN protocol list (RFC 7301): per entry, a u8 BE length
-/// followed by the raw protocol bytes. Returns just the entries; the caller
-/// prepends the list-length field.
-fn encode_alpn_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
-    let mut out = Vec::new();
+/// Encodes a `supported_groups` extension from a GREASE-filled slice: the
+/// hello builder fills a stack array (no `Vec` clone) and streams it here.
+pub(crate) fn encode_supported_groups_into(
+    groups: &[u16],
+    out: &mut Vec<u8>,
+) -> Result<(), TlsError> {
+    // RFC 8446 NamedGroupList: u16 byte-length + groups, no count field.
+    let byte_len = u16::try_from(groups.len() * 2)
+        .map_err(|_| TlsError::Spec("supported_groups exceeds u16 length".to_string()))?;
+    write_ext_header(out, 0x000a, 2 + groups.len() * 2)?;
+    out.extend_from_slice(&byte_len.to_be_bytes());
+    for group in groups {
+        out.extend_from_slice(&group.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// Encodes a `supported_versions` extension from a GREASE-filled slice.
+pub(crate) fn encode_supported_versions_into(
+    versions: &[u16],
+    out: &mut Vec<u8>,
+) -> Result<(), TlsError> {
+    // RFC 8446: 1-byte length counts BYTES (n*2), not versions.
+    let byte_len = u8::try_from(versions.len() * 2)
+        .map_err(|_| TlsError::Spec("supported_versions exceeds 255 bytes".to_string()))?;
+    write_ext_header(out, 0x002b, 1 + versions.len() * 2)?;
+    out.push(byte_len);
+    for version in versions {
+        out.extend_from_slice(&version.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// Length of ALPN entries (RFC 7301): per entry, a u8 BE length plus the
+/// raw protocol bytes. Generic over `String`/`&str` so the hello builder
+/// encodes a `&[&str]` override with no `Vec<String>` staging.
+fn alpn_entries_len<S: AsRef<str>>(protos: &[S]) -> Result<usize, TlsError> {
+    let mut len = 0usize;
     for proto in protos {
-        let len = u8::try_from(proto.len())
+        let bytes = proto.as_ref().as_bytes();
+        if bytes.len() > 255 {
+            return Err(TlsError::Spec(
+                "alpn protocol exceeds 255 bytes".to_string(),
+            ));
+        }
+        len += 1 + bytes.len();
+    }
+    Ok(len)
+}
+
+/// Writes ALPN entries (no list-length prefix) into `out`.
+fn write_alpn_entries<S: AsRef<str>>(protos: &[S], out: &mut Vec<u8>) -> Result<(), TlsError> {
+    for proto in protos {
+        let bytes = proto.as_ref().as_bytes();
+        let len = u8::try_from(bytes.len())
             .map_err(|_| TlsError::Spec("alpn protocol exceeds 255 bytes".to_string()))?;
         out.push(len);
-        out.extend_from_slice(proto.as_bytes());
+        out.extend_from_slice(bytes);
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Encodes an ALPS protocol list (draft-ietf-tls-alps): per entry, a u16 BE
-/// length followed by the raw protocol bytes — 2-byte entries, unlike ALPN.
-fn encode_alps_list(protos: &[String]) -> Result<Vec<u8>, TlsError> {
-    let mut out = Vec::new();
+/// Length of ALPS entries (draft-ietf-tls-alps): per entry, a u16 BE
+/// length plus the raw protocol bytes.
+fn alps_entries_len<S: AsRef<str>>(protos: &[S]) -> Result<usize, TlsError> {
+    let mut len = 0usize;
     for proto in protos {
-        let len = u16::try_from(proto.len()).map_err(|_| {
+        let bytes = proto.as_ref().as_bytes();
+        if bytes.len() > 0xFFFF {
+            return Err(TlsError::Spec(
+                "application_settings protocol exceeds u16 length".to_string(),
+            ));
+        }
+        len += 2 + bytes.len();
+    }
+    Ok(len)
+}
+
+/// Writes ALPS entries (no list-length prefix) into `out`.
+fn write_alps_entries<S: AsRef<str>>(protos: &[S], out: &mut Vec<u8>) -> Result<(), TlsError> {
+    for proto in protos {
+        let bytes = proto.as_ref().as_bytes();
+        let len = u16::try_from(bytes.len()).map_err(|_| {
             TlsError::Spec("application_settings protocol exceeds u16 length".to_string())
         })?;
         out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(proto.as_bytes());
+        out.extend_from_slice(bytes);
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Encodes an ALPN extension from a `&[&str]` override list (no `Vec<String>`
+/// staging): the hello builder's `params.alpn` path.
+pub(crate) fn encode_alpn_override_into(
+    protos: &[&str],
+    out: &mut Vec<u8>,
+) -> Result<(), TlsError> {
+    let entries_len = alpn_entries_len(protos)?;
+    let list_len = u16::try_from(entries_len)
+        .map_err(|_| TlsError::Spec("protocol list exceeds u16 length".to_string()))?;
+    write_ext_header(out, 0x0010, 2 + entries_len)?;
+    out.extend_from_slice(&list_len.to_be_bytes());
+    write_alpn_entries(protos, out)
 }
 
 #[cfg(test)]

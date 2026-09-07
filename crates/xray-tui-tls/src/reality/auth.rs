@@ -57,16 +57,15 @@ pub fn encrypt_session_id(
     let unbound = UnboundKey::new(&ring::aead::AES_256_GCM, auth_key)
         .map_err(|_| TlsError::Crypto("REALITY session-id key setup failed".into()))?;
     let key = LessSafeKey::new(unbound);
-    let mut in_out = plaintext.to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
+    // `seal_in_place_append_tag` needs a `Vec` to push the tag into;
+    // `separate_tag` seals the stack array and hands the tag back.
+    let mut in_out = *plaintext;
+    let tag = key
+        .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut in_out)
         .map_err(|_| TlsError::Crypto("REALITY session-id seal failed".into()))?;
     let mut sealed = [0u8; 32];
-    sealed
-        .get_mut(..in_out.len())
-        .ok_or_else(|| {
-            TlsError::Crypto("REALITY session-id seal produced unexpected length".into())
-        })?
-        .copy_from_slice(&in_out);
+    sealed[..16].copy_from_slice(&in_out);
+    sealed[16..].copy_from_slice(tag.as_ref());
     Ok(sealed)
 }
 
@@ -83,7 +82,7 @@ pub fn decrypt_session_id(
     let unbound = UnboundKey::new(&ring::aead::AES_256_GCM, auth_key)
         .map_err(|_| TlsError::Crypto("REALITY session-id key setup failed".into()))?;
     let key = LessSafeKey::new(unbound);
-    let mut in_out = ciphertext_and_tag.to_vec();
+    let mut in_out = *ciphertext_and_tag;
     let plaintext = key
         .open_in_place(nonce, Aad::from(aad), &mut in_out)
         .map_err(|_| {

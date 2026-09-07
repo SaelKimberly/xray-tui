@@ -27,14 +27,14 @@ use zeroize::Zeroizing;
 pub mod tls12;
 
 use crate::SecureRandom;
-use crate::crypto::mlkem::{Mlkem768, SecretKey as MlkemSecretKey};
+use crate::crypto::mlkem::{Ciphertext, Mlkem768, SecretKey as MlkemSecretKey};
 use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule, X25519KeyPair, tls12::Tls12Suite};
 use crate::error::{Result, TlsError};
 use crate::hello::{BuildParams, build_hello, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{
     CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
-    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, aead_aad, make_app_data_record,
+    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, MAX_RECORD_PAYLOAD, aead_aad,
     parse_handshake_messages, skip_ccs,
 };
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup};
@@ -246,14 +246,12 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // IKM is `mlkem_shared || classical_shared` — Go's
     // handshake_client_tls13 appends the ECDH secret AFTER the ML-KEM
     // shared secret (`sharedKey = append(mlkemShared, sharedKey...)`).
-    let shared: Zeroizing<Vec<u8>> = match (mlkem_sk, server_hello.mlkem_ciphertext.as_deref()) {
+    let shared: Zeroizing<Vec<u8>> = match (mlkem_sk, server_hello.mlkem_ciphertext.as_ref()) {
         (Some(sk), Some(ct)) => {
-            let pq_shared = Mlkem768::decapsulate(
-                sk,
-                &crate::crypto::mlkem::Ciphertext::from_bytes(ct)
-                    .map_err(|e| TlsError::Crypto(e.to_string()))?,
-            )
-            .map_err(|e| TlsError::Crypto(e.to_string()))?;
+            // The ciphertext was validated at parse; decapsulate it
+            // directly — no second copy through a temp `Vec`.
+            let pq_shared =
+                Mlkem768::decapsulate(sk, ct).map_err(|e| TlsError::Crypto(e.to_string()))?;
             let mut combined = Zeroizing::new(Vec::with_capacity(classical_shared.len() + 32));
             combined.extend_from_slice(pq_shared.as_bytes());
             combined.extend_from_slice(classical_shared.as_slice());
@@ -262,25 +260,28 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
         _ => Zeroizing::new(classical_shared.to_vec()),
     };
 
+    let hash_len = server_hello.suite.hash_len();
     let mut ks = KeySchedule::new(server_hello.suite);
     ks.add_transcript(hello);
     ks.add_transcript(&server_hello.raw);
     let hs_secret = ks.handshake_secret(&shared)?;
-    let (client_hs_ts, server_hs_ts) = ks.handshake_traffic_secrets(&hs_secret)?;
-    let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts)?;
-    let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts)?;
+    let (client_hs_ts, server_hs_ts) = ks.handshake_traffic_secrets(&hs_secret[..hash_len])?;
+    let server_hs_key = AeadKey::new(server_hello.suite, &server_hs_ts[..hash_len])?;
+    let client_hs_key = AeadKey::new(server_hello.suite, &client_hs_ts[..hash_len])?;
 
     let flight = read_server_hs_messages(&mut stream, &server_hs_key, offered_compress).await?;
 
+    // The key schedule already accumulates `ClientHello .. Certificate`
+    // verbatim — feeding it here (before the auth dispatch) makes its
+    // arena the single transcript copy; the verifier below borrows it
+    // instead of a second `hello + sh + ee + cert` buffer. Ordering is
+    // unchanged (`ee, cert, cv, server Finished`), so the Finished MACs
+    // and app secrets derive exactly as before (RFC 8446 §4.4.4, §7.1).
+    ks.add_transcript(&flight.ee_raw);
+    ks.add_transcript(&flight.cert_raw);
     // Transcript up to (excluding) CertificateVerify — consumed only by the
     // auth dispatch below (RFC 8446 §4.4.3).
-    let mut transcript = Vec::with_capacity(
-        hello.len() + server_hello.raw.len() + flight.ee_raw.len() + flight.cert_raw.len(),
-    );
-    transcript.extend_from_slice(hello);
-    transcript.extend_from_slice(&server_hello.raw);
-    transcript.extend_from_slice(&flight.ee_raw);
-    transcript.extend_from_slice(&flight.cert_raw);
+    let transcript = ks.transcript_bytes();
 
     let outcome = match auth {
         ServerAuth::Verifier(verifier) => {
@@ -299,7 +300,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 suite: server_hello.suite,
                 signature_scheme: flight.signature_scheme,
                 signature,
-                signed_data: &transcript,
+                signed_data: transcript,
             })?;
             AuthOutcome::Ok
         }
@@ -313,7 +314,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 cert_der,
                 &flight.cv_raw,
                 auth_key,
-                &transcript,
+                transcript,
                 server_hello.suite.digest(),
             ) {
                 Ok(()) => AuthOutcome::Ok,
@@ -325,11 +326,9 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
     };
 
-    ks.add_transcript(&flight.ee_raw);
-    ks.add_transcript(&flight.cert_raw);
     ks.add_transcript(&flight.cv_raw);
-    let server_finished_key = ks.finished_key(&server_hs_ts)?;
-    if ks.finished_mac(&server_finished_key) != flight.sf_verify_data {
+    let server_finished_key = ks.finished_key(&server_hs_ts[..hash_len])?;
+    if ks.finished_mac(&server_finished_key[..hash_len]) != flight.sf_verify_data {
         return Err(TlsError::Handshake(
             "server Finished MAC mismatch — possible MITM or wrong key".into(),
         ));
@@ -337,21 +336,32 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let sf_raw = make_hs_msg(HS_FINISHED, &flight.sf_verify_data);
     ks.add_transcript(&sf_raw);
-    let client_finished_key = ks.finished_key(&client_hs_ts)?;
-    let client_finished_mac = ks.finished_mac(&client_finished_key);
+    let client_finished_key = ks.finished_key(&client_hs_ts[..hash_len])?;
+    let client_finished_mac = ks.finished_mac(&client_finished_key[..hash_len]);
+    // The client Finished record is framed in place: header placeholder,
+    // inner plaintext, tag — one buffer, one copy of the plaintext, with
+    // the seal happening inside the record buffer (no allocating twin,
+    // no `make_app_data_record` re-copy).
     let cf_hs_msg = make_hs_msg(HS_FINISHED, &client_finished_mac);
-    let mut cf_inner = cf_hs_msg.clone();
-    cf_inner.push(CONTENT_HANDSHAKE);
-    let cf_ciphertext =
-        client_hs_key.seal(0, &aead_aad(cf_inner.len() + AEAD_TAG_LEN), &cf_inner)?;
-    stream
-        .write_all(&make_app_data_record(&cf_ciphertext))
-        .await?;
+    let ct_len = cf_hs_msg.len() + 1 + AEAD_TAG_LEN;
+    let cf_aad = aead_aad(ct_len);
+    let mut cf_record = Vec::with_capacity(5 + ct_len);
+    cf_record.extend_from_slice(&[
+        CONTENT_APPLICATION_DATA,
+        0x03,
+        0x03,
+        (ct_len >> 8) as u8,
+        ct_len as u8,
+    ]);
+    cf_record.extend_from_slice(&cf_hs_msg);
+    cf_record.push(CONTENT_HANDSHAKE);
+    client_hs_key.seal_in_place(0, &cf_aad, &mut cf_record, 5)?;
+    stream.write_all(&cf_record).await?;
 
-    let master = ks.master_secret(&hs_secret)?;
-    let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master)?;
-    let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts)?;
-    let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts)?;
+    let master = ks.master_secret(&hs_secret[..hash_len])?;
+    let (client_app_ts, server_app_ts) = ks.app_traffic_secrets(&master[..hash_len])?;
+    let client_app_key = AeadKey::new(server_hello.suite, &client_app_ts[..hash_len])?;
+    let server_app_key = AeadKey::new(server_hello.suite, &server_app_ts[..hash_len])?;
     let mut tls = TlsStream::new(stream, AppKeys::tls13(server_app_key, client_app_key));
     tls.set_negotiated_hybrid(server_hello.mlkem_ciphertext.is_some());
     Ok((tls, outcome))
@@ -443,8 +453,9 @@ pub(crate) struct ServerHelloData {
     pub(crate) server_random: [u8; 32],
     /// The server's classical (X25519) public key from `key_share` (TLS 1.3).
     pub(crate) peer_key: Option<[u8; 32]>,
-    /// The ML-KEM ciphertext from the server's hybrid key share (TLS 1.3).
-    pub(crate) mlkem_ciphertext: Option<Vec<u8>>,
+    /// The ML-KEM ciphertext from the server's hybrid key share (TLS 1.3),
+    /// validated at parse so the handshake decapsulates it with no re-copy.
+    pub(crate) mlkem_ciphertext: Option<Ciphertext>,
     /// The cipher suite the server selected (TLS 1.3).
     pub(crate) suite: CipherSuiteId,
     /// The cipher suite the server selected (TLS 1.2).
@@ -461,7 +472,7 @@ struct ParsedServerHello {
     suite: CipherSuiteId,
     suite12: Option<Tls12Suite>,
     peer_key: Option<[u8; 32]>,
-    mlkem_ciphertext: Option<Vec<u8>>,
+    mlkem_ciphertext: Option<Ciphertext>,
     ems: bool,
 }
 
@@ -481,23 +492,28 @@ where
             rec.content_type
         )));
     }
-    let msgs = parse_handshake_messages(&rec.payload)?;
-    let (msg_type, body) = msgs
-        .into_iter()
-        .next()
-        .ok_or_else(|| TlsError::Handshake("empty record for ServerHello".into()))?;
-    if msg_type != HS_SERVER_HELLO {
-        return Err(TlsError::Handshake(format!(
-            "expected ServerHello (0x02), got 0x{msg_type:02X}"
-        )));
-    }
-    let parsed = parse_server_hello(&body, offered_session_id)?;
-    // TLS 1.2 may pack subsequent handshake messages after the ServerHello
-    // in the same record; preserve those bytes for the flight reader.
-    let first_total = 4 + body.len();
-    let pre_buffer = rec.payload[first_total..].to_vec();
+    let (parsed, first_total) = {
+        let msgs = parse_handshake_messages(&rec.payload)?;
+        let (msg_type, body) = msgs
+            .into_iter()
+            .next()
+            .ok_or_else(|| TlsError::Handshake("empty record for ServerHello".into()))?;
+        if msg_type != HS_SERVER_HELLO {
+            return Err(TlsError::Handshake(format!(
+                "expected ServerHello (0x02), got 0x{msg_type:02X}"
+            )));
+        }
+        let parsed = parse_server_hello(&body, offered_session_id)?;
+        // TLS 1.2 may pack subsequent handshake messages after the
+        // ServerHello in the same record; preserve those bytes for the
+        // flight reader.
+        (parsed, 4 + body.len())
+    };
+    let mut payload = rec.payload;
+    let raw = payload[..first_total].to_vec();
+    let pre_buffer = payload.split_off(first_total);
     Ok(ServerHelloData {
-        raw: make_hs_msg(HS_SERVER_HELLO, &body),
+        raw,
         pre_buffer,
         version: parsed.version,
         server_random: parsed.server_random,
@@ -668,7 +684,10 @@ fn parse_server_hello(body: &[u8], offered_session_id: &[u8]) -> Result<ParsedSe
                         peer_key = Some(ext_data[4..36].try_into().expect("32 bytes"));
                     }
                     (0x11EC, 1120, n) if n == 4 + key_len => {
-                        mlkem_ciphertext = Some(ext_data[4..4 + 1088].to_vec());
+                        mlkem_ciphertext = Some(
+                            Ciphertext::from_bytes(&ext_data[4..4 + 1088])
+                                .map_err(|e| TlsError::Handshake(e.to_string()))?,
+                        );
                         peer_key = Some(ext_data[4 + 1088..].try_into().expect("32 bytes"));
                     }
                     (0x11EB | 0x11ED, ..) => {
@@ -812,7 +831,10 @@ where
     let mut signature_scheme = 0u16;
     let mut cert_verify_body = Vec::new();
     let mut seq = 0u64;
-    let mut buf: Vec<u8> = Vec::new();
+    // The reassembly buffer is pre-sized to one full record (like
+    // `TlsStream::rec_buf`): single-record flights never regrow it, and
+    // multi-record flights amortize into the same allocation.
+    let mut buf: Vec<u8> = Vec::with_capacity(MAX_RECORD_PAYLOAD);
 
     loop {
         // Consume every complete handshake message buffered so far.
@@ -824,10 +846,12 @@ where
                 break; // body incomplete — wait for the next record
             }
             let msg_type = buf[consumed];
-            let body = buf[consumed + 4..consumed + total].to_vec();
+            // One copy: the raw message already sits contiguous in `buf`
+            // (`type || len || body`), so slice it out directly instead of
+            // copying the body and re-encoding the header.
+            let raw = buf[consumed..consumed + total].to_vec();
+            let body = &raw[4..];
             consumed += total;
-
-            let raw = make_hs_msg(msg_type, &body);
             match msg_type {
                 HS_ENCRYPTED_EXTENSIONS => {
                     parse_encrypted_extensions(&body)?;
@@ -838,11 +862,11 @@ where
                     cert_raw = Some(raw);
                 }
                 HS_CERTIFICATE_VERIFY => {
-                    signature_scheme = parse_certificate_verify(&body)?;
-                    cert_verify_body = body;
+                    signature_scheme = parse_certificate_verify(body)?;
+                    cert_verify_body = body.to_vec();
                     cv_raw = Some(raw);
                 }
-                HS_FINISHED => finished_data = Some(body),
+                HS_FINISHED => finished_data = Some(body.to_vec()),
                 _ => {} // unknown handshake messages are skipped
             }
 
@@ -875,10 +899,10 @@ where
 
         let aad = aead_aad(rec.payload.len());
         let mut payload = rec.payload;
-        let plaintext = server_hs_key.open(seq, &aad, &mut payload)?;
+        let plain_len = server_hs_key.open_in_place(seq, &aad, &mut payload)?;
         seq += 1;
 
-        let (content_type, hs_data) = strip_padding(&plaintext)?;
+        let (content_type, hs_data) = strip_padding(&payload[..plain_len])?;
         if content_type != CONTENT_HANDSHAKE {
             continue;
         }
@@ -1175,7 +1199,7 @@ mod tests {
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
     use crate::hello::{BuildParams, build_hello};
-    use crate::record::{CONTENT_HANDSHAKE, aead_aad, make_app_data_record};
+    use crate::record::{CONTENT_HANDSHAKE, aead_aad};
     use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, SessionIdSpec};
     use crate::verify::WebPkiVerifier;
 
@@ -1643,12 +1667,18 @@ mod tests {
     ) {
         let mut inner = chunk.to_vec();
         inner.push(CONTENT_HANDSHAKE);
-        let ciphertext = key
-            .seal(seq, &aead_aad(inner.len() + AEAD_TAG_LEN), &inner)
-            .unwrap();
-        w.write_all(&make_app_data_record(&ciphertext))
-            .await
-            .unwrap();
+        let aad = aead_aad(inner.len() + AEAD_TAG_LEN);
+        let mut record = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
+        record.extend_from_slice(&[
+            CONTENT_APPLICATION_DATA,
+            0x03,
+            0x03,
+            ((inner.len() + AEAD_TAG_LEN) >> 8) as u8,
+            (inner.len() + AEAD_TAG_LEN) as u8,
+        ]);
+        record.extend_from_slice(&inner);
+        key.seal_in_place(seq, &aad, &mut record, 5).unwrap();
+        w.write_all(&record).await.unwrap();
     }
 
     #[tokio::test]
@@ -1815,8 +1845,9 @@ mod tests {
             sk.add_transcript(&ch);
             sk.add_transcript(&sh_msg);
             let hs_secret = sk.handshake_secret(&combined).unwrap();
-            let (_client_hs_ts, server_hs_ts) = sk.handshake_traffic_secrets(&hs_secret).unwrap();
-            let server_hs_key = AeadKey::new(suite, &server_hs_ts).unwrap();
+            let (_client_hs_ts, server_hs_ts) =
+                sk.handshake_traffic_secrets(&hs_secret[..32]).unwrap();
+            let server_hs_key = AeadKey::new(suite, &server_hs_ts[..32]).unwrap();
 
             // Encrypted flight with a REAL server Finished MAC.
             let ee_msg = make_hs_msg(HS_ENCRYPTED_EXTENSIONS, &[0x00, 0x00]);
@@ -1829,15 +1860,15 @@ mod tests {
                 ],
             );
             let mut cv_body = Vec::new();
-            cv_body.extend_from_slice(&0x0403u16.to_be_bytes());
+            cv_body.extend_from_slice(&0x0403u16.to_be_bytes()); // ecdsa_secp256r1_sha256
             cv_body.extend_from_slice(&0x0040u16.to_be_bytes());
             cv_body.extend_from_slice(&[0xAA; 64]);
             let cv_msg = make_hs_msg(HS_CERTIFICATE_VERIFY, &cv_body);
             sk.add_transcript(&ee_msg);
             sk.add_transcript(&cert_msg);
             sk.add_transcript(&cv_msg);
-            let sf_key = sk.finished_key(&server_hs_ts).unwrap();
-            let sf_wire = make_hs_msg(HS_FINISHED, &sk.finished_mac(&sf_key));
+            let sf_key = sk.finished_key(&server_hs_ts[..32]).unwrap();
+            let sf_wire = make_hs_msg(HS_FINISHED, &sk.finished_mac(&sf_key[..32]));
             let mut flight = Vec::new();
             flight.extend_from_slice(&ee_msg);
             flight.extend_from_slice(&cert_msg);
@@ -1851,31 +1882,37 @@ mod tests {
             server_side.read_exact(&mut fin_hdr).await.unwrap();
             let mut fin = vec![0u8; u16::from_be_bytes([fin_hdr[3], fin_hdr[4]]) as usize];
             server_side.read_exact(&mut fin).await.unwrap();
+            let master = sk.master_secret(&hs_secret[..32]).unwrap();
+            let (client_app_ts, server_app_ts) = sk.app_traffic_secrets(&master[..32]).unwrap();
+            let client_app_key = AeadKey::new(suite, &client_app_ts[..32]).unwrap();
+            let server_app_key = AeadKey::new(suite, &server_app_ts[..32]).unwrap();
 
             // App traffic secrets; decrypt and echo the client's ping.
-            let master = sk.master_secret(&hs_secret).unwrap();
-            let (client_app_ts, server_app_ts) = sk.app_traffic_secrets(&master).unwrap();
-            let client_app_key = AeadKey::new(suite, &client_app_ts).unwrap();
-            let server_app_key = AeadKey::new(suite, &server_app_ts).unwrap();
-
             let mut ping_hdr = [0u8; 5];
             server_side.read_exact(&mut ping_hdr).await.unwrap();
             let mut ping_ct = vec![0u8; u16::from_be_bytes([ping_hdr[3], ping_hdr[4]]) as usize];
             server_side.read_exact(&mut ping_ct).await.unwrap();
-            let ping = client_app_key
-                .open(0, &aead_aad(ping_ct.len()), &mut ping_ct)
+            let plain_len = client_app_key
+                .open_in_place(0, &aead_aad(ping_ct.len()), &mut ping_ct)
                 .unwrap();
-            assert!(ping.starts_with(b"ping"));
+            assert!(ping_ct[..plain_len].starts_with(b"ping"));
 
             let mut inner = b"ping".to_vec();
             inner.push(CONTENT_APPLICATION_DATA);
-            let echo_ct = server_app_key
-                .seal(0, &aead_aad(inner.len() + AEAD_TAG_LEN), &inner)
+            let aad = aead_aad(inner.len() + AEAD_TAG_LEN);
+            let mut record = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
+            record.extend_from_slice(&[
+                CONTENT_APPLICATION_DATA,
+                0x03,
+                0x03,
+                ((inner.len() + AEAD_TAG_LEN) >> 8) as u8,
+                (inner.len() + AEAD_TAG_LEN) as u8,
+            ]);
+            record.extend_from_slice(&inner);
+            server_app_key
+                .seal_in_place(0, &aad, &mut record, 5)
                 .unwrap();
-            server_side
-                .write_all(&make_app_data_record(&echo_ct))
-                .await
-                .unwrap();
+            server_side.write_all(&record).await.unwrap();
         });
 
         let rng = ring::rand::SystemRandom::new();

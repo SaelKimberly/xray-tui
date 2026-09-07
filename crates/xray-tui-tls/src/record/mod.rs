@@ -42,11 +42,13 @@ pub struct TlsRecord {
     pub payload: Vec<u8>,
 }
 
-/// Read a single TLS record (5-byte header, then payload) from the stream.
+/// Read a single TLS record header + payload with a caller-reused buffer.
 ///
-/// Alert records are rejected with a [`TlsError::Handshake`] carrying the
-/// alert's `level` and `description`; oversized records are rejected too.
-pub async fn read_record<S>(stream: &mut S) -> Result<TlsRecord>
+/// The allocation-free counterpart of [`read_record`]: `payload` is cleared
+/// and refilled in place, so a handshake loop reading N records allocates
+/// once (when the buffer first grows) instead of once per record. Returns
+/// the record's content type; the payload is `payload[..len]`.
+pub async fn read_record_into<S>(stream: &mut S, payload: &mut Vec<u8>) -> Result<u8>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -62,8 +64,12 @@ where
         )));
     }
 
-    let mut payload = vec![0u8; length];
-    stream.read_exact(&mut payload).await?;
+    // Reuse the buffer: `resize` only allocates when the record exceeds
+    // current capacity (zeroing is one pass over bytes the read fills
+    // right after).
+    payload.clear();
+    payload.resize(length, 0);
+    stream.read_exact(payload).await?;
 
     if content_type == CONTENT_ALERT && payload.len() >= 2 {
         return Err(TlsError::Handshake(format!(
@@ -72,6 +78,19 @@ where
         )));
     }
 
+    Ok(content_type)
+}
+
+/// Read a single TLS record (5-byte header, then payload) from the stream.
+///
+/// Alert records are rejected with a [`TlsError::Handshake`] carrying the
+/// alert's `level` and `description`; oversized records are rejected too.
+pub async fn read_record<S>(stream: &mut S) -> Result<TlsRecord>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut payload = Vec::new();
+    let content_type = read_record_into(stream, &mut payload).await?;
     Ok(TlsRecord {
         content_type,
         payload,
@@ -96,8 +115,10 @@ where
 /// Parse one or more handshake messages from a raw record payload.
 ///
 /// Each message is `type(1) || length(3) || body` (RFC 8446 §4); returns a
-/// `Vec` of `(msg_type, body)` pairs.
-pub fn parse_handshake_messages(payload: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
+/// `Vec` of `(msg_type, body)` pairs borrowing the payload — no per-message
+/// copy. Callers needing owned messages (transcript, flight) copy the one
+/// range they keep.
+pub fn parse_handshake_messages(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
     let mut msgs = Vec::new();
     let mut pos = 0;
     while pos < payload.len() {
@@ -115,7 +136,7 @@ pub fn parse_handshake_messages(payload: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
                 payload.len() - pos
             )));
         }
-        msgs.push((msg_type, payload[pos..pos + length].to_vec()));
+        msgs.push((msg_type, &payload[pos..pos + length]));
         pos += length;
     }
     Ok(msgs)
@@ -237,7 +258,7 @@ mod tests {
         let payload = [0x02, 0x00, 0x00, 0x02, 0xaa, 0xbb, 0x08, 0x00, 0x00, 0x00]; // SH + EE
         let msgs = parse_handshake_messages(&payload).unwrap();
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0], (0x02, vec![0xaa, 0xbb]));
+        assert_eq!(msgs[0], (0x02, &[0xaa, 0xbb][..]));
     }
 
     #[test]

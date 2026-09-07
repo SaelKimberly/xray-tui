@@ -33,7 +33,7 @@
 use super::b3;
 
 use base64::Engine as _;
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, AeadInOut};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use ring::rand::SecureRandom;
 use std::io;
@@ -121,6 +121,9 @@ impl WireAead {
         self.nonce
     }
 
+    /// Test-only allocating seal: production seals via [`Self::seal_into`]
+    /// / [`Self::seal_append`] / [`Self::seal_zeros_in_place`].
+    #[cfg(test)]
     fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         let n = self.increase_nonce();
         let nonce = ChachaNonce::from(n);
@@ -136,17 +139,93 @@ impl WireAead {
             .expect("chacha20poly1305 seal cannot fail")
     }
 
-    fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, io::Error> {
+    /// Seal `plaintext` into `out` (`out.len() == plaintext.len() +
+    /// [`TAG_LEN`]).
+    ///
+    /// The allocation-free counterpart of [`Self::seal`]: handshake code
+    /// sealing straight into the flight buffer skips the temp `Vec`.
+    fn seal_into(&mut self, out: &mut [u8], plaintext: &[u8], aad: &[u8]) {
+        use inout::InOutBuf;
+        debug_assert_eq!(out.len(), plaintext.len() + TAG_LEN);
         let n = self.increase_nonce();
-        let nonce = ChachaNonce::from(n);
-        let nonce = &nonce;
+        let (msg, tag_out) = out.split_at_mut(plaintext.len());
+        msg.copy_from_slice(plaintext);
+        let tag = self
+            .cipher
+            .encrypt_inout_detached(&ChachaNonce::from(n), aad, InOutBuf::from(msg))
+            .expect("chacha20poly1305 seal cannot fail");
+        tag_out.copy_from_slice(tag.as_slice());
+    }
+
+    fn seal_append(&mut self, buf: &mut Vec<u8>, body_start: usize, aad: &[u8]) {
+        use inout::InOutBuf;
+        let n = self.increase_nonce();
+        let tag = self
+            .cipher
+            .encrypt_inout_detached(
+                &ChachaNonce::from(n),
+                aad,
+                InOutBuf::from(&mut buf[body_start..]),
+            )
+            .expect("chacha20poly1305 seal cannot fail");
+        buf.extend_from_slice(tag.as_slice());
+    }
+
+    /// Open `buf` (`ciphertext || tag`) in place, returning the plaintext
+    /// length: the plaintext occupies `buf[..len]`.
+    ///
+    /// The allocation-free counterpart of [`Self::open`]: the record
+    /// reader decrypts inside its reused read buffer.
+    fn open_in_place(&mut self, buf: &mut [u8], aad: &[u8]) -> Result<usize, io::Error> {
+        use inout::InOutBuf;
+        if buf.len() < TAG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "aead open failed",
+            ));
+        }
+        let split = buf.len() - TAG_LEN;
+        let (msg, tag_bytes) = buf.split_at_mut(split);
+        let tag: [u8; TAG_LEN] = tag_bytes
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "aead open failed"))?;
+        let n = self.increase_nonce();
+        let msg_len = msg.len();
+        self.cipher
+            .decrypt_inout_detached(
+                &ChachaNonce::from(n),
+                aad,
+                InOutBuf::from(msg),
+                (&tag).into(),
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "aead open failed"))?;
+        Ok(msg_len)
+    }
+
+    /// Seal an all-zeros `buf` in place, returning the tag: for padding
+    /// bodies that are already zeroed in the flight buffer (no staging).
+    fn seal_zeros_in_place(&mut self, buf: &mut [u8]) -> [u8; TAG_LEN] {
+        use inout::InOutBuf;
+        let n = self.increase_nonce();
+        debug_assert!(buf.iter().all(|&b| b == 0));
+        let tag = self
+            .cipher
+            .encrypt_inout_detached(&ChachaNonce::from(n), &[], InOutBuf::from(buf))
+            .expect("chacha20poly1305 seal cannot fail");
+        let mut out = [0u8; TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        out
+    }
+
+    /// Test-only allocating open: production decrypts via
+    /// [`Self::open_in_place`].
+    #[cfg(test)]
+    fn open(&mut self, buf: &[u8], aad: &[u8]) -> Result<Vec<u8>, io::Error> {
+        let n = self.increase_nonce();
         self.cipher
             .decrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: ciphertext,
-                    aad,
-                },
+                &ChachaNonce::from(n),
+                chacha20poly1305::aead::Payload { msg: buf, aad },
             )
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "aead open failed"))
     }
@@ -415,10 +494,18 @@ pub async fn handshake(
             }
             ServerKey::Mlkem(ek) => {
                 let pk = PublicKey::from_bytes(ek).map_err(|e| NativeError::Tls(e.to_string()))?;
-                let (ct, ss) =
-                    Mlkem768::encapsulate(&pk).map_err(|e| NativeError::Tls(e.to_string()))?;
-                hello[off..off + MLKEM_CT_LEN].copy_from_slice(ct.as_bytes());
-                nfs_key = Zeroizing::new(ss.as_bytes().to_vec());
+                // Encapsulate straight into the hello relay slot and a
+                // stack secret — no `Ciphertext`/`Vec` temps.
+                let mut ss = [0u8; 32];
+                let slot: &mut [u8; MLKEM_CT_LEN] = (&mut hello[off..off + MLKEM_CT_LEN])
+                    .try_into()
+                    .expect("relay slot");
+                Mlkem768::encapsulate_into(&pk, slot, &mut ss)
+                    .map_err(|e| NativeError::Tls(e.to_string()))?;
+                // Wrap before copying: the stack array itself has no wipe
+                // hook, so it must die inside `Zeroizing`.
+                let ss = Zeroizing::new(ss);
+                nfs_key = Zeroizing::new(ss.to_vec());
                 MLKEM_CT_LEN
             }
         };
@@ -449,29 +536,36 @@ pub async fn handshake(
     let mut nfs_aead = WireAead::new(&iv, &nfs_key);
 
     // Client PFS key exchange: ephemeral ML-KEM-768 + ephemeral X25519.
+    // The public material is staged in a stack array and sealed straight
+    // into the hello — no `pfs_public` Vec, no seal temp `Vec`s.
     let (mlkem_pk, mlkem_dsk) =
         Mlkem768::generate_keypair().map_err(|e| NativeError::Tls(e.to_string()))?;
     let x25519_eph = X25519KeyPair::generate(&rng).map_err(|e| NativeError::Tls(e.to_string()))?;
-    let mut pfs_public = Vec::with_capacity(1184 + X25519_LEN);
-    pfs_public.extend_from_slice(mlkem_pk.as_bytes());
-    pfs_public.extend_from_slice(&x25519_eph.public_key());
+    let mut pfs_public = [0u8; 1184 + X25519_LEN];
+    pfs_public[..1184].copy_from_slice(mlkem_pk.as_bytes());
+    pfs_public[1184..].copy_from_slice(&x25519_eph.public_key());
 
     let pfs_off = IV_LEN + relays_len;
-    hello[pfs_off..pfs_off + 18]
-        .copy_from_slice(&nfs_aead.seal(&encode_length(PFS_EXCHANGE_LEN - 18), &[]));
-    hello[pfs_off + 18..pfs_off + PFS_EXCHANGE_LEN]
-        .copy_from_slice(&nfs_aead.seal(&pfs_public, &[]));
+    let len_prefix = encode_length(PFS_EXCHANGE_LEN - 18);
+    nfs_aead.seal_into(&mut hello[pfs_off..pfs_off + 18], &len_prefix, &[]);
+    nfs_aead.seal_into(
+        &mut hello[pfs_off + 18..pfs_off + PFS_EXCHANGE_LEN],
+        &pfs_public,
+        &[],
+    );
 
     // Padding: a sealed [2B len] prefix, then the zero body sealed so the
     // ciphertext (body + tag) fills the remainder exactly (xray seals
     // `padding[18:paddingLength-16]` — zeros at that point — into the tail).
+    // The body region is already zeroed (fresh `vec![0u8; ..]` hello), so
+    // it seals in place with no staging `Vec`.
     debug_assert!(padding_len >= 34, "padding first block min is 35");
     let pad_off = pfs_off + PFS_EXCHANGE_LEN;
-    hello[pad_off..pad_off + 18]
-        .copy_from_slice(&nfs_aead.seal(&encode_length(padding_len - 18), &[]));
-    let body = vec![0u8; padding_len - 34];
-    let ct = nfs_aead.seal(&body, &[]);
-    hello[pad_off + 18..pad_off + padding_len].copy_from_slice(&ct);
+    let pad_len_prefix = encode_length(padding_len - 18);
+    nfs_aead.seal_into(&mut hello[pad_off..pad_off + 18], &pad_len_prefix, &[]);
+    let pad_body_end = pad_off + padding_len - TAG_LEN;
+    let pad_tag = nfs_aead.seal_zeros_in_place(&mut hello[pad_off + 18..pad_body_end]);
+    hello[pad_body_end..pad_off + padding_len].copy_from_slice(&pad_tag);
 
     // Fragmented send: the first fragment carries the whole pre-padding
     // prefix (xray folds it into paddingLens[0]); gaps between fragments
@@ -528,20 +622,23 @@ pub async fn handshake(
     let self_aead = WireAead::new(&pfs_public, &united);
     let mut peer_aead = WireAead::new(&server_pfs, &united);
 
-    let encrypted_ticket = &flight[pfs_len..pfs_len + TICKET_LEN];
     // xray opens the ticket IN PLACE and reuses its first 16 bytes
-    // (plaintext) as the random-mode inbound CTR IV.
-    let ticket_plain = peer_aead.open(encrypted_ticket, &[])?;
-    let encrypted_len = &flight[pfs_len + TICKET_LEN..];
-    let length_plain = peer_aead.open(encrypted_len, &[])?;
-    let peer_padding_len = decode_length(&length_plain);
+    // (plaintext) as the random-mode inbound CTR IV. Both fields are
+    // opened inside the flight buffer — no temp `Vec`s.
+    let mut flight = flight;
+    let ticket_len = peer_aead.open_in_place(&mut flight[pfs_len..pfs_len + TICKET_LEN], &[])?;
+    debug_assert_eq!(ticket_len, 16, "ticket plaintext is 16 bytes");
+    let length_len = peer_aead.open_in_place(&mut flight[pfs_len + TICKET_LEN..], &[])?;
+    let peer_padding_len = decode_length(&flight[pfs_len + TICKET_LEN..][..length_len]);
 
     // random mode: XOR-mask everything past the handshake except record
     // headers. The server's Hello tail (the padding still unread below) was
     // written before its masking layer engaged, so the inbound side skips
     // exactly those bytes (xray `NewXorConn(.., 0, peerPaddingLen)`).
     let (out_xor, in_xor) = if cfg.mode == MlkemMode::Random {
-        let ticket_iv: [u8; 16] = ticket_plain[..16].try_into().expect("ticket slice");
+        let ticket_iv: [u8; 16] = flight[pfs_len..pfs_len + 16]
+            .try_into()
+            .expect("ticket slice");
         (
             Some(new_ctr(&united, &iv)),
             Some(new_ctr(&united, &ticket_iv)),
@@ -704,7 +801,7 @@ impl AsyncRead for CommonConn {
                             }
                         }
                     }
-                    peer_aead.open(&padding, &[])?;
+                    peer_aead.open_in_place(&mut padding, &[])?;
                     *pad_pos = 0;
                     *header_pos = 0;
                     *phase = ReadPhase::Header;
@@ -745,7 +842,10 @@ impl AsyncRead for CommonConn {
                             "vless mlkem: invalid record header",
                         )));
                     }
-                    *payload = vec![0u8; l];
+                    // Reuse the payload allocation across records: `resize`
+                    // only allocates when a larger record arrives.
+                    payload.clear();
+                    payload.resize(l, 0);
                     *payload_pos = 0;
                     *phase = ReadPhase::Payload;
                 }
@@ -763,8 +863,11 @@ impl AsyncRead for CommonConn {
                             Poll::Pending => return Poll::Pending,
                         }
                     }
-                    let taken = std::mem::take(payload);
-                    *in_buf = peer_aead.open(&taken, header)?;
+                    let plain_len = peer_aead.open_in_place(payload, header)?;
+                    payload.truncate(plain_len);
+                    // Ping-pong the buffers so both keep their capacity:
+                    // `payload` becomes the next record's scratch.
+                    std::mem::swap(payload, in_buf);
                     *in_pos = 0;
                     *header_pos = 0;
                     *phase = ReadPhase::Header;
@@ -810,21 +913,21 @@ impl AsyncWrite for CommonConn {
             if accepted >= buf.len() {
                 return Poll::Ready(Ok(accepted));
             }
-            // Seal the next ≤8192-byte chunk as one record.
+            // Seal the next ≤8192-byte chunk as one record, framed and
+            // sealed inside `out_pending` — one copy of the chunk, no
+            // `seal` temp, no `record` temp.
             let end = std::cmp::min(buf.len(), accepted + MAX_CHUNK);
             let chunk = &buf[accepted..end];
-            let mut record = Vec::with_capacity(HEADER_LEN + chunk.len() + TAG_LEN);
             let hdr = encode_length_header(chunk.len() + TAG_LEN);
-            let sealed = aead.seal(chunk, &hdr);
             // random mode masks ONLY the wire header (xray `XorConn`); the
             // AEAD AAD stays the clear header.
             let mut wire_hdr = hdr;
             if let Some(ctr) = out_xor {
                 ctr.apply_keystream(&mut wire_hdr);
             }
-            record.extend_from_slice(&wire_hdr);
-            record.extend_from_slice(&sealed);
-            *out_pending = record;
+            out_pending.extend_from_slice(&wire_hdr);
+            out_pending.extend_from_slice(chunk);
+            aead.seal_append(out_pending, HEADER_LEN, &hdr);
             accepted = end;
         }
     }

@@ -186,12 +186,21 @@ fn verify_certificate_verify(
         TlsVersion::Tls13 => {
             let algorithm = tls13_algorithm(ctx.signature_scheme)?;
             let transcript_hash = ring::digest::digest(ctx.suite.digest(), ctx.signed_data);
-            let mut signed = Vec::with_capacity(64 + SERVER_CV_CONTEXT.len() + 32);
-            signed.resize(64, 0x20);
-            signed.extend_from_slice(SERVER_CV_CONTEXT);
-            signed.extend_from_slice(transcript_hash.as_ref());
+            // Stack-signed content: `64 spaces || SERVER_CV_CONTEXT ||
+            // transcript_hash`, sized to the SHA-384 max.
+            let mut signed = [0u8; 64 + 34 + 48];
+            signed[..64].fill(0x20);
+            signed[64..64 + SERVER_CV_CONTEXT.len()].copy_from_slice(SERVER_CV_CONTEXT);
+            let th = transcript_hash.as_ref();
+            if th.len() > 48 {
+                return Err(TlsError::Verify(
+                    "transcript hash exceeds SHA-384 length".to_string(),
+                ));
+            }
+            let content_len = 64 + SERVER_CV_CONTEXT.len() + th.len();
+            signed[64 + SERVER_CV_CONTEXT.len()..content_len].copy_from_slice(th);
             end_entity
-                .verify_signature(algorithm, &signed, signature)
+                .verify_signature(algorithm, &signed[..content_len], signature)
                 .map_err(|e| {
                     TlsError::Verify(format!(
                         "CertificateVerify signature verification failed: {e}"

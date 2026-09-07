@@ -8336,6 +8336,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "inout 0.2.2",
  "md-5",
  "parking_lot",
  "quinn",

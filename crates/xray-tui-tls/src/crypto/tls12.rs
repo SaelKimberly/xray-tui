@@ -85,6 +85,18 @@ impl Tls12Suite {
         }
     }
 
+    /// PRF hash output length in bytes (sizes `P_hash` scratch buffers).
+    #[must_use]
+    pub const fn prf_len(self) -> usize {
+        match self {
+            Self::EcdheRsaAes128GcmSha256
+            | Self::EcdheRsaChacha20Poly1305Sha256
+            | Self::EcdheEcdsaAes128GcmSha256
+            | Self::EcdheEcdsaChacha20Poly1305Sha256 => 32,
+            Self::EcdheRsaAes256GcmSha384 | Self::EcdheEcdsaAes256GcmSha384 => 48,
+        }
+    }
+
     /// AEAD key length in bytes.
     #[must_use]
     pub const fn key_len(self) -> usize {
@@ -124,11 +136,14 @@ fn p_hash(suite: Tls12Suite, secret: &[u8], seed: &[u8], out_len: usize) -> Zero
     let mut out = Zeroizing::new(Vec::with_capacity(out_len));
     // A(0) = seed.
     let mut a = Zeroizing::new(seed.to_vec());
+    // `A(i) || seed` scratch, hoisted out of the loop: every iteration
+    // refills the same allocation instead of building a fresh `Vec`.
+    let mut block_in = Zeroizing::new(Vec::with_capacity(suite.prf_len() + seed.len()));
     while out.len() < out_len {
         // A(i) = HMAC(secret, A(i-1)).
         a = hmac_sign(suite, secret, &a);
         // Block = HMAC(secret, A(i) || seed).
-        let mut block_in = Zeroizing::new(Vec::with_capacity(a.len() + seed.len()));
+        block_in.clear();
         block_in.extend_from_slice(&a);
         block_in.extend_from_slice(seed);
         let block = hmac_sign(suite, secret, &block_in);

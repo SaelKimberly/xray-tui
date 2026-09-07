@@ -18,7 +18,7 @@ use crate::handshake::{ServerVerifier, TlsVersion, VerifyContext};
 use crate::record::stream::{AppKeys, Tls12Aead, TlsStream};
 use crate::record::{
     AEAD_TAG_LEN, CONTENT_CHANGE_CIPHER_SPEC, CONTENT_HANDSHAKE, aead_aad_12,
-    make_handshake_record, make_record_12, parse_handshake_messages, read_record, skip_ccs,
+    make_handshake_record, parse_handshake_messages, read_record, skip_ccs,
 };
 
 // ── TLS 1.2 handshake message types (RFC 5246) ─────────────────────────────
@@ -78,7 +78,7 @@ async fn read_server_flight<S: AsyncRead + Unpin>(
                 break;
             }
             let msg_type = buf[consumed];
-            let body = buf[consumed + 4..consumed + total].to_vec();
+            let body = &buf[consumed + 4..consumed + total];
             transcript.extend_from_slice(&buf[consumed..consumed + total]);
             consumed += total;
 
@@ -362,20 +362,25 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .write_all(&[CONTENT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01])
         .await?;
 
-    // 11. Client Finished (encrypted with client_write_key, seq=0).
+    // 11. Client Finished (encrypted with client_write_key, seq=0), framed
+    // in place: header, explicit nonce, plaintext, tag — one buffer, with
+    // the seal happening inside the record buffer.
     let cf_verify = finished_verify_data(suite, &master, b"client finished", &handshake_hash);
     let cf_hs = crate::handshake::make_hs_msg(HS_FINISHED, &cf_verify);
     let cf_explicit = aead_for_client.explicit_nonce(0);
     let cf_nonce = aead_for_client.nonce(0, cf_explicit.as_slice())?;
     let cf_aad = aead_aad_12(0, CONTENT_HANDSHAKE, cf_hs.len());
-    let cf_ciphertext = client_write_key.seal_with_nonce(cf_nonce, &cf_aad, &cf_hs)?;
-    stream
-        .write_all(&make_record_12(
-            CONTENT_HANDSHAKE,
-            cf_explicit.as_slice(),
-            &cf_ciphertext,
-        ))
-        .await?;
+    let cf_ct_len = cf_hs.len() + AEAD_TAG_LEN;
+    let cf_body_len = cf_explicit.as_slice().len() + cf_ct_len;
+    let mut cf_record = Vec::with_capacity(5 + cf_body_len);
+    cf_record.push(CONTENT_HANDSHAKE);
+    cf_record.extend_from_slice(&0x0303u16.to_be_bytes());
+    cf_record.extend_from_slice(&u16::try_from(cf_body_len).unwrap_or(u16::MAX).to_be_bytes());
+    let cf_pt_start = cf_record.len() + cf_explicit.as_slice().len();
+    cf_record.extend_from_slice(cf_explicit.as_slice());
+    cf_record.extend_from_slice(&cf_hs);
+    client_write_key.seal_in_place_with_nonce(cf_nonce, &cf_aad, &mut cf_record, cf_pt_start)?;
+    stream.write_all(&cf_record).await?;
     transcript.extend_from_slice(&cf_hs);
 
     // 12. Read the server's closing flight. RFC 5077 §3.3 puts
@@ -412,14 +417,24 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         "TLS 1.2 server Finished record too short".into(),
                     ));
                 }
-                let sf_explicit = rec.payload[..explicit_len].to_vec();
-                let mut sf_ct = rec.payload[explicit_len..].to_vec();
-                let sf_plaintext_len = sf_ct.len() - AEAD_TAG_LEN;
+                // Open inside the record buffer: the explicit nonce is only
+                // borrowed for the nonce build, then the ciphertext tail is
+                // decrypted in place and the nonce prefix drained — no
+                // `to_vec` pair, no allocating twin.
+                let mut payload = rec.payload;
                 let sf_nonce = aead_for_server
-                    .nonce(0, &sf_explicit)
+                    .nonce(0, &payload[..explicit_len])
                     .map_err(|e| TlsError::Handshake(e.to_string()))?;
+                let sf_plaintext_len = payload.len() - explicit_len - AEAD_TAG_LEN;
                 let sf_aad = aead_aad_12(0, CONTENT_HANDSHAKE, sf_plaintext_len);
-                break server_write_key.open_with_nonce(sf_nonce, &sf_aad, &mut sf_ct)?;
+                let plain_len = server_write_key.open_in_place_with_nonce(
+                    sf_nonce,
+                    &sf_aad,
+                    &mut payload[explicit_len..],
+                )?;
+                payload.drain(..explicit_len);
+                payload.truncate(plain_len);
+                break payload;
             }
             other => {
                 return Err(TlsError::Handshake(format!(

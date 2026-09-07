@@ -15,7 +15,7 @@ use thiserror::Error;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 /// ML-KEM-768 public key (1184 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicKey(Vec<u8>);
+pub struct PublicKey([u8; 1184]);
 
 /// ML-KEM-768 secret key (2400 bytes).
 ///
@@ -23,7 +23,7 @@ pub struct PublicKey(Vec<u8>);
 /// enough to recover every shared secret negotiated with it. `Debug` prints
 /// the length only — the derive would dump the key into any log line.
 #[derive(Clone, PartialEq, Eq, ZeroizeOnDrop)]
-pub struct SecretKey(Vec<u8>);
+pub struct SecretKey([u8; 2400]);
 
 impl core::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -33,7 +33,7 @@ impl core::fmt::Debug for SecretKey {
 
 /// ML-KEM-768 ciphertext (1088 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ciphertext(Vec<u8>);
+pub struct Ciphertext([u8; 1088]);
 
 /// ML-KEM-768 shared secret (32 bytes).
 ///
@@ -69,12 +69,15 @@ pub enum MlkemError {
 }
 
 impl PublicKey {
-    /// Create a [`PublicKey`] from raw bytes.
+    /// Create a [`PublicKey`] from raw bytes: copied once into the fixed
+    /// array, no `Vec` allocation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
         if bytes.len() != 1184 {
             return Err(MlkemError::InvalidPublicKeyLength(bytes.len()));
         }
-        Ok(Self(bytes.to_vec()))
+        let mut arr = [0u8; 1184];
+        arr.copy_from_slice(bytes);
+        Ok(Self(arr))
     }
 
     /// Get the raw bytes of the public key.
@@ -84,12 +87,15 @@ impl PublicKey {
     }
 }
 impl SecretKey {
-    /// Create a [`SecretKey`] from raw bytes.
+    /// Create a [`SecretKey`] from raw bytes: copied once into the fixed
+    /// array, no `Vec` allocation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
         if bytes.len() != 2400 {
             return Err(MlkemError::InvalidSecretKeyLength(bytes.len()));
         }
-        Ok(Self(bytes.to_vec()))
+        let mut arr = [0u8; 2400];
+        arr.copy_from_slice(bytes);
+        Ok(Self(arr))
     }
 
     /// Get the raw bytes of the secret key.
@@ -99,12 +105,15 @@ impl SecretKey {
     }
 }
 impl Ciphertext {
-    /// Create a [`Ciphertext`] from raw bytes.
+    /// Create a [`Ciphertext`] from raw bytes: copied once into the fixed
+    /// array, no `Vec` allocation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
         if bytes.len() != 1088 {
             return Err(MlkemError::InvalidCiphertextLength(bytes.len()));
         }
-        Ok(Self(bytes.to_vec()))
+        let mut arr = [0u8; 1088];
+        arr.copy_from_slice(bytes);
+        Ok(Self(arr))
     }
 
     /// Get the raw bytes of the ciphertext.
@@ -147,7 +156,16 @@ impl Mlkem768 {
     pub fn generate_keypair() -> Result<(PublicKey, SecretKey), MlkemError> {
         let kem = Self::kem()?;
         let (pk, sk) = kem.keypair().map_err(|_| MlkemError::KeygenFailed)?;
-        Ok((PublicKey(pk.into_vec()), SecretKey(sk.into_vec())))
+        let pk_vec = pk.into_vec();
+        let sk_vec = sk.into_vec();
+        if pk_vec.len() != 1184 || sk_vec.len() != 2400 {
+            return Err(MlkemError::KeygenFailed);
+        }
+        let mut pk_arr = [0u8; 1184];
+        let mut sk_arr = [0u8; 2400];
+        pk_arr.copy_from_slice(&pk_vec);
+        sk_arr.copy_from_slice(&sk_vec);
+        Ok((PublicKey(pk_arr), SecretKey(sk_arr)))
     }
 
     /// Derive a keypair from the 64-byte FIPS 203 keygen seed (`d || z`).
@@ -169,7 +187,16 @@ impl Mlkem768 {
         let (pk, sk) = kem
             .keypair_derand(seed_ref)
             .map_err(|_| MlkemError::KeygenFailed)?;
-        Ok((PublicKey(pk.into_vec()), SecretKey(sk.into_vec())))
+        let pk_vec = pk.into_vec();
+        let sk_vec = sk.into_vec();
+        if pk_vec.len() != 1184 || sk_vec.len() != 2400 {
+            return Err(MlkemError::KeygenFailed);
+        }
+        let mut pk_arr = [0u8; 1184];
+        let mut sk_arr = [0u8; 2400];
+        pk_arr.copy_from_slice(&pk_vec);
+        sk_arr.copy_from_slice(&sk_vec);
+        Ok((PublicKey(pk_arr), SecretKey(sk_arr)))
     }
 
     /// Encapsulate a shared secret to the given public key.
@@ -178,6 +205,31 @@ impl Mlkem768 {
     /// - [`Ciphertext`] is 1088 bytes (to be sent to the key holder)
     /// - [`SharedSecret`] is 32 bytes (the derived secret)
     pub fn encapsulate(pk: &PublicKey) -> Result<(Ciphertext, SharedSecret), MlkemError> {
+        let mut ct = [0u8; 1088];
+        let mut ss = [0u8; 32];
+        Self::encapsulate_into(pk, &mut ct, &mut ss)?;
+        // `encapsulate_into` leaves the shared secret in a plain caller
+        // buffer; move it into the wiping wrapper here (the zeroize happens
+        // on drop, same as before).
+        let ss = Zeroizing::new(ss);
+        Ok((
+            Ciphertext(ct),
+            SharedSecret::from_bytes(ss.as_slice()).map_err(|_| MlkemError::EncapsulateFailed)?,
+        ))
+    }
+
+    /// Encapsulate a shared secret into caller buffers: the ciphertext
+    /// lands in `ct_out`, the shared secret in `ss_out`.
+    ///
+    /// The allocation-free counterpart of [`Self::encapsulate`]: handshake
+    /// code sealing straight into a flight buffer skips the intermediate
+    /// [`Ciphertext`]/`Vec` copies. `ss_out` is a plain buffer (no wipe
+    /// hook) — wrap it in [`Zeroizing`] when it outlives this call.
+    pub fn encapsulate_into(
+        pk: &PublicKey,
+        ct_out: &mut [u8; 1088],
+        ss_out: &mut [u8; 32],
+    ) -> Result<(), MlkemError> {
         let kem = Self::kem()?;
         let oqs_pk = kem
             .public_key_from_bytes(&pk.0)
@@ -188,10 +240,13 @@ impl Mlkem768 {
         // liboqs' own `SharedSecret` is a plain `Vec<u8>` with no `Drop`
         // wipe; take ownership of the allocation so it is cleared here.
         let ss = Zeroizing::new(ss.into_vec());
-        Ok((
-            Ciphertext(ct.into_vec()),
-            SharedSecret::from_bytes(&ss).map_err(|_| MlkemError::EncapsulateFailed)?,
-        ))
+        let ct_vec = ct.into_vec();
+        if ct_vec.len() != 1088 || ss.len() != 32 {
+            return Err(MlkemError::EncapsulateFailed);
+        }
+        ct_out.copy_from_slice(&ct_vec);
+        ss_out.copy_from_slice(&ss);
+        Ok(())
     }
 
     /// Decapsulate a shared secret from the given ciphertext using the secret key.

@@ -10,7 +10,10 @@ use std::ops::Range;
 
 use crate::error::TlsError;
 use crate::spec::grease::GREASE_PLACEHOLDER;
-use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec};
+use crate::spec::{
+    ClientHelloSpec, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec,
+    encode_alpn_override_into, encode_supported_groups_into, encode_supported_versions_into,
+};
 
 pub mod parse;
 pub use crate::SecureRandom;
@@ -75,7 +78,6 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
 
     let mut rt = RuntimeValues {
         server_name: params.server_name.to_string(),
-        alpn: effective_alpn(spec, params.alpn),
         x25519_pub: *params.x25519_pub,
         mlkem768_pub: params.mlkem768_pub.unwrap_or(&[]).to_vec(),
         grease_a,
@@ -91,8 +93,6 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
         .map_err(|_| TlsError::Crypto("client random failed".to_string()))?;
 
     // Legacy session id: 32 random bytes (TLS 1.3 default) or the REALITY
-    // auth payload slot (len zero bytes; the range is recorded so a later
-    // stage can overwrite them with the payload).
     let (session_id, session_id_range) = match &spec.session_id {
         SessionIdSpec::Random32 => {
             let mut sid = [0u8; 32];
@@ -137,14 +137,16 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
         .map_err(|_| TlsError::Spec("cipher suites exceed u16 length".to_string()))?;
     body.extend_from_slice(&cs_len.to_be_bytes());
     let mut first_cs_grease = true;
-    let mut used_cs = vec![grease_a];
+    let mut used_cs = [0u16; 16];
+    used_cs[0] = grease_a;
+    let mut used_cs_len = 1usize;
     for &cs in &spec.cipher_suites {
         let v = if cs == GREASE_PLACEHOLDER {
             if first_cs_grease {
                 first_cs_grease = false;
                 grease_a
             } else {
-                draw_grease_distinct(params.rng, &mut used_cs)?
+                draw_grease_distinct(params.rng, &mut used_cs, &mut used_cs_len)?
             }
         } else {
             cs
@@ -158,19 +160,18 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
     // Extensions in spec order.
     let mut ext_bytes = Vec::with_capacity(spec.extensions.len() * 8);
     let mut first_grease_ext = true;
-    let mut used_ext = vec![rt.grease_b];
+    let mut used_ext = [0u16; 16];
+    used_ext[0] = rt.grease_b;
+    let mut used_ext_len = 1usize;
     for ext in &spec.extensions {
         match ext {
             ExtensionSpec::Alpn(_) => {
-                let encoded = match params.alpn {
-                    Some(protos) => {
-                        let list: Vec<String> =
-                            protos.iter().copied().map(str::to_string).collect();
-                        ExtensionSpec::Alpn(list).encode_body(&rt)?
-                    }
-                    None => ext.encode_body(&rt)?,
-                };
-                ext_bytes.extend_from_slice(&encoded);
+                match params.alpn {
+                    // The override encodes straight from `&[&str]` — no
+                    // `Vec<String>` staging.
+                    Some(protos) => encode_alpn_override_into(protos, &mut ext_bytes)?,
+                    None => ext.encode_body_into(&rt, &mut ext_bytes)?,
+                }
             }
             ExtensionSpec::Grease => {
                 // Standalone GREASE extensions must carry DISTINCT values:
@@ -184,31 +185,41 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                     first_grease_ext = false;
                     rt.grease_b
                 } else {
-                    draw_grease_distinct(params.rng, &mut used_ext)?
+                    draw_grease_distinct(params.rng, &mut used_ext, &mut used_ext_len)?
                 };
-                let mut encoded = Vec::with_capacity(5);
-                encoded.extend_from_slice(&value.to_be_bytes());
-                encoded.extend_from_slice(&[0x00, 0x01, 0x00]); // len 1, body [0x00]
-                ext_bytes.extend_from_slice(&encoded);
+                // len 1, body [0x00] — framed straight into the list buffer.
+                ext_bytes.extend_from_slice(&value.to_be_bytes());
+                ext_bytes.extend_from_slice(&[0x00, 0x01, 0x00]);
             }
             ExtensionSpec::SupportedGroups(groups) => {
                 if groups.contains(&GREASE_PLACEHOLDER) {
-                    let mut g = groups.clone();
-                    fill_grease(&mut g, grease_a, params.rng)?;
-                    ext_bytes
-                        .extend_from_slice(&ExtensionSpec::SupportedGroups(g).encode_body(&rt)?);
+                    // GREASE-fill a stack array instead of cloning the Vec.
+                    let mut tmp = [0u16; 32];
+                    if groups.len() > tmp.len() {
+                        return Err(TlsError::Spec(
+                            "supported_groups exceeds 32 entries".to_string(),
+                        ));
+                    }
+                    tmp[..groups.len()].copy_from_slice(groups);
+                    fill_grease(&mut tmp[..groups.len()], grease_a, params.rng)?;
+                    encode_supported_groups_into(&tmp[..groups.len()], &mut ext_bytes)?;
                 } else {
-                    ext_bytes.extend_from_slice(&ext.encode_body(&rt)?);
+                    ext.encode_body_into(&rt, &mut ext_bytes)?;
                 }
             }
             ExtensionSpec::SupportedVersions(versions) => {
                 if versions.contains(&GREASE_PLACEHOLDER) {
-                    let mut v = versions.clone();
-                    fill_grease(&mut v, grease_a, params.rng)?;
-                    ext_bytes
-                        .extend_from_slice(&ExtensionSpec::SupportedVersions(v).encode_body(&rt)?);
+                    let mut tmp = [0u16; 32];
+                    if versions.len() > tmp.len() {
+                        return Err(TlsError::Spec(
+                            "supported_versions exceeds 32 entries".to_string(),
+                        ));
+                    }
+                    tmp[..versions.len()].copy_from_slice(versions);
+                    fill_grease(&mut tmp[..versions.len()], grease_a, params.rng)?;
+                    encode_supported_versions_into(&tmp[..versions.len()], &mut ext_bytes)?;
                 } else {
-                    ext_bytes.extend_from_slice(&ext.encode_body(&rt)?);
+                    ext.encode_body_into(&rt, &mut ext_bytes)?;
                 }
             }
             ExtensionSpec::Padding => {
@@ -235,10 +246,10 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
                 let padding_len = PADDING_TARGET.saturating_sub(acc_record + 4);
                 if padding_len > 0 {
                     rt.padding_len = padding_len;
-                    ext_bytes.extend_from_slice(&ext.encode_body(&rt)?);
+                    ext.encode_body_into(&rt, &mut ext_bytes)?;
                 }
             }
-            _ => ext_bytes.extend_from_slice(&ext.encode_body(&rt)?),
+            _ => ext.encode_body_into(&rt, &mut ext_bytes)?,
         }
     }
 
@@ -283,14 +294,23 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
 #[must_use]
 pub fn to_record(handshake_bytes: &[u8]) -> Vec<u8> {
     let mut record = Vec::with_capacity(5 + handshake_bytes.len());
-    record.push(0x16); // ContentType: handshake
-    record.extend_from_slice(&0x0301u16.to_be_bytes()); // legacy record version
+    to_record_into(handshake_bytes, &mut record);
+    record
+}
+
+/// Appends a TLS handshake record framing of `handshake_bytes` to `out`:
+/// `0x16 0x0301 <len u16 BE> <handshake>`.
+///
+/// The allocation-free counterpart of [`to_record`]: drivers framing into
+/// a send buffer skip the dedicated record allocation.
+pub fn to_record_into(handshake_bytes: &[u8], out: &mut Vec<u8>) {
+    out.push(0x16); // ContentType: handshake
+    out.extend_from_slice(&0x0301u16.to_be_bytes()); // legacy record version
     // A ClientHello never approaches the u16 record length limit; saturate
     // defensively rather than panic on a pathological spec.
     let len = u16::try_from(handshake_bytes.len()).unwrap_or(u16::MAX);
-    record.extend_from_slice(&len.to_be_bytes());
-    record.extend_from_slice(handshake_bytes);
-    record
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(handshake_bytes);
 }
 
 /// Returns `true` if the spec contains any GREASE placeholder slot.
@@ -312,21 +332,21 @@ fn spec_has_grease(spec: &ClientHelloSpec) -> bool {
 /// from every value already used in this namespace.
 fn fill_grease(values: &mut [u16], grease_a: u16, rng: &dyn SecureRandom) -> Result<(), TlsError> {
     let mut first = true;
-    let mut used = vec![grease_a];
+    let mut used = [0u16; 16];
+    used[0] = grease_a;
+    let mut used_len = 1usize;
     for v in values.iter_mut() {
         if *v == GREASE_PLACEHOLDER {
             *v = if first {
                 first = false;
                 grease_a
             } else {
-                draw_grease_distinct(rng, &mut used)?
+                draw_grease_distinct(rng, &mut used, &mut used_len)?
             };
         }
     }
     Ok(())
 }
-
-/// Draws a GREASE value uniformly from the 16 RFC 8701 values.
 ///
 /// Mirrors `spec::grease::random_grease`, which is bounded to ring's sealed
 /// `SecureRandom` and therefore unusable through the crate-local seam.
@@ -351,34 +371,24 @@ fn draw_grease(rng: &dyn SecureRandom) -> Result<u16, TlsError> {
 /// with real randomness the chance of 8 consecutive collisions is
 /// (1/16)^8, while a degenerate fixed-seed RNG (tests, golden vectors)
 /// falls back to the reference's all-equal output instead of failing.
-fn draw_grease_distinct(rng: &dyn SecureRandom, used: &mut Vec<u16>) -> Result<u16, TlsError> {
+fn draw_grease_distinct(
+    rng: &dyn SecureRandom,
+    used: &mut [u16; 16],
+    used_len: &mut usize,
+) -> Result<u16, TlsError> {
     const ATTEMPTS: usize = 8;
     let mut last = 0;
     for _ in 0..ATTEMPTS {
         last = draw_grease(rng)?;
-        if !used.contains(&last) {
-            used.push(last);
+        if !used[..*used_len].contains(&last) {
+            if *used_len < used.len() {
+                used[*used_len] = last;
+                *used_len += 1;
+            }
             return Ok(last);
         }
     }
     Ok(last)
-}
-
-/// The ALPN list to inject: `params.alpn` wins, else the spec's first ALPN
-/// extension, else empty.
-fn effective_alpn(spec: &ClientHelloSpec, override_alpn: Option<&[&str]>) -> Vec<String> {
-    override_alpn.map_or_else(
-        || {
-            spec.extensions
-                .iter()
-                .find_map(|e| match e {
-                    ExtensionSpec::Alpn(list) => Some(list.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        },
-        |protos| protos.iter().copied().map(str::to_string).collect(),
-    )
 }
 
 #[cfg(test)]

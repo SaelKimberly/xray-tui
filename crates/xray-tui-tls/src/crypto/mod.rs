@@ -194,33 +194,70 @@ impl hkdf::KeyType for ExpandLen {
     }
 }
 
+/// Maximum transcript-hash / PRK length over all suites (SHA-384, 48
+/// bytes); SHA-256 suites use the first 32. Stack buffers sized to this
+/// hold every suite's secret with no allocation.
+pub(crate) const MAX_HASH_LEN: usize = 48;
+
+/// Compile-time proof the stack buffers fit every suite's hash length.
+const _: () = assert!(CipherSuiteId::Aes128GcmSha256.hash_len() <= MAX_HASH_LEN);
+const _: () = assert!(CipherSuiteId::Aes256GcmSha384.hash_len() <= MAX_HASH_LEN);
+const _: () = assert!(CipherSuiteId::Chacha20Poly1305Sha256.hash_len() <= MAX_HASH_LEN);
+
 /// Hash of the empty string for `suite`, used as the context of the
 /// `"derived"` expansion steps (RFC 8446 §7.1).
+///
+/// Returns the digest bytes plus the valid length (`suite.hash_len()`):
+/// only `out[..len]` is meaningful.
 #[must_use]
-pub fn empty_hash(suite: CipherSuiteId) -> Vec<u8> {
+pub fn empty_hash(suite: CipherSuiteId) -> ([u8; MAX_HASH_LEN], usize) {
     transcript_digest(suite, &[])
 }
 
 /// Transcript-Hash of `data` for `suite`.
-fn transcript_digest(suite: CipherSuiteId, data: &[u8]) -> Vec<u8> {
-    digest::digest(suite.digest(), data).as_ref().to_vec()
+///
+/// Stack return, no `Vec`: the digest is copied once into a fixed buffer
+/// and the valid prefix length rides along. Callers must use `out[..len]`
+/// — the tail is zero padding, and feeding the full 48 bytes into HKDF
+/// for a SHA-256 suite would derive the wrong secret.
+fn transcript_digest(suite: CipherSuiteId, data: &[u8]) -> ([u8; MAX_HASH_LEN], usize) {
+    let computed = digest::digest(suite.digest(), data);
+    let bytes = computed.as_ref();
+    let mut out = [0u8; MAX_HASH_LEN];
+    out[..bytes.len()].copy_from_slice(bytes);
+    (out, bytes.len())
 }
 
-// ── TLS 1.3 key schedule ───────────────────────────────────────────────────
-
 /// One direction pair of TLS 1.3 traffic secrets, `(client, server)`. Both
-/// halves wipe on drop.
-pub type TrafficSecrets = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
-
+/// halves wipe on drop. Only `secret[..hash_len]` is meaningful (see
+/// [`transcript_digest`]).
+pub type TrafficSecrets = (Zeroizing<[u8; MAX_HASH_LEN]>, Zeroizing<[u8; MAX_HASH_LEN]>);
 /// Incremental TLS 1.3 key schedule.
 ///
 /// Mirrors the `tls-fingerprint` flow: `new` seeds the `EarlySecret`, then
-/// `handshake_secret` → `handshake_traffic_secrets`, then `master_secret` →
-/// `app_traffic_secrets`. `add_transcript` feeds handshake messages as they
-/// arrive; `derive_secret` hashes whatever transcript has accumulated.
 pub struct KeySchedule {
     suite: CipherSuiteId,
     transcript: Vec<u8>,
+}
+
+/// Maps an `HKDF-Expand-Label` label to its full `tls13 ...` wire form
+/// (RFC 8446 §7.1) without `format!`.
+///
+/// The engine only derives the labels below; anything else is a caller bug,
+/// reported as an error rather than formatted onto the wire.
+fn tls13_label(label: &str) -> Result<&'static [u8]> {
+    match label {
+        "key" => Ok(b"tls13 key"),
+        "iv" => Ok(b"tls13 iv"),
+        "finished" => Ok(b"tls13 finished"),
+        "derived" => Ok(b"tls13 derived"),
+        "c hs traffic" => Ok(b"tls13 c hs traffic"),
+        "s hs traffic" => Ok(b"tls13 s hs traffic"),
+        "c ap traffic" => Ok(b"tls13 c ap traffic"),
+        "s ap traffic" => Ok(b"tls13 s ap traffic"),
+        "exp master" => Ok(b"tls13 exp master"),
+        _ => Err(TlsError::Crypto("unknown HKDF-Expand-Label label".into())),
+    }
 }
 
 impl KeySchedule {
@@ -238,27 +275,95 @@ impl KeySchedule {
         self.transcript.extend_from_slice(hs_msg);
     }
 
-    /// Transcript-Hash of everything added so far.
+    /// Transcript-Hash of everything added so far: stack return, no `Vec`.
+    /// Only `hash[..len]` is meaningful (see [`transcript_digest`]).
     #[must_use]
-    pub fn transcript_hash(&self) -> Vec<u8> {
+    pub fn transcript_hash(&self) -> ([u8; MAX_HASH_LEN], usize) {
         transcript_digest(self.suite, &self.transcript)
+    }
+
+    /// The raw accumulated transcript (handshake messages in wire order),
+    /// for verifiers that hash it themselves.
+    #[must_use]
+    pub fn transcript_bytes(&self) -> &[u8] {
+        &self.transcript
     }
 
     /// HKDF-Extract(salt, ikm) → PRK bytes.
     ///
     /// HKDF-Extract(salt, ikm) = HMAC(salt, ikm); ring's `Prk` hides its
     /// bytes, so the HMAC is computed directly — identical to what ring's
-    /// `Salt::extract` does internally.
+    /// `Salt::extract` does internally. Only `out[..hash_len]` is the PRK;
+    /// the tail is zero padding (never feed the full array onward).
     ///
     /// The returned PRK wipes on drop. ring's intermediate `hmac::Tag` is a
-    /// stack value with no wipe hook — the heap copy is what we own.
-    pub fn hkdf_extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    /// stack value with no wipe hook — the array copy is what we own, with
+    /// no heap allocation and no realloc-copy of secret material.
+    pub fn hkdf_extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
         let key = hmac::Key::new(self.suite.hmac_alg(), salt);
-        Ok(Zeroizing::new(hmac::sign(&key, ikm).as_ref().to_vec()))
+        let tag = hmac::sign(&key, ikm);
+        let tag_bytes = tag.as_ref();
+        let mut out = Zeroizing::new([0u8; MAX_HASH_LEN]);
+        out[..tag_bytes.len()].copy_from_slice(tag_bytes);
+        Ok(out)
+    }
+    /// HKDF-Expand-Label(prk, label, ctx, len) per RFC 8446 §7.1.
+    ///
+    /// Stack implementation: the `info` encoding lives in a `[u8; 128]`
+    /// scratch (non-secret — label digits and the transcript hash are
+    /// public) and the output in a wiped `[u8; 48]`; only `out[..len]` is
+    /// meaningful. `len` is bounded to `MAX_HASH_LEN`: every in-engine use
+    /// (key, IV, traffic secret, finished) fits a hash length.
+    pub fn hkdf_expand_label_stack(
+        &self,
+        prk: &[u8],
+        label: &str,
+        ctx: &[u8],
+        len: usize,
+    ) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        if len > MAX_HASH_LEN {
+            return Err(TlsError::Crypto(
+                "HKDF-Expand-Label length too large".into(),
+            ));
+        }
+        let len16 = u16::try_from(len)
+            .map_err(|_| TlsError::Crypto("HKDF-Expand-Label length too large".into()))?;
+        let full_label = tls13_label(label)?;
+        let ctx_len = u8::try_from(ctx.len())
+            .map_err(|_| TlsError::Crypto("HKDF-Expand-Label context too long".into()))?;
+
+        // HkdfLabel: uint16 length || uint8 label_len || label ||
+        //            uint8 ctx_len || ctx
+        let mut info = [0u8; 128];
+        let info_len = 2 + 1 + full_label.len() + 1 + ctx.len();
+        if info_len > info.len() {
+            return Err(TlsError::Crypto(
+                "HKDF-Expand-Label context too long".into(),
+            ));
+        }
+        info[..2].copy_from_slice(&len16.to_be_bytes());
+        info[2] = full_label.len() as u8;
+        info[3..3 + full_label.len()].copy_from_slice(full_label);
+        info[3 + full_label.len()] = ctx_len;
+        info[4 + full_label.len()..info_len].copy_from_slice(ctx);
+
+        let prk = Prk::new_less_safe(self.suite.hkdf_alg(), prk);
+        let info_slice: &[u8] = &info[..info_len];
+        let info_arr = [info_slice];
+        let okm = prk
+            .expand(&info_arr, ExpandLen(len))
+            .map_err(|_| TlsError::Crypto(format!("HKDF-Expand-Label({label}) failed")))?;
+        let mut out = Zeroizing::new([0u8; MAX_HASH_LEN]);
+        okm.fill(&mut out[..len])
+            .map_err(|_| TlsError::Crypto("HKDF fill failed".into()))?;
+        Ok(out)
     }
 
-    /// HKDF-Expand-Label(prk, label, ctx, len) per RFC 8446 §7.1.
-    pub fn hkdf_expand_label(
+    /// The pre-Task-3 heap `HKDF-Expand-Label` (`format!` + `Vec` info),
+    /// kept as the test oracle for
+    /// [`hkdf_expand_label_stack_matches_heap`](tests::hkdf_expand_label_stack_matches_heap).
+    #[cfg(test)]
+    pub fn hkdf_expand_label_heap(
         &self,
         prk: &[u8],
         label: &str,
@@ -298,21 +403,26 @@ impl KeySchedule {
     }
 
     /// `Derive-Secret(prk, label)` = `HKDF-Expand-Label(prk, label,
-    /// Hash(transcript), hash_len)`.
-    pub fn derive_secret(&self, prk: &[u8], label: &str) -> Result<Zeroizing<Vec<u8>>> {
-        let h = self.transcript_hash();
-        self.hkdf_expand_label(prk, label, &h, self.suite.hash_len())
+    /// Hash(transcript), hash_len)`. Only `secret[..hash_len]` is valid.
+    pub fn derive_secret(&self, prk: &[u8], label: &str) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        let (h, hn) = self.transcript_hash();
+        self.hkdf_expand_label_stack(prk, label, &h[..hn], self.suite.hash_len())
     }
 
     /// `handshake_secret` = `HKDF-Extract(Derive-Secret(early_secret,
-    /// "derived", ""), shared_secret)`.
-    pub fn handshake_secret(&self, shared_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    /// "derived", ""), shared_secret)`. Only `secret[..hash_len]` is valid.
+    pub fn handshake_secret(&self, shared_secret: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
         let hash_len = self.suite.hash_len();
-        let zeros = vec![0u8; hash_len];
-        let early = self.hkdf_extract(&zeros, &zeros)?;
-        let derived =
-            self.hkdf_expand_label(&early, "derived", &empty_hash(self.suite), hash_len)?;
-        self.hkdf_extract(&derived, shared_secret)
+        let zeros = [0u8; MAX_HASH_LEN];
+        let early = self.hkdf_extract(&zeros[..hash_len], &zeros[..hash_len])?;
+        let (empty, empty_len) = empty_hash(self.suite);
+        let derived = self.hkdf_expand_label_stack(
+            &early[..hash_len],
+            "derived",
+            &empty[..empty_len],
+            hash_len,
+        )?;
+        self.hkdf_extract(&derived[..hash_len], shared_secret)
     }
 
     /// `(c hs traffic, s hs traffic)` from the handshake secret and the
@@ -324,13 +434,14 @@ impl KeySchedule {
     }
 
     /// `master_secret` = `HKDF-Extract(Derive-Secret(hs_secret, "derived",
-    /// ""), 0^hash_len)`.
-    pub fn master_secret(&self, hs_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    /// ""), 0^hash_len)`. Only `secret[..hash_len]` is valid.
+    pub fn master_secret(&self, hs_secret: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
         let hash_len = self.suite.hash_len();
+        let (empty, empty_len) = empty_hash(self.suite);
         let derived =
-            self.hkdf_expand_label(hs_secret, "derived", &empty_hash(self.suite), hash_len)?;
-        let zeros = vec![0u8; hash_len];
-        self.hkdf_extract(&derived, &zeros)
+            self.hkdf_expand_label_stack(hs_secret, "derived", &empty[..empty_len], hash_len)?;
+        let zeros = [0u8; MAX_HASH_LEN];
+        self.hkdf_extract(&derived[..hash_len], &zeros[..hash_len])
     }
 
     /// `(c ap traffic, s ap traffic)` from the master secret and the
@@ -342,18 +453,20 @@ impl KeySchedule {
     }
 
     /// `Finished` key = `HKDF-Expand-Label(traffic_secret, "finished", "",
-    /// hash_len)`.
-    pub fn finished_key(&self, traffic_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        self.hkdf_expand_label(traffic_secret, "finished", &[], self.suite.hash_len())
+    /// hash_len)`. Only `key[..hash_len]` is valid.
+    pub fn finished_key(&self, traffic_secret: &[u8]) -> Result<Zeroizing<[u8; MAX_HASH_LEN]>> {
+        self.hkdf_expand_label_stack(traffic_secret, "finished", &[], self.suite.hash_len())
     }
 
     /// `Finished` `verify_data` = `HMAC(finished_key,
-    /// Transcript-Hash(transcript))`.
+    /// Transcript-Hash(transcript))`. The MAC is sent on the wire, so it is
+    /// a plain (non-`Zeroizing`) value; the transcript hash feeding it is
+    /// the stack form, with no transcript copy.
     #[must_use]
     pub fn finished_mac(&self, finished_key: &[u8]) -> Vec<u8> {
-        let th = self.transcript_hash();
+        let (th, thn) = self.transcript_hash();
         let key = hmac::Key::new(self.suite.hmac_alg(), finished_key);
-        hmac::sign(&key, &th).as_ref().to_vec()
+        hmac::sign(&key, &th[..thn]).as_ref().to_vec()
     }
 }
 
@@ -377,11 +490,11 @@ impl AeadKey {
         // wipe hook; what we own — and what `hkdf_expand_label` hands back as
         // `Zeroizing` — are these derivation buffers. The write IV alone is
         // not a secret without the key, so it stays a plain array.
-        let key_bytes = ks.hkdf_expand_label(secret, "key", &[], suite.key_len())?;
-        let iv_vec = ks.hkdf_expand_label(secret, "iv", &[], 12)?;
+        let key_bytes = ks.hkdf_expand_label_stack(secret, "key", &[], suite.key_len())?;
+        let iv_arr = ks.hkdf_expand_label_stack(secret, "iv", &[], 12)?;
         let mut iv = [0u8; 12];
-        iv.copy_from_slice(&iv_vec);
-        Self::from_key_iv(suite, &key_bytes, iv)
+        iv.copy_from_slice(&iv_arr[..12]);
+        Self::from_key_iv(suite, &key_bytes[..suite.key_len()], iv)
     }
 
     /// Builds a record key directly from raw key bytes with a zero IV
@@ -421,6 +534,10 @@ impl AeadKey {
         n
     }
 
+    /// Test-only copy of the pre-Task-3 allocating seal: production seals
+    /// through [`Self::seal_in_place`], so this twin exists only for the
+    /// round-trip tests below.
+    #[cfg(test)]
     /// Encrypts `plaintext` under `(seq, aad)`, appending the AEAD tag.
     pub fn seal(&self, seq: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = Nonce::assume_unique_for_key(self.make_nonce(seq));
@@ -431,6 +548,9 @@ impl AeadKey {
         Ok(in_out)
     }
 
+    /// Test-only copy of the pre-Task-3 allocating open: production opens
+    /// through [`Self::open_in_place`].
+    #[cfg(test)]
     /// Decrypts and authenticates `ciphertext` under `(seq, aad)`.
     pub fn open(&self, seq: u64, aad: &[u8], ciphertext: &mut [u8]) -> Result<Vec<u8>> {
         let nonce = Nonce::assume_unique_for_key(self.make_nonce(seq));
@@ -443,6 +563,9 @@ impl AeadKey {
         Ok(plaintext.to_vec())
     }
 
+    /// Test-only copy of the allocating explicit-nonce seal (TLS 1.2
+    /// production path uses [`Self::seal_in_place_with_nonce`]).
+    #[cfg(test)]
     /// Encrypts `plaintext` with an explicit 12-byte nonce, appending the
     /// AEAD tag. TLS 1.2 uses an explicit nonce carried in the record
     /// (RFC 5246 §6.2.3.3), unlike TLS 1.3's `IV XOR seq` construction.
@@ -460,6 +583,9 @@ impl AeadKey {
         Ok(in_out)
     }
 
+    /// Test-only copy of the allocating explicit-nonce open (TLS 1.2
+    /// production path uses [`Self::open_in_place_with_nonce`]).
+    #[cfg(test)]
     /// Decrypts and authenticates `ciphertext` with an explicit 12-byte
     /// nonce (TLS 1.2 record protection).
     pub fn open_with_nonce(
@@ -647,6 +773,17 @@ mod tests {
     const SERVER_AP_KEY: &str = "9f02283b6c9c07efc26bb9f2ac92e356";
     const CLIENT_HS_KEY: &str = "dbfaa693d1762c5b666af5d950258d01";
 
+    /// Stack `HKDF-Expand-Label` matches the heap implementation byte for
+    /// byte (memory-diet Task 3, Step 1).
+    #[test]
+    fn hkdf_expand_label_stack_matches_heap() {
+        let ks = KeySchedule::new(CipherSuiteId::Aes128GcmSha256);
+        let prk = vec![0x0Bu8; 32];
+        let a = ks.hkdf_expand_label_heap(&prk, "key", &[], 16).unwrap();
+        let b = ks.hkdf_expand_label_stack(&prk, "key", &[], 16).unwrap();
+        assert_eq!(a.as_slice(), &b[..16]);
+    }
+
     /// The full RFC 8448 §3 key schedule: early → handshake → master and
     /// the handshake/application traffic secrets.
     #[test]
@@ -657,60 +794,68 @@ mod tests {
         // early_secret = HKDF-Extract(0^32, 0^32).
         let zeros = [0u8; 32];
         let early = ks.hkdf_extract(&zeros, &zeros).unwrap();
-        assert_eq!(hex(&early), EARLY_SECRET);
+        assert_eq!(hex(&early[..32]), EARLY_SECRET);
 
         // Derive-Secret(early, "derived", "") with Hash("") as context.
+        let (empty, empty_len) = empty_hash(suite);
         let derived = ks
-            .hkdf_expand_label(&early, "derived", &empty_hash(suite), 32)
+            .hkdf_expand_label_stack(&early[..32], "derived", &empty[..empty_len], 32)
             .unwrap();
-        assert_eq!(hex(&derived), DERIVED_FROM_EARLY);
+        assert_eq!(hex(&derived[..32]), DERIVED_FROM_EARLY);
 
         // handshake_secret = HKDF-Extract(derived, ecdhe).
         let ecdhe = decode_hex(ECDHE_SHARED_SECRET);
-        let hs = ks.hkdf_extract(&derived, &ecdhe).unwrap();
-        assert_eq!(hex(&hs), HANDSHAKE_SECRET);
+        let hs = ks.hkdf_extract(&derived[..32], &ecdhe).unwrap();
+        assert_eq!(hex(&hs[..32]), HANDSHAKE_SECRET);
 
         // Transcript CH..SH feeds the handshake traffic secrets.
         ks.add_transcript(&decode_hex(CLIENT_HELLO));
         ks.add_transcript(&decode_hex(SERVER_HELLO));
-        assert_eq!(hex(&ks.transcript_hash()), TRANSCRIPT_CH_SH);
+        let (th, thn) = ks.transcript_hash();
+        assert_eq!(hex(&th[..thn]), TRANSCRIPT_CH_SH);
 
-        let (c_hs, s_hs) = ks.handshake_traffic_secrets(&hs).unwrap();
-        assert_eq!(hex(&c_hs), CLIENT_HS_TRAFFIC);
-        assert_eq!(hex(&s_hs), SERVER_HS_TRAFFIC);
+        let (c_hs, s_hs) = ks.handshake_traffic_secrets(&hs[..32]).unwrap();
+        assert_eq!(hex(&c_hs[..32]), CLIENT_HS_TRAFFIC);
+        assert_eq!(hex(&s_hs[..32]), SERVER_HS_TRAFFIC);
 
         // The intermediate "derived" expansion the master step consumes.
+        let (empty2, empty2_len) = empty_hash(suite);
         let derived_hs = ks
-            .hkdf_expand_label(&hs, "derived", &empty_hash(suite), 32)
+            .hkdf_expand_label_stack(&hs[..32], "derived", &empty2[..empty2_len], 32)
             .unwrap();
-        assert_eq!(hex(&derived_hs), DERIVED_FROM_HS);
+        assert_eq!(hex(&derived_hs[..32]), DERIVED_FROM_HS);
 
         // master_secret.
-        let master = ks.master_secret(&hs).unwrap();
-        assert_eq!(hex(&master), MASTER_SECRET);
+        let master = ks.master_secret(&hs[..32]).unwrap();
+        assert_eq!(hex(&master[..32]), MASTER_SECRET);
 
         // Transcript CH..server Finished feeds the app traffic secrets.
         ks.add_transcript(&decode_hex(ENCRYPTED_EXTENSIONS));
         ks.add_transcript(&decode_hex(CERTIFICATE));
         ks.add_transcript(&decode_hex(CERTIFICATE_VERIFY));
         ks.add_transcript(&decode_hex(SERVER_FINISHED));
-        assert_eq!(hex(&ks.transcript_hash()), TRANSCRIPT_CH_FINISHED);
+        let (th2, th2n) = ks.transcript_hash();
+        assert_eq!(hex(&th2[..th2n]), TRANSCRIPT_CH_FINISHED);
 
-        let (c_ap, s_ap) = ks.app_traffic_secrets(&master).unwrap();
-        assert_eq!(hex(&c_ap), CLIENT_AP_TRAFFIC);
-        assert_eq!(hex(&s_ap), SERVER_AP_TRAFFIC);
+        let (c_ap, s_ap) = ks.app_traffic_secrets(&master[..32]).unwrap();
+        assert_eq!(hex(&c_ap[..32]), CLIENT_AP_TRAFFIC);
+        assert_eq!(hex(&s_ap[..32]), SERVER_AP_TRAFFIC);
 
         // Server application write key and exporter master secret.
-        let s_ap_key = ks.hkdf_expand_label(&s_ap, "key", &[], 16).unwrap();
-        assert_eq!(hex(&s_ap_key), SERVER_AP_KEY);
-        let exp_master = ks
-            .hkdf_expand_label(&master, "exp master", &ks.transcript_hash(), 32)
+        let s_ap_key = ks
+            .hkdf_expand_label_stack(&s_ap[..32], "key", &[], 16)
             .unwrap();
-        assert_eq!(hex(&exp_master), EXPORTER_MASTER);
+        assert_eq!(hex(&s_ap_key[..16]), SERVER_AP_KEY);
+        let (th3, th3n) = ks.transcript_hash();
+        let exp_master = ks
+            .hkdf_expand_label_stack(&master[..32], "exp master", &th3[..th3n], 32)
+            .unwrap();
+        assert_eq!(hex(&exp_master[..32]), EXPORTER_MASTER);
 
         // Hash("") — the empty_hash the "derived" steps use.
+        let (eh, ehn) = empty_hash(suite);
         assert_eq!(
-            hex(&empty_hash(suite)),
+            hex(&eh[..ehn]),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
@@ -721,18 +866,19 @@ mod tests {
         let suite = CipherSuiteId::Aes128GcmSha256;
         let ks = KeySchedule::new(suite);
 
-        // finished_key = HKDF-Expand-Label(s_hs_traffic, "finished", "", 32).
         let s_hs = decode_hex(SERVER_HS_TRAFFIC);
-        let finished_key = ks.hkdf_expand_label(&s_hs, "finished", &[], 32).unwrap();
-        assert_eq!(hex(&finished_key), SERVER_FINISHED_KEY);
+        let finished_key = ks
+            .hkdf_expand_label_stack(&s_hs, "finished", &[], 32)
+            .unwrap();
+        assert_eq!(hex(&finished_key[..32]), SERVER_FINISHED_KEY);
 
         // client handshake write key = HKDF-Expand-Label(c_hs_traffic, "key", "", 16).
         let c_hs = decode_hex(CLIENT_HS_TRAFFIC);
-        let key = ks.hkdf_expand_label(&c_hs, "key", &[], 16).unwrap();
-        assert_eq!(hex(&key), CLIENT_HS_KEY);
+        let key = ks.hkdf_expand_label_stack(&c_hs, "key", &[], 16).unwrap();
+        assert_eq!(hex(&key[..16]), CLIENT_HS_KEY);
         // client handshake write IV = HKDF-Expand-Label(c_hs_traffic, "iv", "", 12).
-        let iv = ks.hkdf_expand_label(&c_hs, "iv", &[], 12).unwrap();
-        assert_eq!(hex(&iv), "5bd3c71b836e0b76bb73265f");
+        let iv = ks.hkdf_expand_label_stack(&c_hs, "iv", &[], 12).unwrap();
+        assert_eq!(hex(&iv[..12]), "5bd3c71b836e0b76bb73265f");
     }
 
     /// Server `Finished` `verify_data` = `HMAC(finished_key, Hash(CH..CV))`.
@@ -745,10 +891,12 @@ mod tests {
         ks.add_transcript(&decode_hex(ENCRYPTED_EXTENSIONS));
         ks.add_transcript(&decode_hex(CERTIFICATE));
         ks.add_transcript(&decode_hex(CERTIFICATE_VERIFY));
-
         let finished_key = ks.finished_key(&decode_hex(SERVER_HS_TRAFFIC)).unwrap();
-        assert_eq!(hex(&finished_key), SERVER_FINISHED_KEY);
-        assert_eq!(hex(&ks.finished_mac(&finished_key)), SERVER_FINISHED_VERIFY);
+        assert_eq!(hex(&finished_key[..32]), SERVER_FINISHED_KEY);
+        assert_eq!(
+            hex(&ks.finished_mac(&finished_key[..32])),
+            SERVER_FINISHED_VERIFY
+        );
     }
 
     /// AEAD seal/open round-trip with a fixed key (brief's test).
@@ -788,13 +936,13 @@ mod tests {
         let suite = CipherSuiteId::Aes128GcmSha256;
         let secret = [0x42; 32];
         let ks = KeySchedule::new(suite);
-        let key_bytes = ks.hkdf_expand_label(&secret, "key", &[], 16).unwrap();
-        let iv_vec = ks.hkdf_expand_label(&secret, "iv", &[], 12).unwrap();
+        let key_bytes = ks.hkdf_expand_label_stack(&secret, "key", &[], 16).unwrap();
+        let iv_arr = ks.hkdf_expand_label_stack(&secret, "iv", &[], 12).unwrap();
         let mut iv = [0u8; 12];
-        iv.copy_from_slice(&iv_vec);
+        iv.copy_from_slice(&iv_arr[..12]);
 
         let a = AeadKey::new(suite, &secret).unwrap();
-        let b = AeadKey::from_key_iv(suite, &key_bytes, iv).unwrap();
+        let b = AeadKey::from_key_iv(suite, &key_bytes[..16], iv).unwrap();
         let mut ct = a.seal(5, b"aad", b"payload").unwrap();
         assert_eq!(b.open(5, b"aad", &mut ct).unwrap(), b"payload");
     }
