@@ -28,6 +28,18 @@ static DEFAULT_RESOLVER_OPTS: std::sync::LazyLock<ResolverOpts> = std::sync::Laz
     resolver_opts
 });
 
+/// Process-wide reqwest client, built once: per-call `Client::build` pays
+/// a full TLS-provider setup + connection pool on every DNSCrypt list
+/// refresh. `rustls-no-provider` needs the ring provider installed before
+/// first build — done here, idempotently.
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    ensure_tls_provider();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client build must succeed")
+});
+
 fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
     let Ok(stamp) = DnsStamp::decode(url.as_str()) else {
         return None;
@@ -133,11 +145,11 @@ fn ensure_tls_provider() {
 /// Downloads the `DNSCrypt` public resolver list under a hard 10s deadline;
 /// without the timeout a blocked network hangs every lookup forever.
 async fn download_dnscrypt_resolvers(resolvers_url: &str) -> anyhow::Result<String> {
-    ensure_tls_provider();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    let response = client.get(resolvers_url).send().await?.error_for_status()?;
+    let response = HTTP_CLIENT
+        .get(resolvers_url)
+        .send()
+        .await?
+        .error_for_status()?;
     Ok(response.text().await?)
 }
 
@@ -160,9 +172,11 @@ async fn write_dnscrypt_cache(
     ));
     let write = async {
         let mut file = tokio::fs::File::create(&tmp_path).await?;
+        // Borrowed keys: `line` lives in `text`, so dedup costs no per-line
+        // String allocation.
         let mut seen = HashSet::new();
         for line in text.lines().filter(|s| s.starts_with("sdns://")) {
-            if seen.insert(line.to_owned()) {
+            if seen.insert(line) {
                 file.write_all(line.as_bytes()).await?;
                 file.write_all(b"\n").await?;
             }
@@ -241,21 +255,30 @@ impl DnsResolver {
         }
     }
 
-    pub async fn lookup_ip(&self, hostname: &str, allow_ipv6: bool) -> anyhow::Result<Vec<IpAddr>> {
+    /// Resolves `hostname`, returning all addresses as a boxed slice — one
+    /// contiguous allocation, no growth headroom, so cache and callers hold
+    /// exactly the answer. IPv6 results are filtered out unless
+    /// `allow_ipv6`.
+    pub async fn lookup_ip(
+        &self,
+        hostname: &str,
+        allow_ipv6: bool,
+    ) -> anyhow::Result<Box<[IpAddr]>> {
         if let Ok(ip) = hostname.parse::<IpAddr>() {
-            return Ok(vec![ip]);
+            return Ok(vec![ip].into_boxed_slice());
         }
         if self.resolver.get().is_none() {
             let resolver = self.init().await?;
             let _ = self.resolver.set(resolver);
         }
         let resolver = self.resolver.get().expect("resolver set above");
-        Ok(resolver
+        let ips: Vec<IpAddr> = resolver
             .lookup_ip(hostname)
             .await?
             .iter()
             .filter(|ip| allow_ipv6 || ip.is_ipv4())
-            .collect())
+            .collect();
+        Ok(ips.into_boxed_slice())
     }
 
     async fn init(&self) -> anyhow::Result<TokioResolver> {

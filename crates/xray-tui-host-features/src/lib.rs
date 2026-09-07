@@ -11,6 +11,7 @@
 //! is not present when it loads — no data is vendored into the repo.
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -224,13 +225,22 @@ impl HostFeaturesChecker {
     // ── Lookup methods ───────────────────────────────────────────────────
 
     /// Fast-negative bloom filter + `HashSet` verification.
+    ///
+    /// The bloom probe hashes the host's bytes lowercased on the fly
+    /// (`LowercaseHash` — no `to_ascii_lowercase` allocation), and the
+    /// exact check borrows the input when it is already lowercase; only a
+    /// mixed-case host on the (≈1% false-positive) bloom-hit path allocates
+    /// a verification copy.
     #[must_use]
     pub fn is_sni_whitelisted(&self, host: &str) -> bool {
-        let lower = host.to_ascii_lowercase();
-        if !self.sni_bloom.contains(&lower) {
+        if !self.sni_bloom.contains(&LowercaseHash(host)) {
             return false;
         }
-        self.sni_set.contains(&lower)
+        if host.bytes().all(|b| !b.is_ascii_uppercase()) {
+            self.sni_set.contains(host)
+        } else {
+            self.sni_set.contains(&host.to_ascii_lowercase())
+        }
     }
 
     /// Fast-negative bloom filter + `HashSet` verification.
@@ -249,6 +259,24 @@ impl HostFeaturesChecker {
         let key = u32::from_be_bytes(ip.octets());
         let idx = self.cidr_ranges.partition_point(|&(s, _)| s <= key);
         idx > 0 && key <= self.cidr_ranges[idx - 1].1
+    }
+}
+
+/// Hashes a hostname as its ASCII-lowercased bytes without allocating: the
+/// bloom filter was built from lowercased `String`s, so probing must hash
+/// the same byte sequence for misses to be exact — `String::hash` hashes
+/// raw bytes, so lowercasing per byte on the fly reproduces it.
+struct LowercaseHash<'a>(&'a str);
+
+impl Hash for LowercaseHash<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Mirror `str`'s `Hash` impl exactly (bytes + `0xff` terminator):
+        // the filter was built from `String`s, so the probe must hash the
+        // same byte stream or hits go missing.
+        for b in self.0.bytes() {
+            state.write_u8(b.to_ascii_lowercase());
+        }
+        state.write_u8(0xff);
     }
 }
 

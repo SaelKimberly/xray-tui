@@ -269,7 +269,7 @@ async fn handle_connect(
             match &outbound.kind {
                 OutboundKind::Block => write_refusal(&mut conn, Refusal::Blocked).await,
                 kind => {
-                    let target = override_addr.map(net_to_target).unwrap_or(target);
+                    let target = override_addr.map(|a| net_to_target(&a)).unwrap_or(target);
                     let mut upstream = match outbound::dial(kind, &target).await {
                         Ok(stream) => stream,
                         Err(error) => {

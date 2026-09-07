@@ -21,8 +21,20 @@ impl NetHost {
     #[must_use]
     pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
         match self {
+            // `Display` keeps the IP arm allocation-free for callers that
+            // only need formatting; a borrowed slice is impossible without
+            // caching the rendering, so this arm owns the one string.
             Self::Ip(ip) => std::borrow::Cow::Owned(ip.to_string()),
             Self::Domain(d) => std::borrow::Cow::Borrowed(d),
+        }
+    }
+}
+
+impl std::fmt::Display for NetHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => ip.fmt(f),
+            Self::Domain(d) => f.write_str(d),
         }
     }
 }

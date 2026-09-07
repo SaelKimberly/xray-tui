@@ -8,6 +8,8 @@ use std::{
 
 use parking_lot::Mutex;
 
+use bytes::Bytes;
+
 use crate::{
     addr::{NetAddr, NetHost, PortRange},
     error::RouteError,
@@ -30,8 +32,10 @@ pub struct ConnMeta {
     pub source: Option<SocketAddr>,
     /// Pre-resolved source IPs.
     pub source_resolved_ips: Vec<IpAddr>,
-    /// Caller-owned leading payload bytes (spec §2 data-flow 3).
-    pub payload_prefix: Option<Vec<u8>>,
+    /// Caller-owned leading payload bytes (spec §2 data-flow 3). Shared
+    /// `Bytes` per the Task 2 relay convention — sniffing borrows it, never
+    /// copies it.
+    pub payload_prefix: Option<Bytes>,
     /// Application protocol detected by sniffing, when available.
     pub sniffed: Option<SniffedProtocol>,
     /// SNI host carried on the wire, stashed by the sniff-enrichment pass
@@ -61,7 +65,9 @@ pub enum Decision {
         /// Outbound tag to forward through.
         tag: Arc<str>,
         /// Rewritten destination, if the matched action requested one.
-        override_addr: Option<NetAddr>,
+        /// Shared: a decision clone is then a refcount bump instead of a
+        /// deep `Domain(String)` copy (the scan's working set stays clean).
+        override_addr: Option<Arc<NetAddr>>,
     },
     /// Refuse the connection with a method.
     Reject {
@@ -298,7 +304,7 @@ impl Engine {
             let decision = match rule.action {
                 Action::Route { tag, override_addr } => Decision::Route {
                     tag: Arc::from(tag),
-                    override_addr,
+                    override_addr: override_addr.map(Arc::new),
                 },
                 Action::Reject { method } => Decision::Reject { method },
                 Action::HijackDns => Decision::HijackDns,
@@ -390,13 +396,14 @@ impl Engine {
     fn emit_decision(&self, decision: &Decision, rule_name: Option<&str>, sni: Option<&str>) {
         let Some(tx) = &self.event_sink else { return };
         let tag = match decision {
-            Decision::Route { tag, .. } => Some(tag.to_string()),
+            // Refcount bump, not a deep copy.
+            Decision::Route { tag, .. } => Some(Arc::clone(tag)),
             _ => None,
         };
         let _ = tx.send(RouteEvent::DecisionApplied {
-            rule_name: rule_name.map(str::to_owned),
+            rule_name: rule_name.map(Arc::from),
             tag,
-            sni: sni.map(str::to_owned),
+            sni: sni.map(Arc::from),
             at: jiff::Timestamp::now(),
         });
     }
@@ -405,7 +412,7 @@ impl Engine {
     fn emit_resolved(&self, host: &str, ips: &[IpAddr]) {
         if let Some(tx) = &self.event_sink {
             let _ = tx.send(RouteEvent::Resolved {
-                host: host.to_owned(),
+                host: Arc::from(host),
                 ips: ips.to_vec(),
                 at: jiff::Timestamp::now(),
             });
@@ -440,18 +447,28 @@ impl Engine {
 pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
     // Sniff enrichment runs once per connection before the first pass: a
     // Protocol item in any rule means declared intent to look at payload.
-    if engine.needs_sniff()
-        && meta.sniffed.is_none()
-        && let Some(prefix) = meta.payload_prefix.as_deref()
-        && let Some(result) = sniff::probe(prefix)
-    {
-        // QUIC is UDP-only (RFC 9000): a QUIC sniff on a non-UDP
-        // connection is rejected — prevents the decrypt path from
-        // running on TCP binary handshakes (VMess, VLESS, etc.).
-        if result.protocol != sniff::SniffedProtocol::Quic || meta.network == NetworkMask::UDP {
-            meta.sni_host = result.host;
-            meta.sniffed = Some(result.protocol.into());
-        }
+    // The probe result borrows `meta.payload_prefix`, so it is reduced to
+    // owned (protocol, host) fields before `meta` is mutated — the SNI is
+    // stashed by value (one alloc) because a `ConnMeta` cannot hold a
+    // borrow of its own payload buffer.
+    let sniff_outcome = if engine.needs_sniff() && meta.sniffed.is_none() {
+        meta.payload_prefix
+            .as_deref()
+            .and_then(sniff::probe)
+            .and_then(|result| {
+                // QUIC is UDP-only (RFC 9000): a QUIC sniff on a non-UDP
+                // connection is rejected — prevents the decrypt path from
+                // running on TCP binary handshakes (VMess, VLESS, etc.).
+                (result.protocol != sniff::SniffedProtocol::Quic
+                    || meta.network == NetworkMask::UDP)
+                    .then(|| (result.protocol, result.host.map(|h| h.into_owned())))
+            })
+    } else {
+        None
+    };
+    if let Some((protocol, host)) = sniff_outcome {
+        meta.sni_host = host;
+        meta.sniffed = Some(protocol.into());
     }
 
     let mut resolved_this_call = false;
@@ -488,20 +505,20 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
             .and_then(|c| c.lock().get_fresh(&host, now).map(<[IpAddr]>::to_vec));
         let outcome = match cached {
             Some(ips) => Ok(ips),
-            None => resolver.lookup_ip(host.clone()).await,
+            // Borrowed host: the sink's boxed future holds the `&str` and
+            // is awaited right here, so no `String` clone crosses the seam.
+            None => resolver.lookup_ip(&host).await,
         };
-        // Success emits Resolved first, fills the TTL cache (failures stay
-        // uncached), then ProbeTracker bookkeeping — the resolved host may
-        // itself be a probe target. Reachability semantics: empty-Ok and
-        // Err are both failure.
+        // Success emits Resolved first, then ProbeTracker bookkeeping —
+        // the resolved host may itself be a probe target. Reachability
+        // semantics: empty-Ok and Err are both failure. The TTL cache is
+        // filled last so `host` and `ips` move into it (entry API reuses
+        // the owned key — no clones).
         if let Ok(ips) = &outcome
             && !ips.is_empty()
         {
             engine.emit_resolved(&host, ips);
             meta.resolved_host_ips.clone_from(ips);
-            if let Some(cache) = &engine.resolve_cache {
-                cache.lock().put(host.clone(), ips.clone(), now);
-            }
         }
         let failed = outcome.as_ref().map_or(true, std::vec::Vec::is_empty);
         engine.probe_tracker.lock().update(
@@ -510,6 +527,12 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
             Some((failed, Some(host.as_str()))),
             &engine.event_sink,
         );
+        if let Ok(ips) = outcome
+            && !ips.is_empty()
+            && let Some(cache) = &engine.resolve_cache
+        {
+            cache.lock().put(host, ips, now);
+        }
 
         // Errors and empty results degrade silently: nothing stashed, the
         // loop re-evaluates once and falls through to default.

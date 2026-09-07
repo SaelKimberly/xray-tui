@@ -2090,7 +2090,7 @@ mod tests {
                 failed_probe,
                 at,
             }) => {
-                assert_eq!(failed_probe, "gstatic");
+                assert_eq!(&*failed_probe, "gstatic");
                 assert_eq!(at, ts(6));
             }
             other => panic!("unexpected event: {other:?}"),

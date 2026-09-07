@@ -3,19 +3,22 @@
 //! Pure bookkeeping only — no network I/O here. The caller (engine) invokes
 //! the [`DnsSink`] and feeds outcomes to [`ProbeTracker`]/[`ResolvedCache`].
 
-use std::{collections::HashMap, future::Future, net::IpAddr, pin::Pin};
+use std::{collections::HashMap, future::Future, net::IpAddr, pin::Pin, sync::Arc};
 
 use crate::{error::RouteError, events::RouteEvent};
 
 /// Async DNS resolution seam, consumed by the routing engine.
 ///
-/// Object-safe: the engine stores `Arc<dyn DnsSink>`.
+/// Object-safe: the engine stores `Arc<dyn DnsSink>`. The host arrives
+/// borrowed; implementations copy only what their transport actually needs
+/// (the boxed future may hold the `&str`, so callers await it within the
+/// borrow's scope).
 pub trait DnsSink: Send + Sync {
     /// Resolves `host`, returning all addresses or a [`RouteError::Resolve`].
-    fn lookup_ip(
+    fn lookup_ip<'a>(
         &self,
-        host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RouteError>> + Send>>;
+        host: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RouteError>> + Send + 'a>>;
 }
 
 /// TTL-keyed DNS resolution cache.
@@ -49,21 +52,35 @@ impl ResolvedCache {
         }
     }
 
-    /// Stores `ips` for `host`, stamped at `now`.
+    /// Stores `ips` for `host`, stamped at `now`. The owned `host` key is
+    /// moved through the entry API — no key clone, no re-hash; an existing
+    /// entry is re-stamped in place.
     pub fn put(&mut self, host: String, ips: Vec<IpAddr>, now: jiff::Timestamp) {
-        self.entries.insert(host, (ips, now));
+        use std::collections::hash_map::Entry;
+        match self.entries.entry(host) {
+            Entry::Occupied(mut e) => {
+                let (slot, stored) = e.get_mut();
+                *slot = ips;
+                *stored = now;
+            }
+            Entry::Vacant(e) => {
+                e.insert((ips, now));
+            }
+        }
     }
 }
 
 /// Consecutive-failure streak tracker for probe targets.
 ///
 /// Zero-cost no-op while the probes list is empty. Streaks are keyed per
-/// probe; entering failure emits [`RouteEvent::NetworkBreakdown`] exactly
-/// once per streak, and the next success emits [`RouteEvent::ProbeRecovered`]
-/// exactly once and resets the streak.
+/// probe (`Arc<str>`, shared with the emitted events — one alloc per
+/// streak, bumps thereafter); entering failure emits
+/// [`RouteEvent::NetworkBreakdown`] exactly once per streak, and the next
+/// success emits [`RouteEvent::ProbeRecovered`] exactly once and resets the
+/// streak (the removed `Arc` is reused for the event — no realloc).
 #[derive(Debug, Default)]
 pub struct ProbeTracker {
-    streaks: HashMap<String, u32>,
+    streaks: HashMap<Arc<str>, u32>,
 }
 
 impl ProbeTracker {
@@ -88,22 +105,27 @@ impl ProbeTracker {
             return;
         }
         if failed {
-            let entry = self.streaks.entry(probe.to_owned()).or_insert(0);
-            *entry += 1;
-            if *entry == 1 {
+            // One allocation per failure: the streak-key `Arc`, whose
+            // refcount the emitted Breakdown event shares via `key()`.
+            let entry = self.streaks.entry(Arc::from(probe));
+            let event_key = entry.key().clone();
+            let count = entry.or_insert(0);
+            *count += 1;
+            if *count == 1 {
                 emit(
                     tx.as_ref(),
                     RouteEvent::NetworkBreakdown {
-                        failed_probe: probe.to_owned(),
+                        failed_probe: event_key,
                         at: jiff::Timestamp::now(),
                     },
                 );
             }
-        } else if self.streaks.remove(probe).is_some() {
+        } else if let Some((key, _)) = self.streaks.remove_entry(probe) {
             emit(
                 tx.as_ref(),
                 RouteEvent::ProbeRecovered {
-                    probe: probe.to_owned(),
+                    // Reuse the removed key — no realloc.
+                    probe: key,
                     at: jiff::Timestamp::now(),
                 },
             );
@@ -166,13 +188,17 @@ mod tests {
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            matches!(events[0], RouteEvent::NetworkBreakdown { ref failed_probe, .. } if failed_probe == "p1")
+            matches!(events[0], RouteEvent::NetworkBreakdown { ref failed_probe, .. } if &**failed_probe == "p1")
         );
         assert!(
-            matches!(events[1], RouteEvent::NetworkBreakdown { ref failed_probe, .. } if failed_probe == "p2")
+            matches!(events[1], RouteEvent::NetworkBreakdown { ref failed_probe, .. } if &**failed_probe == "p2")
         );
-        assert!(matches!(events[2], RouteEvent::ProbeRecovered { ref probe, .. } if probe == "p1"));
-        assert!(matches!(events[3], RouteEvent::ProbeRecovered { ref probe, .. } if probe == "p2"));
+        assert!(
+            matches!(events[2], RouteEvent::ProbeRecovered { ref probe, .. } if &**probe == "p1")
+        );
+        assert!(
+            matches!(events[3], RouteEvent::ProbeRecovered { ref probe, .. } if &**probe == "p2")
+        );
         assert_eq!(events.len(), 4);
         // Steady state: further successes emit nothing.
         tracker.update(&list, false, Some((false, Some("p1"))), &Some(tx));
@@ -247,6 +273,6 @@ async fn dns_adapter_ip_literal_passthrough() {
     let adapter = crate::dns_adapter::DnsSinkAdapter {
         resolver: std::sync::Arc::new(xray_tui_dns::DnsResolver::new("/tmp")),
     };
-    let ips = adapter.lookup_ip("127.0.0.1".into()).await.unwrap();
+    let ips = adapter.lookup_ip("127.0.0.1").await.unwrap();
     assert_eq!(ips, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
 }

@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maxminddb::Reader;
@@ -11,13 +12,18 @@ use tokio::io::AsyncWriteExt;
 const GEOLITE_DOWNLOAD: &str =
     "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb";
 
-type FetchResult = Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send>>;
-type Fetcher = dyn Fn() -> FetchResult + Send + Sync;
+/// Fetches the GeoLite database, streaming the body to `dest` on disk — the
+/// ~70 MB payload is never buffered in memory, let alone copied.
+type FetchResult = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+type Fetcher = dyn Fn(&Path) -> FetchResult + Send + Sync;
 
 #[derive(Debug, Clone)]
 pub struct Location {
-    pub country: String,
-    pub city_en: Option<String>,
+    /// ISO-3166 alpha-2 country code, shared (`Arc<str>`) so the per-IP
+    /// micro-cache and every consumer hand it around with refcount bumps.
+    pub country: Arc<str>,
+    /// English city name, when the database carries one.
+    pub city_en: Option<Arc<str>>,
 }
 
 pub struct GeoIp {
@@ -25,28 +31,49 @@ pub struct GeoIp {
     reader: tokio::sync::OnceCell<Arc<Reader<Vec<u8>>>>,
     init_lock: tokio::sync::Mutex<()>,
     fetch: Arc<Fetcher>,
+    /// Per-IP decode cache (misses cached too): a repeated IP costs a lock
+    /// + `Arc` clones, never another mmdb walk or string decode.
+    cache: Mutex<HashMap<IpAddr, Option<Arc<Location>>>>,
 }
 
 impl GeoIp {
     pub fn new(db_path: impl Into<PathBuf>) -> Self {
-        Self::new_with_fetcher(db_path, || Box::pin(fetch_geolite_bytes()))
+        Self::new_with_fetcher(db_path, |dest: &Path| {
+            let dest = dest.to_path_buf();
+            Box::pin(async move { fetch_geolite_to(&dest).await })
+        })
     }
 
     /// Build a `GeoIp` backed by a custom fetcher, so tests can avoid the
     /// real 70 MB network download.
     pub fn new_with_fetcher<F>(db_path: impl Into<PathBuf>, fetcher: F) -> Self
     where
-        F: Fn() -> FetchResult + Send + Sync + 'static,
+        F: Fn(&Path) -> FetchResult + Send + Sync + 'static,
     {
         Self {
             db_path: db_path.into(),
             reader: tokio::sync::OnceCell::new(),
             init_lock: tokio::sync::Mutex::new(()),
             fetch: Arc::new(fetcher),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn location_by_ip(&self, ip: IpAddr) -> anyhow::Result<Option<Location>> {
+        // Cache-first: the common repeat lookup never touches the reader.
+        if let Some(hit) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&ip)
+            .cloned()
+        {
+            return Ok(hit.map(|loc| Location {
+                // Refcount bumps — no re-decode, no string copies.
+                country: loc.country.clone(),
+                city_en: loc.city_en.clone(),
+            }));
+        }
         if self.reader.get().is_none() {
             // Serialize first init so concurrent lookups can't race the
             // download and observe a partially-written database.
@@ -60,25 +87,32 @@ impl GeoIp {
         let reader = Arc::clone(self.reader.get().expect("reader set above"));
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Location>> {
             let result = reader.lookup(ip)?;
+            // Borrowed decodes: the strings live inside the mmap'd buffer,
+            // so `decode_path::<&str>` copies nothing; `Arc::from` moves
+            // them into shared strings the cache reuses.
             let Some(country) =
-                result.decode_path::<String>(&maxminddb::path!["country", "iso_code"])?
+                result.decode_path::<&str>(&maxminddb::path!["country", "iso_code"])?
             else {
                 return Ok(None);
             };
             let Some(city_en) =
-                result.decode_path::<String>(&maxminddb::path!["city", "names", "en"])?
+                result.decode_path::<&str>(&maxminddb::path!["city", "names", "en"])?
             else {
                 return Ok(Some(Location {
-                    country,
+                    country: Arc::from(country),
                     city_en: None,
                 }));
             };
             Ok(Some(Location {
-                country,
-                city_en: Some(city_en),
+                country: Arc::from(country),
+                city_en: Some(Arc::from(city_en)),
             }))
         })
         .await??;
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(ip, result.as_ref().map(|loc| Arc::new(loc.clone())));
         Ok(result)
     }
 
@@ -91,7 +125,12 @@ impl GeoIp {
     /// re-downloading once before giving up.
     async fn open_reader_healing(&self) -> anyhow::Result<Reader<Vec<u8>>> {
         self.ensure_db().await?;
-        match Self::open_reader(&self.db_path) {
+        // The 70 MB read is blocking — never on the async runtime.
+        let path = self.db_path.clone();
+        let opened = tokio::task::spawn_blocking(move || Self::open_reader(&path))
+            .await
+            .map_err(|e| anyhow::anyhow!("geoip open thread panicked: {e}"))?;
+        match opened {
             Ok(reader) => Ok(reader),
             Err(first_err) => {
                 tracing::warn!(
@@ -101,7 +140,10 @@ impl GeoIp {
                 // Ignore a missing file: it may already have been removed.
                 let _ = tokio::fs::remove_file(&self.db_path).await;
                 self.ensure_db().await?;
-                Self::open_reader(&self.db_path)
+                let path = self.db_path.clone();
+                tokio::task::spawn_blocking(move || Self::open_reader(&path))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("geoip open thread panicked: {e}"))?
             }
         }
     }
@@ -114,9 +156,6 @@ impl GeoIp {
             "Downloading {GEOLITE_DOWNLOAD} to {}",
             self.db_path.display()
         );
-        // Hard deadline: a stalled 70MB download must fail (and degrade to
-        // `🏴`) instead of hanging every lookup forever.
-        let bytes = (self.fetch)().await?;
         if let Some(parent) = self.db_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -133,14 +172,14 @@ impl GeoIp {
             std::process::id()
         ));
         let write = async {
-            let mut file = tokio::fs::File::create(&tmp_path).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-            tokio::fs::rename(&tmp_path, &self.db_path).await
+            // Streamed straight to disk — no 70 MB `Vec` in memory.
+            (self.fetch)(&tmp_path).await?;
+            tokio::fs::rename(&tmp_path, &self.db_path).await?;
+            Ok::<(), anyhow::Error>(())
         };
         if let Err(e) = write.await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e.into());
+            return Err(e);
         }
         Ok(())
     }
@@ -153,19 +192,24 @@ fn ensure_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-async fn fetch_geolite_bytes() -> anyhow::Result<Vec<u8>> {
+/// Streams the GeoLite database to `dest`: each body chunk is written as it
+/// arrives (bounded memory), then fsync'd before the caller's atomic rename.
+async fn fetch_geolite_to(dest: &Path) -> anyhow::Result<()> {
     ensure_tls_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_mins(2))
         .build()?;
-    let bytes = client
+    let mut response = client
         .get(GEOLITE_DOWNLOAD)
         .send()
         .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    Ok(bytes.to_vec())
+        .error_for_status()?;
+    let mut file = tokio::fs::File::create(dest).await?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.sync_all().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -173,10 +217,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn bytes_fetcher(bytes: Vec<u8>) -> impl Fn() -> FetchResult + Send + Sync {
-        move || {
+    fn bytes_fetcher(bytes: Vec<u8>) -> impl Fn(&Path) -> FetchResult + Send + Sync {
+        move |dest: &Path| {
             let bytes = bytes.clone();
-            Box::pin(async move { Ok(bytes) })
+            let dest = dest.to_path_buf();
+            Box::pin(async move {
+                tokio::fs::write(&dest, &bytes).await?;
+                Ok(())
+            })
         }
     }
 
@@ -187,9 +235,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
-    ) -> impl Fn() -> FetchResult + Send + Sync {
-        move || {
+    ) -> impl Fn(&Path) -> FetchResult + Send + Sync {
+        move |dest: &Path| {
             let bytes = bytes.clone();
+            let dest = dest.to_path_buf();
             let calls = Arc::clone(&calls);
             let active = Arc::clone(&active);
             let max_active = Arc::clone(&max_active);
@@ -201,7 +250,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 active.fetch_sub(1, Ordering::SeqCst);
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(bytes)
+                tokio::fs::write(&dest, &bytes).await?;
+                Ok(())
             })
         }
     }
@@ -219,7 +269,7 @@ mod tests {
         // re-download attempt made before the error surfaces.
         let calls = Arc::new(AtomicUsize::new(0));
         let fetcher_calls = Arc::clone(&calls);
-        let geo = GeoIp::new_with_fetcher(db_path.as_path(), move || {
+        let geo = GeoIp::new_with_fetcher(db_path.as_path(), move |_dest: &Path| {
             let calls = Arc::clone(&fetcher_calls);
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -285,11 +335,11 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let fetcher_calls = Arc::clone(&calls);
-        let geo = GeoIp::new_with_fetcher(db_path.as_path(), move || {
+        let geo = GeoIp::new_with_fetcher(db_path.as_path(), move |_dest: &Path| {
             let calls = Arc::clone(&fetcher_calls);
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Vec::new())
+                Ok(())
             })
         });
 

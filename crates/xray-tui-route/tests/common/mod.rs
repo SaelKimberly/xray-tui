@@ -12,10 +12,10 @@ pub struct SeqSink {
 }
 
 impl DnsSink for SeqSink {
-    fn lookup_ip(
+    fn lookup_ip<'a>(
         &self,
-        _host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<std::net::IpAddr>, RouteError>> + Send>> {
+        _host: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<std::net::IpAddr>, RouteError>> + Send + 'a>> {
         let mut q = self.results.lock();
         let r = if q.is_empty() {
             Err(RouteError::Resolve("exhausted".into()))

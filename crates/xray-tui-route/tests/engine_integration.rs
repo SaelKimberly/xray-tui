@@ -98,7 +98,7 @@ async fn if_non_match_resolves_once_then_matches_ip_rule() {
     let ev0 = rx.try_recv().unwrap();
     assert!(
         matches!(&ev0, RouteEvent::Resolved { host, ips, .. }
-            if host == "example.com" && ips.len() == 1),
+            if &**host == "example.com" && ips.len() == 1),
         "expected Resolved, got {ev0:?}"
     );
     let ev1 = rx.try_recv().unwrap();
@@ -159,7 +159,7 @@ async fn protocol_item_consumes_payload_prefix_sniff() {
     let engine = Engine::build(set).unwrap();
 
     let mut m = meta("1.2.3.4", 443);
-    m.payload_prefix = Some(fixture);
+    m.payload_prefix = Some(fixture.into());
     let d = decide_async(&engine, &mut m).await;
     assert!(
         matches!(d, Decision::Route { ref tag, .. } if &**tag == "tls-out"),
@@ -232,7 +232,7 @@ async fn probe_breakdown_and_recovery_flow_end_to_end_via_events_rx() {
 
     let ev0 = rx.try_recv().unwrap();
     assert!(
-        matches!(&ev0, RouteEvent::NetworkBreakdown { failed_probe, .. } if failed_probe == "probe.example"),
+        matches!(&ev0, RouteEvent::NetworkBreakdown { failed_probe, .. } if &**failed_probe == "probe.example"),
         "expected NetworkBreakdown, got {ev0:?}"
     );
     let RouteEvent::DecisionApplied { tag, .. } = rx.try_recv().unwrap() else {
@@ -242,12 +242,12 @@ async fn probe_breakdown_and_recovery_flow_end_to_end_via_events_rx() {
 
     let ev2 = rx.try_recv().unwrap();
     assert!(
-        matches!(&ev2, RouteEvent::Resolved { host, .. } if host == "probe.example"),
+        matches!(&ev2, RouteEvent::Resolved { host, .. } if &**host == "probe.example"),
         "expected Resolved, got {ev2:?}"
     );
     let ev3 = rx.try_recv().unwrap();
     assert!(
-        matches!(&ev3, RouteEvent::ProbeRecovered { probe, .. } if probe == "probe.example"),
+        matches!(&ev3, RouteEvent::ProbeRecovered { probe, .. } if &**probe == "probe.example"),
         "expected ProbeRecovered, got {ev3:?}"
     );
     let RouteEvent::DecisionApplied { tag, .. } = rx.try_recv().unwrap() else {
@@ -411,7 +411,7 @@ async fn pre_sniffed_meta_is_not_reprobed() {
     let engine = Engine::build(set).unwrap();
 
     let mut m = meta("1.2.3.4", 443);
-    m.payload_prefix = Some(fixture);
+    m.payload_prefix = Some(fixture.into());
     m.sniffed = Some(SniffedProtocol::Dns); // caller-pre-populated
     let d = decide_async(&engine, &mut m).await;
     // Protocol(Tls) evaluates against the PRE-EXISTING sniffed value, not
@@ -479,7 +479,7 @@ async fn quic_protocol_item_consumes_payload_prefix_sniff() {
     // QUIC is UDP-only; the sniff must be adopted only on UDP.
     let mut m = meta("1.2.3.4", 443);
     m.network = NetworkMask::UDP;
-    m.payload_prefix = Some(fixture.clone());
+    m.payload_prefix = Some(fixture.clone().into());
     let d = decide_async(&engine, &mut m).await;
     assert!(
         matches!(d, Decision::Route { ref tag, .. } if &**tag == "quic-out"),
@@ -500,7 +500,7 @@ async fn quic_protocol_item_consumes_payload_prefix_sniff() {
     // gated off non-UDP, so the rule cannot fire.
     let engine_tcp = Engine::build(set).unwrap();
     let mut tcp = meta("1.2.3.4", 443);
-    tcp.payload_prefix = Some(fixture.clone());
+    tcp.payload_prefix = Some(fixture.clone().into());
     let dt = decide_async(&engine_tcp, &mut tcp).await;
     assert!(
         matches!(dt, Decision::Route { ref tag, .. } if &**tag == "direct"),

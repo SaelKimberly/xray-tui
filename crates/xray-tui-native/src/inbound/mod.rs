@@ -367,7 +367,9 @@ async fn handle_connect(
                     Ok(())
                 }
                 kind => {
-                    let target = override_addr.map(net_to_target).unwrap_or(request.target);
+                    let target = override_addr
+                        .map(|a| net_to_target(&a))
+                        .unwrap_or(request.target);
                     let upstream = match outbound::dial(kind, &target).await {
                         Ok(stream) => stream,
                         Err(error) => {
@@ -820,7 +822,11 @@ impl UdpRelay {
         // payload: a QUIC Initial is padded to ≥1200 bytes and the QUIC arm
         // rejects a truncated packet, so a prefix could never decrypt one.
         // The copy is skipped entirely when no rule sniffs.
-        let payload_prefix = self.config.engine.needs_sniff().then(|| payload.to_vec());
+        let payload_prefix = self
+            .config
+            .engine
+            .needs_sniff()
+            .then(|| bytes::Bytes::copy_from_slice(payload));
         let mut meta = ConnMeta {
             target: target_to_net(&target),
             network: NetworkMask::UDP,
@@ -860,7 +866,7 @@ impl UdpRelay {
             tracing::debug!(%tag, "socks5 inbound: udp decision named an unknown outbound");
             return;
         };
-        let dest = override_addr.map(net_to_target).unwrap_or(target);
+        let dest = override_addr.map(|a| net_to_target(&a)).unwrap_or(target);
 
         match &outbound.kind {
             OutboundKind::Block => {}
@@ -1261,12 +1267,15 @@ pub(crate) fn target_to_net(target: &TargetAddr) -> NetAddr {
 }
 
 /// Convert a router rewrite ([`NetAddr`]) back into a native wire target.
+///
+/// Borrows the (possibly `Arc`-shared) decision address; the single
+/// `Domain` copy here is per-connection dial setup, never the hot path.
 #[must_use]
-pub(crate) fn net_to_target(addr: NetAddr) -> TargetAddr {
+pub(crate) fn net_to_target(addr: &NetAddr) -> TargetAddr {
     TargetAddr {
-        host: match addr.host {
-            NetHost::Ip(ip) => Host::Ip(ip),
-            NetHost::Domain(domain) => Host::Domain(domain),
+        host: match &addr.host {
+            NetHost::Ip(ip) => Host::Ip(*ip),
+            NetHost::Domain(domain) => Host::Domain(domain.clone()),
         },
         port: addr.port,
     }

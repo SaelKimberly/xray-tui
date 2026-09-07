@@ -8,6 +8,8 @@
 //! wire data, an HTTP response, an unsupported QUIC version, or an oversize
 //! slice — and never panics on malformed input.
 
+use std::borrow::Cow;
+
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
 /// Protocol identified by the sniffer.
@@ -32,10 +34,24 @@ impl From<SniffedProtocol> for crate::ir::SniffedProtocol {
 }
 
 /// Sniff outcome: protocol plus the host carried on the wire, if any.
+///
+/// The host borrows the caller's buffer (`Cow::Borrowed`) on the TLS and
+/// HTTP arms — the walk reads it straight from the input slice, so the
+/// common case allocates nothing. Only the QUIC arm owns (`Cow::Owned`):
+/// the SNI is reassembled into a temporary CRYPTO buffer that dies with
+/// the call. One allocation, only where ownership is load-bearing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SniffResult {
+pub struct SniffResult<'a> {
     pub protocol: SniffedProtocol,
-    pub host: Option<String>,
+    pub host: Option<Cow<'a, str>>,
+}
+
+impl SniffResult<'_> {
+    /// The sniffed host as a `&str` (`""` when none), without allocating.
+    #[must_use]
+    pub fn sni_as_str(&self) -> &str {
+        self.host.as_deref().unwrap_or_default()
+    }
 }
 
 /// Hard cap on the sniffed prefix: anything longer is refused up front.
@@ -59,7 +75,7 @@ const MAX_INITIALS: usize = 8;
 /// `None` = indeterminate (garbage / truncated / oversize / HTTP response /
 /// unsupported QUIC version); never panics on malformed wire data.
 #[must_use]
-pub fn probe(bytes: &[u8]) -> Option<SniffResult> {
+pub fn probe(bytes: &[u8]) -> Option<SniffResult<'_>> {
     if bytes.len() > MAX_SNIFF_LEN {
         return None;
     }
@@ -74,12 +90,15 @@ pub fn probe(bytes: &[u8]) -> Option<SniffResult> {
 }
 
 /// Progress of a stateful multi-datagram QUIC sniff.
+///
+/// `Done` borrows the stored answer: re-feeding a completed sniffer costs a
+/// ref, never another `String` clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuicSniffProgress {
+pub enum QuicSniffProgress<'a> {
     /// The `ClientHello` is not complete yet — feed the next datagram.
     NeedMore,
     /// The `ClientHello` completed; the result carries the SNI.
-    Done(SniffResult),
+    Done(&'a SniffResult<'static>),
     /// Not QUIC / unsupported version / inconsistent connection identity /
     /// oversize datagram — the flow is not sniffable; stop feeding.
     Indeterminate,
@@ -111,12 +130,14 @@ pub struct QuicSniffer {
     crypto: Vec<u8>,
     /// Version of the first Initial packet seen (`None` before the first).
     version: Option<u32>,
-    /// DCID of the first Initial packet seen (`None` before the first).
-    dcid: Option<Vec<u8>>,
+    /// DCID of the first Initial packet seen (`None` before the first),
+    /// kept on the stack: connection IDs are 0–20 bytes (RFC 9000 §17.2).
+    dcid: Option<([u8; 20], usize)>,
     /// Terminal result once the `ClientHello` resolves. Completion is
     /// sticky: a later datagram whose CRYPTO extends past the hello must
-    /// not un-complete the sniff.
-    done: Option<SniffResult>,
+    /// not un-complete the sniff. Always owned (QUIC reassembly buffer
+    /// dies with the walk), so `'static` reads back for free.
+    done: Option<SniffResult<'static>>,
 }
 
 impl QuicSniffer {
@@ -127,15 +148,15 @@ impl QuicSniffer {
     }
 
     /// Feeds one UDP datagram. See [`QuicSniffProgress`] for the outcomes.
-    pub fn feed(&mut self, datagram: &[u8]) -> QuicSniffProgress {
+    pub fn feed(&mut self, datagram: &[u8]) -> QuicSniffProgress<'_> {
         if datagram.len() > MAX_SNIFF_LEN {
             return QuicSniffProgress::Indeterminate;
         }
         // Completion is sticky: once the hello resolves, any further
-        // datagram of the flow keeps the answer (the caller is expected to
-        // stop at the first non-NeedMore outcome).
-        if let Some(result) = &self.done {
-            return QuicSniffProgress::Done(result.clone());
+        // datagram of the flow re-reads the stored answer by ref (the
+        // caller is expected to stop at the first non-NeedMore outcome).
+        if self.done.is_some() {
+            return QuicSniffProgress::Done(self.done.as_ref().expect("checked above"));
         }
         match walk_quic_datagram(
             datagram,
@@ -144,8 +165,8 @@ impl QuicSniffer {
             &mut self.dcid,
         ) {
             Ok(Some(result)) => {
-                self.done = Some(result.clone());
-                QuicSniffProgress::Done(result)
+                self.done = Some(result);
+                QuicSniffProgress::Done(self.done.as_ref().expect("just stored"))
             }
             // The datagram parsed cleanly but the hello is incomplete. Only
             // "need more" once a connection identity was established — a
@@ -159,7 +180,7 @@ impl QuicSniffer {
 
 /// TLS arm: record walk with every length validated against the remaining
 /// slice before advancing.
-fn probe_tls(bytes: &[u8]) -> Option<SniffResult> {
+fn probe_tls(bytes: &[u8]) -> Option<SniffResult<'_>> {
     // Record header (5 bytes): content type 0x16, version u16 >= 0x0301,
     // record length u16 (validated, not used to bound — the slice bounds).
     if bytes.len() < 5 || u16::from_be_bytes([bytes[1], bytes[2]]) < 0x0301 {
@@ -190,7 +211,7 @@ fn probe_tls(bytes: &[u8]) -> Option<SniffResult> {
 /// HTTP arm: request-line must start with a method token (alphabetic),
 /// response lines (`HTTP/`) are not requests, and a `host:` header is
 /// matched case-insensitively with the value trimmed.
-fn probe_http(bytes: &[u8]) -> Option<SniffResult> {
+fn probe_http(bytes: &[u8]) -> Option<SniffResult<'_>> {
     // Find end of request line.
     let line_end = bytes.iter().position(|&b| b == b'\n')?;
     let line = &bytes[..line_end];
@@ -227,7 +248,8 @@ fn probe_http(bytes: &[u8]) -> Option<SniffResult> {
         if !line[..colon].eq_ignore_ascii_case(b"host") {
             continue;
         }
-        // Name matched: trim OWS, return value as-is (case preserved).
+        // Name matched: trim OWS, borrow the value straight from the input
+        // slice (case preserved, zero alloc).
         let value = std::str::from_utf8(&line[colon + 1..]).ok()?;
         let host = value.trim();
         if host.is_empty() {
@@ -235,19 +257,24 @@ fn probe_http(bytes: &[u8]) -> Option<SniffResult> {
         }
         return Some(SniffResult {
             protocol: SniffedProtocol::Http,
-            host: Some(host.to_owned()),
+            host: Some(Cow::Borrowed(host)),
         });
     }
     None
 }
 
 /// Outcome of walking a `ClientHello` body for its SNI.
+///
+/// Borrowed by default: the SNI slice points into the walked hello body.
+/// The single-datagram TLS caller's buffer outlives the result (`probe`
+/// returns it straight); the QUIC arm's reassembly buffer dies with the
+/// walk, so `walk_quic_datagram` owns it there (one alloc).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HelloSni {
+enum HelloSni<'a> {
     /// Hello is complete; the `server_name` extension was absent.
     NoSni,
     /// Hello is complete; the SNI host (when the extension was present).
-    Host(String),
+    Host(Cow<'a, str>),
     /// Body is malformed or truncated — the caller treats this as
     /// indeterminate and (for QUIC) keeps accumulating `CRYPTO` data.
     Malformed,
@@ -259,7 +286,7 @@ enum HelloSni {
 /// Returns [`HelloSni::Host`] when the SNI extension is present,
 /// [`HelloSni::NoSni`] when the hello is complete without one, and
 /// [`HelloSni::Malformed`] for a truncated/malformed body.
-fn sni_from_hello_body(body: &[u8]) -> HelloSni {
+fn sni_from_hello_body(body: &[u8]) -> HelloSni<'_> {
     let r = &mut Reader::new(body);
     // legacy_version (2) + random (32); a short body is malformed.
     if r.take(2).is_none() || r.take(32).is_none() {
@@ -307,11 +334,16 @@ fn sni_from_hello_body(body: &[u8]) -> HelloSni {
             let Some(host) = s.take_len16() else {
                 return HelloSni::Malformed;
             };
-            // SNI MUST be ASCII (RFC 6066); reject anything else.
+            // SNI MUST be ASCII (RFC 6066); reject anything else. The bytes
+            // are already ASCII-checked above — borrow them (`from_utf8` on
+            // an ASCII slice cannot fail).
             if host.is_empty() || host.contains(&0x00) || !host.iter().all(|&b| b.is_ascii()) {
                 return HelloSni::Malformed;
             }
-            return String::from_utf8(host.to_vec()).map_or(HelloSni::Malformed, HelloSni::Host);
+            return match std::str::from_utf8(host) {
+                Ok(s) => HelloSni::Host(Cow::Borrowed(s)),
+                Err(_) => HelloSni::Malformed,
+            };
         }
     }
     HelloSni::NoSni
@@ -326,10 +358,10 @@ fn sni_from_hello_body(body: &[u8]) -> HelloSni {
 ///
 /// `None` = indeterminate (not QUIC, non-Initial only, unsupported version,
 /// truncated, or the hello split across datagrams we don't hold).
-fn probe_quic(bytes: &[u8]) -> Option<SniffResult> {
+fn probe_quic(bytes: &[u8]) -> Option<SniffResult<'static>> {
     let mut crypto = Vec::new();
     let mut version = None;
-    let mut dcid = None;
+    let mut dcid: Option<([u8; 20], usize)> = None;
     walk_quic_datagram(bytes, &mut crypto, &mut version, &mut dcid)
         .ok()
         .flatten()
@@ -356,8 +388,8 @@ fn walk_quic_datagram(
     datagram: &[u8],
     crypto: &mut Vec<u8>,
     version: &mut Option<u32>,
-    dcid: &mut Option<Vec<u8>>,
-) -> Result<Option<SniffResult>, ()> {
+    dcid: &mut Option<([u8; 20], usize)>,
+) -> Result<Option<SniffResult<'static>>, ()> {
     let mut buf = datagram;
     let mut packets = 0usize;
     while !buf.is_empty() {
@@ -385,8 +417,13 @@ fn walk_quic_datagram(
         let packet_type = (first >> 4) & 0x03;
         let is_initial = packet_type == params.initial_type;
         let mut p = &buf[5..];
-        // DCID: u8 length + bytes.
+        // DCID: u8 length + bytes. RFC 9000 §17.2 caps connection IDs at
+        // 20 bytes — longer is not QUIC and (bounded here) always fits
+        // the stack slot.
         let dcid_len = usize::from(*p.first().ok_or(())?);
+        if dcid_len > 20 {
+            return Err(());
+        }
         let this_dcid = p.get(1..1 + dcid_len).ok_or(())?;
         p = p.get(1 + dcid_len..).ok_or(())?;
         // SCID: u8 length + bytes.
@@ -424,20 +461,24 @@ fn walk_quic_datagram(
         // datagram of one flow, share the version + DCID).
         let established = match (version.as_ref(), dcid.as_ref()) {
             (None, None) => false,
-            (Some(v), Some(d)) if *v == ver && d.as_slice() == this_dcid => true,
+            (Some(v), Some(d)) if *v == ver && d.0[..d.1] == *this_dcid => true,
             _ => return Err(()),
         };
         if !established {
             *version = Some(ver);
-            *dcid = Some(this_dcid.to_vec());
+            let mut slot = [0u8; 20];
+            slot[..dcid_len].copy_from_slice(this_dcid);
+            *dcid = Some((slot, dcid_len));
         }
 
         let mut pkt = buf[..ext_len].to_vec();
         match decrypt_initial_packet(&mut pkt, pn_off, &params, this_dcid, crypto)? {
+            // The reassembly buffer dies with this walk, so the SNI is
+            // owned here (the single QUIC-arm allocation).
             HelloSni::Host(host) => {
                 return Ok(Some(SniffResult {
                     protocol: SniffedProtocol::Quic,
-                    host: Some(host),
+                    host: Some(Cow::Owned(host.into_owned())),
                 }));
             }
             HelloSni::NoSni => {
@@ -462,13 +503,13 @@ fn walk_quic_datagram(
 /// [`HelloSni::Malformed`] while it is still assembling. `Err` = the
 /// packet failed to decrypt, was truncated, or carried an invalid Initial
 /// frame set.
-fn decrypt_initial_packet(
-    pkt: &mut [u8],
+fn decrypt_initial_packet<'a>(
+    pkt: &'a mut [u8],
     pn_off: usize,
     params: &QuicVersionParams,
     dcid: &[u8],
-    crypto: &mut Vec<u8>,
-) -> Result<HelloSni, ()> {
+    crypto: &'a mut Vec<u8>,
+) -> Result<HelloSni<'a>, ()> {
     // --- Key schedule (RFC 9001 §5.2 / RFC 9369 §3.3.2) ---
     // initial_secret = HKDF-Extract(salt, client_dcid)
     // secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
@@ -512,12 +553,14 @@ fn decrypt_initial_packet(
 
     // --- Payload decryption (RFC 9001 §5.3) ---
     // nonce = IV XOR (0^pn_len || pn); AAD = full header incl. pn.
+    // The decrypt lands in the packet slice itself (`open_in_place` on the
+    // caller buffer): no second `to_vec` of the payload alongside the
+    // packet copy.
     let pn = &pkt[pn_off..pn_off + pn_len];
     let ext_hdr_len = pn_off + pn_len;
     if pkt.len() < ext_hdr_len + 16 {
         return Err(()); // no room for the AEAD tag
     }
-    let mut payload = pkt[ext_hdr_len..].to_vec();
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&iv);
     for (i, b) in pn.iter().enumerate() {
@@ -525,11 +568,12 @@ fn decrypt_initial_packet(
     }
     let aead = ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key_bytes).map_err(|_| ())?;
     let aead = ring::aead::LessSafeKey::new(aead);
+    let (aad, payload) = pkt.split_at_mut(ext_hdr_len);
     let plain = aead
         .open_in_place(
             ring::aead::Nonce::assume_unique_for_key(nonce),
-            ring::aead::Aad::from(&pkt[..ext_hdr_len]),
-            &mut payload,
+            ring::aead::Aad::from(&aad[..]),
+            payload,
         )
         .map_err(|_| ())?;
 
@@ -599,7 +643,7 @@ fn decrypt_initial_packet(
 /// [`HelloSni::Host`]/[`HelloSni::NoSni`] = the hello is complete;
 /// [`HelloSni::Malformed`] = truncated (still assembling) or not a
 /// `ClientHello`.
-fn hello_sni(handshake: &[u8]) -> HelloSni {
+fn hello_sni(handshake: &[u8]) -> HelloSni<'_> {
     if handshake.len() < 4 || handshake[0] != 0x01 {
         return HelloSni::Malformed;
     }
@@ -696,13 +740,22 @@ fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], out: &mut [u8]
     if out.len() > 32 {
         return None;
     }
-    let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
-    info.extend_from_slice(&u16::try_from(out.len()).ok()?.to_be_bytes());
-    info.push(u8::try_from(6 + label.len()).ok()?);
-    info.extend_from_slice(b"tls13 ");
-    info.extend_from_slice(label);
-    info.push(u8::try_from(context.len()).ok()?);
-    info.extend_from_slice(context);
+    // Stack struct: 2 (out len) + 1 (label len) + 6 ("tls13 ") + label +
+    // 1 (context len) + context. Production labels are ≤10 bytes
+    // ("quicv2 key") with empty context, so 38 bytes covers any
+    // label+context up to 28. No heap on the key-schedule path.
+    if label.len() + context.len() > 28 {
+        return None;
+    }
+    let mut info = [0u8; 38];
+    info[..2].copy_from_slice(&u16::try_from(out.len()).ok()?.to_be_bytes());
+    info[2] = u8::try_from(6 + label.len()).ok()?;
+    info[3..9].copy_from_slice(b"tls13 ");
+    info[9..9 + label.len()].copy_from_slice(label);
+    let ctx_off = 9 + label.len();
+    info[ctx_off] = u8::try_from(context.len()).ok()?;
+    info[ctx_off + 1..ctx_off + 1 + context.len()].copy_from_slice(context);
+    let info = &info[..ctx_off + 1 + context.len()];
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
     let mut ctx = ring::hmac::Context::with_key(&key);
     ctx.update(&info);

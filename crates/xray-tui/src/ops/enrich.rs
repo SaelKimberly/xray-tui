@@ -100,7 +100,7 @@ async fn fill_features(
     if let Some(ip) = selected {
         if let Some(geo) = geo {
             match geo.location_by_ip(ip).await {
-                Ok(Some(loc)) => info.country = Some(loc.country),
+                Ok(Some(loc)) => info.country = Some(loc.country.to_string()),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(target: "tui::ops::enrich", "geo lookup failed: {e}"),
             }
@@ -184,7 +184,9 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
                                         "Resolved {host}: {} IP(s)",
                                         ips.len()
                                     );
-                                    (ips, Some(now))
+                                    // `Box<[IpAddr]>` → `Vec`: reuses the
+                                    // allocation, no copy.
+                                    (Vec::from(ips), Some(now))
                                 }
                                 Ok(Err(e)) => {
                                     resolved_ok = false;
@@ -426,7 +428,7 @@ pub fn spawn_outbound_countries(state: &mut AppState) {
                 continue;
             };
             let country = match geo.location_by_ip(ipaddr).await {
-                Ok(Some(loc)) => Some(loc.country),
+                Ok(Some(loc)) => Some(loc.country.to_string()),
                 _ => None,
             };
             if let Ok(mut c) = cache.lock() {
@@ -481,9 +483,9 @@ pub fn spawn_outbound_enrich(state: &mut AppState, endpoint_id: i64, ip_info: Op
         if let Some(geo) = &geo {
             match geo.location_by_ip(outbound_ip).await {
                 Ok(Some(loc)) => {
-                    info.outbound_country = Some(loc.country.clone());
+                    info.outbound_country = Some(loc.country.to_string());
                     if let Ok(mut c) = cache.lock() {
-                        c.insert(outbound_ip.to_string(), Some(loc.country));
+                        c.insert(outbound_ip.to_string(), Some(loc.country.to_string()));
                     }
                 }
                 Ok(None) => {}

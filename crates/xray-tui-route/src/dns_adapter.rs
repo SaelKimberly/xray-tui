@@ -12,15 +12,17 @@ pub struct DnsSinkAdapter {
 }
 
 impl DnsSink for DnsSinkAdapter {
-    fn lookup_ip(
+    fn lookup_ip<'a>(
         &self,
-        host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RouteError>> + Send>> {
+        host: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RouteError>> + Send + 'a>> {
         let resolver = Arc::clone(&self.resolver);
         Box::pin(async move {
             resolver
-                .lookup_ip(&host, true)
+                .lookup_ip(host, true)
                 .await
+                // `Box<[IpAddr]>` → `Vec`: reuses the allocation, no copy.
+                .map(Vec::from)
                 .map_err(|e| RouteError::Resolve(e.to_string()))
         })
     }

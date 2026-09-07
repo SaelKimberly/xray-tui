@@ -25,6 +25,12 @@ ring.workspace = true
 # ============ Time / Duration Parsing ============
 jiff.workspace = true
 
+# ============ Payload Buffers ============
+# Task 2 relay convention: the datapath carries payload bytes as `Bytes`
+# (zero-copy slices); `ConnMeta.payload_prefix` shares that buffer instead
+# of owning a `Vec` copy.
+bytes = "1"
+
 [features]
 default = []
 dns = ["dep:xray-tui-dns"]

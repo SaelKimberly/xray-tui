@@ -3,6 +3,35 @@ use super::{
     probe,
 };
 use std::path::Path;
+/// Builds a full TLS record wrapping a minimal `ClientHello` carrying `sni`.
+/// The `minimal_client_hello` helper below builds the raw handshake (QUIC
+/// CRYPTO shape); this adds the TLS record header so the TLS arm walks it.
+fn build_client_hello_with_sni(sni: &[u8]) -> Vec<u8> {
+    let hello = minimal_client_hello(std::str::from_utf8(sni).expect("test SNI must be ASCII"));
+    let mut record = vec![0x16, 0x03, 0x01]; // handshake, TLS 1.0+
+    record.extend_from_slice(
+        &u16::try_from(hello.len())
+            .expect("test hello fits u16")
+            .to_be_bytes(),
+    );
+    record.extend_from_slice(&hello);
+    record
+}
+
+/// TLS-arm-only probe: asserts the record walks as TLS and returns the
+/// result with its SNI still borrowing the caller's prefix.
+fn sniff_tls(bytes: &[u8]) -> Option<SniffResult<'_>> {
+    let r = probe(bytes);
+    assert_eq!(r.as_ref().map(|r| r.protocol), Some(SniffedProtocol::Tls));
+    r
+}
+
+#[test]
+fn sniff_sni_borrows_prefix() {
+    let pkt = build_client_hello_with_sni(b"example.com");
+    let r = sniff_tls(&pkt).unwrap();
+    assert_eq!(r.sni_as_str(), "example.com"); // no owned String in hot struct
+}
 
 /// Deterministic RNG feeding back a fixed byte sequence (same shape as the
 /// `xray-tui-tls` hello tests).
