@@ -210,8 +210,8 @@ impl<'a> RawUrlX<'a> {
             return Ok(None);
         };
         let decoded = urlencoding::decode_binary(fragment.as_bytes());
-        let text = std::str::from_utf8(decoded.as_ref())?;
-        Ok(Some(text.into()))
+        let text = String::from_utf8_lossy(decoded.as_ref());
+        Ok(Some(text.as_ref().into()))
     }
 
     fn from_str_impl(s: &'a str) -> Option<Self> {

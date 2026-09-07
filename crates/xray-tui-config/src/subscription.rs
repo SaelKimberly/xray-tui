@@ -449,6 +449,20 @@ pub fn parse_subscription_data(
         file_profile(&mut profiles, &mut summary, url, settings);
     }
 
+    // Scan parsed profiles for allow_insecure / insecure settings (typed
+    // security accessor — the full flow rework lands in T12).
+    summary.security_warning_count = profiles
+        .iter()
+        .filter(|p| {
+            p.parsed
+                .protocol
+                .config
+                .security()
+                .and_then(SecurityConfig::insecure)
+                == Some(true)
+        })
+        .count();
+
     summary.total_errors = summary.missing_field_count
         + summary.host_validation_count
         + summary.security_warning_count
