@@ -14,17 +14,20 @@ use tui_popup::{KnownSizeWrapper, Popup};
 
 // ── DataTable row type ────────────────────────────────────────────────
 
-/// Pre-computed log row data for `DataTable` rendering.
-struct LogRow {
+/// Pre-computed log row data for `DataTable` rendering. `target`/`level`/`msg`
+/// borrow the cached [`crate::LogLine`] — the render pass must not clone a
+/// String per row per frame; only the formatted `ts` is owned (one per
+/// *visible* row, see [`build_rows_viewport`]).
+struct LogRow<'a> {
     ts: String,
-    target: String,
+    target: &'a str,
     target_style: Style,
-    level: String,
+    level: &'a str,
     level_style: Style,
-    msg: String,
+    msg: &'a str,
 }
 
-impl DataTableRow for LogRow {
+impl DataTableRow for LogRow<'_> {
     fn render(
         &self,
         col_xs: &[u16],
@@ -51,32 +54,79 @@ impl DataTableRow for LogRow {
         buf.set_stringn(
             col_xs[1],
             y,
-            &self.target,
+            self.target,
             col_widths[1] as usize,
             self.target_style,
         );
         buf.set_stringn(
             col_xs[2],
             y,
-            &self.level,
+            self.level,
             col_widths[2] as usize,
             self.level_style,
         );
         buf.set_stringn(
             col_xs[3],
             y,
-            &self.msg,
+            self.msg,
             col_widths[3] as usize,
             Style::default(),
         );
     }
 
     fn height(&self, available_width: u16) -> u16 {
-        let text_width = unicode_width::UnicodeWidthStr::width(self.msg.as_str());
+        let text_width = unicode_width::UnicodeWidthStr::width(self.msg);
         let msg_width = available_width.saturating_sub(25).max(1);
         1 + (text_width as u16).saturating_sub(1) / msg_width
     }
 }
+
+/// Narrow a [`crate::LogLine`] to its [`LogRow`] display form (borrows the
+/// line; allocates only the formatted timestamp).
+fn log_row_from<'a>(
+    log: &'a crate::LogLine,
+    palette: &ratatui_cheese::theme::Palette,
+) -> LogRow<'a> {
+    let target_style = if log.target.starts_with("xray") {
+        Style::default().fg(Color::Cyan)
+    } else if log.target.starts_with("sing") {
+        Style::default().fg(Color::Green)
+    } else if log.target == "tui" {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let level_style = match log.level.as_str() {
+        "error" | "fatal" | "panic" => ThemeStyles::error(palette),
+        "warning" | "warn" => ThemeStyles::warning(palette),
+        "debug" | "trace" => ThemeStyles::hint(palette),
+        _ => Style::default(),
+    };
+    LogRow {
+        ts: fmt_ts(log.timestamp_nanos),
+        target: &log.target,
+        target_style,
+        level: &log.level,
+        level_style,
+        msg: &log.message,
+    }
+}
+
+/// Materialize row data only for `cache[offset..offset + visible]` — the old
+/// shape built one `LogRow` per filtered entry (up to 10k Strings per
+/// frame); the render pass now passes just the visible window.
+fn build_rows_viewport(cache: &[crate::LogLine], offset: usize, visible: usize) -> Vec<LogRow<'_>> {
+    let palette =
+        crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+    let end = offset.saturating_add(visible).min(cache.len());
+    cache
+        .get(offset..end)
+        .unwrap_or(&[])
+        .iter()
+        .map(|log| log_row_from(log, &palette))
+        .collect()
+}
+
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
     let block = Block::default()
@@ -127,54 +177,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    // Filter cache by target
-    let mut filtered_indices = Vec::with_capacity(state.log_cache.len());
-    filtered_indices.extend(state.log_cache.iter().enumerate().filter_map(|(i, l)| {
-        if state.selected_targets.is_empty() || state.selected_targets.contains(&l.target) {
-            Some(i)
-        } else {
-            None
-        }
-    }));
-
-    let filtered_count = filtered_indices.len();
+    // Filter cache by target — count only (no per-frame 10k-entry index
+    // Vec): the window below streams the cache once and keeps just the rows
+    // the viewport can show.
+    let filtered_count = if state.selected_targets.is_empty() {
+        log_count
+    } else {
+        state
+            .log_cache
+            .iter()
+            .filter(|l| state.selected_targets.contains(&l.target))
+            .count()
+    };
     if filtered_count == 0 {
         let paragraph = Paragraph::new(Line::from(" No logs match current filter"))
             .style(ThemeStyles::hint(&palette));
         frame.render_widget(paragraph, log_area);
         return;
     }
-
-    // Build DataTable rows from the full filtered set
-    let log_rows: Vec<LogRow> = filtered_indices
-        .iter()
-        .map(|&idx| {
-            let log = &state.log_cache[idx];
-            let target_style = if log.target.starts_with("xray") {
-                Style::default().fg(Color::Cyan)
-            } else if log.target.starts_with("sing") {
-                Style::default().fg(Color::Green)
-            } else if log.target == "tui" {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let level_style = match log.level.as_str() {
-                "error" | "fatal" | "panic" => ThemeStyles::error(&palette),
-                "warning" | "warn" => ThemeStyles::warning(&palette),
-                "debug" | "trace" => ThemeStyles::hint(&palette),
-                _ => Style::default(),
-            };
-            LogRow {
-                ts: fmt_ts(log.timestamp_nanos),
-                target: shorten_target(&log.target),
-                target_style,
-                level: log.level.clone(),
-                level_style,
-                msg: log.message.clone(),
-            }
-        })
-        .collect();
 
     let columns = vec![
         Column::new("Time", ColumnWidth::Fixed(25)),
@@ -198,8 +218,36 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
             }
         },
     );
+    // The DataTable receives ONLY the visible slice with offset 0; a window
+    // starting past the last row would render an empty table (the old full-
+    // slice path clamped internally). Clamp here so at least one row shows.
+    let offset = offset.min(filtered_count.saturating_sub(1));
 
-    // Build multi-selection set from anchor range (offset-from-bottom)
+    // Materialize ONLY the visible window of the filtered stream: rows borrow
+    // the cache lines, and the pass stops as soon as the window is filled.
+    // Multi-line (wrapped) rows can exceed the area height, so build one row
+    // of slack; the DataTable clips whatever overflows.
+    let visible = approx_visible.saturating_add(1);
+    let no_filter = state.selected_targets.is_empty();
+    let mut log_rows: Vec<LogRow> = Vec::with_capacity(visible);
+    let end = offset.saturating_add(visible);
+    let mut rank = 0usize;
+    for log in &state.log_cache {
+        if !no_filter && !state.selected_targets.contains(&log.target) {
+            continue;
+        }
+        if rank >= offset {
+            log_rows.push(log_row_from(log, &palette));
+            if log_rows.len() >= visible {
+                break;
+            }
+        }
+        rank += 1;
+    }
+
+    // Build multi-selection set from anchor range (offset-from-bottom),
+    // translated into visible-window row indices (the slice starts at `offset`
+    // in filtered space).
     let mut multi_selected = HashSet::new();
     if let Some(anchor) = state.log_select_anchor {
         let lo = state.log_scroll.min(anchor);
@@ -207,12 +255,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         // Convert offset-from-bottom to row indices (0 = oldest)
         let lo_row = filtered_count.saturating_sub(hi + 1);
         let hi_row = filtered_count.saturating_sub(lo + 1);
+        let win_end = offset.saturating_add(log_rows.len());
         for i in lo_row..=hi_row {
-            multi_selected.insert(i);
+            if i >= offset && i < win_end {
+                multi_selected.insert(i - offset);
+            }
         }
     }
 
-    // Cursor row in filtered index space
+    // Cursor row in filtered index space → visible-window selection
     let cursor_row = filtered_count.saturating_sub(state.log_scroll + 1);
     let selected = cursor_row
         .checked_sub(offset)
@@ -221,12 +272,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let data_table = DataTable::new(columns, &log_rows)
         .column_spacing(1)
         .selection_style(ThemeStyles::table_row_selected(&palette))
+        // The slice is the visible window; the scrollbar still reports the
+        // full filtered length and the true offset.
+        .total_rows(Some(filtered_count))
+        .scrollbar_offset(Some(offset))
         .scrollbar(
             ThemeStyles::scrollbar_thumb(&palette),
             ThemeStyles::scrollbar_track(&palette),
         );
     let mut dt_state = DataTableState {
-        offset,
+        offset: 0,
         selected,
         multi_selected,
     };
@@ -241,15 +296,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     ) {
         render_confirmation_overlay(frame, area, " Purge entire log database? (y/N) ");
     }
-}
-
-/// Shorten a target string for display (max ~18 chars).
-fn shorten_target(target: &str) -> String {
-    if target.len() <= 18 {
-        return target.to_string();
-    }
-    // For "xray::infra::conf::serial" → "xray::infra::con.."
-    format!("{}..", &target[..16])
 }
 
 /// Handle key events for the Logs tab.
@@ -538,11 +584,9 @@ pub fn handle_target_picker_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Enter => {
             // Toggle the selected target
-            if let Some(target) = state.known_targets.get(selected) {
-                if let Some(pos) = state.selected_targets.iter().position(|t| t == target) {
-                    state.selected_targets.remove(pos);
-                } else {
-                    state.selected_targets.push(target.clone());
+            if let Some(target) = state.known_targets.get(selected).cloned() {
+                if !state.selected_targets.remove(&target) {
+                    state.selected_targets.insert(target);
                 }
             }
         }
@@ -691,4 +735,25 @@ fn fmt_ts(ts_nanos: i64) -> String {
         || format!("{}s", ts_nanos / 1_000_000_000),
         |dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_line(s: &str) -> crate::LogLine {
+        crate::LogLine {
+            level: "info".to_string(),
+            target: "tui".to_string(),
+            message: s.to_string(),
+            timestamp_nanos: 0,
+        }
+    }
+
+    #[test]
+    fn log_rows_build_viewport_only() {
+        let cache = vec![make_line("a"); 10000];
+        let rows = build_rows_viewport(&cache, 0, 30);
+        assert_eq!(rows.len(), 30);
+    }
 }

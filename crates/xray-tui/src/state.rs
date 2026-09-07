@@ -1,8 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -135,8 +135,9 @@ pub struct AppState {
     pub last_seen_log_ns: u64,
     /// Known target names from the heed targets database.
     pub known_targets: Vec<String>,
-    /// Selected targets for filtering (empty = show all).
-    pub selected_targets: Vec<String>,
+    /// Selected targets for filtering (empty = show all). A set so the
+    /// per-line filter probe in the Logs render pass is O(1), not O(n).
+    pub selected_targets: HashSet<String>,
     /// Last time we polled heed for new log entries.
     pub last_heed_poll: std::time::Instant,
     /// Channel sender for non-blocking log persistence.
@@ -153,13 +154,15 @@ pub struct AppState {
     pub dns_resolver: Option<Arc<xray_tui_dns::DnsResolver>>,
     /// Whitelist checker (loaded in background; None until `HostFeaturesLoaded`).
     pub host_features: Option<Arc<xray_tui_host_features::HostFeaturesChecker>>,
-    /// Per-endpoint enrichment data; survives profile reloads.
     pub endpoint_info: HashMap<i64, EndpointInfo>,
     /// mmdb country per outbound (exit) IP, keyed by the IP string. Filled at
     /// profile load and on real-ping success; survives reruns because the
     /// source (`Latency::Real.ip`) is persisted and lookups rerun at load.
-    pub outbound_country_cache:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
+    /// A 512-entry LRU (not the old unbounded `HashMap`): a long-lived
+    /// session touching many exit IPs stays bounded; `lru::LruCache::get`
+    /// needs `&mut`, hence the `Mutex` (the old plain `HashMap` had no
+    /// eviction at all, so the lock discipline is unchanged in practice).
+    pub outbound_country_cache: Arc<parking_lot::Mutex<lru::LruCache<String, Option<String>>>>,
     /// TTL (secs) for the DNS-resolution cache; default 300.
     pub dns_cache_ttl_secs: i64,
 }
@@ -170,7 +173,6 @@ impl AppState {
     pub fn outbound_country_for(&self, ip: &str) -> Option<String> {
         self.outbound_country_cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(ip)
             .cloned()
             .flatten()
@@ -466,7 +468,7 @@ impl AppState {
             heed_storage: None,
             last_seen_log_ns: 0,
             known_targets: Vec::new(),
-            selected_targets: Vec::new(),
+            selected_targets: HashSet::new(),
             last_heed_poll: std::time::Instant::now(),
             log_sender_tx: None,
             core_log_tx: None,
@@ -475,9 +477,10 @@ impl AppState {
             dns_resolver: None,
             host_features: None,
             endpoint_info: HashMap::new(),
-            outbound_country_cache: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            // 512-entry LRU: hot exit IPs stay resident; cold ones evict.
+            outbound_country_cache: Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(512).expect("512 is nonzero"),
+            ))),
             dns_cache_ttl_secs: 300,
         };
         // Cheap constructors — no I/O until first lookup.

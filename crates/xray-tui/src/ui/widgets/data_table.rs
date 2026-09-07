@@ -109,6 +109,11 @@ pub struct DataTable<'a, R: DataTableRow> {
     pub show_scrollbar: bool,
     pub scrollbar_thumb_style: Style,
     pub scrollbar_track_style: Style,
+    /// When the caller passes a WINDOWED row slice (viewport virtualization),
+    /// the scrollbar's content length comes from here instead of `rows.len()`.
+    pub total_rows: Option<usize>,
+    /// True scroll position when the slice starts at a non-zero offset.
+    pub scrollbar_offset: Option<usize>,
 }
 
 impl<R: DataTableRow> Default for DataTable<'_, R> {
@@ -126,6 +131,8 @@ impl<R: DataTableRow> Default for DataTable<'_, R> {
             show_scrollbar: false,
             scrollbar_thumb_style: Style::default(),
             scrollbar_track_style: Style::default(),
+            total_rows: None,
+            scrollbar_offset: None,
         }
     }
 }
@@ -184,6 +191,24 @@ impl<'a, R: DataTableRow> DataTable<'a, R> {
         self.scrollbar_track_style = track_style;
         self
     }
+
+    /// Scrollbar content length when `rows` is a windowed (viewport) slice:
+    /// the full filtered row count the thumb size/proportion use.
+    /// `None` (default) uses `rows.len()`.
+    #[must_use]
+    pub const fn total_rows(mut self, total: Option<usize>) -> Self {
+        self.total_rows = total;
+        self
+    }
+
+    /// True scroll position when a windowed slice starts past row 0: the
+    /// scrollbar thumb uses this instead of `state.offset`.
+    /// `None` (default) uses `state.offset`.
+    #[must_use]
+    pub const fn scrollbar_offset(mut self, offset: Option<usize>) -> Self {
+        self.scrollbar_offset = offset;
+        self
+    }
 }
 
 // ── State ───────────────────────────────────────────────────────────────
@@ -211,20 +236,33 @@ impl Default for DataTableState {
 
 // ── Width computation ───────────────────────────────────────────────────
 
+/// Maximum supported column count; the widest caller has 17 (profiles).
+/// Stack-resident so the per-frame render never touches the allocator.
+const MAX_COLS: usize = 32;
+
 /// Compute pixel widths for each column given the available inner width.
-fn compute_widths(columns: &[Column], available: u16, spacing: u16) -> Vec<u16> {
-    if columns.is_empty() {
-        return Vec::new();
+/// Writes into `out`, returning the number of columns filled (columns beyond
+/// [`MAX_COLS`] are ignored — no caller is near it).
+fn compute_widths(
+    columns: &[Column],
+    available: u16,
+    spacing: u16,
+    out: &mut [u16; MAX_COLS],
+) -> usize {
+    let n = columns.len().min(MAX_COLS);
+    if n == 0 {
+        return 0;
     }
 
-    let total_spacing = columns.len().saturating_sub(1) as u16 * spacing;
+    let total_spacing = n.saturating_sub(1) as u16 * spacing;
     let available = available.saturating_sub(total_spacing);
 
-    let mut widths: Vec<u16> = vec![0; columns.len()];
+    let widths = &mut out[..n];
+    widths.fill(0);
     let mut remaining = available;
 
     // 1. Assign Fixed widths
-    for (i, col) in columns.iter().enumerate() {
+    for (i, col) in columns.iter().take(n).enumerate() {
         if let ColumnWidth::Fixed(w) = col.width {
             let w = w.min(remaining);
             widths[i] = w;
@@ -233,7 +271,7 @@ fn compute_widths(columns: &[Column], available: u16, spacing: u16) -> Vec<u16> 
     }
 
     // 2. Assign Min widths
-    for (i, col) in columns.iter().enumerate() {
+    for (i, col) in columns.iter().take(n).enumerate() {
         if let ColumnWidth::Min(min) = col.width {
             let w = min.min(remaining);
             widths[i] = w;
@@ -244,6 +282,7 @@ fn compute_widths(columns: &[Column], available: u16, spacing: u16) -> Vec<u16> 
     // 3. Distribute remaining to Ratio columns
     let ratio_total: u16 = columns
         .iter()
+        .take(n)
         .filter_map(|c| match c.width {
             ColumnWidth::Ratio(r) => Some(r),
             _ => None,
@@ -253,7 +292,7 @@ fn compute_widths(columns: &[Column], available: u16, spacing: u16) -> Vec<u16> 
     if ratio_total > 0 && remaining > 0 {
         let remaining_before_ratio = remaining;
         let mut assigned = 0u16;
-        for (i, col) in columns.iter().enumerate() {
+        for (i, col) in columns.iter().take(n).enumerate() {
             if let ColumnWidth::Ratio(r) = col.width {
                 let share = remaining_before_ratio * r / ratio_total;
                 widths[i] = share;
@@ -263,6 +302,7 @@ fn compute_widths(columns: &[Column], available: u16, spacing: u16) -> Vec<u16> 
         // Give any leftover pixels to the last ratio column
         if let Some(ratio_idx) = columns
             .iter()
+            .take(n)
             .enumerate()
             .rev()
             .find(|(_, c)| matches!(c.width, ColumnWidth::Ratio(_)))
@@ -272,7 +312,7 @@ fn compute_widths(columns: &[Column], available: u16, spacing: u16) -> Vec<u16> 
         }
     }
 
-    widths
+    n
 }
 
 impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
@@ -301,44 +341,53 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             (inner, Rect::default())
         };
 
-        // Compute column pixel widths
-        let col_widths = compute_widths(&self.columns, content_inner.width, self.column_spacing);
-        let col_xs: Vec<u16> = {
-            let mut xs = Vec::with_capacity(col_widths.len());
+        // Compute column pixel widths (stack arrays — no per-frame heap).
+        let mut widths_buf = [0u16; MAX_COLS];
+        let ncols = compute_widths(
+            &self.columns,
+            content_inner.width,
+            self.column_spacing,
+            &mut widths_buf,
+        );
+        let col_widths = &widths_buf[..ncols];
+        let mut xs_buf = [0u16; MAX_COLS];
+        let col_xs = {
+            let xs = &mut xs_buf[..ncols];
             let mut x = content_inner.x;
             for (i, w) in col_widths.iter().enumerate() {
-                xs.push(x);
+                xs[i] = x;
                 x += w;
                 if i < col_widths.len() - 1 {
                     x += self.column_spacing;
                 }
             }
-            xs
+            &xs_buf[..ncols]
         };
 
-        // Header row
+        // Header row. The header line is rendered borrowed (no spans clone);
+        // the sort arrow overwrites the column's trailing cells with a second
+        // `set_stringn` instead of a re-allocated header string.
         let mut header_y = inner.y;
-        for (i, col) in self.columns.iter().enumerate() {
+        for (i, col) in self.columns.iter().take(ncols).enumerate() {
             let w = col_widths[i];
             if w == 0 {
                 continue;
             }
-            let header_text = if self.sort_column == Some(i) {
+            buf.set_line(col_xs[i], header_y, &col.header, w);
+            if self.sort_column == Some(i) {
+                // The old shape appended " ↑"/" ↓" to the header text (a
+                // spans clone + format! per frame). Draw the same suffix with
+                // a second `set_stringn` right after the header's own width.
                 let arrow = match self.sort_direction {
                     SortDirection::Ascending => " ↑",
                     SortDirection::Descending => " ↓",
                 };
-                // Append a sort-indicator span to the header text
-                let mut spans = col.header.spans.clone();
-                if let Some(last) = spans.last_mut() {
-                    let new_content = format!("{}{}", last.content, arrow);
-                    last.content = std::borrow::Cow::Owned(new_content);
+                let ax = col_xs[i] + (col.header.width() as u16).min(w.saturating_sub(2));
+                let aw = w.saturating_sub(ax - col_xs[i]) as usize;
+                if aw > 0 {
+                    buf.set_stringn(ax, header_y, arrow, aw, self.columns[i].style);
                 }
-                Line::from(spans)
-            } else {
-                col.header.clone()
-            };
-            buf.set_line(col_xs[i], header_y, &header_text, w);
+            }
         }
 
         header_y += 1;
@@ -418,15 +467,17 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
             row_idx += 1;
         }
 
-        // Render vertical scrollbar
+        // Render vertical scrollbar. With a windowed (viewport) slice the
+        // content length and the true offset are supplied by the caller —
+        // the slice length alone would pin the thumb at full-track.
         if self.show_scrollbar && scrollbar_area.width > 0 && total_rows > 0 {
             let visible_rows = rows_from_end.max(1);
             let lengths = ScrollLengths {
-                content_len: total_rows.max(1),
+                content_len: self.total_rows.unwrap_or(total_rows).max(1),
                 viewport_len: visible_rows.max(1),
             };
             let scrollbar = ScrollBar::vertical(lengths)
-                .offset(state.offset)
+                .offset(self.scrollbar_offset.unwrap_or(state.offset))
                 .thumb_style(self.scrollbar_thumb_style)
                 .track_style(self.scrollbar_track_style)
                 .glyph_set(GlyphSet::minimal());

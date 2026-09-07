@@ -60,6 +60,10 @@ chrono = { version = "0.4" }
 humantime.workspace = true
 url.workspace = true
 parking_lot = "0.12"
+# Memory-diet Task 6 (B-slice gate): the ONLY new-dep allowance. `lru 0.18`
+# is already in Cargo.lock (toasty's transitive dep), so no new crates enter
+# the tree — direct edges only for the TUI's bounded caches.
+lru = "0.18"
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]

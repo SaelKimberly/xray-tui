@@ -8035,6 +8035,7 @@ dependencies = [
  "futures-util",
  "humantime",
  "jiff",
+ "lru 0.18.2",
  "parking_lot",
  "ratatui",
  "ratatui-cheese",

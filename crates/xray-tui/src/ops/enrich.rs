@@ -431,9 +431,7 @@ pub fn spawn_outbound_countries(state: &mut AppState) {
                 Ok(Some(loc)) => Some(loc.country.to_string()),
                 _ => None,
             };
-            if let Ok(mut c) = cache.lock() {
-                c.insert(ip, country);
-            }
+            cache.lock().push(ip, country);
         }
     });
 }
@@ -484,9 +482,9 @@ pub fn spawn_outbound_enrich(state: &mut AppState, endpoint_id: i64, ip_info: Op
             match geo.location_by_ip(outbound_ip).await {
                 Ok(Some(loc)) => {
                     info.outbound_country = Some(loc.country.to_string());
-                    if let Ok(mut c) = cache.lock() {
-                        c.insert(outbound_ip.to_string(), Some(loc.country.to_string()));
-                    }
+                    cache
+                        .lock()
+                        .push(outbound_ip.to_string(), Some(loc.country.to_string()));
                 }
                 Ok(None) => {}
                 Err(e) => {
