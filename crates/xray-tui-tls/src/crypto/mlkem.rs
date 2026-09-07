@@ -157,7 +157,7 @@ impl Mlkem768 {
         let kem = Self::kem()?;
         let (pk, sk) = kem.keypair().map_err(|_| MlkemError::KeygenFailed)?;
         let pk_vec = pk.into_vec();
-        let sk_vec = sk.into_vec();
+        let sk_vec = Zeroizing::new(sk.into_vec());
         if pk_vec.len() != 1184 || sk_vec.len() != 2400 {
             return Err(MlkemError::KeygenFailed);
         }
@@ -188,7 +188,7 @@ impl Mlkem768 {
             .keypair_derand(seed_ref)
             .map_err(|_| MlkemError::KeygenFailed)?;
         let pk_vec = pk.into_vec();
-        let sk_vec = sk.into_vec();
+        let sk_vec = Zeroizing::new(sk.into_vec());
         if pk_vec.len() != 1184 || sk_vec.len() != 2400 {
             return Err(MlkemError::KeygenFailed);
         }
