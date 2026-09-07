@@ -581,15 +581,11 @@ pub(crate) fn clash_transport_to_transport(
             let Some(w) = ws_opts else {
                 return TransportConfig::Tcp;
             };
-            // The vhost lives in the dedicated `host` field, not in `headers`;
-            // drop `Host` from the header map so the two never double-represent it.
-            let headers = w.headers.as_ref().map(|h| {
-                h.iter()
-                    .filter(|(key, _)| !key.eq_ignore_ascii_case("host"))
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<std::collections::HashMap<_, _>>()
+            let headers = w.headers.as_ref().and_then(|h| {
+                let mut headers = h.clone();
+                headers.retain(|key, _| !key.eq_ignore_ascii_case("host"));
+                (!headers.is_empty()).then_some(headers)
             });
-            let headers = headers.filter(|h| !h.is_empty());
             TransportConfig::Ws(WebSocketConfig {
                 path: w.path.clone().map(TinyText::from),
                 // Match the strip above case-insensitively, so a lowercase

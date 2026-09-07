@@ -178,26 +178,19 @@ pub fn format_share_url(parsed: &ParsedProto, endpoint: &EndpointEssentials) -> 
 
 /// Parsed URL components that avoid the edge-case failures of `url::Url::parse`
 /// (Trojan `#` in password, `@` in query values, etc.).
-///
-/// Currently consumed as the `parse_share_url` shape gate (its fields are
-/// intentionally kept populated for the T12 subscription rework, which will
-/// consume the split components).
-#[allow(dead_code, reason = "splitter fields kept for T12 subscription rework")]
-struct UrlComponents {
+struct UrlComponents<'a> {
     _scheme: String,
-    username: String,
-    password: Option<String>,
+    username: std::borrow::Cow<'a, str>,
+    password: Option<std::borrow::Cow<'a, str>>,
     host: String,
     port: Option<u16>,
-    _path: Option<String>,
-    query_pairs: Vec<(String, String)>,
-    fragment: Option<String>,
+    _path: Option<std::borrow::Cow<'a, str>>,
+    query_pairs: Vec<(&'a str, std::borrow::Cow<'a, str>)>,
+    fragment: Option<std::borrow::Cow<'a, str>>,
 }
-
 /// Robust URL splitting that handles Trojan `#`-in-password and `@`-in-query edge cases.
 /// Returns components without using `url::Url`.
-fn split_share_url(url: &str) -> Result<UrlComponents> {
-    // 1. Extract scheme
+fn split_share_url(url: &str) -> Result<UrlComponents<'_>> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| ImportError::Parse("missing scheme in URL".into()))?;
@@ -238,8 +231,8 @@ fn split_share_url(url: &str) -> Result<UrlComponents> {
         unparsed
     };
 
-    let (mut host, port) = parse_hostport(hostport);
-    host = fix_percent_encoding(&host);
+    let (host, port) = parse_hostport(hostport);
+    let host = fix_percent_encoding(&host).into_owned();
 
     Ok(UrlComponents {
         _scheme: scheme,
@@ -256,8 +249,14 @@ fn split_share_url(url: &str) -> Result<UrlComponents> {
 /// Find userinfo separator (`@`) with Trojan password `#` handling.
 /// Returns `(username, password, rest_of_url)`.
 /// When no `@` found at the correct position, username and password are empty and rest is the full body.
-fn find_userinfo<'a>(s: &'a str, scheme: &str) -> (String, Option<String>, &'a str) {
-    // Find the @ that appears before any # or ?
+fn find_userinfo<'a>(
+    s: &'a str,
+    scheme: &str,
+) -> (
+    std::borrow::Cow<'a, str>,
+    Option<std::borrow::Cow<'a, str>>,
+    &'a str,
+) {
     let at_pos = s.find('@').and_then(|pos| {
         let earliest = s.find('#').or_else(|| s.find('?'));
         match earliest {
@@ -287,7 +286,7 @@ fn find_userinfo<'a>(s: &'a str, scheme: &str) -> (String, Option<String>, &'a s
     });
 
     at_pos.map_or_else(
-        || (String::new(), None, s),
+        || (std::borrow::Cow::Borrowed(""), None, s),
         |pos| {
             let userinfo = &s[..pos];
             let rest = &s[pos + 1..];
@@ -307,12 +306,15 @@ fn parse_hostport(s: &str) -> (String, Option<u16>) {
     if let Some(inner) = s.strip_prefix('[') {
         if let Some((host, port_part)) = inner.split_once("]:") {
             let port = port_part.parse::<u16>().ok();
-            return (format!("[{host}]"), port);
+            let host = port.map_or_else(
+                || format!("[{host}]"),
+                |port| format!("[{host}]:{port}").split_off(host.len() + 2),
+            );
+            return (host, port);
         }
         let trimmed = s.trim_end_matches(']');
         return (format!("[{}]", &trimmed[1..]), None);
     }
-
     // Iterative scan from right: find first colon where the suffix starts
     // with valid ASCII digits forming a u16 port number.
     // Handles port-suffix like `host:443:extra` and trailing-garbage like `host:443abc`.
@@ -338,19 +340,22 @@ fn parse_hostport(s: &str) -> (String, Option<u16>) {
 }
 
 /// Fix bare `%` characters not followed by 2 valid hex digits by percent-encoding them.
-fn fix_percent_encoding(s: &str) -> String {
+/// Borrows when the input needs no fix (the common path for hosts).
+fn fix_percent_encoding(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.contains('%') {
-        return s.to_string();
+        return std::borrow::Cow::Borrowed(s);
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            if i + 2 < bytes.len() && is_hex_char(bytes[i + 1]) && is_hex_char(bytes[i + 2]) {
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
                 out.push(b'%');
             } else {
-                // Bare % — encode it
                 out.extend_from_slice(b"%25");
             }
         } else {
@@ -358,17 +363,15 @@ fn fix_percent_encoding(s: &str) -> String {
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
-const fn is_hex_char(b: u8) -> bool {
-    b.is_ascii_hexdigit()
-}
-
-/// Percent-decode a string. Fallback to original on failure.
-fn percent_decode(s: &str) -> String {
+/// Percent-decode a string, borrowing when there is nothing to decode.
+/// Fallback to original on failure. Keys/values that need no unescaping stay
+/// zero-copy; only escaped components allocate.
+fn percent_decode(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.contains('%') {
-        return s.to_string();
+        return std::borrow::Cow::Borrowed(s);
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -386,7 +389,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    String::from_utf8_lossy(&out).into_owned().into()
 }
 
 /// Normalize a remark string: percent-decode, trim, collapse inner whitespace.
@@ -423,15 +426,16 @@ const fn hex_val_sub(b: u8) -> Option<u8> {
         _ => None,
     }
 }
-
-/// Parse query string into `Vec<(String, String)>` — linear scan, no `HashMap`.
-fn parse_query_params(query: &str) -> Vec<(String, String)> {
+/// Parse query string into borrowed `&str` ranges — linear scan, no `HashMap`.
+/// Keys stay borrowed (URL-split validation compares `k` directly); only
+/// decoded values that need unescaping allocate.
+fn parse_query_params(query: &str) -> Vec<(&str, std::borrow::Cow<'_, str>)> {
     let mut result = Vec::new();
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            result.push((k.to_string(), percent_decode(v)));
+            result.push((k, percent_decode(v)));
         } else if !pair.is_empty() {
-            result.push((pair.to_string(), String::new()));
+            result.push((pair, std::borrow::Cow::Borrowed("")));
         }
     }
     result

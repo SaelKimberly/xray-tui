@@ -265,13 +265,17 @@ pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
         links: Deferred::default(),
     }
 }
-
-/// The per-pair `ProfileStats` link for one parsed endpoint.
-fn link_from_parsed(parsed: &ParsedProto, ep: &EndpointEssentials) -> ProfileStats {
+/// The per-pair `ProfileStats` link for one parsed endpoint, reusing the
+/// already-computed protocol id (no `uid()` rehash per endpoint) and the
+fn link_from_parsed_with_id(
+    parsed: &ParsedProto,
+    protocol_id: ProtocolId,
+    endpoint_id: EndpointId,
+) -> ProfileStats {
     let now = jiff::Timestamp::now();
     ProfileStats {
-        protocol_id: ProtocolId::new(parsed.uid()),
-        endpoint_id: EndpointId::new(stable_hash(&ep.host, i64::from(ep.port))),
+        protocol_id,
+        endpoint_id,
         core_type: parsed.protocol.core_type,
         config_type: match parsed.protocol.config_type {
             ConfigKind::ShareUrl => ConfigType::ShareUrl,
@@ -297,25 +301,27 @@ fn link_from_parsed(parsed: &ParsedProto, ep: &EndpointEssentials) -> ProfileSta
         endpoint: Deferred::default(),
     }
 }
-
 /// Convert a typed parse result into db rows: one `(Endpoint, Protocol,
 /// ProfileStats)` triple per parsed endpoint. Encrypted configs that carry no
 /// endpoint produce an empty vec (nothing to store).
+///
+/// The `Protocol` row (including its uid/sig/`cred_hash` canonical pass) is
+/// built ONCE per `ParsedProto` and cloned per row — the per-endpoint
+/// `protocol_from_parsed` rehash is gone, and the shared row's deferred JSON
+/// payloads are `Clone`-shared handles, not re-serializations.
 pub fn parsed_to_rows(parsed: &ParsedProto) -> Vec<(Endpoint, Protocol, ProfileStats)> {
+    let protocol = protocol_from_parsed(parsed);
+    let protocol_id = protocol.id;
     parsed
         .endpoints
         .iter()
         .map(|ep| {
             let endpoint = endpoint_from_essentials(ep);
-            (
-                endpoint,
-                protocol_from_parsed(parsed),
-                link_from_parsed(parsed, ep),
-            )
+            let link = link_from_parsed_with_id(parsed, protocol_id, endpoint.id);
+            (endpoint, protocol.clone(), link)
         })
         .collect()
 }
-
 /// Persist a parsed protocol as typed rows: one endpoint per parsed endpoint,
 /// one shared protocol row, one per-pair link, plus the endpoint-group link
 /// when `group_id` is `Some`. Returns the number of endpoints persisted.

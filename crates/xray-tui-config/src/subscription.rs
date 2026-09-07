@@ -33,8 +33,10 @@ pub struct StreamingDecoder {
     pending_input_len: usize,
     carry_over: Box<[MaybeUninit<u8>]>,
     carry_over_len: usize,
+    /// Reused per-feed staging buffer (`clear` + `resize`, no fresh alloc):
+    /// pending bytes + one chunk, 4-byte-aligned before decode.
+    work: Vec<u8>,
 }
-
 impl StreamingDecoder {
     /// Create a new decoder.
     #[must_use]
@@ -45,6 +47,7 @@ impl StreamingDecoder {
             pending_input_len: 0,
             carry_over: vec![MaybeUninit::uninit(); CARRY_OVER_SIZE].into_boxed_slice(),
             carry_over_len: 0,
+            work: Vec::new(),
         }
     }
 
@@ -65,7 +68,6 @@ impl StreamingDecoder {
     ///
     /// # Errors
     ///
-    /// Returns an error if base64 decoding fails after encoding was determined.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
         if chunk.is_empty() && self.pending_input_len == 0 {
             return Ok(vec![]);
@@ -79,23 +81,21 @@ impl StreamingDecoder {
             ));
         }
 
+        // Reuse the staging allocation across feeds (`clear` + `resize` keeps
+        // the buffer; the borrow below ends before `self` is touched again).
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        work.resize(INPUT_CHUNK_SIZE + 4, 0);
         let total_len = self.pending_input_len + chunk.len();
-        let mut work = vec![MaybeUninit::<u8>::uninit(); INPUT_CHUNK_SIZE + 4];
         // Prepend pending bytes
         for (w, p) in work[..self.pending_input_len]
             .iter_mut()
             .zip(self.pending_input.iter())
         {
-            *w = MaybeUninit::new(unsafe { p.assume_init() });
+            *w = unsafe { p.assume_init() };
         }
-
         // Copy chunk bytes into remaining work area
-        for (w, c) in work[self.pending_input_len..total_len]
-            .iter_mut()
-            .zip(chunk)
-        {
-            *w = MaybeUninit::new(*c);
-        }
+        work[self.pending_input_len..total_len].copy_from_slice(chunk);
         self.pending_input_len = 0;
 
         // Align to 4-byte base64 boundary
@@ -104,19 +104,20 @@ impl StreamingDecoder {
 
         // Save trailing bytes as pending for next call
         for i in 0..remainder {
-            self.pending_input[i] =
-                MaybeUninit::new(unsafe { work[aligned_len + i].assume_init() });
+            self.pending_input[i] = MaybeUninit::new(work[aligned_len + i]);
         }
         self.pending_input_len = remainder;
 
-        // SAFETY: work[..aligned_len] is fully initialized
-        let input = unsafe { std::slice::from_raw_parts(work.as_ptr().cast::<u8>(), aligned_len) };
+        let input = &work[..aligned_len];
         let decoded = self.process_aligned(input)?;
-        Ok(self.process_decoded(&decoded))
+        let urls = self.process_decoded(&decoded);
+        drop(decoded);
+        // Hand a possibly-grown buffer back so the next feed reuses it.
+        self.work = work;
+        Ok(urls)
     }
 
     /// Flush any remaining buffered data. Call once after the last `feed()`.
-    ///
     /// Returns any final URLs from the last partial line.
     ///
     /// # Errors
@@ -151,10 +152,14 @@ impl StreamingDecoder {
 
     // ── internal helpers ──
 
-    /// Detect encoding and decode one 4-byte-aligned portion.
-    fn process_aligned(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    /// Detect encoding and decode one 4-byte-aligned portion. Raw text is
+    /// borrowed from `data` (`Cow::Borrowed`) — no 64 KiB copy per chunk.
+    fn process_aligned<'a>(
+        &mut self,
+        data: &'a [u8],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, String> {
         if data.is_empty() {
-            return Ok(vec![]);
+            return Ok(std::borrow::Cow::Borrowed(&[]));
         }
 
         // Trim trailing whitespace and '=' padding for base64 decode attempts.
@@ -166,28 +171,27 @@ impl StreamingDecoder {
         {
             &data[..=pos]
         } else {
-            return Ok(vec![]);
+            return Ok(std::borrow::Cow::Borrowed(&[]));
         };
-
         match self.state {
             EncodingState::Unknown => {
                 let (encoding, decoded) = if memchr::memchr2(b'+', b'\\', trimmed).is_some() {
                     // Has standard-base64-specific characters
                     STANDARD_NO_PAD.decode_to_vec(trimmed).map_or_else(
-                        |_| (EncodingState::Raw, data.to_vec()),
-                        |d| (EncodingState::StdB64, d),
+                        |_| (EncodingState::Raw, std::borrow::Cow::Borrowed(data)),
+                        |d| (EncodingState::StdB64, std::borrow::Cow::Owned(d)),
                     )
                 } else if memchr::memchr2(b'-', b'_', trimmed).is_some() {
                     // Has URL-safe-base64-specific characters
                     URL_SAFE_NO_PAD.decode_to_vec(trimmed).map_or_else(
-                        |_| (EncodingState::Raw, data.to_vec()),
-                        |d| (EncodingState::UrlSafeB64, d),
+                        |_| (EncodingState::Raw, std::borrow::Cow::Borrowed(data)),
+                        |d| (EncodingState::UrlSafeB64, std::borrow::Cow::Owned(d)),
                     )
                 } else {
                     // Alphanumeric-only — try standard (most common)
                     STANDARD_NO_PAD.decode_to_vec(trimmed).map_or_else(
-                        |_| (EncodingState::Raw, data.to_vec()),
-                        |d| (EncodingState::StdB64, d),
+                        |_| (EncodingState::Raw, std::borrow::Cow::Borrowed(data)),
+                        |d| (EncodingState::StdB64, std::borrow::Cow::Owned(d)),
                     )
                 };
                 self.state = encoding;
@@ -195,11 +199,13 @@ impl StreamingDecoder {
             }
             EncodingState::StdB64 => STANDARD_NO_PAD
                 .decode_to_vec(trimmed)
+                .map(std::borrow::Cow::Owned)
                 .map_err(|e| format!("base64 decode error: {e}")),
             EncodingState::UrlSafeB64 => URL_SAFE_NO_PAD
                 .decode_to_vec(trimmed)
+                .map(std::borrow::Cow::Owned)
                 .map_err(|e| format!("base64 decode error: {e}")),
-            EncodingState::Raw => Ok(data.to_vec()),
+            EncodingState::Raw => Ok(std::borrow::Cow::Borrowed(data)),
         }
     }
 
@@ -231,7 +237,6 @@ impl StreamingDecoder {
             self.process_text_owned(&combined)
         }
     }
-
     /// Helper: split on last \n, extract URLs, save `carry_over`.
     /// Takes ownership of the string for splitting.
     fn process_text_owned(&mut self, full_text: &str) -> Vec<String> {
@@ -239,7 +244,7 @@ impl StreamingDecoder {
             return Vec::new();
         }
 
-        if let Some(last_nl) = full_text.rfind('\n') {
+        if let Some(last_nl) = memchr::memrchr(b'\n', full_text.as_bytes()) {
             let complete = &full_text[..last_nl];
             let remaining = &full_text[last_nl + 1..];
             let urls = process_text_std(complete.as_bytes());
@@ -259,7 +264,7 @@ impl StreamingDecoder {
         if text.is_empty() {
             return Vec::new();
         }
-        if let Some(last_nl) = text.rfind('\n') {
+        if let Some(last_nl) = memchr::memrchr(b'\n', text.as_bytes()) {
             let complete = &text[..last_nl];
             let remaining = &text[last_nl + 1..];
             let urls = process_text_std(complete.as_bytes());
@@ -305,19 +310,62 @@ impl Default for StreamingDecoder {
 }
 
 /// Standard `process_text` that splits text by newlines and extracts URLs via
-/// `subscription_url_split`.
+/// `subscription_url_split`. Lines are scanned with `memchr` ranges over the
+/// raw bytes; each line is `from_utf8_lossy`-borrowed when valid (no String
+/// copy) and only copied on genuinely invalid UTF-8 lines.
 fn process_text_std(data: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(data);
     let mut result = Vec::new();
-    for line in text.lines() {
+    let mut start = 0;
+    while start <= data.len() {
+        let end = match memchr::memchr(b'\n', &data[start..]) {
+            Some(rel) => start + rel,
+            None => data.len(),
+        };
+        let line = String::from_utf8_lossy(&data[start..end]);
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             result.extend(subscription_url_split(trimmed));
         }
+        if end == data.len() {
+            break;
+        }
+        start = end + 1;
     }
     result
 }
 
+/// File one parsed-URL outcome into `profiles`/`summary` (the shared
+/// per-URL parse the streaming and finalized paths both funnel through, so
+/// URLs are parsed then dropped — never held wholesale).
+fn file_profile(
+    profiles: &mut Vec<ParsedProfile>,
+    summary: &mut ValidationSummary,
+    url: &str,
+    settings: &ValidationSettings,
+) {
+    match parse_share_url(url, settings) {
+        Ok(profile) => profiles.push(profile),
+        Err(ImportError::Validation(msg)) => {
+            let lower = msg.to_lowercase();
+            if lower.starts_with("missing field") {
+                summary.missing_field_count += 1;
+            } else if lower.starts_with("private ip")
+                || lower.starts_with("loopback")
+                || lower.starts_with("link-local")
+                || lower.starts_with("unique-local")
+                || lower.starts_with("localhost")
+                || lower.starts_with("unspecified")
+            {
+                summary.host_validation_count += 1;
+            } else {
+                summary.other_count += 1;
+            }
+        }
+        Err(_) => {
+            summary.other_count += 1;
+        }
+    }
+}
 /// Split concatenated subscription data into individual URLs using
 /// Aho-Corasick to find all scheme boundaries.
 ///
@@ -383,59 +431,23 @@ pub fn parse_subscription_data(
     settings: &ValidationSettings,
 ) -> Result<(Vec<ParsedProfile>, ValidationSummary), String> {
     let mut decoder = StreamingDecoder::new();
-    let mut all_urls = Vec::new();
+    let mut profiles: Vec<ParsedProfile> = Vec::new();
+    let mut summary = ValidationSummary::default();
 
-    // Process in chunks of 64KB
+    // Stream: parse each chunk's URLs then drop them — no `all_urls`
+    // hold-all, peak transient is one chunk's URLs plus `profiles`.
     for chunk in data.chunks(INPUT_CHUNK_SIZE) {
         let urls = decoder.feed(chunk)?;
-        all_urls.extend(urls);
+        for url in &urls {
+            file_profile(&mut profiles, &mut summary, url, settings);
+        }
     }
 
     // Finalize
     let urls = decoder.finalize()?;
-    all_urls.extend(urls);
-
-    // Parse each URL into a typed ParsedProfile
-    let mut profiles: Vec<ParsedProfile> = Vec::new();
-    let mut summary = ValidationSummary::default();
-    for url in &all_urls {
-        match parse_share_url(url, settings) {
-            Ok(profile) => profiles.push(profile),
-            Err(ImportError::Validation(msg)) => {
-                let lower = msg.to_lowercase();
-                if lower.starts_with("missing field") {
-                    summary.missing_field_count += 1;
-                } else if lower.starts_with("private ip")
-                    || lower.starts_with("loopback")
-                    || lower.starts_with("link-local")
-                    || lower.starts_with("unique-local")
-                    || lower.starts_with("localhost")
-                    || lower.starts_with("unspecified")
-                {
-                    summary.host_validation_count += 1;
-                } else {
-                    summary.other_count += 1;
-                }
-            }
-            Err(_) => {
-                summary.other_count += 1;
-            }
-        }
+    for url in &urls {
+        file_profile(&mut profiles, &mut summary, url, settings);
     }
-
-    // Scan parsed profiles for allow_insecure / insecure settings (typed
-    // security accessor — the full flow rework lands in T12).
-    summary.security_warning_count = profiles
-        .iter()
-        .filter(|p| {
-            p.parsed
-                .protocol
-                .config
-                .security()
-                .and_then(SecurityConfig::insecure)
-                == Some(true)
-        })
-        .count();
 
     summary.total_errors = summary.missing_field_count
         + summary.host_validation_count

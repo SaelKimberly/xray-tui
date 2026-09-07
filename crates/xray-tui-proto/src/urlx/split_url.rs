@@ -179,39 +179,39 @@ impl<'a> RawUrlX<'a> {
     ///
     /// If query is present but invalid, return error.
     pub fn query(&self) -> Result<Vec<(TinyText, Option<TinyText>)>, std::string::FromUtf8Error> {
-        self.query
-            .iter()
-            .flat_map(|s| s.split('&'))
-            .map(|s| -> Result<_, std::string::FromUtf8Error> {
-                let (k, v) = if let Some((k, v)) = s.split_once('=') {
-                    if v.is_empty() {
-                        (TinyText::from(k), Option::<TinyText>::None)
-                    } else {
-                        let v = urlencoding::decode(v)?;
-                        (k.into(), Some(v.into()))
-                    }
-                } else {
-                    (s.into(), None)
-                };
-                Ok((k, v))
-            })
-            .collect::<Result<_, _>>()
+        let Some(query) = self.query else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for pair in query.split('&') {
+            let (raw_key, raw_value) = match pair.split_once('=') {
+                Some((key, value)) => (key, Some(value)),
+                None => (pair, None),
+            };
+            let key = urlencoding::decode(raw_key)?;
+            let value = raw_value
+                .filter(|value| !value.is_empty())
+                .map(urlencoding::decode)
+                .transpose()?;
+            out.push((
+                key.as_ref().into(),
+                value.as_ref().map(|value| value.as_ref().into()),
+            ));
+        }
+        Ok(out)
     }
-
     /// Returns the fragment part of the URL, if any.
     ///
     /// # Errors
     ///
     /// If the fragment is not valid UTF-8, an error is returned.
     pub fn fragment(&self) -> Result<Option<TinyText>, core::str::Utf8Error> {
-        self.fragment.as_ref().map_or_else(
-            || Ok(None),
-            |fragment| {
-                let fragment = urlencoding::decode_binary(fragment.as_bytes());
-                let s = String::from_utf8_lossy(&fragment);
-                Ok(Some(TinyText::from(s.as_ref())))
-            },
-        )
+        let Some(fragment) = self.fragment else {
+            return Ok(None);
+        };
+        let decoded = urlencoding::decode_binary(fragment.as_bytes());
+        let text = std::str::from_utf8(decoded.as_ref())?;
+        Ok(Some(text.into()))
     }
 
     fn from_str_impl(s: &'a str) -> Option<Self> {

@@ -12,6 +12,7 @@
 use crate::proto_spec::utils;
 use crate::proto_spec::{CoreType, ProtocolConfig, ProtocolKind};
 use serde::{Deserialize, Serialize};
+use std::hash::Hasher;
 
 /// Endpoint host kind. Plain enum (this crate); the db crate has its own
 /// `toasty::Embed` copy.
@@ -85,28 +86,58 @@ pub struct ParsedProto {
     pub protocol: ProtocolEssentials,
 }
 
-impl ParsedProto {
-    /// Canonical serialized form of [`ProtocolEssentials`]: converted through
-    /// `serde_json::Value` so HashMap-backed fields (e.g. `headers` in
-    /// `WebSocketConfig`/`HttpConfig`/`HttpUpgradeConfig`/`XHttpConfig`)
-    /// materialize as sorted-key maps. serde's direct `to_vec` on a `HashMap`
-    /// iterates entries in per-instance random order (fresh `RandomState` per
-    /// map), which would make two value-equal protocols hash differently.
-    fn canonical_json(&self) -> serde_json::Value {
-        serde_json::to_value(&self.protocol)
-            .expect("ProtocolEssentials is serializable by construction")
+/// rapidhash pass over canonical proto bytes, mapped to `i64` exactly as
+/// [`ParsedProto::sig`] does: never zero, two's-complement wrap via
+/// `from_le_bytes` (never clamping, which would collide distinct hashes
+/// above `i64::MAX`).
+fn hash_bytes_sig(bytes: &[u8]) -> i64 {
+    let mut hasher = rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
+    hasher.write(bytes);
+    let sig = hasher.finish();
+    if sig == 0 {
+        1
+    } else {
+        i64::from_le_bytes(sig.to_le_bytes())
     }
+}
 
-    /// rapidhash over the canonical serialized [`ProtocolEssentials`] JSON —
-    /// the same stream-hasher construction every `ProtoIdentity::compute_sig`
-    /// impl uses.
-    fn protocol_hash(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let bytes = serde_json::to_vec(&self.canonical_json())
-            .expect("canonical protocol Value is serializable");
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(&bytes);
-        hasher.finish()
+/// Credential pass over canonical proto bytes: the bytes are UTF-8 JSON by
+/// construction (serde `to_vec` of a `Value` emits exactly the bytes
+/// `to_string` of the same `Value` would), so borrowing them is byte-identical
+/// to the old `to_string` chain — no second serialization needed.
+fn hash_bytes_cred(bytes: &[u8]) -> i64 {
+    let json = std::str::from_utf8(bytes).expect("canonical protocol bytes are UTF-8 JSON");
+    let hash = utils::compute_cred_hash(&[("protocol", json)]);
+    i64::from_le_bytes(hash.to_le_bytes())
+}
+
+/// Parse-boundary canonical triple, serialized exactly once.
+///
+/// One `serde_json::to_value` + one `serde_json::to_vec`, then two
+/// rapidhash-family passes (sig + credential `k=v;` chain) over the SAME
+/// `&[u8]` — byte-identical to the old triple pass
+/// (`to_value→to_vec` for sig, `to_value→to_string` for cred), so uids
+/// computed through here re-key nothing and duplicate no rows.
+#[must_use]
+pub fn canonical_once(cfg: &ProtocolConfig) -> (i64, i64, Vec<u8>) {
+    let value = serde_json::to_value(cfg).expect("ProtocolConfig is serializable by construction");
+    let bytes = serde_json::to_vec(&value).expect("canonical protocol Value is serializable");
+    (hash_bytes_sig(&bytes), hash_bytes_cred(&bytes), bytes)
+}
+
+impl ParsedProto {
+    /// Canonical bytes of [`ProtocolEssentials`], serialized exactly once:
+    /// converted through `serde_json::Value` so HashMap-backed fields (e.g.
+    /// `headers` in `WebSocketConfig`/`HttpConfig`/`HttpUpgradeConfig`/
+    /// `XHttpConfig`) materialize as sorted-key maps. serde's direct `to_vec`
+    /// on a `HashMap` iterates entries in per-instance random order (fresh
+    /// `RandomState` per map), which would make two value-equal protocols
+    /// hash differently.
+    fn canonical_triple(&self) -> (i64, i64, Vec<u8>) {
+        let value = serde_json::to_value(&self.protocol)
+            .expect("ProtocolEssentials is serializable by construction");
+        let bytes = serde_json::to_vec(&value).expect("canonical protocol Value is serializable");
+        (hash_bytes_sig(&bytes), hash_bytes_cred(&bytes), bytes)
     }
 
     /// Deterministic signature over the canonical serialized protocol
@@ -116,16 +147,7 @@ impl ParsedProto {
     /// `NonZeroU64::new(..).unwrap_or(NonZeroU64::MIN)` fallback.
     #[must_use]
     pub fn sig(&self) -> i64 {
-        let sig = self.protocol_hash();
-        if sig == 0 {
-            1
-        } else {
-            // Bit-pattern reinterpretation (two's-complement wrap), the same
-            // mapping the historical `as i64` produced. A clamping conversion
-            // (e.g. `try_from().unwrap_or(i64::MAX)`) would collide distinct
-            // hashes above i64::MAX and break the uid distinctness invariant.
-            i64::from_le_bytes(sig.to_le_bytes())
-        }
+        self.canonical_triple().0
     }
 
     /// Credential hash over the canonical serialized protocol essentials only,
@@ -134,12 +156,7 @@ impl ParsedProto {
     /// impls use).
     #[must_use]
     pub fn cred_hash(&self) -> i64 {
-        let json = serde_json::to_string(&self.canonical_json())
-            .expect("canonical protocol Value is serializable");
-        let hash = utils::compute_cred_hash(&[("protocol", &json)]);
-        // Two's-complement reinterpretation — see `sig` for why clamping is
-        // wrong here: distinct credentials must yield distinct hashes.
-        i64::from_le_bytes(hash.to_le_bytes())
+        self.canonical_triple().1
     }
 
     /// `sig ^ cred_hash`, never zero.
@@ -150,10 +167,10 @@ impl ParsedProto {
     /// not probabilistic.
     #[must_use]
     pub fn uid(&self) -> i64 {
-        let uid = self.sig() ^ self.cred_hash();
+        let (sig, cred, _) = self.canonical_triple();
+        let uid = sig ^ cred;
         if uid == 0 { 1 } else { uid }
     }
-
     /// The first endpoint, if any.
     #[must_use]
     pub fn first_endpoint(&self) -> Option<&EndpointEssentials> {
@@ -385,5 +402,37 @@ mod tests {
         let bytes = serde_json::to_vec(&p).unwrap();
         let back: ProtocolEssentials = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, p);
+    }
+    #[test]
+    fn canonical_once_matches_triple_chain() {
+        let cfg = sample_vless_config();
+        let (sig_a, cred_a) = (sig_triple(&cfg), cred_triple(&cfg));
+        let (sig_b, cred_b, _bytes) = canonical_once(&cfg);
+        assert_eq!((sig_a, cred_a), (sig_b, cred_b));
+    }
+
+    fn sample_vless_config() -> ProtocolConfig {
+        config_from(VLESS_WS_URL)
+    }
+
+    fn sig_triple(cfg: &ProtocolConfig) -> i64 {
+        let value = serde_json::to_value(cfg).expect("ProtocolConfig is serializable");
+        let bytes = serde_json::to_vec(&value).expect("canonical Value is serializable");
+        let mut hasher =
+            rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
+        hasher.write(&bytes);
+        let sig = hasher.finish();
+        if sig == 0 {
+            1
+        } else {
+            i64::from_le_bytes(sig.to_le_bytes())
+        }
+    }
+
+    fn cred_triple(cfg: &ProtocolConfig) -> i64 {
+        let value = serde_json::to_value(cfg).expect("ProtocolConfig is serializable");
+        let json = serde_json::to_string(&value).expect("canonical Value is serializable");
+        let hash = utils::compute_cred_hash(&[("protocol", &json)]);
+        i64::from_le_bytes(hash.to_le_bytes())
     }
 }

@@ -1476,12 +1476,16 @@ fn opt_u32(proto: &str, key: &str, v: Option<&Value>) -> Result<Option<u32>, Str
 /// Reject settings keys the form does not emit for `proto` — catches
 /// form/builder drift (a new form field T17 emits without a mapper here).
 fn check_keys(proto: &str, map: &SettingsMap, allowed: &[&str]) -> Result<(), String> {
+    let mut unknown: Option<&str> = None;
     for key in map.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(format!("unknown setting {key} for {proto}"));
+            unknown = Some(key.as_str());
+            break;
         }
     }
-    Ok(())
+    unknown.map_or(Ok(()), |key| {
+        Err(format!("unknown setting {key} for {proto}"))
+    })
 }
 
 /// TLS options from the shared stream keys (`sni`/`alpn`/`fingerprint`/
@@ -1603,9 +1607,17 @@ fn endpoint_from(address: &str, port: u16) -> EndpointEssentials {
         ports: vec![port],
     }
 }
-
 /// Parse a port spec ("443", "1000-2000,3000") into a flattened list.
+///
+/// A single range may not exceed [`MAX_PORT_RANGE`] ports, and the flattened
+/// total may not exceed [`MAX_PORT_TOTAL`]: an unbounded `lo..=hi` extend is
+/// a trivial heap-exhaustion vector through a pasted form value (u16 space
+/// tops out at 65535 entries, ~128 KiB — the caps below keep pathological
+/// specs cheap while real hop lists stay far under them).
 fn parse_port_spec(proto: &str, spec: &str) -> Result<Vec<u16>, String> {
+    const MAX_PORT_RANGE: u32 = 4096;
+    const MAX_PORT_TOTAL: usize = 8192;
+    let invalid = |part: &str| format!("invalid setting ports for {proto}: {part}");
     let mut out = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
@@ -1613,23 +1625,21 @@ fn parse_port_spec(proto: &str, spec: &str) -> Result<Vec<u16>, String> {
             continue;
         }
         if let Some((lo, hi)) = part.split_once('-') {
-            let lo = lo
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| format!("invalid setting ports for {proto}: {part}"))?;
-            let hi = hi
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| format!("invalid setting ports for {proto}: {part}"))?;
+            let lo = lo.trim().parse::<u16>().map_err(|_| invalid(part))?;
+            let hi = hi.trim().parse::<u16>().map_err(|_| invalid(part))?;
             if lo > hi {
-                return Err(format!("invalid setting ports for {proto}: {part}"));
+                return Err(invalid(part));
+            }
+            let span = u32::from(hi) - u32::from(lo) + 1;
+            if span > MAX_PORT_RANGE || out.len() + span as usize > MAX_PORT_TOTAL {
+                return Err(invalid(part));
             }
             out.extend(lo..=hi);
         } else {
-            out.push(
-                part.parse::<u16>()
-                    .map_err(|_| format!("invalid setting ports for {proto}: {part}"))?,
-            );
+            if out.len() >= MAX_PORT_TOTAL {
+                return Err(invalid(part));
+            }
+            out.push(part.parse::<u16>().map_err(|_| invalid(part))?);
         }
     }
     Ok(out)
