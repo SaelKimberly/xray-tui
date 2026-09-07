@@ -20,7 +20,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use ring::rand::SecureRandom;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use bytes::Buf;
@@ -61,6 +60,9 @@ const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const MAX_FRAME: usize = 8192;
 /// Frame overhead without content: 16 uuid + 1 cmd + 2 content + 2 pad.
 const FRAME_OVERHEAD: usize = 21;
+/// Downlink scratch size for padded reads: one full outer TLS record's
+/// plaintext, which is the most the record layer hands over per poll.
+const READ_CHUNK: usize = 16_384;
 /// Filter chunk budget (xray `NumberOfPacketToFilter`).
 const FILTER_BUDGET: i32 = 8;
 
@@ -136,7 +138,6 @@ fn tls_stream_mut(
 /// sniffs the inner TLS, and switches to a raw socket relay on `Direct`.
 pub struct VisionStream<S> {
     inner: S,
-    rng: ring::rand::SystemRandom,
     writer: WriterState,
     reader: ReaderState,
     /// Shared TLS filter — fed by BOTH directions; the budget is
@@ -154,6 +155,10 @@ pub struct VisionStream<S> {
     read_buf: bytes::BytesMut,
     /// Bytes after a Direct frame — the start of the raw stream.
     raw_leftover: bytes::BytesMut,
+    /// Scratch for padded downlink reads, grown once and reused. The
+    /// steady-state (post-End/Direct) path reads into the caller's buffer
+    /// instead and never touches this.
+    scratch: Vec<u8>,
     /// App bytes accepted by the in-flight write (returned once the
     /// buffered frames drain).
     accepted: usize,
@@ -183,10 +188,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
     /// written the VLESS header AND the camouflage frame (Task 3) before
     /// wrapping; the writer's UUID is consumed by the camouflage frame.
     #[must_use]
-    pub fn new(inner: S, user_uuid: [u8; 16], rng: ring::rand::SystemRandom) -> Self {
+    pub fn new(inner: S, user_uuid: [u8; 16]) -> Self {
         Self {
             inner,
-            rng,
             writer: WriterState {
                 is_padding: true,
                 direct: false,
@@ -200,6 +204,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
             direct_boundary: None,
             read_buf: bytes::BytesMut::new(),
             raw_leftover: bytes::BytesMut::new(),
+            scratch: Vec::new(),
             accepted: 0,
             directable: true,
         }
@@ -207,8 +212,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
 
     /// Test constructor: the same codec over a non-directable duplex.
     #[cfg(test)]
-    fn new_test(inner: S, user_uuid: [u8; 16], rng: ring::rand::SystemRandom) -> Self {
-        let mut this = Self::new(inner, user_uuid, rng);
+    fn new_test(inner: S, user_uuid: [u8; 16]) -> Self {
+        let mut this = Self::new(inner, user_uuid);
         this.directable = false;
         this
     }
@@ -218,12 +223,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
     /// after the VLESS header (spec §4.6 step 3, deviation 1 — xray's
     /// 500 ms timer is skipped; same wire bytes, emitted immediately).
     #[must_use]
-    pub fn camouflage_frame(user_uuid: &[u8; 16], rng: &ring::rand::SystemRandom) -> bytes::Bytes {
+    pub fn camouflage_frame(user_uuid: &[u8; 16]) -> bytes::Bytes {
         bytes::Bytes::from(encode_frame(
             Some(user_uuid),
             CMD_CONTINUE,
             &[],
-            padding_len(0, true, rng),
+            padding_len(0, true),
         ))
     }
 
@@ -238,12 +243,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
         let mut out = Vec::new();
         let mut raw_tail = Vec::new();
         let mut direct = false;
-        if !self.writer.is_padding {
-            // Padding ended earlier (End/Direct): the chunk passes through
-            // the record layer unpadded (the outer TLS continues).
-            out.push(chunk.to_vec());
-            return (out, raw_tail, direct);
-        }
         // Reshape chunks >= 8171 at the last 0x17 0x03 0x03 boundary
         // (ReshapeMultiBuffer, spec §4.3) so each piece keeps the frame cap.
         let pieces: Vec<&[u8]> = if chunk.len() >= MAX_FRAME - FRAME_OVERHEAD {
@@ -274,7 +273,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
                     None,
                     cmd,
                     piece,
-                    padding_len(piece.len(), true, &self.rng),
+                    padding_len(piece.len(), true),
                 ));
                 self.writer.is_padding = false;
                 if d {
@@ -297,7 +296,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
                     None,
                     CMD_END,
                     piece,
-                    padding_len(piece.len(), long_padding, &self.rng),
+                    padding_len(piece.len(), long_padding),
                 ));
                 self.writer.is_padding = false;
                 for rest in &pieces[i + 1..] {
@@ -318,7 +317,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
                 None,
                 cmd,
                 piece,
-                padding_len(piece.len(), long_padding, &self.rng),
+                padding_len(piece.len(), long_padding),
             ));
         }
         (out, raw_tail, direct)
@@ -398,6 +397,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncWrite for VisionStream
         }
         // Process the new chunk: filter, then pad per the writer state.
         this.filter.feed(buf);
+        // Padding already ended (End/Direct sent): the chunk rides the record
+        // layer unpadded, so hand it straight to the inner stream instead of
+        // copying it through a one-element frame vector.
+        if !this.writer.is_padding {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        }
         let (frames, raw_tail, direct) = this.pad_chunk(buf);
         // Write the frames through the record layer.
         let mut pending = None;
@@ -528,23 +533,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + DirectMode> AsyncRead for VisionStream<
                 this.read_buf.advance(n);
                 return Poll::Ready(Ok(()));
             }
+            // Padding ended earlier (End seen, never Direct): the server
+            // sends the stream raw now — xray stops padding after End, so
+            // everything from here is content, never a frame. Read straight
+            // into the caller's buffer: no scratch, no memset, no copy.
+            if !this.reader.unpad.within_padding && !this.reader.direct {
+                let start = buf.filled().len();
+                ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+                if buf.filled().len() > start {
+                    this.filter.feed(&buf.filled()[start..]);
+                }
+                return Poll::Ready(Ok(()));
+            }
             // Read a decrypted chunk from the record layer, unpad it, retry.
-            let mut chunk = [0u8; 16384];
-            let mut rb = ReadBuf::new(&mut chunk);
+            // One scratch buffer per stream, grown once and reused.
+            if this.scratch.len() < READ_CHUNK {
+                this.scratch.resize(READ_CHUNK, 0);
+            }
+            let mut rb = ReadBuf::new(&mut this.scratch);
             ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
             let n = rb.filled().len();
             if n == 0 {
                 return Poll::Ready(Ok(())); // EOF
             }
-            let data = &chunk[..n];
-            // Padding ended earlier (End seen, never Direct): the server
-            // sends the stream raw now — xray stops padding after End, so
-            // everything from here is content, never a frame.
-            if !this.reader.unpad.within_padding && !this.reader.direct {
-                this.filter.feed(data);
-                this.read_buf.extend_from_slice(data);
-                continue;
-            }
+            let data = &this.scratch[..n];
             if this.reader.unpad.plain_passthrough {
                 // Passthrough delivers everything unchanged (still sniffing).
                 this.filter.feed(data);
@@ -610,35 +622,19 @@ fn encode_frame(uuid: Option<&[u8; 16]>, cmd: u8, content: &[u8], pad_len: usize
 /// when `long_padding && content < 900`, else `rand(0..256)`, capped so one
 /// frame never exceeds `MAX_FRAME`. The saturating cap also guards the
 /// (unreachable) underflow path; the caller reshapes chunks >= 8171 first.
-fn padding_len(content_len: usize, long_padding: bool, rng: &ring::rand::SystemRandom) -> usize {
+fn padding_len(content_len: usize, long_padding: bool) -> usize {
     let content_len = u32::try_from(content_len).expect("content fits u32");
     let raw = if long_padding && content_len < 900 {
         // Long padding: 900 + rand(0..500) - content; no underflow possible
         // (content <= 899 leaves at least 900 + 0 - 899 = 1).
-        900 + rand_u32(rng, 500) - content_len
+        900 + crate::rand::u32_below(500) - content_len
     } else {
-        rand_u32(rng, 256)
+        crate::rand::u32_below(256)
     };
     let cap = u32::try_from(MAX_FRAME - FRAME_OVERHEAD)
         .expect("cap fits u32")
         .saturating_sub(content_len);
     usize::try_from(raw.min(cap)).expect("pad fits usize")
-}
-
-/// Rejection-sample `[0, bound)` from ring's CSPRNG — no modulo bias (the
-/// xhttp padding pattern). `bound` must be > 0.
-fn rand_u32(rng: &ring::rand::SystemRandom, bound: u32) -> u32 {
-    debug_assert!(bound > 0);
-    // 2^32 % bound: samples below this threshold are rejected.
-    let threshold = bound.wrapping_neg() % bound;
-    loop {
-        let mut buf = [0u8; 4];
-        rng.fill(&mut buf).expect("system rng failure");
-        let v = u32::from_le_bytes(buf);
-        if v >= threshold {
-            return v % bound;
-        }
-    }
 }
 
 /// `XtlsUnpadding` port (spec §4.4). Splits an incoming chunk into unpadded
@@ -911,10 +907,6 @@ mod tests {
         0x0f,
     ];
 
-    fn rng() -> ring::rand::SystemRandom {
-        ring::rand::SystemRandom::new()
-    }
-
     // Duplex has no record layer, so the direct-mode calls are no-ops; the
     // codec state machine is testable end to end (the test constructor also
     // disables the splice via `directable`).
@@ -924,7 +916,7 @@ mod tests {
     }
 
     fn test_stream(inner: DuplexStream) -> VisionStream<DuplexStream> {
-        VisionStream::new_test(inner, UUID, rng())
+        VisionStream::new_test(inner, UUID)
     }
 
     /// Build a fake inner TLS `ServerHello` record (handshake type 0x02).
@@ -1013,7 +1005,7 @@ mod tests {
     #[test]
     fn padding_long_branch_bounds() {
         for _ in 0..64 {
-            let pad = padding_len(0, true, &rng());
+            let pad = padding_len(0, true);
             assert!((900..=1399).contains(&pad), "pad {pad}");
         }
     }
@@ -1023,18 +1015,18 @@ mod tests {
         // Go: long padding only when `contentLen < 900 && longPadding`
         // (proxy.go:502); content >= 900 always takes rand(0..256).
         for _ in 0..64 {
-            let pad = padding_len(899, true, &rng());
+            let pad = padding_len(899, true);
             assert!((1..=500).contains(&pad), "pad {pad}");
-            assert!(padding_len(900, true, &rng()) < 256);
-            assert!(padding_len(1000, true, &rng()) < 256);
-            assert!(padding_len(8170, true, &rng()) <= 1);
+            assert!(padding_len(900, true) < 256);
+            assert!(padding_len(1000, true) < 256);
+            assert!(padding_len(8170, true) <= 1);
         }
     }
 
     #[test]
     fn padding_plain_branch_bounds() {
         for _ in 0..64 {
-            let pad = padding_len(123, false, &rng());
+            let pad = padding_len(123, false);
             assert!(pad < 256, "pad {pad}");
         }
     }
@@ -1044,19 +1036,11 @@ mod tests {
         for _ in 0..64 {
             // 8170 content leaves at most 1 byte of padding (Go: rand(256)
             // capped at 8192 - 21 - 8170 = 1).
-            assert!(padding_len(8170, true, &rng()) <= 1);
-            assert!(padding_len(8170, false, &rng()) <= 1);
+            assert!(padding_len(8170, true) <= 1);
+            assert!(padding_len(8170, false) <= 1);
             // 8000 content leaves at most 171 bytes.
-            assert!(padding_len(8000, false, &rng()) <= 171);
-            assert!(padding_len(8000, true, &rng()) <= 171);
-        }
-    }
-
-    #[test]
-    fn rand_u32_respects_bound() {
-        for _ in 0..64 {
-            assert_eq!(rand_u32(&rng(), 1), 0);
-            assert!(rand_u32(&rng(), 256) < 256);
+            assert!(padding_len(8000, false) <= 171);
+            assert!(padding_len(8000, true) <= 171);
         }
     }
 
@@ -1229,7 +1213,7 @@ mod tests {
 
     #[test]
     fn camouflage_frame_is_long_padding_continue_with_uuid() {
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
         assert_eq!(&camo[..16], &UUID);
         assert_eq!(camo[16], CMD_CONTINUE);
         assert_eq!(&camo[17..19], &[0x00, 0x00]); // no content
@@ -1244,7 +1228,7 @@ mod tests {
         let (mut server, client) = tokio::io::duplex(16384);
         // The caller writes the VLESS header + camouflage frame raw first.
         let mut raw_client = client;
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
         raw_client.write_all(&camo).await.unwrap();
         let mut vs = test_stream(raw_client);
 
@@ -1314,7 +1298,7 @@ mod tests {
     async fn stream_direct_splices_both_directions() {
         let (mut server, client) = tokio::io::duplex(16384);
         let mut raw_client = client;
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
         raw_client.write_all(&camo).await.unwrap();
         let mut vs = test_stream(raw_client);
 
@@ -1378,7 +1362,7 @@ mod tests {
         // poll_flush/poll_shutdown drain paths.
         let (server, client) = tokio::io::duplex(64);
         let mut raw_client = client;
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
 
         // Server task: drains everything the client sends (the small duplex
         // blocks every write until the peer reads).
@@ -1451,7 +1435,7 @@ mod tests {
     async fn stream_tls12_inner_ends_padding_keeps_tls() {
         let (mut server, client) = tokio::io::duplex(16384);
         let mut raw_client = client;
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
         raw_client.write_all(&camo).await.unwrap();
         let mut vs = test_stream(raw_client);
 
@@ -1498,7 +1482,7 @@ mod tests {
     async fn stream_non_tls_early_finish_ends_padding() {
         let (mut server, client) = tokio::io::duplex(16384);
         let mut raw_client = client;
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
         raw_client.write_all(&camo).await.unwrap();
         let mut vs = test_stream(raw_client);
 
@@ -1538,7 +1522,7 @@ mod tests {
     async fn stream_reshapes_oversized_chunks() {
         let (mut server, client) = tokio::io::duplex(65536);
         let mut raw_client = client;
-        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID, &rng());
+        let camo = VisionStream::<DuplexStream>::camouflage_frame(&UUID);
         raw_client.write_all(&camo).await.unwrap();
         let mut vs = test_stream(raw_client);
 

@@ -13,7 +13,7 @@ xray-tui-proto.workspace = true
 xray-tui-tls.workspace = true
 
 # routing engine for the SOCKS5 inbound (RuleSet → Decision; tag-based outbound dispatch)
-xray-tui-route = { path = "../xray-tui-route" }
+xray-tui-route = { version = "0.1", path = "../xray-tui-route" }
 
 # async runtime
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
@@ -127,6 +127,21 @@ name = "throughput"
 harness = false
 required-features = ["native-e2e"]
 
+# `relay` benches the SOCKS5 inbound + Direct outbound path. The feature is
+# only for the in-process sink/source/udp-echo harness targets — the bench
+# never resolves a core binary, so it always measures instead of skipping.
+[[bench]]
+name = "relay"
+harness = false
+required-features = ["native-e2e"]
+
+# `dispatch` measures the `Box<dyn Stream>` seam against a monomorphized
+# stack of the same depth over `tokio::io::duplex`: no feature gate, no
+# network, no external binary.
+[[bench]]
+name = "dispatch"
+harness = false
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by unit tests in security/transport/context/chain,
@@ -143,5 +158,5 @@ blake3 = "1"
 # server double reuses the same dep.)
 # Throughput benches (`benches/throughput.rs`, Task 2): criterion harness +
 # tempdir for the spawned core's on-disk config.
-criterion = { version = "0.8", features = ["async_tokio"] }
+criterion = { workspace = true, features = ["async_tokio"] }
 tempfile = "3"

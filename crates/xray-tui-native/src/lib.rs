@@ -52,6 +52,9 @@ pub mod error;
 pub mod headers;
 pub mod inbound;
 pub mod protocol;
+/// Buffered CSPRNG for non-secret randomness (padding, salts, ids). Key
+/// material never comes from here — see the module docs.
+pub(crate) mod rand;
 pub mod security;
 pub mod server;
 pub mod shape;

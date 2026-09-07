@@ -360,6 +360,11 @@ fn create_padding(
 
 // ── handshake ──────────────────────────────────────────────────────────────
 
+/// Sealed session ticket length in the server flight.
+const TICKET_LEN: usize = 32;
+/// Sealed padding-length field in the server flight.
+const LENGTH_LEN: usize = 18;
+
 /// Run the client handshake over the secured stream and return the encrypted
 /// tunnel (xray `ClientInstance.Handshake`). On success the VLESS request
 /// header is written through the returned connection.
@@ -489,13 +494,21 @@ pub async fn handshake(
     }
 
     // ── ServerHello ──
-    let encrypted_pfs = read_exact_timeout(
+    //
+    // One read for the entire fixed-size server flight: the encrypted PFS
+    // share, the ticket and the padding length arrive back to back (no client
+    // write sits between them), so three sequential `read_exact`s bought only
+    // extra syscalls and timers. The AEAD open order below is unchanged, so
+    // the nonce sequence is identical on the wire.
+    let pfs_len = MLKEM_CT_LEN + X25519_LEN + TAG_LEN;
+    let flight = read_exact_timeout(
         &mut stream,
-        MLKEM_CT_LEN + X25519_LEN + TAG_LEN,
-        "vless mlkem server pfs",
+        pfs_len + TICKET_LEN + LENGTH_LEN,
+        "vless mlkem server flight",
     )
     .await?;
-    let server_pfs = nfs_aead.open_with(MAX_NONCE, &encrypted_pfs, &[])?;
+    let encrypted_pfs = &flight[..pfs_len];
+    let server_pfs = nfs_aead.open_with(MAX_NONCE, encrypted_pfs, &[])?;
     let mlkem_ct = Ciphertext::from_bytes(&server_pfs[..MLKEM_CT_LEN])
         .map_err(|e| NativeError::Tls(e.to_string()))?;
     let mlkem_key = Mlkem768::decapsulate(&mlkem_dsk, &mlkem_ct)
@@ -515,12 +528,12 @@ pub async fn handshake(
     let self_aead = WireAead::new(&pfs_public, &united);
     let mut peer_aead = WireAead::new(&server_pfs, &united);
 
-    let encrypted_ticket = read_exact_timeout(&mut stream, 32, "vless mlkem ticket").await?;
+    let encrypted_ticket = &flight[pfs_len..pfs_len + TICKET_LEN];
     // xray opens the ticket IN PLACE and reuses its first 16 bytes
     // (plaintext) as the random-mode inbound CTR IV.
-    let ticket_plain = peer_aead.open(&encrypted_ticket, &[])?;
-    let encrypted_len = read_exact_timeout(&mut stream, 18, "vless mlkem padding length").await?;
-    let length_plain = peer_aead.open(&encrypted_len, &[])?;
+    let ticket_plain = peer_aead.open(encrypted_ticket, &[])?;
+    let encrypted_len = &flight[pfs_len + TICKET_LEN..];
+    let length_plain = peer_aead.open(encrypted_len, &[])?;
     let peer_padding_len = decode_length(&length_plain);
 
     // random mode: XOR-mask everything past the handshake except record

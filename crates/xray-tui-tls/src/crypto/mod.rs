@@ -477,6 +477,69 @@ impl AeadKey {
             })?;
         Ok(plaintext.to_vec())
     }
+
+    /// Encrypts `buf[body_start..]` in place under `(seq, aad)` and appends
+    /// the AEAD tag to `buf`.
+    ///
+    /// The allocation-free counterpart of [`Self::seal`]: the caller frames
+    /// the record header into `buf[..body_start]` and copies the plaintext in
+    /// once, so a record reaches the transport as a single contiguous buffer
+    /// with no `plaintext.to_vec()` and no tag reallocation.
+    pub fn seal_in_place(
+        &self,
+        seq: u64,
+        aad: &[u8],
+        buf: &mut Vec<u8>,
+        body_start: usize,
+    ) -> Result<()> {
+        self.seal_in_place_with_nonce(self.make_nonce(seq), aad, buf, body_start)
+    }
+
+    /// [`Self::seal_in_place`] with an explicit nonce (TLS 1.2 records).
+    pub fn seal_in_place_with_nonce(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        buf: &mut Vec<u8>,
+        body_start: usize,
+    ) -> Result<()> {
+        let nonce = Nonce::assume_unique_for_key(nonce);
+        // `seal_in_place_append_tag` would push the tag itself, but it takes
+        // the whole buffer as the plaintext — the record header sitting in
+        // `buf[..body_start]` must stay outside the AEAD input.
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut buf[body_start..])
+            .map_err(|_| TlsError::Crypto("AEAD seal failed".into()))?;
+        buf.extend_from_slice(tag.as_ref());
+        Ok(())
+    }
+
+    /// Decrypts and authenticates `in_out` in place, returning the plaintext
+    /// length: the plaintext occupies `in_out[..len]`.
+    ///
+    /// The allocation-free counterpart of [`Self::open`], which copies ring's
+    /// in-place plaintext out into a fresh `Vec`.
+    pub fn open_in_place(&self, seq: u64, aad: &[u8], in_out: &mut [u8]) -> Result<usize> {
+        self.open_in_place_with_nonce(self.make_nonce(seq), aad, in_out)
+    }
+
+    /// [`Self::open_in_place`] with an explicit nonce (TLS 1.2 records).
+    pub fn open_in_place_with_nonce(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        in_out: &mut [u8],
+    ) -> Result<usize> {
+        let nonce = Nonce::assume_unique_for_key(nonce);
+        let plaintext = self
+            .key
+            .open_in_place(nonce, Aad::from(aad), in_out)
+            .map_err(|_| {
+                TlsError::Crypto("AEAD open failed — wrong key or corrupted record".into())
+            })?;
+        Ok(plaintext.len())
+    }
 }
 
 #[cfg(test)]

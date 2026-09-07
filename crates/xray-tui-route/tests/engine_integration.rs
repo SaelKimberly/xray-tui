@@ -82,7 +82,7 @@ async fn if_non_match_resolves_once_then_matches_ip_rule() {
     let mut m = meta("example.com", 443);
     let d = decide_async(&engine, &mut m).await;
     assert!(
-        matches!(d, Decision::Route { ref tag, .. } if tag == "example"),
+        matches!(d, Decision::Route { ref tag, .. } if &**tag == "example"),
         "resolved ips must satisfy the ip rule: {d:?}"
     );
     assert_eq!(
@@ -123,7 +123,7 @@ async fn cycle_guard_prevents_second_resolution_pass() {
     let mut m = meta("example.com", 443);
     let d = decide_async(&engine, &mut m).await;
     assert!(
-        matches!(d, Decision::Route { ref tag, .. } if tag == "direct"),
+        matches!(d, Decision::Route { ref tag, .. } if &**tag == "direct"),
         "falls through to default: {d:?}"
     );
     assert_eq!(
@@ -162,7 +162,7 @@ async fn protocol_item_consumes_payload_prefix_sniff() {
     m.payload_prefix = Some(fixture);
     let d = decide_async(&engine, &mut m).await;
     assert!(
-        matches!(d, Decision::Route { ref tag, .. } if tag == "tls-out"),
+        matches!(d, Decision::Route { ref tag, .. } if &**tag == "tls-out"),
         "sniffed TLS must satisfy the Protocol item: {d:?}"
     );
     assert_eq!(
@@ -193,7 +193,7 @@ async fn protocol_item_consumes_payload_prefix_sniff() {
     let m2 = meta("1.2.3.4", 443);
     assert!(matches!(
         engine2.decide(&m2),
-        Decision::Route { ref tag, .. } if tag == "direct"
+        Decision::Route { ref tag, .. } if &**tag == "direct"
     ));
 }
 
@@ -217,14 +217,14 @@ async fn probe_breakdown_and_recovery_flow_end_to_end_via_events_rx() {
     // (default) decision.
     let mut m1 = meta("probe.example", 443);
     let d1 = decide_async(&engine, &mut m1).await;
-    assert!(matches!(d1, Decision::Route { ref tag, .. } if tag == "direct"));
+    assert!(matches!(d1, Decision::Route { ref tag, .. } if &**tag == "direct"));
     assert!(m1.resolved_host_ips.is_empty(), "failure degrades silently");
 
     // Cycle 2: same host resolves → Resolved + ProbeRecovered, ip rule now
     // matches.
     let mut m2 = meta("probe.example", 443);
     let d2 = decide_async(&engine, &mut m2).await;
-    assert!(matches!(d2, Decision::Route { ref tag, .. } if tag == "lan"));
+    assert!(matches!(d2, Decision::Route { ref tag, .. } if &**tag == "lan"));
     assert_eq!(
         m2.resolved_host_ips,
         vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()]
@@ -378,7 +378,7 @@ async fn invert_ip_rule_decides_first_pass_resolution_not_consumed() {
     let mut m = meta("host.example", 443);
     let d = decide_async(&engine, &mut m).await;
     assert!(
-        matches!(d, Decision::Route { ref tag, .. } if tag == "not-lan"),
+        matches!(d, Decision::Route { ref tag, .. } if &**tag == "not-lan"),
         "invert rule wins pass 1 against the empty resolved set: {d:?}"
     );
     assert!(
@@ -417,7 +417,7 @@ async fn pre_sniffed_meta_is_not_reprobed() {
     // Protocol(Tls) evaluates against the PRE-EXISTING sniffed value, not
     // a fresh probe of the TLS payload.
     assert!(
-        matches!(d, Decision::Route { ref tag, .. } if tag == "direct"),
+        matches!(d, Decision::Route { ref tag, .. } if &**tag == "direct"),
         "no re-probe: pre-set sniffed (Dns) does not satisfy Protocol(Tls): {d:?}"
     );
     assert_eq!(m.sniffed, Some(SniffedProtocol::Dns), "sniffed untouched");
@@ -440,12 +440,12 @@ async fn second_connection_hits_resolve_cache_without_sink() {
 
     let mut m1 = meta("example.com", 443);
     let d1 = decide_async(&engine, &mut m1).await;
-    assert!(matches!(d1, Decision::Route { ref tag, .. } if tag == "example"));
+    assert!(matches!(d1, Decision::Route { ref tag, .. } if &**tag == "example"));
     assert!(sink.results.lock().is_empty(), "first lookup drains queue");
 
     let mut m2 = meta("example.com", 443);
     let d2 = decide_async(&engine, &mut m2).await;
-    assert!(matches!(d2, Decision::Route { ref tag, .. } if tag == "example"));
+    assert!(matches!(d2, Decision::Route { ref tag, .. } if &**tag == "example"));
     assert_eq!(
         m2.resolved_host_ips, m1.resolved_host_ips,
         "cache hit supplies the same ips"
@@ -482,7 +482,7 @@ async fn quic_protocol_item_consumes_payload_prefix_sniff() {
     m.payload_prefix = Some(fixture.clone());
     let d = decide_async(&engine, &mut m).await;
     assert!(
-        matches!(d, Decision::Route { ref tag, .. } if tag == "quic-out"),
+        matches!(d, Decision::Route { ref tag, .. } if &**tag == "quic-out"),
         "sniffed QUIC must satisfy the Protocol item: {d:?}"
     );
     assert_eq!(
@@ -503,7 +503,7 @@ async fn quic_protocol_item_consumes_payload_prefix_sniff() {
     tcp.payload_prefix = Some(fixture.clone());
     let dt = decide_async(&engine_tcp, &mut tcp).await;
     assert!(
-        matches!(dt, Decision::Route { ref tag, .. } if tag == "direct"),
+        matches!(dt, Decision::Route { ref tag, .. } if &**tag == "direct"),
         "QUIC sniff must be rejected on TCP: {dt:?}"
     );
     assert_eq!(tcp.sniffed, None, "no sniff result on TCP");
@@ -525,7 +525,7 @@ async fn quic_protocol_item_consumes_payload_prefix_sniff() {
     let mut plain = meta("1.2.3.4", 443);
     let d2 = decide_async(&engine2, &mut plain).await;
     assert!(
-        matches!(d2, Decision::Route { ref tag, .. } if tag == "direct"),
+        matches!(d2, Decision::Route { ref tag, .. } if &**tag == "direct"),
         "no payload -> no sniff -> default route: {d2:?}"
     );
 }

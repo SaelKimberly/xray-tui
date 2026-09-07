@@ -391,14 +391,18 @@ pub fn parse_udp_request(buf: &[u8]) -> Result<(u8, TargetAddr, &[u8]), Socks5Er
 #[must_use]
 pub fn new_udp_header(target: &TargetAddr) -> Vec<u8> {
     let mut header = Vec::with_capacity(3 + 1 + 16 + 2);
-    header.extend_from_slice(&[0, 0, 0]);
-    header.extend(
-        crate::addr::encode_addr_port_last(target)
-            // Reply headers name an IP peer, and a wire-decoded domain is
-            // capped at 255 bytes by its own length byte.
-            .expect("reply header addresses are IPs or ≤255-byte domains"),
-    );
+    write_udp_header(&mut header, target);
     header
+}
+
+/// [`new_udp_header`] appended to a caller-owned buffer, so the reply path can
+/// reuse one buffer per association instead of allocating per datagram.
+pub fn write_udp_header(out: &mut Vec<u8>, target: &TargetAddr) {
+    out.extend_from_slice(&[0, 0, 0]);
+    crate::addr::write_addr_port_last(out, target)
+        // Reply headers name an IP peer, and a wire-decoded domain is
+        // capped at 255 bytes by its own length byte.
+        .expect("reply header addresses are IPs or ≤255-byte domains");
 }
 
 #[cfg(test)]

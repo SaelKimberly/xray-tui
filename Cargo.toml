@@ -75,6 +75,9 @@ rapidhash = { version = "4.5", features = ["std", "unsafe"] }
 
 # ============ Test ============
 rstest = "0.26.1"
+# Benchmark harness (`harness = false` targets in native/tls/route; run via
+# `cargo criterion`, results in ./.benchmarks — see criterion.toml).
+criterion = { version = "0.8" }
 
 # ============ TLS ============
 # Workspace TLS standard is RING ONLY — aws-lc-rs is denied. Every rustls

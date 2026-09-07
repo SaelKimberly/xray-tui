@@ -1,6 +1,5 @@
 //! VLESS — the reference protocol for the native core.
 
-use ring::rand::SecureRandom;
 use tokio::io::AsyncWriteExt;
 
 use xray_tui_proto::proto_spec::{VlessConfig, parse_mlkem_encryption};
@@ -165,8 +164,7 @@ async fn connect_vision(
     // a timer; we emit it immediately — same wire bytes, spec §9 deviation
     // 1). The camouflage consumes the writer's UUID, so the codec's own
     // frames never carry one.
-    let rng = ring::rand::SystemRandom::new();
-    let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid, &rng);
+    let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid);
     tokio::time::timeout(timeout, stream.write_all(&camo))
         .await
         .map_err(|_| NativeError::Timeout {
@@ -183,7 +181,7 @@ async fn connect_vision(
     // together) — is consumed by the peel, so the codec's UUID gate never
     // sees it and the multiplexer/payload never sees it either.
     let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
-    let vision = VisionStream::new(peeled, uuid, rng);
+    let vision = VisionStream::new(peeled, uuid);
     Ok(Box::new(vision))
 }
 
@@ -216,9 +214,7 @@ fn check_udp_allowed(
 /// pattern).
 fn random_global_id() -> [u8; 8] {
     let mut gid = [0u8; 8];
-    ring::rand::SystemRandom::new()
-        .fill(&mut gid)
-        .expect("ring CSPRNG fills");
+    crate::rand::fill_nonsecret(&mut gid);
     gid
 }
 
@@ -441,8 +437,7 @@ async fn connect_mux_vision(
     // Step 3: the camouflage frame — one empty long-padding Continue frame
     // carrying the UUID, right after the header (same wire bytes as the
     // TCP vision path, spec §4.6 step 3 deviation 1).
-    let rng = ring::rand::SystemRandom::new();
-    let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid, &rng);
+    let camo = VisionStream::<BoxStream>::camouflage_frame(&uuid);
     tokio::time::timeout(timeout, stream.write_all(&camo))
         .await
         .map_err(|_| NativeError::Timeout {
@@ -456,7 +451,7 @@ async fn connect_mux_vision(
     // VisionReader nor the mux dispatcher ever sees the `[0,0]` (the same
     // composition as the TCP vision path `connect_vision`).
     let peeled: BoxStream = Box::new(VlessClientStream::new(stream));
-    let vision = VisionStream::new(peeled, uuid, rng);
+    let vision = VisionStream::new(peeled, uuid);
     Ok(MuxClient::new(Box::new(vision)))
 }
 

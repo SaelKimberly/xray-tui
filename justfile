@@ -95,3 +95,49 @@ _gate mode target:
         printf 'failed: %s\n' "${failed[@]}"
         exit 1
     fi
+
+# ─── Benchmarks ───────────────────────────────────────────────────
+#
+# `just bench`       — every criterion target (`throughput` needs real cores at
+#                      $XRAY_TUI_CORE_BIN_DIR, see .cargo/config.toml)
+# `just bench micro` — only the targets that need no external binaries
+#
+# Results land in ./.benchmarks (criterion.toml). `XRAY_TUI_BENCH_MB` sets the
+# per-row transfer size (default 64) and is inherited from the environment.
+
+# Run the criterion benchmarks. `target` selects the group: micro | all (default).
+#
+# XRAY_TUI_BENCH_MB defaults to 4 here, NOT to the harness default of 64:
+# benches/baseline.md was captured at 4, and the recorded medians are only
+# comparable at the same transfer size.
+#
+# XRAY_TUI_CORE_BIN_DIR is exported explicitly: `cargo criterion` launches the
+# bench executable itself and does NOT apply `[env]` from .cargo/config.toml,
+# so the throughput rows would silently print "SKIP ... is not set" and the run
+# would still exit 0.
+bench target='all':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{target}}" in
+        micro|all) ;;
+        *)
+            echo "unknown bench target: {{target}} (expected micro | all)" >&2
+            exit 2
+            ;;
+    esac
+    : "${XRAY_TUI_BENCH_MB:=4}"
+    : "${XRAY_TUI_CORE_BIN_DIR:=/tmp/core-bin}"
+    export XRAY_TUI_BENCH_MB XRAY_TUI_CORE_BIN_DIR
+    echo "XRAY_TUI_BENCH_MB=$XRAY_TUI_BENCH_MB XRAY_TUI_CORE_BIN_DIR=$XRAY_TUI_CORE_BIN_DIR"
+    if [ "{{target}}" = all ] && { [ ! -x "$XRAY_TUI_CORE_BIN_DIR/xray" ] || [ ! -x "$XRAY_TUI_CORE_BIN_DIR/sing-box" ]; }; then
+        echo "missing xray/sing-box in $XRAY_TUI_CORE_BIN_DIR — the throughput rows would skip silently" >&2
+        echo "install the pinned versions or run 'just bench micro'" >&2
+        exit 2
+    fi
+    cargo criterion -p xray-tui-tls    --bench record
+    cargo criterion -p xray-tui-route  --bench decide
+    cargo criterion -p xray-tui-native --bench dispatch
+    cargo criterion -p xray-tui-native --features native-e2e --bench relay
+    if [ "{{target}}" = all ]; then
+        cargo criterion -p xray-tui-native --features native-e2e --bench throughput
+    fi

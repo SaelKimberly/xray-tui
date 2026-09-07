@@ -4,6 +4,7 @@ use crate::addr::{Cidr, prefix_match};
 use crate::error::RouteError;
 use aho_corasick::AhoCorasick;
 use regex::RegexSet;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -31,7 +32,12 @@ pub struct CompiledDomain {
     exact: HashSet<String>,
     suffix: HashSet<String>,
     keywords: AhoCorasick,
+    /// Whether any keyword pattern exists: an empty automaton still costs a
+    /// call per evaluation, and most rules carry no keywords.
+    has_keywords: bool,
     regexes: RegexSet,
+    /// Whether any regex pattern exists (see `has_keywords`).
+    has_regexes: bool,
     n_rules: usize,
 }
 
@@ -78,7 +84,9 @@ impl CompiledDomain {
                 + spec.regexes.len(),
             exact,
             suffix,
+            has_keywords: !keyword_pats.is_empty(),
             keywords,
+            has_regexes: !regex_pats.is_empty(),
             regexes,
         })
     }
@@ -86,17 +94,26 @@ impl CompiledDomain {
     /// Whether `host` hits any rule (exact, suffix, keyword, or regex).
     #[must_use]
     pub fn matches_domain(&self, host: &str) -> bool {
-        let host = host.to_lowercase();
-        if self.exact.contains(host.as_str()) {
+        // Hosts arrive lowercase in the common case (SNI, both cores' config
+        // producers), so only allocate when a case fold is actually needed.
+        // The matcher sets are built with `to_lowercase`, so this must use the
+        // same mapping — `to_ascii_lowercase` would diverge on non-ASCII.
+        let lowered: Cow<'_, str> = if host.chars().any(char::is_uppercase) {
+            Cow::Owned(host.to_lowercase())
+        } else {
+            Cow::Borrowed(host)
+        };
+        let host: &str = lowered.as_ref();
+        if !self.exact.is_empty() && self.exact.contains(host) {
             return true;
         }
         if self.suffix.iter().any(|s| host.ends_with(s.as_str())) {
             return true;
         }
-        if self.keywords.is_match(host.as_str()) {
+        if self.has_keywords && self.keywords.is_match(host) {
             return true;
         }
-        self.regexes.is_match(host.as_str())
+        self.has_regexes && self.regexes.is_match(host)
     }
 
     /// Whether no rule is registered.

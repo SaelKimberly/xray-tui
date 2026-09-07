@@ -262,7 +262,7 @@ async fn handle_connect(
 
     match decision {
         Decision::Route { tag, override_addr } => {
-            let Some(outbound) = config.outbounds.iter().find(|o| o.tag == tag) else {
+            let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
                 tracing::warn!(%tag, "http inbound: routing decision named an unknown outbound");
                 return write_refusal(&mut conn, Refusal::BadGateway).await;
             };

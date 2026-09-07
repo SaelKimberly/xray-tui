@@ -18,11 +18,10 @@ pub mod http;
 pub mod outbound;
 pub mod socks5;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -351,7 +350,7 @@ async fn handle_connect(
 
     match decision {
         Decision::Route { tag, override_addr } => {
-            let Some(outbound) = config.outbounds.iter().find(|o| o.tag == tag) else {
+            let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
                 tracing::warn!(%tag, "socks5 inbound: routing decision named an unknown outbound");
                 socks5::write_reply(&mut conn, socks5::ReplyCode::GeneralFailure, &BIND_ZERO)
                     .await?;
@@ -563,7 +562,8 @@ async fn run_udp_relay(
         client_udp: Arc::new(client_udp),
         out_v4: None,
         out_v6: None,
-        dns_cache: Arc::new(Mutex::new(HashMap::new())),
+        dns_cache: Arc::new(DnsCache::default()),
+        reply_buf: Vec::new(),
         proxy: None,
         proxy_retry_at: None,
         bind_retry_at: None,
@@ -722,7 +722,9 @@ struct UdpRelay {
     out_v6: Option<Arc<UdpSocket>>,
     /// Domain → address cache for the association lifetime, shared with the
     /// spawned resolve-and-send tasks.
-    dns_cache: Arc<Mutex<HashMap<(String, u16), SocketAddr>>>,
+    dns_cache: Arc<DnsCache>,
+    /// Reply framing buffer, reused for every downlink datagram.
+    reply_buf: Vec<u8>,
     /// The proxy leg, opened on the first proxy-routed datagram.
     proxy: Option<ProxyLeg>,
     /// Earliest instant a new proxy leg may be opened after a failure.
@@ -767,7 +769,7 @@ impl UdpRelay {
     /// Wrap an upstream reply and send it to the pinned client. Returns
     /// `false` when the association must end.
     async fn reply_to_client(
-        &self,
+        &mut self,
         result: std::io::Result<(usize, SocketAddr)>,
         buf: &[u8],
     ) -> bool {
@@ -783,8 +785,11 @@ impl UdpRelay {
             // pins the source.
             return false;
         };
-        let packet = reply_packet(src, &buf[..len]);
-        match self.client_udp.send_to(&packet, source).await {
+        // One reply buffer per association, refilled per datagram: framing a
+        // fresh `Vec` cost three allocations (header, address, join) plus a
+        // realloc for every packet on the downlink.
+        write_reply(&mut self.reply_buf, src, &buf[..len]);
+        match self.client_udp.send_to(&self.reply_buf, source).await {
             Ok(_) => true,
             Err(error) => {
                 tracing::debug!(%error, "socks5 inbound: udp reply to client failed");
@@ -851,7 +856,7 @@ impl UdpRelay {
         // `self` across the `&mut self` forwarding calls — no per-datagram
         // clone of the proxy config.
         let config = Arc::clone(&self.config);
-        let Some(outbound) = config.outbounds.iter().find(|o| o.tag == tag) else {
+        let Some(outbound) = config.outbounds.iter().find(|o| o.tag.as_str() == &*tag) else {
             tracing::debug!(%tag, "socks5 inbound: udp decision named an unknown outbound");
             return;
         };
@@ -885,6 +890,23 @@ impl UdpRelay {
                 }
             }
             Host::Domain(domain) => {
+                // Cache hit: send inline. Spawning first (as this used to)
+                // meant a task and a payload copy for EVERY domain datagram,
+                // including the ones whose address was already known.
+                if let Some(addr) = cached_domain(&self.dns_cache, &domain, dest.port) {
+                    let Some(socket) = self.socket_for(addr) else {
+                        tracing::debug!(%addr, "socks5 inbound: no upstream socket for family");
+                        return;
+                    };
+                    if let Err(error) = socket.send_to(payload, addr).await {
+                        tracing::debug!(%error, %addr, "socks5 inbound: direct udp send dropped");
+                    }
+                    return;
+                }
+                // Miss: a full DNS lookup must not stall the other flows on
+                // this association, so it runs in a task that receives BOTH
+                // family sockets (guessing the family before the lookup would
+                // drop every `AAAA`-only answer).
                 let cache = Arc::clone(&self.dns_cache);
                 let payload = payload.to_vec();
                 let port = dest.port;
@@ -1061,6 +1083,8 @@ async fn run_proxy_leg(
     // relay drops the queue, so a detached handle leaks a task plus a tunnel
     // per proxy association — including when THIS task is itself aborted.
     let _replies = AbortOnDrop(tokio::spawn(async move {
+        // One framing buffer for the leg, like the direct path's.
+        let mut packet = Vec::new();
         loop {
             match reader.recv().await {
                 Ok(Some((dest, payload))) => {
@@ -1073,7 +1097,7 @@ async fn run_proxy_leg(
                         );
                         continue;
                     };
-                    let packet = reply_packet(src, &payload);
+                    write_reply(&mut packet, src, &payload);
                     if let Err(error) = client_udp.send_to(&packet, source).await {
                         tracing::debug!(%error, "socks5 inbound: proxy reply to client failed");
                         return;
@@ -1123,7 +1147,14 @@ async fn run_proxy_leg(
 }
 
 /// The association's domain → address cache.
-type DnsCache = Mutex<HashMap<(String, u16), SocketAddr>>;
+///
+/// A short `Vec` rather than a `HashMap`: a probe borrows the domain instead
+/// of allocating a `String` key for every datagram, and the cap bounds an
+/// association that keeps naming new hosts (the map grew without limit).
+type DnsCache = parking_lot::Mutex<Vec<(Box<str>, u16, SocketAddr)>>;
+
+/// Cache entries kept per association; the oldest is dropped when full.
+const DNS_CACHE_MAX: usize = 64;
 
 /// Resolve a datagram destination. `None` = unresolvable.
 async fn resolve_cached(cache: &DnsCache, target: &TargetAddr) -> Option<SocketAddr> {
@@ -1133,18 +1164,32 @@ async fn resolve_cached(cache: &DnsCache, target: &TargetAddr) -> Option<SocketA
     }
 }
 
+/// Look up `domain` in the association cache without allocating.
+fn cached_domain(cache: &DnsCache, domain: &str, port: u16) -> Option<SocketAddr> {
+    cache
+        .lock()
+        .iter()
+        .find(|(d, p, _)| *p == port && &**d == domain)
+        .map(|(_, _, addr)| *addr)
+}
+
 /// Resolve a domain, caching the answer for the association's lifetime.
 async fn resolve_domain(cache: &DnsCache, domain: &str, port: u16) -> Option<SocketAddr> {
-    let key = (domain.to_owned(), port);
-    if let Some(cached) = cache.lock().expect("dns cache mutex").get(&key) {
-        return Some(*cached);
+    if let Some(cached) = cached_domain(cache, domain, port) {
+        return Some(cached);
     }
     let addrs = tokio::time::timeout(timeouts::DIAL, tokio::net::lookup_host((domain, port)))
         .await
         .ok()?
         .ok()?;
     let addr = addrs.into_iter().next()?;
-    cache.lock().expect("dns cache mutex").insert(key, addr);
+    {
+        let mut entries = cache.lock();
+        if entries.len() >= DNS_CACHE_MAX {
+            entries.remove(0);
+        }
+        entries.push((Box::from(domain), port, addr));
+    }
     Some(addr)
 }
 
@@ -1161,14 +1206,14 @@ const fn unmap_v6(src: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Build one reply datagram: a SOCKS UDP header naming `src`, then `payload`.
-#[must_use]
-fn reply_packet(src: SocketAddr, payload: &[u8]) -> Vec<u8> {
+/// Frame one reply datagram into `out`: a SOCKS UDP header naming `src`, then
+/// `payload`. The buffer is cleared first, so callers may reuse it.
+fn write_reply(out: &mut Vec<u8>, src: SocketAddr, payload: &[u8]) {
     let src = unmap_v6(src);
     let addr = TargetAddr::new(Host::Ip(src.ip()), src.port());
-    let mut out = socks5::new_udp_header(&addr);
+    out.clear();
+    socks5::write_udp_header(out, &addr);
     out.extend_from_slice(payload);
-    out
 }
 
 /// Map an outbound dial error to a SOCKS5 reply code (RFC 1928 §6).

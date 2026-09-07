@@ -57,25 +57,42 @@ pub fn chacha20_key_32(body_key: &[u8; 16]) -> Zeroizing<[u8; 32]> {
 /// mihomo and sing-vmess (`hMacCreator` form), and the leaf/shoes Rust ports.
 #[must_use]
 pub fn kdf_bytes_path(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
+    /// Scratch bound. Each level prepends a 64-byte HMAC pad block to the
+    /// message it recurses on, so the deepest message is
+    /// `64 * path.len() + key.len()`: `VMess` uses at most 3 path elements
+    /// (`kdf16_bytes_path(cmd_key, [salt, authid, nonce])`) with keys ≤ 64
+    /// bytes, i.e. 3 * 64 + 64 = 256.
+    const SCRATCH: usize = 256;
+
     fn go(id: &[u8], path: &[&[u8]]) -> [u8; 32] {
         match path {
             [] => hmac_sha256(KDF_ROOT.as_bytes(), id),
             [rest @ .., p] => {
-                let inner = {
-                    // Holds `ipad(p) ‖ key` — the caller's key material on the
-                    // heap; wiped when the recursion unwinds.
-                    let mut msg = Zeroizing::new(Vec::with_capacity(64 + id.len()));
-                    msg.extend_from_slice(pad_key(p, IPAD).as_slice());
-                    msg.extend_from_slice(id);
-                    go(&msg, rest)
-                };
-                let mut msg = Zeroizing::new(Vec::with_capacity(64 + inner.len()));
-                msg.extend_from_slice(pad_key(p, OPAD).as_slice());
-                msg.extend_from_slice(&inner);
-                go(&msg, rest)
+                // `ipad(p) ‖ id` then `opad(p) ‖ inner`, both built in one
+                // stack buffer that is wiped when the recursion unwinds —
+                // the previous shape allocated two heap Vecs per level, i.e.
+                // 28 allocations for a 3-element path.
+                let mut msg = Zeroizing::new([0u8; SCRATCH]);
+                let end = 64 + id.len();
+                msg[..64].copy_from_slice(pad_key(p, IPAD).as_slice());
+                msg[64..end].copy_from_slice(id);
+                let inner = go(&msg[..end], rest);
+                msg[..64].copy_from_slice(pad_key(p, OPAD).as_slice());
+                let end = 64 + inner.len();
+                msg[64..end].copy_from_slice(&inner);
+                go(&msg[..end], rest)
             }
         }
     }
+    // A deeper path or a longer key would overflow the scratch: assert here,
+    // once per KDF, rather than panicking inside the recursion on a slice
+    // range — a silently truncated message would derive the wrong key.
+    assert!(
+        64 * path.len() + key.len() <= SCRATCH,
+        "vmess kdf path too deep: 64 * {} + {} > {SCRATCH}",
+        path.len(),
+        key.len()
+    );
     go(key, path)
 }
 

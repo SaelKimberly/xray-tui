@@ -40,9 +40,25 @@ version = "0.1"
 path = "../xray-tui-geoip"
 optional = true
 
+# [[bench]] target: `harness = false` — criterion owns `main`. No
+# `required-features`: `Engine::decide` is pure and the bench needs nothing
+# beyond the crate's default features.
+[[bench]]
+name = "decide"
+harness = false
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 xray-tui-tls = { version = "0.1", path = "../xray-tui-tls" }
+# Routing decision benches (`benches/decide.rs`): criterion harness only —
+# the engine's decide path is synchronous, so no async feature is needed.
+criterion = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `xray-tui-geoip` is wired by the `geoip` feature only, and geo matching is
+# not implemented yet — the IR already carries `geo_country` fields, but no
+# matcher consults the crate, so machete cannot see the dependency.
+ignored = ["xray-tui-geoip"]
 
 [lints]
 workspace = true

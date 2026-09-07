@@ -12,6 +12,7 @@
 //! any other inner handshake message is a protocol error (no renegotiation).
 
 use std::io;
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -23,12 +24,14 @@ use crate::error::{Result, TlsError};
 /// TLS record content types (RFC 8446 §5.1).
 use super::{
     AEAD_TAG_LEN, CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_CHANGE_CIPHER_SPEC,
-    CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET, MAX_RECORD_PAYLOAD, TlsRecord, aead_aad, aead_aad_12,
-    make_app_data_record, make_record_12,
+    CONTENT_HANDSHAKE, HS_NEW_SESSION_TICKET, MAX_RECORD_PAYLOAD, aead_aad, aead_aad_12,
 };
 
 /// Maximum plaintext bytes per TLS 1.3 record: 2^14 (RFC 8446 §5.2).
 const MAX_RECORD_PLAINTEXT: usize = 16_384;
+
+/// TLS record header length: `content_type(1) || version(2) || length(2)`.
+const RECORD_HEADER_LEN: usize = 5;
 
 /// Key material plus per-direction sequence counters for a TLS 1.3
 /// or TLS 1.2 connection.
@@ -214,13 +217,22 @@ impl Tls12Aead {
 pub struct TlsStream<S> {
     inner: S,
     keys: AppKeys,
-    /// Decrypted plaintext from the current record, served before more I/O.
-    read_buf: Vec<u8>,
-    read_pos: usize,
+    /// The record currently being read: wire bytes on the way in, decrypted
+    /// plaintext in place afterwards. Sized once to a full record and reused
+    /// for every record after, so the data path never allocates per record.
+    rec_buf: Vec<u8>,
+    /// Plaintext still owed to the caller, as a range inside `rec_buf`.
+    plain: Range<usize>,
+    /// The 5-byte record header being filled.
+    hdr: [u8; 5],
     /// EOF reached (`close_notify` or clean inner close); reads return 0.
     closed: bool,
-    /// Framed ciphertext not yet fully written to `inner`.
+    /// The record being written: header, body and tag framed in one buffer,
+    /// reused for every record.
     pending: Vec<u8>,
+    /// How much of `pending` has already reached `inner`. A cursor instead of
+    /// `drain(..n)`, which memmoves the remainder on every partial write.
+    pending_pos: usize,
     /// Record-read state machine (header, then payload).
     rec: RecordState,
     /// Write side switched to raw passthrough: `poll_write`/`poll_flush`/
@@ -235,16 +247,16 @@ pub struct TlsStream<S> {
     negotiated_hybrid: bool,
 }
 
-/// Incremental state of reading one TLS record off the wire.
+/// Incremental state of reading one TLS record off the wire. The bytes live
+/// in [`TlsStream::hdr`] and [`TlsStream::rec_buf`]; this only tracks how
+/// much of the current header or payload has arrived.
 enum RecordState {
     Header {
-        buf: [u8; 5],
         filled: usize,
     },
     Payload {
         content_type: u8,
         len: usize,
-        buf: Vec<u8>,
         filled: usize,
     },
 }
@@ -254,14 +266,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
         Self {
             inner,
             keys,
-            read_buf: Vec::new(),
-            read_pos: 0,
+            rec_buf: Vec::new(),
+            plain: 0..0,
+            hdr: [0; 5],
             closed: false,
             pending: Vec::new(),
-            rec: RecordState::Header {
-                buf: [0; 5],
-                filled: 0,
-            },
+            pending_pos: 0,
+            rec: RecordState::Header { filled: 0 },
             write_direct: false,
             read_direct: false,
             negotiated_hybrid: false,
@@ -294,24 +305,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
     /// Switch the read side to direct raw reads from the underlying stream.
     ///
     /// Caller must have consumed all decrypted bytes and be at a clean
-    /// record boundary (`read_buf` empty, `rec` back in `Header` state);
+    /// record boundary (no plaintext owed, `rec` back in `Header` state);
     /// the record layer performs no read-ahead, so any bytes already in the
     /// transport buffer are preserved for the direct reader.
     pub const fn set_read_direct(&mut self) {
         self.read_direct = true;
     }
 
-    /// Read the next complete raw record off `inner`.
+    /// Read the next complete raw record off `inner` into `self.rec_buf`.
     ///
-    /// Returns `Ok(None)` on a clean EOF at a record boundary, `Ok(Some(..))`
-    /// once the full header + payload have been read. Partial progress across
-    /// polls is preserved in `self.rec`.
-    fn poll_record(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<TlsRecord>>> {
+    /// Returns `Ok(None)` on a clean EOF at a record boundary, or
+    /// `Ok(Some((content_type, len)))` once the full header + payload have
+    /// arrived — the payload is then `self.rec_buf[..len]`. Partial progress
+    /// across polls is preserved in `self.rec`.
+    fn poll_record(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<(u8, usize)>>> {
         loop {
             let step = match &mut self.rec {
-                RecordState::Header { buf, filled } => {
-                    while *filled < buf.len() {
-                        let mut rb = ReadBuf::new(&mut buf[*filled..]);
+                RecordState::Header { filled } => {
+                    while *filled < self.hdr.len() {
+                        let mut rb = ReadBuf::new(&mut self.hdr[*filled..]);
                         match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -330,8 +342,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                             }
                         }
                     }
-                    let content_type = buf[0];
-                    let len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
+                    let content_type = self.hdr[0];
+                    let len = usize::from(u16::from_be_bytes([self.hdr[3], self.hdr[4]]));
                     if len > MAX_RECORD_PAYLOAD {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -343,11 +355,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                 RecordState::Payload {
                     content_type,
                     len,
-                    buf,
                     filled,
                 } => {
                     while *filled < *len {
-                        let mut rb = ReadBuf::new(&mut buf[*filled..]);
+                        let mut rb = ReadBuf::new(&mut self.rec_buf[*filled..*len]);
                         match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -365,80 +376,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                     }
                     Step::RecordReady {
                         content_type: *content_type,
-                        payload: std::mem::take(buf),
+                        len: *len,
                     }
                 }
             };
             match step {
                 Step::HeaderComplete { content_type, len } => {
+                    // One buffer per stream, sized for the largest legal
+                    // record: grown once, then reused for every record.
+                    if self.rec_buf.len() < MAX_RECORD_PAYLOAD {
+                        self.rec_buf.resize(MAX_RECORD_PAYLOAD, 0);
+                    }
                     self.rec = RecordState::Payload {
                         content_type,
                         len,
-                        buf: vec![0; len],
                         filled: 0,
                     };
                 }
-                Step::RecordReady {
-                    content_type,
-                    payload,
-                } => {
-                    self.rec = RecordState::Header {
-                        buf: [0; 5],
-                        filled: 0,
-                    };
-                    return Poll::Ready(Ok(Some(TlsRecord {
-                        content_type,
-                        payload,
-                    })));
+                Step::RecordReady { content_type, len } => {
+                    self.rec = RecordState::Header { filled: 0 };
+                    return Poll::Ready(Ok(Some((content_type, len))));
                 }
             }
-        }
-    }
-
-    /// Dispatch a raw record to the version-specific process path.
-    ///
-    /// The key is borrowed, never cloned: cloning a `RecordCipher` copies a
-    /// ring `LessSafeKey` (expanded AES key schedule + GHASH tables) per
-    /// record and duplicates key material on the heap.
-    fn process_record(&mut self, rec: TlsRecord) -> io::Result<DecryptedRecord> {
-        let AppKeys { read, read_seq, .. } = &mut self.keys;
-        match read {
-            RecordCipher::Tls13(key) => process_record_13(key, read_seq, rec),
-            RecordCipher::Tls12(key, aead) => process_record_12(key, *aead, read_seq, rec),
         }
     }
 
     /// Write as much of `pending` to `inner` as possible.
     fn flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while !self.pending.is_empty() {
-            match Pin::new(&mut self.inner).poll_write(cx, &self.pending) {
+        while self.pending_pos < self.pending.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pending_pos..]) {
                 // Ok(0) with a non-empty buffer means "would block" —
                 // wait for writability instead of spinning.
                 Poll::Pending | Poll::Ready(Ok(0)) => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(n)) => {
-                    self.pending.drain(..n);
+                    self.pending_pos += n;
                 }
             }
         }
+        self.pending.clear();
+        self.pending_pos = 0;
         Poll::Ready(Ok(()))
     }
 }
 
-/// TLS 1.3: decrypt an `Application Data` record (inner content type at
-/// the end of the padded plaintext, RFC 8446 §5.4).
-fn process_record_13(
-    key: &AeadKey,
-    seq: &mut u64,
-    mut rec: TlsRecord,
+/// Decrypt the record held in `buf` in place, dispatching to the
+/// version-specific path. Takes the keys and the buffer as separate borrows
+/// so both can be fields of the same stream.
+///
+/// The key is borrowed, never cloned: cloning a `RecordCipher` copies a
+/// ring `LessSafeKey` (expanded AES key schedule + GHASH tables) per
+/// record and duplicates key material on the heap.
+fn decrypt_record(
+    keys: &mut AppKeys,
+    content_type: u8,
+    buf: &mut [u8],
 ) -> io::Result<DecryptedRecord> {
+    let AppKeys { read, read_seq, .. } = keys;
+    match read {
+        RecordCipher::Tls13(key) => process_record_13(key, read_seq, buf),
+        RecordCipher::Tls12(key, aead) => {
+            process_record_12(key, *aead, read_seq, content_type, buf)
+        }
+    }
+}
+
+/// TLS 1.3: decrypt an `Application Data` record in place (inner content
+/// type at the end of the padded plaintext, RFC 8446 §5.4).
+fn process_record_13(key: &AeadKey, seq: &mut u64, buf: &mut [u8]) -> io::Result<DecryptedRecord> {
     let n = advance_seq(seq)?;
-    let plaintext = key
-        .open(n, &aead_aad(rec.payload.len()), &mut rec.payload)
+    let plain_len = key
+        .open_in_place(n, &aead_aad(buf.len()), buf)
         .map_err(to_io_error)?;
-    let (inner_type, content) = strip_padding(&plaintext).map_err(to_io_error)?;
+    let (inner_type, content) = strip_padding(&buf[..plain_len]).map_err(to_io_error)?;
+    // The plaintext starts at offset 0, so its length is the whole range.
+    let content_len = content.len();
     match inner_type {
-        CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(content.to_vec())),
+        CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(0..content_len)),
         CONTENT_ALERT => alert_to_record(content),
         CONTENT_HANDSHAKE => post_handshake_message(content),
         other => Err(io::Error::new(
@@ -448,45 +462,46 @@ fn process_record_13(
     }
 }
 
-/// TLS 1.2: decrypt a record (content type in the outer record header,
-/// explicit nonce, no padding, RFC 5246 §6.2.3.3).
+/// TLS 1.2: decrypt a record in place (content type in the outer record
+/// header, explicit nonce, no padding, RFC 5246 §6.2.3.3).
 fn process_record_12(
     key: &AeadKey,
     aead: Tls12Aead,
     seq: &mut u64,
-    mut rec: TlsRecord,
+    content_type: u8,
+    buf: &mut [u8],
 ) -> io::Result<DecryptedRecord> {
     // Every post-handshake record is AEAD-protected. A plaintext
     // ChangeCipherSpec here is an injected record (RFC 5246 §7.4.1 makes it
     // `unexpected_message`): accepting it would let any off-path party feed
     // the read loop records that never yield application bytes.
-    if rec.content_type == CONTENT_CHANGE_CIPHER_SPEC {
+    if content_type == CONTENT_CHANGE_CIPHER_SPEC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unauthenticated ChangeCipherSpec record after the TLS 1.2 handshake",
         ));
     }
     let explicit_len = aead.explicit_nonce_len();
-    if rec.payload.len() < explicit_len + AEAD_TAG_LEN {
+    if buf.len() < explicit_len + AEAD_TAG_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "TLS 1.2 record too short for explicit nonce + tag",
         ));
     }
     let mut explicit = [0u8; 8];
-    explicit[..explicit_len].copy_from_slice(&rec.payload[..explicit_len]);
+    explicit[..explicit_len].copy_from_slice(&buf[..explicit_len]);
     let n = advance_seq(seq)?;
     let nonce = aead.nonce(n, &explicit[..explicit_len])?;
-    let ct = &mut rec.payload[explicit_len..];
-    let plaintext_len = ct.len() - AEAD_TAG_LEN;
-    let additional = aead_aad_12(n, rec.content_type, plaintext_len);
-    let plaintext = key
-        .open_with_nonce(nonce, &additional, ct)
+    let plaintext_len = buf.len() - explicit_len - AEAD_TAG_LEN;
+    let additional = aead_aad_12(n, content_type, plaintext_len);
+    let opened = key
+        .open_in_place_with_nonce(nonce, &additional, &mut buf[explicit_len..])
         .map_err(to_io_error)?;
-    match rec.content_type {
-        CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(plaintext)),
-        CONTENT_ALERT => alert_to_record(&plaintext),
-        CONTENT_HANDSHAKE => post_handshake_message(&plaintext),
+    let plain = explicit_len..explicit_len + opened;
+    match content_type {
+        CONTENT_APPLICATION_DATA => Ok(DecryptedRecord::Data(plain)),
+        CONTENT_ALERT => alert_to_record(&buf[plain]),
+        CONTENT_HANDSHAKE => post_handshake_message(&buf[plain]),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected TLS content type {other:#04x}"),
@@ -535,21 +550,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
         loop {
-            // Serve buffered plaintext before touching the wire.
-            if this.read_pos < this.read_buf.len() {
-                let n = (this.read_buf.len() - this.read_pos).min(buf.remaining());
-                buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
-                this.read_pos += n;
-                if this.read_pos == this.read_buf.len() {
-                    this.read_buf.clear();
-                    this.read_pos = 0;
+            // Serve decrypted plaintext from the current record before
+            // touching the wire.
+            if this.plain.start < this.plain.end {
+                let n = (this.plain.end - this.plain.start).min(buf.remaining());
+                buf.put_slice(&this.rec_buf[this.plain.start..this.plain.start + n]);
+                this.plain.start += n;
+                if this.plain.start == this.plain.end {
+                    this.plain = 0..0;
                 }
                 return Poll::Ready(Ok(()));
             }
             if this.closed {
                 return Poll::Ready(Ok(()));
             }
-            let rec = match this.poll_record(cx) {
+            let (content_type, len) = match this.poll_record(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(None)) => {
@@ -566,31 +581,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsStream<S> {
             // exactly 2 bytes (`level || description`, RFC 8446 §6); a
             // truncated raw alert is a protocol error, never silently
             // skipped. TLS 1.2 protects every record type (alerts/handshake/
-            // CCS) and dispatches them inside `process_record`.
+            // CCS) and dispatches them inside `decrypt_record`.
             if this.keys.read.is_tls13() {
-                if rec.content_type == CONTENT_ALERT {
-                    if rec.payload.len() >= 2 {
+                if content_type == CONTENT_ALERT {
+                    if len >= 2 {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("TLS alert: {} {}", rec.payload[0], rec.payload[1]),
+                            format!("TLS alert: {} {}", this.rec_buf[0], this.rec_buf[1]),
                         )));
                     }
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "truncated TLS alert record ({} payload byte(s))",
-                            rec.payload.len()
-                        ),
+                        format!("truncated TLS alert record ({len} payload byte(s))"),
                     )));
                 }
-                if rec.content_type != CONTENT_APPLICATION_DATA {
+                if content_type != CONTENT_APPLICATION_DATA {
                     continue;
                 }
             }
-            match this.process_record(rec) {
-                Ok(DecryptedRecord::Data(plaintext)) => {
-                    this.read_buf.extend_from_slice(&plaintext);
-                    this.read_pos = 0;
+            match decrypt_record(&mut this.keys, content_type, &mut this.rec_buf[..len]) {
+                Ok(DecryptedRecord::Data(plain)) => {
+                    this.plain = plain;
                 }
                 Ok(DecryptedRecord::CloseNotify) => {
                     this.closed = true;
@@ -615,7 +626,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
         // A partial record from a previous call must drain first.
-        if !this.pending.is_empty() {
+        if this.pending_pos < this.pending.len() {
             match this.flush_pending(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -630,41 +641,67 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
         // TLS 1.2 frames the plaintext directly, with the explicit nonce
         // (AES-GCM) or nothing (ChaCha20-Poly1305) ahead of the ciphertext.
         let take = buf.len().min(MAX_RECORD_PLAINTEXT);
-        let plaintext = &buf[..take];
+        // The record is framed in place: header placeholder, body, tag — one
+        // buffer, one copy of the caller's bytes, no per-record allocation
+        // after the first (`pending` keeps its capacity across records).
+        this.pending.clear();
+        this.pending_pos = 0;
+        this.pending
+            .reserve(RECORD_HEADER_LEN + MAX_RECORD_PLAINTEXT + 1 + AEAD_TAG_LEN);
+        this.pending
+            .extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03, 0, 0]);
         let AppKeys {
             write, write_seq, ..
         } = &mut this.keys;
+        let seq = *write_seq;
         // The sequence number is advanced only after a successful seal:
         // a failed seal must not leave the counter — and therefore the
         // next record's nonce — ahead of the AAD the peer will reconstruct.
-        let framed = match write {
+        let sealed = match write {
             RecordCipher::Tls13(key) => {
-                let mut tls_inner = Vec::with_capacity(take + 1);
-                tls_inner.extend_from_slice(plaintext);
-                tls_inner.push(CONTENT_APPLICATION_DATA);
-                let ciphertext = key
-                    .seal(
-                        *write_seq,
-                        &aead_aad(tls_inner.len() + AEAD_TAG_LEN),
-                        &tls_inner,
-                    )
-                    .map_err(to_io_error)?;
-                advance_seq(write_seq)?;
-                make_app_data_record(&ciphertext)
+                this.pending.extend_from_slice(&buf[..take]);
+                this.pending.push(CONTENT_APPLICATION_DATA);
+                let body_len = this.pending.len() - RECORD_HEADER_LEN;
+                key.seal_in_place(
+                    seq,
+                    &aead_aad(body_len + AEAD_TAG_LEN),
+                    &mut this.pending,
+                    RECORD_HEADER_LEN,
+                )
             }
             RecordCipher::Tls12(key, aead) => {
-                let seq = *write_seq;
                 let explicit = aead.explicit_nonce(seq);
-                let nonce = aead.nonce(seq, explicit.as_slice())?;
-                let additional = aead_aad_12(seq, CONTENT_APPLICATION_DATA, plaintext.len());
-                let ciphertext = key
-                    .seal_with_nonce(nonce, &additional, plaintext)
-                    .map_err(to_io_error)?;
-                advance_seq(write_seq)?;
-                make_record_12(CONTENT_APPLICATION_DATA, explicit.as_slice(), &ciphertext)
+                let nonce = match aead.nonce(seq, explicit.as_slice()) {
+                    Ok(nonce) => nonce,
+                    Err(e) => {
+                        this.pending.clear();
+                        this.pending_pos = 0;
+                        return Poll::Ready(Err(e));
+                    }
+                };
+                let additional = aead_aad_12(seq, CONTENT_APPLICATION_DATA, take);
+                // RFC 5246 §6.2.3.3: the explicit nonce is part of the record
+                // body but not of the AEAD input (mirrors `make_record_12`).
+                this.pending.extend_from_slice(explicit.as_slice());
+                let body_start = RECORD_HEADER_LEN + explicit.as_slice().len();
+                this.pending.extend_from_slice(&buf[..take]);
+                key.seal_in_place_with_nonce(nonce, &additional, &mut this.pending, body_start)
             }
         };
-        this.pending = framed;
+        if let Err(e) = sealed {
+            // Never leave a half-framed record behind for `poll_flush`.
+            this.pending.clear();
+            this.pending_pos = 0;
+            return Poll::Ready(Err(to_io_error(e)));
+        }
+        advance_seq(write_seq)?;
+        let body_len = u16::try_from(this.pending.len() - RECORD_HEADER_LEN).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "framed TLS record exceeds the record length field",
+            )
+        })?;
+        this.pending[3..RECORD_HEADER_LEN].copy_from_slice(&body_len.to_be_bytes());
         match this.flush_pending(cx) {
             // Data stays buffered in `pending`; a later poll drains it.
             Poll::Pending | Poll::Ready(Ok(())) => {}
@@ -704,13 +741,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsStream<S> {
 /// `self.rec` borrow so the state can be reassigned.
 enum Step {
     HeaderComplete { content_type: u8, len: usize },
-    RecordReady { content_type: u8, payload: Vec<u8> },
+    RecordReady { content_type: u8, len: usize },
 }
 
 /// What a decrypted record contributes to the application byte stream.
 enum DecryptedRecord {
-    /// Plaintext to buffer and serve.
-    Data(Vec<u8>),
+    /// Plaintext to serve, as a range inside [`TlsStream::rec_buf`].
+    Data(Range<usize>),
     /// `close_notify` — subsequent reads are EOF.
     CloseNotify,
     /// Record consumed with nothing to deliver (`NewSessionTicket`).
@@ -843,6 +880,41 @@ mod tests {
         let mut buf = [0u8; 11];
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn one_write_frames_exactly_one_record() {
+        // A full 2^14 plaintext write must leave exactly one record on the
+        // wire — `17 03 03 || len`, then plaintext + inner type + AEAD tag —
+        // and a following smaller write must start its own record instead of
+        // extending the first (in-place framing must patch the length field
+        // of the record it just built, and only that one).
+        let (a, mut b) = duplex(256 * 1024);
+        let mut client = TlsStream::new(a, test_keys());
+        client
+            .write_all(&[0x5a; MAX_RECORD_PLAINTEXT])
+            .await
+            .unwrap();
+        client.write_all(b"12345678").await.unwrap();
+        client.flush().await.unwrap();
+
+        let first_body = MAX_RECORD_PLAINTEXT + 1 + AEAD_TAG_LEN;
+        let second_body = 8 + 1 + AEAD_TAG_LEN;
+        assert_eq!(first_body, 16_401, "16 KiB plaintext + type byte + tag");
+        let mut wire = vec![0u8; RECORD_HEADER_LEN * 2 + first_body + second_body];
+        b.read_exact(&mut wire).await.unwrap();
+
+        assert_eq!(&wire[..3], &[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([wire[3], wire[4]])),
+            first_body
+        );
+        let second = &wire[RECORD_HEADER_LEN + first_body..];
+        assert_eq!(&second[..3], &[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([second[3], second[4]])),
+            second_body
+        );
     }
 
     #[tokio::test]

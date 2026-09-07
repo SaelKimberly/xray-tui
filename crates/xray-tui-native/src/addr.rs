@@ -141,6 +141,13 @@ pub const fn addr_port_last_tail_len(atyp: u8, domain_len: u8) -> Option<usize> 
 /// (`0x01`/`0x03`/`0x04`), NOT the VLESS/VMess `ADDR_TYPE_*` (1/2/3).
 pub fn encode_addr_port_last(target: &TargetAddr) -> Result<Vec<u8>, NativeError> {
     let mut out = Vec::with_capacity(1 + 16 + 2);
+    write_addr_port_last(&mut out, target)?;
+    Ok(out)
+}
+
+/// [`encode_addr_port_last`] into a caller-owned buffer: the UDP reply path
+/// frames one datagram per packet and reuses its buffer.
+pub fn write_addr_port_last(out: &mut Vec<u8>, target: &TargetAddr) -> Result<(), NativeError> {
     match &target.host {
         Host::Ip(IpAddr::V4(ip)) => {
             out.push(TROJAN_ATYP_IPV4);
@@ -160,7 +167,7 @@ pub fn encode_addr_port_last(target: &TargetAddr) -> Result<Vec<u8>, NativeError
         }
     }
     out.extend_from_slice(&target.port.to_be_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Decode one wire address; returns the address plus the unconsumed tail.

@@ -30,6 +30,8 @@ chacha20 = { version = "0.10", default-features = false, features = ["rng", "xch
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 compact_str = { version = "0.9", default-features = false, features = ["std"] }
 constant_time_eq = { version = "0.4" }
+criterion = { version = "0.8", features = ["async_tokio"] }
+crossbeam-epoch = { version = "0.9" }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 data-encoding = { version = "2" }
 digest = { version = "0.11", features = ["alloc", "mac", "oid", "zeroize"] }
@@ -51,7 +53,8 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "ser
 icu_locale_core = { version = "2", default-features = false, features = ["alloc", "zerovec"] }
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data", "utf16_iter", "utf8_iter"] }
 icu_provider = { version = "2", default-features = false, features = ["alloc", "baked"] }
-itertools = { version = "0.14" }
+itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
+itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 kasuari = { version = "0.4", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
 litemap = { version = "0.8", default-features = false, features = ["alloc"] }
@@ -109,6 +112,7 @@ uuid = { version = "1", features = ["fast-rng", "js", "v4", "v5", "v7"] }
 winnow = { version = "1" }
 writeable = { version = "0.6", default-features = false, features = ["alloc"] }
 yoke = { version = "0.8", default-features = false, features = ["alloc", "derive"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
 zeroize = { version = "1", features = ["derive"] }
 zerotrie = { version = "0.2", default-features = false, features = ["alloc", "yoke", "zerofrom"] }
@@ -129,7 +133,8 @@ either = { version = "1", features = ["use_std"] }
 form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
-itertools = { version = "0.14" }
+itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
+itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 libc = { version = "0.2" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
@@ -239,6 +244,7 @@ zeroize = { version = "1", features = ["derive"] }
 # design. Regenerate this list after `cargo hakari generate` with:
 #   awk '/^\[/ {in_deps = ($0 ~ /dependencies\]/)} in_deps && /^[a-zA-Z0-9_-]+ = \{/ {print $1}' Cargo.toml | sort -u
 ignored = [
+    "aes",
     "aho-corasick",
     "base64",
     "bit-set",
@@ -253,6 +259,8 @@ ignored = [
     "clang-sys",
     "compact_str",
     "constant_time_eq",
+    "criterion",
+    "crossbeam-epoch",
     "crypto-common",
     "data-encoding",
     "deranged",
@@ -270,21 +278,23 @@ ignored = [
     "h2",
     "hashbrown-9067fe90e8c1f593",
     "hashbrown-986da7b5efc2b80e",
-    "hmac",
     "http-body-util",
+    "hybrid-array",
     "hyper",
     "hyper-util",
     "icu_locale_core",
     "icu_normalizer",
     "icu_provider",
     "ipnet",
-    "itertools",
+    "itertools-582f2526e08bb6a0",
+    "itertools-594e8ee84c453af0",
     "kasuari",
     "libc",
     "linux-raw-sys",
     "litemap",
     "lock_api",
     "log",
+    "md-5",
     "memchr",
     "miniz_oxide",
     "mio",
@@ -314,6 +324,7 @@ ignored = [
     "rustls-webpki",
     "serde",
     "serde_core",
+    "sha2",
     "simd-adler32",
     "siphasher",
     "slab",
@@ -346,6 +357,7 @@ ignored = [
     "winnow",
     "writeable",
     "yoke",
+    "zerocopy",
     "zerofrom",
     "zeroize",
     "zerotrie",

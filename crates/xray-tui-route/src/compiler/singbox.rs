@@ -1023,13 +1023,13 @@ mod tests {
             resolved_host_ips: vec![],
         };
         assert!(
-            matches!(engine.decide(&meta("www.a.com")), Decision::Route { tag, .. } if tag == "proxy-x")
+            matches!(engine.decide(&meta("www.a.com")), Decision::Route { tag, .. } if &*tag == "proxy-x")
         );
         assert!(
-            matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if tag == "proxy-x")
+            matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if &*tag == "proxy-x")
         );
         assert!(
-            !matches!(engine.decide(&meta("other.net")), Decision::Route { tag, .. } if tag == "proxy-x")
+            !matches!(engine.decide(&meta("other.net")), Decision::Route { tag, .. } if &*tag == "proxy-x")
         );
     }
 
@@ -1093,11 +1093,11 @@ mod tests {
             resolved_host_ips: vec![],
         };
         assert!(
-            !matches!(engine.decide(&meta("sub.x.com")), Decision::Route { tag, .. } if tag == "o"),
+            !matches!(engine.decide(&meta("sub.x.com")), Decision::Route { tag, .. } if &*tag == "o"),
             "negated suffix must not match its own domain"
         );
         assert!(
-            matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if tag == "o")
+            matches!(engine.decide(&meta("192.168.1.1")), Decision::Route { tag, .. } if &*tag == "o")
         );
     }
 
@@ -1128,7 +1128,7 @@ mod tests {
             resolved_host_ips: vec![],
         };
         assert!(
-            matches!(engine.decide(&meta("sub.x.com")), Decision::Route { tag, .. } if tag == "o")
+            matches!(engine.decide(&meta("sub.x.com")), Decision::Route { tag, .. } if &*tag == "o")
         );
     }
 
@@ -1235,19 +1235,19 @@ mod tests {
         };
         assert!(matches!(
             engine.decide(&meta("www.a.com", 443)),
-            Decision::Route { tag, .. } if tag == "mix"
+            Decision::Route { tag, .. } if &*tag == "mix"
         ));
         assert!(matches!(
             engine.decide(&meta("192.168.1.1", 443)),
-            Decision::Route { tag, .. } if tag == "mix"
+            Decision::Route { tag, .. } if &*tag == "mix"
         ));
         assert!(matches!(
             engine.decide(&meta("www.a.com", 8443)),
-            Decision::Route { tag, .. } if tag == "direct"
+            Decision::Route { tag, .. } if &*tag == "direct"
         ));
         assert!(matches!(
             engine.decide(&meta("other.net", 443)),
-            Decision::Route { tag, .. } if tag == "direct"
+            Decision::Route { tag, .. } if &*tag == "direct"
         ));
     }
 
@@ -1284,7 +1284,7 @@ mod tests {
             sni_host: None,
             resolved_host_ips: vec![],
         };
-        assert!(matches!(engine.decide(&m), Decision::Route { tag, .. } if tag == "o"));
+        assert!(matches!(engine.decide(&m), Decision::Route { tag, .. } if &*tag == "o"));
         // (c) child mode:"xor" ⇒ Unsupported, never silently OR'd.
         let xor_child = r#"{"route":{"rules":[{"mode":"or","rules":[
             {"mode":"xor","rules":[{"domain_suffix":[".a.com"]}]},
@@ -1383,15 +1383,15 @@ mod tests {
         };
         assert!(matches!(
             engine.decide(&meta("other.net", 443)),
-            Decision::Route { tag, .. } if tag == "other-net"
+            Decision::Route { tag, .. } if &*tag == "other-net"
         ));
         assert!(matches!(
             engine.decide(&meta("www.a.com", 443)),
-            Decision::Route { tag, .. } if tag == "other-net"
+            Decision::Route { tag, .. } if &*tag == "other-net"
         ));
         assert!(matches!(
             engine.decide(&meta("www.a.com", 8443)),
-            Decision::Route { tag, .. } if tag == "direct"
+            Decision::Route { tag, .. } if &*tag == "direct"
         ));
         // AND parent: ¬(a∨b) ∧ port has no IR encoding (Cond::All holds
         // leaf items only) — positionally Unsupported, never silently
@@ -1604,16 +1604,16 @@ mod tests {
             resolved_host_ips: vec![],
         };
         assert!(
-            matches!(engine.decide(&meta("sagernet.org")), Decision::Route { tag, .. } if tag == "o")
+            matches!(engine.decide(&meta("sagernet.org")), Decision::Route { tag, .. } if &*tag == "o")
         );
         assert!(
-            matches!(engine.decide(&meta("sing-box.sagernet.org")), Decision::Route { tag, .. } if tag == "o")
+            matches!(engine.decide(&meta("sing-box.sagernet.org")), Decision::Route { tag, .. } if &*tag == "o")
         );
         assert!(
-            matches!(engine.decide(&meta("www.google.com")), Decision::Route { tag, .. } if tag == "o")
+            matches!(engine.decide(&meta("www.google.com")), Decision::Route { tag, .. } if &*tag == "o")
         );
         assert!(
-            !matches!(engine.decide(&meta("google.com")), Decision::Route { tag, .. } if tag == "o")
+            !matches!(engine.decide(&meta("google.com")), Decision::Route { tag, .. } if &*tag == "o")
         );
     }
 
@@ -1713,7 +1713,7 @@ mod tests {
         // (1000:2000 and the open-ended 8080:).
         assert!(matches!(
             engine.decide(&meta("other.net", 700, NetworkMask::TCP)),
-            Decision::Route { tag, .. } if tag == "proxy-main"
+            Decision::Route { tag, .. } if &*tag == "proxy-main"
         ));
     }
 }

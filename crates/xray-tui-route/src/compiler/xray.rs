@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(out.ruleset.rules.len(), 2);
         let engine = crate::Engine::build(out.ruleset).unwrap();
         let routed_to =
-            |d: &Decision, tag: &str| matches!(d, Decision::Route { tag: t, .. } if t == tag);
+            |d: &Decision, tag: &str| matches!(d, Decision::Route { tag: t, .. } if &**t == tag);
         let mut http = conn("api.example.com", 80, NetworkMask::TCP);
         http.sniffed = Some(SniffedProtocol::Http);
 

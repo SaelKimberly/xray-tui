@@ -59,7 +59,7 @@ pub enum Decision {
     /// Forward to the outbound `tag`, optionally rewriting the address.
     Route {
         /// Outbound tag to forward through.
-        tag: String,
+        tag: Arc<str>,
         /// Rewritten destination, if the matched action requested one.
         override_addr: Option<NetAddr>,
     },
@@ -165,11 +165,13 @@ fn private_contains(ip: &IpAddr) -> bool {
     PRIVATE.contains(ip)
 }
 
-/// One rule with its predicate pre-compiled into a condition tree.
+/// One rule with its predicate pre-compiled into a condition tree and its
+/// [`Decision`] pre-built, so a match clones a ready value instead of
+/// rebuilding it from the IR action.
 struct CompiledRule {
     name: Option<String>,
     cond: CompiledCond,
-    action: Action,
+    decision: Decision,
 }
 
 impl CompiledRule {
@@ -252,7 +254,12 @@ impl CompiledCond {
 /// First-match flat-rule routing engine.
 pub struct Engine {
     rules: Vec<CompiledRule>,
-    default_route: DefaultRoute,
+    /// The rule-set default, pre-built like every rule's decision.
+    default_decision: Decision,
+    /// Whether any rule carries a `Protocol` item, computed at build time:
+    /// [`decide_async`] consults it per connection AND per UDP datagram, and
+    /// the walk is O(rules x items).
+    needs_sniff: bool,
     resolve_strategy: crate::ir::ResolveStrategy,
     event_sink: Option<tokio::sync::mpsc::UnboundedSender<RouteEvent>>,
     /// DNS seam installed via [`Engine::with_resolver`]; absent ⇒ no
@@ -283,15 +290,40 @@ impl Engine {
     pub fn build(rs: crate::ir::RuleSet) -> Result<Self, RouteError> {
         let mut rules = Vec::with_capacity(rs.rules.len());
         for (idx, rule) in rs.rules.into_iter().enumerate() {
+            // Built once, here: at runtime a match only clones it. The tag is
+            // an `Arc<str>`, which measured faster than `String` on this path
+            // at every rule count (benches/baseline.md v2 records the A/B):
+            // the scan's working set stays clean when the decision clone does
+            // not touch the allocator.
+            let decision = match rule.action {
+                Action::Route { tag, override_addr } => Decision::Route {
+                    tag: Arc::from(tag),
+                    override_addr,
+                },
+                Action::Reject { method } => Decision::Reject { method },
+                Action::HijackDns => Decision::HijackDns,
+            };
             rules.push(CompiledRule {
                 name: rule.name,
                 cond: CompiledCond::build(rule.cond, idx, 1)?,
-                action: rule.action,
+                decision,
             });
         }
+        let default_decision = match rs.default {
+            DefaultRoute::Route { tag } => Decision::Route {
+                tag: Arc::from(tag),
+                override_addr: None,
+            },
+            DefaultRoute::Reject { method } => Decision::Reject { method },
+        };
+        let needs_sniff = rules.iter().any(|rule| {
+            rule.cond
+                .walk_items(&mut |m| matches!(m, ItemMatcher::Protocol(_)))
+        });
         Ok(Self {
             rules,
-            default_route: rs.default,
+            default_decision,
+            needs_sniff,
             resolve_strategy: rs.resolve_strategy,
             event_sink: None,
             resolver: None,
@@ -310,11 +342,11 @@ impl Engine {
     /// Use [`decide_async`] for lazy sniff/resolve enrichment.
     pub fn decide(&self, meta: &ConnMeta) -> Decision {
         if let Some(rule) = self.rules.iter().find(|rule| rule.matches(meta)) {
-            let decision = Decision::from(&rule.action);
+            let decision = rule.decision.clone();
             self.emit_decision(&decision, rule.name.as_deref(), meta.sni_host.as_deref());
             return decision;
         }
-        let decision = Decision::from(&self.default_route);
+        let decision = self.default_decision.clone();
         self.emit_decision(&decision, None, meta.sni_host.as_deref());
         decision
     }
@@ -330,13 +362,10 @@ impl Engine {
     }
 
     /// True when any rule carries a `Protocol` item needing
-    /// `payload_prefix` sniffing.
+    /// `payload_prefix` sniffing (decided at build time).
     #[must_use]
-    pub fn needs_sniff(&self) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.cond
-                .walk_items(&mut |m| matches!(m, ItemMatcher::Protocol(_)))
-        })
+    pub const fn needs_sniff(&self) -> bool {
+        self.needs_sniff
     }
 
     /// True when strategy == `IfNonMatch` OR any `IpCidr`/`SourceIpCidr`
@@ -361,7 +390,7 @@ impl Engine {
     fn emit_decision(&self, decision: &Decision, rule_name: Option<&str>, sni: Option<&str>) {
         let Some(tx) = &self.event_sink else { return };
         let tag = match decision {
-            Decision::Route { tag, .. } => Some(tag.clone()),
+            Decision::Route { tag, .. } => Some(tag.to_string()),
             _ => None,
         };
         let _ = tx.send(RouteEvent::DecisionApplied {
@@ -428,7 +457,7 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
     let mut resolved_this_call = false;
     loop {
         if let Some(rule) = engine.rules.iter().find(|rule| rule.matches(meta)) {
-            let decision = Decision::from(&rule.action);
+            let decision = rule.decision.clone();
             engine.emit_decision(&decision, rule.name.as_deref(), meta.sni_host.as_deref());
             return decision;
         }
@@ -486,34 +515,9 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
         // loop re-evaluates once and falls through to default.
         resolved_this_call = true;
     }
-    let decision = Decision::from(&engine.default_route);
+    let decision = engine.default_decision.clone();
     engine.emit_decision(&decision, None, meta.sni_host.as_deref());
     decision
-}
-
-impl From<&Action> for Decision {
-    fn from(action: &Action) -> Self {
-        match action {
-            Action::Route { tag, override_addr } => Self::Route {
-                tag: tag.clone(),
-                override_addr: override_addr.clone(),
-            },
-            Action::Reject { method } => Self::Reject { method: *method },
-            Action::HijackDns => Self::HijackDns,
-        }
-    }
-}
-
-impl From<&DefaultRoute> for Decision {
-    fn from(default: &DefaultRoute) -> Self {
-        match default {
-            DefaultRoute::Route { tag } => Self::Route {
-                tag: tag.clone(),
-                override_addr: None,
-            },
-            DefaultRoute::Reject { method } => Self::Reject { method: *method },
-        }
-    }
 }
 
 /// Compiles one [`crate::ir::MatchItem`] with rule-index attribution on errors.
@@ -687,7 +691,7 @@ mod tests {
         assert_eq!(
             e.decide(&meta("example.com", 80, NetworkMask::TCP)),
             Decision::Route {
-                tag: "a".to_owned(),
+                tag: "a".into(),
                 override_addr: None
             }
         );
@@ -708,7 +712,7 @@ mod tests {
         assert_eq!(
             e.decide(&meta("example.com", 443, NetworkMask::UDP)),
             Decision::Route {
-                tag: "direct".to_owned(),
+                tag: "direct".into(),
                 override_addr: None
             }
         );
@@ -727,7 +731,7 @@ mod tests {
         assert_eq!(
             e.decide(&meta("example.org", 443, NetworkMask::TCP)),
             Decision::Route {
-                tag: "direct".to_owned(),
+                tag: "direct".into(),
                 override_addr: None
             }
         );
@@ -788,7 +792,7 @@ mod tests {
         assert_eq!(
             d,
             Decision::Route {
-                tag: "blackhole".to_owned(),
+                tag: "blackhole".into(),
                 override_addr: None
             },
             "decision itself is unchanged by the sink"
@@ -1413,7 +1417,7 @@ mod tests {
     }
     impl DecisionExt for Decision {
         fn is_routed_to(&self, tag: &str) -> bool {
-            matches!(self, Self::Route { tag: t, .. } if t == tag)
+            matches!(self, Self::Route { tag: t, .. } if &**t == tag)
         }
     }
 }

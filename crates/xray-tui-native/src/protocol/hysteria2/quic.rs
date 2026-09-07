@@ -12,7 +12,6 @@ use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes};
 use http::Request;
-use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use xray_tui_proto::proto_spec::Hysteria2Config;
@@ -25,31 +24,30 @@ use crate::error::{NativeError, timeouts};
 use super::{ALPN_H3, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LEN, TCP_RESPONSE_OK};
 
 // ── randomness ────────────────────────────────────────────────────────────
-
-fn random_bytes(buf: &mut [u8]) {
-    SystemRandom::new()
-        .fill(buf)
-        .expect("system rng is infallible");
-}
+//
+// Salts and padding are wire-visible filler, not key material, and
+// `random_salt` runs once per OUTBOUND DATAGRAM — so both draw from the
+// buffered pool (`crate::rand`), which keeps ring's `SystemRandom` as the
+// entropy source but amortizes `getrandom(2)` over ~512 salts.
 
 /// A fresh random salt for one salamander packet.
 fn random_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
-    random_bytes(&mut salt);
+    crate::rand::fill_nonsecret(&mut salt);
     salt
 }
 
 /// Random alphanumeric padding in `[min, max)` — the wire value is
 /// arbitrary, only its length matters. Fills the whole payload with ONE
-/// `getrandom` call, not one per character.
+/// pool draw, not one per character.
 fn random_padding(min: usize, max: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut len_bytes = [0u8; 8];
-    random_bytes(&mut len_bytes);
+    crate::rand::fill_nonsecret(&mut len_bytes);
     let span = max - min;
     let len = min + (usize::from_le_bytes(len_bytes) % span);
     let mut buf = vec![0u8; len];
-    random_bytes(&mut buf);
+    crate::rand::fill_nonsecret(&mut buf);
     buf.iter()
         .map(|b| char::from(CHARS[usize::from(*b) % CHARS.len()]))
         .collect()
@@ -431,29 +429,34 @@ pub(super) async fn open_tcp_tunnel(
     })?;
 
     // TCPResponse: `status byte | msgLen | msg | padLen | padding`.
+    //
+    // ONE deadline for the whole response. The parse makes up to 19 reads
+    // (status, two varints of up to 8 bytes, two payloads); a timer per read
+    // would hand each of them a fresh `PROTOCOL` budget, so a stalling peer
+    // could hold the connect open for ~19x the intended limit.
     let mut recv = recv;
-    let mut head = [0u8; 1];
     let limit = timeouts::PROTOCOL;
-    tokio::time::timeout(
-        limit,
-        tokio::io::AsyncReadExt::read_exact(&mut recv, &mut head),
-    )
+    let (status, msg) = tokio::time::timeout(limit, async {
+        let mut head = [0u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut recv, &mut head)
+            .await
+            .map_err(|e| NativeError::Protocol {
+                kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
+                detail: format!("read tcp response status: {e}"),
+            })?;
+        // Message + padding are always present, on both the OK and error paths
+        // (`WriteTCPResponse` emits `status | msgLen | msg | padLen | padding`).
+        let msg = read_vstring(&mut recv, "hysteria2 tcp response").await?;
+        read_vstring(&mut recv, "hysteria2 tcp response padding").await?;
+        Ok::<_, NativeError>((head[0], msg))
+    })
     .await
     .map_err(|_| NativeError::Timeout {
         step: "hysteria2 tcp response read",
         limit,
-    })?
-    .map_err(|e| NativeError::Protocol {
-        kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
-        detail: format!("read tcp response status: {e}"),
-    })?;
+    })??;
 
-    // Message + padding are always present, on both the OK and error paths
-    // (`WriteTCPResponse` emits `status | msgLen | msg | padLen | padding`).
-    let msg = read_vstring(&mut recv, "hysteria2 tcp response").await?;
-    read_vstring(&mut recv, "hysteria2 tcp response padding").await?;
-
-    if head[0] != TCP_RESPONSE_OK {
+    if status != TCP_RESPONSE_OK {
         return Err(NativeError::Protocol {
             kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
             detail: format!("remote error: {msg}"),
@@ -463,16 +466,18 @@ pub(super) async fn open_tcp_tunnel(
     Ok(H2Stream::new(conn.clone(), keepalive, send, recv))
 }
 
-/// Read a single byte from the stream, bounded and EOF-mapped.
+/// Read a single byte from the stream, EOF-mapped.
+///
+/// Deliberately untimed: every caller runs inside one `timeout` per protocol
+/// message (see [`open_tcp_tunnel`]), so a per-byte timer would multiply the
+/// effective deadline by the number of bytes read.
 async fn read_exact_u8(
     recv: &mut quinn::RecvStream,
     step: &'static str,
 ) -> Result<u8, NativeError> {
-    let limit = timeouts::PROTOCOL;
     let mut b = [0u8; 1];
-    tokio::time::timeout(limit, tokio::io::AsyncReadExt::read_exact(recv, &mut b))
+    tokio::io::AsyncReadExt::read_exact(recv, &mut b)
         .await
-        .map_err(|_| NativeError::Timeout { step, limit })?
         .map_err(|e| NativeError::Protocol {
             kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
             detail: format!("{step}: {e}"),
@@ -481,7 +486,8 @@ async fn read_exact_u8(
 }
 
 /// Read a QUIC varint from the stream: one leading byte selects the width
-/// (1/2/4/8 by the top two bits), then the remaining bytes complete it.
+/// (1/2/4/8 by the top two bits), then the remaining bytes complete it in a
+/// single read into a fixed 8-byte buffer.
 async fn read_varint_stream(
     recv: &mut quinn::RecvStream,
     step: &'static str,
@@ -493,11 +499,17 @@ async fn read_varint_stream(
         2 => 4,
         _ => 8,
     };
-    let mut raw = vec![first];
-    for _ in 1..width {
-        raw.push(read_exact_u8(recv, step).await?);
+    let mut raw = [0u8; 8];
+    raw[0] = first;
+    if width > 1 {
+        tokio::io::AsyncReadExt::read_exact(recv, &mut raw[1..width])
+            .await
+            .map_err(|e| NativeError::Protocol {
+                kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
+                detail: format!("{step}: {e}"),
+            })?;
     }
-    read_varint(&raw)
+    read_varint(&raw[..width])
         .map(|(v, _)| v)
         .ok_or_else(|| NativeError::Protocol {
             kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
@@ -506,12 +518,12 @@ async fn read_varint_stream(
 }
 
 /// Read a varint-length-prefixed string (message or padding) and return it
-/// as owned bytes. Bounded by the protocol overflow guards.
+/// as owned bytes. Bounded by the protocol overflow guards and by the
+/// caller's single per-message deadline (see [`read_exact_u8`]).
 async fn read_vstring(
     recv: &mut quinn::RecvStream,
     step: &'static str,
 ) -> Result<String, NativeError> {
-    let limit = timeouts::PROTOCOL;
     let len_u64 = read_varint_stream(recv, step).await?;
     let len = usize::try_from(len_u64).map_err(|_| NativeError::Protocol {
         kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
@@ -525,9 +537,8 @@ async fn read_vstring(
     }
     let mut buf = vec![0u8; len];
     if len > 0 {
-        tokio::time::timeout(limit, tokio::io::AsyncReadExt::read_exact(recv, &mut buf))
+        tokio::io::AsyncReadExt::read_exact(recv, &mut buf)
             .await
-            .map_err(|_| NativeError::Timeout { step, limit })?
             .map_err(|e| NativeError::Protocol {
                 kind: xray_tui_proto::proto_spec::ProtocolKind::Hysteria2,
                 detail: format!("{step}: {e}"),

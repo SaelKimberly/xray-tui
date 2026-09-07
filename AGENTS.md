@@ -58,6 +58,7 @@ cargo run
 - `crates/xray-tui-native/src/server/` — `NativeCoreServer`: one native session = both inbounds bound (`ServerConfig { socks, http, proxy, telemetry, udp }`), a proxy-all `Engine`, and watch-channel shutdown. `shutdown().await` is the ONLY teardown that guarantees the ports are free on return; `Drop` signals then aborts the accept loops (the ports still come back, just not synchronously), a failed HTTP bind unwinds the already-serving SOCKS listener, and `start()` warns once when a bind address is not loopback (neither inbound authenticates by default)
 - `crates/xray-tui-native/src/capability.rs` — the connect-time gate: `NATIVE_KINDS`/`kind_supported` (vless/vmess/trojan/hysteria2) and `supported(kind, &ProtocolConfig)`. Returns false for anything native serves WORSE than the subprocess so `ops/connect.rs` can downgrade: VLESS account encryption (incl. the `mlkem768x25519plus` interop divergence) and non-vision flows, legacy VMess payload ciphers, non-zero `alter_id`, fingerprint ids the engine cannot parse (shares `security::fingerprint::parse_fingerprint_id`, so the two lists cannot drift), mKCP `seed`/`header_type`/share-link `path` carriers (the native dial reads only mtu+tti). `transport_supported` is a POSITIVE exhaustive match — a new `TransportConfig` variant is a compile error here, never a silent `true`
 - `crates/xray-tui-native/src/telemetry.rs` — the native session's event feed: `Telemetry` + `NativeEvents` on SEPARATE log and trace queues (a log burst must not evict a paired `Opened`/`Closed`), bounded `try_send` with drop counts folded into ONE summary per poll window (a per-drop `warn!` re-enters `TuiLogLayer`), `TraceEvent`/`TraceOpened`/`TraceClosed`, `TraceGuard` (emits `Closed` from `Drop`, so a leg cancelled by shutdown still closes its row), and `Counted<S>` — the byte-counting stream wrapper that feeds the shared traffic atomics AS BYTES FLOW (per-leg atomics published only at close report 0 B for the whole life of a transfer)
+- `crates/xray-tui-native/src/rand.rs` — buffered CSPRNG for NON-SECRET randomness (`fill_nonsecret`, `u32_below`): ring's `SystemRandom` stays the entropy source, a 4 KiB thread-local pool amortizes `getrandom(2)` over ~512 draws. Used by the per-packet draws — hysteria2's Salamander salt (one per outbound datagram), vision padding lengths, xhttp `x_padding`, mlkem padding plans, the VLESS global id. Key material NEVER comes from here (VMess IV/body keys, the mlkem IV and X25519 seeds, everything in `xray-tui-tls` draw directly), so no key byte ever sits in a process-lifetime buffer.
 - `crates/xray-tui-route/src/` — first-match routing engine (`Engine` `decide`/`decide_async`, IR + xray/sing-box/DB-row compilers, `resolve` `DnsSink`/`ProbeTracker`). Sniffer (`sniff.rs`): TLS `ClientHello` SNI + HTTP `Host` + QUIC `Initial` decryption (RFC 9001 §5.2 key schedule + header-protection removal) with stateful multi-datagram `ClientHello` reassembly (`QuicSniffer`); `SniffedProtocol::Quic` accepted in both compilers (`protocol` tokens http/tls/dns/quic)
 - `crates/xray-tui-hakari/` — generated feature-unification crate (cargo-hakari); deps exist only to unify features, never referenced from code. Every member depends on it; regenerate after any Cargo.lock change.
 ### TUI screens (crates/xray-tui/src/ui/)
@@ -281,8 +282,14 @@ Anything requiring a third binary backend beyond xray-core or sing-box.
 	  in the generated `xray-tui-hakari` (base64 0.22 via dns-stamp-parser,
 	  compact_str 0.9 via ratatui, hashbrown 0.16 via yaml-rust2, syn 2,
 	  windows-sys platform pins), so the gate never hard-fails on them
-- Benchmarks: run only via `cargo criterion` (criterion.toml; results in `.benchmarks/`, survive `cargo clean`);
-  `cargo bench` is not used
+- Benchmarks: `just bench` (`micro` = record + decide + dispatch + relay, no core binaries needed;
+  `all` adds the `throughput` matrix and refuses to start without the pinned cores). Five criterion
+  targets: `xray-tui-tls/record` (record layer), `xray-tui-route/decide` (routing), and
+  `xray-tui-native/{dispatch,relay,throughput}`. `cargo bench` is not used; results land in
+  `.benchmarks/` (criterion.toml) and survive `cargo clean`. The recipe pins `XRAY_TUI_BENCH_MB=4`
+  (the size every row in `benches/baseline.md` was captured at) and exports `XRAY_TUI_CORE_BIN_DIR`
+  itself — `cargo criterion` runs the bench executable directly and does NOT apply `[env]` from
+  `.cargo/config.toml`, so without it the throughput rows print `SKIP … is not set` and still exit 0
 - `cargo build --release` — release build
 - Manual: run xray-tui against real xray-core and sing-box binaries, verify connect/speedtest/disconnect flow for both backends
 
