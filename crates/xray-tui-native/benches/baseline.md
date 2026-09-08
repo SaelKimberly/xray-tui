@@ -20,16 +20,23 @@ apply `[env]` from `.cargo/config.toml`, so without it the throughput rows print
 
 ## 2026-09-08 (v3) — memory-diet plan land
 
-Same machine, same cores (xray 26.3.27, sing-box 1.13.16), `just bench all`
-at `XRAY_TUI_BENCH_MB=4`. Covers the full plan branch (Tasks 1–6 + fix waves +
-state.rs wave: native `Bytes` relay, TLS stack/in-place, route borrows,
-canonical-once import, TUI virtualization + runtime bounds).
+Measured at commit `a63067b` (plan branch tip at bench time), same box
+(`/proc/cpuinfo`: 12th Gen Intel i7-12700, verified this run), same cores
+(xray 26.3.27, sing-box 1.13.16), `just bench all` at `XRAY_TUI_BENCH_MB=4`.
+Covers the full plan branch (Tasks 1–6 + fix waves + state.rs wave).
+
+Against the v2 table (absolute medians, throughput in GiB/s): throughput rows
+sit −3.5…+2.8 % — inside run-to-run drift — except vless plain recv −10.5 %
+and vmess-ws recv −14.5 %, the suite's two known high-variance rows (criterion
+flags both not-significant, and they warn about sample counts every run).
+Record: AES seal/open +8.8/+3.8 % time on a warm box at suite end (criterion:
+not-significant/−4.08 % vs its own history — history basis differs, see
+below); ChaCha ±1 %. Relay +3.5/+5.3 %, dispatch +3.6/+4.4 %, decide rules_0
+−14 % absolute (the T4 borrow gain, already in history).
 
 Δ is criterion's own time delta against its stored history (which includes the
 per-task intermediate runs, so Δ measures the final waves, not v1/v2). Verdict:
 **no significant change on any row** — every row `NoChange`/`NotSignificant`.
-Absolute medians drift a few % run to run (17-minute back-to-back suite on a
-warm box); nothing exceeds the noise the suite itself reports.
 
 ### End-to-end tunnel matrix (`throughput`)
 
