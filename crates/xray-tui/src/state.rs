@@ -141,7 +141,7 @@ pub struct AppState {
     pub last_heed_poll: std::time::Instant,
     /// Channel sender for non-blocking log persistence.
     /// `TuiLogLayer` and core log forwarder send `LogMessage` here; background writer batches and writes to heed.
-    pub log_sender_tx: Option<std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>>,
+    pub log_sender_tx: Option<std::sync::mpsc::SyncSender<xray_tui_core::log_heed::LogMessage>>,
     /// Channel sender for core subprocess log lines (String lines from stdout/stderr).
     pub core_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Whether initial logs have been loaded from heed into `log_cache` yet.
@@ -497,9 +497,7 @@ impl AppState {
                 std::num::NonZeroUsize::new(512).expect("512 is nonzero"),
             ))),
             dns_cache_ttl_secs: 300,
-            display_rows_cache: RefCell::new(
-                crate::ui::profiles::DisplayRowsCache::default()
-            ),
+            display_rows_cache: RefCell::new(crate::ui::profiles::DisplayRowsCache::default()),
         };
         // Cheap constructors — no I/O until first lookup.
         let config_dir = dirs::config_dir()
@@ -639,7 +637,7 @@ impl AppState {
 
         // Send to heed storage (via background batched writer)
         if let Some(sender) = &self.log_sender_tx {
-            let _ = sender.send(log_msg);
+            let _ = sender.try_send(log_msg);
         }
 
         // Send to actions panel

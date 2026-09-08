@@ -8028,6 +8028,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "bytes",
  "chrono",
  "crossterm",
  "dashmap",
@@ -8162,6 +8163,7 @@ name = "xray-tui-geoip"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lru 0.18.2",
  "maxminddb",
  "reqwest",
  "rustls",
@@ -8399,6 +8401,7 @@ dependencies = [
  "bytes",
  "criterion",
  "jiff",
+ "lru 0.18.2",
  "parking_lot",
  "regex",
  "ring",

@@ -75,6 +75,10 @@ pub async fn connect_chain(
     let mut base: Option<BoxStream> = None;
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
+        // Owned clone per hop (not `&link`): `LinkContext` crosses `.await`
+        // points and a borrow would lifetime-infect the struct plus every
+        // `&ctx` consumer for a per-connection, usually-single-hop clone.
+        // Deliberately kept (memory-diet Task 6 ruling).
         let ctx = LinkContext::new(link.clone(), to);
         if protocol::is_quic_link(&ctx) {
             // QUIC-family protocols (Hysteria2/Hysteria1/TUIC) are a

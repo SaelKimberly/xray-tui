@@ -471,7 +471,11 @@ fn build_display_rows(
             .iter()
             .all(|id| state.multi_select.contains(id))
         && cache.expanded.len() == rows.len()
-        && cache.expanded.iter().zip(rows.iter()).all(|(c, r)| *c == r.expanded)
+        && cache
+            .expanded
+            .iter()
+            .zip(rows.iter())
+            .all(|(c, r)| *c == r.expanded)
     {
         return cache.rows.clone();
     }

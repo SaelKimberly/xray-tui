@@ -106,45 +106,57 @@ pub async fn udp_ping(
 }
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 
-type ClientCacheInner = HashMap<(String, u16, bool), reqwest::Client>;
+type ClientCacheInner = HashMap<(String, u16, bool, bool), reqwest::Client>;
 
-fn client_cache() -> &'static Mutex<ClientCacheInner> {
-    static CACHE: OnceLock<Mutex<ClientCacheInner>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static CLIENT_CACHE: LazyLock<Mutex<ClientCacheInner>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Reset the client cache — exposed for testing.
 #[doc(hidden)]
 pub fn reset_client_cache() {
-    if let Ok(mut cache) = client_cache().lock() {
+    if let Ok(mut cache) = CLIENT_CACHE.lock() {
         cache.clear();
     }
 }
 
 /// Create a `reqwest::Client` with SOCKS5 proxy configured, using a cache to
-/// avoid per-call connection pool creation overhead.
+/// avoid per-call connection pool creation overhead. The cache key includes
+/// the redirect policy: probe clients use `Policy::none()` (a redirecting
+/// probe URL must not silently follow), fetch clients use the default policy.
 async fn create_socks5_client(
     proxy: &str,
     port: u16,
     socks5h: bool,
     timeout: Duration,
 ) -> Result<reqwest::Client, SpeedTestError> {
+    create_socks5_client_with_policy(proxy, port, socks5h, timeout, false).await
+}
+
+async fn create_socks5_client_with_policy(
+    proxy: &str,
+    port: u16,
+    socks5h: bool,
+    timeout: Duration,
+    no_redirects: bool,
+) -> Result<reqwest::Client, SpeedTestError> {
     crate::ensure_tls_provider();
-    let key = (proxy.to_string(), port, socks5h);
-    if let Some(client) = client_cache().lock().unwrap().get(&key) {
+    let key = (proxy.to_string(), port, socks5h, no_redirects);
+    if let Some(client) = CLIENT_CACHE.lock().unwrap().get(&key) {
         return Ok(client.clone()); // Client::clone() is cheap (Arc)
     }
     let scheme = if socks5h { "socks5h" } else { "socks5" };
     let proxy_url = format!("{scheme}://{proxy}:{port}");
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
-        .timeout(timeout)
-        .build()
-        .map_err(SpeedTestError::Http)?;
-    client_cache().lock().unwrap().insert(key, client.clone());
+        .timeout(timeout);
+    if no_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = builder.build().map_err(SpeedTestError::Http)?;
+    CLIENT_CACHE.lock().unwrap().insert(key, client.clone());
     Ok(client)
 }
 
@@ -168,15 +180,8 @@ pub async fn real_ping(
     retries: u32,
 ) -> Result<RealPingResult, SpeedTestError> {
     crate::ensure_tls_provider();
-    let scheme = "socks5";
-    let proxy_url = format!("{scheme}://{proxy}:{port}");
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| SpeedTestError::Proxy(e.to_string()))?)
-        .timeout(test_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(0)
-        .build()
-        .map_err(SpeedTestError::Http)?;
+    // Pooled probe client (Policy::none preserved via the cache's policy bit).
+    let client = create_socks5_client_with_policy(proxy, port, false, test_timeout, true).await?;
 
     let start = std::time::Instant::now();
     let mut best_latency: Option<u64> = None;
@@ -208,16 +213,10 @@ pub async fn real_ping(
         last_error.unwrap_or_else(|| SpeedTestError::Proxy("all retries failed".to_string()))
     })?;
 
-    // Fetch IP info on success — use separate client with default redirect policy
+    // Fetch IP info on success — pooled client with default redirect policy.
     let ip_info = {
-        match reqwest::Client::builder()
-            .proxy(
-                reqwest::Proxy::all(&proxy_url)
-                    .map_err(|e| SpeedTestError::Proxy(e.to_string()))?,
-            )
-            .timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(0)
-            .build()
+        match create_socks5_client_with_policy(proxy, port, false, Duration::from_secs(10), false)
+            .await
         {
             Ok(ip_client) => match ip_client.get(ip_api_url).send().await {
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
@@ -464,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn client_cache_reset() {
         reset_client_cache();
-        assert!(client_cache().lock().unwrap().is_empty());
+        assert!(super::CLIENT_CACHE.lock().unwrap().is_empty());
     }
 
     #[test]

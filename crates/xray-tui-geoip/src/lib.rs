@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -31,9 +30,10 @@ pub struct GeoIp {
     reader: tokio::sync::OnceCell<Arc<Reader<Vec<u8>>>>,
     init_lock: tokio::sync::Mutex<()>,
     fetch: Arc<Fetcher>,
-    /// Per-IP decode cache (misses cached too): a repeated IP costs a lock
-    /// + `Arc` clones, never another mmdb walk or string decode.
-    cache: Mutex<HashMap<IpAddr, Option<Arc<Location>>>>,
+    /// Per-IP decode cache (misses cached too), bounded at 1024 entries: a
+    /// repeated IP costs a lock + `Arc` clones, never another mmdb walk or
+    /// string decode; distinct-IP churn evicts cold entries.
+    cache: Mutex<lru::LruCache<IpAddr, Option<Arc<Location>>>>,
 }
 
 impl GeoIp {
@@ -55,7 +55,9 @@ impl GeoIp {
             reader: tokio::sync::OnceCell::new(),
             init_lock: tokio::sync::Mutex::new(()),
             fetch: Arc::new(fetcher),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(1024).expect("cache cap is nonzero"),
+            )),
         }
     }
 
@@ -109,10 +111,11 @@ impl GeoIp {
             }))
         })
         .await??;
-        self.cache
+        let _ = self
+            .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(ip, result.as_ref().map(|loc| Arc::new(loc.clone())));
+            .push(ip, result.as_ref().map(|loc| Arc::new(loc.clone())));
         Ok(result)
     }
 

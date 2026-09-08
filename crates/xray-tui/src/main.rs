@@ -16,8 +16,12 @@ use xray_tui_db::Database;
 /// Optionally writes to a file when `log_to_file` is enabled.
 struct TuiLogLayer {
     core_event_tx: tokio::sync::mpsc::Sender<xray_tui::CoreEvent>,
-    log_sender: std::sync::mpsc::Sender<xray_tui_core::log_heed::LogMessage>,
+    log_sender: std::sync::mpsc::SyncSender<xray_tui_core::log_heed::LogMessage>,
     log_file: Option<std::sync::Mutex<std::fs::File>>,
+    /// Messages dropped when the bounded log queue is full (writer stalled on
+    /// LMDB resize). Folded into the writer's poll summary, never logged here
+    /// (a warn! would re-enter this layer).
+    dropped_logs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A field visitor that captures the `message` field.
@@ -47,16 +51,19 @@ where
     ) {
         use std::time::SystemTime;
 
+        // Static level, no `to_string().to_lowercase()` alloc pair. Trace and
+        // debug are filtered here (too verbose for the heed store).
+        let level: &'static str = match *event.metadata().level() {
+            tracing::Level::ERROR => "error",
+            tracing::Level::WARN => "warn",
+            tracing::Level::INFO => "info",
+            tracing::Level::DEBUG | tracing::Level::TRACE => return,
+        };
+
         let mut visitor = LogVisitor(String::new());
         event.record(&mut visitor);
         let message = visitor.0;
-        let target = event.metadata().target().to_string();
-        let level = event.metadata().level().to_string().to_lowercase();
-
-        // Skip trace and debug levels — they are too verbose
-        if level == "trace" || level == "debug" {
-            return;
-        }
+        let target = event.metadata().target();
 
         let timestamp_nanos = u64::try_from(
             SystemTime::now()
@@ -78,19 +85,27 @@ where
             }
         }
 
-        // Non-blocking send to the log storage channel (batched, async writer).
-        // If the channel is closed (writer panicked), silently drop — UI must keep running.
-        let _ = self.log_sender.send(xray_tui_core::log_heed::LogMessage {
-            level: level.clone(),
-            target: target.clone(),
-            message: message.clone(),
-            timestamp_nanos,
-        });
+        // Bounded non-blocking send (never blocks under the tracing lock). On a
+        // full queue the message is dropped and counted — the writer folds the
+        // count into its poll summary instead of warn!-ing (which re-enters).
+        if self
+            .log_sender
+            .try_send(xray_tui_core::log_heed::LogMessage {
+                level: level.to_owned(),
+                target: target.to_owned(),
+                message: message.clone(),
+                timestamp_nanos,
+            })
+            .is_err()
+        {
+            self.dropped_logs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Send lightweight notification to TUI for the actions panel
         let _ = self.core_event_tx.try_send(xray_tui::CoreEvent::TuiLog {
-            target,
-            level,
+            target: target.to_owned(),
+            level: level.to_owned(),
             message,
         });
     }
@@ -128,7 +143,14 @@ async fn main() -> Result<()> {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| Path::new(".").to_path_buf())
         .join("xray-tui");
-
+    // Bounded (4096) so a stalled LMDB writer caps retention instead of growing
+    // without bound; `on_event`/`log_trace`/forwarder all `try_send` + drop.
+    // The 200ms `recv_timeout` poll below stays: the global subscriber holds a
+    // `Sender` forever, so a blocking `recv()` would park at quit; the timeout
+    // lets the loop notice `shutdown_token`.
+    let (log_sender_tx, log_rx) =
+        std::sync::mpsc::sync_channel::<xray_tui_core::log_heed::LogMessage>(4096);
+    let dropped_logs = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // 2. Open database (~/.config/xray-tui/data.db)
     let db_path = config_dir.join("data.db");
     let db = Database::open(&db_path).await?;
@@ -136,11 +158,8 @@ async fn main() -> Result<()> {
     let log_path = config_dir.join("logs.lmdb");
     let heed = Arc::new(HeedLogStorage::new(&log_path)?);
 
-    // 3b. Create channel for non-blocking log persistence and spawn background batched writer.
-    //     TuiLogLayer sends messages via the channel; the background task batches up to
-    //     100 messages per heed write_transaction and runs heed ops on the blocking pool.
-    //     Uses unbounded std::sync::mpsc channel so TuiLogLayer::on_event never blocks.
-    let (log_sender_tx, log_rx) = std::sync::mpsc::channel::<xray_tui_core::log_heed::LogMessage>();
+    // 3b. Batched writer over the bounded channel created above (4096): batches
+    //     up to 100 messages per heed write_transaction on the blocking pool.
 
     // The writer cannot rely on the channel closing to exit: `TuiLogLayer` holds a
     // `Sender` clone inside the GLOBAL tracing subscriber, which is never dropped, so
@@ -242,7 +261,9 @@ async fn main() -> Result<()> {
                     target,
                     message,
                 };
-                let _ = log_sender.send(msg);
+                // `try_send`: a blocking `send` on the full bounded queue would
+                // stall the async executor; drop instead (counted on the layer).
+                let _ = log_sender.try_send(msg);
             }
         });
     }
@@ -289,6 +310,7 @@ async fn main() -> Result<()> {
                     .expect("core_event_tx must be set before tracing init"),
                 log_sender: log_sender_tx,
                 log_file,
+                dropped_logs: dropped_logs.clone(),
             }
             // Logs tab stays unfiltered (trace+) except hickory's DoH h2
             // transport chatter — those connections retry transparently and

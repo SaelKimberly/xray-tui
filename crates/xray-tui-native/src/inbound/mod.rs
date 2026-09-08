@@ -21,7 +21,7 @@ pub mod socks5;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -500,6 +500,11 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// Queue depth per proxy leg. UDP has no delivery guarantee: a full queue
 /// drops the datagram rather than stalling the relay loop.
 const PROXY_QUEUE_DEPTH: usize = 256;
+/// Cap on queued (unsent) proxy-leg payload bytes per association: 256 queue
+/// slots of 64 KiB datagrams could otherwise pin 16 MB behind a slow tunnel.
+/// The gate below drops (not queues) past this — same drop-newest policy as
+/// the existing `Full` arm, since tokio mpsc cannot drop-oldest.
+const PROXY_QUEUE_BYTES: usize = 1_000_000;
 
 /// Handle a UDP ASSOCIATE: reply with the bound client-facing UDP port, then
 /// relay datagrams until the controlling TCP connection closes (RFC 1928 §7).
@@ -702,6 +707,11 @@ struct ProxyLeg {
     /// dropped (one association carries one tunnel).
     tag: String,
     queue: mpsc::Sender<ProxyDatagram>,
+    /// Unsent payload bytes currently queued (sender + leg both hold this):
+    /// the send gate refuses past [`PROXY_QUEUE_BYTES`], the leg releases on
+    /// `recv`. Plain counter (not a semaphore): the leg never blocks the
+    /// relay, it just stops receiving when slow.
+    queued_bytes: Arc<AtomicUsize>,
     /// The leg task, aborted when the leg drops: an association that ends —
     /// control EOF, shutdown, relay error — must take its tunnel down instead
     /// of leaving it forwarding to the previous profile.
@@ -787,12 +797,16 @@ impl UdpRelay {
             // pins the source.
             return false;
         };
-        // One reply buffer per association, refilled per datagram: framing a
-        // fresh `Vec` cost three allocations (header, address, join) plus a
-        // realloc for every packet on the downlink.
         write_reply(&mut self.reply_buf, src, &buf[..len]);
         match self.client_udp.send_to(&self.reply_buf, source).await {
-            Ok(_) => true,
+            Ok(_) => {
+                // Grow-only buffer would pin the association's high-water mark
+                // forever; drop oversized capacity back once drained.
+                if self.reply_buf.capacity() > 16384 {
+                    self.reply_buf.shrink_to(2048);
+                }
+                true
+            }
             Err(error) => {
                 tracing::debug!(%error, "socks5 inbound: udp reply to client failed");
                 false
@@ -1013,31 +1027,49 @@ impl UdpRelay {
                 return;
             };
             let (queue, rx) = mpsc::channel(PROXY_QUEUE_DEPTH);
+            let queued_bytes = Arc::new(AtomicUsize::new(0));
             let task = AbortOnDrop(tokio::spawn(run_proxy_leg(
                 proxy.clone(),
                 dest.clone(),
                 Arc::clone(&self.client_udp),
                 source,
                 Arc::clone(&self.dns_cache),
+                Arc::clone(&queued_bytes),
                 rx,
             )));
             self.proxy = Some(ProxyLeg {
                 tag: tag.to_owned(),
                 queue,
+                queued_bytes,
                 _task: task,
             });
         }
         let leg = self.proxy.as_ref().expect("leg set above");
+        // Byte gate ahead of the slot gate: 256 slots of 64 KiB datagrams
+        // could pin 16 MB behind a slow tunnel. Over the cap the datagram is
+        // dropped (same drop-newest policy as the `Full` arm — tokio mpsc
+        // cannot drop-oldest).
+        let len = payload.len();
+        if leg.queued_bytes.load(std::sync::atomic::Ordering::Relaxed) + len > PROXY_QUEUE_BYTES {
+            tracing::debug!("socks5 inbound: proxy udp byte cap reached; dropping datagram");
+            return;
+        }
+        leg.queued_bytes
+            .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         let datagram = ProxyDatagram {
             dest,
             payload: payload.to_vec(),
         };
         match leg.queue.try_send(datagram) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(dropped)) => {
+                leg.queued_bytes
+                    .fetch_sub(dropped.payload.len(), std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!("socks5 inbound: proxy udp queue full; dropping datagram");
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::TrySendError::Closed(dropped)) => {
+                leg.queued_bytes
+                    .fetch_sub(dropped.payload.len(), std::sync::atomic::Ordering::Relaxed);
                 // The leg ended (tunnel open failed, or the tunnel closed).
                 // Clear it so a later datagram re-opens, bounded by the
                 // backoff — a transient proxy failure must not blackhole the
@@ -1061,6 +1093,7 @@ async fn run_proxy_leg(
     client_udp: Arc<UdpSocket>,
     source: SocketAddr,
     dns_cache: Arc<DnsCache>,
+    queued_bytes: Arc<AtomicUsize>,
     mut queue: mpsc::Receiver<ProxyDatagram>,
 ) {
     let params = outbound::proxy_params(&proxy, &session_target);
@@ -1122,6 +1155,9 @@ async fn run_proxy_leg(
     }));
 
     while let Some(datagram) = queue.recv().await {
+        // Release this datagram's budget first: the bytes are now owned by
+        // this task, not the queue.
+        queued_bytes.fetch_sub(datagram.payload.len(), std::sync::atomic::Ordering::Relaxed);
         // The session destination needs no address on the wire — and no DNS:
         // comparing targets short-circuits the common single-destination case.
         // Every carrier accepts `None`; only a DIFFERENT destination needs an

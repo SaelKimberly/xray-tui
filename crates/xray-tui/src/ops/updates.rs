@@ -78,7 +78,7 @@ pub fn spawn_update_download(state: &mut AppState, core_type: CoreType) {
     let bin_dir = dirs::config_dir()
         .unwrap_or_else(|| std::path::Path::new(".").to_path_buf())
         .join("xray-tui/bin");
-    let client = reqwest::Client::new();
+    let client = xray_tui_core::updater::update_client();
     let temp_dir = std::env::temp_dir().join(format!("xray-tui-update-{core_type}"));
 
     state

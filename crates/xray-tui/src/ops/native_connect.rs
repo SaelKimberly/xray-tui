@@ -39,7 +39,7 @@ pub async fn run_native_session(
     endpoint: &Endpoint,
     protocol: &Protocol,
     tx: &mpsc::Sender<CoreEvent>,
-    log_sender: &Option<std::sync::mpsc::Sender<LogMessage>>,
+    log_sender: &Option<std::sync::mpsc::SyncSender<LogMessage>>,
     mut stop_rx: oneshot::Receiver<()>,
     protocol_id: i64,
 ) {
@@ -127,7 +127,7 @@ pub async fn run_native_session(
                 match event {
                     Some(NativeEvent::Log { level, target, message }) => {
                         if let Some(sender) = log_sender {
-                            let _ = sender.send(LogMessage {
+                            let _ = sender.try_send(LogMessage {
                                 level: level.to_string(),
                                 target: target.to_string(),
                                 message,

@@ -187,10 +187,26 @@ impl HeedLogStorage {
             .write_txn()
             .map_err(|e| HeedError::Txn(e.to_string()))?;
 
+        // One 4 KiB scratch reused for every message in the batch (postcard
+        // writes into it, heed copies out on `put`): 1 alloc per batch instead
+        // of 1 per message. Oversized messages fall back to a heap vec.
+        let mut scratch = vec![0u8; 4096];
         for msg in messages {
-            let value = postcard::to_allocvec(msg).map_err(|e| HeedError::Serde(e.to_string()))?;
+            // Scratch reused across the batch; the oversized fallback owns its
+            // vec for exactly one iteration (declared uninit, assigned only on
+            // the overflow path, so the hot path pays no extra alloc).
+            let fallback: Option<Vec<u8>>;
+            let encoded: &[u8] = match postcard::to_slice(msg, &mut scratch) {
+                Ok(used) => used,
+                Err(_) => {
+                    fallback = Some(
+                        postcard::to_allocvec(msg).map_err(|e| HeedError::Serde(e.to_string()))?,
+                    );
+                    fallback.as_deref().unwrap_or(&[])
+                }
+            };
 
-            if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, &value) {
+            if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, &encoded) {
                 return Err(match e {
                     heed::Error::Mdb(heed::MdbError::MapFull) => HeedError::MapFull,
                     other => HeedError::Db(other.to_string()),

@@ -3,7 +3,18 @@ use futures_util::StreamExt;
 use semver::Version;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+/// Shared HTTP client for update checks/downloads: one connection pool per
+/// process instead of one `Client::new()` per check.
+static UPDATE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    crate::ensure_tls_provider();
+    reqwest::Client::new()
+});
 
+/// Clone the shared update HTTP client (`Client::clone` is an `Arc` bump).
+#[must_use]
+pub fn update_client() -> reqwest::Client {
+    UPDATE_CLIENT.clone()
+}
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("Unsupported platform: {0} {1}")]
@@ -94,9 +105,7 @@ pub async fn get_latest_version(core_type: CoreType) -> Option<String> {
     };
 
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-
-    crate::ensure_tls_provider();
-    let client = reqwest::Client::new();
+    let client = update_client();
     let resp = client
         .get(&url)
         .header("User-Agent", "xray-tui")

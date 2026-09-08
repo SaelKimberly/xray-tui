@@ -21,14 +21,29 @@ pub trait DnsSink: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RouteError>> + Send + 'a>>;
 }
 
-/// TTL-keyed DNS resolution cache.
+/// TTL-keyed DNS resolution cache, bounded by LRU eviction.
 ///
 /// Expiry is by [`jiff::Timestamp`] comparison: an entry is fresh while
 /// `now < stored + ttl`, stale from `now >= stored + ttl` (inclusive).
-#[derive(Debug, Default)]
+/// Capacity is [`RESOLVED_CACHE_CAP`]: distinct-host growth (e.g. subscription
+/// churn) evicts cold entries instead of growing without bound.
+const RESOLVED_CACHE_CAP: usize = 2048;
+
+#[derive(Debug)]
 pub struct ResolvedCache {
-    entries: HashMap<String, (Vec<IpAddr>, jiff::Timestamp)>,
+    entries: lru::LruCache<String, (Vec<IpAddr>, jiff::Timestamp)>,
     ttl_secs: i64,
+}
+
+impl Default for ResolvedCache {
+    fn default() -> Self {
+        Self {
+            entries: lru::LruCache::new(
+                std::num::NonZeroUsize::new(RESOLVED_CACHE_CAP).expect("cache cap is nonzero"),
+            ),
+            ttl_secs: 300,
+        }
+    }
 }
 
 impl ResolvedCache {
@@ -36,15 +51,19 @@ impl ResolvedCache {
     #[must_use]
     pub fn new(ttl_secs: i64) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: lru::LruCache::new(
+                std::num::NonZeroUsize::new(RESOLVED_CACHE_CAP).expect("cache cap is nonzero"),
+            ),
             ttl_secs,
         }
     }
 
     /// Returns the cached addresses for `host` when `now` is before expiry.
+    /// `peek` (no recency bump): a freshness check must not keep entries
+    /// alive past their TTL intent.
     #[must_use]
     pub fn get_fresh(&self, host: &str, now: jiff::Timestamp) -> Option<&[IpAddr]> {
-        let (ips, stored) = self.entries.get(host)?;
+        let (ips, stored) = self.entries.peek(host)?;
         if now >= *stored + jiff::Span::new().seconds(self.ttl_secs) {
             None
         } else {
@@ -52,20 +71,16 @@ impl ResolvedCache {
         }
     }
 
-    /// Stores `ips` for `host`, stamped at `now`. The owned `host` key is
-    /// moved through the entry API — no key clone, no re-hash; an existing
-    /// entry is re-stamped in place.
+    /// Stores `ips` for `host`, stamped at `now`. The owned `host` key moves
+    /// into the cache — no key clone; an existing entry is re-stamped in
+    /// place (`get_mut` also refreshes recency); overflow evicts the
+    /// least-recently-used entry.
     pub fn put(&mut self, host: String, ips: Vec<IpAddr>, now: jiff::Timestamp) {
-        use std::collections::hash_map::Entry;
-        match self.entries.entry(host) {
-            Entry::Occupied(mut e) => {
-                let (slot, stored) = e.get_mut();
-                *slot = ips;
-                *stored = now;
-            }
-            Entry::Vacant(e) => {
-                e.insert((ips, now));
-            }
+        if let Some((slot, stored)) = self.entries.get_mut(host.as_str()) {
+            *slot = ips;
+            *stored = now;
+        } else {
+            self.entries.push(host, (ips, now));
         }
     }
 }
@@ -105,13 +120,26 @@ impl ProbeTracker {
             return;
         }
         if failed {
-            // One allocation per failure: the streak-key `Arc`, whose
-            // refcount the emitted Breakdown event shares via `key()`.
-            let entry = self.streaks.entry(Arc::from(probe));
-            let event_key = entry.key().clone();
-            let count = entry.or_insert(0);
-            *count += 1;
-            if *count == 1 {
+            // Borrow-first: repeat failures for a tracked probe cost no
+            // alloc; only a genuinely new streak allocates its key `Arc`
+            // (whose refcount the Breakdown event then shares — no realloc).
+            if let Some(count) = self.streaks.get_mut(probe) {
+                *count += 1;
+                if *count == 1 {
+                    if let Some((event_key, _)) = self.streaks.get_key_value(probe) {
+                        let event_key = event_key.clone();
+                        emit(
+                            tx.as_ref(),
+                            RouteEvent::NetworkBreakdown {
+                                failed_probe: event_key,
+                                at: jiff::Timestamp::now(),
+                            },
+                        );
+                    }
+                }
+            } else {
+                let event_key: Arc<str> = Arc::from(probe);
+                self.streaks.insert(event_key.clone(), 1);
                 emit(
                     tx.as_ref(),
                     RouteEvent::NetworkBreakdown {

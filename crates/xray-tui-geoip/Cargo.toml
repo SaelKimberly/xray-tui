@@ -22,6 +22,11 @@ anyhow.workspace = true
 
 # ============ Logging ============
 tracing.workspace = true
+
+# ============ Bounded caches ============
+# Memory-diet Task 6 (B-slice gate): per-IP location micro-cache LRU bound.
+# `lru 0.18` matches the workspace pick and is already in Cargo.lock.
+lru = "0.18"
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]

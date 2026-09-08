@@ -25,6 +25,11 @@ ring.workspace = true
 # ============ Time / Duration Parsing ============
 jiff.workspace = true
 
+# ============ Bounded caches ============
+# Memory-diet Task 6 (B-slice gate): `ResolvedCache` LRU bound. `lru 0.18`
+# matches the workspace pick (xray-tui) and is already in Cargo.lock.
+lru = "0.18"
+
 # ============ Payload Buffers ============
 # Task 2 relay convention: the datapath carries payload bytes as `Bytes`
 # (zero-copy slices); `ConnMeta.payload_prefix` shares that buffer instead

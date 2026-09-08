@@ -18,6 +18,12 @@ use crate::ops::scheduler::{ScheduleOutcome, SchedulerDb, TaskScheduler};
 use crate::state::{link_is_failed, load_protocol_with_config};
 use crate::try_send_or_warn;
 use crate::types::CoreEvent;
+/// Bound on concurrent single-test tasks (menu-triggered pings): the spawned
+/// future parks on this permit before doing work, so rapid keypresses queue
+/// as tiny futures instead of spawning unbounded concurrent cores. Batch
+/// paths already gate through their own semaphore/JoinSet.
+static SINGLE_TEST_SEMAPHORE: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(16));
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
@@ -91,6 +97,9 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
     let timeout_dur = *state.config.speed_test.tcp_timeout_secs;
 
     tokio::spawn(async move {
+        let Ok(_permit) = SINGLE_TEST_SEMAPHORE.acquire().await else {
+            return;
+        };
         let fmgr = xray_tui_core::FastPingManager::new(timeout_dur);
         let result = fmgr.ping(config_type, &addr, port).await;
         let (latency_ms, error) = match result {
@@ -189,6 +198,9 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     let retries = state.config.speed_test.real_ping_retries;
 
     tokio::spawn(async move {
+        let Ok(_permit) = SINGLE_TEST_SEMAPHORE.acquire().await else {
+            return;
+        };
         let _ = tx.try_send(CoreEvent::TestTypeUpdate {
             endpoint_id,
             protocol_id,
@@ -292,6 +304,9 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
     let max_dur = std::time::Duration::from_secs(10);
 
     tokio::spawn(async move {
+        let Ok(_permit) = SINGLE_TEST_SEMAPHORE.acquire().await else {
+            return;
+        };
         let result = xray_tui_core::speed_test::speed_test(
             &proxy_addr,
             proxy_port,
@@ -346,6 +361,9 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
     let proxy_port = state.config.inbound.socks_port;
 
     tokio::spawn(async move {
+        let Ok(_permit) = SINGLE_TEST_SEMAPHORE.acquire().await else {
+            return;
+        };
         let result = xray_tui_core::speed_test::udp_test(
             &proxy_addr,
             proxy_port,

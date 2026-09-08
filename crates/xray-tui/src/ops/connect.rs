@@ -19,6 +19,14 @@ use crate::parse_core_log_line;
 use crate::types::CoreEvent;
 use crate::{ClashTraffic, try_send_or_warn};
 use futures_util::StreamExt;
+use std::sync::LazyLock;
+
+/// Shared reqwest client for the sing-box Clash API stream: one connection
+/// pool per process instead of one `Client::new()` per connection session.
+static CLASH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    xray_tui_core::ensure_tls_provider();
+    reqwest::Client::new()
+});
 
 /// Map one sing-box clash `/traffic` line to its `StatsUpdate` event.
 ///
@@ -553,11 +561,12 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             // === Sing-box Clash API /traffic streaming ===
             let clash_port = params.clash_api_port.unwrap_or(CLASH_API_PORT);
             let url = format!("http://127.0.0.1:{clash_port}/traffic");
-
-            match reqwest::Client::new().get(&url).send().await {
+            match CLASH_CLIENT.get(&url).send().await {
                 Ok(resp) => {
                     let mut stream = Box::pin(resp.bytes_stream());
-                    let mut buf = Vec::new();
+                    // `split_to` advances the start offset without memmove; a
+                    // traffic line is ~50 B/s, so retention is one partial line.
+                    let mut buf = bytes::BytesMut::new();
                     loop {
                         tokio::select! {
                             _ = &mut stop_rx => break,
@@ -566,8 +575,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                                     Some(Ok(bytes)) => {
                                         buf.extend_from_slice(&bytes);
                                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                                            let raw_line = buf.drain(..=pos).collect::<Vec<_>>();
-                                            let trimmed = raw_line.as_slice().trim_ascii();
+                                            let trimmed = buf[..=pos].trim_ascii();
                                             if let Ok(t) = serde_json::from_slice::<ClashTraffic>(trimmed) {
                                                 // Per-line deltas (sing-box
                                                 // emits each second's traffic
@@ -582,6 +590,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                                                     "clash_stats_update",
                                                 );
                                             }
+                                            let _ = buf.split_to(pos + 1);
                                         }
                                     }
                                     Some(Err(e)) => {
