@@ -115,6 +115,7 @@ fn log_row_from<'a>(
 /// Materialize row data only for `cache[offset..offset + visible]` — the old
 /// shape built one `LogRow` per filtered entry (up to 10k Strings per
 /// frame); the render pass now passes just the visible window.
+#[cfg(test)]
 fn build_rows_viewport(cache: &[crate::LogLine], offset: usize, visible: usize) -> Vec<LogRow<'_>> {
     let palette =
         crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
@@ -230,7 +231,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let visible = approx_visible.saturating_add(1);
     let no_filter = state.selected_targets.is_empty();
     let mut log_rows: Vec<LogRow> = Vec::with_capacity(visible);
-    let end = offset.saturating_add(visible);
     let mut rank = 0usize;
     for log in &state.log_cache {
         if !no_filter && !state.selected_targets.contains(&log.target) {
