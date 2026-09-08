@@ -66,11 +66,11 @@ pub fn encode_frame(payload: &[u8]) -> Bytes {
     let hunk_len = 1 + varint_len + payload.len();
     let mut hunk_header_stack = [0u8; 9];
     hunk_header_stack[0] = 0x0A; // field 1, wire type 2 (length-delimited)
-    hunk_header_stack[1..1 + varint_len].copy_from_slice(&varint[..varint_len]);
-    let mut out = bytes::BytesMut::with_capacity(5 + 2 + payload.len());
+    hunk_header_stack[1..=varint_len].copy_from_slice(&varint[..varint_len]);
+    let mut out = bytes::BytesMut::with_capacity(5 + hunk_len);
     out.extend_from_slice(&[0u8]);
     out.extend_from_slice(&u32::try_from(hunk_len).unwrap_or(u32::MAX).to_be_bytes());
-    out.extend_from_slice(&hunk_header_stack[..1 + varint_len]);
+    out.extend_from_slice(&hunk_header_stack[..=varint_len]);
     out.extend_from_slice(payload);
     out.freeze()
 }

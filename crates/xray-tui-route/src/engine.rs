@@ -461,7 +461,7 @@ pub async fn decide_async(engine: &Engine, meta: &mut ConnMeta) -> Decision {
                 // running on TCP binary handshakes (VMess, VLESS, etc.).
                 (result.protocol != sniff::SniffedProtocol::Quic
                     || meta.network == NetworkMask::UDP)
-                    .then(|| (result.protocol, result.host.map(|h| h.into_owned())))
+                    .then(|| (result.protocol, result.host.map(std::borrow::Cow::into_owned)))
             })
     } else {
         None

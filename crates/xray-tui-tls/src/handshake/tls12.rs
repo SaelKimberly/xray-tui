@@ -83,8 +83,8 @@ async fn read_server_flight<S: AsyncRead + Unpin>(
             consumed += total;
 
             match msg_type {
-                HS_CERTIFICATE => chain = Some(parse_cert_12(&body)?),
-                HS_SERVER_KEY_EXCHANGE => ske = Some(parse_ske(&body)?),
+                HS_CERTIFICATE => chain = Some(parse_cert_12(body)?),
+                HS_SERVER_KEY_EXCHANGE => ske = Some(parse_ske(body)?),
                 HS_CERTIFICATE_REQUEST => {
                     // Answering requires a client Certificate +
                     // CertificateVerify, which this engine does not have;
@@ -407,7 +407,7 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
                             "unexpected plaintext TLS 1.2 handshake message 0x{msg_type:02X} before the server ChangeCipherSpec"
                         )));
                     }
-                    transcript.extend_from_slice(&crate::handshake::make_hs_msg(msg_type, &body));
+                    transcript.extend_from_slice(&crate::handshake::make_hs_msg(msg_type, body));
                 }
             }
             CONTENT_HANDSHAKE => {

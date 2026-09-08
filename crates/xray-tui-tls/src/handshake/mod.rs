@@ -346,13 +346,12 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let ct_len = cf_hs_msg.len() + 1 + AEAD_TAG_LEN;
     let cf_aad = aead_aad(ct_len);
     let mut cf_record = Vec::with_capacity(5 + ct_len);
-    cf_record.extend_from_slice(&[
-        CONTENT_APPLICATION_DATA,
-        0x03,
-        0x03,
-        (ct_len >> 8) as u8,
-        ct_len as u8,
-    ]);
+    cf_record.extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
+    cf_record.extend_from_slice(
+        &u16::try_from(ct_len)
+            .map_err(|_| TlsError::Handshake("client Finished record too long".into()))?
+            .to_be_bytes(),
+    );
     cf_record.extend_from_slice(&cf_hs_msg);
     cf_record.push(CONTENT_HANDSHAKE);
     client_hs_key.seal_in_place(0, &cf_aad, &mut cf_record, 5)?;
@@ -503,7 +502,7 @@ where
                 "expected ServerHello (0x02), got 0x{msg_type:02X}"
             )));
         }
-        let parsed = parse_server_hello(&body, offered_session_id)?;
+        let parsed = parse_server_hello(body, offered_session_id)?;
         // TLS 1.2 may pack subsequent handshake messages after the
         // ServerHello in the same record; preserve those bytes for the
         // flight reader.
@@ -854,11 +853,11 @@ where
             consumed += total;
             match msg_type {
                 HS_ENCRYPTED_EXTENSIONS => {
-                    parse_encrypted_extensions(&body)?;
+                    parse_encrypted_extensions(body)?;
                     ee_raw = Some(raw);
                 }
                 HS_CERTIFICATE => {
-                    chain = Some(parse_certificate_message(&body, offered_compress)?);
+                    chain = Some(parse_certificate_message(body, offered_compress)?);
                     cert_raw = Some(raw);
                 }
                 HS_CERTIFICATE_VERIFY => {
@@ -1667,15 +1666,12 @@ mod tests {
     ) {
         let mut inner = chunk.to_vec();
         inner.push(CONTENT_HANDSHAKE);
+        let rec_len = u16::try_from(inner.len() + AEAD_TAG_LEN)
+            .expect("test flight chunk fits u16");
         let aad = aead_aad(inner.len() + AEAD_TAG_LEN);
         let mut record = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
-        record.extend_from_slice(&[
-            CONTENT_APPLICATION_DATA,
-            0x03,
-            0x03,
-            ((inner.len() + AEAD_TAG_LEN) >> 8) as u8,
-            (inner.len() + AEAD_TAG_LEN) as u8,
-        ]);
+        record.extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
+        record.extend_from_slice(&rec_len.to_be_bytes());
         record.extend_from_slice(&inner);
         key.seal_in_place(seq, &aad, &mut record, 5).unwrap();
         w.write_all(&record).await.unwrap();
@@ -1899,15 +1895,12 @@ mod tests {
 
             let mut inner = b"ping".to_vec();
             inner.push(CONTENT_APPLICATION_DATA);
+            let rec_len = u16::try_from(inner.len() + AEAD_TAG_LEN)
+                .expect("test echo record fits u16");
             let aad = aead_aad(inner.len() + AEAD_TAG_LEN);
             let mut record = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
-            record.extend_from_slice(&[
-                CONTENT_APPLICATION_DATA,
-                0x03,
-                0x03,
-                ((inner.len() + AEAD_TAG_LEN) >> 8) as u8,
-                (inner.len() + AEAD_TAG_LEN) as u8,
-            ]);
+            record.extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
+            record.extend_from_slice(&rec_len.to_be_bytes());
             record.extend_from_slice(&inner);
             server_app_key
                 .seal_in_place(0, &aad, &mut record, 5)

@@ -141,7 +141,7 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> i
 /// Write all of `bufs` out as vectored writes — no combined frame `Vec`.
 /// Shared by [`write_packet`] (prefix + payload) and the packetaddr sender
 /// (prefix + address header + payload).
-pub(crate) async fn write_all_vectored<W: AsyncWrite + Unpin>(
+pub async fn write_all_vectored<W: AsyncWrite + Unpin>(
     w: &mut W,
     bufs: &[&[u8]],
 ) -> io::Result<()> {

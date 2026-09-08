@@ -317,10 +317,7 @@ fn process_text_std(data: &[u8]) -> Vec<String> {
     let mut result = Vec::new();
     let mut start = 0;
     while start <= data.len() {
-        let end = match memchr::memchr(b'\n', &data[start..]) {
-            Some(rel) => start + rel,
-            None => data.len(),
-        };
+        let end = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |rel| start + rel);
         let line = String::from_utf8_lossy(&data[start..end]);
         let trimmed = line.trim();
         if !trimmed.is_empty() {

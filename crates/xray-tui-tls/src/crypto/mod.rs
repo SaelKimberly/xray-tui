@@ -342,7 +342,8 @@ impl KeySchedule {
             ));
         }
         info[..2].copy_from_slice(&len16.to_be_bytes());
-        info[2] = full_label.len() as u8;
+        info[2] = u8::try_from(full_label.len())
+            .map_err(|_| TlsError::Crypto("HKDF-Expand-Label label too long".into()))?;
         info[3..3 + full_label.len()].copy_from_slice(full_label);
         info[3 + full_label.len()] = ctx_len;
         info[4 + full_label.len()..info_len].copy_from_slice(ctx);
@@ -797,9 +798,9 @@ mod tests {
         assert_eq!(hex(&early[..32]), EARLY_SECRET);
 
         // Derive-Secret(early, "derived", "") with Hash("") as context.
-        let (empty, empty_len) = empty_hash(suite);
+        let (empty_early, empty_early_len) = empty_hash(suite);
         let derived = ks
-            .hkdf_expand_label_stack(&early[..32], "derived", &empty[..empty_len], 32)
+            .hkdf_expand_label_stack(&early[..32], "derived", &empty_early[..empty_early_len], 32)
             .unwrap();
         assert_eq!(hex(&derived[..32]), DERIVED_FROM_EARLY);
 
@@ -811,17 +812,17 @@ mod tests {
         // Transcript CH..SH feeds the handshake traffic secrets.
         ks.add_transcript(&decode_hex(CLIENT_HELLO));
         ks.add_transcript(&decode_hex(SERVER_HELLO));
-        let (th, thn) = ks.transcript_hash();
-        assert_eq!(hex(&th[..thn]), TRANSCRIPT_CH_SH);
+        let (th_ch_sh, th_ch_sh_len) = ks.transcript_hash();
+        assert_eq!(hex(&th_ch_sh[..th_ch_sh_len]), TRANSCRIPT_CH_SH);
 
         let (c_hs, s_hs) = ks.handshake_traffic_secrets(&hs[..32]).unwrap();
         assert_eq!(hex(&c_hs[..32]), CLIENT_HS_TRAFFIC);
         assert_eq!(hex(&s_hs[..32]), SERVER_HS_TRAFFIC);
 
         // The intermediate "derived" expansion the master step consumes.
-        let (empty2, empty2_len) = empty_hash(suite);
+        let (empty_hs, empty_hs_len) = empty_hash(suite);
         let derived_hs = ks
-            .hkdf_expand_label_stack(&hs[..32], "derived", &empty2[..empty2_len], 32)
+            .hkdf_expand_label_stack(&hs[..32], "derived", &empty_hs[..empty_hs_len], 32)
             .unwrap();
         assert_eq!(hex(&derived_hs[..32]), DERIVED_FROM_HS);
 
@@ -834,8 +835,8 @@ mod tests {
         ks.add_transcript(&decode_hex(CERTIFICATE));
         ks.add_transcript(&decode_hex(CERTIFICATE_VERIFY));
         ks.add_transcript(&decode_hex(SERVER_FINISHED));
-        let (th2, th2n) = ks.transcript_hash();
-        assert_eq!(hex(&th2[..th2n]), TRANSCRIPT_CH_FINISHED);
+        let (th_ch_finished, th_ch_finished_len) = ks.transcript_hash();
+        assert_eq!(hex(&th_ch_finished[..th_ch_finished_len]), TRANSCRIPT_CH_FINISHED);
 
         let (c_ap, s_ap) = ks.app_traffic_secrets(&master[..32]).unwrap();
         assert_eq!(hex(&c_ap[..32]), CLIENT_AP_TRAFFIC);
@@ -846,9 +847,9 @@ mod tests {
             .hkdf_expand_label_stack(&s_ap[..32], "key", &[], 16)
             .unwrap();
         assert_eq!(hex(&s_ap_key[..16]), SERVER_AP_KEY);
-        let (th3, th3n) = ks.transcript_hash();
+        let (th_exp, th_exp_len) = ks.transcript_hash();
         let exp_master = ks
-            .hkdf_expand_label_stack(&master[..32], "exp master", &th3[..th3n], 32)
+            .hkdf_expand_label_stack(&master[..32], "exp master", &th_exp[..th_exp_len], 32)
             .unwrap();
         assert_eq!(hex(&exp_master[..32]), EXPORTER_MASTER);
 

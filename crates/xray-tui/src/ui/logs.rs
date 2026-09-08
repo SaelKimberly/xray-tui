@@ -584,10 +584,10 @@ pub fn handle_target_picker_key(state: &mut AppState, key: &KeyEvent) {
         }
         KeyCode::Enter => {
             // Toggle the selected target
-            if let Some(target) = state.known_targets.get(selected).cloned() {
-                if !state.selected_targets.remove(&target) {
-                    state.selected_targets.insert(target);
-                }
+            if let Some(target) = state.known_targets.get(selected).cloned()
+                && !state.selected_targets.remove(&target)
+            {
+                state.selected_targets.insert(target);
             }
         }
         KeyCode::Char('t' | 'T' | 'q' | 'Q') | KeyCode::Esc => {

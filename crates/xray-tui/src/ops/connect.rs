@@ -472,9 +472,11 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
                         .unwrap_or_default()
                         .as_nanos() as i64
                 });
-                // Write to log storage via non-blocking channel (batched async writer)
+                // Write to log storage via bounded channel: `try_send` never
+                // blocks the executor; on a full queue the line drops (counted
+                // on the layer) instead of parking this task per line.
                 if let Some(ref sender) = log_sender {
-                    let _ = sender.send(xray_tui_core::log_heed::LogMessage {
+                    let _ = sender.try_send(xray_tui_core::log_heed::LogMessage {
                         level: level.clone(),
                         target: target.clone(),
                         message: message.clone(),

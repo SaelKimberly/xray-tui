@@ -71,7 +71,7 @@ pub enum MlkemError {
 impl PublicKey {
     /// Create a [`PublicKey`] from raw bytes: copied once into the fixed
     /// array, no `Vec` allocation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
+    pub const fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
         if bytes.len() != 1184 {
             return Err(MlkemError::InvalidPublicKeyLength(bytes.len()));
         }
@@ -82,14 +82,14 @@ impl PublicKey {
 
     /// Get the raw bytes of the public key.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 impl SecretKey {
     /// Create a [`SecretKey`] from raw bytes: copied once into the fixed
     /// array, no `Vec` allocation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
+    pub const fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
         if bytes.len() != 2400 {
             return Err(MlkemError::InvalidSecretKeyLength(bytes.len()));
         }
@@ -100,14 +100,14 @@ impl SecretKey {
 
     /// Get the raw bytes of the secret key.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 impl Ciphertext {
     /// Create a [`Ciphertext`] from raw bytes: copied once into the fixed
     /// array, no `Vec` allocation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
+    pub const fn from_bytes(bytes: &[u8]) -> Result<Self, MlkemError> {
         if bytes.len() != 1088 {
             return Err(MlkemError::InvalidCiphertextLength(bytes.len()));
         }
@@ -118,7 +118,7 @@ impl Ciphertext {
 
     /// Get the raw bytes of the ciphertext.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }

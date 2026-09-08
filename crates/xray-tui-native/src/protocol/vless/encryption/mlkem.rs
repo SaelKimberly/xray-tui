@@ -139,8 +139,7 @@ impl WireAead {
             .expect("chacha20poly1305 seal cannot fail")
     }
 
-    /// Seal `plaintext` into `out` (`out.len() == plaintext.len() +
-    /// [`TAG_LEN`]).
+    /// Seal `plaintext` into `out` (`out.len() == plaintext.len() + TAG_LEN`).
     ///
     /// The allocation-free counterpart of [`Self::seal`]: handshake code
     /// sealing straight into the flight buffer skips the temp `Vec`.

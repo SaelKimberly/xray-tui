@@ -86,10 +86,12 @@ struct PanelRow {
     outbound_country: String,
 }
 
-/// A single-line endpoint row; the expanded sub-table is drawn inside the
-/// row's own height (`1 + panel_rows + 4`) by `render_expansion_panel`.
-/// `Clone` backs the display-row cache's hit path. `pub` because the cache
-/// (and thus this row type) lives on the crate-`pub` `AppState`.
+/// A single-line endpoint row.
+///
+/// The expanded sub-table is drawn inside the row's own height
+/// (`1 + panel_rows + 4`) by `render_expansion_panel`. `Clone` backs the
+/// display-row cache's hit path. `pub` because the cache (and thus this row
+/// type) lives on the crate-`pub` `AppState`.
 #[derive(Clone)]
 pub struct DisplayRowData {
     indicator: String,
@@ -732,7 +734,7 @@ fn build_display_rows(
     cache.selected_sub = state.selected_sub;
     cache.connected_protocol_id = state.connected_protocol_id;
     cache.multi_select = state.multi_select.iter().copied().collect();
-    cache.multi_select.sort();
+    cache.multi_select.sort_unstable();
     cache.expanded = rows.iter().map(|r| r.expanded).collect();
     cache.dirty = 0;
     cache.rows = result;

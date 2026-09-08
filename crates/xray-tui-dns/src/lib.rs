@@ -29,7 +29,7 @@ static DEFAULT_RESOLVER_OPTS: std::sync::LazyLock<ResolverOpts> = std::sync::Laz
 });
 
 /// Process-wide reqwest client, built once: per-call `Client::build` pays
-/// a full TLS-provider setup + connection pool on every DNSCrypt list
+/// a full TLS-provider setup + connection pool on every `DNSCrypt` list
 /// refresh. `rustls-no-provider` needs the ring provider installed before
 /// first build — done here, idempotently.
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {

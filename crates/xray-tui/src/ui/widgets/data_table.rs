@@ -461,7 +461,7 @@ impl<R: DataTableRow> StatefulWidget for DataTable<'_, R> {
                 }
             }
 
-            self.rows[row_idx].render(&col_xs, &col_widths, buf, y, bottom);
+            self.rows[row_idx].render(col_xs, col_widths, buf, y, bottom);
 
             y += rh;
             row_idx += 1;

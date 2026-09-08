@@ -155,6 +155,11 @@ impl QuicSniffer {
         // Completion is sticky: once the hello resolves, any further
         // datagram of the flow re-reads the stored answer by ref (the
         // caller is expected to stop at the first non-NeedMore outcome).
+        // `if let ... as_ref()` is what clippy suggests, but the scrutinee
+        // borrow lives across the later `self.done = ...` assignment (E0506);
+        // the `is_some` + `expect` shape keeps the borrow in the return
+        // expression only.
+        #[allow(clippy::unnecessary_unwrap)]
         if self.done.is_some() {
             return QuicSniffProgress::Done(self.done.as_ref().expect("checked above"));
         }
@@ -340,10 +345,8 @@ fn sni_from_hello_body(body: &[u8]) -> HelloSni<'_> {
             if host.is_empty() || host.contains(&0x00) || !host.iter().all(|&b| b.is_ascii()) {
                 return HelloSni::Malformed;
             }
-            return match std::str::from_utf8(host) {
-                Ok(s) => HelloSni::Host(Cow::Borrowed(s)),
-                Err(_) => HelloSni::Malformed,
-            };
+            return std::str::from_utf8(host)
+                .map_or(HelloSni::Malformed, |s| HelloSni::Host(Cow::Borrowed(s)));
         }
     }
     HelloSni::NoSni
@@ -568,11 +571,11 @@ fn decrypt_initial_packet<'a>(
     }
     let aead = ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key_bytes).map_err(|_| ())?;
     let aead = ring::aead::LessSafeKey::new(aead);
-    let (aad, payload) = pkt.split_at_mut(ext_hdr_len);
+    let (header, payload) = pkt.split_at_mut(ext_hdr_len);
     let plain = aead
         .open_in_place(
             ring::aead::Nonce::assume_unique_for_key(nonce),
-            ring::aead::Aad::from(&aad[..]),
+            ring::aead::Aad::from(&header[..]),
             payload,
         )
         .map_err(|_| ())?;
@@ -758,7 +761,7 @@ fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], out: &mut [u8]
     let info = &info[..ctx_off + 1 + context.len()];
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
     let mut ctx = ring::hmac::Context::with_key(&key);
-    ctx.update(&info);
+    ctx.update(info);
     ctx.update(&[1]);
     let tag = ctx.sign();
     out.copy_from_slice(&tag.as_ref()[..out.len()]);

@@ -206,7 +206,7 @@ impl HeedLogStorage {
                 }
             };
 
-            if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, &encoded) {
+            if let Err(e) = self.logs.put(&mut wtxn, &msg.timestamp_nanos, encoded) {
                 return Err(match e {
                     heed::Error::Mdb(heed::MdbError::MapFull) => HeedError::MapFull,
                     other => HeedError::Db(other.to_string()),

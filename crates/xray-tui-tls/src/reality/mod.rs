@@ -894,8 +894,9 @@ mod tests {
             sk.add_transcript(&sf_wire);
             let ct_len = flight_rec.len() - 5 + AEAD_TAG_LEN;
             let flight_aad = aead_aad(ct_len);
-            flight_rec[3] = (ct_len >> 8) as u8;
-            flight_rec[4] = ct_len as u8;
+            let ct_len_u16 =
+                u16::try_from(ct_len).expect("test flight record fits u16");
+            flight_rec[3..5].copy_from_slice(&ct_len_u16.to_be_bytes());
             server_hs_key
                 .seal_in_place(0, &flight_aad, &mut flight_rec, 5)
                 .unwrap();
@@ -929,8 +930,9 @@ mod tests {
             echo_rec.extend_from_slice(&[0x17, 0x03, 0x03, 0, 0]);
             echo_rec.extend_from_slice(&inner);
             let echo_len = inner.len() + AEAD_TAG_LEN;
-            echo_rec[3] = (echo_len >> 8) as u8;
-            echo_rec[4] = echo_len as u8;
+            let echo_len_u16 =
+                u16::try_from(echo_len).expect("test echo record fits u16");
+            echo_rec[3..5].copy_from_slice(&echo_len_u16.to_be_bytes());
             server_app_key
                 .seal_in_place(0, &echo_aad, &mut echo_rec, 5)
                 .unwrap();

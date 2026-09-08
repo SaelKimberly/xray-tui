@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 const GEOLITE_DOWNLOAD: &str =
     "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb";
 
-/// Fetches the GeoLite database, streaming the body to `dest` on disk — the
+/// Fetches the `GeoLite` database, streaming the body to `dest` on disk — the
 /// ~70 MB payload is never buffered in memory, let alone copied.
 type FetchResult = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 type Fetcher = dyn Fn(&Path) -> FetchResult + Send + Sync;
@@ -63,13 +63,16 @@ impl GeoIp {
 
     pub async fn location_by_ip(&self, ip: IpAddr) -> anyhow::Result<Option<Location>> {
         // Cache-first: the common repeat lookup never touches the reader.
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&ip)
-            .cloned()
-        {
+        // (Lock scoped to this block: the guard must drop before the awaits
+        // below, and a guard in an `if let` scrutinee trips clippy.)
+        let hit = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get(&ip).cloned()
+        };
+        if let Some(hit) = hit {
             return Ok(hit.map(|loc| Location {
                 // Refcount bumps — no re-decode, no string copies.
                 country: loc.country.clone(),
@@ -195,7 +198,7 @@ fn ensure_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Streams the GeoLite database to `dest`: each body chunk is written as it
+/// Streams the `GeoLite` database to `dest`: each body chunk is written as it
 /// arrives (bounded memory), then fsync'd before the caller's atomic rename.
 async fn fetch_geolite_to(dest: &Path) -> anyhow::Result<()> {
     ensure_tls_provider();
