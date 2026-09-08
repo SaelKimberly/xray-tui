@@ -268,12 +268,15 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
 
 /// Build a typed `Protocol` row from a parse result: id = `uid()`, with the
 /// `config`/`transport.data`/`security.data` deferred JSON loaded so it is
-/// ready for `Database::upsert_protocol`.
+/// ready for `Database::upsert_protocol`. Identity comes from ONE canonical
+/// serialization (`identity_once`); the three separate `sig()`/`cred_hash()`/
+/// `uid()` calls would serialize 3×.
 pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
+    let (sig, cred_hash, uid) = parsed.identity_once();
     Protocol {
-        id: ProtocolId::new(parsed.uid()),
-        sig: parsed.sig(),
-        cred_hash: parsed.cred_hash(),
+        id: ProtocolId::new(uid),
+        sig,
+        cred_hash,
         proto_kind: parsed.protocol.proto_kind,
         transport: transport_embed(&parsed.protocol.config),
         security: security_embed(&parsed.protocol.config),
@@ -318,27 +321,6 @@ fn link_from_parsed_with_id(
         endpoint: Deferred::default(),
     }
 }
-/// Convert a typed parse result into db rows: one `(Endpoint, Protocol,
-/// ProfileStats)` triple per parsed endpoint. Encrypted configs that carry no
-/// endpoint produce an empty vec (nothing to store).
-///
-/// The `Protocol` row (including its uid/sig/`cred_hash` canonical pass) is
-/// built ONCE per `ParsedProto` and cloned per row — the per-endpoint
-/// `protocol_from_parsed` rehash is gone, and the shared row's deferred JSON
-/// payloads are `Clone`-shared handles, not re-serializations.
-pub fn parsed_to_rows(parsed: &ParsedProto) -> Vec<(Endpoint, Protocol, ProfileStats)> {
-    let protocol = protocol_from_parsed(parsed);
-    let protocol_id = protocol.id;
-    parsed
-        .endpoints
-        .iter()
-        .map(|ep| {
-            let endpoint = endpoint_from_essentials(ep);
-            let link = link_from_parsed_with_id(parsed, protocol_id, endpoint.id);
-            (endpoint, protocol.clone(), link)
-        })
-        .collect()
-}
 /// Persist a parsed protocol as typed rows: one endpoint per parsed endpoint,
 /// one shared protocol row, one per-pair link, plus the endpoint-group link
 /// when `group_id` is `Some`. Returns the number of endpoints persisted.
@@ -358,19 +340,28 @@ pub async fn persist_parsed(
     group_id: Option<&str>,
     core_override: Option<xray_tui_proto::proto_spec::CoreType>,
 ) -> Result<usize, xray_tui_db::DatabaseError> {
-    let rows = parsed_to_rows(parsed);
+    // Stream rows instead of materializing `parsed_to_rows`: the shared
+    // `Protocol` row upserts ONCE (not once per endpoint), and endpoints /
+    // links build inline per endpoint. Orphan protocols (zero endpoints)
+    // persist nothing — same as the old collect-then-loop shape.
+    if parsed.endpoints.is_empty() {
+        return Ok(0);
+    }
+    let protocol = protocol_from_parsed(parsed);
+    db.upsert_protocol(&protocol).await?;
     let mut count = 0usize;
-    for (endpoint, protocol, mut link) in rows {
+    for ep in &parsed.endpoints {
+        let endpoint = endpoint_from_essentials(ep);
+        let mut link = link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
         if let Some(core) = core_override {
             link.core_type = core;
         }
         db.upsert_endpoint(&endpoint).await?;
-        db.upsert_protocol(&protocol).await?;
         db.upsert_link(&link).await?;
         if let Some(gid) = group_id {
             db.upsert_endpoint_group_link(&EndpointGroup {
                 endpoint_id: endpoint.id,
-                group_id: gid.to_string(),
+                group_id: gid.to_owned(),
                 last_seen_at: link.last_seen_at,
                 sort_order: None,
                 endpoint: Deferred::default(),

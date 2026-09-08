@@ -110,20 +110,6 @@ fn hash_bytes_cred(bytes: &[u8]) -> i64 {
     i64::from_le_bytes(hash.to_le_bytes())
 }
 
-/// Parse-boundary canonical triple, serialized exactly once.
-///
-/// One `serde_json::to_value` + one `serde_json::to_vec`, then two
-/// rapidhash-family passes (sig + credential `k=v;` chain) over the SAME
-/// `&[u8]` — byte-identical to the old triple pass
-/// (`to_value→to_vec` for sig, `to_value→to_string` for cred), so uids
-/// computed through here re-key nothing and duplicate no rows.
-#[must_use]
-pub fn canonical_once(cfg: &ProtocolConfig) -> (i64, i64, Vec<u8>) {
-    let value = serde_json::to_value(cfg).expect("ProtocolConfig is serializable by construction");
-    let bytes = serde_json::to_vec(&value).expect("canonical protocol Value is serializable");
-    (hash_bytes_sig(&bytes), hash_bytes_cred(&bytes), bytes)
-}
-
 impl ParsedProto {
     /// Canonical bytes of [`ProtocolEssentials`], serialized exactly once:
     /// converted through `serde_json::Value` so HashMap-backed fields (e.g.
@@ -166,10 +152,23 @@ impl ParsedProto {
     /// not probabilistic.
     #[must_use]
     pub fn uid(&self) -> i64 {
+        let (_, _, uid) = self.identity_once();
+        uid
+    }
+
+    /// `sig`, `cred_hash` and `uid` from a SINGLE canonical serialization.
+    ///
+    /// `sig()`, `cred_hash()` and `uid()` each serialize independently; call
+    /// sites needing two or more (notably `protocol_from_parsed`, which needs
+    /// all three) must use this to avoid 3× serialize+hash. Byte-identical to
+    /// the three separate calls — the golden test pins it.
+    #[must_use]
+    pub fn identity_once(&self) -> (i64, i64, i64) {
         let (sig, cred, _) = self.canonical_triple();
         let uid = sig ^ cred;
-        if uid == 0 { 1 } else { uid }
+        (sig, cred, if uid == 0 { 1 } else { uid })
     }
+
     /// The first endpoint, if any.
     #[must_use]
     pub fn first_endpoint(&self) -> Option<&EndpointEssentials> {
@@ -403,35 +402,18 @@ mod tests {
         assert_eq!(back, p);
     }
     #[test]
-    fn canonical_once_matches_triple_chain() {
-        let cfg = sample_vless_config();
-        let (sig_a, cred_a) = (sig_triple(&cfg), cred_triple(&cfg));
-        let (sig_b, cred_b, _bytes) = canonical_once(&cfg);
-        assert_eq!((sig_a, cred_a), (sig_b, cred_b));
-    }
-
-    fn sample_vless_config() -> ProtocolConfig {
-        config_from(VLESS_WS_URL)
-    }
-
-    fn sig_triple(cfg: &ProtocolConfig) -> i64 {
-        let value = serde_json::to_value(cfg).expect("ProtocolConfig is serializable");
-        let bytes = serde_json::to_vec(&value).expect("canonical Value is serializable");
-        let mut hasher =
-            rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(&bytes);
-        let sig = hasher.finish();
-        if sig == 0 {
-            1
-        } else {
-            i64::from_le_bytes(sig.to_le_bytes())
-        }
-    }
-
-    fn cred_triple(cfg: &ProtocolConfig) -> i64 {
-        let value = serde_json::to_value(cfg).expect("ProtocolConfig is serializable");
-        let json = serde_json::to_string(&value).expect("canonical Value is serializable");
-        let hash = utils::compute_cred_hash(&[("protocol", &json)]);
-        i64::from_le_bytes(hash.to_le_bytes())
+    fn identity_once_matches_separate_calls() {
+        // Byte-identity gate for the production identity path: one
+        // serialization must equal three separate `sig()`/`cred_hash()`/
+        // `uid()` calls, or stored uids re-key and rows duplicate.
+        let parsed = ParsedProto {
+            endpoints: vec![],
+            protocol: proto(ProtocolKind::Vless, config_from(VLESS_WS_URL)),
+        };
+        let (sig, cred, uid) = parsed.identity_once();
+        assert_eq!(
+            (sig, cred, uid),
+            (parsed.sig(), parsed.cred_hash(), parsed.uid())
+        );
     }
 }

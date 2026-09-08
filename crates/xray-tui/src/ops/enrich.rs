@@ -596,9 +596,7 @@ mod tests {
             &xray_tui_config::import_export::ValidationSettings::default(),
         )
         .expect("parse vless url");
-        let (_, protocol, _) = crate::state::parsed_to_rows(&parsed.parsed)
-            .pop()
-            .expect("typed rows");
+        let protocol = crate::state::protocol_from_parsed(&parsed.parsed);
         assert_eq!(extract_sni(&protocol).as_deref(), Some("chat.example.com"));
     }
 }
