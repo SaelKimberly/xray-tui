@@ -18,6 +18,86 @@ apply `[env]` from `.cargo/config.toml`, so without it the throughput rows print
 - Benches: `just bench` (`micro` = record + decide + dispatch + relay, no core
   binaries; `all` adds the throughput matrix)
 
+## 2026-09-08 (v3) — memory-diet plan land
+
+Same machine, same cores (xray 26.3.27, sing-box 1.13.16), `just bench all`
+at `XRAY_TUI_BENCH_MB=4`. Covers the full plan branch (Tasks 1–6 + fix waves +
+state.rs wave: native `Bytes` relay, TLS stack/in-place, route borrows,
+canonical-once import, TUI virtualization + runtime bounds).
+
+Δ is criterion's own time delta against its stored history (which includes the
+per-task intermediate runs, so Δ measures the final waves, not v1/v2). Verdict:
+**no significant change on any row** — every row `NoChange`/`NotSignificant`.
+Absolute medians drift a few % run to run (17-minute back-to-back suite on a
+warm box); nothing exceeds the noise the suite itself reports.
+
+### End-to-end tunnel matrix (`throughput`)
+
+| bench | send | Δ send | recv | Δ recv |
+|---|---|---|---|---|
+| vless/tcp/plain | 4.3596 GiB/s | +3.72% | 3.5438 GiB/s | +12.27% |
+| vless/tcp/tls-chrome | 1.3647 GiB/s | +1.41% | 1.3198 GiB/s | +1.60% |
+| vless/tcp/reality | 1.3600 GiB/s | +2.34% | 1.3268 GiB/s | +2.12% |
+| vless/vision+reality | 1.3674 GiB/s | +0.53% | 1.3353 GiB/s | +1.35% |
+| vless/ws/plain | 1.3888 GiB/s | +1.70% | 1.6550 GiB/s | +2.41% |
+| vless/grpc/tls-chrome | 1007.3 MiB/s | +7.12% | 773.8 MiB/s | −2.44% |
+| vmess/tcp/aes | 1.5765 GiB/s | +0.02% | 1.1120 GiB/s | +2.18% |
+| vmess/ws/chacha | 918.0 MiB/s | +0.97% | 639.7 MiB/s | +22.21% |
+| trojan/tcp/tls-chrome | 2.6857 GiB/s | −0.33% | 1.5455 GiB/s | +0.05% |
+| hysteria2/tcp | 657.6 MiB/s | −0.33% | 816.1 MiB/s | +2.33% |
+
+Δ positive = slower (time delta), but all rows not significant — including the
+two eye-catching ones (vless plain recv +12.27 %, vmess ws recv +22.21 %),
+which are the suite's known high-variance rows (the hysteria/vmess-ws rows
+warn about sample counts every run).
+
+### TLS record layer (`record`, `xray-tui-tls`)
+
+| row | median | Δ |
+|---|---|---|
+| tls_record/aes128gcm/seal | 650.07 µs (6.01 GiB/s) | +0.26% |
+| tls_record/aes128gcm/open | 737.69 µs (5.30 GiB/s) | −4.08% |
+| tls_record/chacha20/seal | 1.8282 ms (2.14 GiB/s) | −2.45% |
+| tls_record/chacha20/open | 1.9038 ms (2.05 GiB/s) | −3.77% |
+
+### Routing engine (`decide`, `xray-tui-route`)
+
+| row | median | Δ |
+|---|---|---|
+| decide/rules_0/domain_hit | 16.865 ns | +6.22% |
+| decide/rules_0/ip_hit | 17.105 ns | +7.76% |
+| decide/rules_0/miss | 17.239 ns | +9.90% |
+| decide/rules_8/domain_hit | 156.06 ns | −4.77% |
+| decide/rules_8/ip_hit | 59.742 ns | −4.08% |
+| decide/rules_8/miss | 184.41 ns | −5.57% |
+| decide/rules_64/domain_hit | 1.0666 µs | +0.23% |
+| decide/rules_64/ip_hit | 372.67 ns | −3.75% |
+| decide/rules_64/miss | 1.0767 µs | −1.49% |
+
+The rules_0 rows read ~17 ns absolute (vs 19.6 ns in v2) — the T4 borrow work
+already in history; Δ is vs the recent post-T4 runs, not v2.
+
+### Dispatch cost (`dispatch`) — measurement only, still no change made
+
+| row | median | Δ |
+|---|---|---|
+| dispatch/static (4 monomorphized layers) | 324.89 µs (12.02 GiB/s) | −3.65% |
+| dispatch/boxed (4 `Box<dyn Stream>` layers) | 334.49 µs (11.68 GiB/s) | −2.78% |
+
+`boxed / static = 1.03`, same as v2's 1.02 within noise.
+
+### SOCKS5 inbound relay (`relay`, in-process, no core binary)
+
+| row | median | Δ |
+|---|---|---|
+| relay/socks5-direct/send | 1.1550 ms (3.38 GiB/s) | −14.80% |
+| relay/socks5-direct/recv | 1.4101 ms (2.77 GiB/s) | −19.97% |
+| relay/socks5-udp/pps | 17.243 ms/1000 (58.0 Kpps) | −6.90% |
+
+Large-looking Δs but `NoChange` — this bench has wide confidence intervals, so
+criterion refuses significance either way. Absolute medians within a few % of
+v2.
+
 ## 2026-09-04 (v2) — native/tls/route performance pass
 
 Same machine and settings as v1. Every row re-measured after the pass; the
