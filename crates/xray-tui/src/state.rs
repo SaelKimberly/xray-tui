@@ -164,6 +164,13 @@ pub struct AppState {
     pub outbound_country_cache: Arc<parking_lot::Mutex<lru::LruCache<String, Option<String>>>>,
     /// TTL (secs) for the DNS-resolution cache; default 300.
     pub dns_cache_ttl_secs: i64,
+    /// Profiles display-row cache (part-2 runtime bounds): rebuilt when a row
+    /// input changed — structural `endpoints_gen`, selection/connection (in
+    /// the key), or the dirty bits set by the async mutation sites
+    /// (traffic/test/country). `RefCell` because `render` rebuilds under
+    /// `&self`; the UI loop is single-threaded and only this cache sits
+    /// behind the cell.
+    pub display_rows_cache: RefCell<crate::ui::profiles::DisplayRowsCache>,
 }
 
 impl AppState {
@@ -175,6 +182,15 @@ impl AppState {
             .get(ip)
             .cloned()
             .flatten()
+    }
+
+    /// Mark the profiles display-row cache stale for `bits` (`ROWS_DIRTY_*`).
+    /// Called by the async mutation sites (`ops::events` handlers, the ping
+    /// entry points) so `build_display_rows` rebuilds without re-deriving
+    /// every row input. Sticky: cleared only by a successful rebuild.
+    pub fn mark_rows_dirty(&mut self, bits: u8) {
+        let mut cache = self.display_rows_cache.borrow_mut();
+        cache.dirty |= bits;
     }
 }
 
@@ -481,6 +497,9 @@ impl AppState {
                 std::num::NonZeroUsize::new(512).expect("512 is nonzero"),
             ))),
             dns_cache_ttl_secs: 300,
+            display_rows_cache: RefCell::new(
+                crate::ui::profiles::DisplayRowsCache::default()
+            ),
         };
         // Cheap constructors — no I/O until first lookup.
         let config_dir = dirs::config_dir()

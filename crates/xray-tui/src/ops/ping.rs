@@ -81,12 +81,13 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
         return;
     };
 
+    // The fast-ping adapters dispatch on the protocol kind.
+    let config_type = proto.proto_kind.to_i32();
     state
         .testing_details
         .insert((endpoint_id, protocol_id), TestType::TcpPing);
     state.testing_profiles.insert((endpoint_id, protocol_id));
-    // The fast-ping adapters dispatch on the protocol kind.
-    let config_type = proto.proto_kind.to_i32();
+    state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
     let timeout_dur = *state.config.speed_test.tcp_timeout_secs;
 
     tokio::spawn(async move {
@@ -176,6 +177,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         .testing_details
         .insert((endpoint_id, protocol_id), TestType::RealPing);
     state.testing_profiles.insert((endpoint_id, protocol_id));
+    state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
 
     // Lazily create the core pool on first use
     let pool = get_or_create_pool(state);
@@ -282,6 +284,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
         .testing_details
         .insert((endpoint_id, protocol_id), TestType::SpeedTest);
     state.testing_profiles.insert((endpoint_id, protocol_id));
+    state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
     let proxy_addr = state.config.inbound.listen.clone();
     let proxy_port = state.config.inbound.socks_port;
     let test_url = "http://cachefly.cachefly.net/1mb.test".to_string();
@@ -338,6 +341,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
         .testing_details
         .insert((endpoint_id, protocol_id), TestType::UdpTest);
     state.testing_profiles.insert((endpoint_id, protocol_id));
+    state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
     let proxy_addr = state.config.inbound.listen.clone();
     let proxy_port = state.config.inbound.socks_port;
 

@@ -15,7 +15,63 @@ use crate::ui::widgets::data_table::{
 };
 use crate::{AppState, ConfirmAction, EndpointRow, format_relative_ts, format_ts, iso_to_flag};
 
+// ── Display-row cache (part-2 runtime bounds) ────────────────────────────
+//
+// `build_display_rows` rebuilds a `Vec<DisplayRowData>` for the visible
+// endpoint list every frame. Most frames' inputs are unchanged, so the rows
+// are cached behind a fingerprint: structural `endpoints_gen`, the selection
+// (`selected`/`selected_sub`), the connected protocol, the multi-select
+// membership, each row's `expanded` flag — all cheap to compare — plus a
+// dirty bitmask for the async inputs that mutate WITHOUT touching any of
+// those. The bits are set by the mutation sites (`ops::events` handlers, the
+// ping entry points); `build_display_rows` clears them on rebuild.
+
+/// Rebuild because link traffic changed (a `StatsUpdate` delta landed).
+pub(crate) const ROWS_DIRTY_TRAFFIC: u8 = 1 << 0;
+/// Rebuild because test state changed (a `SpeedTestResult`/`TestTypeUpdate`
+/// landed, or a single-ping entry point seeded `testing_details`).
+pub(crate) const ROWS_DIRTY_TEST: u8 = 1 << 1;
+/// Rebuild because enrichment changed (an `EndpointInfoUpdated` merge landed:
+/// resolved IPs, country, outbound fields).
+pub(crate) const ROWS_DIRTY_COUNTRY: u8 = 1 << 2;
+
+/// One entry of the profiles display-row cache.
+///
+/// `Default` forces the first build: `gen` starts at `u64::MAX` so no real
+/// `endpoints_gen` matches, and `rows` starts empty. The `expanded` vector is
+/// per filtered row, compared membership-wise against the row list so a
+/// single toggle invalidates without a per-row key.
+pub struct DisplayRowsCache {
+    pub gen_id: u64,
+    pub selected_index: usize,
+    pub selected_sub: Option<usize>,
+    pub connected_protocol_id: Option<i64>,
+    /// Sorted multi-select ids, compared membership-wise against the live set.
+    pub multi_select: Vec<i64>,
+    /// `expanded` flag per filtered row, in row order.
+    pub expanded: Vec<bool>,
+    /// Pending rebuild reasons (see `ROWS_DIRTY_*`).
+    pub dirty: u8,
+    pub rows: Vec<DisplayRowData>,
+}
+
+impl Default for DisplayRowsCache {
+    fn default() -> Self {
+        Self {
+            gen_id: u64::MAX,
+            selected_index: usize::MAX,
+            selected_sub: Some(usize::MAX),
+            connected_protocol_id: Some(i64::MIN),
+            multi_select: Vec::new(),
+            expanded: Vec::new(),
+            dirty: 0,
+            rows: Vec::new(),
+        }
+    }
+}
+
 /// One row of the expanded per-protocol sub-table inside an endpoint panel.
+#[derive(Clone)]
 struct PanelRow {
     /// "●" for the active protocol, "○" otherwise.
     marker: String,
@@ -32,7 +88,10 @@ struct PanelRow {
 
 /// A single-line endpoint row; the expanded sub-table is drawn inside the
 /// row's own height (`1 + panel_rows + 4`) by `render_expansion_panel`.
-struct DisplayRowData {
+/// `Clone` backs the display-row cache's hit path. `pub` because the cache
+/// (and thus this row type) lives on the crate-`pub` `AppState`.
+#[derive(Clone)]
+pub struct DisplayRowData {
     indicator: String,
     indicator_fg: Style,
     idx_str: String,
@@ -394,6 +453,29 @@ fn build_display_rows(
     state: &AppState,
     palette: &ratatui_cheese::theme::Palette,
 ) -> Vec<DisplayRowData> {
+    // Cache check (part-2 runtime bounds): reuse the previous frame's rows
+    // when every input is unchanged — structural gen, the selection,
+    // connection, multi-select membership, per-row expansion, and the async
+    // dirty bits. All comparisons are reference/flag reads; the only per-row
+    // work on a hit is the `expanded` zip.
+    let mut cache = state.display_rows_cache.borrow_mut();
+    if !cache.rows.is_empty()
+        && cache.gen_id == state.endpoints_gen
+        && cache.selected_index == selected
+        && cache.selected_sub == state.selected_sub
+        && cache.connected_protocol_id == state.connected_protocol_id
+        && cache.dirty == 0
+        && cache.multi_select.len() == state.multi_select.len()
+        && cache
+            .multi_select
+            .iter()
+            .all(|id| state.multi_select.contains(id))
+        && cache.expanded.len() == rows.len()
+        && cache.expanded.iter().zip(rows.iter()).all(|(c, r)| *c == r.expanded)
+    {
+        return cache.rows.clone();
+    }
+
     let mut result = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let is_connected = state.connected_protocol_id.as_ref() == Some(&row.endpoint.id.get());
@@ -637,7 +719,20 @@ fn build_display_rows(
             panel_rows,
         });
     }
-    result
+    // Store the rebuild: fingerprint + rows. The dirty bits are cleared here
+    // (a rebuild is the reset point; mutation sites re-set them on the next
+    // change). The multi-select projection is sorted for cheap membership
+    // comparison on the next frame.
+    cache.gen_id = state.endpoints_gen;
+    cache.selected_index = selected;
+    cache.selected_sub = state.selected_sub;
+    cache.connected_protocol_id = state.connected_protocol_id;
+    cache.multi_select = state.multi_select.iter().copied().collect();
+    cache.multi_select.sort();
+    cache.expanded = rows.iter().map(|r| r.expanded).collect();
+    cache.dirty = 0;
+    cache.rows = result;
+    cache.rows.clone()
 }
 
 fn render_data_grid(

@@ -223,6 +223,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 total_up,
                 total_down,
             } => {
+                state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TRAFFIC);
                 state.connection_error = None;
                 // Stale-event guard: only the connected session's poller may
                 // write traffic. An event whose protocol the connected
@@ -337,6 +338,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 protocol_id,
                 test_type,
             } => {
+                state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
                 state
                     .testing_details
                     .insert((endpoint_id, protocol_id), test_type);
@@ -351,6 +353,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 ip_info,
                 error,
             } => {
+                // The test result mutates link latency/speed/error and the
+                // testing_details map — the profiles display cache must
+                // rebuild the affected rows.
+                state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
                 // Guard against duplicate events for the same (endpoint,
                 // protocol) pair — the unique ProfileStats row. Protocol-only
                 // keys dropped the second result when two endpoints shared a
@@ -693,6 +699,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 crate::ops::enrich::spawn_whitelist_pass(state);
             }
             CoreEvent::EndpointInfoUpdated { endpoint_id, info } => {
+                // The merge mutates endpoint_info (resolved IPs, country,
+                // outbound) — the profiles display cache must rebuild.
+                state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_COUNTRY);
                 // Before the merge: was this endpoint's DNS unresolved?
                 let was_resolved = state
                     .endpoint_info
@@ -901,6 +910,7 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
                 total_up,
                 total_down,
             } => {
+                state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TRAFFIC);
                 if !is_connected_protocol(state, protocol_id) {
                     continue;
                 }
