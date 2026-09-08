@@ -1666,8 +1666,8 @@ mod tests {
     ) {
         let mut inner = chunk.to_vec();
         inner.push(CONTENT_HANDSHAKE);
-        let rec_len = u16::try_from(inner.len() + AEAD_TAG_LEN)
-            .expect("test flight chunk fits u16");
+        let rec_len =
+            u16::try_from(inner.len() + AEAD_TAG_LEN).expect("test flight chunk fits u16");
         let aad = aead_aad(inner.len() + AEAD_TAG_LEN);
         let mut record = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
         record.extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03]);
@@ -1895,8 +1895,8 @@ mod tests {
 
             let mut inner = b"ping".to_vec();
             inner.push(CONTENT_APPLICATION_DATA);
-            let rec_len = u16::try_from(inner.len() + AEAD_TAG_LEN)
-                .expect("test echo record fits u16");
+            let rec_len =
+                u16::try_from(inner.len() + AEAD_TAG_LEN).expect("test echo record fits u16");
             let aad = aead_aad(inner.len() + AEAD_TAG_LEN);
             let mut record = Vec::with_capacity(5 + inner.len() + AEAD_TAG_LEN);
             record.extend_from_slice(&[CONTENT_APPLICATION_DATA, 0x03, 0x03]);

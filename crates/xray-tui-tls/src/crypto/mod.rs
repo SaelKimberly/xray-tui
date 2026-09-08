@@ -836,7 +836,10 @@ mod tests {
         ks.add_transcript(&decode_hex(CERTIFICATE_VERIFY));
         ks.add_transcript(&decode_hex(SERVER_FINISHED));
         let (th_ch_finished, th_ch_finished_len) = ks.transcript_hash();
-        assert_eq!(hex(&th_ch_finished[..th_ch_finished_len]), TRANSCRIPT_CH_FINISHED);
+        assert_eq!(
+            hex(&th_ch_finished[..th_ch_finished_len]),
+            TRANSCRIPT_CH_FINISHED
+        );
 
         let (c_ap, s_ap) = ks.app_traffic_secrets(&master[..32]).unwrap();
         assert_eq!(hex(&c_ap[..32]), CLIENT_AP_TRAFFIC);

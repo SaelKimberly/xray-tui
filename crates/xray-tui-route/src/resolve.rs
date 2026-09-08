@@ -125,7 +125,9 @@ impl ProbeTracker {
             // (whose refcount the Breakdown event then shares — no realloc).
             if let Some(count) = self.streaks.get_mut(probe) {
                 *count += 1;
-                if *count == 1 && let Some((event_key, _)) = self.streaks.get_key_value(probe) {
+                if *count == 1
+                    && let Some((event_key, _)) = self.streaks.get_key_value(probe)
+                {
                     let event_key = event_key.clone();
                     emit(
                         tx.as_ref(),
