@@ -180,13 +180,13 @@ pub fn format_share_url(parsed: &ParsedProto, endpoint: &EndpointEssentials) -> 
 /// (Trojan `#` in password, `@` in query values, etc.).
 struct UrlComponents<'a> {
     _scheme: String,
-    username: std::borrow::Cow<'a, str>,
-    password: Option<std::borrow::Cow<'a, str>>,
-    host: String,
-    port: Option<u16>,
+    _username: std::borrow::Cow<'a, str>,
+    _password: Option<std::borrow::Cow<'a, str>>,
+    _host: String,
+    _port: Option<u16>,
     _path: Option<std::borrow::Cow<'a, str>>,
-    query_pairs: Vec<(&'a str, std::borrow::Cow<'a, str>)>,
-    fragment: Option<std::borrow::Cow<'a, str>>,
+    _query_pairs: Vec<(&'a str, std::borrow::Cow<'a, str>)>,
+    _fragment: Option<std::borrow::Cow<'a, str>>,
 }
 /// Robust URL splitting that handles Trojan `#`-in-password and `@`-in-query edge cases.
 /// Returns components without using `url::Url`.
@@ -236,13 +236,13 @@ fn split_share_url(url: &str) -> Result<UrlComponents<'_>> {
 
     Ok(UrlComponents {
         _scheme: scheme,
-        username,
-        password,
-        host,
-        port,
+        _username: username,
+        _password: password,
+        _host: host,
+        _port: port,
         _path: path,
-        query_pairs,
-        fragment,
+        _query_pairs: query_pairs,
+        _fragment: fragment,
     })
 }
 

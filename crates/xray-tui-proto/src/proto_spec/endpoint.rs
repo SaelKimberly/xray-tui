@@ -12,7 +12,6 @@
 use crate::proto_spec::utils;
 use crate::proto_spec::{CoreType, ProtocolConfig, ProtocolKind};
 use serde::{Deserialize, Serialize};
-use std::hash::Hasher;
 
 /// Endpoint host kind. Plain enum (this crate); the db crate has its own
 /// `toasty::Embed` copy.
