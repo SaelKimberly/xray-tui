@@ -55,51 +55,66 @@ pub async fn clear_expired_errors(db: &Database, ttl_hours: Option<i64>) {
     }
 }
 
-pub async fn reload_profiles(state: &mut AppState) {
+/// Snapshot of the parameters a profile load needs — the spawn boundary
+/// cannot carry `&AppState`.
+#[derive(Clone)]
+pub(crate) struct ProfilesLoad {
+    pub view: PurgatoryView,
+    pub purgatory_ttl_secs: i64,
+    pub purgatory_retention_secs: i64,
+    pub error_ttl_hours: Option<i64>,
+}
+
+impl From<&AppState> for ProfilesLoad {
+    fn from(s: &AppState) -> Self {
+        Self {
+            view: s.purgatory_view,
+            purgatory_ttl_secs: s.purgatory_ttl_secs,
+            purgatory_retention_secs: s.purgatory_retention_secs,
+            error_ttl_hours: s.config.speed_test.error_ttl_hours,
+        }
+    }
+}
+
+/// The DB half of a profile reload: error-TTL sweep + the current view's
+/// rows. Safe to run OFF the UI task — whole-table reads at 10k+ endpoints
+/// take seconds and must not block input/render (the subscription-update
+/// freeze).
+pub async fn load_profiles_rows(
+    db: &Database,
+    load: &ProfilesLoad,
+) -> Result<Vec<EndpointRow>, DatabaseError> {
     let now = now_ts();
     // Error-TTL sweep (design §6.4): clear failure markers older than the
     // configured TTL before rows are (re)loaded, so a swept error never
     // renders. `None` (default) = no-op.
-    clear_expired_errors(&state.db, state.config.speed_test.error_ttl_hours).await;
-    let result = match state.purgatory_view {
+    clear_expired_errors(db, load.error_ttl_hours).await;
+    let threshold = |ttl_secs: i64| -> Timestamp {
+        now.checked_sub(jiff::Span::new().seconds(ttl_secs))
+            .unwrap_or(now)
+    };
+    match load.view {
         PurgatoryView::Active => {
-            let threshold = now
-                .checked_sub(jiff::Span::new().seconds(state.purgatory_ttl_secs))
-                .unwrap_or(now);
-            state.db.get_active_endpoints(threshold).await
+            db.get_active_endpoints(threshold(load.purgatory_ttl_secs))
+                .await
         }
         PurgatoryView::Stale => {
-            let active_threshold = now
-                .checked_sub(jiff::Span::new().seconds(state.purgatory_ttl_secs))
-                .unwrap_or(now);
-            let stale_threshold = now
-                .checked_sub(jiff::Span::new().seconds(state.purgatory_retention_secs))
-                .unwrap_or(now);
-            state
-                .db
-                .get_stale_endpoints(active_threshold, stale_threshold)
-                .await
+            let active = threshold(load.purgatory_ttl_secs);
+            let stale = threshold(load.purgatory_retention_secs);
+            db.get_stale_endpoints(active, stale).await
         }
         PurgatoryView::All => {
-            state
-                .db
-                .get_active_endpoints(Timestamp::from_second(0).unwrap_or(now))
+            db.get_active_endpoints(Timestamp::from_second(0).unwrap_or(now))
                 .await
         }
-    };
-    match result {
-        Ok(rows) => {
-            state.endpoints = rows;
-        }
-        Err(e) => {
-            state.log_trace(
-                "error",
-                "tui::ops::profiles",
-                &format!("Failed to load profiles: {e}"),
-            );
-            state.endpoints.clear();
-        }
     }
+}
+
+/// The UI half of a profile reload: swap in fresh rows, invalidate filters,
+/// re-clamp the selection, and seed background enrichment for rows that lack
+/// cached `endpoint_info`.
+pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>) {
+    state.endpoints = rows;
     state.filter_cache_valid.set(false);
     clamp_selection(state);
     // Enrich new endpoints in the background (IP hosts + persisted DNS cache;
@@ -107,6 +122,25 @@ pub async fn reload_profiles(state: &mut AppState) {
     crate::ops::enrich::spawn_enrich_ip_hosts(state);
     // mmdb countries for persisted outbound (exit) IPs — survives reruns.
     crate::ops::enrich::spawn_outbound_countries(state);
+}
+
+pub async fn reload_profiles(state: &mut AppState) {
+    // A synchronous reload supersedes any background load still in flight.
+    state.reload_gen = state.reload_gen.wrapping_add(1);
+    let load = ProfilesLoad::from(&*state);
+    match load_profiles_rows(&state.db, &load).await {
+        Ok(rows) => apply_profiles_rows(state, rows),
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to load profiles: {e}"),
+            );
+            state.endpoints.clear();
+            state.filter_cache_valid.set(false);
+            clamp_selection(state);
+        }
+    }
 }
 
 /// Clamp a selection index into `[0, len)`, returning 0 for an empty list.

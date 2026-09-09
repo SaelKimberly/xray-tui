@@ -347,8 +347,43 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         &format!("Subscription updated: {count} profiles"),
                     );
                 }
-                state.reload_profiles().await;
+                // Reload OFF the UI task: a whole-table read at 10k+ endpoints
+                // takes seconds — awaiting it inline here froze input/render
+                // after every subscription update. The load runs in the
+                // background and the rows arrive via `ProfilesRowsReady`
+                // (generation-guarded so a slower load never clobbers a newer
+                // one). Groups are tiny — reload those inline.
+                let db = state.db.clone();
+                let load = crate::ops::profiles::ProfilesLoad::from(&*state);
+                let generation = state.reload_gen.wrapping_add(1);
+                state.reload_gen = generation;
+                let tx = state.core_event_tx.clone();
+                tokio::spawn(async move {
+                    match crate::ops::profiles::load_profiles_rows(&db, &load).await {
+                        Ok(rows) => {
+                            if let Some(t) = &tx {
+                                crate::try_send_or_warn(
+                                    t,
+                                    CoreEvent::ProfilesRowsReady { generation, rows },
+                                    "profiles_ready",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "tui::ops::events",
+                                "profile rows load failed: {e}"
+                            );
+                        }
+                    }
+                });
                 state.reload_groups().await;
+            }
+            CoreEvent::ProfilesRowsReady { generation, rows } => {
+                if generation == state.reload_gen {
+                    crate::ops::profiles::apply_profiles_rows(state, rows);
+                }
+                // A newer reload superseded this one — drop the stale rows.
             }
             CoreEvent::TestTypeUpdate {
                 endpoint_id,
@@ -1359,6 +1394,34 @@ mod tests {
         assert!(state.poll_core_events().await);
         assert_eq!(state.endpoints[0].links[0].traffic.total_up, 100);
         assert_eq!(state.current_traffic_up, 0);
+    }
+
+    #[tokio::test]
+    async fn profiles_rows_ready_applies_only_current_generation() {
+        let (mut state, tx) = event_state().await;
+        state.core_event_tx = Some(tx.clone());
+        let row = row_with_protocols(100, 1, 7);
+        state.reload_gen = 5;
+
+        // Stale load (generation 4 < 5): dropped, endpoints untouched.
+        tx.send(CoreEvent::ProfilesRowsReady {
+            generation: 4,
+            rows: vec![row.clone()],
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert!(state.endpoints.is_empty(), "stale rows must be dropped");
+
+        // Current generation: applied.
+        tx.send(CoreEvent::ProfilesRowsReady {
+            generation: 5,
+            rows: vec![row],
+        })
+        .await
+        .unwrap();
+        assert!(state.poll_core_events().await);
+        assert_eq!(state.endpoints.len(), 1, "matching rows applied");
     }
 
     #[tokio::test]

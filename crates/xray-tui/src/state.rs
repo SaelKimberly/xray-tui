@@ -54,6 +54,11 @@ pub struct AppState {
     /// Generation counter bumped on every profile mutation.
     /// Used to skip redundant reloads.
     pub endpoints_gen: u64,
+    /// Monotonic reload generation: a synchronous `reload_profiles` (or a
+    /// spawned subscription reload) bumps this; a late
+    /// `CoreEvent::ProfilesRowsReady` whose `gen` no longer matches is
+    /// dropped instead of clobbering fresher rows.
+    pub reload_gen: u64,
     /// Cached groups for subscriptions/settings UI.
     pub groups: Vec<Group>,
 
@@ -432,6 +437,7 @@ impl AppState {
             cached_filtered_indices: RefCell::new(Vec::new()),
             filter_cache_valid: Cell::new(true),
             endpoints_gen: 0,
+            reload_gen: 0,
             groups: Vec::new(),
             purgatory_view: PurgatoryView::Active,
             purgatory_ttl_secs,

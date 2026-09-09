@@ -466,6 +466,15 @@ pub enum CoreEvent {
         error: Option<String>,
         summary: ValidationSummary,
     },
+    /// Fresh profile rows computed OFF the UI task (a `SubscriptionsUpdated`
+    /// reload at 10k+ endpoints takes seconds — awaiting it inline froze
+    /// input/render after every update). `generation` must equal the request
+    /// (`AppState::reload_gen`); a stale load superseded by a newer reload is
+    /// dropped rather than clobbering fresher rows.
+    ProfilesRowsReady {
+        generation: u64,
+        rows: Vec<EndpointRow>,
+    },
     /// Result from a speed test operation. `endpoint_id` + `protocol_id`
     /// together address exactly one `ProfileStats` row: protocol rows are
     /// shared across endpoints (identity dedup excludes host/port), so a
