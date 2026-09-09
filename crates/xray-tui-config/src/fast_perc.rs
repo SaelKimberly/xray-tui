@@ -100,6 +100,13 @@ const fn char_advance(slice: &mut &[u8], state: &mut usize) -> Option<char> {
         *state += n;
         Some(c)
     } else {
+        // Consume the bytes decode examined even when it rejects: a
+        // truncated multibyte tail (raw cut mid-sequence) must yield the
+        // remaining chars, not wedge the iterator returning None forever.
+        if n > 0 {
+            *slice = unsafe { core::slice::from_raw_parts(slice.as_ptr().add(n), slice.len() - n) };
+            *state += n;
+        }
         None
     }
 }
@@ -156,5 +163,61 @@ mod tests {
         let mut ac = AutoChars::new(b"");
         assert_eq!(ac.next(), None);
         assert!(ac.remaining().is_empty());
+
+        // Truncated multibyte tail: the sequence can never complete, so the
+        // bytes are consumed (with one replacement char surfaced by callers
+        // mapping None+remaining to invalid) and iteration terminates — a
+        // stuck iterator would spin any retry loop forever.
+        let mut ac = AutoChars::new(b"ok\xF0\x9F");
+        assert_eq!(ac.next(), Some('o'));
+        assert_eq!(ac.next(), Some('k'));
+        assert_eq!(ac.next(), None);
+        assert!(ac.remaining().is_empty(), "truncated tail must be consumed");
+    }
+
+    /// Exhaustion fuzz: for EVERY 1..=4-byte truncated prefix of a multibyte
+    /// sequence, iteration must terminate with an empty remainder — a prefix
+    /// that made `AutoChars` return `None` without consuming would spin any
+    /// retry loop forever. Also asserts the remainder shrinks monotonically.
+    #[test]
+    fn auto_chars_terminates_on_every_truncated_prefix() {
+        use super::AutoChars;
+
+        let leads = 0xC2_u8..=0xF4;
+        let conts = [0x80_u8, 0x90, 0xA0, 0xBF];
+        for lead in leads {
+            for len in 1..=4_usize {
+                // Build every prefix shape: lead alone, lead + conts, lead +
+                // mixed cont/ascii, lead + conts + truncated continuation.
+                for &c1 in &conts {
+                    for &c2 in std::iter::once(&0x80_u8).chain(&conts) {
+                        let mut bytes = vec![lead, c1, c2];
+                        bytes.truncate(len.min(3));
+                        if len == 4 {
+                            bytes.push(0x80);
+                        }
+                        let mut ac = AutoChars::new(&bytes);
+                        let mut prev_len = bytes.len();
+                        let mut steps = 0;
+                        // Drain contract: next() must eventually consume every
+                        // byte — advance may pause (None with bytes left, a
+                        // hard-invalid tail), but remaining() must shrink every
+                        // call until empty. An advance==0 None here is the wedge
+                        // shape this test exists to forbid.
+                        while !ac.remaining().is_empty() {
+                            let _ = ac.next();
+                            steps += 1;
+                            assert!(
+                                steps <= bytes.len(),
+                                "drain exceeded byte count for {bytes:?}"
+                            );
+                            let rem = ac.remaining().len();
+                            assert!(rem < prev_len, "remainder must shrink for {bytes:?}");
+                            prev_len = rem;
+                        }
+                    }
+                }
+            }
+        }
     }
 }

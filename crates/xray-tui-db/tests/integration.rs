@@ -163,10 +163,10 @@ async fn large_page_loads_via_batched_in_list() {
     let mut conn = db.connection().await.expect("connection");
 
     // 1000 endpoints, each with exactly one link. `load_endpoint_rows`
-    // batches the link load with ONE `endpoint_id IN (1000 ids)` statement —
+    // loads the links with ONE `endpoint_id IN (1000 ids)` statement —
     // comfortably below SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (default
     // 32766; the T8+9 note's ">32k" ceiling). A page at or above the limit
-    // would need chunking; 1000 proves the batched path at a realistic
+    // would need chunking; 1000 proves the in_list path at a realistic
     // large-page scale without a slow 32k+ test.
     for i in 0..1000 {
         seed_endpoint(
@@ -185,7 +185,7 @@ async fn large_page_loads_via_batched_in_list() {
     assert_eq!(rows.len(), 1000, "every endpoint on the page");
     assert!(
         rows.iter().all(|r| r.links.len() == 1),
-        "each endpoint carries its single link through the batched in_list load"
+        "each endpoint carries its single link through the in_list load"
     );
     assert_eq!(
         rows.iter().map(|r| r.endpoint.id.get()).min(),
@@ -1153,6 +1153,148 @@ async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
     .expect("link");
     assert_eq!(link.task_id, None);
     assert_eq!(link.task_queue, vec![40]);
+}
+
+#[tokio::test]
+async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
+    let db = test_db().await;
+
+    let endpoint = |port: u16| Endpoint {
+        id: EndpointId::new(1),
+        host: "sub.example".to_string(),
+        host_type: HostType::Dns,
+        port,
+        ports: Vec::<u16>::new(),
+        parent_id: None,
+        last_source: Some("g1".to_string()),
+        manual_protocol_override: None,
+        resolved_as: Vec::<String>::new(),
+        resolved_at: None,
+        created_at: ts(0),
+        links: Deferred::default(),
+        group_links: Deferred::default(),
+    };
+    let protocol = Protocol {
+        id: ProtocolId::new(1001),
+        sig: 1001,
+        cred_hash: 0,
+        proto_kind: ProtocolKind::Vless,
+        transport: tcp_transport(),
+        security: no_security(),
+        config: Deferred::from(Json(vless_config())),
+        created_at: ts(0),
+        links: Deferred::default(),
+    };
+    let link = |last_seen: i64, latency: Option<Latency>| ProfileStats {
+        protocol_id: ProtocolId::new(1001),
+        endpoint_id: EndpointId::new(1),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_used_at: Some(ts(10)),
+        last_seen_at: ts(last_seen),
+        task_id: Some(7),
+        task_queue: vec![8, 9],
+        latency,
+        speed_bps: None,
+        error: None,
+        traffic: zero_traffic(),
+        created_at: ts(0),
+        updated_at: ts(0),
+        version: 1,
+        protocol: Deferred::default(),
+        endpoint: Deferred::default(),
+    };
+    let group_link = EndpointGroup {
+        endpoint_id: EndpointId::new(1),
+        group_id: "g1".to_string(),
+        last_seen_at: ts(50),
+        sort_order: None,
+        endpoint: Deferred::default(),
+        group: Deferred::default(),
+    };
+
+    // First insert: endpoints, protocols, links, group links — all in ONE
+    // transaction (the caller owns the txn; the free functions take `&mut`).
+    {
+        let mut conn = db.connection().await.expect("connection");
+        let mut tx = conn.transaction().await.expect("txn");
+        xray_tui_db::upsert_endpoints_bulk(&mut tx, &[endpoint(443)])
+            .await
+            .expect("bulk endpoints");
+        xray_tui_db::upsert_protocols_bulk(&mut tx, &[protocol.clone()])
+            .await
+            .expect("bulk protocols");
+        xray_tui_db::upsert_links_bulk(&mut tx, &[link(50, None)])
+            .await
+            .expect("bulk links");
+        xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, std::slice::from_ref(&group_link))
+            .await
+            .expect("bulk group links");
+        // Empty slices are no-ops inside the same transaction, not errors.
+        xray_tui_db::upsert_endpoints_bulk(&mut tx, &[])
+            .await
+            .expect("empty endpoints");
+        xray_tui_db::upsert_protocols_bulk(&mut tx, &[])
+            .await
+            .expect("empty protocols");
+        xray_tui_db::upsert_links_bulk(&mut tx, &[])
+            .await
+            .expect("empty links");
+        xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &[])
+            .await
+            .expect("empty group links");
+        tx.commit().await.expect("commit");
+    }
+
+    // Simulate the scheduler owning its fields (as it does between two
+    // subscription refreshes): the bulk link upsert must not touch them.
+    db.update_scheduler_state(ProtocolId::new(1001), EndpointId::new(1), Some(7), &[8, 9])
+        .await
+        .expect("seed scheduler state");
+    db.update_last_used(ProtocolId::new(1001), EndpointId::new(1), ts(10))
+        .await
+        .expect("seed last_used_at");
+
+    // Re-upsert: port and latency update; scheduler state (task_id,
+    // task_queue) and last_used_at must survive (owned by their own writers).
+    {
+        let mut conn = db.connection().await.expect("connection 2");
+        let mut tx = conn.transaction().await.expect("txn 2");
+        xray_tui_db::upsert_endpoints_bulk(&mut tx, &[endpoint(8443)])
+            .await
+            .expect("bulk endpoints update");
+        xray_tui_db::upsert_protocols_bulk(&mut tx, &[protocol])
+            .await
+            .expect("bulk protocols update");
+        xray_tui_db::upsert_links_bulk(&mut tx, &[link(60, Some(Latency::Fast { delay: 123 }))])
+            .await
+            .expect("bulk links update");
+        xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, std::slice::from_ref(&group_link))
+            .await
+            .expect("bulk group links update");
+        tx.commit().await.expect("commit 2");
+    }
+
+    let row = db
+        .get_active_endpoints_by_group("g1", ts(0))
+        .await
+        .expect("group read");
+    assert_eq!(row.len(), 1, "one endpoint despite duplicate upserts");
+    assert_eq!(row[0].endpoint.port, 8443, "port updated");
+    assert_eq!(row[0].links.len(), 1, "one link despite duplicate upserts");
+    assert_eq!(row[0].links[0].last_seen_at, ts(60), "last_seen_at updated");
+    assert_eq!(
+        row[0].links[0].latency,
+        Some(Latency::Fast { delay: 123 }),
+        "latency updated"
+    );
+    assert_eq!(row[0].links[0].task_id, Some(7), "task_id preserved");
+    assert_eq!(row[0].links[0].task_queue, vec![8, 9], "queue preserved");
+    assert_eq!(
+        row[0].links[0].last_used_at,
+        Some(ts(10)),
+        "last_used_at preserved"
+    );
 }
 
 #[tokio::test]

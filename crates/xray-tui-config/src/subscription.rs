@@ -10,7 +10,7 @@ use base64_simd::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use xray_tui_proto::proto_spec::{ProtoSpec, SecurityConfig};
 
 /// Maximum input chunk size for `StreamingDecoder::feed()`.
-const INPUT_CHUNK_SIZE: usize = 65536;
+pub const INPUT_CHUNK_SIZE: usize = 65536;
 
 /// Maximum bytes to carry over between chunks (incomplete lines).
 const CARRY_OVER_SIZE: usize = 262_144;
@@ -415,37 +415,44 @@ pub fn subscription_url_split(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Parse base64-encoded subscription data into a list of Profiles.
+/// Decode subscription data into individual share URLs (no parsing).
 ///
-/// Returns `(profiles, summary)` on success, where `summary` is a
-/// `ValidationSummary` counting the types of errors encountered.
+/// Runs the same [`StreamingDecoder`] pass as [`parse_subscription_data`]
+/// but stops at the URL level: the caller parses in bounded batches so a
+/// 100k-URL feed never materializes 100k `ParsedProfile`s at once.
 ///
 /// # Errors
 ///
 /// Returns an error if the data cannot be decoded.
-pub fn parse_subscription_data(
-    data: &[u8],
-    settings: &ValidationSettings,
-) -> Result<(Vec<ParsedProfile>, ValidationSummary), String> {
+pub fn subscription_url_chunks(data: &[u8]) -> Result<Vec<String>, String> {
     let mut decoder = StreamingDecoder::new();
+    let mut urls: Vec<String> = Vec::new();
+    for chunk in data.chunks(INPUT_CHUNK_SIZE) {
+        urls.extend(decoder.feed(chunk)?);
+    }
+    urls.extend(decoder.finalize()?);
+    Ok(urls)
+}
+
+/// Parse one batch of share URLs into profiles with a complete per-batch summary.
+///
+/// The summary includes the security-warning scan + `total_errors`. This is
+/// the funnel shared by [`parse_subscription_data`] and the TUI's chunked
+/// import.
+///
+/// # Errors
+///
+/// None — parse failures are counted in the summary, never propagated.
+#[must_use]
+pub fn parse_url_batch(
+    urls: &[String],
+    settings: &ValidationSettings,
+) -> (Vec<ParsedProfile>, ValidationSummary) {
     let mut profiles: Vec<ParsedProfile> = Vec::new();
     let mut summary = ValidationSummary::default();
-
-    // Stream: parse each chunk's URLs then drop them — no `all_urls`
-    // hold-all, peak transient is one chunk's URLs plus `profiles`.
-    for chunk in data.chunks(INPUT_CHUNK_SIZE) {
-        let urls = decoder.feed(chunk)?;
-        for url in &urls {
-            file_profile(&mut profiles, &mut summary, url, settings);
-        }
-    }
-
-    // Finalize
-    let urls = decoder.finalize()?;
-    for url in &urls {
+    for url in urls {
         file_profile(&mut profiles, &mut summary, url, settings);
     }
-
     // Scan parsed profiles for allow_insecure / insecure settings (typed
     // security accessor — the full flow rework lands in T12).
     summary.security_warning_count = profiles
@@ -464,6 +471,40 @@ pub fn parse_subscription_data(
         + summary.host_validation_count
         + summary.security_warning_count
         + summary.other_count;
+    (profiles, summary)
+}
+
+/// Parse base64-encoded subscription data into a list of Profiles.
+///
+/// Returns `(profiles, summary)` on success, where `summary` is a
+/// `ValidationSummary` counting the types of errors encountered.
+///
+/// # Errors
+///
+/// Returns an error if the data cannot be decoded.
+pub fn parse_subscription_data(
+    data: &[u8],
+    settings: &ValidationSettings,
+) -> Result<(Vec<ParsedProfile>, ValidationSummary), String> {
+    let mut decoder = StreamingDecoder::new();
+    let mut profiles: Vec<ParsedProfile> = Vec::new();
+    let mut summary = ValidationSummary::default();
+
+    // Stream: parse each chunk's URLs via the shared batch funnel, then drop
+    // them — no `all_urls` hold-all, peak transient is one chunk's URLs plus
+    // `profiles`.
+    for chunk in data.chunks(INPUT_CHUNK_SIZE) {
+        let urls = decoder.feed(chunk)?;
+        let (batch, batch_summary) = parse_url_batch(&urls, settings);
+        profiles.extend(batch);
+        summary.merge(&batch_summary);
+    }
+
+    // Finalize
+    let urls = decoder.finalize()?;
+    let (batch, batch_summary) = parse_url_batch(&urls, settings);
+    profiles.extend(batch);
+    summary.merge(&batch_summary);
 
     Ok((profiles, summary))
 }
@@ -471,6 +512,7 @@ pub fn parse_subscription_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_tui_proto::proto_spec::ProtocolKind;
 
     #[test]
     fn test_subscription_url_split_single() {
@@ -657,5 +699,70 @@ mod tests {
         let urls = subscription_url_split("vmess://");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], "vmess://");
+    }
+
+    /// Canonical valid vmess URL (parses through `parse_share_url`).
+    fn valid_vmess_url() -> String {
+        let qr = serde_json::json!({
+            "v": "2", "ps": "test", "add": "1.2.3.4", "port": "443",
+            "id": "550e8400-e29b-41d4-a716-446655440000", "aid": "0", "scy": "auto",
+            "net": "tcp", "type": "none", "host": "", "path": "", "tls": "",
+            "sni": "", "alpn": "", "fp": "", "insecure": "0",
+        });
+        let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
+        format!("vmess://{b64}")
+    }
+
+    #[test]
+    fn parse_url_batch_counts_valid_and_invalid() {
+        let settings = crate::import_export::ValidationSettings::default();
+        let urls = vec![
+            valid_vmess_url(),
+            // Garbage that cannot parse: lands in other_count.
+            "vmess://!!!not-base64!!!".to_string(),
+        ];
+        let (profiles, summary) = parse_url_batch(&urls, &settings);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].parsed.protocol.proto_kind, ProtocolKind::Vmess);
+        assert_eq!(summary.other_count, 1);
+        assert_eq!(summary.total_errors, 1);
+        assert_eq!(summary.missing_field_count, 0);
+        assert_eq!(summary.host_validation_count, 0);
+    }
+
+    #[test]
+    fn url_chunks_matches_parse_subscription_data_profile_count() {
+        let settings = crate::import_export::ValidationSettings::default();
+        // Plain-text body (no base64).
+        let plain = format!(
+            "{}\n{}\nvless://bad-url-!\n",
+            valid_vmess_url(),
+            valid_vmess_url()
+        );
+        let (profiles, _) = parse_subscription_data(plain.as_bytes(), &settings).unwrap();
+        let urls = subscription_url_chunks(plain.as_bytes()).unwrap();
+        // 3 URLs split, but `vless://bad-url-!` fails to parse → 2 profiles.
+        assert_eq!(urls.len(), 3);
+        assert_eq!(profiles.len(), 2);
+
+        // Base64-encoded body.
+        let b64 = base64_simd::STANDARD.encode_to_string(plain.as_bytes());
+        let (profiles_b64, _) = parse_subscription_data(b64.as_bytes(), &settings).unwrap();
+        let urls_b64 = subscription_url_chunks(b64.as_bytes()).unwrap();
+        assert_eq!(
+            urls_b64.len(),
+            urls.len(),
+            "both encodings split identically"
+        );
+        assert_eq!(
+            profiles_b64.len(),
+            profiles.len(),
+            "both encodings parse identically"
+        );
+    }
+
+    #[test]
+    fn url_chunks_empty_input_yields_empty() {
+        assert!(subscription_url_chunks(b"").unwrap().is_empty());
     }
 }

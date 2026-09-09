@@ -12,7 +12,7 @@
 
 pub mod ops;
 pub mod route_compile;
-mod state;
+pub mod state;
 mod types;
 pub mod ui;
 

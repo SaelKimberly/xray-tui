@@ -243,6 +243,7 @@ fn security_embed(config: &ProtocolConfig) -> Security {
 
 /// Build a typed `Endpoint` row from parse-boundary endpoint essentials:
 /// id = `stable_hash(host, port)`, host kind from the address family.
+#[must_use]
 pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
     Endpoint {
         id: EndpointId::new(stable_hash(&ep.host, i64::from(ep.port))),
@@ -266,11 +267,14 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
     }
 }
 
-/// Build a typed `Protocol` row from a parse result: id = `uid()`, with the
-/// `config`/`transport.data`/`security.data` deferred JSON loaded so it is
-/// ready for `Database::upsert_protocol`. Identity comes from ONE canonical
-/// serialization (`identity_once`); the three separate `sig()`/`cred_hash()`/
-/// `uid()` calls would serialize 3×.
+/// Build a typed `Protocol` row from a parse result, with deferred
+/// `config`/`transport.data`/`security.data` JSON loaded so it is ready for
+/// `Database::upsert_protocol`.
+///
+/// Identity: id = `uid()`, computed from ONE canonical serialization
+/// (`identity_once`) — the three separate `sig()`/`cred_hash()`/`uid()` calls
+/// would serialize 3×.
+#[must_use]
 pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
     let (sig, cred_hash, uid) = parsed.identity_once();
     Protocol {
@@ -285,9 +289,11 @@ pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
         links: Deferred::default(),
     }
 }
+
 /// The per-pair `ProfileStats` link for one parsed endpoint, reusing the
-/// already-computed protocol id (no `uid()` rehash per endpoint) and the
-fn link_from_parsed_with_id(
+/// already-computed protocol id (no `uid()` rehash per endpoint).
+#[must_use]
+pub fn link_from_parsed_with_id(
     parsed: &ParsedProto,
     protocol_id: ProtocolId,
     endpoint_id: EndpointId,
@@ -321,9 +327,10 @@ fn link_from_parsed_with_id(
         endpoint: Deferred::default(),
     }
 }
-/// Persist a parsed protocol as typed rows: one endpoint per parsed endpoint,
-/// one shared protocol row, one per-pair link, plus the endpoint-group link
-/// when `group_id` is `Some`. Returns the number of endpoints persisted.
+/// Persist a parsed protocol as typed rows, returning the endpoint count.
+///
+/// Rows written: one endpoint per parsed endpoint, one shared protocol row,
+/// one per-pair link, plus the endpoint-group link when `group_id` is `Some`.
 ///
 /// Dedup is natural: endpoint ids (`stable_hash(host, port)`) and protocol
 /// ids (`uid()`) are deterministic, so re-imports update the existing rows
@@ -383,10 +390,12 @@ pub const fn link_is_failed(link: &ProfileStats) -> bool {
 }
 
 /// Load a `Protocol` row with its deferred `config`/`transport.data`/
-/// `security.data` JSON included. Default read paths exclude deferred columns
-/// (the `EndpointRow` list ships unloaded `Protocol`s); `ConfigBuilder::build`
-/// and `Database::upsert_protocol` require them loaded. Returns `Ok(None)`
-/// when no such protocol row exists.
+/// `security.data` JSON included.
+///
+/// Default read paths exclude deferred columns (the `EndpointRow` list ships
+/// unloaded `Protocol`s); `ConfigBuilder::build` and
+/// `Database::upsert_protocol` require them loaded. Returns `Ok(None)` when
+/// no such protocol row exists.
 pub async fn load_protocol_with_config(
     db: &Database,
     id: ProtocolId,

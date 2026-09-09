@@ -673,6 +673,18 @@ pub struct ValidationSummary {
     pub other_count: usize,
 }
 
+impl ValidationSummary {
+    /// Add `other`'s counters into `self` (chunked imports sum per-batch
+    /// summaries into one whole-run summary).
+    pub const fn merge(&mut self, other: &Self) {
+        self.total_errors += other.total_errors;
+        self.missing_field_count += other.missing_field_count;
+        self.host_validation_count += other.host_validation_count;
+        self.security_warning_count += other.security_warning_count;
+        self.other_count += other.other_count;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

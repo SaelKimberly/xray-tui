@@ -7,5 +7,6 @@ pub mod ping;
 pub mod profiles;
 pub mod scheduler;
 pub mod settings;
+pub mod stream_import;
 pub mod subscriptions;
 pub mod updates;

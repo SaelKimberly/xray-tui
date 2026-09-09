@@ -301,52 +301,63 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
         return;
     }
 
+    // Phase 1 runs SYNCHRONOUSLY here: insert the cached resolution directly
+    // into `endpoint_info` instead of round-tripping an event. The old
+    // phase-1 `EndpointInfoUpdated` events looked identical to real DNS
+    // resolutions to the event handler, which re-persisted
+    // `update_endpoint_resolution` + `upsert_resolved_ip_children` for EVERY
+    // already-resolved endpoint on every reload (7000 redundant write pairs
+    // after a 7000-URL import).
+    let mut feature_targets: Vec<(i64, EndpointInfo, Option<String>)> =
+        Vec::with_capacity(targets.len());
+    for (endpoint_id, ep, cached_as, cached_at, sni) in targets {
+        let info = if cached_as.is_empty() {
+            // IP host — its own address is the "resolution".
+            EndpointInfo {
+                resolved_ips: vec![
+                    ep.host
+                        .parse()
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                ],
+                country: None,
+                host_features: HostFeatures::default(),
+                sni_whitelisted: None,
+                outbound_ip: None,
+                outbound_country: None,
+                resolved_at_secs: None,
+            }
+        } else {
+            // DNS host with a persisted resolution — reuse it, no network.
+            EndpointInfo {
+                resolved_ips: cached_as
+                    .iter()
+                    .filter_map(|s| s.parse::<IpAddr>().ok())
+                    .collect(),
+                country: None,
+                host_features: HostFeatures::default(),
+                sni_whitelisted: None,
+                outbound_ip: None,
+                outbound_country: None,
+                resolved_at_secs: cached_at,
+            }
+        };
+        state.endpoint_info.insert(endpoint_id, info.clone());
+        feature_targets.push((endpoint_id, info, sni));
+    }
+    state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_COUNTRY);
+
+    // Phase 2 stays in the background: mmdb may download on first use and
+    // must never stall the UI task. Feature fields only — the handler's
+    // persist branch stays silent because the seeded `resolved_at_secs` now
+    // equals the incoming value.
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
-        for (endpoint_id, ep, cached_as, cached_at, sni) in targets {
-            let mut info = if cached_as.is_empty() {
-                // IP host — its own address is the "resolution".
-                EndpointInfo {
-                    resolved_ips: vec![
-                        ep.host
-                            .parse()
-                            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                    ],
-                    country: None,
-                    host_features: HostFeatures::default(),
-                    sni_whitelisted: None,
-                    outbound_ip: None,
-                    outbound_country: None,
-                    resolved_at_secs: None,
-                }
-            } else {
-                // DNS host with a persisted resolution — reuse it, no network.
-                EndpointInfo {
-                    resolved_ips: cached_as
-                        .iter()
-                        .filter_map(|s| s.parse::<IpAddr>().ok())
-                        .collect(),
-                    country: None,
-                    host_features: HostFeatures::default(),
-                    sni_whitelisted: None,
-                    outbound_ip: None,
-                    outbound_country: None,
-                    resolved_at_secs: cached_at,
-                }
-            };
-            // Phase 1 first: cached IPs/host reach the UI before geo work
-            // (mmdb may download 70MB on first use — must not stall seeding).
-            if let Some(t) = tx.as_ref() {
-                let _ = t.try_send(CoreEvent::EndpointInfoUpdated {
-                    endpoint_id,
-                    info: info.clone(),
-                });
-            }
+        for (endpoint_id, mut info, sni) in feature_targets {
             fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await;
-            if let Some(t) = tx.clone() {
+            if let Some(t) = tx.as_ref() {
                 let _ = t.try_send(CoreEvent::EndpointInfoUpdated { endpoint_id, info });
             }
         }

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use toasty::Executor;
 use toasty::stmt::IntoStatement;
 use toasty_core::stmt::Value;
 
@@ -215,9 +216,9 @@ fn first_i64(rows: &[Value]) -> Option<i64> {
 impl Database {
     /// Active endpoints: at least one link with `last_seen_at >= active_threshold`.
     ///
-    /// Assembled with a batched relation load — the endpoint query plus ONE
-    /// `ProfileStats` query carrying the per-link `protocol`/`endpoint`
-    /// relations (no N+1). Endpoints ordered by id.
+    /// Assembled by [`Self::load_endpoint_rows`]: the endpoint query plus
+    /// plain per-table SELECTs joined in memory (no toasty relation
+    /// includes — see that fn's doc for why). Endpoints ordered by id.
     pub async fn get_active_endpoints(
         &self,
         active_threshold: Timestamp,
@@ -431,25 +432,28 @@ impl Database {
         Ok(settings.into_iter().next())
     }
 
-    /// Assemble [`EndpointRow`]s for a page of endpoints with ONE batched
-    /// query for the per-link `protocol`/`endpoint` relations (no N+1):
+    /// Assemble [`EndpointRow`]s for a page of endpoints WITHOUT toasty
+    /// relation includes.
     ///
-    /// 1. `Endpoint::filter(...)` — the page, ordered by id.
-    /// 2. `ProfileStats::filter(endpoint_id IN page_ids)` with
-    ///    `.include(profile_stats.protocol())` and
-    ///    `.include(profile_stats.endpoint())` — every link of the page with
-    ///    its relations preloaded by the engine in a single statement.
+    /// The obvious shape — `ProfileStats::filter(endpoint_id IN ids)` with
+    /// `.include(protocol)`/`.include(endpoint)` — makes toasty resolve each
+    /// include as `WHERE endpoint_id IN (VALUES (?1)..(?N))` / `WHERE id IN
+    /// (VALUES …)`. At 6332 links those VALUES lists hit ~13s (protocols) and
+    /// ~7s (endpoints) of pure SQLite statement-parse + VM setup per
+    /// reload — the TUI freeze of 2026-09-09. Instead: three plain SELECTs
+    /// (links for the page ids via `in_list`, ALL protocols — the app always
+    /// renders every row anyway, and `protocols` is bounded by distinct
+    /// configs, not servers) joined in memory.
     ///
     /// Links are grouped per endpoint and sorted by test priority
     /// (`sort_links_by_test_priority`); the `protocols` map is built from the
-    /// included relations. `dns_unresolved` is endpoint-level: `Dns` host
+    /// id-keyed protocol rows. `dns_unresolved` is endpoint-level: `Dns` host
     /// with no cached `resolved_as` sinks all its links to tier 5.
     ///
-    /// Page ceiling: the step-2 `IN` list is bounded by `SQLite`'s
-    /// `SQLITE_MAX_VARIABLE_NUMBER` (default 32766 parameters — the T8+9
-    /// note's ">32k" limit). Real TUI pages are hundreds of endpoints, far
-    /// below it; a page larger than the limit would need chunking. The
-    /// batched path is exercised at 1000 endpoints in the integration suite.
+    /// The `in_list` step-2 filter is bounded by `SQLite`'s
+    /// `SQLITE_MAX_VARIABLE_NUMBER` (default 32766 parameters). Real pages
+    /// are hundreds of endpoints; a page larger than the limit would need
+    /// chunking. Exercised at 1000 endpoints in the integration suite.
     async fn load_endpoint_rows(
         &self,
         endpoints: Vec<Endpoint>,
@@ -465,10 +469,14 @@ impl Database {
             ProfileStats::fields().endpoint_id(),
             ids,
         ))
-        .include(ProfileStats::fields().protocol())
-        .include(ProfileStats::fields().endpoint())
         .exec(conn)
         .await?;
+        // Plain table scan: no include -> no EXISTS(VALUES …) monster query.
+        // ~6k distinct configs is the whole protocol table; a fresh in-memory
+        // join is cheaper than any per-page relation resolution.
+        let protocols: Vec<Protocol> = Protocol::all().exec(conn).await?;
+        let protocol_by_id: HashMap<ProtocolId, Protocol> =
+            protocols.into_iter().map(|p| (p.id, p)).collect();
 
         let mut by_endpoint: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
         for link in links {
@@ -480,7 +488,11 @@ impl Database {
             let links = by_endpoint.remove(&endpoint.id).unwrap_or_default();
             let protocols = links
                 .iter()
-                .filter_map(|l| l.protocol.get().as_ref().map(|p| (p.id, p.clone())))
+                .filter_map(|l| {
+                    protocol_by_id
+                        .get(&l.protocol_id)
+                        .map(|p| (p.id, p.clone()))
+                })
                 .collect();
             let dns_unresolved =
                 endpoint.host_type == HostType::Dns && endpoint.resolved_as.is_empty();
@@ -1025,6 +1037,96 @@ impl Database {
             .await?;
         Ok(())
     }
+}
+// ── Bulk upserts (subscription import) ───────────────────────────────
+//
+// Executor-taking free functions rather than `Database` methods: the caller
+// owns the transaction, so a whole batch (endpoints + protocols + links +
+// group links) commits as ONE transaction — one fsync per batch instead of
+// four, and a crash mid-batch never leaves half a batch stored. Field lists
+// are copied verbatim from the single-row methods above — the bulk path must
+// never drift from them.
+
+/// Insert-or-update many endpoints on the caller's executor (usually a
+/// `&mut Transaction`). Empty slice is a no-op.
+pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> Result<()> {
+    for e in eps {
+        Endpoint::upsert_by_id(e.id)
+            .host(e.host.clone())
+            .host_type(e.host_type)
+            .port(e.port)
+            .ports(e.ports.clone())
+            .parent_id(e.parent_id)
+            .last_source(e.last_source.clone())
+            .on_create(|create| create.resolved_as(Vec::<String>::new()))
+            .exec(tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Insert-or-update many protocols on the caller's executor. Empty slice is a
+/// no-op. Same deferred-unloaded guard as `Database::upsert_protocol`.
+pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> Result<()> {
+    for p in ps {
+        if p.config.is_unloaded() || p.transport.data.is_unloaded() || p.security.data.is_unloaded()
+        {
+            return Err(DatabaseError::Generic(
+                "upsert_protocols_bulk: deferred config not loaded (rebuild the Protocol or load it with config/transport/security data included)"
+                    .into(),
+            ));
+        }
+    }
+    for p in ps {
+        Protocol::upsert_by_id(p.id)
+            .sig(p.sig)
+            .cred_hash(p.cred_hash)
+            .proto_kind(p.proto_kind)
+            .transport(p.transport.clone())
+            .security(p.security.clone())
+            .config(p.config.get().0.clone())
+            .exec(tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Insert-or-update many per-pair link rows on the caller's executor.
+///
+/// Empty slice is a no-op. Field list identical to `Database::upsert_link`:
+/// scheduler state (`task_id`, `task_queue`) and `last_used_at` stay owned by
+/// their single-row writers and are preserved on update.
+pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -> Result<()> {
+    for s in links {
+        ProfileStats::upsert_by_protocol_id_and_endpoint_id(s.protocol_id, s.endpoint_id)
+            .core_type(s.core_type)
+            .config_type(s.config_type)
+            .last_seen_at(s.last_seen_at)
+            .latency(s.latency.clone())
+            .speed_bps(s.speed_bps)
+            .error(s.error.clone())
+            .traffic(s.traffic)
+            .on_create(|create| create.task_queue(Vec::<u16>::new()))
+            .exec(tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Insert-or-update many endpoint↔group links on the caller's executor.
+/// Empty slice is a no-op.
+pub async fn upsert_endpoint_group_links_bulk(
+    tx: &mut impl Executor,
+    egs: &[EndpointGroup],
+) -> Result<()> {
+    for eg in egs {
+        EndpointGroup::upsert_by_endpoint_id_and_group_id(eg.endpoint_id, eg.group_id.clone())
+            .last_seen_at(eg.last_seen_at)
+            .sort_order(eg.sort_order)
+            .exec(tx)
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

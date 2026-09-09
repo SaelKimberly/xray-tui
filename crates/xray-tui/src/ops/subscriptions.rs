@@ -275,40 +275,56 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let db = state.db.clone();
     let validation: ValidationSettings = state.config.parsing.clone().into();
     tokio::spawn(async move {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_mins(2),
-            do_update_subscription(url, user_agent, gid.clone(), db, validation),
-        )
-        .await;
-        if let Ok(inner) = result {
-            if let Some(tx) = &tx {
-                try_send_or_warn(
-                    tx,
-                    CoreEvent::SubscriptionsUpdated {
-                        group_id: inner.0,
-                        count: inner.1,
-                        summary: inner.2,
-                        error: inner.3,
-                    },
-                    "subs_updated",
-                );
-            }
-        } else {
-            tracing::error!(target: "tui::ops::subscriptions", "Subscription update timed out after 120s");
-            if let Some(tx) = &tx {
-                try_send_or_warn(
-                    tx,
-                    CoreEvent::SubscriptionsUpdated {
-                        group_id: gid.clone(),
-                        count: 0,
-                        summary: ValidationSummary::default(),
-                        error: Some("Subscription update timed out after 120s".into()),
-                    },
-                    "subs_timeout",
-                );
-            }
-        }
+        update_one_group(url, user_agent, gid, db, validation, tx).await;
     });
+}
+
+/// One group's update cycle: fetch + parse + persist under an overall
+/// timeout, then deliver `SubscriptionsUpdated` (timeout or not). The
+/// `updating_groups` spinner entry is removed by the event handler; the
+/// 30-minute cap exists so a 100k-URL import is never aborted mid-parse
+/// (the HTTP client itself times out after 30s).
+async fn update_one_group(
+    url: String,
+    user_agent: String,
+    gid: String,
+    db: Arc<Database>,
+    validation: ValidationSettings,
+    tx: Option<tokio::sync::mpsc::Sender<CoreEvent>>,
+) {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_mins(30),
+        do_update_subscription(url, user_agent, gid.clone(), db, validation),
+    )
+    .await;
+    if let Ok(inner) = result {
+        if let Some(tx) = &tx {
+            try_send_or_warn(
+                tx,
+                CoreEvent::SubscriptionsUpdated {
+                    group_id: inner.0,
+                    count: inner.1,
+                    summary: inner.2,
+                    error: inner.3,
+                },
+                "subs_updated",
+            );
+        }
+    } else {
+        tracing::error!(target: "tui::ops::subscriptions", "Subscription update timed out after 30m");
+        if let Some(tx) = &tx {
+            try_send_or_warn(
+                tx,
+                CoreEvent::SubscriptionsUpdated {
+                    group_id: gid.clone(),
+                    count: 0,
+                    summary: ValidationSummary::default(),
+                    error: Some("Subscription update timed out after 30m".into()),
+                },
+                "subs_timeout",
+            );
+        }
+    }
 }
 
 async fn do_update_subscription(
@@ -318,22 +334,6 @@ async fn do_update_subscription(
     db: Arc<Database>,
     validation: ValidationSettings,
 ) -> (String, usize, ValidationSummary, Option<String>) {
-    let client = match reqwest::Client::builder()
-        .user_agent(&user_agent)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                group_id,
-                0,
-                ValidationSummary::default(),
-                Some(e.to_string()),
-            );
-        }
-    };
-
     // Warn on HTTP (non-HTTPS) subscription URLs
     if url.starts_with("http://") {
         tracing::warn!(
@@ -341,60 +341,15 @@ async fn do_update_subscription(
             "Subscription URL uses HTTP, traffic is not encrypted"
         );
     }
-
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                group_id,
-                0,
-                ValidationSummary::default(),
-                Some(format!("HTTP: {e}")),
-            );
-        }
-    };
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                group_id,
-                0,
-                ValidationSummary::default(),
-                Some(format!("Body: {e}")),
-            );
-        }
-    };
-    let (profiles, summary) =
-        match xray_tui_config::subscription::parse_subscription_data(&bytes, &validation) {
-            Ok((p, s)) => (p, s),
-            Err(e) => return (group_id, 0, ValidationSummary::default(), Some(e)),
-        };
-    tracing::info!(
-        target: "tui::ops::subscriptions",
-        "Parsed {} profiles, {} errors from subscription",
-        profiles.len(),
-        summary.total_errors,
-    );
-    if profiles.is_empty() {
-        tracing::info!(target: "tui::ops::subscriptions", "Subscription returned 0 usable profiles — all URLs may have failed validation");
-    }
-    // Persist every parsed profile with the typed upserts. Dedup is natural:
-    // endpoint ids (`stable_hash(host, port)`) and protocol ids (`uid()`) are
-    // deterministic, so re-imports of the same (endpoint id, uid) pair update
-    // the existing rows instead of duplicating. Profiles missing from this
-    // fetch keep their old `last_seen_at` and age into the Stale view —
-    // preserving the old move-orphans-to-purgatory semantics through the
-    // typed staleness clock (purge_expired reclaims them after retention).
-    let mut count = 0usize;
-    for parsed in &profiles {
-        match crate::state::persist_parsed(&db, &parsed.parsed, Some(&group_id), None).await {
-            Ok(n) => count += n,
-            Err(e) => {
-                tracing::error!(target: "tui::ops::subscriptions", "profile upsert failed: {e}");
-            }
-        }
-    }
-    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded");
+    let (count, summary) = crate::ops::stream_import::import_http_subscription(
+        &url,
+        &user_agent,
+        &db,
+        Some(&group_id),
+        &validation,
+    )
+    .await;
+    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded: {count} links, {} errors", summary.total_errors);
 
     // Update group metadata (last_refreshed, status)
     if let Ok(groups) = db.get_all_groups().await
@@ -409,16 +364,174 @@ async fn do_update_subscription(
     (group_id, count, summary, None)
 }
 
+/// URLs per parse+persist batch (one DB transaction per batch).
+pub const PERSIST_CHUNK: usize = 500;
+
+/// Parse URLs in bounded batches and persist each batch's rows with the
+/// db-crate bulk upserts.
+///
+/// One transaction per batch instead of one autocommit per row — a 7000-URL
+/// feed previously issued ~28k implicit commits, pegging the `NVMe` and
+/// starving the UI. Rows are deduped across the WHOLE import via deterministic
+/// ids before the bulk calls, so repeated protocol configs and duplicate
+/// (host, port) lines upsert once per run.
+///
+/// Batch failures are logged with the URL index range and skipped — same
+/// log-and-continue semantics the old per-profile loop had, coarser.
+/// Returns `(links persisted, whole-run summary)`.
+pub async fn persist_parsed_urls(
+    db: &Arc<Database>,
+    urls: &[String],
+    group_id: Option<&str>,
+    validation: &ValidationSettings,
+) -> (usize, ValidationSummary) {
+    const PROGRESS_EVERY: usize = 5000;
+    let total = urls.len();
+
+    let mut summary = ValidationSummary::default();
+    let mut count = 0usize;
+    // Deterministic-id dedup sets: a protocol row is shared across endpoints
+    // (identity excludes host/port), so subscription feeds that repeat one
+    // protocol config over hundreds of server URLs collapse to one upsert.
+    let mut seen_protocols = std::collections::HashSet::new();
+    let mut seen_endpoints = std::collections::HashSet::new();
+    let mut seen_links = std::collections::HashSet::new();
+
+    for (chunk_idx, chunk) in urls.chunks(PERSIST_CHUNK).enumerate() {
+        let (profiles, batch_summary) =
+            xray_tui_config::subscription::parse_url_batch(chunk, validation);
+        summary.merge(&batch_summary);
+
+        let mut endpoints: Vec<xray_tui_db::models::Endpoint> = Vec::new();
+        let mut protocols: Vec<xray_tui_db::models::Protocol> = Vec::new();
+        let mut links: Vec<xray_tui_db::models::ProfileStats> = Vec::new();
+        let mut group_links: Vec<xray_tui_db::models::EndpointGroup> = Vec::new();
+        let mut chunk_links = 0usize;
+
+        for profile in &profiles {
+            let parsed = &profile.parsed;
+            if parsed.endpoints.is_empty() {
+                continue;
+            }
+            let protocol = crate::state::protocol_from_parsed(parsed);
+            if seen_protocols.insert(protocol.id.get()) {
+                protocols.push(protocol.clone());
+            }
+            for ep in &parsed.endpoints {
+                let endpoint = crate::state::endpoint_from_essentials(ep);
+                let link = crate::state::link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
+                if seen_links.insert((link.protocol_id.get(), link.endpoint_id.get())) {
+                    if seen_endpoints.insert(endpoint.id.get()) {
+                        endpoints.push(endpoint.clone());
+                    }
+                    links.push(link.clone());
+                    if let Some(gid) = group_id {
+                        group_links.push(xray_tui_db::models::EndpointGroup {
+                            endpoint_id: endpoint.id,
+                            group_id: gid.to_owned(),
+                            last_seen_at: link.last_seen_at,
+                            sort_order: None,
+                            endpoint: toasty::Deferred::default(),
+                            group: toasty::Deferred::default(),
+                        });
+                    }
+                    chunk_links += 1;
+                }
+            }
+        }
+
+        let url_range = (
+            chunk_idx * PERSIST_CHUNK,
+            chunk_idx * PERSIST_CHUNK + chunk.len(),
+        );
+        // One transaction for the WHOLE chunk: the four bulk families share
+        // one commit, and a busy error retries the whole chunk. Row Vecs are
+        // moved into Arc slices so each retry attempt clones the Arc
+        // (refcount bump) instead of deep-copying the chunk contents.
+        let endpoints = Arc::from(endpoints);
+        let protocols = Arc::from(protocols);
+        let links = Arc::from(links);
+        let group_links = Arc::from(group_links);
+        let persist = || {
+            let (endpoints, protocols, links, group_links) = (
+                Arc::clone(&endpoints),
+                Arc::clone(&protocols),
+                Arc::clone(&links),
+                Arc::clone(&group_links),
+            );
+            async move {
+                let mut conn = db.connection().await?;
+                let mut tx = conn.transaction().await?;
+                xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints).await?;
+                xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await?;
+                xray_tui_db::upsert_links_bulk(&mut tx, &links).await?;
+                xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &group_links).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        };
+        if let Err(e) = xray_tui_db::retry_on_busy(persist, 5).await {
+            tracing::error!(
+                target: "tui::ops::subscriptions",
+                "bulk persist failed for URLs [{}..{}): {e}",
+                url_range.0,
+                url_range.1,
+            );
+        } else {
+            count += chunk_links;
+        }
+
+        if count != 0 && count / PROGRESS_EVERY != (count - chunk_links) / PROGRESS_EVERY {
+            tracing::info!(target: "tui::ops::subscriptions", "Imported {count}/{total} links from subscription");
+        }
+        tokio::task::yield_now().await;
+    }
+
+    (count, summary)
+}
+
 pub fn update_all_subscriptions(state: &mut AppState) {
-    let group_ids: Vec<String> = state
+    // One shared pipeline: a group with a URL runs sequentially. Parallel
+    // group herds multiplied write contention (each group previously spawned
+    // its own upsert task burst); the per-group `updating_groups` guard still
+    // prevents double-updates of the same group.
+    let groups: Vec<(String, String, Option<String>)> = state
         .groups
         .iter()
         .filter(|g| g.url.as_deref().is_some_and(|u| !u.is_empty()))
-        .map(|g| g.id.clone())
+        .filter(|g| !state.updating_groups.contains(&g.id))
+        .map(|g| {
+            (
+                g.id.clone(),
+                g.url.clone().unwrap_or_default(),
+                g.user_agent.clone(),
+            )
+        })
         .collect();
-    for gid in group_ids {
-        update_group_subscriptions(state, &gid);
+    if groups.is_empty() {
+        return;
     }
+
+    let tx = state.core_event_tx.clone();
+    let db = state.db.clone();
+    let validation: ValidationSettings = state.config.parsing.clone().into();
+    for (gid, _url, _ua) in &groups {
+        state.updating_groups.insert(gid.clone());
+    }
+    tokio::spawn(async move {
+        for (gid, url, ua) in groups {
+            let user_agent = ua.unwrap_or_else(|| "xray-tui/0.1".into());
+            update_one_group(
+                url,
+                user_agent,
+                gid,
+                db.clone(),
+                validation.clone(),
+                tx.clone(),
+            )
+            .await;
+        }
+    });
 }
 
 /// Start a background task to check and update subscriptions.
@@ -523,5 +636,71 @@ mod tests {
             Some(GroupCoreType::SingBox)
         );
         assert_eq!(group_core_from_str("singbox"), Some(GroupCoreType::SingBox));
+    }
+
+    fn valid_vmess_url(host: &str) -> String {
+        let qr = serde_json::json!({
+            "v": "2", "ps": "test", "add": host, "port": "443",
+            "id": "550e8400-e29b-41d4-a716-446655440000", "aid": "0", "scy": "auto",
+            "net": "tcp", "type": "none", "host": "", "path": "", "tls": "",
+            "sni": "", "alpn": "", "fp": "", "insecure": "0",
+        });
+        let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
+        format!("vmess://{b64}")
+    }
+
+    #[tokio::test]
+    async fn persist_parsed_urls_dedups_and_persists_group_links() {
+        use xray_tui_db::models::EndpointId;
+        let db = Arc::new(Database::in_memory().await.expect("in-memory db"));
+        let validation = ValidationSettings::default();
+
+        // Two identical URLs (same host+protocol), one distinct host, one
+        // garbage URL. The two identical URLs dedup to ONE link (same
+        // endpoint id + protocol id), the distinct host is a second link;
+        // both share ONE protocol row (identity excludes host/port).
+        let urls = vec![
+            valid_vmess_url("1.2.3.4"),
+            valid_vmess_url("1.2.3.4"),
+            valid_vmess_url("5.6.7.8"),
+            "vmess://!!!not-base64!!!".to_string(),
+        ];
+
+        let (count, summary) = persist_parsed_urls(&db, &urls, Some("g1"), &validation).await;
+        assert_eq!(count, 2, "duplicate (host, protocol) collapses");
+        assert_eq!(summary.other_count, 1, "garbage URL counted");
+        assert_eq!(summary.total_errors, 1);
+
+        // One endpoint per unique host, both linked to the group.
+        let rows = db
+            .get_active_endpoints_by_group("g1", jiff::Timestamp::from_second(0).unwrap())
+            .await
+            .expect("group read");
+        assert_eq!(rows.len(), 2, "one row per unique endpoint");
+        assert_eq!(rows[0].links.len(), 1);
+        assert_eq!(rows[1].links.len(), 1);
+
+        // Rerun the same list: counts identical, no duplicate rows.
+        let (count2, _) = persist_parsed_urls(&db, &urls, Some("g1"), &validation).await;
+        assert_eq!(count2, 2, "idempotent rerun");
+        let rows2 = db
+            .get_active_endpoints_by_group("g1", jiff::Timestamp::from_second(0).unwrap())
+            .await
+            .expect("group read 2");
+        assert_eq!(rows2.len(), 2, "no row duplication on rerun");
+        assert_eq!(rows2[0].links.len(), 1, "no link duplication on rerun");
+
+        // No group id: links persist without group membership rows.
+        let db2 = Arc::new(Database::in_memory().await.expect("in-memory db"));
+        let (count3, _) = persist_parsed_urls(&db2, &urls, None, &validation).await;
+        assert_eq!(count3, 2);
+        assert!(
+            db2.get_active_endpoints_by_group("g1", jiff::Timestamp::from_second(0).unwrap())
+                .await
+                .expect("no group rows")
+                .is_empty(),
+            "group_id=None must not create group links"
+        );
+        let _ = EndpointId::new(1); // import reference for the models path
     }
 }

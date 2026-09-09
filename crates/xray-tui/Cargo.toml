@@ -71,3 +71,4 @@ xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 workspace = true
 [dev-dependencies]
 tempfile = "3"
+base64-simd = "0.8"
