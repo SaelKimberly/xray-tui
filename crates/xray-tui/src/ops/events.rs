@@ -136,6 +136,14 @@ pub fn spawn_route_event_forwarder(
 /// caller runs immediately because this one reports work handled.
 const NATIVE_TRACE_BUDGET: usize = 512;
 
+/// [`CoreEvent::EndpointInfoUpdated`] events processed per
+/// [`poll_core_events`] call.
+/// Enrichment passes emit one event per endpoint (10k+ at production scale);
+/// without a cap one poll monopolizes the UI task and no draw or key event
+/// is serviced until the whole backlog is drained. 256/16ms tick ≈ 16k
+/// events/sec — a 10k flood clears in ~0.7s with renders interleaved.
+const EVENT_DRAIN_BUDGET: usize = 256;
+
 /// Poll core event channel and update state accordingly.
 ///
 /// Returns `true` when anything was handled (an event consumed, or a finished
@@ -158,6 +166,15 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
         false
     };
     let mut trace_budget = NATIVE_TRACE_BUDGET;
+    // Per-tick drain cap: enrichment passes can emit one event per endpoint
+    // (10571+ at production scale). Draining the whole backlog in one poll
+    // monopolizes the UI task and starves the render/key handling that only
+    // runs between polls; a cap interleaves drain and draw every 16ms tick.
+    let mut budget = EVENT_DRAIN_BUDGET;
+    // DNS resolutions changed this pass, flushed as ONE spawned task after
+    // the drain (see the `persist_batch.push` in the EndpointInfoUpdated arm).
+    let mut persist_batch: Vec<(EndpointId, Vec<String>, jiff::Timestamp, Vec<IpAddr>)> =
+        Vec::new();
     while let Some(rx) = state.core_event_rx.as_mut() {
         let event = match rx.try_recv() {
             Ok(event) => event,
@@ -768,27 +785,17 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // write also refreshes the resolved-IP child endpoints (port
                 // 443, per the T10 decision).
                 if let Some((resolved_as, resolved_at)) = persist {
-                    let db = state.db.clone();
+                    // Batched: one spawned flush per poll instead of one
+                    // task per event — an enrichment flood must not create
+                    // thousands of concurrent DB write tasks.
                     let ip_addrs: Vec<IpAddr> =
                         resolved_as.iter().filter_map(|s| s.parse().ok()).collect();
-                    tokio::spawn(async move {
-                        let eid = EndpointId::new(endpoint_id);
-                        if let Err(e) = db
-                            .update_endpoint_resolution(eid, resolved_as, resolved_at)
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "tui::ops::events",
-                                "update_endpoint_resolution failed: {e}"
-                            );
-                        }
-                        if let Err(e) = db.upsert_resolved_ip_children(eid, &ip_addrs).await {
-                            tracing::warn!(
-                                target: "tui::ops::events",
-                                "upsert_resolved_ip_children failed: {e}"
-                            );
-                        }
-                    });
+                    persist_batch.push((
+                        EndpointId::new(endpoint_id),
+                        resolved_as,
+                        resolved_at,
+                        ip_addrs,
+                    ));
                 }
 
                 // DNS flip (unresolved -> resolved): lift the endpoint's
@@ -809,6 +816,37 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 }
             }
         }
+        budget -= 1;
+        if budget == 0 {
+            // Cap reached: stop for this tick so a draw and key handling
+            // interleave; the next poll resumes the drain. `break` (not
+            // return) so the post-loop tail still runs.
+            break;
+        }
+    }
+    // Flush this pass's DNS-resolution writes as ONE spawned task: an
+    // enrichment flood previously spawned one DB task per event.
+    if !persist_batch.is_empty() {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            for (eid, resolved_as, resolved_at, ip_addrs) in persist_batch {
+                if let Err(e) = db
+                    .update_endpoint_resolution(eid, resolved_as, resolved_at)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "tui::ops::events",
+                        "update_endpoint_resolution failed: {e}"
+                    );
+                }
+                if let Err(e) = db.upsert_resolved_ip_children(eid, &ip_addrs).await {
+                    tracing::warn!(
+                        target: "tui::ops::events",
+                        "upsert_resolved_ip_children failed: {e}"
+                    );
+                }
+            }
+        });
     }
     handled
 }
@@ -1097,11 +1135,15 @@ mod tests {
                 .unwrap();
         }
         assert!(poll_core_events(&mut state).await);
-        // One pass applies exactly the budget and leaves the rest queued so
-        // the frame can draw.
-        assert_eq!(state.native_activity.entries.len(), NATIVE_TRACE_BUDGET);
-        // The next pass resumes where this one stopped — nothing is lost.
-        poll_core_events(&mut state).await;
+        // One pass applies at most the per-pass budget AND the global drain
+        // cap (whichever is smaller — the drain cap governs) and leaves the
+        // rest queued so the frame can draw.
+        let first = state.native_activity.entries.len();
+        assert_eq!(first, NATIVE_TRACE_BUDGET.min(EVENT_DRAIN_BUDGET));
+        // Successive passes resume where the last stopped — nothing is lost.
+        while state.native_activity.entries.len() < over {
+            poll_core_events(&mut state).await;
+        }
         assert_eq!(state.native_activity.entries.len(), over);
     }
 
