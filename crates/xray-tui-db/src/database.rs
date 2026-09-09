@@ -214,24 +214,19 @@ fn first_i64(rows: &[Value]) -> Option<i64> {
 // ── Read queries (public API) ───────────────────────────────────────────
 
 impl Database {
-    /// Active endpoints: at least one link with `last_seen_at >= active_threshold`.
+    /// Active endpoints: at least one link with `last_seen_at >=
+    /// active_threshold` (the profiles Active tab). Endpoints ordered by id.
     ///
-    /// Assembled by [`Self::load_endpoint_rows`]: the endpoint query plus
-    /// plain per-table SELECTs joined in memory (no toasty relation
-    /// includes — see that fn's doc for why). Endpoints ordered by id.
+    /// Built with plain full-table scans + an in-memory filter — no correlated
+    /// EXISTS subqueries and no `endpoint_id IN (...)` lists (see
+    /// [`Self::load_tab_rows`] for why both blow up super-linearly at 10k+
+    /// endpoints and wedged the UI on large subscription reloads).
     pub async fn get_active_endpoints(
         &self,
         active_threshold: Timestamp,
     ) -> Result<Vec<EndpointRow>> {
-        let mut conn = self.conn().await?;
-        let endpoints: Vec<Endpoint> = Endpoint::filter(
-            Endpoint::fields()
-                .links()
-                .any(ProfileStats::fields().last_seen_at().ge(active_threshold)),
-        )
-        .exec(&mut conn)
-        .await?;
-        self.load_endpoint_rows(endpoints, &mut conn).await
+        self.load_tab_rows(|row| row.links.iter().any(|l| l.last_seen_at >= active_threshold))
+            .await
     }
 
     /// Active endpoints filtered by group membership (endpoint has an
@@ -242,49 +237,102 @@ impl Database {
         active_threshold: Timestamp,
     ) -> Result<Vec<EndpointRow>> {
         let mut conn = self.conn().await?;
-        let endpoints: Vec<Endpoint> = Endpoint::filter(
-            Endpoint::fields()
-                .links()
-                .any(ProfileStats::fields().last_seen_at().ge(active_threshold))
-                .and(
-                    Endpoint::fields()
-                        .group_links()
-                        .any(EndpointGroup::fields().group_id().eq(group_id)),
-                ),
-        )
-        .exec(&mut conn)
-        .await?;
-        self.load_endpoint_rows(endpoints, &mut conn).await
+        let members: std::collections::HashSet<EndpointId> =
+            EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
+                .exec(&mut conn)
+                .await?
+                .into_iter()
+                .map(|eg| eg.endpoint_id)
+                .collect();
+        drop(conn);
+        self.load_tab_rows(move |row| {
+            members.contains(&row.endpoint.id)
+                && row.links.iter().any(|l| l.last_seen_at >= active_threshold)
+        })
+        .await
     }
 
-    /// Stale endpoints: `max(last_seen_at)` < `active_threshold` AND
-    /// >= `stale_threshold`.
-    ///
-    /// Fetched with the wide predicate (at least one link as old as
-    /// `stale_threshold`); the max-window is checked in memory over the
-    /// loaded links (pages are bounded).
+    /// Stale endpoints: `max(last_seen_at)` in `[stale_threshold,
+    /// active_threshold)` — at least one link as old as `stale_threshold` and
+    /// none as fresh as `active_threshold`.
     pub async fn get_stale_endpoints(
         &self,
         active_threshold: Timestamp,
         stale_threshold: Timestamp,
     ) -> Result<Vec<EndpointRow>> {
+        self.load_tab_rows(|row| {
+            row.links.iter().any(|l| l.last_seen_at >= stale_threshold)
+                && !row.links.iter().any(|l| l.last_seen_at >= active_threshold)
+        })
+        .await
+    }
+
+    /// Assemble [`EndpointRow`]s for a tab load with PLAIN full-table scans
+    /// and an in-memory filter — the third rewrite of this hot path.
+    ///
+    /// Why not the "obvious" SQL shapes:
+    /// - `Endpoint::filter(links().any(...))` compiles to a correlated EXISTS;
+    ///   with no index on `profile_stats.endpoint_id` (PK is
+    ///   `(protocol_id, endpoint_id)`) each endpoint probes the whole links
+    ///   table → O(endpoints × links), ~2.6s at 10.5k/37k.
+    /// - `ProfileStats::filter(endpoint_id IN ids)` — toasty expands `in_list`
+    ///   to row-value `IN (VALUES (?1)..(?N))`; 10.5k ids cost ~14s of pure
+    ///   SQLite statement-parse + VM setup (the same VALUES blowup the 2026-09
+    ///   include fix removed from the other leg).
+    ///
+    /// Three full scans (`Endpoint::all`, `ProfileStats::all`,
+    /// `Protocol::all` — `protocols` is bounded by distinct configs, not
+    /// servers) + one in-memory join, then the caller's predicate filters.
+    /// Linear in table size: ~17s → well under a second at 10.5k endpoints,
+    /// and it stays linear as feeds grow instead of degrading quadratically.
+    /// One transient cost: the whole `profile_stats` table is materialized
+    /// per load (~37k rows ≈ tens of MB); acceptable for the tab load.
+    async fn load_tab_rows<F>(&self, keep: F) -> Result<Vec<EndpointRow>>
+    where
+        F: Fn(&EndpointRow) -> bool,
+    {
         let mut conn = self.conn().await?;
-        let endpoints: Vec<Endpoint> = Endpoint::filter(
-            Endpoint::fields()
-                .links()
-                .any(ProfileStats::fields().last_seen_at().ge(stale_threshold)),
-        )
-        .exec(&mut conn)
-        .await?;
-        let mut rows = self.load_endpoint_rows(endpoints, &mut conn).await?;
-        rows.retain(|r| {
-            r.links
+        let endpoints: Vec<Endpoint> = Endpoint::all().exec(&mut conn).await?;
+        let links: Vec<ProfileStats> = ProfileStats::all().exec(&mut conn).await?;
+        let protocols: Vec<Protocol> = Protocol::all().exec(&mut conn).await?;
+        let protocol_by_id: HashMap<ProtocolId, Protocol> =
+            protocols.into_iter().map(|p| (p.id, p)).collect();
+
+        let mut by_endpoint: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
+        for link in links {
+            by_endpoint.entry(link.endpoint_id).or_default().push(link);
+        }
+
+        let mut rows = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let links = by_endpoint.remove(&endpoint.id).unwrap_or_default();
+            let protocols = links
                 .iter()
-                .map(|l| l.last_seen_at)
-                .max()
-                .is_some_and(|max| max >= stale_threshold && max < active_threshold)
-        });
-        Ok(rows)
+                .filter_map(|l| {
+                    protocol_by_id
+                        .get(&l.protocol_id)
+                        .map(|p| (p.id, p.clone()))
+                })
+                .collect();
+            let dns_unresolved =
+                endpoint.host_type == HostType::Dns && endpoint.resolved_as.is_empty();
+            let mut row = EndpointRow {
+                endpoint,
+                links,
+                protocols,
+                selected_protocol: 0,
+                expanded: false,
+            };
+            row.sort_links_by_test_priority(dns_unresolved);
+            // Single-row display follows the best measured link (survives
+            // restarts via the persisted latency columns); the sub-table
+            // keeps test-priority order.
+            row.select_best_measured_link();
+            rows.push(row);
+        }
+        // Deterministic page order (the newtype id path cannot be ordered in SQL).
+        rows.sort_by_key(|r| r.endpoint.id);
+        Ok(rows.into_iter().filter(keep).collect())
     }
 
     /// Stale endpoint ids only (`max(last_seen_at)` in
@@ -432,28 +480,14 @@ impl Database {
         Ok(settings.into_iter().next())
     }
 
-    /// Assemble [`EndpointRow`]s for a page of endpoints WITHOUT toasty
-    /// relation includes.
+    /// Assemble [`EndpointRow`]s for a small endpoint set (the single-endpoint
+    /// lookups [`Self::get_endpoint`] / [`Self::get_endpoint_by_protocol_id`]
+    /// — the tab loads go through [`Self::load_tab_rows`] instead).
     ///
-    /// The obvious shape — `ProfileStats::filter(endpoint_id IN ids)` with
-    /// `.include(protocol)`/`.include(endpoint)` — makes toasty resolve each
-    /// include as `WHERE endpoint_id IN (VALUES (?1)..(?N))` / `WHERE id IN
-    /// (VALUES …)`. At 6332 links those VALUES lists hit ~13s (protocols) and
-    /// ~7s (endpoints) of pure SQLite statement-parse + VM setup per
-    /// reload — the TUI freeze of 2026-09-09. Instead: three plain SELECTs
-    /// (links for the page ids via `in_list`, ALL protocols — the app always
-    /// renders every row anyway, and `protocols` is bounded by distinct
-    /// configs, not servers) joined in memory.
-    ///
-    /// Links are grouped per endpoint and sorted by test priority
-    /// (`sort_links_by_test_priority`); the `protocols` map is built from the
-    /// id-keyed protocol rows. `dns_unresolved` is endpoint-level: `Dns` host
-    /// with no cached `resolved_as` sinks all its links to tier 5.
-    ///
-    /// The `in_list` step-2 filter is bounded by `SQLite`'s
-    /// `SQLITE_MAX_VARIABLE_NUMBER` (default 32766 parameters). Real pages
-    /// are hundreds of endpoints; a page larger than the limit would need
-    /// chunking. Exercised at 1000 endpoints in the integration suite.
+    /// Loads the page's links with one `endpoint_id IN (...)` statement; the
+    /// set is ≤1 endpoint here, so the row-value expansion cost that makes
+    /// `in_list` untenable at 10k+ ids (see [`Self::load_tab_rows`]) never
+    /// applies. Protocols are joined in memory (bounded by distinct configs).
     async fn load_endpoint_rows(
         &self,
         endpoints: Vec<Endpoint>,
