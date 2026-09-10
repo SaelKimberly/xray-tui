@@ -93,11 +93,12 @@ mod tests {
     }
 
     /// The 2022 helper must delegate to the crate with the spec's ASCII
-    /// context and the `key ‖ salt` material order. (The independent pin for
-    /// BLAKE3 derive-key lives in `protocol/vless/encryption/b3.rs`, which
-    /// cross-checks this helper against the hand-rolled implementation.)
+    /// context. (The derive-key primitive's independence is pinned in
+    /// `protocol/vless/encryption/b3.rs`; the caller's `key ‖ salt` material
+    /// order is pinned in `protocol/ss/method.rs`'s tests, against that same
+    /// hand-rolled implementation.)
     #[test]
-    fn blake3_helper_uses_the_spec_context_and_material_order() {
+    fn blake3_helper_uses_the_spec_context() {
         assert_eq!(SS2022_SUBKEY_CONTEXT, "shadowsocks 2022 session subkey");
         let key = [0x22_u8; 32];
         let salt = [0x33_u8; 32];
@@ -113,7 +114,9 @@ mod tests {
                 swapped.extend_from_slice(&key);
                 swapped
             }),
-            "material order is key ‖ salt, not salt ‖ key"
+            "the underlying KDF is order-sensitive (the caller's `key ‖ salt` \
+             concatenation is pinned in protocol/ss/method.rs's tests against \
+             the hand-rolled BLAKE3)"
         );
     }
 
@@ -135,6 +138,16 @@ mod tests {
                 0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d, 0x83, 0x27, 0xde, 0xb8, 0x82,
                 0xcf, 0x99, 0x2b, 0x95, 0x99, 0x0a, 0x91, 0x51, 0x37, 0x4a, 0xbd, 0x8f, 0xf8, 0xc5,
                 0xa7, 0xa0, 0xfe, 0x08,
+            ]
+        );
+        // 24 bytes is the ONLY non-multiple-of-16 key length in the classic
+        // cipher table (aes-192-gcm), so it is the only case that exercises
+        // the final `truncate` — independent vector, same provenance.
+        assert_eq!(
+            &*evp_bytes_to_key_md5(b"password", 24),
+            &[
+                0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d, 0x83, 0x27, 0xde, 0xb8, 0x82,
+                0xcf, 0x99, 0x2b, 0x95, 0x99, 0x0a, 0x91, 0x51, 0x37, 0x4a,
             ]
         );
     }
@@ -176,6 +189,10 @@ Expected: FAIL — `cannot find function hkdf_sha1` / `blake3_derive_key` / `evp
 //! (2022 edition spec §2.2) — an ASCII context, so the `blake3` crate is used
 //! directly (unlike VLESS's binary-context derive-key in
 //! `protocol/vless/encryption/b3.rs`).
+//!
+//! Backends: REALITY auth-key derivation uses ring (workspace standard); the
+//! Shadowsocks helpers above use RustCrypto `hkdf`/`sha1`, `md-5`, and the
+//! `blake3` crate.
 
 use hkdf::Hkdf;
 use sha1::Sha1;
@@ -185,7 +202,7 @@ use zeroize::Zeroizing;
 pub fn hkdf_sha1(psk: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
     Hkdf::<Sha1>::new(Some(salt), psk)
         .expand(info, out)
-        .expect("HKDF-SHA1 output length is bounded by callers (< 255*32)");
+        .expect("HKDF-SHA1 output length is bounded by callers (< 255*20)");
 }
 
 /// The 2022 session-subkey context (2022 edition spec §2.2) — the ONE owner
@@ -208,15 +225,15 @@ pub fn blake3_derive_key(context: &str, material: &[u8]) -> [u8; 32] {
 pub fn evp_bytes_to_key_md5(password: &[u8], key_len: usize) -> Zeroizing<Vec<u8>> {
     use md5::{Digest as _, Md5};
     let mut key = Zeroizing::new(Vec::with_capacity(key_len + 16));
-    let mut prev: Option<[u8; 16]> = None;
+    let mut prev: Option<Zeroizing<[u8; 16]>> = None;
     while key.len() < key_len {
         let mut hasher = Md5::new();
         if let Some(prev) = &prev {
-            hasher.update(prev);
+            hasher.update(prev.as_slice());
         }
         hasher.update(password);
-        let digest: [u8; 16] = hasher.finalize().into();
-        key.extend_from_slice(&digest);
+        let digest = Zeroizing::new(<[u8; 16]>::from(hasher.finalize()));
+        key.extend_from_slice(digest.as_slice());
         prev = Some(digest);
     }
     key.truncate(key_len);
@@ -640,6 +657,29 @@ mod tests {
         let d = stream_subkey(s2022, &key, &[4u8; 32]);
         assert_eq!(c.len(), 32);
         assert_ne!(&*c, &*d);
+    }
+
+    /// The `key ‖ salt` material order is pinned against the hand-rolled
+    /// BLAKE3 (an implementation independent of the `blake3` crate the helper
+    /// delegates to). Requires exposing it crate-wide: in
+    /// `protocol/vless/encryption/mod.rs` change `mod b3;` to
+    /// `pub(crate) mod b3;` and in `b3.rs` change
+    /// `pub(super) fn derive_key_bytes` to `pub(crate) fn derive_key_bytes`.
+    #[test]
+    fn blake3_subkey_material_order_is_key_then_salt() {
+        let s2022 = SsMethod::from_method("2022-blake3-aes-256-gcm").unwrap();
+        let key = [0x11u8; 32];
+        let salt = [0x22u8; 32];
+        let material = [key.as_slice(), salt.as_slice()].concat();
+        assert_eq!(
+            &*stream_subkey(s2022, &key, &salt),
+            &crate::protocol::vless::encryption::b3::derive_key_bytes(
+                b"shadowsocks 2022 session subkey",
+                &material
+            )[..]
+        );
+        // …and the subkey advances with the salt (per-connection freshness).
+        assert_ne!(&*stream_subkey(s2022, &key, &salt), &*stream_subkey(s2022, &key, &[0x23u8; 32]));
     }
 
     fn hex(s: &str) -> Vec<u8> {
