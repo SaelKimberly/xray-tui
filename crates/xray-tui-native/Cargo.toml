@@ -149,6 +149,13 @@ required-features = ["native-e2e"]
 name = "dispatch"
 harness = false
 
+# `ss_codec` measures the Shadowsocks codecs the client runs per chunk and
+# per datagram (classic AEAD + 2022-blake3, TCP framing and UDP codec) plus
+# the per-connection subkey KDFs: no feature gate, no core binary, no socket.
+[[bench]]
+name = "ss_codec"
+harness = false
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # serde_json/rcgen are used by unit tests in security/transport/context/chain,

@@ -111,6 +111,34 @@ fn rows() -> Vec<Row> {
             build: || CaseSpec::trojan().with_tls(Box::new(FingerprintTls("chrome"))),
             core: CoreKind::Xray,
         },
+        // Shadowsocks: `SsConfig` has no transport field, so every SS row is
+        // the plain TCP dial. `NoTls` is the genuinely plain wire shape the
+        // e2e matrix uses (`tests/shadowsocks.rs::ss`), not a TLS layer with
+        // defaults. The four rows cover both cipher families — classic AEAD
+        // (HKDF-SHA1 subkey) and 2022-blake3 (standalone header chunks) —
+        // across both cores.
+        Row {
+            name: "ss/tcp/aead-aes-128-gcm",
+            build: || CaseSpec::shadowsocks("aes-128-gcm").with_tls(Box::new(NoTls)),
+            core: CoreKind::Xray,
+        },
+        Row {
+            name: "ss/tcp/aead-chacha20-ietf-poly1305",
+            build: || CaseSpec::shadowsocks("chacha20-ietf-poly1305").with_tls(Box::new(NoTls)),
+            core: CoreKind::Xray,
+        },
+        Row {
+            name: "ss/tcp/2022-blake3-aes-256-gcm",
+            build: || CaseSpec::shadowsocks("2022-blake3-aes-256-gcm").with_tls(Box::new(NoTls)),
+            core: CoreKind::Xray,
+        },
+        Row {
+            name: "ss/tcp/2022-blake3-chacha20-poly1305",
+            build: || {
+                CaseSpec::shadowsocks("2022-blake3-chacha20-poly1305").with_tls(Box::new(NoTls))
+            },
+            core: CoreKind::SingBox,
+        },
         // TCP path only (QUIC-stream tunnel via plain `connect`, same as the
         // e2e default row). The datagram `connect_udp` shape is out of scope:
         // no byte-stream, no sink/source target.
