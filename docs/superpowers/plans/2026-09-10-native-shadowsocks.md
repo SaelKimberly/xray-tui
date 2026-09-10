@@ -1287,6 +1287,17 @@ async fn dispatch_picks_the_family_codec() {
     assert_eq!(method.family, SsFamily::Classic);
 }
 
+- **Dispatch coverage through the public seam** (the brief's family test only
+  checks the static method table and would pass even if `connect` picked the
+  wrong codec). Drive `ss::connect` over a `tokio::io::duplex` and assert:
+  (a) a classic method emits classic framing (the first 16 bytes are the salt,
+  then the 2-byte length seal — the 2022 codec's first seal is the 11-byte
+  fixed header, so the two framings are distinguishable on the wire);
+  (b) a legacy method (`aes-256-cfb`) is refused by `resolve_method` with
+  `NativeError::Config` before the codec is entered.
+- Keep the probe the implementer already used as that permanent test (it was
+  written and deleted; re-add it in-tree).
+
 #[tokio::test]
 async fn unknown_method_is_a_config_error() {
     let cfg = SsConfig {
@@ -1322,7 +1333,6 @@ Expected: FAIL — `resolve_method` not found.
 pub mod method;
 pub mod stream;
 pub mod stream2022;
-pub mod udp;
 
 /// Resolve the row's method, refusing anything native does not implement.
 fn resolve_method(cfg: &SsConfig) -> Result<SsMethod, NativeError> {
