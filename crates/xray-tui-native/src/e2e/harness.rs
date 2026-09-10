@@ -403,13 +403,23 @@ impl Drop for CoreGuard {
 /// port-unreachable as "not yet bound". A bound listener consumes the
 /// datagram (recv times out); an unbound port bounces ICMP → recv errors
 /// with `ConnectionRefused`.
+///
+/// The probe socket MUST be **connected**: Linux only delivers ICMP errors to
+/// a connected UDP socket, so `send_to` on an unconnected one never surfaces
+/// the refusal and the old form of this probe reported `true` for an unbound
+/// port too (measured: 80/80 unconnected sends to a closed loopback port time
+/// out; 60/60 connected ones report `ConnectionRefused`). That made every
+/// UDP-readiness call a no-op.
 fn udp_ready(port: u16) -> bool {
     use std::net::UdpSocket;
     let Ok(sock) = UdpSocket::bind("127.0.0.1:0") else {
         return false;
     };
+    if sock.connect(("127.0.0.1", port)).is_err() {
+        return false;
+    }
     let _ = sock.set_read_timeout(Some(Duration::from_millis(150)));
-    let _ = sock.send_to(&[0u8; 1], ("127.0.0.1", port));
+    let _ = sock.send(&[0u8; 1]);
     let mut buf = [0u8; 4];
     !matches!(
         sock.recv(&mut buf),
@@ -956,7 +966,25 @@ mod bench_helper_tests {
     use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    use super::{spawn_sink, spawn_source};
+    use super::{spawn_sink, spawn_source, udp_ready};
+
+    #[test]
+    fn udp_ready_distinguishes_bound_from_unbound() {
+        // A bound listener: the garbage datagram is consumed, so the probe
+        // must report ready.
+        let bound = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = bound.local_addr().unwrap().port();
+        assert!(udp_ready(port), "a bound UDP port must read as ready");
+        // Unbound (the listener was dropped): the kernel answers with ICMP
+        // port-unreachable, which only a CONNECTED probe socket surfaces —
+        // the old `send_to` form returned `true` here too, making every
+        // UDP-readiness call a no-op.
+        drop(bound);
+        assert!(
+            !udp_ready(port),
+            "an unbound UDP port must read as not ready"
+        );
+    }
 
     #[tokio::test]
     async fn sink_discards_and_source_streams() {

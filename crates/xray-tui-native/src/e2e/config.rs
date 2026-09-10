@@ -789,6 +789,33 @@ pub fn client_params_vless(
 /// The trojan outbound password shared by the serve-side configs and the
 /// client params.
 pub const TROJAN_PASSWORD: &str = "trojan-test-password";
+/// The classic Shadowsocks password (arbitrary string; both cores derive the
+/// key with MD5 `EVP_BytesToKey`).
+pub const SS_PASSWORD: &str = "ss-test-password";
+/// The 2022-blake3 PSK for the 32-byte key length methods
+/// (`2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-poly1305`): 32 zero
+/// bytes, base64.
+pub const SS_2022_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+/// The 2022-blake3 PSK for `2022-blake3-aes-128-gcm` (16-byte key length).
+pub const SS_2022_KEY_128: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+
+/// The password a Shadowsocks row must carry for `method`: the method's key
+/// length is fixed by the 2022 spec (16 B AES-128, 32 B AES-256/ChaCha20), so
+/// a 2022 row needs a base64 PSK of exactly that length while classic AEAD
+/// rows take an arbitrary string.
+///
+/// An explicit table over the known 2022 names, not a `2022-blake3-` prefix
+/// test: an unknown `2022-blake3-*` name must not silently receive a
+/// plausible-looking key. It falls through to [`SS_PASSWORD`], which is not a
+/// valid PSK, so `password_key` fails closed at connect/gate time.
+fn ss_password(method: &str) -> &'static str {
+    match method {
+        "2022-blake3-aes-128-gcm" => SS_2022_KEY_128,
+        "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => SS_2022_KEY,
+        _ => SS_PASSWORD,
+    }
+}
+
 /// The hysteria2 auth password shared by the server config and client params.
 pub const HYSTERIA2_AUTH: &str = "hy2-test-auth-token";
 /// The salamander obfuscation PSK (≥4 bytes) for the obfs row.
@@ -946,6 +973,111 @@ pub fn client_params_hysteria2(
     }
     let protocol: ProtocolConfig =
         serde_json::from_value(protocol_value).expect("hysteria2 client config parses");
+    let server = EndpointEssentials::new("127.0.0.1", port);
+    NativeConnectParams::new(
+        protocol,
+        server,
+        TargetAddr::new(Host::Ip(target.ip()), target.port()),
+    )
+}
+
+/// Shadowsocks inbound JSON for `core`.
+///
+/// The password is method-derived ([`ss_password`]): classic AEAD rows take
+/// [`SS_PASSWORD`], 2022 rows a base64 PSK of exactly the method's key length.
+/// `udp` widens xray's `settings.network` to `tcp,udp` (the default is
+/// TCP-only); sing-box serves both by default. `tls` adds the stream/TLS layer
+/// — xray only: sing-box 1.13's shadowsocks inbound has no `tls` field
+/// (`inbounds[0].tls: json: unknown field "tls"`), so a TLS SS row is
+/// single-cored to xray (see `tests/shadowsocks.rs`).
+#[must_use]
+pub fn ss_inbound(
+    core: CoreKind,
+    env: &ServerEnv,
+    tls: &dyn TlsVariant,
+    network: &str,
+    method: &str,
+    udp: bool,
+) -> String {
+    let cert_path = env.tmp.join("server.crt").to_string_lossy().into_owned();
+    let key_path = env.tmp.join("server.key").to_string_lossy().into_owned();
+    let password = ss_password(method);
+    let alpn = match network {
+        "grpc" => serde_json::json!(["h2"]),
+        _ => serde_json::json!(["http/1.1"]),
+    };
+    let json = match core {
+        CoreKind::Xray => {
+            let mut stream = serde_json::json!({ "network": network });
+            if tls.tls_enabled() {
+                stream["security"] = serde_json::json!("tls");
+                stream["tlsSettings"] = serde_json::json!({
+                    "certificates": [
+                        { "certificateFile": cert_path, "keyFile": key_path }
+                    ],
+                    "alpn": alpn
+                });
+            }
+            serde_json::json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1", "port": env.port, "protocol": "shadowsocks",
+                    "settings": {
+                        "method": method,
+                        "password": password,
+                        "network": if udp { "tcp,udp" } else { "tcp" }
+                    },
+                    "streamSettings": stream
+                }],
+                "outbounds": [{ "protocol": "freedom" }]
+            })
+        }
+        CoreKind::SingBox => {
+            let mut inbound = serde_json::json!({
+                "type": "shadowsocks", "listen": "127.0.0.1", "listen_port": env.port,
+                "method": method, "password": password
+            });
+            if tls.tls_enabled() {
+                inbound["tls"] = serde_json::json!({
+                    "enabled": true,
+                    "certificate_path": cert_path,
+                    "key_path": key_path,
+                    "alpn": alpn
+                });
+            }
+            serde_json::json!({
+                "log": { "level": "warn" },
+                "inbounds": [inbound],
+                "outbounds": [{ "type": "direct" }]
+            })
+        }
+    };
+    serde_json::to_string(&json).expect("shadowsocks server config serializes")
+}
+
+/// Native client params dialing a Shadowsocks listener.
+///
+/// `SsConfig` has no transport field: the row is a plain TCP dial, plus the
+/// optional TLS layer the chain applies when `tls.tls_enabled()` (the SS UDP
+/// relay dials the server's own UDP port, so a UDP row never carries a
+/// security layer — `ss::udp::connect_udp` refuses one).
+#[must_use]
+pub fn client_params_ss(
+    port: u16,
+    target: SocketAddr,
+    tls: &dyn TlsVariant,
+    network: &str,
+    method: &str,
+) -> NativeConnectParams {
+    let mut protocol_value = serde_json::json!({
+        "schema": "Ss",
+        "method": method,
+        "password": ss_password(method)
+    });
+    if tls.tls_enabled() {
+        protocol_value["security"] = client_security(tls, network);
+    }
+    let protocol: ProtocolConfig =
+        serde_json::from_value(protocol_value).expect("ss client config parses");
     let server = EndpointEssentials::new("127.0.0.1", port);
     NativeConnectParams::new(
         protocol,
@@ -1331,5 +1463,107 @@ mod tests {
             tls_params.protocol.security().unwrap().type_str(),
             Some("tls")
         );
+    }
+
+    #[test]
+    fn ss_password_matches_the_method_key_length() {
+        // Classic rows take an arbitrary string (MD5 EVP_BytesToKey); a 2022
+        // row's PSK must decode to exactly the method's key length — any
+        // other length is a fatal `password_key` error in the connect path.
+        let len = |pw: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(pw)
+                .map(|b| b.len())
+        };
+        assert_eq!(ss_password("aes-128-gcm"), SS_PASSWORD);
+        assert_eq!(ss_password("xchacha20-ietf-poly1305"), SS_PASSWORD);
+        assert_eq!(len(ss_password("2022-blake3-aes-128-gcm")), Ok(16));
+        assert_eq!(len(ss_password("2022-blake3-aes-256-gcm")), Ok(32));
+        assert_eq!(len(ss_password("2022-blake3-chacha20-poly1305")), Ok(32));
+        // Fail-closed, not prefix-matched: an unknown 2022 name does NOT get
+        // a plausible 32-byte PSK — it gets the non-base64 classic password,
+        // so `password_key` refuses it.
+        assert_eq!(ss_password("2022-blake3-aes-192-gcm"), SS_PASSWORD);
+    }
+
+    #[test]
+    fn ss_builders_emit_the_per_core_dialect() {
+        let env = ServerEnv {
+            port: 12345,
+            certs: &generate_certs(),
+            tmp: std::path::Path::new("/tmp"),
+            echo: "127.0.0.1:9999".parse().unwrap(),
+            tls_echo: "127.0.0.1:9443".parse().unwrap(),
+            inner_tls_echo: None,
+            udp_echo: None,
+        };
+        // Plain TCP row: xray takes `settings.{method,password,network}` and
+        // a streamSettings WITHOUT a security layer; sing-box the same
+        // values top-level and no `tls` object.
+        let xray: serde_json::Value = serde_json::from_str(&ss_inbound(
+            CoreKind::Xray,
+            &env,
+            &NoTls,
+            "tcp",
+            "aes-128-gcm",
+            false,
+        ))
+        .unwrap();
+        let settings = &xray["inbounds"][0]["settings"];
+        assert_eq!(settings["method"], "aes-128-gcm");
+        assert_eq!(settings["password"], SS_PASSWORD);
+        assert_eq!(settings["network"], "tcp");
+        let stream = &xray["inbounds"][0]["streamSettings"];
+        assert!(stream.get("security").is_none());
+        assert!(stream.get("tlsSettings").is_none());
+
+        let sing: serde_json::Value = serde_json::from_str(&ss_inbound(
+            CoreKind::SingBox,
+            &env,
+            &NoTls,
+            "tcp",
+            "aes-128-gcm",
+            false,
+        ))
+        .unwrap();
+        let inbound = &sing["inbounds"][0];
+        assert_eq!(inbound["type"], "shadowsocks");
+        assert_eq!(inbound["method"], "aes-128-gcm");
+        assert_eq!(inbound["password"], SS_PASSWORD);
+        assert!(inbound.get("tls").is_none());
+
+        // The UDP row widens ONLY xray's `network` (sing-box serves both
+        // networks by default) and the 2022 method carries its PSK.
+        let udp: serde_json::Value = serde_json::from_str(&ss_inbound(
+            CoreKind::Xray,
+            &env,
+            &NoTls,
+            "tcp",
+            "2022-blake3-aes-256-gcm",
+            true,
+        ))
+        .unwrap();
+        assert_eq!(udp["inbounds"][0]["settings"]["network"], "tcp,udp");
+        assert_eq!(udp["inbounds"][0]["settings"]["password"], SS_2022_KEY);
+
+        // Client params parse as an Ss config: the method/password pair and
+        // the omitted-vs-present `security` key.
+        let target = "1.2.3.4:80".parse().unwrap();
+        let params = client_params_ss(12345, target, &NoTls, "tcp", "2022-blake3-aes-256-gcm");
+        match &params.protocol {
+            ProtocolConfig::Ss(cfg) => {
+                assert_eq!(cfg.method.as_str(), "2022-blake3-aes-256-gcm");
+                assert_eq!(cfg.password, SS_2022_KEY);
+                assert!(cfg.security.is_empty());
+            }
+            other => panic!("expected an Ss config, got {other:?}"),
+        }
+        let tls_params = client_params_ss(12345, target, &StandardTls, "tcp", "aes-128-gcm");
+        match &tls_params.protocol {
+            ProtocolConfig::Ss(cfg) => {
+                assert_eq!(cfg.security.type_str(), Some("tls"));
+            }
+            other => panic!("expected an Ss config, got {other:?}"),
+        }
     }
 }

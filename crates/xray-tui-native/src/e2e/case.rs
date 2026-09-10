@@ -19,6 +19,7 @@ pub enum ProtocolKind {
     Vmess,
     Trojan,
     Hysteria2,
+    Shadowsocks,
 }
 
 /// VLESS flow control: `xtls-rprx-vision` (`Vision`) or the XUDP variant
@@ -126,8 +127,13 @@ pub struct CaseSpec {
     /// Hysteria2 Salamander obfuscation PSK (`Some` enables it).
     obfs: Option<&'static str>,
     /// Single-core gate: `Some(kind)` restricts the row to that core only
-    /// (hysteria2 is sing-box-only — xray-core has no hysteria2 inbound).
+    /// (hysteria2 is sing-box-only — xray-core has no hysteria2 inbound; the
+    /// SS TLS row is xray-only — sing-box's shadowsocks inbound has no `tls`
+    /// field). Set via [`CaseSpec::with_single_core`].
     single_core: Option<CoreKind>,
+    /// Shadowsocks cipher method (`None` for every other protocol); selects
+    /// the codec family and the server config's method/password.
+    ss_method: Option<&'static str>,
 }
 
 impl CaseSpec {
@@ -147,6 +153,7 @@ impl CaseSpec {
             pq_assert: false,
             obfs: None,
             single_core: None,
+            ss_method: None,
         }
     }
 
@@ -166,6 +173,7 @@ impl CaseSpec {
             pq_assert: false,
             obfs: None,
             single_core: None,
+            ss_method: None,
         }
     }
 
@@ -187,6 +195,7 @@ impl CaseSpec {
             pq_assert: false,
             obfs: None,
             single_core: None,
+            ss_method: None,
         }
     }
 
@@ -208,6 +217,35 @@ impl CaseSpec {
             pq_assert: false,
             obfs,
             single_core: Some(CoreKind::SingBox),
+            ss_method: None,
+        }
+    }
+
+    /// A Shadowsocks case: `method` selects the cipher family
+    /// (`aes-128-gcm`, `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305`,
+    /// `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`,
+    /// `2022-blake3-chacha20-poly1305`).
+    ///
+    /// `SsConfig` has no transport field, so the row is a plain TCP dial —
+    /// cert/fingerprint TLS via [`CaseSpec::with_tls`], or `NoTls` for the
+    /// genuinely plain rows (the `ss(...)` helpers in `tests/shadowsocks.rs`).
+    #[must_use]
+    pub fn shadowsocks(method: &'static str) -> Self {
+        Self {
+            protocol: ProtocolKind::Shadowsocks,
+            security: None,
+            tls: None,
+            network: "tcp",
+            xhttp_mode: None,
+            flow: None,
+            app: AppKind::Plain,
+            mux: false,
+            udp: None,
+            vless_enc: None,
+            pq_assert: false,
+            obfs: None,
+            single_core: None,
+            ss_method: Some(method),
         }
     }
 
@@ -278,6 +316,15 @@ impl CaseSpec {
         self
     }
 
+    /// Restrict a row to one core (used when the server side genuinely cannot
+    /// serve the config — e.g. sing-box 1.13's shadowsocks inbound has no
+    /// `tls` field, so the SS TLS row is xray-only).
+    #[must_use]
+    pub const fn with_single_core(mut self, kind: CoreKind) -> Self {
+        self.single_core = Some(kind);
+        self
+    }
+
     /// The app-side probe kind.
     #[must_use]
     pub const fn app(&self) -> AppKind {
@@ -334,12 +381,24 @@ impl CaseSpec {
             .map_or(&[CoreKind::Xray, CoreKind::SingBox], |s| s.cores())
     }
 
-    /// True when the row's server listens on UDP (a QUIC/QUIC-family
-    /// listener — hysteria2) and the readiness probe must be a bound UDP
-    /// socket rather than a TCP accept.
+    /// True when the row's server must be probed over UDP at readiness time:
+    /// a QUIC/QUIC-family listener (hysteria2 — UDP-only) or an SS row whose
+    /// `app` is [`AppKind::Udp`].
+    ///
+    /// `harness::spawn_core`'s UDP probe binds an EPHEMERAL socket and sends
+    /// a datagram at the server's port — it never binds that port — so it is
+    /// safe for SS's dual TCP+UDP listener: it only proves the server's UDP
+    /// socket is bound. A TCP accept alone can win the race against xray's
+    /// UDP bind (the client only ever uses the server's UDP port), losing the
+    /// first datagram and burning the full probe deadline. SS TCP rows stay
+    /// `false` (their client never touches UDP).
     #[must_use]
     pub const fn is_udp_listener(&self) -> bool {
-        matches!(self.protocol, ProtocolKind::Hysteria2)
+        match self.protocol {
+            ProtocolKind::Hysteria2 => true,
+            ProtocolKind::Shadowsocks => matches!(self.app, AppKind::Udp),
+            _ => false,
+        }
     }
 }
 
@@ -350,7 +409,10 @@ impl E2eCase for CaseSpec {
             ProtocolKind::Vmess => "vmess",
             ProtocolKind::Trojan => "trojan",
             ProtocolKind::Hysteria2 => "hysteria2",
+            ProtocolKind::Shadowsocks => "ss",
         };
+        // The SS method is the row's identity: two SS rows differ only by it.
+        let meth = self.ss_method.map_or(String::new(), |m| format!("/{m}"));
         let flow = self
             .flow
             .map_or_else(String::new, |flow| format!("{}/", flow.as_str()));
@@ -384,7 +446,7 @@ impl E2eCase for CaseSpec {
             ""
         };
         format!(
-            "{proto}/{flow}{}/{tls}{sec}{app}{mux}{obfs}{pq}{enc}",
+            "{proto}{meth}/{flow}{}/{tls}{sec}{app}{mux}{obfs}{pq}{enc}",
             self.network
         )
     }
@@ -405,6 +467,14 @@ impl E2eCase for CaseSpec {
             }
             ProtocolKind::Trojan => config::trojan_inbound(core, env, self.network),
             ProtocolKind::Hysteria2 => config::hysteria2_inbound(env, self.obfs),
+            ProtocolKind::Shadowsocks => config::ss_inbound(
+                core,
+                env,
+                self.tls(),
+                self.network,
+                self.ss_method.expect("shadowsocks case requires a method"),
+                self.app == AppKind::Udp,
+            ),
         }
     }
 
@@ -437,6 +507,13 @@ impl E2eCase for CaseSpec {
                 config::client_params_trojan(port, target, self.tls(), self.network)
             }
             ProtocolKind::Hysteria2 => config::client_params_hysteria2(port, target, self.obfs),
+            ProtocolKind::Shadowsocks => config::client_params_ss(
+                port,
+                target,
+                self.tls(),
+                self.network,
+                self.ss_method.expect("shadowsocks case requires a method"),
+            ),
         };
         // pq-enc rows: the VLESS outbound carries the mlkem768x25519plus
         // account `encryption` (the client-side PUBLIC key segments).
@@ -595,6 +672,22 @@ mod tests {
                 .label(),
             "vless/xtls-rprx-vision-udp443/tcp/tls/udp-xudp/mux"
         );
+        // SS rows: the method is part of the name (two SS rows differ only
+        // by it); the tls segment still names the variant, and there is no
+        // transport dimension.
+        assert_eq!(
+            CaseSpec::shadowsocks("aes-128-gcm")
+                .with_tls(Box::new(NoTls))
+                .label(),
+            "ss/aes-128-gcm/tcp/plain"
+        );
+        assert_eq!(
+            CaseSpec::shadowsocks("2022-blake3-chacha20-poly1305")
+                .with_app(AppKind::Udp)
+                .with_udp(PacketMode::Raw)
+                .label(),
+            "ss/2022-blake3-chacha20-poly1305/tcp/tls/udp-raw"
+        );
     }
 
     #[test]
@@ -683,6 +776,31 @@ mod tests {
     }
 
     #[test]
+    fn udp_readiness_gate() {
+        // A UDP row's client only ever uses the server's UDP port, so the
+        // readiness probe must be the UDP one (a TCP accept can win the race
+        // against the server's UDP bind and lose the first datagram).
+        assert!(
+            CaseSpec::shadowsocks("aes-128-gcm")
+                .with_app(AppKind::Udp)
+                .with_udp(PacketMode::Raw)
+                .is_udp_listener()
+        );
+        // SS TCP rows never touch UDP: the readiness probe stays a TCP accept.
+        assert!(!CaseSpec::shadowsocks("aes-128-gcm").is_udp_listener());
+        // hysteria2 is a QUIC (UDP-only) listener regardless of `app`.
+        assert!(CaseSpec::hysteria2(None).is_udp_listener());
+        // The other protocols' listeners are TCP.
+        assert!(!CaseSpec::trojan().is_udp_listener());
+        assert!(
+            !CaseSpec::vless()
+                .with_app(AppKind::Udp)
+                .with_udp(PacketMode::Raw)
+                .is_udp_listener()
+        );
+    }
+
+    #[test]
     fn cores_gate_defaults_to_both() {
         assert_eq!(
             CaseSpec::vless().cores(),
@@ -691,6 +809,18 @@ mod tests {
         assert_eq!(
             CaseSpec::vmess(Chacha20Poly1305Variant).cores(),
             &[CoreKind::Xray, CoreKind::SingBox]
+        );
+        // SS rows default to both cores; `with_single_core` narrows exactly
+        // the TLS row (sing-box 1.13's shadowsocks inbound has no `tls`).
+        assert_eq!(
+            CaseSpec::shadowsocks("aes-128-gcm").cores(),
+            &[CoreKind::Xray, CoreKind::SingBox]
+        );
+        assert_eq!(
+            CaseSpec::shadowsocks("aes-128-gcm")
+                .with_single_core(CoreKind::Xray)
+                .cores(),
+            &[CoreKind::Xray]
         );
     }
 }
