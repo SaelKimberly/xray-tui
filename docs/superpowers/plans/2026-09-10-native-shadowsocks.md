@@ -19,7 +19,8 @@
 - **After any `Cargo.lock` change:** `cargo hakari generate`, and append the new crates (`sha1`, `hkdf`, `blake3`) to the `xray-tui-hakari` machete ignore list using the AGENTS.md awk recipe. `just quality-gate` must pass at the end.
 - **UDP mode guard unchanged:** `reject_vless_only_mode` stays as-is; SS rows use `PacketMode::Raw` (inert — the wire always carries a per-packet address).
 - **Out of scope (never add silently):** SIP003 plugins, legacy stream ciphers, 2022 multi-user EIH, server side, `PacketMode` additions.
-- **Skip per-task formatters/linters/suites.** Run `cargo fmt`/`clippy`/full nextest once at the end (Task 12).
+- **Skip per-task formatters/linters/suites.** Run `cargo fmt`/`clippy`/full nextest once at the end (Task 11).
+- **Commits are the coordinator's.** This plan runs under subagent-driven development: implementers edit and test but never stage/commit/branch; the coordinator stages the task-owned paths and creates one task commit after the spec-compliance and code-quality reviews pass. Every "Step N: Commit" below is the coordinator's step, and the listed message is the suggested one.
 - Salts come from `crate::rand::fill_nonsecret` (wire-visible filler).
 - Errors: return `NativeError::Config` for bad method/password, `NativeError::Protocol { kind: ProtocolKind::Shadowsocks|Shadowsocks2022, detail }` for wire failures.
 
@@ -56,11 +57,12 @@ Delete the `blake3 = "1"` line from `[dev-dependencies]`.
 mod tests {
     use super::*;
 
-    /// RFC 5869 test case 1 (SHA-1): IKMsalt/IKM zero-filled by the RFC's
-    /// counts. Guards the extract/expand wiring (hkdf 0.13 × sha1 0.11 ×
-    /// hmac 0.13 must share digest 0.11).
+    /// HKDF-SHA1 pinned to vectors computed with an INDEPENDENT
+    /// implementation (Python `hmac`/`hashlib`, HMAC-SHA1 extract/expand per
+    /// RFC 5869) — not with the crate under test. First case: IKM = 0x0b×22,
+    /// salt = 0x00..0x0c, info = 0xf0..0xf9, L = 42.
     #[test]
-    fn hkdf_sha1_rfc5869_case1() {
+    fn hkdf_sha1_matches_independent_vectors() {
         let ikm = [0x0b_u8; 22];
         let salt: Vec<u8> = (0..13u8).collect();
         let info: Vec<u8> = (0xf0..0xfa).collect();
@@ -69,38 +71,55 @@ mod tests {
         assert_eq!(
             okm,
             [
-                0x08, 0x5a, 0x4d, 0xf6, 0x6d, 0xd2, 0x9b, 0x9a, 0x6f, 0x32, 0x34, 0x1c, 0x2a, 0x69,
-                0x8d, 0x2b, 0x2c, 0x79, 0x51, 0x77, 0x03, 0xe7, 0xa5, 0x18, 0x20, 0x64, 0x6b, 0x9d,
-                0xdc, 0xd0, 0xf8, 0xf5, 0x0b, 0xf8, 0x00, 0x90, 0x7d, 0x64, 0x86, 0xa4, 0x76, 0x04,
+                0xd6, 0x00, 0x0f, 0xfb, 0x5b, 0x50, 0xbd, 0x39, 0x70, 0xb2, 0x60, 0x01, 0x77, 0x98,
+                0xfb, 0x9c, 0x8d, 0xf9, 0xce, 0x2e, 0x2c, 0x16, 0xb6, 0xcd, 0x70, 0x9c, 0xca, 0x07,
+                0xdc, 0x3c, 0xf9, 0xcf, 0x26, 0xd6, 0xc6, 0xd7, 0x50, 0xd0, 0xaa, 0xf5, 0xac, 0x94,
             ]
         );
     }
 
     /// The exact classic-SS call: subkey = HKDF-SHA1(psk, salt, "ss-subkey").
     #[test]
-    fn ss_subkey_matches_reference_implementation() {
-        let psk = b"password";
-        let salt = [0x11_u8; 16];
+    fn ss_subkey_matches_independent_vector() {
         let mut out = [0u8; 16];
-        hkdf_sha1(psk, &salt, b"ss-subkey", &mut out);
-        // Generated with `hkdf.New(sha1.New, psk, salt, []byte("ss-subkey"))`.
-        assert_eq!(out, [0u8; 16]); // REPLACE with the generated vector in Step 4
+        hkdf_sha1(b"password", &[0x11_u8; 16], b"ss-subkey", &mut out);
+        assert_eq!(
+            out,
+            [
+                0x8e, 0x2b, 0x1a, 0x61, 0x11, 0x23, 0x92, 0x29, 0x40, 0x0b, 0x5d, 0xd6, 0x12, 0x77,
+                0x19, 0x31,
+            ]
+        );
     }
 
-    /// 2022 session subkey: ASCII context, binary material (spec §2.2).
+    /// The 2022 helper must delegate to the crate with the spec's ASCII
+    /// context and the `key ‖ salt` material order. (The independent pin for
+    /// BLAKE3 derive-key lives in `protocol/vless/encryption/b3.rs`, which
+    /// cross-checks this helper against the hand-rolled implementation.)
     #[test]
-    fn blake3_session_subkey_matches_reference() {
-        let psk = [0x22_u8; 32];
+    fn blake3_helper_uses_the_spec_context_and_material_order() {
+        assert_eq!(SS2022_SUBKEY_CONTEXT, "shadowsocks 2022 session subkey");
+        let key = [0x22_u8; 32];
         let salt = [0x33_u8; 32];
-        let mut material = Vec::new();
-        material.extend_from_slice(&psk);
-        material.extend_from_slice(&salt);
-        let sub = blake3_derive_key("shadowsocks 2022 session subkey", &material);
-        assert_eq!(sub, [0u8; 32]); // REPLACE with the generated vector in Step 4
+        let material = [key.as_slice(), salt.as_slice()].concat();
+        assert_eq!(
+            blake3_derive_key(SS2022_SUBKEY_CONTEXT, &material),
+            blake3::derive_key("shadowsocks 2022 session subkey", &material)
+        );
+        assert_ne!(
+            blake3_derive_key(SS2022_SUBKEY_CONTEXT, &material),
+            blake3_derive_key(SS2022_SUBKEY_CONTEXT, &{
+                let mut swapped = salt.to_vec();
+                swapped.extend_from_slice(&key);
+                swapped
+            }),
+            "material order is key ‖ salt, not salt ‖ key"
+        );
     }
 
     /// Classic password → key: MD5 `EVP_BytesToKey`, ALWAYS (xray
-    /// `passwordToCipherKey` — no raw-password shortcut).
+    /// `passwordToCipherKey` — no raw-password shortcut). Second block =
+    /// MD5(digest ‖ password).
     #[test]
     fn evp_bytes_to_key_md5_vectors() {
         assert_eq!(
@@ -110,10 +129,30 @@ mod tests {
                 0xcf, 0x99,
             ]
         );
-        // 32-byte key = the 16-byte digest followed by MD5(digest || password).
-        let k32 = evp_bytes_to_key_md5(b"password", 32);
-        assert_eq!(k32.len(), 32);
-        assert_eq!(&k32[..16], &*evp_bytes_to_key_md5(b"password", 16));
+        assert_eq!(
+            &*evp_bytes_to_key_md5(b"password", 32),
+            &[
+                0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d, 0x83, 0x27, 0xde, 0xb8, 0x82,
+                0xcf, 0x99, 0x2b, 0x95, 0x99, 0x0a, 0x91, 0x51, 0x37, 0x4a, 0xbd, 0x8f, 0xf8, 0xc5,
+                0xa7, 0xa0, 0xfe, 0x08,
+            ]
+        );
+    }
+
+    /// The in-tree hand-rolled BLAKE3 (already pinned against the `blake3`
+    /// crate by `derive_key_matches_reference_crate`) must agree with the
+    /// helper on the 2022 context — an implementation the crate call cannot
+    /// silently define into correctness. Add this test to
+    /// `protocol/vless/encryption/b3.rs`'s test module.
+    #[test]
+    fn ss2022_subkey_matches_hand_rolled_derive_key() {
+        let key = [0x22_u8; 32];
+        let salt = [0x33_u8; 32];
+        let material = [key.as_slice(), salt.as_slice()].concat();
+        assert_eq!(
+            crate::crypto::kdf::blake3_derive_key("shadowsocks 2022 session subkey", &material),
+            derive_key_bytes(b"shadowsocks 2022 session subkey", &material)
+        );
     }
 }
 ```
@@ -149,6 +188,10 @@ pub fn hkdf_sha1(psk: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
         .expect("HKDF-SHA1 output length is bounded by callers (< 255*32)");
 }
 
+/// The 2022 session-subkey context (2022 edition spec §2.2) — the ONE owner
+/// of this string; `protocol/ss/method.rs` imports it.
+pub(crate) const SS2022_SUBKEY_CONTEXT: &str = "shadowsocks 2022 session subkey";
+
 /// `blake3::derive_key(context, material)` — the 2022 session-subkey KDF.
 #[must_use]
 pub fn blake3_derive_key(context: &str, material: &[u8]) -> [u8; 32] {
@@ -181,36 +224,7 @@ pub fn evp_bytes_to_key_md5(password: &[u8], key_len: usize) -> Zeroizing<Vec<u8
 }
 ```
 
-Generate the two placeholder vectors with the local toolchain (Go 1.27 is installed), then paste them in:
-
-```bash
-cat > /tmp/ssvec.go <<'EOF'
-package main
-
-import (
-	"crypto/sha1"
-	"fmt"
-	"io"
-	"golang.org/x/crypto/hkdf"
-)
-
-func main() {
-	psk := []byte("password")
-	salt := make([]byte, 16)
-	for i := range salt {
-		salt[i] = 0x11
-	}
-	out := make([]byte, 16)
-	r := hkdf.New(sha1.New, psk, salt, []byte("ss-subkey"))
-	io.ReadFull(r, out)
-	fmt.Printf("%#v\n", out)
-}
-EOF
-# run inside the go-shadowsocks2 module (has golang.org/x/crypto vendored):
-cp /tmp/ssvec.go thirdparty/go-shadowsocks2/ssvec/main.go 2>/dev/null || true
-cd thirdparty/go-shadowsocks2 && go mod tidy >/dev/null 2>&1; go run ./ssvec
-```
-For the BLAKE3 vector, `cargo test -p xray-tui-native --lib blake3_session_subkey -- --nocapture` with a temporary `println!("{:?}", sub);` is the reference-equivalent path (the `blake3` crate *is* the reference); record the printed value, then remove the print. Delete `thirdparty/go-shadowsocks2/ssvec` afterwards — `thirdparty/` is read-only reference material.
+No vector generation step is needed: the HKDF-SHA1 and `EVP_BytesToKey` values above were computed with an independent implementation (Python `hmac`/`hashlib`) and are pinned verbatim; the BLAKE3 helper is cross-checked against the in-tree hand-rolled implementation in `b3.rs` (the last test in Step 2), and tier-3 interop with both cores is the wire-level authority.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -656,7 +670,7 @@ use xray_tui_proto::proto_spec::ProtocolKind;
 use zeroize::Zeroizing;
 
 use crate::crypto::aead::SsAead;
-use crate::crypto::kdf::{blake3_derive_key, evp_bytes_to_key_md5, hkdf_sha1};
+use crate::crypto::kdf::{SS2022_SUBKEY_CONTEXT, blake3_derive_key, evp_bytes_to_key_md5, hkdf_sha1};
 use crate::error::NativeError;
 
 /// The KDF family a method belongs to — it selects the subkey derivation and
@@ -668,9 +682,6 @@ pub enum SsFamily {
     /// 2022-blake3: BLAKE3 subkey, standalone header chunks, `[salt][header]…`.
     Blake3_2022,
 }
-
-/// The 2022 session-subkey context (2022 edition spec §2.2).
-const SS2022_SUBKEY_CONTEXT: &str = "shadowsocks 2022 session subkey";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SsMethod {
@@ -1263,7 +1274,7 @@ git commit -m "feat(native): dispatch shadowsocks TCP through the family codecs"
 
 ---
 
-### Task 6: Classic AEAD UDP (dial-end carrier) + `PacketTunnel::Ss`
+### Task 6: Shadowsocks UDP — dial-end carrier (classic + 2022), `PacketTunnel::Ss`
 
 **Files:**
 - Create: `crates/xray-tui-native/src/protocol/ss/udp.rs`
@@ -1275,7 +1286,7 @@ git commit -m "feat(native): dispatch shadowsocks TCP through the family codecs"
 - Produces:
   - `fn seal_datagram(method, key: &[u8], dest: &TargetAddr, payload: &[u8]) -> Result<Vec<u8>, NativeError>`,
   - `fn open_datagram(method, key: &[u8], packet: &[u8]) -> Result<(TargetAddr, Vec<u8>), NativeError>`,
-  - `pub struct SsUdpTunnel { socket: Arc<UdpSocket>, method: SsMethod, key: Arc<Zeroizing<Vec<u8>>>, target: TargetAddr, s2022_writer: Option<Ss2022WriterState>, s2022_reader: Option<Ss2022ReaderState> }` with `send`/`recv`/`split` (the two 2022 states are defined in Task 7; classic rows leave both `None`),
+  - `pub struct SsUdpTunnel { socket: Arc<UdpSocket>, method: SsMethod, key: Arc<Zeroizing<Vec<u8>>>, target: TargetAddr, s2022_writer: Option<Ss2022WriterState>, s2022_reader: Option<Ss2022ReaderState> }` with `send`/`recv`/`split` (the two 2022 states are defined in this task's later steps; classic rows leave both `None`),
   - `pub struct SsUdpReader` / `pub struct SsUdpWriter` (split halves; independent state over the shared `Arc<UdpSocket>`),
   - `pub async fn connect_udp(ctx: &LinkContext, method: SsMethod, cfg: &SsConfig) -> Result<SsUdpTunnel, NativeError>`.
 
@@ -1509,32 +1520,7 @@ fn ss_udp_guard(links: &[NativeConnectParams], i: usize, base: Option<&BoxStream
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
-
-Run: `cargo test -p xray-tui-native --lib protocol::ss::udp`
-Expected: PASS (3 tests).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/xray-tui-native/src/protocol/ crates/xray-tui-native/src/chain.rs
-git commit -m "feat(native): shadowsocks UDP dial-end carrier + PacketTunnel::Ss"
-```
-
----
-
-### Task 7: 2022-blake3 UDP + session state
-
-**Files:**
-- Modify: `crates/xray-tui-native/src/protocol/ss/udp.rs` (add the 2022 codec + session map)
-
-**Interfaces:**
-- Consumes: `crypto::aead::SsAead`, `crypto::kdf::blake3_derive_key`, the `aes` crate's block API (`Aes128`/`Aes256`, `BlockEncrypt`/`BlockDecrypt` — already a dependency), `rand::{fill_nonsecret, u32_below}`, `addr::encode_addr_port_last`/`decode_addr_port_last`.
-- Produces (the ONE session shape; there is no `Ss2022ClientSession` type):
-  - `pub struct Ss2022WriterState` — client session id + packet counter + cached session subkey; `fn new(method, key: Arc<Zeroizing<Vec<u8>>>) -> Self`, `fn seal(&mut self, dest: &TargetAddr, payload: &[u8]) -> Result<Vec<u8>, NativeError>`.
-  - `pub struct Ss2022ReaderState` — the server-session table (each slot carries its OWN replay window and body subkey); `fn new(..)`, `fn open(&mut self, packet: &[u8]) -> Result<Option<(TargetAddr, Vec<u8>)>, NativeError>`.
-  - `struct SlidingWindow`, `struct ServerSession { server_id, client_id, window: SlidingWindow, body_subkey: Zeroizing<Vec<u8>> }`, `struct ServerSessions { current: Option<ServerSession>, old: Option<ServerSession> }` (internal, unit-tested) — the window is **per relay session** (spec §3.2.4), never global: a server restart starts a new server session whose packet ids restart at 0, and a shared window would reject every reply.
-  - No EIH: the client never emits identity headers (single-user PSK only, spec decision 6) — do not thread an `eih` parameter anywhere.
+- [ ] **Step 4: Write the failing 2022 tests (same task — the tunnel's 2022 fields are filled here)**
 
 Wire (spec §3.2 + §4.1, shadowsocks-rust `udprelay/aead_2022.rs`):
 
@@ -1550,8 +1536,6 @@ server → client (client must parse):
 ChaCha method:
   [24B random nonce] ‖ XChaCha20Poly1305(psk directly, [client_session_id ‖ client_packet_id ‖ type | ts | pad_len | padding | addr | port | payload])
 ```
-
-- [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -1623,12 +1607,12 @@ fn check_without_commit_does_not_advance_the_window() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 5: Run to verify they fail**
 
 Run: `cargo test -p xray-tui-native --lib protocol::ss::udp`
 Expected: FAIL — the 2022 helpers do not exist.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 6: Implement the 2022 codecs**
 
 Add to `udp.rs`:
 - `fn aes_ecb_encrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16])` / `fn aes_ecb_decrypt(..)` via `Aes128`/`Aes256` `encrypt_block`/`decrypt_block` — 2022 has no aes-192 method, so any other cipher is a `NativeError::Config`.
@@ -1646,21 +1630,13 @@ Add to `udp.rs`:
   - `open`: AES family → ECB-decrypt `packet[..16]` with the psk to recover the plaintext separate header `(server_session_id, server_packet_id)`; `let Some(client) = sessions.check(server_session_id, server_packet_id) else { return Ok(None) };` `aead.open(key = sessions.body_subkey(server_session_id).unwrap(), nonce = separate_header_nonce(server_session_id, server_packet_id), aad = "", packet[16..])` — an open failure also returns `Ok(None)` **without committing**; parse the body, validate `type == 1`, the timestamp within 30 s, and `client_session_id == client`; only then `sessions.commit(server_session_id, server_packet_id)`. ChaCha family: same check → open → validate → commit order with the psk and the 24-byte leading nonce, ids read from the merged header. The opened body is the server main header `type=1 ‖ ts ‖ client_session_id BE8 ‖ pad_len u16be ‖ padding ‖ addr ‖ port ‖ payload` → `(origin TargetAddr, payload)`. A datagram dropped at any step never ends the session.
 - Wire the two states into `SsUdpTunnel` (Task 6) exactly as its struct declares: `send` → `s2022_writer`, `recv` → `s2022_reader`, `split` moves them into `SsUdpWriter`/`SsUdpReader`; classic rows keep `seal_datagram`/`open_datagram` and both options stay `None`.
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 7: Run the whole UDP module to verify pass**
 
 Run: `cargo test -p xray-tui-native --lib protocol::ss::udp`
-Expected: PASS.
+Expected: PASS (classic + 2022 tests).
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/xray-tui-native/src/protocol/ss/udp.rs
-git commit -m "feat(native): shadowsocks-2022 UDP sessions + sliding window"
-```
-
----
-
-### Task 8: Capability gate
+**Then the coordinator commits one task commit** (this plan runs under subagent-driven development: implementers never commit; see the ledger's coordinator-commit ruling).
+### Task 7: Capability gate
 
 **Files:**
 - Modify: `crates/xray-tui-native/src/capability.rs` (`NATIVE_KINDS`, `kind_supported`, `supported`, new `ss_supported`, tests)
@@ -1777,7 +1753,7 @@ git commit -m "feat(native): capability gate for shadowsocks + shadowsocks-2022"
 
 ---
 
-### Task 9: E2E harness + matrix
+### Task 8: E2E harness + matrix
 
 **Files:**
 - Modify: `crates/xray-tui-native/src/e2e/case.rs` (`ProtocolKind::Shadowsocks`, `ss_method` field, `CaseSpec::shadowsocks`, label/server_config/client_params arms)
@@ -1923,7 +1899,7 @@ git commit -m "test(native): shadowsocks + 2022 e2e matrix against both cores"
 
 ---
 
-### Task 10: Benches
+### Task 9: Benches
 
 **Files:**
 - Create: `crates/xray-tui-native/benches/ss_codec.rs`
@@ -2025,7 +2001,7 @@ git commit -m "bench(native): shadowsocks codec + throughput rows"
 
 ---
 
-### Task 11: Docs
+### Task 10: Docs
 
 **Files:**
 - Modify: `NATIVE_CORE.md` (crate map `protocol/` + `crypto/` rows, capability notes, tier counts, SS axis paragraph, deferral list)
@@ -2048,7 +2024,7 @@ git commit -m "docs: native shadowsocks support in the core maps + capability no
 
 ---
 
-### Task 12: Full verification
+### Task 11: Full verification
 
 **Files:** none (verification only).
 
