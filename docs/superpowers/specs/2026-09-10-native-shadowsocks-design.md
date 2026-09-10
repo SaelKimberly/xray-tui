@@ -122,7 +122,9 @@ all-zero bytes.
 
 ```
 subkey = blake3::derive_key("shadowsocks 2022 session subkey", psk ‖ salt)
-nonce  = 12-byte LE counter, incremented per chunk;  each chunk = one AEAD seal
+nonce  = 12-byte LE counter, advanced by EVERY seal/open (spec §3.1.1) —
+         so a payload chunk costs +2 (length seal, payload seal), and the
+         standalone header chunks cost +1 each
 
 request : [salt][seal(11B: type=0 | ts u64be | len u16be)]
                 [seal(varlen: ATYP|addr|port | pad_len u16be | padding | initial payload)]
@@ -171,6 +173,22 @@ per-packet address, so
   `reject_vless_only_mode`; `PacketMode::Raw` is accepted and inert.
   **The guard is not modified** — no carved exemption, no divergent e2e row
   shape (mirrors trojan/hysteria2 rows).
+
+**Transport shape (dial-end, not a stream carrier).** Shadowsocks' UDP relay
+is reached by sending UDP datagrams to the server's own port — not by framing
+UDP inside a TCP tunnel the way VLESS/VMess/trojan do (xray
+`proxy/shadowsocks/client.go` UDP dispatch; sing-box's ss outbound likewise).
+`connect_chain_udp` therefore treats an SS last link like the QUIC arm: the
+dial (`bind` a UDP socket to `params.server`) REPLACES dial + security +
+transport + upgrade, no chain is possible (an SS UDP link must be the only
+link — the guard mirrors `quic_guard` and refuses any non-last position), and
+each SS datagram is exactly one UDP datagram on the wire (no carrier length
+prefix). `PacketTunnel::Ss` consequently owns an `Arc<UdpSocket>`, and its
+split halves are two independent states over that socket (classic: salt/subkey
+per datagram, stateless; 2022: writer state = client session + packet counter,
+reader state = server-session map + sliding window), so no shared lock is
+needed. SS remains `ConnectShape::TcpStream` for the TCP path — the UDP shape
+is a UDP-path-only dispatch arm, documented next to `is_quic_link`.
 
 ## Capability gate
 
