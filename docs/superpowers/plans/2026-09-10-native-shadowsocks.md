@@ -191,7 +191,7 @@ Expected: FAIL — `cannot find function hkdf_sha1` / `blake3_derive_key` / `evp
 //! `protocol/vless/encryption/b3.rs`).
 //!
 //! Backends: REALITY auth-key derivation uses ring (workspace standard); the
-//! Shadowsocks helpers above use RustCrypto `hkdf`/`sha1`, `md-5`, and the
+//! Shadowsocks helpers above use `RustCrypto` `hkdf`/`sha1`, `md-5`, and the
 //! `blake3` crate.
 
 use hkdf::Hkdf;
@@ -277,7 +277,8 @@ git commit -m "feat(native): shadowsocks KDF primitives (HKDF-SHA1, blake3, EVP_
 - Produces:
   - `pub enum SsAead { Aes128Gcm, Aes192Gcm, Aes256Gcm, ChaCha20Poly1305, XChaCha20Poly1305 }` with `const fn key_len(self) -> usize`, `const fn salt_len(self) -> usize`, `const fn nonce_len(self) -> usize`, `const fn tag_len(self) -> usize`,
   - `pub fn seal(&self, key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, NativeError>`,
-  - `pub fn open(&self, key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, NativeError>`,
+  - `pub fn open(&self, key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, NativeError>` (the convenient allocating form),
+  - `pub fn seal_into(&self, key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], out: &mut Vec<u8>) -> Result<(), NativeError>` and the matching `open_into(...)` — the allocation-free siblings the TCP/UDP codecs use on the hot path, mirroring `protocol/vmess/stream.rs`'s in-place record helpers (`encrypt_into`/`decrypt_inplace`, which append the detached tag themselves). `seal`/`open` stay as thin wrappers over them.
   - `pub struct NonceCounter { .. }` with `fn new(len: usize) -> Self`, `fn next(&mut self) -> &[u8]` (little-endian increment over the whole buffer).
 
 - [ ] **Step 1: Write the failing tests**
@@ -349,28 +350,28 @@ mod tests {
     #[test]
     fn nonce_counter_is_little_endian_and_wraps() {
         let mut c = NonceCounter::new(12);
-        assert_eq!(c.next(), &[0u8; 12]);
-        assert_eq!(c.next(), &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(c.next_nonce(), &[0u8; 12]);
+        assert_eq!(c.next_nonce(), &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Width: the XChaCha path hands out 24 bytes.
         let mut wide = NonceCounter::new(24);
-        assert_eq!(wide.next().len(), 24);
+        assert_eq!(wide.next_nonce().len(), 24);
         let mut expected = [0u8; 24];
         expected[0] = 1;
-        assert_eq!(wide.next(), &expected[..]);
+        assert_eq!(wide.next_nonce(), &expected[..]);
         // Carry chain + wrap: byte 0 carries into byte 1, and the top byte's
         // carry is dropped rather than panicking.
         let mut c = NonceCounter::new(2);
         for _ in 0..256 {
-            let _ = c.next(); // `next` is #[must_use]; the value is discarded on purpose
+            let _ = c.next_nonce(); // `next` is #[must_use]; the value is discarded on purpose
         }
-        assert_eq!(c.next(), &[0x00, 0x01]); // 256 as u16 LE
+        assert_eq!(c.next_nonce(), &[0x00, 0x01]); // 256 as u16 LE
         let mut c = NonceCounter::new(1);
         for _ in 0..256 {
-            let _ = c.next();
+            let _ = c.next_nonce();
         }
-        assert_eq!(c.next(), &[0x00]); // 256 truncated to one byte
+        assert_eq!(c.next_nonce(), &[0x00]); // 256 truncated to one byte
         let mut c = NonceCounter::new(0);
-        assert_eq!(c.next(), &[] as &[u8]);
+        assert_eq!(c.next_nonce(), &[] as &[u8]);
     }
 }
 ```
@@ -386,9 +387,9 @@ Expected: FAIL — `cannot find type SsAead`.
 //! AEAD body ciphers: AES-128/192/256-GCM and ChaCha20/XChaCha20-Poly1305.
 //!
 //! Consumers: `protocol/ss` (classic AEAD + 2022-blake3, Tasks 3/4/6). The
-//! VMess record codec (`protocol/vmess/stream.rs`) drives the same RustCrypto
+//! VMess record codec (`protocol/vmess/stream.rs`) drives the same `RustCrypto`
 //! primitives directly for its own record framing.
-//! Backend: RustCrypto (`aes-gcm`, `chacha20poly1305`) — not ring: both are
+//! Backend: `RustCrypto` (`aes-gcm`, `chacha20poly1305`) — not ring: both are
 //! already in the tree with the `zeroize` feature, and their explicit-nonce
 //! APIs are what the Shadowsocks counters need. References: RFC 8439,
 //! NIST SP 800-38D, draft-irtf-cfrg-xchacha.
@@ -542,7 +543,7 @@ impl NonceCounter {
     }
 
     /// The nonce for the next operation, incrementing the counter.
-    pub fn next(&mut self) -> &[u8] {
+    pub fn next_nonce(&mut self) -> &[u8] {
         let out = &self.buf[..self.len];
         // Increment AFTER handing out `out` on the following call: copy-free
         // readers take a snapshot, so bump at the start of the next call.
@@ -561,7 +562,7 @@ impl NonceCounter {
 }
 ```
 
-`NonceCounter::next` above is deliberately trivial-but-correct; simplify to a plain `copy_from_slice` into a caller buffer if the aliasing dance reads badly — the *observable* contract the tests pin is: first call all-zero, second call `[1, 0, …]`.
+`NonceCounter::next_nonce` above is deliberately trivial-but-correct; simplify to a plain `copy_from_slice` into a caller buffer if the aliasing dance reads badly — the *observable* contract the tests pin is: first call all-zero, second call `[1, 0, …]`.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -702,7 +703,7 @@ mod tests {
         let material = [key.as_slice(), salt.as_slice()].concat();
         assert_eq!(
             &*stream_subkey(s2022, &key, &salt),
-            &crate::protocol::vless::encryption::b3::derive_key_bytes(
+            &crate::protocol::vless::encryption::derive_key_bytes(
                 b"shadowsocks 2022 session subkey",
                 &material
             )[..]
@@ -812,7 +813,7 @@ impl SsMethod {
 
 /// Per-stream/-session subkey.
 ///
-/// Classic: `HKDF-SHA1(key, salt, "ss-subkey")`, output = key_len.
+/// Classic: `HKDF-SHA1(key, salt, "ss-subkey")`, output = `key_len`.
 /// 2022: `blake3::derive_key("shadowsocks 2022 session subkey", key ‖ salt)`.
 #[must_use]
 pub fn stream_subkey(method: SsMethod, key: &[u8], salt: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -890,7 +891,7 @@ git commit -m "feat(native): shadowsocks method table + key derivation"
 - Modify: `crates/xray-tui-native/src/protocol/ss/mod.rs` (`pub mod stream;`)
 
 **Interfaces:**
-- Consumes: `SsMethod`, `password_key`, `stream_subkey`, `SsAead`, `NonceCounter`, `crate::addr::encode_addr_port_last`, `crate::rand::fill_nonsecret`.
+- Consumes: `SsMethod`, `password_key`, `stream_subkey`, `SsAead` (`seal_into`/`open_into` on the chunk path — no per-chunk `Vec`s), `NonceCounter`, `crate::addr::encode_addr_port_last`, `crate::rand::fill_nonsecret`.
 - Produces: `pub struct SsStream<S>`, `pub async fn connect(ctx: &LinkContext, stream: BoxStream, cfg: &SsConfig, method: SsMethod) -> Result<BoxStream, NativeError>`.
 
 **Address family:** Shadowsocks carries the SOCKS5 address (`ATYP | addr | port BE2`, ATYP `0x01`/`0x03`/`0x04`) — the **port-last** family, i.e. `addr::encode_addr_port_last` / `decode_addr_port_last`, NOT `encode_addr` (VLESS/VMess port-first, `ADDR_TYPE_*` 1/2/3).
@@ -920,9 +921,9 @@ mod tests {
         assert_ne!(&wire[..16], &[0u8; 16]);
         let sub = stream_subkey(method, &key, &wire[..16]);
         let mut counter = NonceCounter::new(12);
-        let len_pt = method.aead.open(&sub, counter.next(), b"", &wire[16..34]).unwrap();
+        let len_pt = method.aead.open(&sub, counter.next_nonce(), b"", &wire[16..34]).unwrap();
         assert_eq!(len_pt, vec![0x00, 0x07]);
-        let payload = method.aead.open(&sub, counter.next(), b"", &wire[34..57]).unwrap();
+        let payload = method.aead.open(&sub, counter.next_nonce(), b"", &wire[34..57]).unwrap();
         assert_eq!(payload, encode_addr_port_last(&target).unwrap());
         task.await.unwrap();
     }
@@ -1015,11 +1016,11 @@ impl<S> SsStream<S> {
     /// ≤ `MAX_CHUNK` slice — TWO seals, TWO counter nonces, per chunk.
     fn push_chunks(&mut self, plaintext: &[u8]) {
         for slice in plaintext.chunks(MAX_CHUNK) {
-            let len_nonce = self.write.counter.next().to_vec();
+            let len_nonce = self.write.counter.next_nonce().to_vec();
             self.out.extend_from_slice(
                 &self.aead.seal(&self.write.subkey, &len_nonce, b"", &(slice.len() as u16).to_be_bytes()).expect("seal"),
             );
-            let payload_nonce = self.write.counter.next().to_vec();
+            let payload_nonce = self.write.counter.next_nonce().to_vec();
             self.out.extend_from_slice(
                 &self.aead.seal(&self.write.subkey, &payload_nonce, b"", slice).expect("seal"),
             );
@@ -1044,13 +1045,13 @@ fn read_chunk(&mut self, wire: &[u8], out: &mut Vec<u8>) -> Result<usize, Native
     if wire.len() < 2 + tag {
         return Err(chunk_error("short length chunk"));
     }
-    let len = self.aead.open(&self.read.as_ref().unwrap().subkey, self.read.as_mut().unwrap().counter.next(), b"", &wire[..2 + tag])?;
+    let len = self.aead.open(&self.read.as_ref().unwrap().subkey, self.read.as_mut().unwrap().counter.next_nonce(), b"", &wire[..2 + tag])?;
     let n = usize::from(u16::from_be_bytes([len[0], len[1]]));
     if n == 0 {
         return Err(chunk_error("zero-length chunk"));
     }
     let body = &wire[2 + tag..2 + tag + n + tag];
-    out.extend_from_slice(&self.aead.open(&self.read.as_ref().unwrap().subkey, self.read.as_mut().unwrap().counter.next(), b"", body)?);
+    out.extend_from_slice(&self.aead.open(&self.read.as_ref().unwrap().subkey, self.read.as_mut().unwrap().counter.next_nonce(), b"", body)?);
     Ok(2 + tag + n + tag)
 }
 ```
@@ -2026,7 +2027,7 @@ fn criterion_benches(c: &mut Criterion) {
         let mut nonce = NonceCounter::new(aead.nonce_len());
         let pt = vec![0xABu8; 0x3FFF];
         group.bench_function(format!("classic/{name}/seal"), |b| {
-            b.iter(|| aead.seal(&key, nonce.next(), b"", &pt).unwrap());
+            b.iter(|| aead.seal(&key, nonce.next_nonce(), b"", &pt).unwrap());
         });
         let ct = aead.seal(&key, &vec![0u8; aead.nonce_len()], b"", &pt).unwrap();
         group.bench_function(format!("classic/{name}/open"), |b| {
