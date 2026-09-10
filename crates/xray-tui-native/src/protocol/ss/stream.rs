@@ -69,10 +69,15 @@ fn wire_error(error: NativeError) -> io::Error {
 }
 
 /// The error for a response that ends inside a frame.
+///
+/// Truncation is a wire failure like any other, so it carries the same
+/// classification as the chunk failures: the seam's `io::Error` keeps the
+/// `UnexpectedEof` kind the stream layer already relies on, and the
+/// [`NativeError`] rides as its source.
 fn truncated() -> io::Error {
     io::Error::new(
         io::ErrorKind::UnexpectedEof,
-        "shadowsocks: response stream truncated mid-chunk",
+        chunk_error("response stream truncated mid-chunk"),
     )
 }
 
@@ -865,6 +870,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A response truncated mid-chunk — a length seal that arrives, then EOF
+    /// before the payload it announced — is a wire failure like any other and
+    /// keeps the Shadowsocks classification: `UnexpectedEof` at the seam,
+    /// `Protocol` in its source. Without that classification this is the one
+    /// failure class a caller cannot classify at all.
+    #[tokio::test]
+    async fn truncated_response_keeps_its_classification() {
+        let method = SsMethod::from_method("aes-128-gcm").unwrap();
+        let key = [0xEEu8; 16];
+        let salt = [0xFFu8; 16];
+        let (client, mut server) = duplex(4096);
+        let subkey = stream_subkey(method, &key, &salt);
+        server.write_all(&salt).await.unwrap();
+        // A full length seal announcing 5 bytes at the all-zero first nonce,
+        // then EOF: the body never arrives.
+        let head = method
+            .aead
+            .seal(&subkey, &[0u8; 12], b"", &5u16.to_be_bytes())
+            .unwrap();
+        server.write_all(&head).await.unwrap();
+        drop(server);
+        let mut s = SsStream::new(client, method, Zeroizing::new(key.to_vec()), &salt, None);
+        let mut buf = [0u8; 16];
+        let err = s.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // Written out rather than routed through `codec_error`: a missing (or
+        // double-wrapped) classification must fail with THIS message.
+        let source = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NativeError>());
+        assert!(
+            matches!(
+                source,
+                Some(NativeError::Protocol {
+                    kind: ProtocolKind::Shadowsocks,
+                    ..
+                })
+            ),
+            "a truncated response must stay a Shadowsocks protocol error: {err}"
+        );
     }
 
     fn ss_config(method: &str, password: &str) -> SsConfig {
