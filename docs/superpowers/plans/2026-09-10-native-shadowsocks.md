@@ -1532,8 +1532,8 @@ git commit -m "feat(native): shadowsocks UDP dial-end carrier + PacketTunnel::Ss
 - Consumes: `crypto::aead::SsAead`, `crypto::kdf::blake3_derive_key`, the `aes` crate's block API (`Aes128`/`Aes256`, `BlockEncrypt`/`BlockDecrypt` — already a dependency), `rand::{fill_nonsecret, u32_below}`, `addr::encode_addr_port_last`/`decode_addr_port_last`.
 - Produces (the ONE session shape; there is no `Ss2022ClientSession` type):
   - `pub struct Ss2022WriterState` — client session id + packet counter + cached session subkey; `fn new(method, key: Arc<Zeroizing<Vec<u8>>>) -> Self`, `fn seal(&mut self, dest: &TargetAddr, payload: &[u8]) -> Result<Vec<u8>, NativeError>`.
-  - `pub struct Ss2022ReaderState` — server-session map + sliding window + per-server-session body-subkey cache; `fn new(..)`, `fn open(&mut self, packet: &[u8]) -> Result<Option<(TargetAddr, Vec<u8>)>, NativeError>`.
-  - `struct SlidingWindow`, `struct ServerSessions` (internal, unit-tested).
+  - `pub struct Ss2022ReaderState` — the server-session table (each slot carries its OWN replay window and body subkey); `fn new(..)`, `fn open(&mut self, packet: &[u8]) -> Result<Option<(TargetAddr, Vec<u8>)>, NativeError>`.
+  - `struct SlidingWindow`, `struct ServerSession { server_id, client_id, window: SlidingWindow, body_subkey: Zeroizing<Vec<u8>> }`, `struct ServerSessions { current: Option<ServerSession>, old: Option<ServerSession> }` (internal, unit-tested) — the window is **per relay session** (spec §3.2.4), never global: a server restart starts a new server session whose packet ids restart at 0, and a shared window would reject every reply.
   - No EIH: the client never emits identity headers (single-user PSK only, spec decision 6) — do not thread an `eih` parameter anywhere.
 
 Wire (spec §3.2 + §4.1, shadowsocks-rust `udprelay/aead_2022.rs`):
@@ -1588,16 +1588,20 @@ fn sliding_window_rejects_duplicates_and_old_packets() {
     assert!(w.accept(65));
 }
 
+/// The window is PER relay session: after a server restart the new session's
+/// ids restart at 0 and must be accepted (a global window would reject every
+/// reply — spec §3.2.4's old/current association exists for this).
 #[test]
-fn server_session_map_keeps_one_old_association() {
-    let mut m = ServerSessions::new();
-    m.learn(100, 7);
-    m.learn(200, 7);
-    assert_eq!(m.resolve(200), Some(7));
-    assert_eq!(m.resolve(100), Some(7), "one old association stays valid");
-    m.learn(300, 7);
-    assert_eq!(m.resolve(100), None, "only one old association is retained");
-    assert_eq!(m.resolve(200), Some(7));
+fn each_server_session_has_its_own_window_and_one_old_slot_is_kept() {
+    let mut s = ServerSessions::new();
+    assert_eq!(s.accept(100, 0), Some(7)); // learn(server 100 → client 7)
+    assert_eq!(s.accept(100, 0), None); // duplicate on the same session
+    assert_eq!(s.accept(200, 0), Some(7)); // new server session, fresh window
+    assert_eq!(s.accept(200, 0), None);
+    assert_eq!(s.accept(100, 1), Some(7), "one old association stays valid");
+    assert_eq!(s.accept(300, 0), Some(7)); // third session evicts the oldest
+    assert_eq!(s.accept(100, 2), None, "only one old association is retained");
+    assert_eq!(s.accept(200, 2), Some(7));
 }
 ```
 
@@ -1610,14 +1614,14 @@ Expected: FAIL — the 2022 helpers do not exist.
 
 Add to `udp.rs`:
 - `fn aes_ecb_encrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16])` / `fn aes_ecb_decrypt(..)` via `Aes128`/`Aes256` `encrypt_block`/`decrypt_block` — 2022 has no aes-192 method, so any other cipher is a `NativeError::Config`.
-- `fn separate_header_aes(aead, psk, session_id: u64, packet_id: u64) -> [u8; 16]` (AES-ECB over `session_id BE8 ‖ packet_id BE8`) and `fn udp_session_subkey(key: &[u8], session_id: u64) -> [u8; 32]` (`blake3::derive_key("shadowsocks 2022 session subkey", key ‖ session_id BE8)`).
+- `fn separate_header_aes(aead, psk, session_id: u64, packet_id: u64) -> [u8; 16]` (AES-ECB over `session_id BE8 ‖ packet_id BE8`), `fn separate_header_nonce(session_id: u64, packet_id: u64) -> [u8; 12]` (the **plaintext** header's `[4..16]`: last 4 bytes of the session id ‖ all 8 bytes of the packet id — spec §3.2.1; NEVER take a nonce off the wire ciphertext at `packet[4..16]`), and `fn udp_session_subkey(key: &[u8], session_id: u64) -> [u8; 32]` (`blake3::derive_key("shadowsocks 2022 session subkey", key ‖ session_id BE8)`).
 - `struct SlidingWindow { highest: u64, bitmap: u64 }` with `accept(&mut self, id: u64) -> bool` — accept iff `id` has not been seen and is inside the 65-packet window.
-- `struct ServerSessions { current: Option<(u64, u64)>, old: Option<(u64, u64)> }` with `learn(server_id, client_id)` / `resolve(server_id) -> Option<u64>` — keeps exactly one previous association (spec §3.2.4).
+- `struct ServerSessions` with `accept(&mut self, server_id: u64, packet_id: u64) -> Option<u64>` — resolves the (or creates the current) session, runs THAT session's window check (`None` on a duplicate/out-of-window id or an evicted session), and keeps exactly one previous association (spec §3.2.4).
 - `Ss2022WriterState { aead, key: Arc<Zeroizing<Vec<u8>>>, client_session_id: u64, packet_id: u64, subkey: Zeroizing<Vec<u8>> }`:
   - `new` draws the 8-byte client session id (`rand::fill_nonsecret`, read as BE) and caches `subkey = udp_session_subkey(key, client_session_id)`.
-  - `seal`: AES family → `separate_header_aes(..)` on the wire front, then `aead.seal(key = subkey, nonce = header[4..16], aad = "", body)` where body = `type=0 ‖ ts u64be ‖ pad_len u16be ‖ padding ‖ encode_addr_port_last(dest) ‖ payload`; packet id increments per packet. ChaCha family → no separate header: `[24B random nonce] ‖ XChaCha20Poly1305(psk directly, nonce, client_session_id BE8 ‖ packet_id BE8 ‖ body)`.
-- `Ss2022ReaderState { aead, key, server_sessions: ServerSessions, window: SlidingWindow, body_subkeys: HashMap<u64, Zeroizing<Vec<u8>>> }`:
-  - `open`: AES family → ECB-decrypt `packet[..16]` with the psk to recover `(server_session_id, server_packet_id)`, resolve `client_session_id` via `server_sessions` (refuse an unknown session), check the timestamp within 30 s and `window.accept(server_packet_id)`, derive/cache `body_subkeys[server_session_id]`, then `aead.open(key = that subkey, nonce = packet[4..16], aad = "", packet[16..])`; ChaCha family → XChaCha20-Poly1305 with the psk and the 24-byte leading nonce, ids read from the merged header. The opened body is the server main header `type=1 ‖ ts ‖ client_session_id BE8 ‖ pad_len u16be ‖ padding ‖ addr ‖ port ‖ payload` → `(origin TargetAddr, payload)`.
+  - `seal`: AES family → `separate_header_nonce(client_session_id, packet_id)` for the body seal, then `separate_header_aes(..)` prepended as the wire front: `packet = [encrypted separate header][aead.seal(key = subkey, nonce = separate_header_nonce(..), aad = "", body)]`, body = `type=0 ‖ ts u64be ‖ pad_len u16be ‖ padding ‖ encode_addr_port_last(dest) ‖ payload`; packet id increments per packet. ChaCha family → no separate header: `[24B random nonce] ‖ XChaCha20Poly1305(psk directly, nonce, client_session_id BE8 ‖ packet_id BE8 ‖ body)`.
+- `Ss2022ReaderState { aead, key: Arc<Zeroizing<Vec<u8>>>, sessions: ServerSessions }`:
+  - `open`: AES family → ECB-decrypt `packet[..16]` with the psk to recover the plaintext separate header `(server_session_id, server_packet_id)`, then `sessions.accept(server_session_id, server_packet_id)` — which owns the per-session replay window and the session's `body_subkey` (`udp_session_subkey(key, server_session_id)`, derived on first sight and cached in that slot) — then `aead.open(key = slot.body_subkey, nonce = separate_header_nonce(server_session_id, server_packet_id), aad = "", packet[16..])`. An unknown/evicted session or a rejected packet id yields `Ok(None)` (drop the datagram, never the session). ChaCha family → XChaCha20-Poly1305 with the psk and the 24-byte leading nonce; the ids come from the merged header, and the timestamp/client-session checks still run. The opened body is the server main header `type=1 ‖ ts ‖ client_session_id BE8 ‖ pad_len u16be ‖ padding ‖ addr ‖ port ‖ payload` → `(origin TargetAddr, payload)`.
 - Wire the two states into `SsUdpTunnel` (Task 6) exactly as its struct declares: `send` → `s2022_writer`, `recv` → `s2022_reader`, `split` moves them into `SsUdpWriter`/`SsUdpReader`; classic rows keep `seal_datagram`/`open_datagram` and both options stay `None`.
 
 - [ ] **Step 4: Run to verify pass**

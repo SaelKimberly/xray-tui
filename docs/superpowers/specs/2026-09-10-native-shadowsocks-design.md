@@ -156,6 +156,14 @@ The client keeps a client-session ↔ server-session map (≥1 old association p
 spec §3.2.4) and a packet-id sliding-window filter, checked after header
 validation.
 
+The slice `separate_header[4..16]` above is the **plaintext** block (the
+ciphertext is `encrypted_separate_header`): the nonce is
+`session_id[4..8] ‖ packet_id` — never bytes read off the wire. The replay
+window is **per relay session**, not global: a restarted server issues a new
+server session whose packet ids restart at 0, and a shared window would reject
+every one of its replies. Each session slot therefore carries its own window
+(and its own body subkey).
+
 ChaCha method: `[24B random nonce][XChaCha20-Poly1305(psk directly) over body]`
 with the session id + packet id **merged into the main header** (no separate
 header block).
