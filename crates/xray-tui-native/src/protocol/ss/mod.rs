@@ -9,6 +9,7 @@
 //! codec — [`stream`] for the 2017 AEAD set, [`stream2022`] for 2022-blake3 —
 //! which writes the handshake and returns the tunnel.
 
+pub mod consts;
 pub mod method;
 pub mod stream;
 pub mod stream2022;

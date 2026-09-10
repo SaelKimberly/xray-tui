@@ -339,8 +339,9 @@ pub async fn connect_udp(
             feature: "socks5 udp (needs a raw UDP socket shape, not the stream tunnel)".into(),
         }),
         _ => Err(NativeError::NotImplemented {
-            feature: "udp protocol connect (native UDP path: vless, vmess, trojan, hysteria2)"
-                .into(),
+            feature:
+                "udp protocol connect (native UDP path: vless, vmess, trojan, hysteria2, shadowsocks)"
+                    .into(),
         }),
     }
 }

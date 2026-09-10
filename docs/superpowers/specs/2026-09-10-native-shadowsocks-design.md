@@ -213,8 +213,19 @@ per-packet address, so
 
 **Transport shape (dial-end, not a stream carrier).** Shadowsocks' UDP relay
 is reached by sending UDP datagrams to the server's own port — not by framing
-UDP inside a TCP tunnel the way VLESS/VMess/trojan do (xray
-`proxy/shadowsocks/client.go` UDP dispatch; sing-box's ss outbound likewise).
+UDP inside a TCP tunnel. Native implements the datagram-relay shape shared by
+sing-box (`option/shadowsocks.go` — the inbound serves UDP by default),
+shadowsocks-rust (`relay/udprelay/`) and mihomo
+(`transport/shadowsocks/shadowaead/packet.go`, the classic `Pack`/`Unpack`
+referenced by `protocol/ss/udp.rs`). xray-core is the odd one out: its SS
+*client* frames UDP INSIDE the TCP stream (`proxy/shadowsocks/client.go:88`
+stamps `RequestCommandUDP` on the same conn, relayed by `UDPWriter`/`UDPReader`
+over it at `:156-181`), while its SS *server* serves the datagram relay only
+when the inbound sets `network: "tcp,udp"` (`infra/conf/shadowsocks.go:48,64`;
+`infra/conf/common.go:111-113` defaults a nil network list to TCP). Native
+cannot observe the server's setting, so a profile whose server is a default
+xray SS inbound leaves its datagrams at a port with no UDP listener — where
+the subprocess xray client would have carried them over TCP.
 `connect_chain_udp` therefore treats an SS last link like the QUIC arm: the
 dial (`bind` a UDP socket to `params.server`) REPLACES dial + security +
 transport + upgrade, no chain is possible (an SS UDP link must be the only

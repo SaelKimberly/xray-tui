@@ -87,7 +87,7 @@ const fn asks_native(forced: Option<CoreType>) -> bool {
 /// native and still faces the capability gate.
 ///
 /// Native is asked for by that override, or by an xray-stamped link on one of
-/// the four native kinds — the connect-time replacement for the old parse-time
+/// the six native kinds — the connect-time replacement for the old parse-time
 /// `Auto` stamp, so nothing native-specific is persisted.
 fn resolve_runtime_core(
     link_core: CoreType,

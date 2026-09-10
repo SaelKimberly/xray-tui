@@ -2,7 +2,7 @@
 //! `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305`) and 2022-blake3
 //! (`2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`,
 //! `2022-blake3-chacha20-poly1305`) against both cores, plus a TLS row and
-//! three UDP relay rows.
+//! four UDP relay rows.
 //!
 //! `SsConfig` has no transport field, so every SS row is a plain TCP dial
 //! (+ the optional TLS `security` layer the chain applies); there is no
@@ -59,6 +59,12 @@ fn ss(method: &'static str) -> CaseSpec {
 // are proven on both carriers.
 #[case::udp_2022_aes128(
     ss("2022-blake3-aes-128-gcm").with_app(AppKind::Udp).with_udp(PacketMode::Raw)
+)]
+// The 2022 `ChaCha` datagram shape: XChaCha20-Poly1305 with the 24-byte random
+// nonce and the session/packet ids merged into the main header. The only 2022
+// datagram row whose cipher and id header differ from the AES rows.
+#[case::udp_2022_chacha20(
+    ss("2022-blake3-chacha20-poly1305").with_app(AppKind::Udp).with_udp(PacketMode::Raw)
 )]
 #[tokio::test]
 async fn shadowsocks_against_cores(

@@ -35,7 +35,7 @@ use std::borrow::Cow;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
@@ -47,6 +47,9 @@ use crate::addr::{Host, TargetAddr, decode_addr_port_last, write_addr_port_last}
 use crate::context::LinkContext;
 use crate::crypto::aead::SsAead;
 use crate::error::NativeError;
+use crate::protocol::ss::consts::{
+    MAX_PADDING, TIMESTAMP_TOLERANCE_SECS, now_unix_secs, s2022_error,
+};
 use crate::protocol::ss::method::{
     SsFamily, SsMethod, password_key, stream_subkey, stream_subkey_into,
 };
@@ -66,14 +69,6 @@ const MAX_DATAGRAM: usize = 64 * 1024;
 /// can hold. A bigger payload would be refused by the kernel with `EMSGSIZE`
 /// instead of a clean error.
 const MAX_PAYLOAD: usize = 65_000;
-
-/// `AEAD2022_MAX_PADDING_SIZE`: the largest padding a 2022 datagram may add
-/// (shadowsocks-rust `relay/mod.rs`).
-const MAX_PADDING: u32 = 900;
-
-/// Timestamp skew tolerated on a peer datagram: anything older or newer is a
-/// replay (spec §3.2.3; shadowsocks-rust `SERVER_PACKET_TIMESTAMP_MAX_DIFF`).
-const TIMESTAMP_TOLERANCE_SECS: u64 = 30;
 
 /// Spec §3.2.4's rotation gate: keeping one old and one current server session
 /// is only allowed while the client "reject[s] newer server sessions when the
@@ -130,23 +125,6 @@ fn datagram_error(detail: &str) -> NativeError {
         kind: ProtocolKind::Shadowsocks,
         detail: detail.to_owned(),
     }
-}
-
-/// A wire failure in the 2022 codec (`NativeError::Protocol` with the 2022
-/// kind).
-fn s2022_error(detail: &str) -> NativeError {
-    NativeError::Protocol {
-        kind: ProtocolKind::Shadowsocks2022,
-        detail: detail.to_owned(),
-    }
-}
-
-/// Seconds since the UNIX epoch — the timestamp both codecs stamp and check.
-fn now_unix_secs() -> Result<u64, NativeError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .map_err(|_| NativeError::Config("system clock is before the UNIX epoch".to_owned()))
 }
 
 /// A `SocketAddr` destination as a wire `TargetAddr` (the IP families only —

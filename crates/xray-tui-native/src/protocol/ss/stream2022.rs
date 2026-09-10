@@ -40,7 +40,6 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_tui_proto::proto_spec::{ProtocolKind, SsConfig};
@@ -51,6 +50,9 @@ use crate::addr::{TargetAddr, encode_addr_port_last};
 use crate::context::LinkContext;
 use crate::crypto::aead::{NonceCounter, SsAead};
 use crate::error::{NativeError, timeouts};
+use crate::protocol::ss::consts::{
+    MAX_PADDING, TIMESTAMP_TOLERANCE_SECS, now_unix_secs, s2022_error,
+};
 use crate::protocol::ss::method::{SsFamily, SsMethod, password_key, stream_subkey};
 
 /// Request header type: client → server stream.
@@ -64,13 +66,6 @@ const HEADER_TYPE_SERVER_STREAM: u8 = 1;
 /// exceed this, so the reader's staging buffer is structurally capped and a
 /// hostile length cannot make it allocate more than 0xFFFF + tag.
 const MAX_PAYLOAD: usize = 0xFFFF;
-
-/// `MaxPaddingLength`: the largest padding a request header may carry.
-const MAX_PADDING: u32 = 900;
-
-/// Timestamp skew tolerated in a response header (shadowsocks-rust
-/// `SERVER_STREAM_TIMESTAMP_MAX_DIFF`, v2ray-core's ±30 s).
-const TIMESTAMP_TOLERANCE_SECS: u64 = 30;
 
 /// Request fixed header: `type(1) + timestamp(8 BE) + length(2 BE)`.
 const REQUEST_FIXED_LEN: usize = 11;
@@ -87,17 +82,6 @@ const MAX_VARIABLE_HEADER: usize = 1 + 1 + 255 + 2 + 2 + MAX_PADDING as usize;
 /// echoed `request_salt` inserted before the length field.
 const fn response_fixed_len(salt_len: usize) -> usize {
     REQUEST_FIXED_LEN + salt_len
-}
-
-/// A wire failure of this codec, classified as the 2022 Shadowsocks
-/// [`ProtocolKind`]; the `AsyncRead`/`AsyncWrite` seam can only carry
-/// `io::Error`, which wraps this as its source so nothing above loses the
-/// classification.
-fn protocol_error(detail: &str) -> NativeError {
-    NativeError::Protocol {
-        kind: ProtocolKind::Shadowsocks2022,
-        detail: detail.to_owned(),
-    }
 }
 
 /// Re-label a failure from the shared cipher layer for this codec's kind.
@@ -130,20 +114,8 @@ fn wire_error(error: NativeError) -> io::Error {
 fn truncated() -> io::Error {
     io::Error::new(
         io::ErrorKind::UnexpectedEof,
-        protocol_error("response stream truncated mid-frame"),
+        s2022_error("response stream truncated mid-frame"),
     )
-}
-
-/// Seconds since the UNIX epoch.
-///
-/// A clock before the epoch cannot stamp a header anyone will accept, so it is
-/// a config error — never the panic shadowsocks-rust's `get_now_timestamp`
-/// takes.
-fn now_unix_secs() -> Result<u64, NativeError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .map_err(|_| NativeError::Config("system clock is before the UNIX epoch".to_owned()))
 }
 
 /// Random padding length for a request with no initial payload.
@@ -201,13 +173,13 @@ fn request_variable_header(target: &TargetAddr, initial: &[u8]) -> Result<Vec<u8
 fn validate_response_header(plain: &[u8], request_salt: &[u8]) -> Result<u16, NativeError> {
     let expected = response_fixed_len(request_salt.len());
     if plain.len() != expected {
-        return Err(protocol_error(&format!(
+        return Err(s2022_error(&format!(
             "response header opened to {} bytes, expected {expected}",
             plain.len()
         )));
     }
     if plain[0] != HEADER_TYPE_SERVER_STREAM {
-        return Err(protocol_error(&format!(
+        return Err(s2022_error(&format!(
             "response header type is {:#04x}, expected {HEADER_TYPE_SERVER_STREAM:#04x}",
             plain[0]
         )));
@@ -216,12 +188,12 @@ fn validate_response_header(plain: &[u8], request_salt: &[u8]) -> Result<u16, Na
     let now = now_unix_secs()?;
     let skew = now.abs_diff(timestamp);
     if skew > TIMESTAMP_TOLERANCE_SECS {
-        return Err(protocol_error(&format!(
+        return Err(s2022_error(&format!(
             "response timestamp {timestamp} is {skew}s from our {now} (tolerance {TIMESTAMP_TOLERANCE_SECS}s)"
         )));
     }
     if &plain[9..9 + request_salt.len()] != request_salt {
-        return Err(protocol_error(
+        return Err(s2022_error(
             "response header carries a request salt that is not ours",
         ));
     }
@@ -396,8 +368,12 @@ impl<S> Ss2022Stream<S> {
     /// Wrap `inner`: `salt` leads the request stream and `target` is the
     /// destination the request header will carry. `write_handshake` must
     /// follow before any write.
+    ///
+    /// `pub(crate)`: the constructor and [`Self::write_handshake`] are a
+    /// pair — calling the handshake twice reuses counters 0 and 1 under the
+    /// same subkey, so neither escapes the crate.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         inner: S,
         method: SsMethod,
         key: Zeroizing<Vec<u8>>,
@@ -509,13 +485,15 @@ impl<S: AsyncWrite + Unpin> Ss2022Stream<S> {
     ///
     /// Call exactly once, before the first [`AsyncWrite::poll_write`]: the two
     /// seals spend counters 0 and 1, so the first caller chunk continues at 2.
+    /// A second call would reuse those nonces under the same subkey, which is
+    /// why this is `pub(crate)` — nothing outside the module may call it.
     /// This client never sends an initial payload, so the variable-length
     /// header always carries `1..=MAX_PADDING` bytes of random padding.
-    pub async fn write_handshake(&mut self) -> Result<(), NativeError> {
+    pub(crate) async fn write_handshake(&mut self) -> Result<(), NativeError> {
         let timestamp = now_unix_secs()?;
         let variable = request_variable_header(&self.target, &[])?;
         let len = u16::try_from(variable.len()).map_err(|_| {
-            protocol_error("variable-length header does not fit the 0xFFFF length field")
+            s2022_error("variable-length header does not fit the 0xFFFF length field")
         })?;
         let fixed = request_fixed_header(timestamp, len);
         self.out.clear();
@@ -552,8 +530,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
     ///
     /// This is NOT cancel-safe — the write direction's `sealed` count only
     /// survives a retry with the same buffer, as in `protocol::ss::stream`.
-    /// The write side is only ever driven to completion (the handshake write
-    /// in [`connect`], then `tokio::io::copy`).
+    /// Re-issued with the SAME buffer the retry is exact; a mismatched
+    /// (shorter) buffer can only lose the difference, and the count is clamped
+    /// to the supplied buffer so `tokio::io::WriteAll`'s `split_at` can never
+    /// see an oversized one. The write side is only ever driven to completion
+    /// (the handshake write in [`connect`], then `tokio::io::copy`).
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -575,7 +556,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
         // A retry with the same buffer only owes the flush: `sealed` bytes
         // are already on their way.
         ready!(this.poll_flush_out(cx))?;
-        let written = this.sealed;
+        // Never report more than this call supplied: a `write_all` dropped
+        // mid-flush and re-issued with a shorter buffer must not see a count
+        // past its end — tokio's `WriteAll` would `split_at` out of bounds.
+        let written = this.sealed.min(buf.len());
         this.sealed = 0;
         Poll::Ready(Ok(written))
     }
@@ -876,6 +860,45 @@ mod tests {
             1,
             "salt + both header chunks must be one write"
         );
+    }
+
+    /// A `write_all` dropped mid-flush leaves `sealed` set; a shorter retry
+    /// after it is credited at most its own length, never the stale chunk's —
+    /// `tokio::io::WriteAll` would `split_at` the count and panic. The 8-byte
+    /// duplex cannot flush the sealed 1 KiB chunk, so the first poll really
+    /// does stop with the chunk pending.
+    #[tokio::test]
+    async fn dropped_write_does_not_overstate_a_shorter_retry() {
+        let method = SsMethod::from_method("2022-blake3-aes-256-gcm").unwrap();
+        let target = TargetAddr::new(Host::Ip(IpAddr::from([127, 0, 0, 1])), 8080);
+        let (client, mut server) = duplex(8);
+        let mut s = Ss2022Stream::new(
+            client,
+            method,
+            Zeroizing::new(vec![0x1Au8; 32]),
+            vec![0x2Bu8; 32],
+            target,
+        );
+        let payload = vec![0x11u8; 1024];
+        let mut fut = Box::pin(s.write_all(&payload));
+        let first = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "an 8-byte duplex cannot flush the sealed 1 KiB chunk"
+        );
+        drop(fut);
+
+        // Drain the transport so the stale chunk's flush can finish.
+        let drain = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = server.read_to_end(&mut sink).await;
+        });
+        let short = vec![0x22u8; 4];
+        s.write_all(&short)
+            .await
+            .expect("a shorter retry must complete, not panic");
+        drop(s);
+        drain.await.unwrap();
     }
 
     /// A test-local transport that counts [`AsyncWrite::poll_write`] calls, so

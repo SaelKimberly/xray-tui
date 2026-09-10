@@ -274,10 +274,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SsStream<S> {
     /// This is NOT cancel-safe — unlike [`AsyncRead::poll_read`], whose
     /// partial state is entirely in the struct. A `write_all` future dropped
     /// mid-flush leaves the sealed chunk and its count in `out`/`sealed`, and
-    /// the next write (of any buffer) finishes that flush and is credited
-    /// with those bytes; the write side is only ever driven to completion
-    /// (the handshake write in [`connect`], then `tokio::io::copy`, which
-    /// never drops a half-finished `poll_write`).
+    /// the next write finishes that flush: re-issued with the SAME buffer the
+    /// retry is exact, while a mismatched (shorter) buffer can only lose the
+    /// difference — the returned count is clamped to the supplied buffer, so
+    /// an oversized one never reaches `tokio::io::WriteAll`'s `split_at` (a
+    /// panic). The write side is only ever driven to completion (the
+    /// handshake write in [`connect`], then `tokio::io::copy`, which never
+    /// drops a half-finished `poll_write`).
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -300,7 +303,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SsStream<S> {
         // A retry with the same buffer only owes the flush: `sealed` bytes
         // are already on their way.
         ready!(this.poll_flush_out(cx))?;
-        let written = this.sealed;
+        // Never report more than this call supplied: a `write_all` dropped
+        // mid-flush and re-issued with a shorter buffer must not see a count
+        // past its end — tokio's `WriteAll` would `split_at` out of bounds.
+        let written = this.sealed.min(buf.len());
         this.sealed = 0;
         Poll::Ready(Ok(written))
     }
@@ -729,6 +735,41 @@ mod tests {
         // The write really crossed the cap: the wire carries two chunks, the
         // full 0x3FFF one and the 6-byte tail.
         assert_eq!(lens, vec![MAX_CHUNK, payload.len() - MAX_CHUNK]);
+    }
+
+    /// A `write_all` dropped mid-flush leaves `sealed` set; the next write is
+    /// credited at most its own length. The transport (an 8-byte duplex) is
+    /// too small to swallow the 1 KiB chunk, so the first poll really does
+    /// stop with the chunk sealed but unflushed. A shorter retry must not see
+    /// the stale 1024 — `tokio::io::WriteAll` would `split_at` the count and
+    /// panic on a 4-byte buffer.
+    #[tokio::test]
+    async fn dropped_write_does_not_overstate_a_shorter_retry() {
+        let method = SsMethod::from_method("aes-128-gcm").unwrap();
+        let key = [0xAAu8; 16];
+        let salt = [0xBBu8; 16];
+        let (client, mut server) = duplex(8);
+        let mut s = SsStream::new(client, method, Zeroizing::new(key.to_vec()), &salt, None);
+        let payload = vec![0x11u8; 1024];
+        let mut fut = Box::pin(s.write_all(&payload));
+        let first = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "an 8-byte duplex cannot flush the sealed 1 KiB chunk"
+        );
+        drop(fut);
+
+        // Drain the transport so the stale chunk's flush can finish.
+        let drain = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = server.read_to_end(&mut sink).await;
+        });
+        let short = vec![0x22u8; 4];
+        s.write_all(&short)
+            .await
+            .expect("a shorter retry must complete, not panic");
+        drop(s);
+        drain.await.unwrap();
     }
 
     /// Every chunk boundary the writer can land on: 1 byte, exactly

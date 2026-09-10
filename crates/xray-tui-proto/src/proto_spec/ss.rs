@@ -528,7 +528,7 @@ mod tests {
 
     use super::super::{
         ConfigKind, CoreType, HostKind, ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig,
-        ProtocolKind,
+        ProtocolKind, SecurityConfig, TlsConfig, TlsOpts,
     };
     use super::SsConfig;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -627,6 +627,30 @@ mod tests {
         let parsed = parse("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
+    }
+
+    /// `ProtoSpec::security()` must hand back the row's TLS/REALITY layer: the
+    /// trait default is `None`, which silently drops a requested layer (the
+    /// client would write the SS handshake in the clear to a TLS listener).
+    /// Like vless/trojan the accessor is never `None`, so a defaulted config
+    /// returns `Some` wrapping an empty layer.
+    #[test]
+    fn security_accessor_exposes_the_rows_layer() {
+        let mut cfg = config(parse("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8080"));
+        assert!(
+            cfg.security().is_some_and(SecurityConfig::is_empty),
+            "a defaulted SS config still exposes an (empty) layer"
+        );
+
+        cfg.security = SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts::default())),
+            enc: None,
+        };
+        assert_eq!(
+            cfg.security().and_then(SecurityConfig::type_str),
+            Some("tls"),
+            "a TLS layer must reach the chain"
+        );
     }
 
     // ── Identity: endpoint-free uid ───────────────────────────────────────

@@ -351,7 +351,7 @@ enum TraceEvent {
   Mitigation: capability gate, downgrade-with-log, and the config-level
   `protocol_core_overrides` veto (`xray`/`sing-box`, per protocol kind — note a
   *profile*-level `xray` stamp does not veto native, it is what asks for it);
-  e2e suite (168 green rows + 6 documented ignored) is the contract.
+  e2e suite (170 green rows + 6 documented ignored) is the contract.
 - Display/run mismatch: the list shows the stamp (`xray`) while a config that
   passes the gate runs native (D2) — cosmetic; the connect log names the
   runtime core.
@@ -396,7 +396,7 @@ enum TraceEvent {
 
 - `cargo test -p xray-tui-native --features native-e2e --lib` (tier 1 hermetic).
 - Tier-3 e2e rows for the six protocol kinds (the 2026-09-03 four-protocol
-  contract, now 174 tests = 168 green + 6 documented ignored) +
+  contract, now 176 tests = 170 green + 6 documented ignored) +
   new server-mode loopback rows (socks + http inbounds, telemetry events).
 - `cargo test` workspace + `just quality-gate code`.
 - Manual: run TUI, import links for the six kinds (vless, vmess, trojan,
