@@ -359,6 +359,15 @@ impl ProtoSpec for SsConfig {
         None
     }
 
+    /// The row's TLS/REALITY layer — an SS row rides plain TCP plus the
+    /// optional `security` the chain applies outside the protocol. Omitting
+    /// this accessor leaves the trait default (`None`), which silently drops
+    /// a requested TLS/REALITY layer (the client would write the SS
+    /// handshake in the clear to a TLS listener).
+    fn security(&self) -> Option<&SecurityConfig> {
+        Some(&self.security)
+    }
+
     /// # Errors
     ///
     /// If the Clash proxy doesn't match this protocol type.
