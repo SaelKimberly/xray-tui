@@ -1275,7 +1275,7 @@ git commit -m "feat(native): dispatch shadowsocks TCP through the family codecs"
 - Produces:
   - `fn seal_datagram(method, key: &[u8], dest: &TargetAddr, payload: &[u8]) -> Result<Vec<u8>, NativeError>`,
   - `fn open_datagram(method, key: &[u8], packet: &[u8]) -> Result<(TargetAddr, Vec<u8>), NativeError>`,
-  - `pub struct SsUdpTunnel { socket: Arc<UdpSocket>, method: SsMethod, key: Zeroizing<Vec<u8>>, target: TargetAddr, session: Option<Ss2022ClientSession> }` with `send`/`recv`/`split`,
+  - `pub struct SsUdpTunnel { socket: Arc<UdpSocket>, method: SsMethod, key: Arc<Zeroizing<Vec<u8>>>, target: TargetAddr, s2022_writer: Option<Ss2022WriterState>, s2022_reader: Option<Ss2022ReaderState> }` with `send`/`recv`/`split` (the two 2022 states are defined in Task 7; classic rows leave both `None`),
   - `pub struct SsUdpReader` / `pub struct SsUdpWriter` (split halves; independent state over the shared `Arc<UdpSocket>`),
   - `pub async fn connect_udp(ctx: &LinkContext, method: SsMethod, cfg: &SsConfig) -> Result<SsUdpTunnel, NativeError>`.
 
@@ -1396,44 +1396,70 @@ Tunnel:
 
 ```rust
 /// The SS UDP carrier: owns the UDP socket to the SS server plus the codec key.
+///
+/// The 2022 session state is split by direction (writer: client session id +
+/// packet counter; reader: server-session map + replay window), so
+/// [`Self::split`] hands each half its own state with no lock. Classic rows
+/// leave both `None` (stateless per datagram).
 pub struct SsUdpTunnel {
     socket: Arc<UdpSocket>,
     method: SsMethod,
-    key: Zeroizing<Vec<u8>>,
+    /// Shared (one wipe copy) with the split halves.
+    key: Arc<Zeroizing<Vec<u8>>>,
     target: TargetAddr,
-    /// 2022 only: client session id + packet counter (writer side).
-    session: Option<Ss2022ClientSession>,
+    s2022_writer: Option<Ss2022WriterState>,
+    s2022_reader: Option<Ss2022ReaderState>,
 }
 
 impl SsUdpTunnel {
-    /// Send one datagram. `dest = None` → `self.target`.
+    /// Send one datagram. `dest = None` → `self.target`. Both codecs take a
+    /// `TargetAddr` (the address travels INSIDE the sealed body, so a domain
+    /// destination is legal on the wire).
     pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> std::io::Result<()> {
-        let dest = dest.unwrap_or_else(|| socket_addr(&self.target));
-        let packet = match &mut self.session {
-            None => seal_datagram(self.method, &self.key, &target_addr(dest), payload),
-            Some(s) => s.seal_client_packet(dest, payload),
+        let packet = match &mut self.s2022_writer {
+            None => {
+                let dest = dest.map_or_else(|| self.target.clone(), target_from_socket);
+                seal_datagram(self.method, &self.key, &dest, payload)
+            }
+            Some(w) => w.seal(
+                &dest.map_or_else(|| self.target.clone(), target_from_socket),
+                payload,
+            ),
         }?;                                   // map NativeError → io::Error
         self.socket.send(&packet).await.map(|_| ())
     }
 
-    /// Receive one datagram (decoding the address the server echoed back).
-    pub async fn recv(&mut self) -> std::io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> { /* recv_from + open_datagram / session open */ }
+    /// Receive one datagram; `Some(addr)` is the origin the reply header
+    /// carried (`None` when that origin is a domain name).
+    pub async fn recv(&mut self) -> std::io::Result<Option<(Option<SocketAddr>, Vec<u8>)>> { /* recv + open_datagram / Ss2022ReaderState::open → TargetAddr → Option<SocketAddr> */ }
 
-    pub fn split(self) -> (SsUdpReader, SsUdpWriter) { /* Arc::clone the socket; split the state */ }
+    /// Classic rows: pure `Arc::clone` of the socket. 2022 rows: the writer
+    /// state goes to the writer half, the reader state to the reader half.
+    pub fn split(self) -> (SsUdpReader, SsUdpWriter) { /* move, no lock */ }
 }
-
-/// `bind` a fresh UDP socket to the SS server — the whole dial.
+```
+/// `bind` a fresh UDP socket to the SS server — the whole dial. The server
+/// address goes through `LinkContext::server_socket()`, which honours
+/// `params.resolved_ip` and bounds DNS with `timeouts::DIAL` (resolving the
+/// host inline here would bypass both).
 pub async fn connect_udp(ctx: &LinkContext, method: SsMethod, cfg: &SsConfig) -> Result<SsUdpTunnel, NativeError> {
-    let key = password_key(method, &cfg.password)?;
-    let server = crate::transport::server_socket_addr(&ctx.params)?; // existing helper used by dial
-    let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
+    let key = Arc::new(password_key(method, &cfg.password)?);
+    let server = ctx.server_socket().await?;
+    let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().expect(" literal");
     let socket = UdpSocket::bind(bind).await.map_err(|e| NativeError::Dial(e.to_string()))?;
     socket.connect(server).await.map_err(|e| NativeError::Dial(e.to_string()))?;
-    Ok(SsUdpTunnel { socket: Arc::new(socket), method, key, target: ctx.params.target.clone(), session: match method.family { SsFamily::Blake3_2022 => Some(Ss2022ClientSession::new(method, &key)), SsFamily::Classic => None } })
+    let (s2022_writer, s2022_reader) = match method.family {
+        SsFamily::Blake3_2022 => (
+            Some(Ss2022WriterState::new(method, Arc::clone(&key))),
+            Some(Ss2022ReaderState::new(method, Arc::clone(&key))),
+        ),
+        SsFamily::Classic => (None, None),
+    };
+    Ok(SsUdpTunnel { socket: Arc::new(socket), method, key, target: ctx.params.target.clone(), s2022_writer, s2022_reader })
 }
 ```
 
-`socket_addr`/`target_addr` are the tiny conversions between `TargetAddr` and `SocketAddr` already used by the transport dial — reuse that helper rather than adding a second one.
+Two tiny private converters live in this module (do NOT add a second dial helper): `fn target_from_socket(sa: SocketAddr) -> TargetAddr { TargetAddr::new(Host::Ip(sa.ip()), sa.port()) }` for `send(Some(..))`/`recv`'s source, and `recv` returns `None` for the `SocketAddr` when the decoded origin address is a **domain** (a `TargetAddr` domain has no `SocketAddr`; replies in practice carry an IP).
 
 Then `protocol/mod.rs`:
 
@@ -1503,8 +1529,12 @@ git commit -m "feat(native): shadowsocks UDP dial-end carrier + PacketTunnel::Ss
 - Modify: `crates/xray-tui-native/src/protocol/ss/udp.rs` (add the 2022 codec + session map)
 
 **Interfaces:**
-- Consumes: `crypto::aead::SsAead`, `blake3` (via `crypto::kdf::blake3_derive_key`), `aes` crate (`Aes128`/`Aes256` block encrypt for the separate header), `rand::fill_nonsecret`/`u32_below`.
-- Produces: `pub struct Ss2022ClientSession { .. }` with `fn seal_client_packet(&mut self, dest: SocketAddr, payload: &[u8], eih: &[u8]) -> Result<Vec<u8>, NativeError>` and `fn open_server_packet(&mut self, packet: &[u8]) -> Result<Option<(SocketAddr, Vec<u8>)>, NativeError>`, plus the window/session-tracking state.
+- Consumes: `crypto::aead::SsAead`, `crypto::kdf::blake3_derive_key`, the `aes` crate's block API (`Aes128`/`Aes256`, `BlockEncrypt`/`BlockDecrypt` — already a dependency), `rand::{fill_nonsecret, u32_below}`, `addr::encode_addr_port_last`/`decode_addr_port_last`.
+- Produces (the ONE session shape; there is no `Ss2022ClientSession` type):
+  - `pub struct Ss2022WriterState` — client session id + packet counter + cached session subkey; `fn new(method, key: Arc<Zeroizing<Vec<u8>>>) -> Self`, `fn seal(&mut self, dest: &TargetAddr, payload: &[u8]) -> Result<Vec<u8>, NativeError>`.
+  - `pub struct Ss2022ReaderState` — server-session map + sliding window + per-server-session body-subkey cache; `fn new(..)`, `fn open(&mut self, packet: &[u8]) -> Result<Option<(TargetAddr, Vec<u8>)>, NativeError>`.
+  - `struct SlidingWindow`, `struct ServerSessions` (internal, unit-tested).
+  - No EIH: the client never emits identity headers (single-user PSK only, spec decision 6) — do not thread an `eih` parameter anywhere.
 
 Wire (spec §3.2 + §4.1, shadowsocks-rust `udprelay/aead_2022.rs`):
 
@@ -1579,14 +1609,16 @@ Expected: FAIL — the 2022 helpers do not exist.
 - [ ] **Step 3: Implement**
 
 Add to `udp.rs`:
-- `fn aes_ecb_encrypt/decrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16])` using `aes::{Aes128, Aes256, cipher::{BlockEncrypt, BlockDecrypt, KeyInit}}` (aes-192-gcm has no 2022 method, so only 128/256 arms + a `Config` error otherwise).
-- `fn separate_header_aes(...)`, `fn udp_session_subkey(psk, session_id) -> [u8; 32]`
-- `struct SlidingWindow { highest: u64, bitmap: u64 }` with `accept(&mut self, id: u64) -> bool`
-- `struct ServerSessions { current: Option<(u64, u64)>, old: Option<(u64, u64)> }` with `learn(server_id, client_id)` / `resolve(server_id) -> Option<u64>`
-- `pub struct Ss2022ClientSession { method, psk (Zeroizing), client_session_id, packet_id, window, server_sessions, aead, subkey }` with the two methods above; the ChaCha family path uses `SsAead::XChaCha20Poly1305` with the PSK directly and a 24-byte random nonce, and merges the ids into the main header.
-- `pub struct Ss2022ClientSession { .. }` used by `SsUdpTunnel` (Task 6): `seal_client_packet(&mut self, dest: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, NativeError>` (writer half: client session id, packet counter, session subkey) and `open_server_packet(&mut self, packet: &[u8]) -> Result<Option<(SocketAddr, Vec<u8>)>, NativeError>` (reader half: server-session map + sliding window). Split them into two states so `SsUdpTunnel::split` needs no lock: `Ss2022WriterState` / `Ss2022ReaderState`.
-- Extend `SsUdpTunnel` (Task 6) so `method.family == Blake3_2022` routes `send`/`recv` through the session codecs above; the classic paths stay `seal_datagram`/`open_datagram`. Both are the same dial-end tunnel — the family only changes the codec.
-- `aes_ecb_encrypt/decrypt` use the `aes` crate's block API directly (already a dependency): `Aes128::new_from_slice(psk)?.encrypt_block(block)` — 2022 has no aes-192 method, so only the 128/256 arms exist and anything else is a `NativeError::Config`.
+- `fn aes_ecb_encrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16])` / `fn aes_ecb_decrypt(..)` via `Aes128`/`Aes256` `encrypt_block`/`decrypt_block` — 2022 has no aes-192 method, so any other cipher is a `NativeError::Config`.
+- `fn separate_header_aes(aead, psk, session_id: u64, packet_id: u64) -> [u8; 16]` (AES-ECB over `session_id BE8 ‖ packet_id BE8`) and `fn udp_session_subkey(key: &[u8], session_id: u64) -> [u8; 32]` (`blake3::derive_key("shadowsocks 2022 session subkey", key ‖ session_id BE8)`).
+- `struct SlidingWindow { highest: u64, bitmap: u64 }` with `accept(&mut self, id: u64) -> bool` — accept iff `id` has not been seen and is inside the 65-packet window.
+- `struct ServerSessions { current: Option<(u64, u64)>, old: Option<(u64, u64)> }` with `learn(server_id, client_id)` / `resolve(server_id) -> Option<u64>` — keeps exactly one previous association (spec §3.2.4).
+- `Ss2022WriterState { aead, key: Arc<Zeroizing<Vec<u8>>>, client_session_id: u64, packet_id: u64, subkey: Zeroizing<Vec<u8>> }`:
+  - `new` draws the 8-byte client session id (`rand::fill_nonsecret`, read as BE) and caches `subkey = udp_session_subkey(key, client_session_id)`.
+  - `seal`: AES family → `separate_header_aes(..)` on the wire front, then `aead.seal(key = subkey, nonce = header[4..16], aad = "", body)` where body = `type=0 ‖ ts u64be ‖ pad_len u16be ‖ padding ‖ encode_addr_port_last(dest) ‖ payload`; packet id increments per packet. ChaCha family → no separate header: `[24B random nonce] ‖ XChaCha20Poly1305(psk directly, nonce, client_session_id BE8 ‖ packet_id BE8 ‖ body)`.
+- `Ss2022ReaderState { aead, key, server_sessions: ServerSessions, window: SlidingWindow, body_subkeys: HashMap<u64, Zeroizing<Vec<u8>>> }`:
+  - `open`: AES family → ECB-decrypt `packet[..16]` with the psk to recover `(server_session_id, server_packet_id)`, resolve `client_session_id` via `server_sessions` (refuse an unknown session), check the timestamp within 30 s and `window.accept(server_packet_id)`, derive/cache `body_subkeys[server_session_id]`, then `aead.open(key = that subkey, nonce = packet[4..16], aad = "", packet[16..])`; ChaCha family → XChaCha20-Poly1305 with the psk and the 24-byte leading nonce, ids read from the merged header. The opened body is the server main header `type=1 ‖ ts ‖ client_session_id BE8 ‖ pad_len u16be ‖ padding ‖ addr ‖ port ‖ payload` → `(origin TargetAddr, payload)`.
+- Wire the two states into `SsUdpTunnel` (Task 6) exactly as its struct declares: `send` → `s2022_writer`, `recv` → `s2022_reader`, `split` moves them into `SsUdpWriter`/`SsUdpReader`; classic rows keep `seal_datagram`/`open_datagram` and both options stay `None`.
 
 - [ ] **Step 4: Run to verify pass**
 
