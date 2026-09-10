@@ -76,11 +76,11 @@ impl From<&AppState> for ProfilesLoad {
     }
 }
 
-/// The DB half of a profile reload: error-TTL sweep + the current view's
-/// rows. Safe to run OFF the UI task — whole-table reads at 10k+ endpoints
-/// take seconds and must not block input/render (the subscription-update
-/// freeze).
-pub async fn load_profiles_rows(
+/// The DB half of a profile reload: error-TTL sweep + the current view's rows.
+///
+/// Safe to run OFF the UI task — whole-table reads at 10k+ endpoints take
+/// seconds and must not block input/render (the subscription-update freeze).
+pub(crate) async fn load_profiles_rows(
     db: &Database,
     load: &ProfilesLoad,
 ) -> Result<Vec<EndpointRow>, DatabaseError> {

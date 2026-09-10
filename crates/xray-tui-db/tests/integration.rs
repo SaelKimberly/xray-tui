@@ -1221,7 +1221,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         xray_tui_db::upsert_endpoints_bulk(&mut tx, &[endpoint(443)])
             .await
             .expect("bulk endpoints");
-        xray_tui_db::upsert_protocols_bulk(&mut tx, &[protocol.clone()])
+        xray_tui_db::upsert_protocols_bulk(&mut tx, std::slice::from_ref(&protocol))
             .await
             .expect("bulk protocols");
         xray_tui_db::upsert_links_bulk(&mut tx, &[link(50, None)])

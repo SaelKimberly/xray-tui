@@ -1,6 +1,6 @@
 //! Headless reproduction of the subscription-update path against the real
 //! 7000+ URL feed. #[ignore]d by default (needs network); run with:
-//!   cargo test -p xray-tui --test e2e_real_feed -- --ignored --nocapture
+//!   cargo test -p xray-tui --test `e2e_real_feed` -- --ignored --nocapture
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -44,7 +44,6 @@ async fn streaming_import_real_feed_completes() {
     assert!(count > 5000, "expected thousands of links, got {count}");
     assert!(
         t_all.as_secs() < 600,
-        "import took {:?} — frozen-path regression",
-        t_all
+        "import took {t_all:?} — frozen-path regression"
     );
 }

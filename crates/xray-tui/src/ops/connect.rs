@@ -1103,7 +1103,10 @@ mod tests {
     fn forced_native_on_a_non_native_kind_reports_the_kind_gate() {
         let got = resolve_runtime_core(
             CoreType::Xray,
-            ProtocolKind::Shadowsocks,
+            // SSR, not Shadowsocks: the plain-SS kind is native now, and SSR is
+            // its closest relative that still has no native implementation, so
+            // the kind gate — not the config gate — is what fires here.
+            ProtocolKind::ShadowsocksR,
             Some(CoreType::Native),
             None,
             false,
@@ -1111,7 +1114,23 @@ mod tests {
         assert_eq!(
             got,
             (CoreType::Xray, Some(REFUSED_KIND)),
-            "native cannot serve shadowsocks; the override is reported, not honored"
+            "native cannot serve shadowsocks-r; the override is reported, not honored"
+        );
+    }
+
+    #[test]
+    fn forced_native_on_a_native_kind_still_needs_a_loaded_config() {
+        let got = resolve_runtime_core(
+            CoreType::Xray,
+            ProtocolKind::Shadowsocks,
+            Some(CoreType::Native),
+            None,
+            false,
+        );
+        assert_eq!(
+            got,
+            (CoreType::Xray, Some(REFUSED_UNLOADED)),
+            "a native kind is refused by the config gate, never silently native"
         );
     }
 

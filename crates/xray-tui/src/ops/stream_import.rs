@@ -378,11 +378,14 @@ mod tests {
     }
 
     /// Source that replays pre-split byte chunks, then optionally fails.
-    struct ScriptedSource {
-        chunks: std::vec::IntoIter<Result<bytes::Bytes, String>>,
+    struct ScriptedSource<I> {
+        chunks: I,
     }
 
-    impl UrlSource for ScriptedSource {
+    impl<I> UrlSource for ScriptedSource<I>
+    where
+        I: Iterator<Item = SourceBatch> + Send,
+    {
         fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Option<SourceBatch>> + Send + '_>> {
             Box::pin(async { self.chunks.next() })
         }
@@ -398,13 +401,11 @@ mod tests {
             .map(|h| valid_vmess_url(h))
             .collect::<Vec<_>>()
             .join("\n");
-        let byte_chunks: Vec<Result<bytes::Bytes, String>> = body
-            .as_bytes()
-            .chunks(3)
-            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
-            .collect();
         let mut source = ScriptedSource {
-            chunks: byte_chunks.into_iter(),
+            chunks: body
+                .as_bytes()
+                .chunks(3)
+                .map(|c| Ok(bytes::Bytes::copy_from_slice(c))),
         };
 
         let (count, summary) = run_streaming_import(
@@ -429,11 +430,6 @@ mod tests {
     async fn streaming_import_keeps_batches_when_source_dies_midway() {
         let db = Arc::new(Database::in_memory().await.expect("db"));
         let validation = ValidationSettings::default();
-        let body = ["21.22.23.24", "25.26.27.28", "29.30.31.32"]
-            .iter()
-            .map(|h| valid_vmess_url(h))
-            .collect::<Vec<_>>()
-            .join("\n");
         // Batch size 2 with 4 URL-sized chunks: first TWO URLs persist, then
         // the source errors. Partial-load semantics keep the stored batch.
         let mut source = ScriptedSource {
