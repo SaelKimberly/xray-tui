@@ -275,11 +275,13 @@ field at all (`option/shadowsocks.go` embeds only `ListenOptions`, so `tls` is a
 and the config decode is fatal) — `with_single_core` reports the excluded sing-box combination
 instead of counting it green. Four UDP relay rows (`PacketMode::Raw`, both cores: one classic
 cipher, both 2022 key lengths, and the 2022 ChaCha20-Poly1305 merged-id shape) exercise the
-dial-end datagram carrier. The relay needs the SERVER to listen on UDP: xray serves it only when
-its inbound sets `network: "tcp,udp"` (`infra/conf/common.go:111-113` defaults a nil list to
-TCP), sing-box by default — so a profile whose server is a default xray SS inbound leaves native
-with no UDP leg to reach (the subprocess xray client would have carried the datagrams over TCP
-instead). Hermetic cost proof:
+dial-end datagram carrier. The relay needs the SERVER to enable UDP: xray serves it only when
+its inbound sets `network: "tcp,udp"` (`proxy/shadowsocks/server.go:81-87` defaults to TCP;
+`infra/conf/common.go:110-112` likewise), sing-box by default — an xray SS inbound without it
+serves no UDP relay to ANY client, the subprocess path included, so this is an operator caveat,
+not a native-vs-subprocess difference (native's client side matches xray's:
+`proxy/shadowsocks/client.go:59-67` dials the server over the destination's network and writes
+one datagram per packet, `UDPWriter` at `:156-181`). Hermetic cost proof:
 `benches/ss_codec.rs` — 22 rows (classic TCP chunk seal/open per cipher, the two 2022 TCP chunk
 rows, `kdf/hkdf_sha1` + `kdf/blake3`, and the classic/2022 UDP paths) via
 `cargo criterion -p xray-tui-native --bench ss_codec`; plus four `benches/throughput.rs` rows —

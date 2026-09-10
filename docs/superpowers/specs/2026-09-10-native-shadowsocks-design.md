@@ -217,15 +217,19 @@ UDP inside a TCP tunnel. Native implements the datagram-relay shape shared by
 sing-box (`option/shadowsocks.go` — the inbound serves UDP by default),
 shadowsocks-rust (`relay/udprelay/`) and mihomo
 (`transport/shadowsocks/shadowaead/packet.go`, the classic `Pack`/`Unpack`
-referenced by `protocol/ss/udp.rs`). xray-core is the odd one out: its SS
-*client* frames UDP INSIDE the TCP stream (`proxy/shadowsocks/client.go:88`
-stamps `RequestCommandUDP` on the same conn, relayed by `UDPWriter`/`UDPReader`
-over it at `:156-181`), while its SS *server* serves the datagram relay only
-when the inbound sets `network: "tcp,udp"` (`infra/conf/shadowsocks.go:48,64`;
-`infra/conf/common.go:111-113` defaults a nil network list to TCP). Native
-cannot observe the server's setting, so a profile whose server is a default
-xray SS inbound leaves its datagrams at a port with no UDP listener — where
-the subprocess xray client would have carried them over TCP.
+referenced by `protocol/ss/udp.rs`). xray-core follows the same shape on the
+client side: its SS client dials the server over the *destination's* network
+(`proxy/shadowsocks/client.go:59-67` sets `dest.Network = destination.Network`
+before `dialer.Dial`) and its UDP branch writes one encrypted datagram per
+packet (`RequestCommandUDP` + `UDPWriter` at `:156-181`) — the same dial-end
+datagram model. The residual is **server-side only**: `Server.Network()`
+(`proxy/shadowsocks/server.go:81-87`) defaults to TCP when the inbound omits
+`network`, and `NetworkList.Build()` does the same (`infra/conf/common.go:110-112`),
+so an xray SS inbound without `network: "tcp,udp"` serves no UDP relay to ANY
+client — the subprocess path included. There is therefore **no
+native-vs-subprocess regression** and SS stays out of the capability
+"native-worse" set; the consequence is an operator caveat (the server's UDP
+relay must be enabled), recorded in `NATIVE_CORE.md`.
 `connect_chain_udp` therefore treats an SS last link like the QUIC arm: the
 dial (`bind` a UDP socket to `params.server`) REPLACES dial + security +
 transport + upgrade, no chain is possible (an SS UDP link must be the only
