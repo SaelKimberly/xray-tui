@@ -463,4 +463,19 @@ mod tests {
         let long = vec![9u8; 3000];
         assert_eq!(hash32(&long), *blake3::hash(&long).as_bytes());
     }
+
+    /// The in-tree hand-rolled BLAKE3 (already pinned against the `blake3`
+    /// crate by `derive_key_matches_reference_crate`) must agree with the
+    /// helper on the 2022 context — an implementation the crate call cannot
+    /// silently define into correctness.
+    #[test]
+    fn ss2022_subkey_matches_hand_rolled_derive_key() {
+        let key = [0x22_u8; 32];
+        let salt = [0x33_u8; 32];
+        let material = [key.as_slice(), salt.as_slice()].concat();
+        assert_eq!(
+            crate::crypto::kdf::blake3_derive_key("shadowsocks 2022 session subkey", &material),
+            derive_key_bytes(b"shadowsocks 2022 session subkey", &material)
+        );
+    }
 }

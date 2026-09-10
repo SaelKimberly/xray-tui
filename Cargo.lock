@@ -253,6 +253,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "ascii"
@@ -600,6 +603,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -2591,6 +2595,15 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "webpki-roots",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
 ]
 
 [[package]]
@@ -8258,6 +8271,7 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_core",
+ "sha1",
  "sha2 0.11.0",
  "simd-adler32",
  "siphasher",
@@ -8334,6 +8348,7 @@ dependencies = [
  "h2",
  "h3",
  "h3-quinn",
+ "hkdf",
  "hmac",
  "http",
  "http-body",
@@ -8349,6 +8364,7 @@ dependencies = [
  "rstest",
  "rustls",
  "serde_json",
+ "sha1",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",

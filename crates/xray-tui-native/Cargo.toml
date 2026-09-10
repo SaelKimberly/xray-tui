@@ -41,6 +41,12 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 crc32fast = "1"
 md-5 = { version = "0.11", features = ["zeroize"] }
 blake2 = { version = "0.11", features = ["zeroize"] }
+# Classic-AEAD subkey KDF: HKDF-SHA1(psk, salt, b"ss-subkey").
+sha1 = { version = "0.11", features = ["zeroize"] }
+hkdf = "0.13"
+# 2022-blake3 session subkey: blake3::derive_key("shadowsocks 2022 session subkey",
+# psk || salt). Promoted from dev-dependency (b3.rs cross-validation uses it too).
+blake3 = { version = "1", features = ["zeroize"] }
 wide = "1.7.0"
 inout = "0.2"
 
@@ -152,9 +158,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 serde_json.workspace = true
 rcgen = "0.14"
 rstest.workspace = true
-# blake3 cross-validates the hand-rolled BLAKE3 in
-# protocol/vless/encryption/b3.rs against the reference implementation.
-blake3 = "1"
 # (rustls is a normal dependency now — the h3 arm's QUIC TLS config; the
 # server double reuses the same dep.)
 # Throughput benches (`benches/throughput.rs`, Task 2): criterion harness +
