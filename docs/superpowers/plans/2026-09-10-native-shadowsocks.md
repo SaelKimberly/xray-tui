@@ -1065,7 +1065,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream, cfg: &SsConfig, metho
     let key = password_key(method, &cfg.password)?;
     let mut salt = Zeroizing::new(vec![0u8; method.aead.salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
-    let first = encode_addr_port_last(&ctx.params.target)?;
+    let first = encode_addr_port_last(&ctx.target)?;
     let mut s = SsStream::new(stream, method, key, &salt, Some(first));
     s.flush_out().await?;                      // salt ‖ len seal ‖ payload seal, one write
     Ok(Box::new(s))
@@ -1455,7 +1455,7 @@ Expected: FAIL.
 //! ```
 //! One packet per UDP datagram, fresh salt and subkey per packet. The address
 //! is ALWAYS on the wire (there is no header-destination mode), so `send(None)`
-//! means the session target (`ctx.params.target`). Address family is SOCKS5
+//! means the session target (`ctx.target`). Address family is SOCKS5
 //! port-last (`encode_addr_port_last`).
 
 /// One datagram: `[salt][seal(zerononce, addr ‖ payload)]`.
@@ -1527,7 +1527,8 @@ pub struct SsUdpTunnel {
 }
 
 impl SsUdpTunnel {
-    /// Send one datagram. `dest = None` → `self.target`. Both codecs take a
+    /// Send one datagram. `dest = None` → `self.target` (the session
+    /// destination, taken from `ctx.target` on the chain's last link). Both codecs take a
     /// `TargetAddr` (the address travels INSIDE the sealed body, so a domain
     /// destination is legal on the wire).
     pub async fn send(&mut self, dest: Option<SocketAddr>, payload: &[u8]) -> std::io::Result<()> {
@@ -1550,7 +1551,7 @@ impl SsUdpTunnel {
 
     /// Classic rows: pure `Arc::clone` of the socket. 2022 rows: the writer
     /// state goes to the writer half, the reader state to the reader half.
-    pub fn split(self) -> (SsUdpReader, SsUdpWriter) { /* move, no lock */ }
+    pub fn split(self) -> std::io::Result<(SsUdpReader, SsUdpWriter)> { /* move, no lock */ }
 }
 ```
 /// `bind` a fresh UDP socket to the SS server — the whole dial. The server
@@ -1570,7 +1571,7 @@ pub async fn connect_udp(ctx: &LinkContext, method: SsMethod, cfg: &SsConfig) ->
         ),
         SsFamily::Classic => (None, None),
     };
-    Ok(SsUdpTunnel { socket: Arc::new(socket), method, key, target: ctx.params.target.clone(), s2022_writer, s2022_reader })
+    Ok(SsUdpTunnel { socket: Arc::new(socket), method, key, target: ctx.target.clone(), s2022_writer, s2022_reader })
 }
 ```
 
@@ -1721,11 +1722,12 @@ Expected: FAIL — the 2022 helpers do not exist.
 Add to `udp.rs`:
 - `fn aes_ecb_encrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16])` / `fn aes_ecb_decrypt(..)` via `Aes128`/`Aes256` `encrypt_block`/`decrypt_block` — 2022 has no aes-192 method, so any other cipher is a `NativeError::Config`.
 - `fn separate_header_aes(aead, psk, session_id: u64, packet_id: u64) -> [u8; 16]` (AES-ECB over `session_id BE8 ‖ packet_id BE8`), `fn separate_header_nonce(session_id: u64, packet_id: u64) -> [u8; 12]` (the **plaintext** header's `[4..16]`: last 4 bytes of the session id ‖ all 8 bytes of the packet id — spec §3.2.1; NEVER take a nonce off the wire ciphertext at `packet[4..16]`), and `fn udp_session_subkey(key: &[u8], session_id: u64, key_len: usize) -> Zeroizing<Vec<u8>>` (`blake3::derive_key("shadowsocks 2022 session subkey", key ‖ session_id BE8)` **truncated to `key_len`**, exactly like Task 2's `stream_subkey` — the UDP body AEAD takes the key length of the method, so the 32-byte root is wrong for 2022-blake3-aes-128-gcm).
-- `struct ServerSessions::new(client_session_id: u64)` (single-user PSK ⇒ exactly one local client session) with a **split check/commit API** — spec §3.2.4: the id MAY be checked right after the separate header decrypts, but the window MUST NOT advance before the body authenticates and the header validates (otherwise a spoofed high-id datagram with a garbage body desyncs the session and every later real reply looks out-of-window):
-  - `fn check(&mut self, server_id: u64, packet_id: u64) -> Option<u64>` — resolves (or creates, learning `client_session_id`) the slot, derives/caches that slot's `body_subkey`, runs the membership test only, returns the client session id; no window mutation.
-  - `fn body_subkey(&self, server_id: u64) -> Option<&[u8]>` — the cached subkey for the body open.
-  - `fn commit(&mut self, server_id: u64, packet_id: u64)` — advances THAT slot's window; called only after the body opened and type/timestamp/client-session validation passed.
-  - `SlidingWindow` starts with no committed id (`highest: Option<u64>`), so a fresh slot accepts any first id (a server session always starts at 0 after a restart).
+- `struct ServerSessions::new(client_session_id: u64, method: SsMethod, key: Arc<Zeroizing<Vec<u8>>>)` (single-user PSK ⇒ exactly one local client session; the ctor takes the key because each slot caches its own body subkey) with a **split check/commit API** — spec §3.2.4: the id MAY be checked right after the separate header decrypts, but the window MUST NOT advance before the body authenticates and the header validates (otherwise a spoofed high-id datagram with a garbage body desyncs the session and every later real reply looks out-of-window):
+  - `fn check(&self, server_id: u64, packet_id: u64) -> Option<u64>` — a **pure** lookup over the known slots (`None` for an unknown session, which the caller treats as a candidate); it mutates nothing at all, neither a window nor the table.
+  - `fn body_subkey(&self, server_id: u64) -> Option<&[u8]>` — the cached subkey for a known slot; an unknown candidate's subkey is derived on the fly (`udp_session_subkey(...)`, one BLAKE3 per first-of-session datagram) so opening a candidate never inserts a slot.
+  - `fn finish(&mut self, server_id: u64, packet_id: u64, client_session_id: u64, now: Instant)` — called only after the body opened AND `type == 1`, the timestamp is within 30 s, and the echoed client session id matches ours; it refreshes the slot's last-seen, learns/rotates only when the slot is new AND the current slot has been quiet ≥60 s (spec §3.2.4 option 2 — a different session is refused while the current one is fresh, so even a freshly captured replay cannot displace it), and then commits the id to that slot's window. A re-learn of the already-known session is always allowed. **An unvalidated datagram can never change the session table** — a replayed authentic packet id 0 from a dead session must not evict the live one, and an unknown session must not need packet id 0 at all (a lost first reply must not kill the return path).
+  - `SlidingWindow` starts with no committed id (`highest: Option<u64>`), so a fresh slot accepts any first id (a server session always starts at 0 after a restart); the window is ≥1024 ids wide (`bitmap: [u64; 16]`, ~120 B per slot — the WireGuard-derived reference uses 8128, v2ray-core 1024, so 64 is too narrow for reordered replies).
+  - The send side clamps the payload so the **sealed** datagram fits the UDP payload ceiling (≤65507 IPv4 / 65527 IPv6): worst-case payload across methods is 65181 B, so use `MAX_PAYLOAD = 65000` (or check the sealed length by address family), and reuse one send buffer per direction (no per-datagram `Vec`s — hysteria2's `WriteState` is the in-crate precedent).
   - Exactly one previous association is retained (spec §3.2.4).
 - `Ss2022WriterState { aead, key: Arc<Zeroizing<Vec<u8>>>, client_session_id: u64, packet_id: u64, subkey: Zeroizing<Vec<u8>> }`:
   - `new` draws the 8-byte client session id (`rand::fill_nonsecret`, read as BE) and caches `subkey = udp_session_subkey(key, client_session_id)`.
@@ -1841,7 +1843,7 @@ fn ss_supported(kind: ProtocolKind, cfg: &SsConfig) -> bool {
 }
 ```
 
-Also extend the existing `NATIVE_KINDS` equality test in the module and the `supported()` doc-comment (the SS UDP path is `connect_udp`, the SOCKS5-proxy UDP gap is unchanged).
+Also extend the existing `NATIVE_KINDS` equality test in the module and the `supported()` doc-comment (the SS UDP path is `connect_udp`, the SOCKS5-proxy UDP gap is unchanged). The gate is TCP-truthful: it must NOT try to encode the UDP dial-end's own refusals (a non-empty `security` on the UDP path is refused inside `ss::udp::connect_udp`).
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1899,6 +1901,9 @@ use xray_tui_native::e2e::{
     CaseSpec, Certs, CoreKind, CoreUnderTest, E2eCase, EchoServer, TlsEchoServer, run_against,
 };
 
+/// `SsConfig` has no transport field, so every SS row is plain TCP (+ the
+/// optional TLS/REALITY `security` layer the chain applies); there is no
+/// ws/grpc SS row to write.
 fn ss(method: &'static str) -> CaseSpec {
     CaseSpec::shadowsocks(method).with_tls(no_tls())
 }
@@ -1909,7 +1914,6 @@ fn ss(method: &'static str) -> CaseSpec {
 #[case::aead_xchacha20(ss("xchacha20-ietf-poly1305"))]
 #[case::ss2022_aes256(ss("2022-blake3-aes-256-gcm"))]
 #[case::ss2022_chacha20(ss("2022-blake3-chacha20-poly1305"))]
-#[case::aead_ws(ss("aes-128-gcm").with_network("ws"))]
 #[case::aead_tls_chrome(ss("aes-128-gcm").with_tls(fp("chrome")))]
 #[case::udp_aead(ss("aes-128-gcm").with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
 #[case::udp_2022(ss("2022-blake3-aes-256-gcm").with_app(AppKind::Udp).with_udp(PacketMode::Raw))]
@@ -1969,8 +1973,7 @@ and the client params protocol JSON:
     let mut protocol_value = serde_json::json!({
         "schema": "Ss",
         "method": method,
-        "password": ss_password(method),
-        "transport": transport
+        "password": ss_password(method)
     });
 ```
 (so `xchacha20-ietf-poly1305` → `xchacha20-ietf-poly1305` and `2022-blake3-chacha20-poly1305` → `2022-blake3-chacha20-poly1305`; the transport mapping copies `client_params_trojan`).

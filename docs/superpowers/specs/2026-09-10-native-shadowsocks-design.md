@@ -174,7 +174,24 @@ every one of its replies. Each session slot therefore carries its own window
 after** validation — spec §3.2.4 permits the id check as soon as the separate
 header decrypts, but forbids updating the window state before the body
 authenticates and the header validates, so a spoofed high-id datagram with a
-garbage body cannot desync the session.
+garbage body cannot desync the session. The **session table follows the same
+rule**: an unvalidated datagram may never create, rotate or evict a slot
+(otherwise a replayed authentic packet id 0 from a dead session evicts the live
+one and the return path blackholes permanently, and a single lost first reply
+after a server restart does the same). An unknown server session is opened with
+a subkey derived on the fly, and the slot is learned/rotated only in the
+validated path — matching both reference clients (ss-rust learns
+`server_session_map` entries only after the payload authenticated; v2ray-core
+tracks `trackedServerSessionID` on the parsed response). Rotating to a
+DIFFERENT server session is additionally gated on the spec §3.2.4 option 2:
+a candidate session is only learned when the current slot has been quiet for
+≥60 s (or none exists), so even a freshly captured replay from another session
+cannot displace a live one; a re-learn of the already-known session is always
+allowed, and the current slot's last-seen is refreshed by every validated
+datagram. The replay window is
+≥1024 ids wide (the WireGuard-derived reference uses 8128, v2ray-core 1024),
+and a sender clamps the payload so the **sealed** datagram stays inside the
+UDP payload ceiling (≤65507 IPv4 / 65527 IPv6), not merely the plaintext.
 
 ChaCha method: `[24B random nonce][XChaCha20-Poly1305(psk directly) over body]`
 with the session id + packet id **merged into the main header** (no separate
@@ -220,9 +237,15 @@ is a UDP-path-only dispatch arm, documented next to `is_quic_link`.
 - `plugin` or `plugin_opts` is set (SIP003, deferral #3);
 - 2022 password is not valid base64 of exactly 16/32 bytes (fail-closed,
   per the file's own contract), or the method is unknown;
-- `security_supported` / `transport_supported` reject the row (SS-over-TLS/ws
-  works and is *allowed* — the chain applies security/transport outside the
-  protocol for free).
+- `security_supported` rejects the row (an xray-only fingerprint). `SsConfig`
+  carries **no transport field** (verified: method/password/security/remarks/
+  plugin/plugin_opts), so an SS row always rides plain TCP + optional
+  `security` (TLS/REALITY, applied by `chain.rs` outside the protocol); there
+  is no ws/grpc/h2 variant to gate.
+- On the UDP dial-end, a row whose `security` is non-empty is refused by
+  `ss::udp::connect_udp` with `NativeError::Config`: a UDP dial replaces
+  dial + security + transport, so a requested TLS/REALITY layer has nowhere to
+  go — refusing beats silently sending plaintext on a row that asked for TLS.
 
 The `supported()` doc note about the SOCKS5 proxy leg never setting
 `params.udp` stays true and keeps its wording (SS-datagram support here is the
