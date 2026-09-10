@@ -162,7 +162,11 @@ ciphertext is `encrypted_separate_header`): the nonce is
 window is **per relay session**, not global: a restarted server issues a new
 server session whose packet ids restart at 0, and a shared window would reject
 every one of its replies. Each session slot therefore carries its own window
-(and its own body subkey).
+(and its own body subkey). The window is also **checked before, committed
+after** validation — spec §3.2.4 permits the id check as soon as the separate
+header decrypts, but forbids updating the window state before the body
+authenticates and the header validates, so a spoofed high-id datagram with a
+garbage body cannot desync the session.
 
 ChaCha method: `[24B random nonce][XChaCha20-Poly1305(psk directly) over body]`
 with the session id + packet id **merged into the main header** (no separate
