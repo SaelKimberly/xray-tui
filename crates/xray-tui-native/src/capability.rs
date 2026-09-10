@@ -21,21 +21,28 @@
 
 use xray_tui_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use xray_tui_proto::proto_spec::{
-    Hysteria2Config, ProtocolConfig, ProtocolKind, SecurityConfig, TrojanConfig, VlessConfig,
-    VmessConfig,
+    Hysteria2Config, ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, TrojanConfig,
+    VlessConfig, VmessConfig,
 };
 
+use crate::protocol::ss::method::password_key;
+use crate::protocol::ss::resolve_method;
 use crate::security::fingerprint::parse_fingerprint_id;
 
 /// The protocols with a native implementation, in canonical order.
 ///
-/// Must stay exactly `[Vless, Vmess, Trojan, Hysteria2]` — the four
-/// e2e-verified protocols the TUI may Auto-resolve onto native.
+/// Must stay exactly `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks,
+/// Shadowsocks2022]` — the e2e-verified protocols the TUI may Auto-resolve
+/// onto native. The two Shadowsocks kinds are separate entries because the
+/// typed kind carries the cipher family (`2022-blake3-*` → `Shadowsocks2022`)
+/// even though both share one [`SsConfig`].
 pub const NATIVE_KINDS: &[ProtocolKind] = &[
     ProtocolKind::Vless,
     ProtocolKind::Vmess,
     ProtocolKind::Trojan,
     ProtocolKind::Hysteria2,
+    ProtocolKind::Shadowsocks,
+    ProtocolKind::Shadowsocks2022,
 ];
 
 /// True when the protocol kind has a native implementation at all.
@@ -47,7 +54,12 @@ pub const NATIVE_KINDS: &[ProtocolKind] = &[
 pub const fn kind_supported(kind: ProtocolKind) -> bool {
     matches!(
         kind,
-        ProtocolKind::Vless | ProtocolKind::Vmess | ProtocolKind::Trojan | ProtocolKind::Hysteria2
+        ProtocolKind::Vless
+            | ProtocolKind::Vmess
+            | ProtocolKind::Trojan
+            | ProtocolKind::Hysteria2
+            | ProtocolKind::Shadowsocks
+            | ProtocolKind::Shadowsocks2022
     )
 }
 
@@ -65,6 +77,12 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
 /// no matter what this predicate answers. Gating UDP-capable shapes off
 /// that gap would cost them their native TCP path for a UDP leg no config
 /// can reach today — see `vless_supported` for the vision flows.
+///
+/// The Shadowsocks row is the sharpest case of that stance: `SsConfig` has no
+/// transport field at all, so the verdict covers the plain-TCP dial plus
+/// optional `security` and nothing else — the UDP dial-end refuses a
+/// non-empty `security` inside `ss::udp::connect_udp`, and refuses a chain in
+/// `chain.rs::ss_udp_guard`, which is where both refusals belong.
 #[must_use]
 pub fn supported(kind: ProtocolKind, config: &ProtocolConfig) -> bool {
     if !kind_supported(kind) {
@@ -75,6 +93,9 @@ pub fn supported(kind: ProtocolKind, config: &ProtocolConfig) -> bool {
         (ProtocolKind::Vmess, ProtocolConfig::Vmess(cfg)) => vmess_supported(cfg),
         (ProtocolKind::Trojan, ProtocolConfig::Trojan(cfg)) => trojan_supported(cfg),
         (ProtocolKind::Hysteria2, ProtocolConfig::Hysteria2(cfg)) => hysteria2_supported(cfg),
+        (ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022, ProtocolConfig::Ss(cfg)) => {
+            ss_supported(kind, cfg)
+        }
         _ => false,
     }
 }
@@ -242,6 +263,56 @@ const fn hysteria2_supported(_cfg: &Hysteria2Config) -> bool {
     true
 }
 
+/// Shadowsocks row (both kinds share this payload type): a native method
+/// family matching `kind`, no SIP003 plugin, a key the connect path can
+/// derive, a fingerprint native parses.
+///
+/// SS has no transport dimension — `SsConfig` carries no transport field, so
+/// the row always rides a plain TCP dial, plus optional `security` applied by
+/// the chain. The UDP dial-end's own refusals (a non-empty `security` on the
+/// UDP path, chaining) live in `ss::udp::connect_udp`/`chain`, not here: this
+/// predicate stays TCP-truthful, exactly as [`supported`] documents.
+///
+/// Every refusal below is a dead native dial the subprocess would have
+/// served:
+///
+/// - [`resolve_method`] is the connect path's ONE config entry point
+///   (`ss::connect` calls it before dispatching to a family codec), so the
+///   gate and the codec cannot drift: routing through the same function
+///   rejects exactly what the dial would reject — legacy stream ciphers
+///   (`aes-*-cfb/ctr`, `rc4-md5`, `chacha20-ietf`, `none`, …) and unknown
+///   names — and keeps those rows on sing-box. Should `resolve_method` ever
+///   grow a check, this gate inherits it.
+/// - Method family vs `kind`: the two kinds share `SsConfig`, and
+///   `2022-blake3-*` selects the BLAKE3 schedule while everything else uses
+///   HKDF-SHA1, so a mismatch means the wrong KDF, not a fallback.
+/// - `plugin`/`plugin_opts`: SIP003 is unimplemented — neither `ss::connect`
+///   nor the UDP carrier ever reads either field, so a plugin row would dial
+///   the bare server without its obfuscation wrapper. These are the only
+///   plugin fields on the typed config; the share-link and clash parsers both
+///   land here.
+/// - `password_key`: a malformed 2022 PSK (not base64, or the wrong length
+///   for the method) is a fatal `NativeError::Config` in the connect path, so
+///   refusing at gate time keeps Auto resolution on the subprocess.
+/// - `security_supported`: an xray-only uTLS fingerprint id is fatal on the
+///   SS TCP path too, because `security::wrap` parses it there like any
+///   other TLS/REALITY row.
+fn ss_supported(kind: ProtocolKind, cfg: &SsConfig) -> bool {
+    let Ok(method) = resolve_method(cfg) else {
+        return false;
+    };
+    if method.kind() != kind {
+        return false;
+    }
+    if cfg.plugin.is_some() || cfg.plugin_opts.is_some() {
+        return false;
+    }
+    if password_key(method, &cfg.password).is_err() {
+        return false;
+    }
+    security_supported(&cfg.security)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +399,23 @@ mod tests {
         }
     }
 
+    /// A shadowsocks row with no plugin and default (no-op) security.
+    fn ss_cfg(method: &str, password: &str) -> SsConfig {
+        SsConfig {
+            method: method.into(),
+            password: password.into(),
+            security: SecurityConfig::default(),
+            remarks: None,
+            plugin: None,
+            plugin_opts: None,
+        }
+    }
+
+    /// `supported` for an SS row (both kinds share the payload type).
+    fn ss_row(kind: ProtocolKind, cfg: SsConfig) -> bool {
+        supported(kind, &ProtocolConfig::Ss(cfg))
+    }
+
     /// `supported` for a vless row whose security is `security`.
     fn vless_with(security: SecurityConfig) -> bool {
         let mut cfg = vless_cfg();
@@ -377,6 +465,8 @@ mod tests {
                 ProtocolKind::Vmess,
                 ProtocolKind::Trojan,
                 ProtocolKind::Hysteria2,
+                ProtocolKind::Shadowsocks,
+                ProtocolKind::Shadowsocks2022,
             ]
         );
     }
@@ -486,8 +576,6 @@ mod tests {
     #[test]
     fn non_native_kinds_unsupported() {
         let non_native = [
-            ProtocolKind::Shadowsocks,
-            ProtocolKind::Shadowsocks2022,
             ProtocolKind::Socks,
             ProtocolKind::Http,
             ProtocolKind::WireGuard,
@@ -510,7 +598,7 @@ mod tests {
             ProtocolKind::TProxy,
             ProtocolKind::Mixed,
         ];
-        assert_eq!(non_native.len(), 23);
+        assert_eq!(non_native.len(), 21);
         let fallback = ProtocolConfig::Vless(vless_cfg());
         for kind in non_native {
             assert!(!kind_supported(kind), "{kind:?}");
@@ -743,6 +831,106 @@ mod tests {
                 want,
                 "{transport:?} via supported"
             );
+        }
+    }
+
+    #[test]
+    fn ss_kinds_are_native_and_legacy_methods_defer() {
+        assert!(kind_supported(ProtocolKind::Shadowsocks));
+        assert!(kind_supported(ProtocolKind::Shadowsocks2022));
+        assert!(ss_row(
+            ProtocolKind::Shadowsocks,
+            ss_cfg("aes-128-gcm", "pw")
+        ));
+        assert!(ss_row(
+            ProtocolKind::Shadowsocks2022,
+            ss_cfg(
+                "2022-blake3-aes-256-gcm",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            )
+        ));
+        // legacy + unknown methods stay on sing-box
+        for method in ["aes-256-cfb", "none", "rc4-md5", "chacha20-ietf"] {
+            assert!(
+                !ss_row(ProtocolKind::Shadowsocks, ss_cfg(method, "pw")),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_kind_and_method_family_must_agree() {
+        // A 2022 method on the classic kind (and vice versa) would pick the
+        // wrong KDF, so mismatched rows defer.
+        assert!(!ss_row(
+            ProtocolKind::Shadowsocks,
+            ss_cfg("2022-blake3-aes-256-gcm", "AAAAAAAAAAAAAAAAAAAAAA==")
+        ));
+        assert!(!ss_row(
+            ProtocolKind::Shadowsocks2022,
+            ss_cfg("aes-128-gcm", "pw")
+        ));
+    }
+
+    #[test]
+    fn ss_plugin_rows_defer() {
+        // SIP003: neither `ss::connect` nor the UDP carrier reads the plugin
+        // fields, so a plugin row must never reach the native dial.
+        let mut cfg = ss_cfg("aes-128-gcm", "pw");
+        cfg.plugin = Some(TinyText::from("obfs-local"));
+        assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
+
+        let mut cfg = ss_cfg("aes-128-gcm", "pw");
+        cfg.plugin_opts = Some(std::collections::HashMap::from([(
+            "obfs".to_owned(),
+            "http".to_owned(),
+        )]));
+        assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
+    }
+
+    #[test]
+    fn ss2022_password_length_is_validated_at_gate_time() {
+        // A wrong-length or non-base64 PSK is a config error in
+        // `password_key`, not a fallback: refusing here keeps Auto
+        // resolution on the subprocess instead of a dead native dial.
+        assert!(!ss_row(
+            ProtocolKind::Shadowsocks2022,
+            ss_cfg("2022-blake3-aes-128-gcm", "c2hvcnQ=")
+        ));
+        assert!(!ss_row(
+            ProtocolKind::Shadowsocks2022,
+            ss_cfg("2022-blake3-aes-128-gcm", "!!!")
+        ));
+        // The classic KDF accepts any password, so an SS AEAD row with an
+        // arbitrary password stays supported.
+        assert!(ss_row(
+            ProtocolKind::Shadowsocks,
+            ss_cfg("chacha20-ietf-poly1305", "")
+        ));
+    }
+
+    #[test]
+    fn ss_xray_only_fingerprint_defers() {
+        // `security::wrap` parses `fp` on the SS TCP path too, so an
+        // xray-only id is fatal there exactly as on vless/vmess/trojan.
+        let mut cfg = ss_cfg("aes-128-gcm", "pw");
+        cfg.security = tls_fp("ios");
+        assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
+
+        let mut cfg = ss_cfg(
+            "2022-blake3-aes-256-gcm",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        );
+        cfg.security = reality_fp("edge");
+        assert!(!ss_row(ProtocolKind::Shadowsocks2022, cfg));
+    }
+
+    #[test]
+    fn ss_native_fingerprint_and_plain_tls_supported() {
+        for security in [tls_fp("chrome"), reality_fp("firefox")] {
+            let mut cfg = ss_cfg("aes-192-gcm", "pw");
+            cfg.security = security.clone();
+            assert!(ss_row(ProtocolKind::Shadowsocks, cfg), "{security:?}");
         }
     }
 }
