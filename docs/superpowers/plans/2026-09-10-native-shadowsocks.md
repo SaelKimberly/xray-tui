@@ -612,6 +612,8 @@ mod tests {
             ("aead_chacha20_poly1305", SsAead::ChaCha20Poly1305, SsFamily::Classic),
             ("xchacha20-ietf-poly1305", SsAead::XChaCha20Poly1305, SsFamily::Classic),
             ("xchacha20-poly1305", SsAead::XChaCha20Poly1305, SsFamily::Classic),
+            ("aead_xchacha20_poly1305", SsAead::XChaCha20Poly1305, SsFamily::Classic),
+            ("aead_aes_192_gcm", SsAead::Aes192Gcm, SsFamily::Classic),
             ("2022-blake3-aes-128-gcm", SsAead::Aes128Gcm, SsFamily::Blake3_2022),
             ("2022-blake3-aes-256-gcm", SsAead::Aes256Gcm, SsFamily::Blake3_2022),
             ("2022-blake3-chacha20-poly1305", SsAead::ChaCha20Poly1305, SsFamily::Blake3_2022),
@@ -707,6 +709,21 @@ mod tests {
         );
         // …and the subkey advances with the salt (per-connection freshness).
         assert_ne!(&*stream_subkey(s2022, &key, &salt), &*stream_subkey(s2022, &key, &[0x23u8; 32]));
+    }
+
+    /// Classic KAT through the PUBLIC API: pins the `key`/`salt` argument
+    /// positions (`hkdf_sha1(psk, salt, b"ss-subkey")`) — the primitive's own
+    /// vector cannot catch a transposition at this call site, and the codec
+    /// round-trips use `stream_subkey` on both ends, so a transposition would
+    /// otherwise only surface at tier-3 interop. Vector = kdf.rs's independent
+    /// HKDF-SHA1("password", 0x11×16, "ss-subkey").
+    #[test]
+    fn classic_subkey_is_hkdf_sha1_of_key_and_salt() {
+        let m = SsMethod::from_method("aes-128-gcm").unwrap();
+        assert_eq!(
+            &*stream_subkey(m, b"password", &[0x11u8; 16]),
+            &hex("8e2b1a6111239229400b5dd612771931")
+        );
     }
 
     fn hex(s: &str) -> Vec<u8> {
@@ -809,8 +826,13 @@ pub fn stream_subkey(method: SsMethod, key: &[u8], salt: &[u8]) -> Zeroizing<Vec
             let mut material = Zeroizing::new(Vec::with_capacity(key.len() + salt.len()));
             material.extend_from_slice(key);
             material.extend_from_slice(salt);
-            let sub = blake3_derive_key(SS2022_SUBKEY_CONTEXT, &material);
-            Zeroizing::new(sub.to_vec())
+            // BLAKE3 derive-key is an XOF: the session key is only the first
+            // `key_len` bytes (16 for 2022-blake3-aes-128-gcm, 32 otherwise) —
+            // v2ray-core `kdf_blake3.go` fills a caller-sized outKey, shoes
+            // fills `session_key_len` from `finalize_xof`. The full 32 bytes
+            // would fail the 16-byte AEAD's key check.
+            let root = Zeroizing::new(blake3_derive_key(SS2022_SUBKEY_CONTEXT, &material));
+            Zeroizing::new(root[..method.key_len()].to_vec())
         }
     }
 }
@@ -823,13 +845,17 @@ pub fn password_key(method: SsMethod, password: &str) -> Result<Zeroizing<Vec<u8
     match method.family {
         SsFamily::Classic => Ok(evp_bytes_to_key_md5(password.as_bytes(), method.key_len())),
         SsFamily::Blake3_2022 => {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(password.trim())
-                .map_err(|e| {
-                    NativeError::Config(format!(
-                        "shadowsocks-2022 password is not base64: {e}"
-                    ))
-                })?;
+            // `Zeroizing` BEFORE the length check: a wrong-length PSK is
+            // still real key material and must not be dropped unwiped.
+            let decoded = Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(password.trim())
+                    .map_err(|e| {
+                        NativeError::Config(format!(
+                            "shadowsocks-2022 password is not base64: {e}"
+                        ))
+                    })?,
+            );
             if decoded.len() != method.key_len() {
                 return Err(NativeError::Config(format!(
                     "shadowsocks-2022 key is {} bytes, method needs {}",
@@ -837,7 +863,7 @@ pub fn password_key(method: SsMethod, password: &str) -> Result<Zeroizing<Vec<u8
                     method.key_len()
                 )));
             }
-            Ok(Zeroizing::new(decoded))
+            Ok(decoded)
         }
     }
 }
@@ -1683,7 +1709,7 @@ Expected: FAIL — the 2022 helpers do not exist.
 
 Add to `udp.rs`:
 - `fn aes_ecb_encrypt(aead: SsAead, psk: &[u8], block: &mut [u8; 16])` / `fn aes_ecb_decrypt(..)` via `Aes128`/`Aes256` `encrypt_block`/`decrypt_block` — 2022 has no aes-192 method, so any other cipher is a `NativeError::Config`.
-- `fn separate_header_aes(aead, psk, session_id: u64, packet_id: u64) -> [u8; 16]` (AES-ECB over `session_id BE8 ‖ packet_id BE8`), `fn separate_header_nonce(session_id: u64, packet_id: u64) -> [u8; 12]` (the **plaintext** header's `[4..16]`: last 4 bytes of the session id ‖ all 8 bytes of the packet id — spec §3.2.1; NEVER take a nonce off the wire ciphertext at `packet[4..16]`), and `fn udp_session_subkey(key: &[u8], session_id: u64) -> [u8; 32]` (`blake3::derive_key("shadowsocks 2022 session subkey", key ‖ session_id BE8)`).
+- `fn separate_header_aes(aead, psk, session_id: u64, packet_id: u64) -> [u8; 16]` (AES-ECB over `session_id BE8 ‖ packet_id BE8`), `fn separate_header_nonce(session_id: u64, packet_id: u64) -> [u8; 12]` (the **plaintext** header's `[4..16]`: last 4 bytes of the session id ‖ all 8 bytes of the packet id — spec §3.2.1; NEVER take a nonce off the wire ciphertext at `packet[4..16]`), and `fn udp_session_subkey(key: &[u8], session_id: u64, key_len: usize) -> Zeroizing<Vec<u8>>` (`blake3::derive_key("shadowsocks 2022 session subkey", key ‖ session_id BE8)` **truncated to `key_len`**, exactly like Task 2's `stream_subkey` — the UDP body AEAD takes the key length of the method, so the 32-byte root is wrong for 2022-blake3-aes-128-gcm).
 - `struct ServerSessions::new(client_session_id: u64)` (single-user PSK ⇒ exactly one local client session) with a **split check/commit API** — spec §3.2.4: the id MAY be checked right after the separate header decrypts, but the window MUST NOT advance before the body authenticates and the header validates (otherwise a spoofed high-id datagram with a garbage body desyncs the session and every later real reply looks out-of-window):
   - `fn check(&mut self, server_id: u64, packet_id: u64) -> Option<u64>` — resolves (or creates, learning `client_session_id`) the slot, derives/caches that slot's `body_subkey`, runs the membership test only, returns the client session id; no window mutation.
   - `fn body_subkey(&self, server_id: u64) -> Option<&[u8]>` — the cached subkey for the body open.

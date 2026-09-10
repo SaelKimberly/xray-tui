@@ -122,6 +122,13 @@ all-zero bytes.
 
 ```
 subkey = blake3::derive_key("shadowsocks 2022 session subkey", psk ‖ salt)
+         TRUNCATED to the method's key length (16 for 2022-blake3-aes-128-gcm,
+         32 otherwise) — the derivation is a BLAKE3 XOF and the session key is
+         only the first key_len bytes (v2ray-core
+         `shadowsocks2022/kdf_blake3.go::GetSessionSubKey` fills a caller-sized
+         `outKey`; shoes `blake3_key.rs` fills `session_key_len` from
+         `finalize_xof`). Feeding the full 32 bytes to a 16-byte AEAD is a
+         bad-key-length failure, not a fallback.
 nonce  = 12-byte LE counter, advanced by EVERY seal/open (spec §3.1.1) —
          so a payload chunk costs +2 (length seal, payload seal), and the
          standalone header chunks cost +1 each
@@ -148,6 +155,7 @@ packet = [ AES-ECB(psk, [client_session_id u64be ‖ packet_id u64be]) ]   (16 B
        ‖ seal( nonce = separate_header[4..16],
                 [type=0 | ts u64be | pad_len u16be | padding | addr | port | payload] )
 subkey = blake3::derive_key("shadowsocks 2022 session subkey", psk ‖ client_session_id[0..8])
+         (truncated to key_len, same rule as TCP / server_session_id for replies)
 ```
 Server → client is a **different, larger** shape: its own
 `[server_session_id ‖ server_packet_id]` header block, and a body whose main
