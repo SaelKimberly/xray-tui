@@ -73,12 +73,25 @@ impl SsMethod {
 /// 2022: `blake3::derive_key("shadowsocks 2022 session subkey", key ‖ salt)`.
 #[must_use]
 pub fn stream_subkey(method: SsMethod, key: &[u8], salt: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(vec![0u8; method.key_len()]);
+    stream_subkey_into(method, key, salt, &mut out);
+    out
+}
+
+/// [`stream_subkey`] into a caller-owned buffer of `method.key_len()` bytes —
+/// the UDP datagram path derives a fresh subkey for EVERY classic packet and
+/// must not allocate on that hot path.
+///
+/// The one owner of both derivations: [`stream_subkey`] is this function plus
+/// the buffer.
+pub(crate) fn stream_subkey_into(method: SsMethod, key: &[u8], salt: &[u8], out: &mut [u8]) {
+    assert_eq!(
+        out.len(),
+        method.key_len(),
+        "the subkey buffer must hold key_len bytes"
+    );
     match method.family {
-        SsFamily::Classic => {
-            let mut out = Zeroizing::new(vec![0u8; method.key_len()]);
-            hkdf_sha1(key, salt, b"ss-subkey", &mut out);
-            out
-        }
+        SsFamily::Classic => hkdf_sha1(key, salt, b"ss-subkey", out),
         SsFamily::Blake3_2022 => {
             let mut material = Zeroizing::new(Vec::with_capacity(key.len() + salt.len()));
             material.extend_from_slice(key);
@@ -87,7 +100,7 @@ pub fn stream_subkey(method: SsMethod, key: &[u8], salt: &[u8]) -> Zeroizing<Vec
             // BLAKE3's XOF is prefix-consistent, so the first `key_len` bytes of
             // the 32-byte root are the session subkey for the 16-byte methods
             // too (`Blake3Key` fills `cipher.algorithm().key_len()` bytes).
-            Zeroizing::new(sub[..method.key_len()].to_vec())
+            out.copy_from_slice(&sub[..method.key_len()]);
         }
     }
 }

@@ -12,6 +12,7 @@
 pub mod method;
 pub mod stream;
 pub mod stream2022;
+pub mod udp;
 
 use xray_tui_proto::proto_spec::SsConfig;
 

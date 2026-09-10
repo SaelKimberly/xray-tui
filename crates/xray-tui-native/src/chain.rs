@@ -17,6 +17,7 @@ use crate::context::{LinkContext, NativeConnectParams};
 use crate::error::NativeError;
 use crate::protocol;
 use crate::protocol::PacketTunnel;
+use crate::protocol::ss;
 use crate::protocol::vless::MuxClient;
 use crate::security;
 use crate::transport;
@@ -48,6 +49,22 @@ fn quic_guard(
     if base.is_some() {
         return Err(NativeError::Config(
             "a QUIC-family protocol cannot reuse a base tunnel (fresh QUIC dial)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// An SS UDP link dials its own UDP socket straight to the server, so it must
+/// be the only link: there is no base tunnel for it to ride and no way to
+/// carry it through a chain (mirrors [`quic_guard`]).
+fn ss_udp_guard(
+    links: &[NativeConnectParams],
+    i: usize,
+    base: Option<&BoxStream>,
+) -> Result<(), NativeError> {
+    if links.len() != 1 || i + 1 != links.len() || base.is_some() {
+        return Err(NativeError::Config(
+            "shadowsocks UDP dials its own UDP socket and cannot ride a proxy chain".into(),
         ));
     }
     Ok(())
@@ -108,7 +125,10 @@ pub async fn connect_chain(
 /// hysteria2 QUIC DATAGRAM `UDPMessage` frames. Intermediate links tunnel
 /// TCP as usual — they carry the UDP tunnel as a byte stream to the next
 /// hop; hysteria2 dials its own QUIC connection and is therefore the only
-/// link (`quic_guard`).
+/// link (`quic_guard`). Shadowsocks is the same shape for a different reason:
+/// its UDP relay is reached by sending datagrams to the server's own UDP
+/// port, so `ss_udp_guard` refuses any chain around it and the carrier binds
+/// its socket directly.
 pub async fn connect_chain_udp(
     links: &[NativeConnectParams],
     target: TargetAddr,
@@ -133,6 +153,20 @@ pub async fn connect_chain_udp(
                     feature: "udp over a QUIC-family protocol (only hysteria2 implemented)".into(),
                 }),
             };
+        }
+        if protocol::is_udp_dial_link(&ctx) {
+            // Shadowsocks UDP: the dial IS a UDP socket to the server — no
+            // security, no transport, no base tunnel. A link that dials its
+            // own socket cannot ride a chain (mirrors `quic_guard`).
+            ss_udp_guard(links, i, base.as_ref())?;
+            let xray_tui_proto::proto_spec::ProtocolConfig::Ss(cfg) = &ctx.params.protocol else {
+                unreachable!("is_udp_dial_link matches only Ss");
+            };
+            let method = ss::resolve_method(cfg)?;
+            protocol::reject_vless_only_mode(&ctx, method.kind())?;
+            return Ok(PacketTunnel::Ss(
+                ss::udp::connect_udp(&ctx, method, cfg).await?,
+            ));
         }
         let dialed = transport::connect(&ctx, base).await?;
         let upgraded = secured_upgraded(&ctx, dialed).await?;
@@ -181,6 +215,8 @@ pub async fn connect_chain_mux(
 #[cfg(test)]
 mod tests {
     use xray_tui_proto::proto_spec::ProtocolConfig;
+    use xray_tui_proto::proto_spec::SecurityConfig;
+    use xray_tui_proto::proto_spec::SsConfig;
     use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
 
     use super::*;
@@ -229,6 +265,71 @@ mod tests {
             quic_guard(&links, 1, Some(&base)),
             Err(NativeError::Config(msg)) if msg.contains("cannot reuse a base tunnel")
         ));
+    }
+
+    /// A single-link SS row pointed at a local port (the server double in the
+    /// carrier tests); the link target is a placeholder that the chain target
+    /// deliberately overrides.
+    fn ss_params(method: &str, password: &str, port: u16) -> NativeConnectParams {
+        NativeConnectParams::new(
+            ProtocolConfig::Ss(SsConfig {
+                method: method.into(),
+                password: password.into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin: None,
+                plugin_opts: None,
+            }),
+            EndpointEssentials::new("127.0.0.1", port),
+            TargetAddr::new(Host::Domain("ignored".into()), 1),
+        )
+    }
+
+    /// An SS UDP link dials its own socket, like a QUIC-family link: it must
+    /// be the only link and there is no base tunnel to hand it.
+    #[test]
+    fn ss_udp_guard_allows_only_the_single_link() {
+        let links = [
+            ss_params("aes-128-gcm", "pw", 8388),
+            params("b.example", 20),
+        ];
+        ss_udp_guard(&links[..1], 0, None).expect("the only link");
+        assert!(matches!(
+            ss_udp_guard(&links, 0, None),
+            Err(NativeError::Config(msg)) if msg.contains("cannot ride a proxy chain")
+        ));
+        let base: BoxStream = Box::new(tokio::io::duplex(1).0);
+        assert!(matches!(
+            ss_udp_guard(&links[..1], 0, Some(&base)),
+            Err(NativeError::Config(_))
+        ));
+    }
+
+    /// The SS UDP arm reaches the carrier with no TLS or transport in
+    /// between: the tunnel really owns a socket pointing at the server's
+    /// port, and a datagram sent through it lands there. The payload's
+    /// `ATYP|addr|port` is the 7-byte IPv4 form of the chain TARGET, not the
+    /// link's placeholder domain — the wire pins which one the carrier uses.
+    #[tokio::test]
+    async fn ss_udp_link_dials_the_carrier_directly() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let links = [ss_params("aes-128-gcm", "hunter2", port)];
+        let target = TargetAddr::new(Host::Ip(std::net::IpAddr::from([1, 2, 3, 4])), 53);
+        let mut tunnel = connect_chain_udp(&links, target).await.unwrap();
+        assert!(matches!(&tunnel, PacketTunnel::Ss(_)));
+
+        tunnel.send(None, b"x").await.unwrap();
+        let mut buf = [0u8; 256];
+        let (read, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.recv_from(&mut buf),
+        )
+        .await
+        .expect("the datagram reaches the server")
+        .unwrap();
+        // aes-128-gcm: [salt 16][seal(ATYP|addr|port ‖ payload) 7+1+16].
+        assert_eq!(read, 16 + 7 + 1 + 16);
     }
 
     #[test]

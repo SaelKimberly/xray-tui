@@ -80,6 +80,19 @@ pub(crate) const fn is_quic_link(ctx: &LinkContext) -> bool {
     )
 }
 
+/// True when the link's UDP path dials its own UDP socket instead of riding
+/// the TCP-tunnel stream carrier.
+///
+/// Shadowsocks' UDP relay is a separate UDP endpoint: the client sends
+/// datagrams to the server's own port, so the dial REPLACES dial + security +
+/// transport + upgrade (there is no in-tunnel framing for it, and no place
+/// for a chain — `chain.rs::ss_udp_guard`). The protocol's TCP path is
+/// unaffected (`is_quic_link` is its own, unrelated shape).
+#[must_use]
+pub(crate) const fn is_udp_dial_link(ctx: &LinkContext) -> bool {
+    matches!(ctx.params.protocol, ProtocolConfig::Ss(_))
+}
+
 /// Run the QUIC protocol phase: a fresh QUIC dial (dial + security +
 /// upgrade REPLACED by the QUIC connection — spec §5.2), then the protocol's
 /// own handshake over a QUIC stream.
@@ -108,6 +121,9 @@ pub async fn connect_quic(ctx: &LinkContext) -> Result<BoxStream, NativeError> {
 ///   (`ATYP|addr|port || len || CRLF || payload`).
 /// - [`PacketTunnel::Hysteria2`] — QUIC DATAGRAM `UDPMessage` frames
 ///   (hysteria2 is a QUIC dial, not a stream chain).
+/// - [`PacketTunnel::Ss`] — one Shadowsocks datagram per UDP datagram on a
+///   socket dialed straight to the SS server (a dial-end carrier, like
+///   hysteria2; classic-AEAD or 2022-blake3 per the row's method).
 ///
 /// All variants expose the same datagram API: [`send`](Self::send) /
 /// [`recv`](Self::recv).
@@ -116,6 +132,7 @@ pub enum PacketTunnel {
     Vmess(vmess::udp::PacketConn<BoxStream>),
     Trojan(trojan::PacketConn<BoxStream>),
     Hysteria2(hysteria2::udp::UdpConn),
+    Ss(ss::udp::SsUdpTunnel),
 }
 
 impl PacketTunnel {
@@ -142,6 +159,7 @@ impl PacketTunnel {
             Self::Vmess(c) => c.send(dest, payload).await,
             Self::Trojan(c) => c.send(dest, payload).await,
             Self::Hysteria2(c) => c.send(dest, payload).await,
+            Self::Ss(c) => c.send(dest, payload).await,
         }
     }
 
@@ -158,6 +176,7 @@ impl PacketTunnel {
             Self::Vmess(c) => c.recv().await,
             Self::Trojan(c) => to_bytes(c.recv().await),
             Self::Hysteria2(c) => to_bytes(c.recv().await),
+            Self::Ss(c) => to_bytes(c.recv().await),
         }
     }
 }
@@ -168,6 +187,7 @@ pub enum PacketReader {
     Vmess(vmess::udp::PacketReader<tokio::io::ReadHalf<BoxStream>>),
     Trojan(trojan::PacketReader<tokio::io::ReadHalf<BoxStream>>),
     Hysteria2(hysteria2::udp::UdpReader),
+    Ss(ss::udp::SsUdpReader),
 }
 
 /// The write half of a split [`PacketTunnel`] — see [`PacketTunnel::split`].
@@ -176,6 +196,7 @@ pub enum PacketWriter {
     Vmess(vmess::udp::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
     Trojan(trojan::PacketWriter<tokio::io::WriteHalf<BoxStream>>),
     Hysteria2(hysteria2::udp::UdpWriter),
+    Ss(ss::udp::SsUdpWriter),
 }
 
 impl PacketTunnel {
@@ -209,6 +230,10 @@ impl PacketTunnel {
                 let (r, w) = c.split()?;
                 Ok((PacketReader::Hysteria2(r), PacketWriter::Hysteria2(w)))
             }
+            Self::Ss(c) => {
+                let (r, w) = c.split()?;
+                Ok((PacketReader::Ss(r), PacketWriter::Ss(w)))
+            }
         }
     }
 }
@@ -227,6 +252,7 @@ impl PacketReader {
             Self::Vmess(r) => r.recv().await,
             Self::Trojan(r) => to_bytes(r.recv().await),
             Self::Hysteria2(r) => to_bytes(r.recv().await),
+            Self::Ss(r) => to_bytes(r.recv().await),
         }
     }
 }
@@ -250,6 +276,7 @@ impl PacketWriter {
             Self::Vmess(w) => w.send(dest, payload).await,
             Self::Trojan(w) => w.send(dest, payload).await,
             Self::Hysteria2(w) => w.send(dest, payload).await,
+            Self::Ss(w) => w.send(dest, payload).await,
         }
     }
 }
@@ -365,12 +392,16 @@ mod tests {
 
     #[test]
     fn vless_only_modes_are_refused_per_protocol() {
-        // The three non-VLESS UDP entry points: the vmess and trojan arms of
-        // `connect_udp`, and the hysteria2 branch of `connect_chain_udp`.
+        // The non-VLESS UDP entry points: the vmess and trojan arms of
+        // `connect_udp`, the hysteria2 branch of `connect_chain_udp`, and the
+        // shadowsocks dial-end arm (which passes `method.kind()`, either SS
+        // kind).
         for kind in [
             ProtocolKind::Vmess,
             ProtocolKind::Trojan,
             ProtocolKind::Hysteria2,
+            ProtocolKind::Shadowsocks,
+            ProtocolKind::Shadowsocks2022,
         ] {
             for mode in [PacketMode::PacketAddr, PacketMode::XUdp] {
                 let err = reject_vless_only_mode(&udp_ctx(Some(mode)), kind)

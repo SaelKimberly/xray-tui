@@ -94,6 +94,9 @@ pub async fn connect(params: NativeConnectParams) -> Result<NativeTunnel, Native
 /// - **Trojan** command 3 address-prefixed frames.
 /// - **Hysteria2** a fresh QUIC dial + QUIC DATAGRAM `UDPMessage` frames
 ///   (the QUIC-family protocol must be the only/last link).
+/// - **Shadowsocks** one datagram per packet on a UDP socket dialed straight
+///   to the server's relay port (classic-AEAD or 2022-blake3 per the row's
+///   method; also the only/last link, and TLS/REALITY rows are refused).
 ///
 /// The returned [`PacketTunnel`] is a datagram API over the tunnel.
 pub async fn connect_udp(params: &NativeConnectParams) -> Result<PacketTunnel, NativeError> {
