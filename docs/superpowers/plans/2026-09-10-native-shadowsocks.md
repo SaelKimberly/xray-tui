@@ -333,19 +333,42 @@ mod tests {
         let aead = SsAead::Aes256Gcm;
         let key = vec![0u8; 32];
         let nonce = vec![0u8; 12];
+        // Wrong AAD against an INTACT ciphertext (isolates AAD authentication
+        // from tamper detection).
+        let ct = aead.seal(&key, &nonce, b"", b"payload").unwrap();
+        assert!(aead.open(&key, &nonce, b"other", &ct).is_err());
+        // Tampered ciphertext with the right AAD.
         let mut ct = aead.seal(&key, &nonce, b"", b"payload").unwrap();
         ct[0] ^= 1;
         assert!(aead.open(&key, &nonce, b"", &ct).is_err());
-        assert!(aead.open(&key, &nonce, b"other", &ct).is_err());
     }
 
     /// The classic/2022 TCP nonce is a little-endian counter over the whole
-    /// nonce buffer. Guards the increment width (XChaCha's 24 bytes).
+    /// nonce buffer. Guards the increment width (XChaCha's 24 bytes) and the
+    /// carry chain (a 1-byte counter wraps 0xff → 0x00 without panicking).
     #[test]
     fn nonce_counter_is_little_endian_and_wraps() {
         let mut c = NonceCounter::new(12);
         assert_eq!(c.next(), &[0u8; 12]);
         assert_eq!(c.next(), &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Width: the XChaCha path hands out 24 bytes.
+        let mut wide = NonceCounter::new(24);
+        assert_eq!(wide.next().len(), 24);
+        let mut expected = [0u8; 24];
+        expected[0] = 1;
+        assert_eq!(wide.next(), &expected[..]);
+        // Carry chain + wrap: byte 0 carries into byte 1, and the top byte's
+        // carry is dropped rather than panicking.
+        let mut c = NonceCounter::new(2);
+        for _ in 0..256 {
+            let _ = c.next(); // `next` is #[must_use]; the value is discarded on purpose
+        }
+        assert_eq!(c.next(), &[0x00, 0x01]); // 256 as u16 LE
+        let mut c = NonceCounter::new(1);
+        for _ in 0..256 {
+            let _ = c.next();
+        }
+        assert_eq!(c.next(), &[0x00]); // 256 truncated to one byte
         let mut c = NonceCounter::new(0);
         assert_eq!(c.next(), &[] as &[u8]);
     }
@@ -362,8 +385,9 @@ Expected: FAIL — `cannot find type SsAead`.
 ```rust
 //! AEAD body ciphers: AES-128/192/256-GCM and ChaCha20/XChaCha20-Poly1305.
 //!
-//! Consumers: `protocol/vmess` (AEAD body, own record framing) and
-//! `protocol/shadowsocks` (classic AEAD + 2022-blake3).
+//! Consumers: `protocol/ss` (classic AEAD + 2022-blake3, Tasks 3/4/6). The
+//! VMess record codec (`protocol/vmess/stream.rs`) drives the same RustCrypto
+//! primitives directly for its own record framing.
 //! Backend: RustCrypto (`aes-gcm`, `chacha20poly1305`) — not ring: both are
 //! already in the tree with the `zeroize` feature, and their explicit-nonce
 //! APIs are what the Shadowsocks counters need. References: RFC 8439,
@@ -507,7 +531,10 @@ pub struct NonceCounter {
 impl NonceCounter {
     #[must_use]
     pub fn new(len: usize) -> Self {
-        debug_assert!(len <= 24);
+        // `assert!`, not `debug_assert!`: an over-wide nonce would otherwise
+        // panic on the first hand-out, far from the constructor that accepted
+        // it — and only in release builds.
+        assert!(len <= 24, "NonceCounter width must be <= 24 bytes, got {len}");
         Self {
             buf: Zeroizing::new([0u8; 24]),
             len,
