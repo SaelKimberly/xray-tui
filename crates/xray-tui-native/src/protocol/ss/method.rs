@@ -69,7 +69,7 @@ impl SsMethod {
 
 /// Per-stream/-session subkey.
 ///
-/// Classic: `HKDF-SHA1(key, salt, "ss-subkey")`, output = key_len.
+/// Classic: `HKDF-SHA1(key, salt, "ss-subkey")`, output = `key_len`.
 /// 2022: `blake3::derive_key("shadowsocks 2022 session subkey", key ‖ salt)`.
 #[must_use]
 pub fn stream_subkey(method: SsMethod, key: &[u8], salt: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -87,8 +87,7 @@ pub fn stream_subkey(method: SsMethod, key: &[u8], salt: &[u8]) -> Zeroizing<Vec
             // BLAKE3's XOF is prefix-consistent, so the first `key_len` bytes of
             // the 32-byte root are the session subkey for the 16-byte methods
             // too (`Blake3Key` fills `cipher.algorithm().key_len()` bytes).
-            let out = Zeroizing::new(sub[..method.key_len()].to_vec());
-            out
+            Zeroizing::new(sub[..method.key_len()].to_vec())
         }
     }
 }
@@ -247,7 +246,7 @@ mod tests {
         );
     }
 
-    /// Classic subkey = HKDF-SHA1; 2022 subkey = blake3 derive_key over key ‖ salt.
+    /// Classic subkey = HKDF-SHA1; 2022 subkey = blake3 `derive_key` over key ‖ salt.
     #[test]
     fn stream_subkeys_differ_per_family_and_track_the_salt() {
         let classic = SsMethod::from_method("aes-128-gcm").unwrap();
@@ -276,7 +275,7 @@ mod tests {
         let material = [key.as_slice(), salt.as_slice()].concat();
         assert_eq!(
             &*sub,
-            &crate::protocol::vless::encryption::b3::derive_key_bytes(
+            &crate::protocol::vless::encryption::derive_key_bytes(
                 b"shadowsocks 2022 session subkey",
                 &material
             )[..16]
@@ -285,10 +284,9 @@ mod tests {
 
     /// The `key ‖ salt` material order is pinned against the hand-rolled
     /// BLAKE3 (an implementation independent of the `blake3` crate the helper
-    /// delegates to). Requires exposing it crate-wide: in
-    /// `protocol/vless/encryption/mod.rs` change `mod b3;` to
-    /// `pub(crate) mod b3;` and in `b3.rs` change
-    /// `pub(super) fn derive_key_bytes` to `pub(crate) fn derive_key_bytes`.
+    /// delegates to), reached through the test-only re-export
+    /// `protocol::vless::encryption::derive_key_bytes` — production builds
+    /// keep `b3` private and expose nothing new.
     #[test]
     fn blake3_subkey_material_order_is_key_then_salt() {
         let s2022 = SsMethod::from_method("2022-blake3-aes-256-gcm").unwrap();
@@ -297,7 +295,7 @@ mod tests {
         let material = [key.as_slice(), salt.as_slice()].concat();
         assert_eq!(
             &*stream_subkey(s2022, &key, &salt),
-            &crate::protocol::vless::encryption::b3::derive_key_bytes(
+            &crate::protocol::vless::encryption::derive_key_bytes(
                 b"shadowsocks 2022 session subkey",
                 &material
             )[..]

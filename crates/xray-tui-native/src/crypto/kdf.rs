@@ -16,7 +16,7 @@
 //! `protocol/vless/encryption/b3.rs`).
 //!
 //! Backends: REALITY auth-key derivation uses ring (workspace standard); the
-//! Shadowsocks helpers above use RustCrypto `hkdf`/`sha1`, `md-5`, and the
+//! Shadowsocks helpers above use `RustCrypto` `hkdf`/`sha1`, `md-5`, and the
 //! `blake3` crate.
 
 use hkdf::Hkdf;

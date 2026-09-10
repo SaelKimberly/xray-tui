@@ -7,3 +7,4 @@
 //! Reference: v2ray-core `proxy/shadowsocks`, thirdparty/shadowsocks-rust.
 
 pub mod method;
+pub mod stream;

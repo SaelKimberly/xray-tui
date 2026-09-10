@@ -378,7 +378,7 @@ fn parent_cv(
 /// BLAKE3 `derive_key(context, key_material)` with a BINARY context —
 /// byte-compatible with Go's `blake3.DeriveKey(dst, ctx, srcKey)`, which
 /// xray feeds non-UTF-8 contexts (random IVs, ciphertext material).
-pub(crate) fn derive_key_bytes(context: &[u8], key_material: &[u8]) -> [u8; KEY_LEN] {
+pub fn derive_key_bytes(context: &[u8], key_material: &[u8]) -> [u8; KEY_LEN] {
     // Step 1: hash the context with the DERIVE_KEY_CONTEXT flag.
     let mut context_hasher = Hasher::new(IV, u32::from(DERIVE_KEY_CONTEXT));
     context_hasher.update(context);
