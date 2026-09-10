@@ -137,6 +137,8 @@ bench target='all':
     cargo criterion -p xray-tui-tls    --bench record
     cargo criterion -p xray-tui-route  --bench decide
     cargo criterion -p xray-tui-native --bench dispatch
+    # Hermetic Shadowsocks codec/KDF rows — no cores, no sockets, so micro-safe.
+    cargo criterion -p xray-tui-native --bench ss_codec
     cargo criterion -p xray-tui-native --features native-e2e --bench relay
     if [ "{{target}}" = all ]; then
         cargo criterion -p xray-tui-native --features native-e2e --bench throughput

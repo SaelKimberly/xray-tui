@@ -34,14 +34,15 @@ Status: IMPLEMENTED 2026-09-03 · Baseline: `b2c1786ecd67be191912f0f1b020fab3f87
 ## Goal
 
 Integrate `xray-tui-native` (in-process proxy core) into the TUI as a first-class
-backend for the four e2e-verified protocols — VLESS, VMess, Trojan, Hysteria2 —
-with the same user-facing capabilities xray-core/sing-box subprocesses have today
+backend for the six e2e-verified protocol kinds — VLESS, VMess, Trojan, Hysteria2,
+Shadowsocks, Shadowsocks-2022 — with the same user-facing capabilities
+xray-core/sing-box subprocesses have today
 (connect/disconnect, per-profile core selection, traffic + sys stats, live logs,
 speed-test integration, UI indicators), plus realtime observability of the native
 core: per-connection usage, failures, and traffic on a dedicated screen.
 
 User decisions (2026-09-03):
-1. Native-selectable set = the four e2e-verified protocols only.
+1. Native-selectable set = the six e2e-verified protocol kinds only.
 2. **Native preferred** — a profile whose protocol+config native supports runs
    the in-process core; subprocess only via explicit override. (Shipped as a
    connect-time decision on xray-stamped links — §1; the original "resolves to
@@ -161,8 +162,8 @@ core.
 Shipped gates (`capability.rs` — unknown values fail CLOSED, so a field or id
 native cannot parse defers to the subprocess instead of dying mid-dial):
 
-- Kind ∉ {Vless, Vmess, Trojan, Hysteria2}, or a `ProtocolConfig` variant that
-  does not match `kind` → false.
+- Kind ∉ {Vless, Vmess, Trojan, Hysteria2, Shadowsocks, Shadowsocks2022}, or a
+  `ProtocolConfig` variant that does not match `kind` → false.
 - VLESS: any non-empty account `encryption` other than `none` → false — this is
   what excludes `mlkem768x25519plus.*` (native diverges from real xray:
   NATIVE_CORE.md SP7 pq-enc, native fails where xray works). Flow must be
@@ -193,6 +194,19 @@ native cannot parse defers to the subprocess instead of dying mid-dial):
   xray-core builds hysteria2 as the unified `protocol: "hysteria"` outbound with
   `version: 2` (`Hysteria2Config::inject_xray`; the e2e header's "no hysteria2"
   note is about the harness SERVER side).
+- Shadowsocks / Shadowsocks-2022: the two kinds share one `SsConfig`, so the
+  method family must match `kind` (a `2022-blake3-*` method on the classic kind
+  → false, and vice versa); the method must be one native implements (the 2017
+  AEAD set + `2022-blake3-*`) — every legacy stream cipher (`aes-*-cfb/ctr`,
+  `rc4-md5`, `chacha20-ietf`, `none`) and unknown name routes to sing-box;
+  SIP003 `plugin`/`plugin_opts` are unimplemented, so a plugin row → false
+  (native would dial the bare server without its obfuscation wrapper); a 2022
+  PSK that is not base64, or not the method's key length, → false. `SsConfig`
+  carries no transport field, so the verdict is the plain-TCP dial plus the
+  optional `security` layer (an xray-only `fp` id → false, exactly as for the
+  other kinds). Deferrals this work records: the legacy stream ciphers
+  (sing-box keeps them), SIP003 plugins, and 2022 multi-user EIH (single-user
+  PSK only — the typed config has no identity field).
 - The verdict is TCP-truthful: SOCKS5 UDP ASSOCIATE through the native *proxy*
   outbound is not implemented (`proxy_params` never sets `params.udp`), so a
   native session drops the proxy UDP leg regardless of the answer — gating the
@@ -323,7 +337,7 @@ enum TraceEvent {
 
 ## Out of scope (v1)
 
-- Protocols beyond the four (SOCKS/HTTP client kinds etc. keep subprocess).
+- Protocols beyond the six (SOCKS/HTTP client kinds etc. keep subprocess).
 - Routing-rule parity (custom rules + sniffing) through the native route engine.
 - TUN/http inbound beyond CONNECT; outbound-only kinds (Redirect/TProxy/Mixed).
 - Trace persistence across sessions; per-conn logs beyond failures (debug frames).
@@ -332,12 +346,12 @@ enum TraceEvent {
 
 ## Risks
 
-- Native becomes the default runtime for the four most common protocols
+- Native becomes the default runtime for the six supported protocol kinds
   (decision 2): regressions surface on real traffic first, e2e suite second.
   Mitigation: capability gate, downgrade-with-log, and the config-level
   `protocol_core_overrides` veto (`xray`/`sing-box`, per protocol kind — note a
   *profile*-level `xray` stamp does not veto native, it is what asks for it);
-  e2e suite (149 green rows) is the contract.
+  e2e suite (168 green rows + 6 documented ignored) is the contract.
 - Display/run mismatch: the list shows the stamp (`xray`) while a config that
   passes the gate runs native (D2) — cosmetic; the connect log names the
   runtime core.
@@ -381,10 +395,12 @@ enum TraceEvent {
 ## Verification
 
 - `cargo test -p xray-tui-native --features native-e2e --lib` (tier 1 hermetic).
-- Tier-3 e2e rows for the four protocols (existing 149-green contract) +
+- Tier-3 e2e rows for the six protocol kinds (the 2026-09-03 four-protocol
+  contract, now 174 tests = 168 green + 6 documented ignored) +
   new server-mode loopback rows (socks + http inbounds, telemetry events).
 - `cargo test` workspace + `just quality-gate code`.
-- Manual: run TUI, import vless/vmess/trojan/hysteria2 links, connect → native
+- Manual: run TUI, import links for the six kinds (vless, vmess, trojan,
+  hysteria2, shadowsocks, shadowsocks-2022), connect → native
   (no core selection needed: the stamp is `xray` and the connect-time gate
   picks native); Statistics shows live traffic; NativeActivity shows per-conn
   rows; kill network mid-connection → Failed events; http_port proxy works;

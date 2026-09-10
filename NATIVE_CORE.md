@@ -75,12 +75,12 @@ the dial.
   of the cipher crates are a separate contract (next bullet).
 - **Secrets are wiped, and the wipe is a dependency contract.** Every owned
   key buffer in both crates is `Zeroizing`/`ZeroizeOnDrop` (key schedules,
-  X25519/ML-KEM shared secrets, the REALITY auth key, VMess/VLESS/trojan
-  protocol key material). The other half is invisible in the source: the
-  `zeroize` FEATURE is OFF by default in every RustCrypto cipher/hasher we
-  use and is STRIPPED from `x25519-dalek` by `default-features = false`, so
-  both manifests list it explicitly. After any crypto dependency edit,
-  re-check `cargo tree -p <crate> -e features | grep zeroize` — losing the
+  X25519/ML-KEM shared secrets, the REALITY auth key, VMess/VLESS/trojan/
+  shadowsocks protocol key material). The other half is invisible in the
+  source: the `zeroize` FEATURE is OFF by default in every RustCrypto
+  cipher/hasher we use and is STRIPPED from `x25519-dalek` by
+  `default-features = false`, so both manifests list it explicitly. After any
+  crypto dependency edit, re-check `cargo tree -p <crate> -e features | grep zeroize` — losing the
   feature compiles clean and silently stops wiping. What is deliberately NOT
   wiped, and why, is decision 19 in AGENTS.md.
 - **Explicit absence beats silent fallback.** Every protocol kind, transport,
@@ -97,9 +97,9 @@ the dial.
 
 | Tier | Gate | What runs | Evidence |
 |------|------|-----------|----------|
-| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, TLS 1.2 client path (ECDHE + AEAD key block, explicit-nonce records, DOWNGRD-sentinel + RFC 7627 EMS guards), Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session), trojan UDP (address-framed `PacketConn` over one reused frame buffer, domain-reply → no-address, length-exact payload read, split-flight reassembly, bad-CRLF/unknown-ATYP rejection), vmess UDP (record-boundary datagram view over the AEAD stream — one record per datagram, cancel-safe `write_datagram`, xray 8192-byte chunk cap, header-dest mismatch refusal), hy2 UDP (UDPMessage wire layout, borrowed-view serializer, defrag reassembly — out-of-order, duplicate and stale-packet discard, drop-undeliverable-and-keep-reading, bandwidth-string parser), xhttp h3 (the `decideHTTPVersion` dispatch rule — single `h3` ALPN → QUIC, `http/1.1` → h1, 0/2+ or other → h2; the shared v3 protocol over the `V3Send` seam; hermetic h3 server double over loopback QUIC; ML-KEM-768 primitives (liboqs roundtrips + size pins), TLS hybrid curves (X25519MLKEM768 key-share encode/parse, `pq || classical` key schedule, fake-PQ-server handshake), VLESS `mlkem768x25519plus` encryption (parser, relay/AEAD chain, xor-mode masking, hermetic double), REALITY 4588 hybrid share (hermetic fake REALITY PQ server)) | 659 lib tests (208 tls + 451 native; native incl. 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP) + 39 non-vless UDP-path tests (19 trojan, 8 vmess udp, 12 hy2 udp))
+| 1 — offline | `cargo test -p xray-tui-tls -p xray-tui-native --features native-e2e --lib` | unit: wire encodings, RFC 8448 key-schedule vectors, GREASE pairing, JA3/JA4 goldens, VMess Go byte-vectors, rustls-server interop (dev-dep), multi-record reassembly, TLS 1.2 client path (ECDHE + AEAD key block, explicit-nonce records, DOWNGRD-sentinel + RFC 7627 EMS guards), Spider-X fallback, transport framing (httpupgrade header set, xhttp chunk/seq/pacing + padding, v2rayhttp method/authority), vision codec (padded frames, TLS filter, Direct splice) + hermetic fake-vision-server, vless UDP (packet framing, packetaddr codec, PacketConn, hermetic fake-UDP-server), v1.mux.cool mux (frame codec, `MuxClient` multiplexer, hermetic fake-mux-server), vless XUDP (mux UDP sessions — per-packet dests + `GlobalID`, `PacketConn` `XUdp` mode, hermetic fake-mux UDP session), trojan UDP (address-framed `PacketConn` over one reused frame buffer, domain-reply → no-address, length-exact payload read, split-flight reassembly, bad-CRLF/unknown-ATYP rejection), vmess UDP (record-boundary datagram view over the AEAD stream — one record per datagram, cancel-safe `write_datagram`, xray 8192-byte chunk cap, header-dest mismatch refusal), hy2 UDP (UDPMessage wire layout, borrowed-view serializer, defrag reassembly — out-of-order, duplicate and stale-packet discard, drop-undeliverable-and-keep-reading, bandwidth-string parser), shadowsocks (method table + both password KDFs, classic-AEAD chunk framing against independent goldens, 2022 header layout/counter/`request_salt`, both UDP datagram codecs + session table + replay windows), xhttp h3 (the `decideHTTPVersion` dispatch rule — single `h3` ALPN → QUIC, `http/1.1` → h1, 0/2+ or other → h2; the shared v3 protocol over the `V3Send` seam; hermetic h3 server double over loopback QUIC; ML-KEM-768 primitives (liboqs roundtrips + size pins), TLS hybrid curves (X25519MLKEM768 key-share encode/parse, `pq || classical` key schedule, fake-PQ-server handshake), VLESS `mlkem768x25519plus` encryption (parser, relay/AEAD chain, xor-mode masking, hermetic double), REALITY 4588 hybrid share (hermetic fake REALITY PQ server)) | 868 lib tests (210 tls + 658 native; native incl. 63 shadowsocks tests (9 method-table/KDF, 12 classic-AEAD chunk framing + independent goldens + cancel-state, 12 2022 header layout/counter/`request_salt`/single-write, 4 family dispatch, 26 UDP datagram codecs + session table + replay windows) + 36 vision-module tests (incl. 2 hermetic fake-vision-server) + 24 vless UDP/XUDP-path tests (udp framing, packetaddr codec, PacketConn incl. `XUdp` mode, 2 hermetic fake-UDP-server) + 42 mux tests (v1.mux.cool codec + `MuxClient`/`SessionStream`/`UdpSession` + 3 hermetic fake-mux-server incl. the fake-mux UDP session) + 68 mKCP tests (segment codec, KCP session — RTO/RTT + send/recv windows + retransmit + state machine, hermetic fake-peer over loopback UDP) + 39 non-vless UDP-path tests (19 trojan, 8 vmess udp, 12 hy2 udp))
 | 2 — live grader | `cargo run -p xray-tui-tls --example grader -- --profile <id>`; `cargo run -p xray-tui-tls --example grader -- --roster [--family <name>] [--sample]`; `cargo test -p xray-tui-tls --test tls_peet_ws -- --ignored` | ClientHello graded against tls.peet.ws | Chrome130 JA4 `t13d1516h2_8daaf6152771_f37e75b10bcc`; Firefox 128 resolves next-modern to the kept `firefox_139_windows_desktop` (JA3 `fdb1b23bd019c5596f46c8bf59f21968` + JA4 `t13d1516h2_8daaf6152771_02713d6af862`); kept 71-profile roster live sweep (71/71 both runs) + offline JA4 gate + Cloudflare amiabot report (see `docs/tls-fingerprint-roster.md`, `docs/amiabot-roster-report.md`) |
-| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess --test trojan --test hysteria2` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis, VLESS mKCP axis, VLESS XHTTP/3 axis, VLESS ML-KEM PQ axis, VMess/Trojan/Hysteria2 UDP datagram rows | 155 tests = 149 green + 6 documented ignored (vless 78+6, vmess 54, trojan 14, hysteria2 3; ignored: the 4 ws/grpc plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (SP7 — see the ML-KEM axis below); single-core rows run only on the serving core: xhttp + xhttp-h3 + kcp + pq-enc on xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on sing-box)
+| 3 — real-core e2e | `XRAY_TUI_CORE_BIN_DIR=<dir> cargo test -p xray-tui-native --features native-e2e --test vless --test vmess --test trojan --test hysteria2 --test shadowsocks` | native client against spawned xray-core (26.3.27) + sing-box (1.13.16) servers, transport + TLS-variant matrix, VLESS vision flow axis, VLESS UDP datagram path, VLESS mux axis, VLESS XUDP axis, VLESS mKCP axis, VLESS XHTTP/3 axis, VLESS ML-KEM PQ axis, VMess/Trojan/Hysteria2/Shadowsocks UDP datagram rows, Shadowsocks classic-AEAD + 2022-blake3 TCP matrix + TLS-fingerprint row | 174 tests = 168 green + 6 documented ignored (vless 78+6, vmess 53, trojan 14, hysteria2 3, shadowsocks 20; ignored: the 4 ws/grpc plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (SP7 — see the ML-KEM axis below); single-core rows run only on the serving core: xhttp + xhttp-h3 + kcp + pq-enc + the shadowsocks TLS row on xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on sing-box)
 
 Tier 2 needs network; tier 3 needs the version-pinned core binaries (hard-fail,
 not skip, on version mismatch). Tier 1 is hermetic and is the CI gate.
@@ -164,10 +164,10 @@ hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`
 | `inbound/http.rs` | local HTTP CONNECT proxy (`HttpInbound`, same `Engine` → tagged-outbound path as SOCKS5). **CONNECT-only v1**: absolute-form requests are not forwarded (`501`), CONNECT without `host:port` `400`, head over 16 KiB `431`, missing/malformed/wrong Basic credential `407` + `Proxy-Authenticate: Basic realm="xray-tui"`, Block/Reject `403`, unknown outbound tag or failed dial `502`, success a bare `200 Connection Established` (refusals framed with Content-Type/Content-Length/`Connection: close` + a one-line reason). Optional Basic auth (`HttpInboundConfig::with_auth`) — the TUI session has no credential source and relies on the loopback bind; both inbounds `warn` once at bind time on a non-loopback bind without auth. Post-head pipelined bytes are replayed into the tunnel; a failed `accept` retries instead of killing the listener |
 | `transport/` | `connect` = TCP dial (ws/grpc/httpupgrade/xhttp/v2rayhttp; framing is an upgrade step) **or fresh-UDP mKCP dial** (`kcp/` — wire codec + session + stream: KCP segments over UDP, one segment per datagram, conv from a process-global counter; xray-only — sing-box has no kcp) **or the QUIC dial** (`quic.rs` — the shared quinn endpoint + rustls/TLS-verify + 0-RTT helpers used by BOTH the xhttp h3 arm and the hysteria2 client; xhttp + exactly-one `h3` ALPN → `connect_quic` and hysteria2 are `is_self_contained` — the dial REPLACES dial + security + upgrade, quinn/rustls TLS is internal, webpki-roots default verify with the harness-CA override in test/e2e builds); `upgrade` = ws (tokio-tungstenite over the engine stream, v2ray Host/path/headers, Binary framing) + grpc (h2 over the engine stream, gun mode, `Hunk` protobuf + 5-byte gRPC prefix, deferred response headers via spawned task, write-through with flow-control reserve) + httpupgrade (hyper http1 conn + RFC 7230 101 upgrade: `GET {path}`, `Connection: Upgrade` + `Upgrade: websocket` echo validated, ALPN `http/1.1`) + xhttp (splithttp v3, xray-only server: uuid session in path, GET-body download, raw POST uploads with `seq` + 30 ms pacing + `Referer` `x_padding`, ≤1 MB chunks; packet-up + stream-up; h1 when no TLS, h2 over TLS — the h3 mode is the `connect` QUIC dial above, not an upgrade step; the v3 protocol (session open, GET download, POST uploads, pacing) is written once over the `V3Send` seam shared by h1/h2/h3, and h3 requests use absolute-URI form (`:scheme`/`:authority` per RFC 9114 §4.3.1 — the interop fix)) + v2rayhttp (h2 single full-duplex PUT stream, `:authority` = config host else `www.example.com`; sing-box only). HTTP framing (requests/responses/chunked/101) is hyper 1.11 (`client`+`http1`+`http2`) + hyper-util 0.1.20 (`tokio`) + http-body-util 0.1.5 (`channel`) — we own the byte stream, the dial, and the timeouts. QUIC/HTTP-3 is quinn 0.11 (rustls-ring) + h3 0.0.8 + h3-quinn 0.0.10 + webpki-roots (the h3 arm's default trust store); rustls (ring) is a mandatory native dep (was native-e2e-gated optional) — the h3 arm's quinn TLS config + the unit/e2e server double |
 | `security/` | `wrap()` builds an engine `TlsConfig` and runs `xray_tui_tls::client::connect` (both arms); `fingerprint.rs` (fp-id parser → `Fingerprint`, `WebPkiVerifier` builder + test CA), `reality.rs` (`HelloProvisionerChoice`, pbk/sid decoders) |
-| `protocol/` | 20 protocol modules; `vless` + `vmess` + `trojan` + `hysteria2` implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT) |
-| `crypto/` | VMess-adjacent primitives (aead/kdf/legacy_stream) + `salamander.rs` (Hysteria2 Salamander packet obfuscation: salt + BLAKE2b-256 keyed-XOR, datagram transform) |
+| `protocol/` | 20 protocol modules; `vless` + `vmess` + `trojan` + `hysteria2` + `ss` (classic AEAD + 2022-blake3) implemented, rest `NotImplemented`. `vless/vision.rs` = the `xtls-rprx-vision` codec (padded camouflage frames, inner-TLS filter, Direct splice state machine); `vless/header.rs` carries the protobuf flow addon (the udp443 variant truncated to the first 16 bytes on the wire — xray `requestAddons.Flow[:16]`) + the command byte (0x03 Mux carries NO destination bytes); `vless/mux.rs` = the v1.mux.cool frame codec + `MuxClient` multiplexer (`[2B meta_len][metadata][2B data_len][payload]` frames, eager New, event-driven Keep/End + tunnel KeepAlive, 8 KiB chunks, concurrent TCP sessions + XUDP datagram sessions (`UdpSession` — network=UDP New frames carrying the tunnel's random 8-byte `GlobalID`, per-packet dests on Keep) over one `cmd 0x03` tunnel); `vless/udp.rs` + `vless/packet.rs` + `vless/packetaddr.rs` = the UDP path (cmd 0x02 raw tunnel with `[2B len][payload]` framing; `PacketConn` datagram API in `Raw`/`PacketAddr`/`XUdp` modes; packetaddr destination codec); `vless/encryption/` = the `mlkem768x25519plus` payload encryption (SP7 — ML-KEM-768 + X25519 PFS handshake, sealed record tunnel, native/xorpub/random modes, xor-mode masking per xray `xor.go`, ChaCha-only client sealing; 0-RTT resume omitted — 0rtt accounts run full 1-RTT); `ss/` = the Shadowsocks client, both families: `method.rs` = the cipher table + password→key (`EVP_BytesToKey`/MD5 for classic, a base64 PSK length-checked against `key_len` for 2022) and the per-connection subkey KDFs (HKDF-SHA1 `b"ss-subkey"` / BLAKE3 derive-key), `stream.rs` = the 2017 AEAD TCP codec (`[salt][ [2B BE len][16B tag][ct][16B tag] ]*`, TWO seals per chunk under consecutive counter nonces, `MAX_CHUNK = 0x3FFF`, port-last target address, resumable partial-read state), `stream2022.rs` = the 2022-blake3 TCP codec (standalone 11-byte request header chunk + variable-length header chunk with mandatory padding, `MAX_PAYLOAD = 0xFFFF`, the response `request_salt` check, salt + both headers in ONE write), `udp.rs` = the dial-end UDP carrier both families share (`connect_udp` binds its own socket; classic = fresh salt+subkey per datagram, 2022 = AES-ECB separate header with the `[4..16]` nonce or the `ChaCha` leading-24-byte-nonce form; per-server-session 1024-id replay windows + ±30 s timestamp gate + 60 s rotation quiet period). Legacy stream ciphers and SIP003 plugins are gated off in `capability` |
+| `crypto/` | shared primitives, today consumed by `protocol/ss`: `aead.rs` = `SsAead` (AES-128/192/256-GCM + ChaCha20/XChaCha20-Poly1305 on RustCrypto — chosen for the explicit-nonce APIs the Shadowsocks counters need — plus `NonceCounter`; the VMess record codec drives the same underlying `aes-gcm`/`chacha20poly1305` crates directly for its own framing) and `kdf.rs` = the three Shadowsocks KDFs (`hkdf_sha1` — the classic `b"ss-subkey"` subkey, `blake3_derive_key` + `SS2022_SUBKEY_CONTEXT` — the 2022 session subkey, `evp_bytes_to_key_md5` — the classic password→key step); `legacy_stream.rs` is a doc-only placeholder (the legacy SS stream ciphers stay on sing-box); `salamander.rs` = Hysteria2 Salamander packet obfuscation (salt + BLAKE2b-256 keyed-XOR, datagram transform) |
 | `shape.rs` | `ConnectShape`: uniform vs divergent connect paths |
-| `e2e/` (feature `native-e2e`) | case/config/core/harness/variant — real-core scenarios |
+| `e2e/` (feature `native-e2e`) | case/config/core/harness/variant — real-core scenarios (incl. the Shadowsocks server-config builders: xray `settings.method/password` + a widened `network` for the UDP rows, sing-box top-level `method`/`password`, and the xray-only TLS-row gate) |
 
 ### xray-tui-tls (`crates/xray-tui-tls/src/`)
 
@@ -234,7 +234,7 @@ X25519/P256/P384, hybrid key share) now works end-to-end.
 
 ## E2E coverage (tier 3)
 
-The suite has eleven subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
+The suite has twelve subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
 VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/XHTTP-h3(QUIC) × serving core(s) — 136
 tests = 130 green + 6 documented ignored (vless 78+6, vmess 52; ignored: the 4 ws/grpc
 plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (ML-KEM axis,
@@ -262,6 +262,24 @@ fresh quinn dial + ALPN \`h3\` + HTTP/3 auth) against a sing-box hysteria2 inbou
 hysteria2 server): {default cert-TLS} × {salamander-obfs}. QUIC TLS is rustls-internal, so no
 fingerprint row exists. TCP tunnels use raw QUIC streams + the \`TCPRequest\`/\`TCPResponse\` frames;
 hysteria2 UDP rows (SP1 gap-closure): the QUIC DATAGRAM relay (UDPMessage framing + fragmentation) against a sing-box inbound.
+
+**Shadowsocks axis** (`tests/shadowsocks.rs`): 10 cases × {xray 26.3.27, sing-box 1.13.16} =
+20 entries, 19 of them real dials (the TLS row is xray-only, below). Classic 2017 AEAD:
+`aes-128-gcm`, `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305` (the 24-byte-nonce counter path
+the first two never touch); 2022-blake3: `2022-blake3-aes-256-gcm`, `-chacha20-poly1305`,
+`-aes-128-gcm`. The aes-128 row is the wire proof of the BLAKE3 XOF truncation to the method's
+`key_len` (16 bytes here — the two 32-byte methods cannot show it). Every row is a plain TCP dial
+(`SsConfig` carries no transport field) plus, for the TLS row, cert TLS through the engine with
+the chrome fingerprint: **xray-only**, because sing-box 1.13.16's shadowsocks inbound has no `tls`
+field at all (`option/shadowsocks.go` embeds only `ListenOptions`, so `tls` is an unknown field
+and the config decode is fatal) — `with_single_core` reports the excluded sing-box combination
+instead of counting it green. Three UDP relay rows (`PacketMode::Raw`, both cores: one classic
+cipher, both 2022 key lengths) exercise the dial-end datagram carrier. Hermetic cost proof:
+`benches/ss_codec.rs` — 22 rows (classic TCP chunk seal/open per cipher, the two 2022 TCP chunk
+rows, `kdf/hkdf_sha1` + `kdf/blake3`, and the classic/2022 UDP paths) via
+`cargo criterion -p xray-tui-native --bench ss_codec`; plus four `benches/throughput.rs` rows —
+`ss/tcp/aead-aes-128-gcm`, `ss/tcp/aead-chacha20-ietf-poly1305`,
+`ss/tcp/2022-blake3-aes-256-gcm` (xray) and `ss/tcp/2022-blake3-chacha20-poly1305` (sing-box).
 
 **VLESS vision flow axis** (spec §7.4): 8 rows — `flow = xtls-rprx-vision`,
 tcp network, × core {xray, sing-box} × outer {tls, reality} × app {plain,
@@ -421,7 +439,7 @@ REALITY compatibility (any resolvable identity via
 | VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Shadowsocks | ✅ | ✅ | 📋 | — | — | 📋 |
+| Shadowsocks / Shadowsocks-2022 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | ShadowsocksR | ⛔ | ✅ | 📋 | — | — | 📋 |
 | SOCKS | ✅ | ✅ | 📋 | — | — | 📋 |
 | HTTP | ✅ | ✅ | 📋 | — | — | 📋 |
@@ -448,8 +466,15 @@ Notes on the matrix:
 - **TLS 1.2**: the engine has a TLS 1.2 fallback path (ECDHE + AEAD only),
   reached on a 1.2 ServerHello — legacy TLS 1.2-only servers are reachable.
   REALITY stays 1.3-only (a 1.2 ServerHello → `RealityFallback` → Spider-X).
-- **Shadowsocks** gets no TLS column (plain TCP + AEAD; obfuscation comes from
-  plugins, which are 📋 transport work). `ss` method whitelists live in
+- **Shadowsocks** has no transport dimension (`SsConfig` carries no transport
+  field), so the row is a plain TCP dial plus the `security` layer the chain
+  applies outside the protocol — engine TLS/REALITY with `fp`, admitted by the
+  same `security_supported` predicate as every other row. The accessor is
+  `SsConfig::security()` in `proto_spec/ss.rs`: while it was missing, the trait
+  default (`None`) silently dropped a requested TLS layer and the SS handshake
+  went out in the clear to a TLS listener (found by the Task-8 e2e TLS row,
+  `tls: first record does not look like a TLS handshake`). SIP003 plugins are
+  still 📋 (gated off in `capability`), and the `ss` method whitelists live in
   `proto_spec/core_mapping.rs`.
 - **Redirect/TProxy/Mixed** are outbound-only kinds (kernel/port forwarding):
   no client handshake of their own — the native `connect` is trivially a dial,
@@ -495,14 +520,17 @@ Notes on the matrix:
 | UDP | command 3 (`cmd 0x03`) per-datagram `[addr][2B len][CRLF][payload]` ✅ (`protocol/trojan/mod.rs` `PacketConn`) — the request header carries command 3 + the session target (port-last); each datagram is an address-prefixed frame (`ATYP|addr|port || len || CRLF || payload`), the per-packet address defaulting to the session target (xray `PacketWriter`/sing-box `WritePacket`). Send payload capped at 8192 (xray `maxLength`; sing-box reads the full u16, so we follow the permissive peer on read). A domain-addressed reply frame — sing-box's default NAT domain-unmapping for FQDN destinations — is delivered with no per-packet address instead of failing the session. e2e 1 row: `udp` × both cores.
 | Status | Native client complete + e2e (`tests/trojan.rs`): {tcp, ws, grpc} × {tls-standard, tls-chrome} × both cores + the UDP row. TLS engine path reuses the existing security stack exactly. |
 
-**Shadowsocks** — 📋 native
+**Shadowsocks / Shadowsocks-2022** — ✅ native
 | Capability | Detail |
 |------------|--------|
-| Encryption | AEAD: `aes-128/256-gcm`, `chacha20-ietf-poly1305`, `xchacha20`, `2022-blake3-*` (both cores); legacy stream: `aes-*-cfb/ctr`, `rc4-md5`, `chacha20-ietf`, `none` (sing-box only) |
-| Auth | none beyond AEAD key from password (2022 adds user lists) |
-| Obfuscation | plugin: `simple-obfs`, `v2ray-plugin` (via URL `plugin` param) 📋 |
-| Transports | TCP + UDP (same key); native UDP path 📋 |
-| Status | Crypto primitives exist in `protocol/ss` + `crypto/` scaffolding; AEAD framing (2-byte length + tag) straightforward. Cipher-validity rules already in `core_mapping.rs`. |
+| Encryption | classic 2017 AEAD: `aes-128-gcm`, `aes-192-gcm` (sing-box-only in the core whitelists), `aes-256-gcm`, `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305` — fresh-salt HKDF-SHA1 subkey, two-seal chunk framing (`MAX_CHUNK = 0x3FFF`, `protocol/ss/stream.rs`); 2022-blake3: `2022-blake3-aes-128-gcm`, `-aes-256-gcm`, `-chacha20-poly1305` — BLAKE3 `derive_key("shadowsocks 2022 session subkey", psk ‖ salt)` truncated to the method's key length, standalone header chunks (`protocol/ss/stream2022.rs`). Legacy stream ciphers (`aes-*-cfb/ctr`, `rc4-md5`, `chacha20-ietf`, `none`) stay on sing-box: `SsMethod::from_method` returns `None` and `resolve_method` — the connect path's only config entry point — is a `NativeError::Config` |
+| Auth | none beyond the AEAD key: classic = MD5 OpenSSL `EVP_BytesToKey`; 2022 = the base64 PSK, length-checked against the method's key length (`password_key`). 2022 multi-user EIH (the extensible identity header) is NOT implemented — single-user PSK only, no proto identity field |
+| Obfuscation | SIP003 plugins (`plugin`/`plugin_opts`) 📋 — gated off in `capability::ss_supported`, so a plugin row stays on the subprocess rather than dialing the bare server |
+| Transports | TCP only — `SsConfig` carries no transport field, so the row is the plain dial + the optional `security` layer the chain applies outside the protocol (`SsConfig::security()`) |
+| Wire (classic) | `[salt][ [2B BE len][16B tag][ct][16B tag] ]*` per direction: TWO AEAD seals per chunk (the length, then the payload) under consecutive counter nonces, independent salt/subkey/counter per direction, `len ≤ 0x3FFF` (the field's top two bits are reserved); a zero-length chunk is refused (mihomo `ErrZeroChunk`). The client's first payload is the target address in SOCKS5 port-last form (`addr::encode_addr_port_last` — NOT the VLESS/VMess port-first form) |
+| Wire (2022) | request `[salt][seal(11B: type=0 ‖ ts u64be ‖ len u16be)][seal(varlen: addr ‖ pad_len u16be ‖ padding ‖ payload)][seal(2B len)][seal(payload)]…`, response `[salt][seal(27/43B: type=1 ‖ ts u64be ‖ request_salt ‖ len u16be)][seal(payload)][seal(2B len)][seal(payload)]…`. The LE counter advances on EVERY seal/open, so the reader keeps ONE `Half` across the response header and the chunks after it. Three client rules that break interop silently: the response `request_salt` must equal the salt this client sent, salt + BOTH request header chunks leave in ONE write (anti-DPI), and a request with no initial payload always pads (1..=`MAX_PADDING`, 900 B) — this client never sends one |
+| UDP | dial-end carrier for both families (`protocol/ss/udp.rs`, `PacketTunnel::Ss`): `connect_udp` binds its own `UdpSocket` to the server's port, so a datagram carries no in-tunnel framing and `chain.rs::ss_udp_guard` refuses any chain around it (mirrors `quic_guard`) — as does a non-empty `security` on the UDP path. Classic = fresh salt+subkey per datagram, address always on the wire; 2022 = AES methods seal the body under the plaintext separate header's `[4..16]` nonce, `ChaCha` prepends a 24-byte nonce and seals `[client_session_id ‖ packet_id ‖ body]` with the PSK. Session table = one current + one previous server session (spec §3.2.4) with a 1024-id replay window anchored at the highest committed id, a ±30 s timestamp gate and a 60 s rotation quiet period. e2e 3 rows: `udp_aead`, `udp_2022`, `udp_2022_aes128` × both cores |
+| Status | Native client complete + e2e (`tests/shadowsocks.rs`): 10 cases × both cores = 20 entries (19 dials — the TLS row is xray-only) — the three classic ciphers, the three 2022 methods (incl. the 16-byte-PSK BLAKE3 XOF truncation), cert TLS + chrome fingerprint, three UDP relay rows. Deferred: SIP003 plugins, the legacy stream ciphers (sing-box), 2022 multi-user EIH. |
 
 **ShadowsocksR** — 📋 native
 | Capability | Detail |
@@ -668,8 +696,9 @@ Notes on the matrix:
 
 ## Where this is headed
 
-1. **Finish the TCP-stream protocol family** (Trojan, Shadowsocks, SOCKS, HTTP,
-   AnyTLS, ShadowTLS, Naïve) — the TLS engine is done, the shapes are uniform.
+1. **Finish the TCP-stream protocol family** (SOCKS, HTTP, AnyTLS, ShadowTLS,
+   Naïve) — the TLS engine is done, the shapes are uniform; Trojan and both
+   Shadowsocks kinds are complete (TCP + the SS dial-end UDP relay, e2e).
 2. **Non-TCP transports** — the TCP-stream transport set is done
    (WS/gRPC/HTTPUpgrade/XHTTP/h2), mKCP landed (SP4, UDP), and the quinn
    QUIC stack landed for the xhttp h3 dial (SP5) plus the hysteria2 client
@@ -677,8 +706,9 @@ Notes on the matrix:
    unlocks Hysteria1 + TUIC.
 3. **Wire in the TUI** ✅ (2026-09-03, `docs/native-core-integration.md`): no
    per-profile toggle and nothing native persisted — the connect-time gate
-   prefers the in-process core for the four e2e-verified protocols
-   (vless/vmess/trojan/hysteria2) via `capability::supported`, with loud
+   prefers the in-process core for the six e2e-verified protocol kinds
+   (vless, vmess, trojan, hysteria2, shadowsocks, shadowsocks-2022) via
+   `capability::supported`, with loud
    downgrade to xray-core for deferred configs. `NativeCoreServer` (SOCKS5 +
    HTTP CONNECT inbounds, proxy-all engine, watch-shutdown) replaces the
    subprocess arm in `ops/connect.rs`; telemetry (log/traffic/trace) feeds the
