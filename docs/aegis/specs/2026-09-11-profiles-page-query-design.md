@@ -293,11 +293,31 @@ fixed direction so paging stays total and deterministic.
   disagree for as long as a resolution takes to reach the database — the
   resolve write is spawned (`ops/events.rs:867`) while the map is updated
   synchronously — so the divergence window opens on **every** successful
-  resolution, not only on a failed persist. The runtime predicate MUST be
-  re-expressed over the persisted column (same expression, one owner), and
-  `endpoint_info` stays the source of the resolved *IP list* only. The
-  in-memory DNS-flip re-sort in `poll_core_events` (which re-sorts the row with
-  `dns_unresolved = false`) is retired with it; a flip re-runs the page query.
+  resolution, not only on a failed persist.
+  Unification has two prerequisites, both inside the `EndpointInfoUpdated`
+  merge arm (`ops/events.rs`):
+  1. **Patch the loaded row.** `EndpointRow.endpoint.resolved_as`/`resolved_at`
+     have no writer after load today (only reads in `ops/enrich.rs`), so
+     pointing the predicate at the row column without this patch would freeze
+     the flag until the next `reload_profiles`, and the in-arm flip at
+     `events.rs:551` would immediately re-sort the endpoint as unresolved
+     again. The merge arm MUST write the merged `resolved_ips`/`resolved_at`
+     onto the matching `state.endpoints[…].endpoint`, which is the existing
+     decision-15 in-memory sync rule applied to DNS state.
+  2. **Persist in the same pass.** The batched DNS flush becomes an awaited
+     write executed in one transaction at the end of the same poll pass,
+     instead of a spawned task: the row patch and the DB write then land
+     together, so on return from the pass the loaded row, the SQL flag, and
+     the comparator agree. Persisting in one transaction bounds the blocking
+     time (the concern behind the original spawn was per-event task
+     proliferation, not one batched write per pass).
+  With both, `endpoint_info` keeps only the resolved *IP list* and display
+  features. The in-memory DNS-flip re-sort in `poll_core_events` (which
+  re-sorts the row with `dns_unresolved = false`) is retired; a resolution that
+  changes the ordering is picked up by the page re-fetch at the end of the pass.
+  Rejected alternative: leaving the flag map-based and accepting a
+  SQL-versus-UI divergence — that reintroduces exactly the two-truth problem
+  this design removes.
 - **The `Test` sort's second, third, and fourth terms come from the
   representative link `r`, not from the display-preference `active` link.**
   Decision 16's endpoint key is `min` over links of
@@ -418,7 +438,12 @@ written when the implementation lands, not before.
    fetch is timed to catch planner regressions.
 6. **Re-anchor** — after mutating a row's weight (via the typed write path),
    `anchor()` finds it at its new offset and the re-fetched window contains it.
-7. **TUI smoke** — launch the TUI (tui-test tools), verify the Profiles tab
+7. **Merge sync** — feed an `EndpointInfoUpdated` carrying new resolved IPs
+   through `poll_core_events`: the loaded row's `resolved_as`/`resolved_at` and
+   the DNS flag flip in the same pass, and the persisted column matches
+   afterwards (the flush is awaited in that pass). The in-memory DNS-flip
+   re-sort is gone; a page re-fetch follows the pass.
+8. **TUI smoke** — launch the TUI (tui-test tools), verify the Profiles tab
    renders, `↓` past the window edge loads the next page, `o` cycles sort
    columns (no `Core`), `g` group filter and `/` search narrow the list, and
    expanding a row shows the panel.
@@ -433,7 +458,8 @@ written when the implementation lands, not before.
 | Planner change alters the query plan | The page query is a bounded scan plus a link-group sort and an endpoint sort; a regression shows up as page latency, timed in §11.5; no criterion target is added by this spec |
 | Per-page cost grows with total links, not page size | Accepted and measured: 8.3–9.3 ms across offsets 0 → 7,472 (7,672 endpoints / 9,048 links), 14.3 ms with the tiebreak term. The win delivered is memory and per-frame work, not an asymptotic scan. Named escalation if that stops being acceptable: add an `endpoints.weight` column with an index on `(weight, id)`, maintained by SQL triggers over `profile_stats` — raw DDL plus a column the typed model does not know, added idempotently in `open()`. That reintroduces a second owner of the ordering law (now in triggers) and is explicitly deferred. Any index added later must be created with `CREATE INDEX IF NOT EXISTS` in `open()` on every open — `push_schema` is skipped whenever the `user_version` tag matches, so a one-shot DDL would never run against existing files |
 | The endpoint-grouped page keeps a sorter | Accepted: the GROUP BY sorter runs over links, the ORDER BY sorter over the grouped endpoint set |
-| Two DNS-unresolved predicates diverge (map vs persisted column) | Removed by unification: the runtime predicate is re-expressed over `resolved_as`, and the SQL flag uses the same expression (§7.5) |
+| Two DNS-unresolved predicates diverge (map vs persisted column) | Removed by unification, including its prerequisite: the merge arm patches the loaded row's `resolved_as`/`resolved_at` (nothing writes them today) and the batched flush becomes an awaited single-transaction write in the same pass, so row, SQL flag, and comparator agree on pass exit (§7.5) |
+| Retiring the spawned DNS flush blocks the UI task on the write | Bounded by one transaction per pass; the design removes per-event task spawning rather than per-pass writes, and the current code already awaits other DB writes inline in `poll_core_events` |
 | The module never writes | It is read-only over `profile_stats`; a raw writer that sets `error = 1` without `error_text` breaks every typed read, because `ErrorInfo.text` is a non-`Option` `String` (found while probing) |
 | `resolved_as` is a JSON text column | The DNS flag predicate compares it to `'[]'`, which is how the typed `Vec<String>` renders when empty (verified against the live database); the drift test covers it |
 
