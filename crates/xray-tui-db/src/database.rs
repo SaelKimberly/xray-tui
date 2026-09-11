@@ -27,7 +27,7 @@ pub struct Database {
 /// The groups exist so the two independent writers of a `profile_stats` row —
 /// ping results and the scheduler gate — cannot clobber each other's columns
 /// when their patches coalesce in the same flush.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LinkGroups(u8);
 
 impl LinkGroups {
