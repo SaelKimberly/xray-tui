@@ -69,11 +69,11 @@ Acceptance criteria (observable):
   remains the eventual replacement for this module; the module's API shape is
   chosen so a typed implementation can satisfy it later without touching the
   TUI.
-- No new index. Measured: the grouped page query runs a scan over
-  `profile_stats` plus a sorter over the grouped endpoint set; a
-  `MIN`-per-group sorter is not removable by an index, and the existing FK
-  indexes already cover per-endpoint lookups. Add an index only against a
-  measured need.
+- No new index. Measured: the grouped page query runs a full scan over
+  `profile_stats`, a `GROUP BY` sorter over links, and an `ORDER BY` sorter over
+  the grouped endpoint set; a `MIN`-per-group sorter is not removable by an
+  index, and the existing FK indexes already cover per-endpoint lookups. Add an
+  index only against a measured need (the named escalation is in §12).
 
 ## 4. Decisions (user-owned, resolved)
 
@@ -81,6 +81,8 @@ Acceptance criteria (observable):
 | --- | --- |
 | Storage approach | Raw SQL page query through the existing `toasty::sql::{query,statement}` surface; no denormalized weight/rollup columns |
 | Windowing | Fixed page window; crossing an edge fetches the adjacent page |
+| Paging mechanism | `LIMIT`/`OFFSET` on the ordered grouped query. Keyset cursors are rejected: they cannot avoid the sort without a stored, indexed endpoint weight column (the denormalization this design removes), and OFFSET was measured flat (8.3–9.3 ms at offsets 0 → 7,472 on the live dataset, 14.3 ms with the active-link tiebreak term), because the sort dominates either way |
+| Re-anchoring | After a weight change the window is re-fetched at its offset; if the selected endpoint is not in the returned page, `anchor()` locates its offset with one extra ordered-count query |
 | `SortColumn::Core` | Removed from the sort cycle (the `SortColumn::Core` variant and its comparator arm are deleted; the Core column stays display-only) — runtime `protocol_core_overrides` cannot be expressed in SQL |
 | Database wipe | Not required by this design (no schema change) |
 | Page size | Fixed, defined as a constant in the TUI layer (initial value 200 endpoint rows) |
@@ -102,6 +104,13 @@ Rules for this module (enforced by review, asserted by tests):
   `models_toasty.rs`; a drift test executes each statement against a pushed
   schema, so a renamed or removed column fails the suite instead of the
   running TUI.
+- The module's hand-written surface stays minimal: it *decodes* only
+  `endpoints.id` and the ordering keys it needs for `anchor()`, and it
+  *predicates* on `endpoints.host`/`port`/`host_type`/`resolved_as`,
+  `profile_stats.*` weight columns, `profile_stats.last_seen_at`, and
+  `endpoint_groups.group_id`. All model hydration stays on the typed path
+  (`load_page_rows` → `load_endpoint_rows`), so no `Value`-level decoding of
+  JSON columns, timestamps, or embed structs exists anywhere.
 - Every returned row is converted into a typed model at the boundary; no
   `Value` escapes the module.
 
@@ -118,22 +127,22 @@ pub struct PageRequest {
     pub group_id: Option<String>,
     pub sort: PageSort,               // Test | Address | Port | LastSeen | Speed | Traffic | ConfigType
     pub ascending: bool,
-    pub cursor: Option<PageCursor>,   // keyset position; None = first page
-    pub limit: usize,
+    pub offset: usize,                // window start, 0-based
+    pub limit: usize,                 // page size
 }
-
-pub struct PageCursor { pub weight: i64, pub endpoint_id: i64 }
 
 pub struct PageMeta {
     pub ids: Vec<EndpointId>,         // page order
-    pub total: u64,                   // filtered count for the footer
-    pub next: Option<PageCursor>,     // None = last page
-    pub prev: Option<PageCursor>,
+    pub total: u64,                   // filtered count (footer: "rows X-Y of N")
+    pub offset: usize,                // effective offset after clamping
 }
 ```
 
-- `page(db, req) -> PageMeta` — endpoint ids in display order plus cursors and
-  the filtered total.
+- `page(db, req) -> PageMeta` — endpoint ids in display order, the filtered
+  total, and the effective offset.
+- `anchor(db, req, endpoint_id) -> Option<usize>` — the offset that endpoint
+  currently occupies in the ordered view (used when a re-sort moves the
+  selected row outside the loaded window).
 - `load_page_rows(db, ids) -> Vec<EndpointRow>` — assembles the page through
   the existing `load_endpoint_rows` path (bounded `endpoint_id IN (…)` list of
   page size; the 10k-id statement-parse blowup does not apply).
@@ -146,11 +155,14 @@ pub struct PageMeta {
 - `enrich_seed(db) -> Vec<EnrichSeed>` — endpoint, resolved cache, and the
   active protocol's SNI for the enrichment spawns.
 
-`PageSort::Test`, `Address`, and `Port` are SQL-expressible. `LastSeen`,
+Every `PageSort` column is SQL-expressible except `Core` (removed, §4).
+`Test`, `Address`, and `Port` order by endpoint-level values. `LastSeen`,
 `Speed`, `Traffic`, and `ConfigType` order by the active link's column, where
 "active" is the manual override if set, else the best measured link (real
-before fast, lowest delay) — computed in SQL with
-`ROW_NUMBER() OVER (PARTITION BY ps.endpoint_id ORDER BY <active rule>) = 1`.
+before fast, lowest delay) — computed either with a correlated
+`… ORDER BY <active rule> LIMIT 1` subquery (the chosen form, §7.5) or with
+`ROW_NUMBER() OVER (PARTITION BY ps.endpoint_id ORDER BY <active rule>) = 1`;
+both were verified through the driver on 2026-09-11.
 
 ## 7. SQL details
 
@@ -159,36 +171,55 @@ before fast, lowest delay) — computed in SQL with
 One template constant, rendered twice (query-qualified and DDL-unqualified):
 
 ```sql
-CASE WHEN {t}.error = 1 AND {t}.error_kind = 'real' THEN 2147483645
-     WHEN {t}.error = 1 AND {t}.error_kind = 'fast' THEN 2147483646
-     WHEN {t}.latency IS NULL                    THEN 2147483644
-     WHEN {t}.latency = 'real'                   THEN {t}.latency_delay
+CASE WHEN {t}.error = 1 AND {t}.error_kind IN ('real', 'name') THEN 2147483645
+     WHEN {t}.error = 1 AND {t}.error_kind = 'fast'             THEN 2147483646
+     WHEN {t}.latency IS NULL                                   THEN 2147483644
+     WHEN {t}.latency = 'real'                                  THEN {t}.latency_delay
      ELSE 1073741824 + {t}.latency_delay END
 ```
 
-`dynamic_weight` ascending reproduces the decision-16 tiers: real success
-(fastest first), fast success (fastest first), untested, real error, fast
-error. DNS-unresolved is not in this expression — it is endpoint state and
-enters the endpoint ordering as a separate `CASE` term over
-`endpoints.host_type`/`resolved_as`, so a DNS resolution never rewrites link
-rows.
+Band mapping, mirroring `EndpointRow::link_test_tier` exactly:
+
+| Tier (decision 16) | Condition | Weight |
+| --- | --- | --- |
+| 0 real success | `latency = 'real'`, no error | `delay` (ascending = fastest first) |
+| 1 fast success | `latency = 'fast'`, no error | `1073741824 + delay` |
+| 2 untested | no latency, no error | `2147483644` |
+| 3 real error | `error_kind IN ('real', 'name')` | `2147483645` |
+| 4 fast error | `error_kind = 'fast'` | `2147483646` |
+
+Note `error_kind = 'name'` shares the real-error band: `link_test_tier` maps
+`ProfileErr::Real | ProfileErr::Name => 3` (a name-resolution failure surfaces
+on a real attempt). A `name` row that also retains a stored `latency` still
+orders as an error — fresh failures dominate stored successes.
+
+`dynamic_weight` ascending reproduces the decision-16 tiers. DNS-unresolved is
+not in this expression — it is endpoint state and enters the endpoint ordering
+as a separate term over `endpoints.host_type`/`resolved_as`, so a DNS
+resolution never rewrites link rows.
 
 ### 7.2 Page query shape
 
 ```sql
-SELECT e.id, MIN(<weight>) AS best
+SELECT e.id
 FROM endpoints e JOIN profile_stats ps ON ps.endpoint_id = e.id
 WHERE <view / search / group predicates>
-GROUP BY e.id, e.host, e.port
-HAVING (?1 = 0 OR (MIN(<weight>), e.id) > (?2, ?3))
-ORDER BY best ASC, e.id ASC
-LIMIT ?4
+GROUP BY e.id
+ORDER BY <sort terms>        -- see 7.5
+LIMIT ?limit OFFSET ?offset
 ```
 
-Verified working through the driver (probe run 2026-09-11): `GROUP BY`,
-`MIN`, keyset row-value comparison, and `LIMIT` all execute with bound
-parameters. Backward paging runs the same query with reversed `ORDER BY` and
-`<`, then reverses the result.
+Verified through the driver on 2026-09-11: `GROUP BY`, `MIN`, the `CASE`
+ordering expression, `LIMIT`/`OFFSET`, and the correlated tiebreak subquery all
+execute with bound parameters. The count query is the same `FROM`/`WHERE`
+without `GROUP BY`/`ORDER BY`/`LIMIT`, wrapped in `COUNT(*)`.
+
+Paging is by offset, not by cursor. A keyset cursor would only pay off if the
+planner could reach the ordered rows through an index; with the ordering
+computed from `profile_stats` aggregates it cannot, so the sort is paid either
+way. Measured page cost on the live dataset: 8.6 ms (offset 0), 8.3 ms
+(offset 5,000), 9.3 ms (offset 7,472); 14.3 ms with the active-link tiebreak
+term.
 
 ### 7.3 Filters
 
@@ -212,13 +243,49 @@ are therefore formatted to the same fixed 30-character shape, and a tripwire
 test asserts the rendered width is constant for every timestamp the code
 writes.
 
+### 7.5 Sort terms
+
+Each sort column defines one ORDER BY term list. `ascending` from the UI
+appends `ASC`/`DESC` to the *primary* term only; the tiebreak terms keep their
+fixed direction so paging stays total and deterministic.
+
+| `PageSort` | ORDER BY terms (ascending case) |
+| --- | --- |
+| `Test` | `<dns_flag> ASC, MIN(<weight>) ASC, <active last_seen> DESC, <active protocol_id> ASC, e.id ASC` |
+| `Address` | `e.host ASC, e.id ASC` |
+| `Port` | `e.port ASC, e.id ASC` |
+| `LastSeen` | `<active last_seen_at> ASC, e.id ASC` |
+| `Speed` | `COALESCE(<active speed_bps>, -1) ASC, e.id ASC` |
+| `Traffic` | `<active total up + down> ASC, e.id ASC` |
+| `ConfigType` | `<active config_type rank> ASC, e.id ASC` |
+
+- `<dns_flag>` = `CASE WHEN e.host_type = 'dns' AND e.resolved_as = '[]' THEN 1
+  ELSE 0 END` — unresolved endpoints sort last, matching the decision-16 tier-5
+  band, and this matches the current comparator which folds the flag into every
+  link's key.
+- `<active …>` selects the display-preference link: the manual override if set,
+  else the best measured link (real before fast, lowest delay). It is computed
+  with a correlated subquery ordered by
+  `(CASE WHEN error = 1 THEN 1 ELSE 0 END), COALESCE(latency_delay, 999999),
+  last_seen_at DESC` and `LIMIT 1`; the corresponding value is projected in the
+  same subquery for the ordering term.
+- Nullable columns are wrapped in `COALESCE` with a sentinel so ordering and
+  paging never depend on NULL placement.
+- `Test`'s third and fourth terms mirror the Rust comparator's `-last_seen_at`
+  then `protocol_id` tiebreak; `e.id` is appended as the unique final term.
+- `SortColumn::Core` has no entry: it is removed from the cycle (§4).
+
+Sort semantics for non-`Test` columns ignore the DNS flag, exactly like the
+current code, where only `SortColumn::Test` consults
+`best_test_priority_key(…, dns_unresolved)`.
+
 ## 8. TUI changes
 
 - `AppState.endpoints` becomes the loaded window; `state.page: PageMeta` holds
-  ids, cursors, and the filtered total.
+  the ids, the effective offset, and the filtered total.
 - `filtered_profiles()` and `compute_filtered_indices` (in-memory filter and
   sort over the full set) are retired for the Profiles tab;
-  `filter_cache_valid` is replaced by the page cursor. `filtered_len()` reads
+  `filter_cache_valid` is replaced by the page offset. `filtered_len()` reads
   `PageMeta.total`.
 - `selected_index` indexes the loaded window; selection identity stays the
   endpoint id (`selected_profile_id`).
@@ -272,19 +339,24 @@ written when the implementation lands, not before.
 ## 11. Verification
 
 1. **Ordering golden** — for a seeded fixture covering every tier and tiebreak
-   (real/fast success, both errors, untested, DNS-unresolved, equal weights
-   with different `last_seen_at`), assert the SQL page order equals the order
-   produced by the existing `EndpointRow` comparator. This is the contract that
-   keeps the SQL expression and the decision-16 law from drifting.
+   (real/fast success, `real`/`name`/`fast` errors, untested, DNS-unresolved,
+   equal weights with different `last_seen_at`), assert the SQL page order
+   equals the order produced by the existing `EndpointRow` comparator. Run it
+   for **every** `PageSort` column, ascending and descending. This is the
+   contract that keeps the SQL expressions and the decision-16 law from
+   drifting.
 2. **Filter equivalence** — same fixture: SQL `page`/`count` results equal the
    current in-memory filter for each view, search term, and group.
 3. **Drift guard** — every statement in the module executes against a pushed
    schema in CI, so a renamed column fails the build.
 4. **Timestamp width tripwire** — rendered bind timestamps are fixed width.
-5. **Integration** — a 5k-endpoint in-memory fixture: page fetch returns
-   `limit` rows; keyset paging visits every endpoint exactly once in order;
-   count matches.
-6. **TUI smoke** — launch the TUI (tui-test tools), verify the Profiles tab
+5. **Paging stability** — a 5k-endpoint in-memory fixture: paging by offset
+   visits every endpoint exactly once, in order, for each sort column; `total`
+   matches; `anchor()` returns the offset the row actually occupies; the page
+   fetch is timed to catch planner regressions.
+6. **Re-anchor** — after mutating a row's weight (via the typed write path),
+   `anchor()` finds it at its new offset and the re-fetched window contains it.
+7. **TUI smoke** — launch the TUI (tui-test tools), verify the Profiles tab
    renders, `↓` past the window edge loads the next page, `o` cycles sort
    columns (no `Core`), `g` group filter and `/` search narrow the list, and
    expanding a row shows the panel.
@@ -296,8 +368,10 @@ written when the implementation lands, not before.
 | Raw SQL drifts from the typed schema | Drift test (§11.3); single owner module |
 | The weight CASE and the Rust comparator diverge | Golden test (§11.1); the Rust comparator is kept as the oracle, not as a runtime path |
 | Mixed-precision timestamp text breaks range filters | Fixed-width binding + width tripwire (§7.4) |
-| Planner change alters the query plan | The query is a bounded scan plus a sort of the endpoint set; a regression shows up as page latency. The page fetch is timed in the integration test (§11.5) against the 5k fixture; no criterion target is added by this spec |
-| Endpoint-grouped page keeps a sorter | Accepted: the sorted set is the endpoint count, measured at 78 ms cold / 6.6 ms warm on 7,672 endpoints |
+| Planner change alters the query plan | The page query is a bounded scan plus a link-group sort and an endpoint sort; a regression shows up as page latency, timed in §11.5; no criterion target is added by this spec |
+| Per-page cost grows with total links, not page size | Accepted and measured: 8.3–9.3 ms across offsets 0 → 7,472 (7,672 endpoints / 9,048 links), 14.3 ms with the tiebreak term. The win delivered is memory and per-frame work, not an asymptotic scan. Named escalation if that stops being acceptable: add an `endpoints.weight` column with an index on `(weight, id)`, maintained by SQL triggers over `profile_stats` — raw DDL plus a column the typed model does not know, added idempotently in `open()`. That reintroduces a second owner of the ordering law (now in triggers) and is explicitly deferred. Any index added later must be created with `CREATE INDEX IF NOT EXISTS` in `open()` on every open — `push_schema` is skipped whenever the `user_version` tag matches, so a one-shot DDL would never run against existing files |
+| The endpoint-grouped page keeps a sorter | Accepted: the GROUP BY sorter runs over links, the ORDER BY sorter over the grouped endpoint set |
+| `resolved_as` is a JSON text column | The DNS flag predicate compares it to `'[]'`, which is how the typed `Vec<String>` renders when empty (verified against the live database); the drift test covers it |
 
 ## Appendix A — Aegis working drafts
 
