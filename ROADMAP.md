@@ -179,10 +179,10 @@
 
 ## Phase 12 — Profiles UI Redesign ✅
 
-- ✅ 17-column single-line endpoint rows — Type, inbound country flag, Address, Feat whitelist flags (IP/SNI merged), transport/security combo, Test delay, outbound IP+country; Remarks, Delay, Speed, Traffic, IP-info, top-level Last Seen dropped from the single line (Remarks wiped from TUI and DB; Last Seen lives only in the panel sub-table)
+- ✅ 16-column single-line endpoint rows — named `Protocol Info` column (`protocol/transport/security`, replacing the endpoint-level Type cell), inbound country flag, Address, Feat whitelist flags (IP/SNI merged), Test delay, outbound IP+country; Remarks, Delay, Speed, Traffic, IP-info, top-level Last Seen dropped from the single line (Remarks wiped from TUI and DB; Last Seen lives only in the panel sub-table)
 - ✅ Test column (2026-08) — active protocol's delay `[ 12 ]` colored by threshold (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` (every protocol of the endpoint unreachable for that test, per session-only per-endpoint ping rounds in `AppState.ping_status`, reset at batch start). Placed after the `}=>` arrow, before Outbound's `[` bracket
 - ✅ Feat column — IP+SNI flag cells merged into one 4-wide column (`🏁` DNS unresolved, `🏳️` IP/CIDR + SNI whitelisted)
-- ✅ Expandable rounded panel — `IPs:` line with `(x resolve)` hint + 10-column per-protocol sub-table (marker, hex id, last seen, last used, config type, delay, speed, traffic, outbound, country); panel keeps a 1-line gap below so the bottom border never touches the next row; height-aware scrolling so expanded rows never strand the last profiles
+- ✅ Expandable rounded panel — `IPs:` line with `(x resolve)` hint + 11-column per-protocol sub-table (marker, hex id, last seen, last used, Protocol Type, config type, delay, speed, traffic, outbound, country), capped at 8 visible sub-rows with a window-scrolled view (window follows the selected variant, separator shows the visible range) so a many-protocol endpoint can never grow taller than the viewport; panel keeps a 1-line gap below so the bottom border never touches the next row; height-aware scrolling so expanded rows never strand the last profiles
 - ✅ Expansion nav semantics — expand lands on first sub-row; `↑`/`↓` walk variants; `↑` at sub 0 → full row; `↓` at last sub-row → next profile; `↓` from full row of expanded endpoint → re-enter sub 0; collapsed endpoint moves on one `↓`
 - ✅ Sub-table newest-first sort — each endpoint's protocols sorted by `last_seen_at` desc in `deserialize_endpoint_rows` (stable, ties keep insertion order); superseded by the test-priority sort in Phase 15
 - ✅ Protocol pin via Enter — Enter on a sub-row sets `manual_protocol_override` (`set_protocol_default`), Enter on the endpoint row clears it (`set_active`); both patch the in-memory row so the UI switches without a reload
@@ -192,6 +192,7 @@
 - ✅ Endpoint-scoped ping batches — Fast/Real Ping on a collapsed multi-protocol endpoint row pings all its protocols; on a sub-row pings the exact protocol (`get_batch_for_real_ping(batch_id, wave, limit, dedup_endpoints)`)
 - ✅ Last Used column — `protocol_rows.last_used_at` set on connect, shown in the panel sub-table
 - ✅ `x` key — force DNS resolution of the selected endpoint
+- ✅ Column/panel rework (2026-09-11) — endpoint-level Type column removed (the kind moved into the panel's Protocol Type column), single-row `Protocol Info` column added, row-number column widened to a six-digit slot (100000+ profiles), panel capped at 8 visible sub-rows with window scrolling + a visible-range label, and panel column offsets made authoritative so the intended inter-column gaps actually render
 
 ## Phase 13 — Hardening & Identity Refactor ✅
 

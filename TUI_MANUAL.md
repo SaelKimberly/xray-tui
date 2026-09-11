@@ -23,15 +23,14 @@ The main screen. Shows a table of single-line endpoint rows with the following c
 | ------------ | ----- | ------------------------------------------- |
 | (arrow)      | 1     | Expand/collapse indicator `▶`/`▾`           |
 | (status)     | 2     | Connection status or test indicator          |
-| `#`          | 5     | Row number; `*` when multi-selected         |
-| `Type`       | 12    | Protocol type (vmess, trojan, etc.)         |
+| `#`          | 7     | Row number, right-aligned in a 6-digit slot (`100000+` fits); `*` when multi-selected |
 | `[`          | 1     | Bracket decoration                          |
-| (country)    | 3     | Inbound country flag (region emoji, `🏴` unknown) |
-| `Address`    | 37    | `host:port` (flag sits inside the brackets) |
+| (country)    | 4     | Inbound country flag (region emoji, `🏴` unknown) |
+| `Address`    | 34    | `host:port` (flag sits inside the brackets) |
 | `][`         | 2     | Bracket decoration                          |
 | `Feat`       | 4     | Whitelist feature flags: `🏁` DNS unresolved, `🏳️` IP/CIDR whitelisted, `🏳️` SNI whitelisted |
 | `]=>{`       | 4     | Bracket decoration                          |
-| (config)     | 12    | `transport/security`, center-aligned        |
+| `Protocol Info` | 24 | `protocol/transport/security` (e.g. `vless/tcp/reality`), center-aligned — the old endpoint-level `Type` cell merged into it |
 | `}=>`        | 3     | Bracket decoration                          |
 | `Test`       | 6     | Ping delay `[ 12 ]`, colored (green <500ms, yellow ≥500ms, red ≥1000ms); red problem labels `[name]` (DNS unresolved), `[fast]`/`[real]` — shown only when the ACTIVE/preferred link has NO measured delay (a measured result always wins over a stale failure marker; real over fast precedence). The preferred link is the best MEASURED one: real-ok with the lowest delay, else fast-ok lowest — auto-selected after every fast/real result and at load, so the row shows the endpoint's best tested result. Labels come from the persisted per-link failure marker and survive restarts; the Speed Test `error_ttl_hours` setting clears them |
 | `[`          | 1     | Bracket decoration (Outbound opener)        |
@@ -46,8 +45,11 @@ Delay/Speed/Traffic/Outbound details live in the expanded panel (below).
 (collapsed) or `▾` (expanded). Press `→` to expand: a rounded panel appears
 under the row with an `IPs:` line (resolved inbound addresses; `[?]` with an
 `(x resolve)` hint while the DNS name is unresolved) and a per-protocol
-sub-table: active marker, hex profile id, Last Seen, Last Used, config type,
-delay, speed, traffic, outbound address, outbound country. `←` collapses.
+sub-table: active marker, hex profile id, Last Seen, Last Used, Protocol Type,
+config type (transport/security), delay, speed, traffic, outbound address,
+outbound country. The panel shows at most 8 sub-rows; longer variant lists
+scroll — the window follows the selected sub-row and the separator shows the
+visible range (`6-13/23`). `←` collapses.
 Expanding lands on the **first sub-row**; `↑`/`↓` then walk the variants.
 `↑` at the first sub-row returns to the full endpoint row; `↓` at the last
 sub-row moves to the next profile; `↓` from the full row of an expanded

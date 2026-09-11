@@ -236,7 +236,7 @@ impl Default for DataTableState {
 
 // ── Width computation ───────────────────────────────────────────────────
 
-/// Maximum supported column count; the widest caller has 17 (profiles).
+/// Maximum supported column count; the widest caller has 16 (profiles).
 /// Stack-resident so the per-frame render never touches the allocator.
 const MAX_COLS: usize = 32;
 

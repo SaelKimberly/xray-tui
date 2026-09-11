@@ -5,7 +5,6 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use xray_tui_core::speed_test::TestType;
-use xray_tui_proto::proto_spec::ProtocolKind;
 
 use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
@@ -70,6 +69,15 @@ impl Default for DisplayRowsCache {
     }
 }
 
+/// Visible sub-rows inside an expanded endpoint panel. Longer variant lists
+/// are windowed — the panel scrolls to follow the selected sub-row instead of
+/// growing the row past the viewport (a 100-protocol endpoint used to blank
+/// itself: its row was taller than the whole table).
+const PANEL_MAX_ROWS: usize = 8;
+
+/// Width of the single-row Protocol Info cell (`protocol/transport/security`).
+const PROTOCOL_INFO_WIDTH: usize = 24;
+
 /// One row of the expanded per-protocol sub-table inside an endpoint panel.
 #[derive(Clone)]
 struct PanelRow {
@@ -78,6 +86,9 @@ struct PanelRow {
     proto_id_hex: String,
     last_seen: String,
     last_used: String,
+    /// Protocol kind (vmess, vless, …) — the endpoint-level Type column's
+    /// value, which belongs to each protocol row.
+    protocol_type: String,
     config_type: String,
     delay: String,
     speed: String,
@@ -97,13 +108,14 @@ pub struct DisplayRowData {
     indicator: String,
     indicator_fg: Style,
     idx_str: String,
-    type_str: String,
     country_flag: String,
     address_port_str: String,
     /// Whitelist feature flags: `🏁` DNS unresolved, `🏳️` IP/CIDR or SNI
     /// whitelisted (4 cells, one per flag).
     feat_str: String,
-    config_type_str: String,
+    /// `protocol/transport/security` single-row cell (the braces around it
+    /// come from the neighbouring decoration columns).
+    protocol_info_str: String,
     /// `[ 12 ]`-style Test cell: `[value]` where value is 4 cells wide,
     /// or the red `[name]`/`[fast]`/`[real]` problem labels, or blank.
     test_str: String,
@@ -143,19 +155,18 @@ impl DataTableRow for DisplayRowData {
                 0 => (tree_marker, self.row_style),
                 1 => (self.indicator.as_str(), self.indicator_fg),
                 2 => (self.idx_str.as_str(), self.row_style),
-                3 => (self.type_str.as_str(), self.row_style),
-                4 | 13 => ("[", self.row_style),
-                5 => (self.country_flag.as_str(), self.row_style),
-                6 => (self.address_port_str.as_str(), self.row_style),
-                7 => ("][", self.row_style),
-                8 => (self.feat_str.as_str(), self.row_style),
-                9 => ("]=>{", self.row_style),
-                10 => (self.config_type_str.as_str(), self.row_style),
-                11 => ("}=>", self.row_style),
-                12 => (self.test_str.as_str(), self.test_style),
-                14 => (self.outbound_addr.as_str(), self.row_style),
-                15 => (self.outbound_country.as_str(), self.row_style),
-                16 => ("]", self.row_style),
+                3 | 12 => ("[", self.row_style),
+                4 => (self.country_flag.as_str(), self.row_style),
+                5 => (self.address_port_str.as_str(), self.row_style),
+                6 => ("][", self.row_style),
+                7 => (self.feat_str.as_str(), self.row_style),
+                8 => ("]=>{", self.row_style),
+                9 => (self.protocol_info_str.as_str(), self.row_style),
+                10 => ("}=>", self.row_style),
+                11 => (self.test_str.as_str(), self.test_style),
+                13 => (self.outbound_addr.as_str(), self.row_style),
+                14 => (self.outbound_country.as_str(), self.row_style),
+                15 => ("]", self.row_style),
                 _ => ("", self.row_style),
             };
             let max_w = col_widths.get(i).copied().unwrap_or(0) as usize;
@@ -181,9 +192,11 @@ impl DataTableRow for DisplayRowData {
 
     fn height(&self, _available_width: u16) -> u16 {
         if self.expanded {
-            // 1 endpoint line + panel (top border + IPs + separator + sub
-            // rows + bottom border = rows + 4) + 1 gap line after the panel.
-            1 + self.panel_rows.len() as u16 + 4 + 1
+            // 1 endpoint line + panel (top border + IPs + separator + up to
+            // PANEL_MAX_ROWS sub rows + bottom border) + 1 gap line after the
+            // panel. The cap keeps a long variant list from growing the row
+            // past the viewport.
+            1 + self.panel_rows.len().min(PANEL_MAX_ROWS) as u16 + 4 + 1
         } else {
             1
         }
@@ -235,40 +248,59 @@ impl DisplayRowData {
             }
         }
 
+        // Sub-table geometry: window the variant list to PANEL_MAX_ROWS and
+        // follow the selected sub-row, so a long list scrolls instead of
+        // growing the panel past the viewport.
+        let total = self.panel_rows.len();
+        let visible = total.min(PANEL_MAX_ROWS);
+        let win = panel_window(total, self.panel_selected, PANEL_MAX_ROWS);
+
         // Separator
         if y0 + 2 < clip_bottom {
             let sep_x = inner_x;
             let sep_y = y0 + 2;
             let sep_line = "─".repeat(inner_w);
             buf.set_stringn(sep_x, sep_y, &sep_line, inner_w, Style::default());
+            if total > visible {
+                // Windowed: the separator carries the visible range (rows N-M
+                // of T) so the panel signals the rows scrolled out of view.
+                let label = format!(" {}-{}/{} ", win + 1, win + visible, total);
+                let lx = inner_x + (inner_w.saturating_sub(label.len())) as u16;
+                buf.set_stringn(lx, sep_y, &label, label.len(), row_style);
+            }
         }
 
-        // Sub-table rows. last_used is relative ("2d ago"/"never"); config
-        // is 14 wide with a 1-space gap before delay so "xhttp/reality"
-        // never blends into the latency column.
-        let cols: [(usize, usize); 10] = [
+        // Sub-table rows. last_used is relative ("2d ago"/"never"); the
+        // protocol-type column precedes config (transport/security). Offsets
+        // are absolute within the panel interior — the untouched cell after
+        // config (68) and the one in outbound's 16th cell are deliberate gaps
+        // so a clipped/full-width value never blends into the next column.
+        let cols: [(usize, usize); 11] = [
             (0, 3),   // marker
-            (3, 10),  // id
-            (13, 20), // last_seen
-            (33, 12), // last_used (relative)
-            (45, 14), // config
-            (60, 8),  // delay
-            (68, 8),  // speed
-            (76, 11), // traffic
-            (87, 16), // outbound
-            (103, 7), // country
+            (3, 9),   // id
+            (12, 20), // last_seen
+            (32, 11), // last_used (relative)
+            (43, 11), // protocol type
+            (54, 14), // config (transport/security)
+            (69, 8),  // delay (1-cell gap after config)
+            (77, 7),  // speed
+            (84, 10), // traffic
+            (94, 16), // outbound (1-cell gap before country)
+            (110, 5), // country
         ];
-        for (n, pr) in self.panel_rows.iter().enumerate() {
+        for n in 0..visible {
+            let pr = &self.panel_rows[win + n];
+            let selected = self.panel_selected == Some(win + n);
             let y = y0 + 3 + n as u16;
             if y >= clip_bottom {
                 break;
             }
-            let style = if Some(n) == self.panel_selected {
+            let style = if selected {
                 self.panel_selected_style
             } else {
                 row_style
             };
-            if Some(n) == self.panel_selected {
+            if selected {
                 // Reverse highlight across the ENTIRE sub-row width: replace
                 // the panel's highlight background (painted by the DataTable
                 // over the selected endpoint row) with the common background,
@@ -278,12 +310,12 @@ impl DisplayRowData {
                     buf[(x, y)].set_style(style);
                 }
             }
-            let mut x = inner_x;
             let cell_texts = [
                 pr.marker.as_str(),
                 pr.proto_id_hex.as_str(),
                 pr.last_seen.as_str(),
                 pr.last_used.as_str(),
+                pr.protocol_type.as_str(),
                 pr.config_type.as_str(),
                 pr.delay.as_str(),
                 pr.speed.as_str(),
@@ -291,9 +323,8 @@ impl DisplayRowData {
                 pr.outbound.as_str(),
                 pr.outbound_country.as_str(),
             ];
-            for ((_, w), text) in cols.iter().zip(cell_texts.iter()) {
-                buf.set_stringn(x, y, text, *w, style);
-                x += *w as u16;
+            for ((off, w), text) in cols.iter().zip(cell_texts.iter()) {
+                buf.set_stringn(inner_x + *off as u16, y, text, *w, style);
             }
         }
     }
@@ -449,6 +480,37 @@ fn test_cell_content(
     }
 }
 
+/// Row-number cell: a 6-cell right-aligned slot plus a trailing gap cell
+/// (carrying the multi-select `*`) — room for 100000+ profiles without the
+/// number bleeding into the next column.
+fn index_cell(number: usize, is_multi: bool) -> String {
+    let digits = if is_multi {
+        String::new()
+    } else {
+        number.to_string()
+    };
+    let suffix = if is_multi { '*' } else { ' ' };
+    format!("{digits:>6}{suffix}")
+}
+
+/// Single-row Protocol Info cell: `protocol/transport/security` (e.g.
+/// `vless/tcp/reality`), centered in the fixed-width slot. A row without an
+/// active protocol renders the `-` placeholder.
+fn protocol_info_cell(row: &EndpointRow) -> String {
+    let info = row.active_protocol().map_or_else(
+        || "-".to_string(),
+        |(_, p)| {
+            format!(
+                "{}/{}/{}",
+                p.proto_kind,
+                p.transport.r#type.as_str(),
+                p.security.r#type.as_str()
+            )
+        },
+    );
+    center_pad(&info, PROTOCOL_INFO_WIDTH)
+}
+
 fn build_display_rows(
     rows: &[&EndpointRow],
     selected: usize,
@@ -522,21 +584,13 @@ fn build_display_rows(
             )
         };
 
-        let protocol = row
-            .active_protocol()
-            .map_or(ProtocolKind::Custom, |(_, p)| p.proto_kind);
         let is_multi = state.multi_select.contains(&row.endpoint.id.get());
 
-        let idx_str = if is_multi {
-            "  *".to_string()
-        } else {
-            format!("{:>3}", i + 1)
-        };
+        let idx_str = index_cell(i + 1, is_multi);
 
         let info = state.endpoint_info.get(&row.endpoint.id.get());
         let resolved = info.is_some_and(|i| !i.resolved_ips.is_empty());
 
-        let type_str = format!("{protocol:.12}");
         let country_flag = info
             .and_then(|i| i.country.as_deref())
             .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
@@ -566,19 +620,7 @@ fn build_display_rows(
         );
         let (test_str, test_style) = compute_test_cell(row, resolved, palette);
 
-        let (t, s) = row.active_protocol().map_or((None, None), |(_, p)| {
-            (
-                Some(p.transport.r#type.as_str()),
-                Some(p.security.r#type.as_str()),
-            )
-        });
-        let config_type = match (t, s) {
-            (None, None) => "-".to_string(),
-            (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
-        };
-        // Column is 14 wide (config widened to fit `xhttp/reality`); the cell
-        // must center inside the same width or the value drifts left.
-        let config_type_str = center_pad(&config_type, 14);
+        let protocol_info_str = protocol_info_cell(row);
 
         // Exit IP: the ACTIVE link's persisted real-ping IP wins (survives
         // reruns); endpoint_info is the live-enrich fallback. Country comes
@@ -674,6 +716,8 @@ fn build_display_rows(
                         (None, None) => "-".to_string(),
                         (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
                     };
+                    let protocol_type =
+                        proto.map_or_else(|| "-".to_string(), |p| p.proto_kind.to_string());
                     PanelRow {
                         marker: if Some(link.protocol_id) == active_id {
                             "●".to_string()
@@ -685,6 +729,7 @@ fn build_display_rows(
                         last_used: link
                             .last_used_at
                             .map_or_else(|| "never".to_string(), |ts| format_relative_ts(&ts)),
+                        protocol_type,
                         config_type,
                         delay,
                         speed,
@@ -702,11 +747,10 @@ fn build_display_rows(
             indicator,
             indicator_fg,
             idx_str,
-            type_str,
             country_flag,
             address_port_str,
             feat_str,
-            config_type_str,
+            protocol_info_str,
             test_str,
             test_style,
             outbound_addr,
@@ -757,9 +801,9 @@ fn render_data_grid(
 
     // Map sort state to DataTable column indices
     let sort_column = match state.sort_column {
-        SortColumn::ConfigType => Some(3),
-        SortColumn::Address | SortColumn::Port => Some(6),
-        SortColumn::Test => Some(12),
+        SortColumn::ConfigType => Some(9),
+        SortColumn::Address | SortColumn::Port => Some(5),
+        SortColumn::Test => Some(11),
         SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
     };
     let sort_direction = if state.sort_ascending {
@@ -768,26 +812,25 @@ fn render_data_grid(
         SortDirection::Descending
     };
 
-    // 17 fixed columns; headers carry only descriptive names (decorative
-    // separator cells have empty headers).
+    // 16 fixed columns (117 cells total); headers carry only descriptive
+    // names (decorative separator cells have empty headers).
     let columns = vec![
-        Column::new("", ColumnWidth::Fixed(1)),      // 0 — tree marker
-        Column::new("", ColumnWidth::Fixed(2)),      // 1 — indicator
-        Column::new("#", ColumnWidth::Fixed(5)),     // 2 — index
-        Column::new("Type", ColumnWidth::Fixed(12)), // 3
-        Column::new("", ColumnWidth::Fixed(1)),      // 4 — [
-        Column::new("", ColumnWidth::Fixed(4)),      // 5 — country flag
-        Column::new("Address", ColumnWidth::Fixed(34)), // 6
-        Column::new("", ColumnWidth::Fixed(2)),      // 7 — ][
-        Column::new("Feat", ColumnWidth::Fixed(4)),  // 8 — IP+SNI flags
-        Column::new("", ColumnWidth::Fixed(4)),      // 9 — ]=>{
-        Column::new("", ColumnWidth::Fixed(14)),     // 10 — config type
-        Column::new("", ColumnWidth::Fixed(3)),      // 11 — }=> arrow
-        Column::new("Test", ColumnWidth::Fixed(6)),  // 12 — [delay]/[name]/[fast]/[real]
-        Column::new("", ColumnWidth::Fixed(1)),      // 13 — [ outbound opener
-        Column::new("Outbound", ColumnWidth::Fixed(16)), // 14
-        Column::new("Country", ColumnWidth::Fixed(7)), // 15
-        Column::new("", ColumnWidth::Fixed(1)),      // 16 — ]
+        Column::new("", ColumnWidth::Fixed(1)),  // 0 — tree marker
+        Column::new("", ColumnWidth::Fixed(2)),  // 1 — indicator
+        Column::new("#", ColumnWidth::Fixed(7)), // 2 — index (6 digits + gap)
+        Column::new("", ColumnWidth::Fixed(1)),  // 3 — [
+        Column::new("", ColumnWidth::Fixed(4)),  // 4 — country flag
+        Column::new("Address", ColumnWidth::Fixed(34)), // 5
+        Column::new("", ColumnWidth::Fixed(2)),  // 6 — ][
+        Column::new("Feat", ColumnWidth::Fixed(4)), // 7 — IP+SNI flags
+        Column::new("", ColumnWidth::Fixed(4)),  // 8 — ]=>{
+        Column::new("Protocol Info", ColumnWidth::Fixed(24)), // 9 — protocol/transport/security
+        Column::new("", ColumnWidth::Fixed(3)),  // 10 — }=> arrow
+        Column::new("Test", ColumnWidth::Fixed(6)), // 11 — [delay]/[name]/[fast]/[real]
+        Column::new("", ColumnWidth::Fixed(1)),  // 12 — [ outbound opener
+        Column::new("Outbound", ColumnWidth::Fixed(16)), // 13
+        Column::new("Country", ColumnWidth::Fixed(7)), // 14
+        Column::new("", ColumnWidth::Fixed(1)),  // 15 — ]
     ];
 
     // Scroll offset: keep the selected row roughly centered, in line units —
@@ -815,6 +858,17 @@ fn render_data_grid(
     };
 
     frame.render_stateful_widget(data_table, area, &mut table_state);
+}
+
+/// First visible sub-row of a windowed panel: keeps the selected sub-row near
+/// the middle of the `max_visible`-row window, clamped so the window always
+/// shows `max_visible` rows when the list is that long.
+fn panel_window(total: usize, selected: Option<usize>, max_visible: usize) -> usize {
+    if total <= max_visible || max_visible == 0 {
+        return 0;
+    }
+    let sel = selected.unwrap_or(0).min(total - 1);
+    sel.saturating_sub(max_visible / 2).min(total - max_visible)
 }
 
 /// First visible row index that keeps the selected row roughly centered, in
@@ -1037,6 +1091,7 @@ mod tests {
             proto_id_hex: String::new(),
             last_seen: String::new(),
             last_used: String::new(),
+            protocol_type: String::new(),
             config_type: String::new(),
             delay: String::new(),
             speed: String::new(),
@@ -1051,11 +1106,10 @@ mod tests {
             indicator: String::new(),
             indicator_fg: Style::default(),
             idx_str: idx.to_string(),
-            type_str: String::new(),
             country_flag: String::new(),
             address_port_str: String::new(),
             feat_str: String::new(),
-            config_type_str: String::new(),
+            protocol_info_str: String::new(),
             test_str: String::new(),
             test_style: Style::default(),
             outbound_addr: String::new(),
@@ -1141,6 +1195,144 @@ mod tests {
         assert_eq!(row.height(0), 8);
         let collapsed = sample_row(false, vec![], "11");
         assert_eq!(collapsed.height(0), 1);
+    }
+
+    #[test]
+    fn index_cell_fits_six_digit_rows() {
+        // 100000+ profiles: the number gets a 6-digit slot plus a trailing
+        // gap cell so it never bleeds into the next column.
+        assert_eq!(index_cell(100_000, false), "100000 ");
+        assert_eq!(index_cell(999_999, false), "999999 ");
+        assert_eq!(index_cell(1, false), "     1 ");
+        // Multi-select keeps the same width; the marker replaces the number.
+        assert_eq!(index_cell(12_345, true), "      *");
+        assert_eq!(
+            index_cell(12_345, true).len(),
+            index_cell(12_345, false).len()
+        );
+    }
+
+    #[test]
+    fn protocol_info_cell_merges_kind_transport_security() {
+        use crate::ops::profiles::test_support::fake_row;
+        let row = fake_row(1, "1.2.3.4", 1);
+        // The test row is a vless protocol over tcp with no security layer.
+        assert_eq!(protocol_info_cell(&row).trim(), "vless/tcp/none");
+        assert_eq!(protocol_info_cell(&row).len(), PROTOCOL_INFO_WIDTH);
+        // A row without an active protocol keeps the placeholder.
+        let linkless = fake_row(2, "5.6.7.8", 0);
+        assert_eq!(protocol_info_cell(&linkless).trim(), "-");
+    }
+
+    #[test]
+    fn panel_window_follows_selected_sub_row() {
+        // Lists that fit are never windowed.
+        assert_eq!(panel_window(3, Some(2), 8), 0);
+        assert_eq!(panel_window(8, Some(7), 8), 0);
+        // A 23-row list centers the selection and clamps at both ends.
+        assert_eq!(panel_window(23, Some(0), 8), 0);
+        assert_eq!(panel_window(23, Some(9), 8), 5);
+        assert_eq!(panel_window(23, Some(22), 8), 15);
+        // No selection (endpoint row focused) shows the top of the list.
+        assert_eq!(panel_window(23, None, 8), 0);
+    }
+
+    #[test]
+    fn panel_height_is_capped_at_eight_sub_rows() {
+        let capped = sample_row(true, (0..20).map(|_| sample_panel_row("○")).collect(), "00");
+        // 1 + PANEL_MAX_ROWS + 4 + 1 — the row can no longer grow past the
+        // viewport, which used to blank the table when expanded.
+        assert_eq!(capped.height(0), 14);
+        // Shorter lists keep their exact panel height.
+        let short = sample_row(true, (0..7).map(|_| sample_panel_row("○")).collect(), "00");
+        assert_eq!(short.height(0), 13);
+    }
+
+    #[test]
+    fn panel_config_and_delay_keep_a_gap() {
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut pr = sample_panel_row("●");
+        // A config value wider than its 14-cell column (the cell clips it):
+        // without the deliberate 1-cell gap the latency text would run into
+        // the clipped config.
+        pr.config_type = "splithttp/reality".to_string();
+        pr.delay = "1234ms".to_string();
+        let mut row = sample_row(true, vec![pr], "00");
+        row.row_style = ThemeStyles::table_row_normal(&palette);
+        let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 6, 1, 16, 7, 1];
+        let mut col_xs = Vec::with_capacity(col_widths.len());
+        let mut x = 0u16;
+        for w in &col_widths {
+            col_xs.push(x);
+            x += w;
+        }
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 20));
+
+        row.render(&col_xs, &col_widths, &mut buf, 0, 20);
+
+        let line: String = (0..120).map(|x| buf[(x, 4)].symbol()).collect();
+        assert!(
+            line.contains("splithttp/real 1234ms"),
+            "config must not blend into the latency cell: {line:?}"
+        );
+    }
+
+    #[test]
+    fn windowed_panel_renders_selected_window_and_range() {
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut row = sample_row(
+            true,
+            (0..23)
+                .map(|i| {
+                    let mut pr = sample_panel_row("●");
+                    pr.proto_id_hex = format!("{i:08x}");
+                    pr
+                })
+                .collect(),
+            "00",
+        );
+        row.row_style = ThemeStyles::table_row_normal(&palette);
+        row.panel_selected_style = ThemeStyles::panel_row_selected(&palette);
+        row.panel_selected = Some(9);
+        // Real column geometry (117 cells) so the panel draws at its
+        // production width.
+        let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 6, 1, 16, 7, 1];
+        let mut col_xs = Vec::with_capacity(col_widths.len());
+        let mut x = 0u16;
+        for w in &col_widths {
+            col_xs.push(x);
+            x += w;
+        }
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 20));
+
+        row.render(&col_xs, &col_widths, &mut buf, 0, 20);
+
+        // Window = panel rows 5..13 (centered on the selected 9): the first
+        // visible sub-row line carries row 5's id, not row 0's.
+        let first_line: String = (0..120).map(|x| buf[(x, 4)].symbol()).collect();
+        assert!(
+            first_line.contains("00000005"),
+            "window must start at the selected window: {first_line:?}"
+        );
+        assert!(
+            !first_line.contains("00000000"),
+            "row 0 must be scrolled out of view: {first_line:?}"
+        );
+        // The separator (y0+2 = 3) carries the visible range + total.
+        let separator: String = (0..120).map(|x| buf[(x, 3)].symbol()).collect();
+        assert!(
+            separator.contains("6-13/23"),
+            "range label missing: {separator:?}"
+        );
+        // The selected sub-row (global 9 → local 4 → y = 8) keeps the reverse
+        // highlight.
+        assert_eq!(buf[(1, 8)].style().bg, Some(ratatui::style::Color::Reset));
+        // Nothing is written at or past the clip line.
+        for x in 0..120u16 {
+            assert_eq!(buf[(x, 19)].symbol(), " ");
+        }
     }
 
     #[test]
