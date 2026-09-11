@@ -111,6 +111,15 @@ impl Database {
         toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
             .await?;
+        // WAL + `synchronous=NORMAL` is the standard durability/throughput
+        // trade: commits are not fsynced individually (a power loss may lose
+        // the most recent transactions, the database stays consistent). The
+        // default FULL costs ~4.2 ms per commit on this engine — a ping batch
+        // over 30k links issues ~90k commits, which froze the UI task that
+        // awaits them (see the 2026-09-11 batch-ping investigation).
+        toasty::sql::query("PRAGMA synchronous=NORMAL")
+            .exec(&mut conn)
+            .await?;
         toasty::sql::query("PRAGMA foreign_keys=ON")
             .exec(&mut conn)
             .await?;
@@ -148,6 +157,11 @@ impl Database {
         toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
             .await?;
+        // Per-connection like `busy_timeout`: the pragma set in `open()` never
+        // reaches pool-created connections.
+        toasty::sql::query("PRAGMA synchronous=NORMAL")
+            .exec(&mut conn)
+            .await?;
         Ok(conn)
     }
 
@@ -177,6 +191,15 @@ impl Database {
         db.push_schema().await?;
 
         toasty::sql::query("PRAGMA busy_timeout=5000")
+            .exec(&mut conn)
+            .await?;
+        // WAL + `synchronous=NORMAL` is the standard durability/throughput
+        // trade: commits are not fsynced individually (a power loss may lose
+        // the most recent transactions, the database stays consistent). The
+        // default FULL costs ~4.2 ms per commit on this engine — a ping batch
+        // over 30k links issues ~90k commits, which froze the UI task that
+        // awaits them (see the 2026-09-11 batch-ping investigation).
+        toasty::sql::query("PRAGMA synchronous=NORMAL")
             .exec(&mut conn)
             .await?;
         toasty::sql::query("PRAGMA foreign_keys=ON")

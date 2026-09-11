@@ -1499,3 +1499,25 @@ async fn in_memory_db_has_full_schema_and_roundtrips() {
         "write + read roundtrip through in_memory()"
     );
 }
+
+/// `synchronous=NORMAL` must reach every pooled connection: the pragma set in
+/// `open()` is per-connection, and without it every commit fsyncs (measured
+/// ~4.2 ms/commit on this engine vs ~0.22 ms with NORMAL), which froze the UI
+/// task during large ping batches (2026-09-11 investigation).
+#[tokio::test]
+async fn pooled_connections_use_synchronous_normal() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let rows = toasty::sql::query("PRAGMA synchronous")
+        .exec(&mut conn)
+        .await
+        .expect("read pragma");
+    let level = rows.first().and_then(|row| match row {
+        toasty_core::stmt::Value::Record(record) => match record.fields.first() {
+            Some(toasty_core::stmt::Value::I64(n)) => Some(*n),
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(level, Some(1), "NORMAL (1) expected, got {level:?}");
+}
