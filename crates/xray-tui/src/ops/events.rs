@@ -1236,6 +1236,52 @@ mod tests {
         assert!(endpoint_row_for_protocol(&mut rows, 999).is_none());
     }
 
+    /// The batch's whole point: draining a tick's worth of results performs NO
+    /// database commit on the UI task. Everything is staged; the flush task
+    /// owns the transaction.
+    #[tokio::test]
+    async fn draining_results_performs_no_commit_on_the_ui_task() {
+        let (mut state, tx) = event_state().await;
+        let row = row_with_protocols(100, 1, 7);
+        let link = row.links[0].clone();
+        state.endpoints = vec![row];
+        state.connected_protocol_id = Some(100);
+        let _ = state.db.upsert_link(&link).await;
+        state.endpoints[0].links[0].latency = None;
+
+        // Send and drain in lockstep: the channel holds 16, and the point is
+        // that each drained result stages instead of committing.
+        for i in 0..256u64 {
+            state.testing_profiles.insert((100, 7));
+            tx.send(CoreEvent::SpeedTestResult {
+                endpoint_id: 100,
+                protocol_id: 7,
+                test_type: TestType::TcpPing,
+                latency_ms: Some(10 + i),
+                speed_bps: None,
+                ip_info: None,
+                error: None,
+            })
+            .await
+            .expect("send");
+            let _ = state.poll_core_events().await;
+        }
+
+        assert_eq!(
+            state.link_writer.flush_count(),
+            0,
+            "a drain tick must not commit anything on the UI task"
+        );
+        assert!(
+            state.link_writer.staged_len() > 0,
+            "the result is staged for the flush task"
+        );
+
+        // The flush task (here: an explicit flush) is what writes it.
+        state.link_writer.flush().await.expect("flush");
+        assert_eq!(state.link_writer.flush_count(), 1, "one transaction");
+    }
+
     #[tokio::test]
     async fn stats_update_resets_today_on_day_change_and_keeps_totals() {
         let (mut state, tx) = event_state().await;
