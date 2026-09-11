@@ -851,10 +851,16 @@ async fn finish_batch(shared: &BatchShared) {
         tracing::warn!(target: "tui::ops::ping", "batch flush failed: {e}");
     }
     // Bound WAL growth: one checkpoint after the write burst, not per commit.
-    if let Ok(mut conn) = shared.db.connection().await {
-        let _ = toasty::sql::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .exec(&mut conn)
-            .await;
+    // Bounded by a timeout — an in-memory database has no WAL to checkpoint
+    // and must never stall the batch.
+    if let Ok(Ok(mut conn)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), shared.db.connection()).await
+    {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            toasty::sql::query("PRAGMA wal_checkpoint(TRUNCATE)").exec(&mut conn),
+        )
+        .await;
     }
     crate::ops::profiles::clear_expired_errors(&shared.db, shared.error_ttl_hours).await;
     let _ = shared.tx.try_send(CoreEvent::BatchProgress {
@@ -1013,9 +1019,11 @@ async fn run_task_chain(
 
 impl BatchShared {
     /// Re-read a link's persisted row (the fire-handshake's fresh snapshot).
+    /// Read-through, exactly like the scheduler gate: task state written by
+    /// this batch is staged in the writer, so the database alone would report
+    /// the link as free and the chain would return early.
     async fn read_link(&self, link: &ProfileStats) -> Option<ProfileStats> {
-        self.db
-            .read_link(link.protocol_id, link.endpoint_id)
+        SchedulerDb::read_link(self.writer.as_ref(), link.protocol_id, link.endpoint_id)
             .await
             .ok()
             .flatten()
@@ -1490,8 +1498,8 @@ mod tests {
         panic!("batch did not finish within the deadline");
     }
 
-    async fn assert_gate_clear(db: &Database, link: &ProfileStats) {
-        let stored = SchedulerDb::read_link(db, link.protocol_id, link.endpoint_id)
+    async fn assert_gate_clear(writer: &crate::ops::link_writer::LinkWriter, link: &ProfileStats) {
+        let stored = SchedulerDb::read_link(writer, link.protocol_id, link.endpoint_id)
             .await
             .expect("read link")
             .expect("link persisted");
@@ -1528,7 +1536,7 @@ mod tests {
                     "unexpected latency {link:?}"
                 );
                 assert!(link.error.is_none(), "no marker expected: {link:?}");
-                assert_gate_clear(&h.state.db, link).await;
+                assert_gate_clear(h.state.link_writer.as_ref(), link).await;
             }
         }
     }
@@ -1569,10 +1577,15 @@ mod tests {
         await_batch_done(&mut h.state).await;
 
         let db: &Database = &h.state.db;
-        let stored = SchedulerDb::read_link(db, link.protocol_id, link.endpoint_id)
-            .await
-            .expect("read link")
-            .expect("link persisted");
+        let _ = db;
+        let stored = SchedulerDb::read_link(
+            h.state.link_writer.as_ref(),
+            link.protocol_id,
+            link.endpoint_id,
+        )
+        .await
+        .expect("read link")
+        .expect("link persisted");
         assert!(
             stored.error.is_none(),
             "stale marker swept at batch completion: {stored:?}"
@@ -1598,7 +1611,7 @@ mod tests {
         for link in &h.state.endpoints[0].links {
             assert!(matches!(link.latency, Some(Latency::Fast { delay: 10 })));
             assert!(link.error.is_none());
-            assert_gate_clear(&h.state.db, link).await;
+            assert_gate_clear(h.state.link_writer.as_ref(), link).await;
         }
     }
 
@@ -1630,7 +1643,7 @@ mod tests {
                 link.error.is_none(),
                 "cancelled link must not write a marker"
             );
-            assert_gate_clear(&h.state.db, link).await;
+            assert_gate_clear(h.state.link_writer.as_ref(), link).await;
         }
     }
 
@@ -1734,7 +1747,7 @@ mod tests {
             for link in &row.links {
                 assert!(matches!(link.latency, Some(Latency::Real { .. })));
                 assert!(link.error.is_none());
-                assert_gate_clear(&h.state.db, link).await;
+                assert_gate_clear(h.state.link_writer.as_ref(), link).await;
             }
         }
         // Regression (reviewer F1): the deferred-real retry was spawned but
@@ -1786,7 +1799,7 @@ mod tests {
                 link.error.is_none(),
                 "stopped batch must not mark: {link:?}"
             );
-            assert_gate_clear(&h.state.db, link).await;
+            assert_gate_clear(h.state.link_writer.as_ref(), link).await;
         }
         // Only the in-flight probe ran; the sibling was retired without a probe.
         assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 1);
