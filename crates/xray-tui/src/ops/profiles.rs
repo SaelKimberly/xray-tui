@@ -127,6 +127,13 @@ pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>) 
 pub async fn reload_profiles(state: &mut AppState) {
     // A synchronous reload supersedes any background load still in flight.
     state.reload_gen = state.reload_gen.wrapping_add(1);
+    // Make staged writes durable BEFORE the load: the load starts with the
+    // error-TTL sweep, which writes the same error columns a staged result
+    // patch carries — flushing afterwards would resurrect the markers the
+    // sweep just cleared.
+    if let Err(e) = state.link_writer.flush().await {
+        tracing::warn!(target: "tui::ops::profiles", "flush before reload: {e}");
+    }
     let load = ProfilesLoad::from(&*state);
     match load_profiles_rows(&state.db, &load).await {
         Ok(rows) => apply_profiles_rows(state, rows),
@@ -1746,6 +1753,24 @@ mod ttl_tests {
     }
 
     /// The persisted error kind of a link, if any.
+    async fn link_latency_delay(db: &Database, proto_id: i64, endpoint_id: i64) -> Option<i32> {
+        let mut conn = db.connection().await.unwrap();
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(proto_id),
+            EndpointId::new(endpoint_id),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .unwrap()
+        .expect("link persisted")
+        .latency
+        .map(|l| match l {
+            xray_tui_db::models::Latency::Real { delay, .. }
+            | xray_tui_db::models::Latency::Fast { delay } => delay,
+        })
+    }
+
     async fn link_error_kind(db: &Database, proto_id: i64, endpoint_id: i64) -> Option<ProfileErr> {
         let mut conn = db.connection().await.unwrap();
         ProfileStats::filter_by_protocol_id_and_endpoint_id(
@@ -1759,6 +1784,57 @@ mod ttl_tests {
         .expect("link persisted")
         .error
         .map(|e| e.kind)
+    }
+
+    /// The reload flushes staged writes BEFORE the sweep, so nothing is
+    /// written after the sweep can undo it:
+    /// - the staged row's value is persisted (proving the flush ran first),
+    /// - an expired marker on a row with no pending write is swept,
+    /// - nothing is left staged, so a later flush cannot resurrect it.
+    #[tokio::test]
+    async fn reload_flushes_before_the_sweep_and_never_resurrects_a_marker() {
+        use xray_tui_db::LinkGroups;
+        let mut row = fake_row(1, "10.0.0.1", 2);
+        set_error(&mut row, 100, ProfileErr::Fast);
+        set_error(&mut row, 101, ProfileErr::Real);
+        let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
+        persist_rows(&db, std::slice::from_ref(&row)).await;
+        let now = jiff::Timestamp::now().as_second();
+        backdate(&db, 100, 1, now - 48 * 3600).await;
+        backdate(&db, 101, 1, now - 48 * 3600).await;
+
+        let mut state = AppState::new(db.clone(), AppConfig::default()).await;
+        state.purgatory_view = PurgatoryView::All;
+        state.config.speed_test.error_ttl_hours = Some(24);
+
+        // p100 was re-tested successfully (staged, not yet written); p101 keeps
+        // its expired marker with nothing pending.
+        let mut retested = row.links[0].clone();
+        retested.error = None;
+        retested.latency = Some(xray_tui_db::models::Latency::Fast { delay: 7 });
+        state.link_writer.stage(&retested, LinkGroups::RESULT);
+
+        reload_profiles(&mut state).await;
+
+        assert_eq!(
+            link_latency_delay(&db, 100, 1).await,
+            Some(7),
+            "the staged re-test was written before the sweep"
+        );
+        assert_eq!(
+            link_error_kind(&db, 101, 1).await,
+            None,
+            "the expired marker of a row with nothing pending is swept"
+        );
+        assert_eq!(state.link_writer.staged_len(), 0, "nothing left to write");
+
+        // A later flush cannot bring the swept marker back.
+        state.link_writer.flush().await.expect("flush");
+        assert_eq!(
+            link_error_kind(&db, 101, 1).await,
+            None,
+            "no resurrection after a later flush"
+        );
     }
 
     #[tokio::test]

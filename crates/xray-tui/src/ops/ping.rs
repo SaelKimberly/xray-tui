@@ -726,10 +726,16 @@ pub(crate) async fn run_batch(params: BatchParams) {
 
     // Wait for every fast task to settle (gate clear per link).
     loop {
+        // Register the waiter BEFORE reading the counter: `notify_waiters` only
+        // wakes already-registered waiters, so a task that settles in between
+        // would otherwise be a lost wakeup and this loop would park forever.
+        let settled = shared.phase1_settled.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
         if shared.pending_fast.load(Ordering::Relaxed) == 0 {
             break;
         }
-        shared.phase1_settled.notified().await;
+        settled.await;
     }
     for h in handles {
         let _ = h.await;
@@ -815,10 +821,14 @@ pub(crate) async fn run_batch(params: BatchParams) {
 
     // Wait for every real task to settle.
     loop {
+        // Same registration order as the phase-1 loop.
+        let settled = shared.real_settled.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
         if shared.pending_real.load(Ordering::Relaxed) == 0 {
             break;
         }
-        shared.real_settled.notified().await;
+        settled.await;
     }
     for h in real_handles {
         let _ = h.await;
@@ -858,7 +868,11 @@ async fn finish_batch(shared: &BatchShared) {
     {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            toasty::sql::query("PRAGMA wal_checkpoint(TRUNCATE)").exec(&mut conn),
+            // PASSIVE, not TRUNCATE: TRUNCATE blocks until every reader has
+            // released its WAL read mark, and the pool keeps connections
+            // alive — a busy checkpoint would stall the batch instead of
+            // merely leaving the WAL larger.
+            toasty::sql::query("PRAGMA wal_checkpoint(PASSIVE)").exec(&mut conn),
         )
         .await;
     }
