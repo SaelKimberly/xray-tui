@@ -36,7 +36,13 @@ impl Database {
         // only run on a database that has no tables yet; the tag lets reopen
         // skip it. Any other tag is a pre-T8 9-table database (incompatible
         // with the typed models) and is recreated from scratch.
-        const SCHEMA_VERSION: i64 = 6;
+        //
+        // 7 = per-kind binary identity (`Protocol.id = uid`, see
+        // `xray-tui-proto::proto_spec::identity`). v6 rows carry uids hashed
+        // from canonical JSON, which are unrelated to the new values, so
+        // reusing a v6 file would re-key every protocol into a duplicate row
+        // and orphan its links. The bump WIPES the file by design.
+        const SCHEMA_VERSION: i64 = 7;
 
         let path_str = path
             .as_ref()

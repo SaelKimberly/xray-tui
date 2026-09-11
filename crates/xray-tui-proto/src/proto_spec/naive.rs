@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use super::ProtoIdentity;
 use super::common::{SecurityConfig, TlsConfig, TlsOpts, to_singbox_tls};
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -275,19 +276,18 @@ impl ProtoSpec for NaiveConfig {
 }
 
 impl ProtoIdentity for NaiveConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"naive");
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// Excluded on purpose: `remarks` (display). `security` carries every TLS
+    /// parameter the builder emits (`server_name`, `insecure`, `alpn`, `fp`,
+    /// …). Credentials: `username` and `password`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("naive");
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("username", self.username.as_str()),
-            ("password", self.password.as_str()),
-        ])
+        super::common::write_security_mandatory(w, &self.security);
+        w.cred("username", &self.username);
+        w.cred("password", &self.password);
     }
 }
 

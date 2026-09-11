@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::identity::IdentityWriter;
 use crate::clash::{ClashProxy, ClashTor};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
@@ -180,15 +181,28 @@ impl ProtoSpec for TorConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_EXECUTABLE_PATH: u8 = 0x50;
+const ID_EXTRA_ARGS: u8 = 0x51;
+const ID_DATA_DIRECTORY: u8 = 0x52;
+const ID_TORRC: u8 = 0x53;
+
 impl ProtoIdentity for TorConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"tor");
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        0
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// Excluded on purpose: `remarks` (display only). Tor has no credential
+    /// fields, so `cred_hash` stays 0 and `uid == sig`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("tor");
+        super::common::write_security(w, &self.security);
+        w.present_str(ID_EXECUTABLE_PATH, self.executable_path.as_deref());
+        if let Some(args) = &self.extra_args {
+            w.list_str(ID_EXTRA_ARGS, args);
+        }
+        w.present_str(ID_DATA_DIRECTORY, self.data_directory.as_deref());
+        if let Some(torrc) = &self.torrc {
+            w.map_str(ID_TORRC, torrc);
+        }
     }
 }
 

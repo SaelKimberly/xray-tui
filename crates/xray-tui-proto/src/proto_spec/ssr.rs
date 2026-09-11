@@ -47,6 +47,7 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 use super::ProtoIdentity;
 use super::common::SecurityConfig;
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -391,31 +392,44 @@ impl ProtoSpec for SsrConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_PROTOCOL: u8 = 0x50;
+const ID_OBFS: u8 = 0x51;
+const ID_PROTOCOL_PARAM: u8 = 0x52;
+const ID_OBFS_PARAM: u8 = 0x53;
+
 impl ProtoIdentity for SsrConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"ssr");
+    /// Identity fields: the obfuscation parameters the sing-box
+    /// `shadowsocksr` outbound emits.
+    ///
+    /// `security` is deliberately NOT hashed: SSR builds on sing-box only,
+    /// and its outbound has no TLS field, so the layer cannot change what any
+    /// consumer emits. Excluded on purpose: `remarks` (display). Credentials:
+    /// `password` and `method` (the cipher identifier).
+    ///
+    /// The builder reads `protocol_param`/`obfs_param` under both the modern
+    /// and the share-link (`protoparam`/`obfsparam`) spellings and defaults a
+    /// missing key to `""`, so the param values are normalized through that
+    /// alias order and elided when equal to the default. Keys unrelated to
+    /// the outbound (`group`) are not identity.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("ssr");
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        let mut sorted_keys: Vec<&String> = self.params.keys().collect();
-        sorted_keys.sort();
-        for k in &sorted_keys {
-            if k.as_str() == "remarks" || k.as_str() == "password" {
-                continue;
-            }
-            hasher.write(k.as_bytes());
-            if let Some(v) = self.params.get(*k) {
-                hasher.write(v.as_bytes());
-            }
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("password", self.password.as_str()),
-            ("method", self.method.as_str()),
-        ])
+        w.str(ID_PROTOCOL, self.protocol.as_str());
+        w.str(ID_OBFS, self.obfs.as_str());
+        let protocol_param = self
+            .params
+            .get("protocol_param")
+            .or_else(|| self.params.get("protoparam"));
+        w.opt_str(ID_PROTOCOL_PARAM, protocol_param.map(String::as_str), "");
+        let obfs_param = self
+            .params
+            .get("obfs_param")
+            .or_else(|| self.params.get("obfsparam"));
+        w.opt_str(ID_OBFS_PARAM, obfs_param.map(String::as_str), "");
+        w.cred("password", &self.password);
+        w.cred("method", self.method.as_str());
     }
 }
 

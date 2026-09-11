@@ -37,6 +37,7 @@ use super::common::{
     should_skip_endpoint_param, to_singbox_tls, to_xray_stream_settings,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -357,19 +358,19 @@ impl ProtoSpec for HttpClientConfig {
 }
 
 impl ProtoIdentity for HttpClientConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"http");
+    /// Identity fields: everything that reaches a builder.
+    ///
+    /// `security` carries the TLS layer both cores emit (xray
+    /// `streamSettings`, sing-box `tls`). Excluded on purpose: `remarks`
+    /// (display). Credentials: `username` and `password` (emitted only when
+    /// both are non-empty).
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("http");
+        super::common::write_security(w, &self.security);
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("username", self.username.as_deref().unwrap_or("")),
-            ("password", self.password.as_deref().unwrap_or("")),
-        ])
+        w.cred("username", self.username.as_deref().unwrap_or(""));
+        w.cred("password", self.password.as_deref().unwrap_or(""));
     }
 }
 

@@ -23,12 +23,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::identity::IdentityWriter;
 use crate::clash::{ClashProxy, ClashSsh};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::clash_to_endpoint;
 use crate::proto_spec::core_mapping;
-use crate::proto_spec::utils;
 use crate::proto_spec::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
     ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
@@ -200,26 +200,39 @@ impl ProtoSpec for SshConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_USER: u8 = 0x50;
+const ID_PRIVATE_KEY_PATH: u8 = 0x51;
+const ID_HOST_KEY: u8 = 0x52;
+const ID_HOST_KEY_ALGORITHMS: u8 = 0x53;
+const ID_CLIENT_VERSION: u8 = 0x54;
+
 impl ProtoIdentity for SshConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"ssh");
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T5).
-        if let Some(v) = &self.user {
-            hasher.write(v.as_bytes());
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// `user` is written through [`IdentityWriter::opt_str`]: the builder
+    /// materializes the `"root"` default, so `None` and `Some("root")` build
+    /// identically and MUST hash identically. Excluded on purpose: `remarks`
+    /// (display). Credentials: `password`, `private_key`,
+    /// `private_key_passphrase`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("ssh");
+        super::common::write_security(w, &self.security);
+        w.opt_str(ID_USER, self.user.as_deref(), "root");
+        w.present_str(ID_PRIVATE_KEY_PATH, self.private_key_path.as_deref());
+        if let Some(keys) = &self.host_key {
+            w.list_str(ID_HOST_KEY, keys);
         }
-        if let Some(v) = &self.client_version {
-            hasher.write(v.as_bytes());
+        if let Some(algos) = &self.host_key_algorithms {
+            w.list_str(ID_HOST_KEY_ALGORITHMS, algos);
         }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("password", self.password.as_deref().unwrap_or("")),
-            ("private_key", self.private_key.as_deref().unwrap_or("")),
-        ])
+        w.present_str(ID_CLIENT_VERSION, self.client_version.as_deref());
+        w.cred("password", self.password.as_deref().unwrap_or(""));
+        w.cred("private_key", self.private_key.as_deref().unwrap_or(""));
+        w.cred(
+            "private_key_passphrase",
+            self.private_key_passphrase.as_deref().unwrap_or(""),
+        );
     }
 }
 

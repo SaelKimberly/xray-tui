@@ -61,6 +61,7 @@ use super::common::{
     should_skip_endpoint_param, to_singbox_tls_or_default, to_xray_stream_settings,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -415,43 +416,43 @@ impl ProtoSpec for Hysteria2Config {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_OBFS: u8 = 0x50;
+const ID_UP_MBPS: u8 = 0x51;
+const ID_DOWN_MBPS: u8 = 0x52;
+
+/// Numeric Mbps prefix of a Hysteria bandwidth string, exactly as the
+/// sing-box builder reads it (`up`/`down` default to 100 Mbps when the prefix
+/// is absent or unparseable — see `inject_singbox`).
+fn bandwidth_mbps(value: &str) -> u64 {
+    let digits = value
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    value[..digits].parse().unwrap_or(100)
+}
+
 impl ProtoIdentity for Hysteria2Config {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"hysteria2");
-        let sec_type = self.security.type_str().unwrap_or("none");
-        hasher.write(sec_type.as_bytes());
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T5).
-        if let Some(v) = &self.obfs {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.insecure() {
-            hasher.write(if v { b"true" } else { b"false" });
-        }
-        if let Some(v) = self.security.sni() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.up {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.down {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.hop_interval {
-            hasher.write(v.to_string().as_bytes());
-        }
-        if let Some(v) = &self.pin_sha256 {
-            hasher.write(v.as_bytes());
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("auth", self.auth.as_str()),
-            ("obfs_password", self.obfs_password.as_deref().unwrap_or("")),
-        ])
+    /// Identity fields: everything that reaches a builder or the native core.
+    ///
+    /// `up`/`down` hash as the numeric Mbps the builders emit (sing-box
+    /// `up_mbps`/`down_mbps`, native `hysteria-cc-rx`), so `100mbps`, `100`
+    /// and an absent value (the builder's 100 Mbps default) share one
+    /// identity.
+    ///
+    /// Excluded on purpose: `remarks` (display), `hop_interval` (dropped by
+    /// every builder and ignored by native — no port hopping) and `pin_sha256`
+    /// (a mirror of `security.tls.pin_sha256`, which `write_security` already
+    /// covers). Credentials: `auth`, `obfs_password`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("hysteria2");
+        super::common::write_security_mandatory(w, &self.security);
+        w.present_str(ID_OBFS, self.obfs.as_deref());
+        w.opt_u64(ID_UP_MBPS, self.up.as_deref().map(bandwidth_mbps), 100);
+        w.opt_u64(ID_DOWN_MBPS, self.down.as_deref().map(bandwidth_mbps), 100);
+        w.cred("auth", &self.auth);
+        w.cred("obfs_password", self.obfs_password.as_deref().unwrap_or(""));
     }
 }
 

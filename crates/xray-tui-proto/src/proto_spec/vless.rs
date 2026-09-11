@@ -53,6 +53,7 @@ use super::common::{
     validate_xray_reality,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -595,58 +596,24 @@ impl ProtoSpec for VlessConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_ENCRYPTION: u8 = 0x50;
+const ID_FLOW: u8 = 0x51;
+
 impl ProtoIdentity for VlessConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"vless");
-        let sec_type = self.security.type_str().unwrap_or("none");
-        hasher.write(sec_type.as_bytes());
-        hasher.write(self.transport.type_str().as_bytes());
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T4).
-        match &self.transport {
-            TransportConfig::HttpUpgrade(cfg) => {
-                if let Some(v) = &cfg.host {
-                    hasher.write(v.as_bytes());
-                }
-            }
-            TransportConfig::XHttp(cfg) => {
-                if let Some(v) = &cfg.host {
-                    hasher.write(v.as_bytes());
-                }
-            }
-            _ => {}
-        }
-        if let Some(path) = &self.path {
-            hasher.write(path.as_bytes());
-        }
-        if let Some(v) = &self.encryption {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.sni() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.flow {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.alpn() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.fp() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.splice {
-            hasher.write(if v { b"true" } else { b"false" });
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("uuid", self.uuid.as_str()),
-            ("pbk", self.security.pbk().unwrap_or("")),
-            ("sid", self.security.sid().unwrap_or("")),
-        ])
+    /// Identity fields: everything that reaches a builder or the native core.
+    ///
+    /// Excluded on purpose: `remarks` (display), `uuid_origin` (redundant —
+    /// the uuid is derived from it deterministically), `path` (a mirror of the
+    /// transport's own path, which `write_transport` already covers) and
+    /// `splice` (no consumer reads it). Credential: `uuid`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("vless");
+        super::common::write_security(w, &self.security);
+        super::common::write_transport(w, &self.transport);
+        w.nonempty_str(ID_ENCRYPTION, self.encryption.as_deref());
+        w.nonempty_str(ID_FLOW, self.flow.as_deref());
+        w.cred("uuid", &self.uuid);
     }
 }
 
@@ -1033,29 +1000,21 @@ mod tests {
     }
 
     #[test]
-    fn vless_reality_sig_excludes_pbk_sid_cred_hash_includes_them() {
-        use super::super::Proto;
+    fn vless_reality_public_params_are_sig_credentials_are_cred_hash() {
+        // REALITY pbk/sid/spx are PUBLIC server parameters: they distinguish
+        // servers, so they belong to sig. The uuid is the only credential.
         let url_a = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
         let url_b = "vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&pbk=BBBB&sid=2222&spx=%2F&fp=chrome#r";
         let url_c = "vless://22222222-3333-4444-5555-666666666666@a.example.com:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome#r";
-        let a = Proto::new(ProtocolConfig::Vless(
-            VlessConfig::try_parse(&RawUrlX::from(url_a)).unwrap(),
-        ));
-        let b = Proto::new(ProtocolConfig::Vless(
-            VlessConfig::try_parse(&RawUrlX::from(url_b)).unwrap(),
-        ));
-        let c = Proto::new(ProtocolConfig::Vless(
-            VlessConfig::try_parse(&RawUrlX::from(url_c)).unwrap(),
-        ));
-        assert_eq!(
-            a.sig(),
-            b.sig(),
-            "sig is semantic: pbk/sid values must NOT change it"
-        );
-        assert_ne!(a.cred_hash(), b.cred_hash(), "cred_hash covers pbk/sid");
-        assert_ne!(a.uid(), b.uid());
-        assert_ne!(a.uid(), c.uid(), "different uuid -> different uid");
-        assert_ne!(a.sig(), 0);
+        let a = parse(url_a).identity_once();
+        let b = parse(url_b).identity_once();
+        let c = parse(url_c).identity_once();
+        assert_ne!(a.0, b.0, "pbk/sid are public server params: sig sees them");
+        // Same public params, different uuid -> same sig, different cred_hash.
+        assert_eq!(a.0, c.0, "same public params -> same sig");
+        assert_ne!(a.1, c.1, "different uuid -> different cred_hash");
+        assert_ne!(a.2, c.2, "different uuid -> different uid");
+        assert_ne!(a.0, 0);
     }
 
     // ── Reconstruct round-trip via endpoint ───────────────────────────────

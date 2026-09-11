@@ -62,6 +62,7 @@ use super::common::{
     to_singbox_transport, to_xray_stream_settings, validate_xray_reality,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -589,51 +590,43 @@ impl ProtoSpec for VmessConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_ALTER_ID: u8 = 0x50;
+
 impl ProtoIdentity for VmessConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"vmess");
-        let sec_type = self.security.type_str().unwrap_or("none");
-        hasher.write(sec_type.as_bytes());
-        if let Some(v) = &self.security.enc {
-            hasher.write(v.as_bytes());
-        }
-        hasher.write(self.transport.type_str().as_bytes());
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T4).
-        match &self.transport {
-            TransportConfig::HttpUpgrade(cfg) => {
-                if let Some(v) = &cfg.host {
-                    hasher.write(v.as_bytes());
-                }
-            }
-            TransportConfig::XHttp(cfg) => {
-                if let Some(v) = &cfg.host {
-                    hasher.write(v.as_bytes());
-                }
-            }
-            _ => {}
-        }
-        if let Some(path) = &self.path {
-            hasher.write(path.as_bytes());
-        }
-        if let Some(v) = &self.alter_id {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.sni() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.alpn() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.fp() {
-            hasher.write(v.as_bytes());
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[("uuid", self.uuid.as_str())])
+    /// Identity fields: everything a builder or the native client reads.
+    ///
+    /// Excluded on purpose: `remarks` (display) and `path` (a mirror of the
+    /// transport's own path, which `write_transport` already covers).
+    /// Credential: `uuid`.
+    ///
+    /// `security.enc` is the payload-security method (`scy`). Both cores fall
+    /// back to `"auto"` when it is absent and the parser always materializes
+    /// it, so the default is normalized away before `write_security` — an
+    /// explicit `scy=auto` must not split from the absent form.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("vmess");
+        let normalized;
+        let security = if self.security.enc.as_deref() == Some("auto") {
+            normalized = SecurityConfig {
+                tls: self.security.tls.clone(),
+                enc: None,
+            };
+            &normalized
+        } else {
+            &self.security
+        };
+        super::common::write_security(w, security);
+        super::common::write_transport(w, &self.transport);
+        // A non-zero `alter_id` selects the legacy pre-AEAD session scheme the
+        // native client never implemented, so it changes what a consumer does;
+        // absent, empty and `"0"` are all the AEAD default.
+        w.opt_str(
+            ID_ALTER_ID,
+            self.alter_id.as_deref().filter(|v| !v.is_empty()),
+            "0",
+        );
+        w.cred("uuid", &self.uuid);
     }
 }
 

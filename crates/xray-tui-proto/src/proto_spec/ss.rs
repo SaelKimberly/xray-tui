@@ -58,6 +58,7 @@ use super::common::{
     SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -392,31 +393,31 @@ impl ProtoSpec for SsConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_PLUGIN: u8 = 0x50;
+const ID_PLUGIN_OPTS: u8 = 0x51;
+
 impl ProtoIdentity for SsConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"ss");
+    /// Identity fields: everything that reaches a builder.
+    ///
+    /// The SIP003 `plugin`/`plugin_opts` reach both cores and are identity;
+    /// `plugin_opts` goes through [`IdentityWriter::map_str`] because raw
+    /// `HashMap` iteration order is per-instance randomized (iterating the map
+    /// into the hasher was a live nondeterminism bug).
+    ///
+    /// Excluded on purpose: `remarks` (display). Credentials: `method` and
+    /// `password` (the 2022-blake3 PSK).
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("ss");
+        super::common::write_security(w, &self.security);
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        if let Some(plugin) = &self.plugin {
-            hasher.write(plugin.as_bytes());
-        }
+        w.present_str(ID_PLUGIN, self.plugin.as_deref());
         if let Some(opts) = &self.plugin_opts {
-            for (k, v) in opts {
-                hasher.write(k.as_bytes());
-                hasher.write(b"=");
-                hasher.write(v.as_bytes());
-                hasher.write(b";");
-            }
+            w.map_str(ID_PLUGIN_OPTS, opts);
         }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("method", self.method.as_str()),
-            ("password", self.password.as_str()),
-        ])
+        w.cred("method", self.method.as_str());
+        w.cred("password", &self.password);
     }
 }
 
@@ -514,7 +515,15 @@ impl SsConfig {
             out["plugin"] = json!(plugin);
         }
         if let Some(opts) = &self.plugin_opts {
-            let joined: Vec<String> = opts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            // Sorted: a HashMap's iteration order is per-instance random, so
+            // joining it raw made the emitted core config differ between runs
+            // (identity already sorts via `map_str`).
+            let mut entries: Vec<(&String, &String)> = opts.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            let joined: Vec<String> = entries
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
             out["plugin_opts"] = json!(joined.join(";"));
         }
         *core_conf = out;
@@ -527,8 +536,8 @@ mod tests {
     use base64::Engine as _;
 
     use super::super::{
-        ConfigKind, CoreType, HostKind, ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig,
-        ProtocolKind, SecurityConfig, TlsConfig, TlsOpts,
+        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+        SecurityConfig, TlsConfig, TlsOpts,
     };
     use super::SsConfig;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -676,14 +685,10 @@ mod tests {
     fn ss_password_is_credential_not_sig() {
         let url_a = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080"; // cleof:password
         let url_b = "ss://Y2xlb2Y6cGFzczEyMw==@1.2.3.4:8080"; // cleof:pass123
-        let a = config(parse(url_a));
-        let b = config(parse(url_b));
-        assert_eq!(
-            a.compute_sig(),
-            b.compute_sig(),
-            "password must not change sig"
-        );
-        assert_ne!(a.compute_cred_hash(), b.compute_cred_hash());
+        let a = parse(url_a);
+        let b = parse(url_b);
+        assert_eq!(a.sig(), b.sig(), "password must not change sig");
+        assert_ne!(a.cred_hash(), b.cred_hash());
     }
 
     // ── Reconstruct round-trip via endpoint ───────────────────────────────

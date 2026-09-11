@@ -23,12 +23,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::identity::IdentityWriter;
 use crate::clash::{ClashProxy, ClashTailscale};
 use crate::proto_spec::ProtoSpecError;
 use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::clash_to_endpoint;
 use crate::proto_spec::core_mapping;
-use crate::proto_spec::utils;
 use crate::proto_spec::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
     ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
@@ -209,18 +209,39 @@ impl ProtoSpec for TailscaleConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_HOSTNAME: u8 = 0x50;
+const ID_CONTROL_URL: u8 = 0x51;
+const ID_STATE_DIRECTORY: u8 = 0x52;
+const ID_EPHEMERAL: u8 = 0x53;
+const ID_ACCEPT_ROUTES: u8 = 0x54;
+const ID_EXIT_NODE: u8 = 0x55;
+const ID_EXIT_NODE_ALLOW_LAN_ACCESS: u8 = 0x56;
+const ID_ADVERTISE_ROUTES: u8 = 0x57;
+
 impl ProtoIdentity for TailscaleConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"tailscale");
-        if let Some(v) = &self.control_url {
-            hasher.write(v.as_bytes());
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// The three flags default to `false` in the builder (only `Some(true)` is
+    /// emitted), so `None` and `Some(false)` are the same identity. Excluded on
+    /// purpose: `remarks` (display). Credential: `auth_key`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("tailscale");
+        super::common::write_security(w, &self.security);
+        w.present_str(ID_HOSTNAME, self.hostname.as_deref());
+        w.present_str(ID_CONTROL_URL, self.control_url.as_deref());
+        w.present_str(ID_STATE_DIRECTORY, self.state_directory.as_deref());
+        w.opt_flag(ID_EPHEMERAL, self.ephemeral);
+        w.opt_flag(ID_ACCEPT_ROUTES, self.accept_routes);
+        w.present_str(ID_EXIT_NODE, self.exit_node.as_deref());
+        w.opt_flag(
+            ID_EXIT_NODE_ALLOW_LAN_ACCESS,
+            self.exit_node_allow_lan_access,
+        );
+        if let Some(routes) = &self.advertise_routes {
+            w.list_str(ID_ADVERTISE_ROUTES, routes);
         }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[("auth_key", self.auth_key.as_deref().unwrap_or(""))])
+        w.cred("auth_key", self.auth_key.as_deref().unwrap_or(""));
     }
 }
 

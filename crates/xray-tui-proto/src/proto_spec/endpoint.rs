@@ -9,7 +9,8 @@
 //! Later tasks (T4/T5) rework every protocol parser to produce this shape; the
 //! db crate (phase B) stores these types.
 
-use crate::proto_spec::utils;
+use super::ProtoIdentity;
+use super::identity::{IdentityWriter, tag};
 use crate::proto_spec::{CoreType, ProtocolConfig, ProtocolKind};
 use serde::{Deserialize, Serialize};
 
@@ -85,88 +86,67 @@ pub struct ParsedProto {
     pub protocol: ProtocolEssentials,
 }
 
-/// rapidhash pass over canonical proto bytes, mapped to `i64` exactly as
-/// [`ParsedProto::sig`] does: never zero, two's-complement wrap via
-/// `from_le_bytes` (never clamping, which would collide distinct hashes
-/// above `i64::MAX`).
-fn hash_bytes_sig(bytes: &[u8]) -> i64 {
-    let mut hasher = rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-    hasher.write(bytes);
-    let sig = hasher.finish();
-    if sig == 0 {
-        1
-    } else {
-        i64::from_le_bytes(sig.to_le_bytes())
+impl ProtocolEssentials {
+    /// Write the parse-boundary discriminators, then delegate to the typed
+    /// config's per-kind writer.
+    ///
+    /// `proto_kind` is load-bearing beyond the config enum: `Redirect`, `TProxy`
+    /// and `Mixed` share one `PlaceholderConfig` type, so the variant is only
+    /// distinguishable here. `config_type` (`ShareUrl` vs `Form`) and `core_type`
+    /// are part of the legacy identity too and stay in — dropping them is a
+    /// deliberate future re-key, not an accident.
+    pub(crate) fn write_identity(&self, w: &mut IdentityWriter) {
+        w.str(tag::PROTO_KIND, self.proto_kind.as_str());
+        w.str(
+            tag::CONFIG_TYPE,
+            match self.config_type {
+                ConfigKind::ShareUrl => "share_url",
+                ConfigKind::Form => "form",
+            },
+        );
+        w.str(tag::CORE_TYPE, self.core_type.as_str());
+        self.config.write_identity(w);
     }
 }
 
-/// Credential pass over canonical proto bytes: the bytes are UTF-8 JSON by
-/// construction (serde `to_vec` of a `Value` emits exactly the bytes
-/// `to_string` of the same `Value` would), so borrowing them is byte-identical
-/// to the old `to_string` chain — no second serialization needed.
-fn hash_bytes_cred(bytes: &[u8]) -> i64 {
-    let json = std::str::from_utf8(bytes).expect("canonical protocol bytes are UTF-8 JSON");
-    let hash = utils::compute_cred_hash(&[("protocol", json)]);
-    i64::from_le_bytes(hash.to_le_bytes())
+/// Reinterpret a 64-bit hash as `i64` (`from_le_bytes`, never clamping — a
+/// clamp would collide every hash above `i64::MAX`).
+const fn as_i64(v: u64) -> i64 {
+    i64::from_le_bytes(v.to_le_bytes())
 }
 
 impl ParsedProto {
-    /// Canonical bytes of [`ProtocolEssentials`], serialized exactly once:
-    /// converted through `serde_json::Value` so HashMap-backed fields (e.g.
-    /// `headers` in `WebSocketConfig`/`HttpConfig`/`HttpUpgradeConfig`/
-    /// `XHttpConfig`) materialize as sorted-key maps. serde's direct `to_vec`
-    /// on a `HashMap` iterates entries in per-instance random order (fresh
-    /// `RandomState` per map), which would make two value-equal protocols
-    /// hash differently.
-    fn canonical_triple(&self) -> (i64, i64, Vec<u8>) {
-        let value = serde_json::to_value(&self.protocol)
-            .expect("ProtocolEssentials is serializable by construction");
-        let bytes = serde_json::to_vec(&value).expect("canonical protocol Value is serializable");
-        (hash_bytes_sig(&bytes), hash_bytes_cred(&bytes), bytes)
+    /// `sig`, `cred_hash` and `uid` from ONE per-kind binary traversal.
+    ///
+    /// The identity is computed over the typed [`ProtocolConfig`] fields, never
+    /// over serialized JSON: no `Value` tree, no intermediate `Vec<u8>`, no
+    /// per-call serialization. `sig` hashes non-credential fields only,
+    /// `cred_hash` is 0 when there are no credentials (and then `uid == sig`).
+    #[must_use]
+    pub fn identity_once(&self) -> (i64, i64, i64) {
+        let mut w = IdentityWriter::new();
+        self.protocol.write_identity(&mut w);
+        let id = w.finish();
+        (as_i64(id.sig), as_i64(id.cred_hash), as_i64(id.uid))
     }
 
-    /// Deterministic signature over the canonical serialized protocol
-    /// essentials only.
-    ///
-    /// Never zero: a zero rapidhash maps to 1, mirroring `Proto::materialize`'s
-    /// `NonZeroU64::new(..).unwrap_or(NonZeroU64::MIN)` fallback.
+    /// Deterministic signature over the non-credential protocol fields: two
+    /// configs differing only in credentials share a `sig`.
     #[must_use]
     pub fn sig(&self) -> i64 {
-        self.canonical_triple().0
+        self.identity_once().0
     }
 
-    /// Credential hash over the canonical serialized protocol essentials only,
-    /// reusing the existing `utils::compute_cred_hash` primitive (stable
-    /// sorted `k=v;` pairs — same algorithm the per-config `compute_cred_hash`
-    /// impls use).
+    /// Credential-only hash; 0 when the config carries no credentials.
     #[must_use]
     pub fn cred_hash(&self) -> i64 {
-        self.canonical_triple().1
+        self.identity_once().1
     }
 
     /// `sig ^ cred_hash`, never zero.
-    ///
-    /// `sig` is guaranteed non-zero; `cred_hash` is a second independent hash
-    /// of the same serialized protocol, so an xor of zero would require a
-    /// 64-bit hash collision — guarded anyway so the invariant is structural,
-    /// not probabilistic.
     #[must_use]
     pub fn uid(&self) -> i64 {
-        let (_, _, uid) = self.identity_once();
-        uid
-    }
-
-    /// `sig`, `cred_hash` and `uid` from a SINGLE canonical serialization.
-    ///
-    /// `sig()`, `cred_hash()` and `uid()` each serialize independently; call
-    /// sites needing two or more (notably `protocol_from_parsed`, which needs
-    /// all three) must use this to avoid 3× serialize+hash. Byte-identical to
-    /// the three separate calls — the golden test pins it.
-    #[must_use]
-    pub fn identity_once(&self) -> (i64, i64, i64) {
-        let (sig, cred, _) = self.canonical_triple();
-        let uid = sig ^ cred;
-        (sig, cred, if uid == 0 { 1 } else { uid })
+        self.identity_once().2
     }
 
     /// The first endpoint, if any.
@@ -179,6 +159,7 @@ impl ParsedProto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto_spec::PlaceholderConfig;
     use crate::proto_spec::ProtoSpec;
     use crate::proto_spec::common::{TransportConfig, WebSocketConfig};
     use crate::urlx::RawUrlX;
@@ -202,6 +183,169 @@ mod tests {
             core_type: CoreType::Xray,
             config,
         }
+    }
+
+    /// One representative config per dispatchable kind for the
+    /// identity-format stability lock. Kinds with a share-URL form are parsed
+    /// from it; `tor`/`ssh`/`tailscale`/placeholders have none and are built
+    /// the way the app builds them (Clash conversion / `PlaceholderConfig`).
+    fn identity_goldens() -> Vec<(ProtocolKind, ProtocolConfig, &'static str)> {
+        use crate::clash::{ClashProxy, ClashSsh, ClashTailscale, ClashTor};
+
+        let mut out = Vec::new();
+        let clash = |proxy: &ClashProxy, kind: ProtocolKind, label: &'static str| {
+            let cfg = ProtocolConfig::try_from_clash(proxy)
+                .unwrap_or_else(|e| panic!("clash parse for {label}: {e}"));
+            (kind, cfg, label)
+        };
+        out.push((
+            ProtocolKind::Vless,
+            config_from(VLESS_WS_URL),
+            "vless-ws-tls",
+        ));
+        out.push((
+            ProtocolKind::Vless,
+            config_from(
+                "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?security=reality&pbk=AAAA&sid=1111&spx=%2F&fp=chrome&flow=xtls-rprx-vision",
+            ),
+            "vless-reality",
+        ));
+        out.push((
+            ProtocolKind::Vmess,
+            config_from(
+                "vmess://eyJ2IjoiMiIsInBzIjoieCIsImFkZCI6IjEuMi4zLjQiLCJwb3J0IjoiNDQzIiwiaWQiOiI2MjAyYjIzMC00MTdjLTRkOGUtYjYyNC0wZjcxYWZhOWM3NWQiLCJhaWQiOiIwIiwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwidHlwZSI6Im5vbmUiLCJob3N0IjoiYS5leGFtcGxlIiwicGF0aCI6Ii93cyIsInRscyI6InRscyJ9",
+            ),
+            "vmess-ws-tls",
+        ));
+        out.push((
+            ProtocolKind::Trojan,
+            config_from(TROJAN_URL),
+            "trojan-ws-tls",
+        ));
+        out.push((
+            ProtocolKind::Shadowsocks,
+            config_from(SS_URL),
+            "shadowsocks",
+        ));
+        out.push((
+            ProtocolKind::Shadowsocks2022,
+            config_from("ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206cGFzcw@1.2.3.4:8388"),
+            "shadowsocks-2022",
+        ));
+        out.push((
+            ProtocolKind::ShadowsocksR,
+            config_from(
+                "ssr://ZXhhbXBsZS5jb206NDQzOm9yaWdpbjpyYzQtbWQ1OnBsYWluOmNHRnpjM2R2Y21RLz9ncm91cD1WR1Z6ZEVkeWIzVncmcmVtYXJrcz1WR1Z6ZEZObGNuWmxjZw",
+            ),
+            "ssr",
+        ));
+        out.push((ProtocolKind::Socks, config_from(SOCKS_URL), "socks5"));
+        out.push((
+            ProtocolKind::Http,
+            config_from("http://user:pass@1.2.3.4:8080"),
+            "http",
+        ));
+        out.push((
+            ProtocolKind::Naive,
+            config_from("naive+https://user:pass@example.com:443"),
+            "naive",
+        ));
+        out.push((
+            ProtocolKind::AnyTls,
+            config_from("anytls://1.2.3.4:8080?password=secret"),
+            "anytls",
+        ));
+        out.push((
+            ProtocolKind::ShadowTls,
+            config_from("shadowtls://1.2.3.4:443?password=pass123&version=1&sni=example.com"),
+            "shadowtls",
+        ));
+        out.push((
+            ProtocolKind::Hysteria2,
+            config_from(
+                "hysteria2://pw@1.2.3.4:443?sni=a.example&obfs=salamander&obfs-password=x&alpn=h3",
+            ),
+            "hysteria2",
+        ));
+        out.push((
+            ProtocolKind::Hysteria,
+            config_from(
+                "hysteria://example.com:443?protocol=udp&obfs=xplus&up_mbps=200&down_mbps=200&insecure=1&sni=real.example.com",
+            ),
+            "hysteria1",
+        ));
+        out.push((
+            ProtocolKind::Tuic,
+            config_from(
+                "tuic://36106e0f-4d9a-470b-a3fd-535f3b7a1e92:dongtaiwang.com@5.178.101.117:30006?congestion_control=cubic&udp_relay_mode=native&alpn=h3",
+            ),
+            "tuic",
+        ));
+        out.push((
+            ProtocolKind::WireGuard,
+            config_from(
+                "wireguard://eERuOncn22jnY3uYp8WLcy0SCuOkEbSDa0j%2BwAPSEH4%3D@162.159.192.1:2408?address=172.16.0.2%2F32&presharedkey=&reserved=236%2C163%2C162&publickey=bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D&mtu=1280",
+            ),
+            "wireguard",
+        ));
+        out.push(clash(
+            &ClashProxy::Tor(ClashTor {
+                name: "tor-node".into(),
+                server: "127.0.0.1".into(),
+                port: 9050,
+            }),
+            ProtocolKind::Tor,
+            "tor",
+        ));
+        out.push(clash(
+            &ClashProxy::Ssh(ClashSsh {
+                name: "ssh-box".into(),
+                server: "example.com".into(),
+                port: 22,
+                user: "root".into(),
+                password: Some("sekrit".into()),
+                private_key: None,
+                private_key_path: Some("/home/user/.ssh/id_ed25519".into()),
+                host_key: Some(vec!["ssh-ed25519 AAA".into()]),
+                host_key_algorithms: Some(vec!["ssh-ed25519".into()]),
+                client_version: Some("SSH-2.0-myclient".into()),
+            }),
+            ProtocolKind::Ssh,
+            "ssh",
+        ));
+        out.push(clash(
+            &ClashProxy::Tailscale(ClashTailscale {
+                name: "ts-node".into(),
+                server: "100.64.0.1".into(),
+                port: 100,
+                hostname: "node1".into(),
+                auth_key: Some("tskey-auth-abc".into()),
+                control_url: Some("https://control.example.com".into()),
+                state_dir: Some("/var/lib/tailscale".into()),
+                ephemeral: true,
+                accept_routes: true,
+                exit_node: Some("100.64.0.2".into()),
+                exit_node_allow_lan_access: Some(true),
+            }),
+            ProtocolKind::Tailscale,
+            "tailscale",
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({"protocol_settings": {}})).unwrap();
+        for (kind, name) in [
+            (ProtocolKind::Redirect, "redirect"),
+            (ProtocolKind::TProxy, "tproxy"),
+            (ProtocolKind::Mixed, "mixed"),
+        ] {
+            let pc = PlaceholderConfig::new(name.to_string(), body.clone());
+            let config = match kind {
+                ProtocolKind::Redirect => ProtocolConfig::Redirect(pc),
+                ProtocolKind::TProxy => ProtocolConfig::TProxy(pc),
+                _ => ProtocolConfig::Mixed(pc),
+            };
+            out.push((kind, config, name));
+        }
+        assert_eq!(out.len(), 22, "every dispatchable kind is covered");
+        out
     }
 
     fn parsed(endpoints: Vec<EndpointEssentials>, protocol: ProtocolEssentials) -> ParsedProto {
@@ -231,8 +375,10 @@ mod tests {
     }
 
     #[test]
-    fn different_config_payloads_produce_different_uid() {
-        // Different vless uuid -> different config payload -> different uid.
+    fn credentials_move_uid_not_sig() {
+        // Different vless uuid -> different credential hash -> different uid,
+        // but the SAME sig: sig is the "same way configured" grouping key and
+        // must not see credentials.
         let uuid_a = parsed(
             vec![],
             proto(
@@ -251,23 +397,68 @@ mod tests {
                 ),
             ),
         );
-        assert_ne!(
+        assert_eq!(
             uuid_a.sig(),
             uuid_b.sig(),
-            "different uuid -> different sig"
+            "uuid is a credential: sig ignores it"
         );
         assert_ne!(
-            uuid_a.uid(),
-            uuid_b.uid(),
-            "different uuid -> different uid"
+            uuid_a.cred_hash(),
+            uuid_b.cred_hash(),
+            "uuid changes cred_hash"
         );
+        assert_ne!(uuid_a.uid(), uuid_b.uid(), "uuid changes uid");
 
-        // Same kind, different transport config must also differ.
+        // Same kind, different transport config must also differ in sig.
         let ws = parsed(
             vec![],
             proto(ProtocolKind::Vless, config_from(VLESS_WS_URL)),
         );
+        assert_ne!(uuid_a.sig(), ws.sig(), "transport config changes sig");
         assert_ne!(uuid_a.uid(), ws.uid(), "transport config changes uid");
+    }
+
+    #[test]
+    fn explicitly_declared_defaults_do_not_move_identity() {
+        // `type=tcp` and `security=none` are the values the builder uses when
+        // the parameter is absent, so spelling them out must not split a row.
+        let bare = parsed(
+            vec![],
+            proto(
+                ProtocolKind::Vless,
+                config_from("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@1.2.3.4:443"),
+            ),
+        );
+        let spelled = parsed(
+            vec![],
+            proto(
+                ProtocolKind::Vless,
+                config_from(
+                    "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@1.2.3.4:443?type=tcp&security=none&encryption=none",
+                ),
+            ),
+        );
+        assert_eq!(bare.uid(), spelled.uid(), "explicit defaults are elided");
+    }
+
+    #[test]
+    fn parse_boundary_discriminators_are_in_identity() {
+        let config = || config_from(VLESS_WS_URL);
+        let base = parsed(vec![], proto(ProtocolKind::Vless, config()));
+        let mut form = base.protocol.clone();
+        form.config_type = ConfigKind::Form;
+        let form = parsed(vec![], form);
+        assert_ne!(base.uid(), form.uid(), "config_type is part of identity");
+
+        let mut singbox = base.protocol.clone();
+        singbox.core_type = CoreType::SingBox;
+        let singbox = parsed(vec![], singbox);
+        assert_ne!(base.uid(), singbox.uid(), "core_type is part of identity");
+
+        let mut mixed = base.protocol.clone();
+        mixed.proto_kind = ProtocolKind::Mixed;
+        let mixed = parsed(vec![], mixed);
+        assert_ne!(base.uid(), mixed.uid(), "proto_kind is part of identity");
     }
 
     #[test]
@@ -401,6 +592,153 @@ mod tests {
         let back: ProtocolEssentials = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, p);
     }
+    #[test]
+    fn identity_format_is_frozen_for_every_kind() {
+        const GOLDEN: &[(&str, i64, i64, i64)] = &[
+            (
+                "vless-ws-tls",
+                3_089_316_420_903_633_163,
+                -3_671_329_074_638_681_578,
+                -1_741_866_924_651_377_891,
+            ),
+            (
+                "vless-reality",
+                1_127_564_875_969_247_992,
+                4_901_257_183_562_748_086,
+                5_449_682_340_669_057_614,
+            ),
+            (
+                "vmess-ws-tls",
+                7_779_831_444_621_083_475,
+                -6_121_794_125_314_136_690,
+                -4_540_604_963_694_434_595,
+            ),
+            (
+                "trojan-ws-tls",
+                619_854_462_785_392_910,
+                4_539_693_499_735_895_282,
+                4_006_534_017_039_728_124,
+            ),
+            (
+                "shadowsocks",
+                -3_626_457_047_165_349_476,
+                -8_461_828_400_503_653_015,
+                5_133_460_775_428_795_637,
+            ),
+            (
+                "shadowsocks-2022",
+                2_171_161_288_340_790_656,
+                518_419_800_799_700_420,
+                1_806_031_135_999_801_412,
+            ),
+            (
+                "ssr",
+                86_648_536_387_555_623,
+                -8_444_016_051_189_696_326,
+                -8_366_841_201_431_402_083,
+            ),
+            (
+                "socks5",
+                894_769_744_639_062_711,
+                -1_324_468_360_326_554_888,
+                -2_165_009_465_080_305_585,
+            ),
+            (
+                "http",
+                2_040_650_694_847_128_044,
+                2_060_728_360_568_690_491,
+                56_564_892_550_919_895,
+            ),
+            (
+                "naive",
+                -4_022_221_735_492_414_278,
+                8_743_600_710_957_120_646,
+                -5_658_297_800_858_982_340,
+            ),
+            (
+                "anytls",
+                5_329_075_494_661_585_488,
+                -7_559_830_465_722_878_442,
+                -2_386_138_336_551_793_594,
+            ),
+            (
+                "shadowtls",
+                -6_485_746_215_789_101_134,
+                1_208_352_109_495_544_012,
+                -5_387_732_348_704_057_474,
+            ),
+            (
+                "hysteria2",
+                -1_366_376_608_290_555_275,
+                4_063_853_313_941_936_306,
+                -3_068_056_664_163_900_729,
+            ),
+            (
+                "hysteria1",
+                2_747_004_670_171_039_834,
+                0,
+                2_747_004_670_171_039_834,
+            ),
+            (
+                "tuic",
+                2_951_537_434_160_194_224,
+                5_504_772_524_924_529_269,
+                7_246_598_404_012_640_453,
+            ),
+            (
+                "wireguard",
+                -3_996_798_730_592_543_515,
+                4_747_472_577_046_533_003,
+                -8_544_756_085_095_346_322,
+            ),
+            (
+                "tor",
+                3_445_265_473_241_839_633,
+                0,
+                3_445_265_473_241_839_633,
+            ),
+            (
+                "ssh",
+                3_972_754_635_815_239_577,
+                3_262_498_630_262_163_294,
+                1_901_845_547_417_090_247,
+            ),
+            (
+                "tailscale",
+                1_383_436_558_267_749_635,
+                5_189_146_043_036_952_176,
+                6_571_166_292_324_250_483,
+            ),
+            (
+                "redirect",
+                5_338_375_316_652_406_911,
+                0,
+                5_338_375_316_652_406_911,
+            ),
+            (
+                "tproxy",
+                -3_937_553_827_210_429_861,
+                0,
+                -3_937_553_827_210_429_861,
+            ),
+            ("mixed", 456_474_488_423_338_464, 0, 456_474_488_423_338_464),
+        ];
+        let goldens = identity_goldens();
+        assert_eq!(GOLDEN.len(), goldens.len(), "one golden per kind");
+        for (kind, config, label) in goldens {
+            let (_, sig, cred_hash, uid) = GOLDEN
+                .iter()
+                .find(|(name, ..)| *name == label)
+                .unwrap_or_else(|| panic!("no golden for {label}"));
+            let p = parsed(vec![], proto(kind, config));
+            assert_eq!(
+                p.identity_once(),
+                (*sig, *cred_hash, *uid),
+                "identity drift for {label} — the frozen format changed (schema bump required)"
+            );
+        }
+    }
+
     #[test]
     fn identity_once_matches_separate_calls() {
         // Byte-identity gate for the production identity path: one

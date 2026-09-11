@@ -5,7 +5,7 @@
 ```
 xray-tui (bin)
   ├── xray-tui-core     (Protocol, CoreType, resolve_core, config_builder, process, log_heed)
-  │     └── xray-tui-proto  (ProtocolConfig types, Proto identity container, URL parsing, Clash YAML)
+  │     └── xray-tui-proto  (ProtocolConfig types, per-kind binary identity, URL parsing, Clash YAML)
   ├── xray-tui-native   (in-process runtime backend — VLESS/VMess/Trojan/Hysteria2 tunnels, SOCKS5 + HTTP CONNECT inbounds, capability gate, telemetry)
   │     ├── xray-tui-tls   (ring TLS 1.3 + TLS 1.2-fallback client, browser fingerprints, REALITY client)
   │     ├── xray-tui-route (first-match routing engine for the local inbounds — TLS/HTTP/QUIC sniffing)
@@ -702,7 +702,7 @@ queue at the SQLite level instead of failing instantly; all write paths use
 `conn()`.
 
 **Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
-- `Endpoint` — server config; dedup key `sub_uid` (uid = sig ^ cred_hash); `resolved_as`/`resolved_at` DNS persistence
+- `Endpoint` — server config; dedup key `stable_hash(host, port)`; `resolved_as`/`resolved_at` DNS persistence
 - `ProtocolRow` — per-protocol variant rows (many per endpoint); `last_used_at`/`last_seen_at`, `endpoint_id` index
 - `EndpointGroup` — many-to-many Endpoint↔Group membership
 - `Group` — subscription group with name, URL, sort order, is_system flag
@@ -712,7 +712,7 @@ queue at the SQLite level instead of failing instantly; all write paths use
 - `DnsSetting` — DNS resolver config
 - `PingSession` — ping batch tracking (batch_id, status, ping_type, latency)
 
-**Schema management**: toasty's `db.push_schema()` creates tables on first open — only when `PRAGMA user_version < 1` (toasty 0.9 uses `CREATE TABLE` without `IF NOT EXISTS`). Existing DBs migrate in place: `SCHEMA_VERSION = 3`, `ensure_column()` (pragma_table_info check + idempotent `ALTER TABLE ADD COLUMN`) for `protocol_rows.last_used_at`, `endpoints.resolved_as`/`resolved_at`, `dns_settings.cache_ttl_secs`; v3 adds the `protocol_rows.endpoint_id` index (`CREATE INDEX IF NOT EXISTS`, idempotent). All inside one explicit `conn.transaction()` + `tx.commit()` (bare multi-statement DDL on the pooled turso connection silently rolls back at drop). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
+**Schema management**: no migration machinery. `db.push_schema()` runs only when the `PRAGMA user_version` tag differs from `SCHEMA_VERSION = 7`; toasty emits `CREATE TABLE` without `IF NOT EXISTS`, so on an existing DB the push fails and `Database::open` **deletes the file** and recreates the 8-table schema — a tag bump is a data reset, never a migration (v7 is the per-kind binary identity re-key; v6 files cannot be reused). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
 **Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB) with backoff retry (50ms*(attempt+1), max 5) — the batch is retried after a successful resize, never dropped. Initial log loading is lazy (deferred to first Logs tab access).
 
 ### xray-tui-config (library crate)
@@ -915,7 +915,8 @@ Streaming base64 decoder → URL list
   → validate_security() emits tracing::warn!(target: "validation", ...)
         │
         ▼
-Enrich each Profile: compute sub_uid (rapidhash), set group_id, is_sub, sub_id
+Enrich each Profile: compute the identity (`uid = sig ^ cred_hash`, per-kind
+binary writer in the proto crate), set group_id, is_sub, sub_id
         │
         ▼
 subscription_upsert_profiles() — single BEGIN DEFERRED transaction:

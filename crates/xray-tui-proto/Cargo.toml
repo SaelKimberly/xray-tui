@@ -53,3 +53,13 @@ xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true
+
+# Identity benches: per-kind `ParsedProto::identity_once()` cost. Hermetic —
+# no cores, no sockets, no features; `cargo criterion -p xray-tui-proto
+# --bench identity`.
+[[bench]]
+name = "identity"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true }

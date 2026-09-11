@@ -43,6 +43,7 @@ use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls_or_default,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -376,35 +377,41 @@ impl ProtoSpec for TuicConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_CONGESTION_CONTROL: u8 = 0x50;
+const ID_UDP_RELAY_MODE: u8 = 0x51;
+
 impl ProtoIdentity for TuicConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"tuic");
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T5).
-        if let Some(v) = &self.congestion_control {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.udp_relay_mode {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.alpn() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.insecure() {
-            hasher.write(if v { b"true" } else { b"false" });
-        }
-        if let Some(v) = self.security.sni() {
-            hasher.write(v.as_bytes());
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("uuid", self.uuid.as_str()),
-            ("password", self.password.as_str()),
-        ])
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// `congestion_control`/`udp_relay_mode` are elided at the sing-box
+    /// defaults (`bbr`/`native`), which the builder leaves to the core. ALPN
+    /// is written by the shared TLS helper, but sing-box's TUIC outbound
+    /// defaults it to `h3` too, so an explicit `h3` is normalized away first —
+    /// otherwise a URL spelling out the parser's default would split the
+    /// identity from one that omits it.
+    ///
+    /// Excluded on purpose: `remarks` (display). Credentials: `uuid`,
+    /// `password`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("tuic");
+        // ALPN `h3` == the sing-box TUIC default (see `to_singbox_tls`).
+        let normalized = (self.security.alpn() == Some("h3")).then(|| {
+            let mut security = self.security.clone();
+            if let Some(TlsConfig::Tls(opts)) = &mut security.tls {
+                opts.alpn = None;
+            }
+            security
+        });
+        super::common::write_security_mandatory(w, normalized.as_ref().unwrap_or(&self.security));
+        w.opt_str(
+            ID_CONGESTION_CONTROL,
+            self.congestion_control.as_deref(),
+            "bbr",
+        );
+        w.opt_str(ID_UDP_RELAY_MODE, self.udp_relay_mode.as_deref(), "native");
+        w.cred("uuid", &self.uuid);
+        w.cred("password", &self.password);
     }
 }
 

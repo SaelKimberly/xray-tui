@@ -46,6 +46,7 @@ use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls_or_default,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -392,35 +393,27 @@ impl ProtoSpec for Hysteria1Config {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_OBFS: u8 = 0x50;
+const ID_UP_MBPS: u8 = 0x51;
+const ID_DOWN_MBPS: u8 = 0x52;
+
 impl ProtoIdentity for Hysteria1Config {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"hysteria");
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T5).
-        if let Some(v) = &self.up_mbps {
-            hasher.write(&v.to_le_bytes());
-        }
-        if let Some(v) = &self.down_mbps {
-            hasher.write(&v.to_le_bytes());
-        }
-        if let Some(v) = &self.protocol {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.obfs {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.insecure() {
-            hasher.write(if v { b"true" } else { b"false" });
-        }
-        if let Some(v) = self.security.sni() {
-            hasher.write(v.as_bytes());
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[("auth", self.auth.as_deref().unwrap_or(""))])
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// `up_mbps`/`down_mbps` are elided at the builder's 100 Mbps default
+    /// (which the parser already skips when the URL states it explicitly).
+    ///
+    /// Excluded on purpose: `remarks` (display) and `protocol` (no sing-box
+    /// outbound key — the builder drops it, so two configs differing only
+    /// there build identically). Credential: `auth`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("hysteria");
+        super::common::write_security_mandatory(w, &self.security);
+        w.present_str(ID_OBFS, self.obfs.as_deref());
+        w.opt_u64(ID_UP_MBPS, self.up_mbps.map(u64::from), 100);
+        w.opt_u64(ID_DOWN_MBPS, self.down_mbps.map(u64::from), 100);
+        w.cred("auth", self.auth.as_deref().unwrap_or(""));
     }
 }
 

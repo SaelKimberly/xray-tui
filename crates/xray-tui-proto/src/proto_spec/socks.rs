@@ -41,6 +41,7 @@ use super::common::{
     SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -308,19 +309,19 @@ impl ProtoSpec for Socks5Config {
 }
 
 impl ProtoIdentity for Socks5Config {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"socks5");
+    /// Identity fields: everything that reaches a builder.
+    ///
+    /// `security` carries the TLS layer xray-core emits as `streamSettings`
+    /// (sing-box's socks outbound has no TLS field, so it ignores the layer).
+    /// Excluded on purpose: `remarks` (display). Credentials: `username` and
+    /// `password` (emitted only when both are non-empty).
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("socks");
+        super::common::write_security(w, &self.security);
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("username", self.username.as_deref().unwrap_or("")),
-            ("password", self.password.as_deref().unwrap_or("")),
-        ])
+        w.cred("username", self.username.as_deref().unwrap_or(""));
+        w.cred("password", self.password.as_deref().unwrap_or(""));
     }
 }
 
@@ -409,8 +410,7 @@ impl Socks5Config {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ConfigKind, CoreType, HostKind, ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig,
-        ProtocolKind,
+        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
     };
     use super::Socks5Config;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -517,14 +517,10 @@ mod tests {
 
     #[test]
     fn socks_credentials_change_cred_hash_not_sig() {
-        let noauth = config(parse("socks://1.2.3.4:1080"));
-        let auth = config(parse("socks://user:pass@1.2.3.4:1080"));
-        assert_eq!(
-            noauth.compute_sig(),
-            auth.compute_sig(),
-            "creds are not part of sig"
-        );
-        assert_ne!(noauth.compute_cred_hash(), auth.compute_cred_hash());
+        let noauth = parse("socks://1.2.3.4:1080");
+        let auth = parse("socks://user:pass@1.2.3.4:1080");
+        assert_eq!(noauth.sig(), auth.sig(), "creds are not part of sig");
+        assert_ne!(noauth.cred_hash(), auth.cred_hash());
     }
 
     // ── Reconstruct round-trip via endpoint ───────────────────────────────

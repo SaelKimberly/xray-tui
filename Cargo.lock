@@ -8391,6 +8391,7 @@ dependencies = [
  "aho-corasick",
  "base64 0.23.1",
  "bstr",
+ "criterion",
  "idna",
  "nom 8.0.0",
  "rapidhash",

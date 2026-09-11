@@ -146,6 +146,8 @@ bench target='all':
     cargo criterion -p xray-tui-native --bench dispatch
     # Hermetic Shadowsocks codec/KDF rows — no cores, no sockets, so micro-safe.
     cargo criterion -p xray-tui-native --bench ss_codec
+    # Per-kind ProtocolId identity traversal — hermetic, micro-safe.
+    cargo criterion -p xray-tui-proto  --bench identity
     cargo criterion -p xray-tui-native --features native-e2e --bench relay
     if [ "{{target}}" = all ]; then
         cargo criterion -p xray-tui-native --features native-e2e --bench throughput

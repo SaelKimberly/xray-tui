@@ -48,6 +48,7 @@ use super::common::{
     validate_xray_reality,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -519,44 +520,20 @@ impl ProtoSpec for TrojanConfig {
 }
 
 impl ProtoIdentity for TrojanConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"trojan");
-        let sec_type = self.security.type_str().unwrap_or("none");
-        hasher.write(sec_type.as_bytes());
-        hasher.write(self.transport.type_str().as_bytes());
-        // Endpoint (host/port) intentionally absent from the identity — it
-        // lives on the ParsedProto boundary, never in the config payload (T5).
-        match &self.transport {
-            TransportConfig::HttpUpgrade(cfg) => {
-                if let Some(v) = &cfg.host {
-                    hasher.write(v.as_bytes());
-                }
-            }
-            TransportConfig::XHttp(cfg) => {
-                if let Some(v) = &cfg.host {
-                    hasher.write(v.as_bytes());
-                }
-            }
-            _ => {}
-        }
-        if let Some(path) = &self.path {
-            hasher.write(path.as_bytes());
-        }
-        if let Some(v) = self.security.sni() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.alpn() {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = self.security.fp() {
-            hasher.write(v.as_bytes());
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[("password", self.password.as_str())])
+    /// Identity fields: everything a builder or the native client reads.
+    ///
+    /// Excluded on purpose: `remarks` (display) and `path` (a mirror of the
+    /// transport's own path, which `write_transport` already covers).
+    /// Credential: `password`.
+    ///
+    /// REALITY `pbk`/`sid`/`spx` and TLS `insecure` reach the builders through
+    /// the shared `write_security` helper (they were missing from both old
+    /// streams).
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("trojan");
+        super::common::write_security(w, &self.security);
+        super::common::write_transport(w, &self.transport);
+        w.cred("password", &self.password);
     }
 }
 

@@ -30,6 +30,7 @@ use super::common::{
     SecurityConfig, TlsConfig, TlsOpts, should_skip_endpoint_param, to_singbox_tls,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -304,25 +305,27 @@ impl ProtoSpec for ShadowTlsConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_VERSION: u8 = 0x50;
+
 impl ProtoIdentity for ShadowTlsConfig {
-    /// Compute a deterministic signature based on non-credential fields:
-    /// protocol tag + version + sni (endpoint host/port excluded — T5).
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"shadowtls");
+    /// Identity fields: everything that reaches the sing-box builder.
+    ///
+    /// Excluded on purpose: `remarks` (display). `version` elides the builder
+    /// default of `3` (absent and an unparseable value both build as 3).
+    /// `security` carries every TLS parameter the builder emits (`server_name`,
+    /// `insecure`, `alpn`, `fp`, …). Credential: `password`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("shadowtls");
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        if let Some(version) = &self.version {
-            hasher.write(version.as_bytes());
-        }
-        if let Some(sni) = self.security.sni() {
-            hasher.write(sni.as_bytes());
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[("password", self.password.as_deref().unwrap_or(""))])
+        super::common::write_security_mandatory(w, &self.security);
+        let version = self
+            .version
+            .as_ref()
+            .and_then(|v| v.as_str().parse::<u64>().ok());
+        w.opt_u64(ID_VERSION, version, 3);
+        w.cred("password", self.password.as_deref().unwrap_or(""));
     }
 }
 

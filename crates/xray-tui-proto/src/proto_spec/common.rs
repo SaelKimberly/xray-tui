@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use crate::urlx::{HostSpec, TinyText};
 
+use super::identity::{IdentityWriter, tag};
+
 /// Clash TLS fields as returned by `security_to_clash_tls`.
 type SecurityClashTls = (
     Option<bool>,
@@ -755,6 +757,167 @@ pub(crate) fn transport_to_clash(
             }),
         ),
         _ => (None, None, None, None, None, None),
+    }
+}
+
+/// Write the identity of a [`SecurityConfig`]: TLS/REALITY discriminator (only
+/// when present — `security: none` is the default), then each explicit
+/// non-default field.
+///
+/// REALITY `pbk`/`sid`/`spx` are PUBLIC server parameters, so they belong to
+/// `sig` (they distinguish servers, not credentials).
+pub(crate) fn write_security(w: &mut IdentityWriter, security: &SecurityConfig) {
+    #[allow(
+        clippy::wildcard_imports,
+        reason = "the tag namespace is a flat field-id table; a wildcard keeps the field list readable"
+    )]
+    use tag::*;
+    match &security.tls {
+        Some(TlsConfig::Tls(opts)) => {
+            w.str(SEC_KIND, "tls");
+            w.nonempty_str(SEC_SNI, opts.sni.as_deref());
+            w.nonempty_str(SEC_ALPN, opts.alpn.as_deref());
+            w.nonempty_str(SEC_FP, opts.fp.as_deref());
+            w.opt_flag(SEC_INSECURE, opts.insecure);
+            w.nonempty_str(SEC_CURVES, opts.curves.as_deref());
+            w.nonempty_str(SEC_PQV, opts.pqv.as_deref());
+            w.nonempty_str(SEC_ECH, opts.ech.as_deref());
+            w.opt_flag(SEC_VCN, opts.vcn);
+            w.nonempty_str(SEC_PCS, opts.pcs.as_deref());
+            w.nonempty_str(SEC_PIN_SHA256, opts.pin_sha256.as_deref());
+        }
+        Some(TlsConfig::Reality(opts)) => {
+            w.str(SEC_KIND, "reality");
+            w.nonempty_str(SEC_SNI, opts.sni.as_deref());
+            w.nonempty_str(SEC_FP, opts.fp.as_deref());
+            w.nonempty_str(SEC_PBK, opts.pbk.as_deref());
+            w.nonempty_str(SEC_SID, opts.sid.as_deref());
+            w.nonempty_str(SEC_SPX, opts.spx.as_deref());
+        }
+        None => {}
+    }
+    w.nonempty_str(SEC_ENC, security.enc.as_deref());
+}
+
+/// True when a TLS block carries nothing a builder acts on: `None`, or a
+/// `Tls` whose optional fields are all absent and whose `insecure` is not
+/// forced true. REALITY is never inert.
+///
+/// The distinction matters only for protocols whose TLS is MANDATORY: their
+/// builder emits the same `tls` block for `None` and for such an inert block,
+/// so identity must not split `security=tls` from an absent `security=`.
+#[must_use]
+pub(crate) fn tls_block_is_inert(security: &SecurityConfig) -> bool {
+    match &security.tls {
+        None => true,
+        Some(TlsConfig::Tls(o)) => {
+            o.sni.is_none()
+                && o.alpn.is_none()
+                && o.curves.is_none()
+                && o.fp.is_none()
+                && o.insecure != Some(true)
+                && o.pqv.is_none()
+                && o.ech.is_none()
+                && o.vcn != Some(true)
+                && o.pcs.is_none()
+                && o.pin_sha256.is_none()
+        }
+        Some(TlsConfig::Reality(_)) => false,
+    }
+}
+
+/// [`write_security`] for protocols whose builder ALWAYS emits a TLS block
+/// (`tuic`/`hysteria1`/`hysteria2`/`naive`/`anytls`/`shadowtls`): an inert TLS
+/// block is elided entirely, so the two spellings of the same mandatory-TLS
+/// config share one identity.
+pub(crate) fn write_security_mandatory(w: &mut IdentityWriter, security: &SecurityConfig) {
+    if tls_block_is_inert(security) {
+        w.nonempty_str(tag::SEC_ENC, security.enc.as_deref());
+        return;
+    }
+    write_security(w, security);
+}
+
+/// Write the identity of a [`TransportConfig`]: the transport discriminator
+/// (only for non-`tcp` — `tcp` is the default) followed by every explicit
+/// field of that variant.
+///
+/// The field set mirrors what the builders can emit (`to_xray_stream_settings`
+/// / `to_singbox_transport`): a field no builder reads is not identity.
+pub(crate) fn write_transport(w: &mut IdentityWriter, transport: &TransportConfig) {
+    #[allow(
+        clippy::wildcard_imports,
+        reason = "the tag namespace is a flat field-id table; a wildcard keeps the field list readable"
+    )]
+    use tag::*;
+    match transport {
+        TransportConfig::Tcp => {}
+        TransportConfig::Ws(cfg) => {
+            w.str(TR_KIND, "ws");
+            w.opt_str(TR_PATH, cfg.path.as_deref(), "/");
+            w.nonempty_str(TR_HOST, cfg.host.as_deref());
+            if let Some(headers) = &cfg.headers {
+                w.map_str(TR_HEADERS, headers);
+            }
+            w.present_u64(TR_MAX_EARLY_DATA, cfg.max_early_data.map(u64::from));
+            w.nonempty_str(TR_EARLY_DATA_HEADER, cfg.early_data_header_name.as_deref());
+            w.opt_flag(TR_V2RAY_UPGRADE, cfg.v2ray_http_upgrade);
+            w.opt_flag(TR_V2RAY_UPGRADE_FAST_OPEN, cfg.v2ray_http_upgrade_fast_open);
+        }
+        TransportConfig::Grpc(cfg) => {
+            w.str(TR_KIND, "grpc");
+            w.present_str(TR_PATH, cfg.path.as_deref());
+            w.nonempty_str(TR_AUTHORITY, cfg.authority.as_deref());
+            w.nonempty_str(TR_SERVICE_NAME, cfg.service_name.as_deref());
+            w.nonempty_str(TR_MODE, cfg.mode.as_deref());
+            w.nonempty_str(TR_USER_AGENT, cfg.user_agent.as_deref());
+            w.present_u64(TR_PING_INTERVAL, cfg.ping_interval.map(u64::from));
+        }
+        TransportConfig::Http(cfg) => {
+            w.str(TR_KIND, "http");
+            w.present_str(TR_PATH, cfg.path.as_deref());
+            w.nonempty_str(TR_HOST, cfg.host.as_deref());
+            w.nonempty_str(TR_METHOD, cfg.method.as_deref());
+            if let Some(headers) = &cfg.headers {
+                w.map_str(TR_HEADERS, headers);
+            }
+            w.present_u64(TR_IDLE_TIMEOUT, cfg.idle_timeout.map(u64::from));
+            w.present_u64(TR_PING_TIMEOUT, cfg.ping_timeout.map(u64::from));
+        }
+        TransportConfig::HttpUpgrade(cfg) => {
+            w.str(TR_KIND, "httpupgrade");
+            w.present_str(TR_PATH, cfg.path.as_deref());
+            w.nonempty_str(TR_HOST, cfg.host.as_deref());
+            if let Some(headers) = &cfg.headers {
+                w.map_str(TR_HEADERS, headers);
+            }
+            w.present_u64(TR_ED, cfg.ed.map(u64::from));
+        }
+        TransportConfig::XHttp(cfg) => {
+            w.str(TR_KIND, "xhttp");
+            w.present_str(TR_PATH, cfg.path.as_deref());
+            w.nonempty_str(TR_HOST, cfg.host.as_deref());
+            w.nonempty_str(TR_MODE, cfg.mode.as_deref());
+            if let Some(headers) = &cfg.headers {
+                w.map_str(TR_HEADERS, headers);
+            }
+            if let Some(extra) = &cfg.extra {
+                w.json(TR_EXTRA, extra);
+            }
+        }
+        TransportConfig::Kcp(cfg) => {
+            w.str(TR_KIND, "kcp");
+            w.opt_u64(TR_MTU, cfg.mtu.map(u64::from), 1350);
+            w.opt_u64(TR_TTI, cfg.tti.map(u64::from), 20);
+            w.present_u64(TR_UPLINK_CAPACITY, cfg.uplink_capacity.map(u64::from));
+            w.present_u64(TR_DOWNLINK_CAPACITY, cfg.downlink_capacity.map(u64::from));
+            w.opt_flag(TR_CONGESTION, cfg.congestion);
+            w.present_u64(TR_READ_BUFFER, cfg.read_buffer.map(u64::from));
+            w.present_u64(TR_WRITE_BUFFER, cfg.write_buffer.map(u64::from));
+            w.nonempty_str(TR_SEED, cfg.seed.as_deref());
+            w.opt_str(TR_HEADER_TYPE, cfg.header_type.as_deref(), "none");
+        }
+        TransportConfig::Quic => w.str(TR_KIND, "quic"),
     }
 }
 

@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,10 @@ use crate::urlx::{HostSpec, RawUrlX, SchemeX};
 pub mod common;
 pub mod core_mapping;
 pub mod endpoint;
+pub(crate) mod identity;
 pub mod utils;
+
+use identity::IdentityWriter;
 
 mod anytls;
 mod error;
@@ -271,9 +273,14 @@ impl ProtocolConfig {
 ///
 /// Crate-private (plain `trait`, no `pub`). The [`ProtoSpec`] trait is sealed
 /// through this supertrait — only config types inside this crate implement it.
+///
+/// One traversal feeds both identity streams: non-credential, non-default
+/// fields go to the `sig` stream, credentials to the domain-separated
+/// credential stream. `uid = sig ^ cred_hash`. See [`identity`].
 trait ProtoIdentity {
-    fn compute_sig(&self) -> u64;
-    fn compute_cred_hash(&self) -> u64;
+    /// Write this config's kind tag, non-default non-credential fields, and
+    /// credentials into `w`. The call order is the frozen identity format.
+    fn write_identity(&self, w: &mut IdentityWriter);
 }
 
 /// Behavioral protocol spec, sealed to this crate via the private
@@ -287,7 +294,7 @@ trait ProtoIdentity {
 /// protocol parameters (host-free parse mandate). T4 converted vless/vmess;
 /// T4 converted vless/vmess; T5 converted all remaining configs (no config struct carries host/port
 /// anymore). This legacy trait is kept as a bridge so `ProtocolConfig`
-/// dispatch and the `Proto` consumers in xray-tui-core keep compiling:
+/// dispatch and the legacy `*_proto` consumers keep compiling:
 /// `try_parse`/`try_from_clash` still work by delegating to the `*_proto`
 /// variants and discarding the endpoints; `to_clash`/`reconstruct` return
 /// errors because host/port are no longer stored on the config. T11 rewired
@@ -427,11 +434,8 @@ pub enum ProtocolConfig {
 }
 
 impl ProtoIdentity for ProtocolConfig {
-    fn compute_sig(&self) -> u64 {
-        dispatch!(self, compute_sig)
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        dispatch!(self, compute_cred_hash)
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        dispatch!(self, write_identity, w);
     }
 }
 
@@ -521,149 +525,6 @@ impl InjectToCoreConf for ProtocolConfig {
         // arguments (`core_conf`, `core_type`, `endpoint`, `opts`) to each
         // variant.
         dispatch!(self, inject_to, core_conf, core_type, endpoint, opts)
-    }
-}
-
-// ── Identity container ──────────────────────────────────────────────────
-
-/// Materialized identity of a [`Proto`]: `(sig, cred_hash)` with `sig` never
-/// zero.
-#[derive(Debug, Clone, Copy)]
-struct Identity {
-    sig: NonZeroU64,
-    cred_hash: u64,
-}
-
-/// A [`ProtocolConfig`] paired with its lazily-materialized identity.
-///
-/// `sig`/`cred_hash`/`uid` are computed once (atomically, on first access) and
-/// cached. Serializes byte-identical to the wrapped [`ProtocolConfig`], so
-/// deserializing a stored spec produces an identical [`Proto`] whose identity
-/// starts deferred (empty `OnceLock`).
-#[derive(Debug)]
-pub struct Proto {
-    config: ProtocolConfig,
-    identity: std::sync::OnceLock<Identity>,
-}
-
-impl Proto {
-    #[must_use]
-    pub const fn new(config: ProtocolConfig) -> Self {
-        Self {
-            config,
-            // Empty lock == deferred identity; materialized on first access.
-            identity: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// Materialize the identity cache on first access. Race-safe by
-    /// construction: `get_or_init` runs the closure at most once and stores a
-    /// single deterministic value.
-    fn materialize(&self) -> &Identity {
-        self.identity.get_or_init(|| Identity {
-            sig: NonZeroU64::new(self.config.compute_sig()).unwrap_or(NonZeroU64::MIN),
-            cred_hash: self.config.compute_cred_hash(),
-        })
-    }
-
-    #[must_use]
-    pub fn sig(&self) -> u64 {
-        self.materialize().sig.get()
-    }
-
-    #[must_use]
-    pub fn cred_hash(&self) -> u64 {
-        self.materialize().cred_hash
-    }
-
-    #[must_use]
-    pub fn uid(&self) -> u64 {
-        self.sig() ^ self.cred_hash()
-    }
-
-    #[must_use]
-    pub const fn config(&self) -> &ProtocolConfig {
-        &self.config
-    }
-
-    #[must_use]
-    pub fn into_config(self) -> ProtocolConfig {
-        self.config
-    }
-
-    /// Seed the identity cache (tests only — lets tests assert no recompute).
-    #[cfg(test)]
-    fn set_identity(&self, identity: Identity) {
-        _ = self.identity.set(identity);
-    }
-}
-
-impl ProtoIdentity for Proto {
-    fn compute_sig(&self) -> u64 {
-        <ProtocolConfig as ProtoIdentity>::compute_sig(&self.config)
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        <ProtocolConfig as ProtoIdentity>::compute_cred_hash(&self.config)
-    }
-}
-
-impl ProtoSpec for Proto {
-    fn reconstruct(&self) -> Result<String, ParseError> {
-        dispatch!(&self.config, reconstruct)
-    }
-    fn schema(&self) -> SchemeX {
-        dispatch!(&self.config, schema)
-    }
-    fn host(&self) -> Option<&HostSpec> {
-        dispatch!(&self.config, host)
-    }
-    fn port(&self) -> Option<u16> {
-        dispatch!(&self.config, port)
-    }
-    fn remarks(&self) -> Option<&str> {
-        dispatch!(&self.config, remarks)
-    }
-    fn security(&self) -> Option<&SecurityConfig> {
-        dispatch!(&self.config, security)
-    }
-    fn transport_type(&self) -> Option<&str> {
-        dispatch!(&self.config, transport_type)
-    }
-    fn security_type(&self) -> Option<&str> {
-        dispatch!(&self.config, security_type)
-    }
-    fn country_flags(&self) -> SmallVec<[crate::urlx::TinyText; 4]> {
-        dispatch!(&self.config, country_flags)
-    }
-    fn to_json_config(&self, core: CoreType) -> Result<serde_json::Value, ProtoSpecError> {
-        dispatch!(&self.config, to_json_config, core)
-    }
-
-    fn try_from_clash(proxy: &ClashProxy) -> Result<Self, ParseError> {
-        ProtocolConfig::try_from_clash(proxy).map(Self::new)
-    }
-
-    fn to_clash(&self) -> Result<ClashProxy, ProtoSpecError> {
-        dispatch!(&self.config, to_clash)
-    }
-
-    /// # Errors
-    ///
-    /// If the URL is not a valid proxy URL for any supported protocol.
-    fn try_parse(raw: &RawUrlX<'_>) -> Result<Self, ParseError> {
-        ProtocolConfig::try_parse(raw).map(Self::new)
-    }
-}
-
-impl Serialize for Proto {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.config.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Proto {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::new(ProtocolConfig::deserialize(deserializer)?))
     }
 }
 
@@ -813,29 +674,29 @@ impl PlaceholderConfig {
 }
 
 impl ProtoIdentity for PlaceholderConfig {
-    fn compute_sig(&self) -> u64 {
-        // Opaque legacy blob: we cannot decompose semantic fields reliably,
-        // so the sig is a deterministic rapidhash over the ENTIRE body
-        // (proto_name + settings_json). Same body -> same uid (dedup); never
-        // zero (mapped to NonZeroU64::MIN by Proto::materialize).
-        //
-        // NOTE: the hashed body INCLUDES the volatile `remarks` field for
-        // placeholder-scheme profiles (set_legacy_fields writes it into the
-        // settings JSON). Renaming a profile's remark therefore changes its
-        // uid, so a subscription refresh treats the row as new and duplicates
-        // it. This is the mandated whole-body-hash design for opaque configs —
-        // the remark is intentionally part of the identity; do NOT special-case
-        // it out of the hash here.
-        use rapidhash::v3::{DEFAULT_RAPID_SECRETS, RapidStreamHasherV3};
-        let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
-        hasher.write(self.proto_name.as_bytes());
-        hasher.write(&self.settings_json);
-        hasher.finish()
-    }
-
-    fn compute_cred_hash(&self) -> u64 {
-        // Opaque blob has no extractable credentials.
-        0
+    /// Opaque legacy blob: the semantic fields cannot be decomposed reliably,
+    /// so the whole body (`proto_name` + `settings_json`) is hashed as framed
+    /// bytes.
+    ///
+    /// The variant (`Redirect` / `TProxy` / `Mixed`) is NOT part of this writer —
+    /// all three share this one type. It is covered by the `proto_kind`
+    /// discriminator that [`ProtocolEssentials::write_identity`] writes before
+    /// delegating here.
+    ///
+    /// NOTE: the hashed body INCLUDES the volatile `remarks` field for
+    /// placeholder-scheme profiles (`set_legacy_fields` writes it into the
+    /// settings JSON). Renaming a profile's remark therefore changes its uid,
+    /// so a subscription refresh treats the row as new and duplicates it. This
+    /// is the mandated whole-body-hash design for opaque configs — the remark
+    /// is intentionally part of the identity; do NOT special-case it out of
+    /// the hash here. There are no extractable credentials, so `cred_hash`
+    /// stays 0 and `uid == sig`.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        const ID_PROTO_NAME: u8 = 0x50;
+        const ID_SETTINGS_JSON: u8 = 0x51;
+        w.kind("placeholder");
+        w.str(ID_PROTO_NAME, &self.proto_name);
+        w.bytes(ID_SETTINGS_JSON, &self.settings_json);
     }
 }
 
@@ -907,96 +768,64 @@ mod tests {
             "stream_settings": {}
         });
         let json = serde_json::to_vec(&blob).unwrap();
-        let a = Proto::new(ProtocolConfig::Mixed(PlaceholderConfig::new(
-            "wireguard".into(),
-            json.clone(),
-        )));
-        let b = Proto::new(ProtocolConfig::Mixed(PlaceholderConfig::new(
-            "wireguard".into(),
-            json,
-        )));
-        let c = Proto::new(ProtocolConfig::Mixed(PlaceholderConfig::new(
+        let a = PlaceholderConfig::new("wireguard".into(), json.clone())
+            .try_parse_proto()
+            .identity_once();
+        let b = PlaceholderConfig::new("wireguard".into(), json)
+            .try_parse_proto()
+            .identity_once();
+        let c = PlaceholderConfig::new(
             "wireguard".into(),
             serde_json::to_vec(&serde_json::json!({
                 "protocol_settings": {"password": "other"},
                 "stream_settings": {}
             }))
             .unwrap(),
-        )));
-        assert_ne!(a.sig(), 0, "sig must never be zero");
-        assert_eq!(a.sig(), b.sig(), "same body -> same sig (dedup)");
-        assert_ne!(a.sig(), c.sig(), "different body -> different sig");
-        assert_eq!(
-            a.cred_hash(),
-            0,
-            "opaque blob has no extractable credentials"
-        );
-        assert_eq!(a.uid(), a.sig(), "uid == sig when cred_hash is 0");
+        )
+        .try_parse_proto()
+        .identity_once();
+        assert_ne!(a.0, 0, "sig must never be zero");
+        assert_eq!(a, b, "same body -> same identity (dedup)");
+        assert_ne!(a.0, c.0, "different body -> different sig");
+        assert_eq!(a.1, 0, "opaque blob has no extractable credentials");
+        assert_eq!(a.2, a.0, "uid == sig when cred_hash is 0");
     }
 
     #[test]
-    fn proto_serde_roundtrip_byte_identical_to_config() {
-        let url = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
-        let config = ProtocolConfig::try_parse(&RawUrlX::from(url)).unwrap();
-        let proto = Proto::new(config.clone());
-        assert_eq!(
-            serde_json::to_string(&proto).unwrap(),
-            serde_json::to_string(&config).unwrap(),
-            "Proto must serialize byte-identical to ProtocolConfig"
-        );
-        let bytes = serde_json::to_vec(&proto).unwrap();
-        let reparsed: Proto = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            reparsed.identity.get().is_none(),
-            "deserialized Proto must start with deferred identity (empty OnceLock)"
-        );
-        assert_eq!(
-            serde_json::from_slice::<ProtocolConfig>(&bytes).unwrap(),
-            config,
-            "Proto bytes must decode to the same ProtocolConfig"
-        );
+    fn placeholder_kind_discriminates_redirect_tproxy_mixed() {
+        // All three share one PlaceholderConfig type; the identity can only
+        // tell them apart through the parse-boundary proto_kind.
+        let body = serde_json::to_vec(&json!({})).unwrap();
+        let of = |name: &str| {
+            PlaceholderConfig::new(name.to_string(), body.clone())
+                .try_parse_proto()
+                .uid()
+        };
+        let (redirect, tproxy, mixed) = (of("redirect"), of("tproxy"), of("mixed"));
+        assert_ne!(redirect, tproxy);
+        assert_ne!(tproxy, mixed);
+        assert_ne!(redirect, mixed);
     }
 
     #[test]
-    fn proto_materialization_consistency() {
+    fn identity_is_stable_across_calls() {
         let url = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
         let config = ProtocolConfig::try_parse(&RawUrlX::from(url)).unwrap();
-        let proto = Proto::new(config);
-        let sig = proto.sig();
-        let cred_hash = proto.cred_hash();
+        let parsed = ParsedProto {
+            endpoints: vec![],
+            protocol: ProtocolEssentials {
+                proto_kind: ProtocolKind::Shadowsocks,
+                config_type: ConfigKind::ShareUrl,
+                core_type: CoreType::Xray,
+                config,
+            },
+        };
+        let (sig, cred_hash, uid) = parsed.identity_once();
         assert_ne!(sig, 0, "sig must never be zero");
-        assert_eq!(proto.uid(), sig ^ cred_hash, "uid == sig ^ cred_hash");
-        assert_eq!(proto.sig(), sig, "sig is stable across calls");
-        assert_eq!(
-            proto.cred_hash(),
-            cred_hash,
-            "cred_hash is stable across calls"
-        );
-        assert_eq!(proto.uid(), sig ^ cred_hash, "uid is stable across calls");
-        assert!(
-            proto.identity.get().is_some(),
-            "identity must materialize on first access"
-        );
-    }
-
-    #[test]
-    fn proto_set_identity_seeds_cache() {
-        let url = "ss://Y2xlb2Y6cGFzc3dvcmQ@1.2.3.4:8080";
-        let config = ProtocolConfig::try_parse(&RawUrlX::from(url)).unwrap();
-        let proto = Proto::new(config);
-        let seeded_sig = std::num::NonZeroU64::new(12_345).unwrap();
-        let seeded_cred_hash = 67_890;
-        proto.set_identity(Identity {
-            sig: seeded_sig,
-            cred_hash: seeded_cred_hash,
-        });
-        assert_eq!(proto.sig(), 12_345, "seeded sig returned without recompute");
-        assert_eq!(
-            proto.cred_hash(),
-            67_890,
-            "seeded cred_hash returned without recompute"
-        );
-        assert_eq!(proto.uid(), 0x3039 ^ 0x1_0932, "uid == sig ^ cred_hash");
+        assert_eq!(uid, sig ^ cred_hash, "uid == sig ^ cred_hash");
+        assert_eq!(parsed.sig(), sig, "sig is stable across calls");
+        assert_eq!(parsed.cred_hash(), cred_hash, "cred_hash is stable");
+        assert_eq!(parsed.uid(), uid, "uid is stable across calls");
     }
 
     #[test]

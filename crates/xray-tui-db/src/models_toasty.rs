@@ -210,7 +210,10 @@ pub struct Endpoint {
 }
 
 /// `Protocol`: a protocol configuration.
-/// PK = uid = sig ^ `cred_hash`.
+///
+/// PK = uid = sig ^ `cred_hash`, all three computed by the crate-private
+/// per-kind `identity` writer in `xray-tui-proto` (non-credential, non-default
+/// fields -> `sig`; credentials -> `cred_hash`, 0 when there are none).
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "protocols"]
 pub struct Protocol {

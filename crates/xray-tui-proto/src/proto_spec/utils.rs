@@ -142,29 +142,6 @@ pub fn query_get_multi<'a>(params: &'a [(String, String)], keys: &[&str]) -> Opt
     keys.iter().find_map(|key| query_get(params, key))
 }
 
-/// Hash credential values in a stable order. Returns 0 when there are no
-/// credentials — the caller's uid then equals its sig.
-#[must_use]
-pub fn compute_cred_hash(pairs: &[(&str, &str)]) -> u64 {
-    let mut non_empty: Vec<(&str, &str)> = pairs
-        .iter()
-        .copied()
-        .filter(|(_, v)| !v.is_empty())
-        .collect();
-    if non_empty.is_empty() {
-        return 0;
-    }
-    non_empty.sort_unstable();
-    let mut hasher = rapidhash::v3::RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-    for (k, v) in &non_empty {
-        hasher.write(k.as_bytes());
-        hasher.write(b"=");
-        hasher.write(v.as_bytes());
-        hasher.write(b";");
-    }
-    hasher.finish()
-}
-
 /// Decode fragment (remarks) from raw URL
 ///
 /// # Errors
@@ -236,27 +213,4 @@ pub fn coerce_u64(val: &serde_json::Value) -> Option<u64> {
                 }
             })
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compute_cred_hash;
-
-    #[test]
-    fn compute_cred_hash_returns_zero_without_credentials() {
-        assert_eq!(compute_cred_hash(&[]), 0);
-        assert_eq!(compute_cred_hash(&[("uuid", "")]), 0);
-        assert_eq!(compute_cred_hash(&[("uuid", ""), ("password", "")]), 0);
-        assert_ne!(compute_cred_hash(&[("uuid", "x")]), 0);
-        // order-independent
-        assert_eq!(
-            compute_cred_hash(&[("a", "1"), ("b", "2")]),
-            compute_cred_hash(&[("b", "2"), ("a", "1")])
-        );
-        // duplicate keys keep all values (different values still differ)
-        assert_ne!(
-            compute_cred_hash(&[("password", "a")]),
-            compute_cred_hash(&[("password", "b")])
-        );
-    }
 }

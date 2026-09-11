@@ -42,6 +42,7 @@ use super::common::{
     SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
 };
 use super::core_mapping;
+use super::identity::IdentityWriter;
 use super::utils;
 use super::{
     ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
@@ -397,39 +398,48 @@ impl ProtoSpec for WireguardConfig {
     }
 }
 
+/// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
+const ID_ADDRESS: u8 = 0x50;
+const ID_PUBLIC_KEY: u8 = 0x51;
+const ID_RESERVED: u8 = 0x52;
+const ID_MTU: u8 = 0x53;
+const ID_PERSISTENT_KEEPALIVE: u8 = 0x54;
+
 impl ProtoIdentity for WireguardConfig {
-    fn compute_sig(&self) -> u64 {
-        use rapidhash::v3::RapidStreamHasherV3;
-        let mut hasher = RapidStreamHasherV3::new(&rapidhash::v3::DEFAULT_RAPID_SECRETS);
-        hasher.write(b"wireguard");
+    /// Identity fields: everything that reaches a builder.
+    ///
+    /// Excluded on purpose: `remarks` (display) and `dns`/`remote_dns_resolve`
+    /// (neither core emits a key for them — sing-box-only concepts dropped by
+    /// both builders). `reserved` is hashed as its decoded byte form, the only
+    /// shape a builder emits (a non-3-byte value is dropped by both cores, so
+    /// it is not identity), which also collapses textual aliases. `mtu` elides
+    /// the sing-box 1420 default. Credentials: `private_key` and
+    /// `preshared_key`; the peer `public_key` is a public server parameter, so
+    /// it is a `sig` field.
+    fn write_identity(&self, w: &mut IdentityWriter) {
+        w.kind("wireguard");
+        super::common::write_security(w, &self.security);
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        hasher.write(self.address.as_bytes());
-        if let Some(v) = &self.reserved {
-            hasher.write(v.as_bytes());
+        w.str(ID_ADDRESS, self.address.as_str());
+        w.str(ID_PUBLIC_KEY, &self.public_key);
+        if let Some(reserved) = &self.reserved
+            && let Some(bytes) = parse_reserved_bytes(reserved.as_str())
+        {
+            w.bytes(ID_RESERVED, &bytes);
         }
-        if let Some(v) = &self.mtu {
-            hasher.write(v.as_bytes());
-        }
-        if let Some(v) = &self.persistent_keepalive {
-            hasher.write(&v.to_le_bytes());
-        }
-        if let Some(v) = &self.dns {
-            for svr in v {
-                hasher.write(svr.as_bytes());
-            }
-        }
-        if let Some(v) = &self.remote_dns_resolve {
-            hasher.write(&[u8::from(*v)]);
-        }
-        hasher.finish()
-    }
-    fn compute_cred_hash(&self) -> u64 {
-        utils::compute_cred_hash(&[
-            ("private_key", self.private_key.as_str()),
-            ("public_key", self.public_key.as_str()),
-            ("preshared_key", self.preshared_key.as_deref().unwrap_or("")),
-        ])
+        let mtu = self
+            .mtu
+            .as_ref()
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .map(u64::from);
+        w.opt_u64(ID_MTU, mtu, 1420);
+        w.present_u64(
+            ID_PERSISTENT_KEEPALIVE,
+            self.persistent_keepalive.map(u64::from),
+        );
+        w.cred("private_key", &self.private_key);
+        w.cred("preshared_key", self.preshared_key.as_deref().unwrap_or(""));
     }
 }
 
